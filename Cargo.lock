@@ -3965,8 +3965,10 @@ name = "relux-kernel"
 version = "0.1.0"
 dependencies = [
  "relux-core",
+ "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
 ]
 

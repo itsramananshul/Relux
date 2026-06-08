@@ -21,12 +21,14 @@ pub mod event;
 pub mod loader;
 pub mod prime;
 pub mod state;
+pub mod store;
 
 pub use clock::Clock;
 pub use event::RunEvent;
 pub use loader::{load_plugin_manifests, MANIFEST_FILENAME};
 pub use prime::{classify_intent, decide};
-pub use state::KernelState;
+pub use state::{KernelCounters, KernelSnapshot, KernelState};
+pub use store::SqliteStore;
 
 use relux_core::ManifestError;
 use thiserror::Error;
@@ -60,4 +62,6 @@ pub enum KernelError {
     ToolNotFound { plugin: String, tool: String },
     #[error("permission denied: agent {agent} lacks {permission}")]
     PermissionDenied { agent: String, permission: String },
+    #[error("storage error: {0}")]
+    Storage(String),
 }

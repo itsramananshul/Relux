@@ -24,11 +24,48 @@ use relux_core::{
     PrimePlan, PrimeTurn, RiskLevel, Run, RunId, RunStatus, StateSummary, Task, TaskBrief, TaskId,
     TaskStatus,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::clock::Clock;
 use crate::event::RunEvent;
 use crate::prime::{classify_intent, decide};
 use crate::KernelError;
+
+/// The monotonic counters and logical-clock position that must be restored for a
+/// resumed [`KernelState`] to keep minting ids and timestamps deterministically
+/// without colliding with anything already persisted.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct KernelCounters {
+    /// Logical seconds the deterministic [`Clock`] has advanced.
+    pub clock_secs: u64,
+    pub next_task: u64,
+    pub next_run: u64,
+    pub next_approval: u64,
+    pub next_audit: u64,
+    pub next_event: u64,
+}
+
+/// A flat, serializable export of the entire [`KernelState`].
+///
+/// This is the unit the [`crate::store::SqliteStore`] persists: every entity, the
+/// run transcripts, the audit log, and the counters needed to resume id/timestamp
+/// minting. Entities are held as ordered `Vec`s (sorted by id on export) so a
+/// snapshot is byte-stable for a given logical state regardless of the live
+/// `HashMap` iteration order.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct KernelSnapshot {
+    pub plugins: Vec<PluginManifest>,
+    pub namespaces: Vec<Namespace>,
+    pub agents: Vec<Agent>,
+    pub tasks: Vec<Task>,
+    pub runs: Vec<Run>,
+    pub approvals: Vec<Approval>,
+    /// Run transcripts, in emission order.
+    pub run_events: Vec<RunEvent>,
+    /// The append-only audit log, in emission order.
+    pub audit_events: Vec<AuditEvent>,
+    pub counters: KernelCounters,
+}
 
 /// The local, in-memory Relux control plane.
 #[derive(Debug, Default)]
@@ -55,6 +92,81 @@ pub struct KernelState {
 impl KernelState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    // --- Persistence -------------------------------------------------------
+
+    /// Export the full control plane into a flat, serializable [`KernelSnapshot`].
+    ///
+    /// Entities are emitted in id order so the snapshot is stable for a given
+    /// logical state; run transcripts and the audit log keep their emission
+    /// order. The counters carry everything needed to resume deterministic
+    /// id/timestamp minting (`docs/RELUX_MASTER_PLAN.md` section 15 Phase 1, section 17.8).
+    pub fn snapshot(&self) -> KernelSnapshot {
+        fn sorted<T, F>(map: &HashMap<F, T>, key: impl Fn(&T) -> &str) -> Vec<T>
+        where
+            T: Clone,
+        {
+            let mut out: Vec<T> = map.values().cloned().collect();
+            out.sort_by(|a, b| key(a).cmp(key(b)));
+            out
+        }
+
+        KernelSnapshot {
+            plugins: sorted(&self.plugins, |p| p.id.as_str()),
+            namespaces: sorted(&self.namespaces, |n| n.id.as_str()),
+            agents: sorted(&self.agents, |a| a.id.as_str()),
+            tasks: sorted(&self.tasks, |t| t.id.as_str()),
+            runs: sorted(&self.runs, |r| r.id.as_str()),
+            approvals: sorted(&self.approvals, |a| a.id.as_str()),
+            run_events: self.run_events.clone(),
+            audit_events: self.audit_log.clone(),
+            counters: KernelCounters {
+                clock_secs: self.clock.secs(),
+                next_task: self.next_task,
+                next_run: self.next_run,
+                next_approval: self.next_approval,
+                next_audit: self.next_audit,
+                next_event: self.next_event,
+            },
+        }
+    }
+
+    /// Rebuild a [`KernelState`] from a previously exported [`KernelSnapshot`].
+    ///
+    /// This restores state directly into the in-memory maps without re-emitting
+    /// audit or run events - it is a resume, not a replay of the actions that
+    /// produced the state. Counters and the logical clock are restored so newly
+    /// minted ids and timestamps continue past whatever is already persisted.
+    pub fn from_snapshot(snapshot: KernelSnapshot) -> Self {
+        let mut state = KernelState::new();
+        for plugin in snapshot.plugins {
+            state.plugins.insert(plugin.id.clone(), plugin);
+        }
+        for namespace in snapshot.namespaces {
+            state.namespaces.insert(namespace.id.clone(), namespace);
+        }
+        for agent in snapshot.agents {
+            state.agents.insert(agent.id.clone(), agent);
+        }
+        for task in snapshot.tasks {
+            state.tasks.insert(task.id.clone(), task);
+        }
+        for run in snapshot.runs {
+            state.runs.insert(run.id.clone(), run);
+        }
+        for approval in snapshot.approvals {
+            state.approvals.insert(approval.id.clone(), approval);
+        }
+        state.run_events = snapshot.run_events;
+        state.audit_log = snapshot.audit_events;
+        state.clock = Clock::from_secs(snapshot.counters.clock_secs);
+        state.next_task = snapshot.counters.next_task;
+        state.next_run = snapshot.counters.next_run;
+        state.next_approval = snapshot.counters.next_approval;
+        state.next_audit = snapshot.counters.next_audit;
+        state.next_event = snapshot.counters.next_event;
+        state
     }
 
     // --- Plugins -----------------------------------------------------------
@@ -111,6 +223,10 @@ impl KernelState {
         );
         self.namespaces.insert(ns_id.clone(), namespace);
         ns_id
+    }
+
+    pub fn namespace(&self, id: &NamespaceId) -> Option<&Namespace> {
+        self.namespaces.get(id)
     }
 
     pub fn namespace_count(&self) -> usize {
@@ -555,6 +671,10 @@ impl KernelState {
 
     pub fn approval(&self, id: &ApprovalId) -> Option<&Approval> {
         self.approvals.get(id)
+    }
+
+    pub fn approval_count(&self) -> usize {
+        self.approvals.len()
     }
 
     pub fn pending_approval_count(&self) -> usize {
@@ -1222,5 +1342,52 @@ mod tests {
         k.prime_turn(&ctx, "fix the flaky test").unwrap();
         let busy = k.prime_turn(&ctx, "what is going on?").unwrap();
         assert!(busy.reply.contains("open task"), "got: {}", busy.reply);
+    }
+
+    #[test]
+    fn snapshot_round_trip_preserves_state_and_counters() {
+        let (mut k, ctx) = prime_chat_kernel();
+        // Walk a full loop so every map, the transcript, and the audit log are
+        // non-empty and the counters have advanced.
+        let turn = k
+            .prime_turn(&ctx, "create a task to echo hello and run it")
+            .unwrap();
+        let task = turn.created_task.expect("a task was created");
+        let run = turn.started_run.expect("a run was started");
+
+        let before = k.snapshot();
+        let restored = KernelState::from_snapshot(before.clone());
+
+        // Entity counts and key states survive the round trip.
+        assert_eq!(restored.plugin_count(), k.plugin_count());
+        assert_eq!(restored.namespace_count(), k.namespace_count());
+        assert_eq!(restored.agent_count(), k.agent_count());
+        assert_eq!(restored.task_count(), k.task_count());
+        assert_eq!(restored.run_count(), k.run_count());
+        assert_eq!(
+            restored.task(&task).unwrap().status,
+            TaskStatus::Completed
+        );
+        assert_eq!(restored.run(&run).unwrap().status, RunStatus::Completed);
+        assert_eq!(
+            restored.run_events(&run).len(),
+            k.run_events(&run).len()
+        );
+        assert_eq!(restored.audit_log().len(), k.audit_log().len());
+
+        // Counters resume: the next snapshot from the restored kernel is identical,
+        // and a fresh action mints the *next* id rather than colliding.
+        let after = restored.snapshot();
+        assert_eq!(after.counters.next_task, before.counters.next_task);
+        assert_eq!(after.counters.next_run, before.counters.next_run);
+        assert_eq!(after.counters.clock_secs, before.counters.clock_secs);
+
+        let mut resumed = restored;
+        let next = resumed
+            .prime_turn(&ctx, "create a task to summarize the README")
+            .unwrap()
+            .created_task
+            .expect("a second task was created");
+        assert_ne!(next, task, "resumed kernel must not reuse a task id");
     }
 }

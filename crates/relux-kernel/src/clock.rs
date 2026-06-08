@@ -18,6 +18,22 @@ impl Clock {
         Self::default()
     }
 
+    /// Rebuild a clock that has already advanced `secs` logical seconds.
+    ///
+    /// Used when restoring kernel state from a snapshot so timestamps keep
+    /// advancing monotonically across process restarts instead of resetting to
+    /// the base instant.
+    pub fn from_secs(secs: u64) -> Self {
+        Self { secs }
+    }
+
+    /// The number of logical seconds this clock has advanced so far.
+    ///
+    /// This is the value that must be persisted to resume the clock exactly.
+    pub fn secs(&self) -> u64 {
+        self.secs
+    }
+
     /// Advance one logical second and return the new timestamp string.
     ///
     /// The base instant is `2026-06-08T00:00:00Z`; ticks roll seconds into
