@@ -6,6 +6,7 @@ resolver = "2"
 # the main workspace cleanly without needing the examples tree.
 # See `examples/plugins/web-lookup/Cargo.toml`.
 members = [
+    "crates/relux-core",
     "crates/relix-core",
     "crates/relix-runtime",
     "crates/relix-controller",
