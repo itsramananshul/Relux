@@ -1,0 +1,1607 @@
+﻿# Relux Master Plan
+
+Version: 0.1.0
+Status: Canonical planning document
+Product name: Relux
+Repository: `D:\DATA\WORK\OpenPrem\Apps\Relix-Revised`
+Remote: `https://github.com/itsramananshul/Relux`
+
+This document exists so Codex, Claude, and any future AI working in this
+repository understand what Relux is, why the direction changed, what must be
+built, what must not be built, and how the current Relix codebase should be
+transformed into the new Relux product.
+
+Read this document before doing product, architecture, backend, frontend,
+dashboard, plugin, agent, or Prime work.
+
+Do not treat older Relix docs as deleted knowledge. They contain valuable
+implementation and product lessons. But when there is a conflict, this master
+plan defines the current product direction.
+
+---
+
+## 1. The Core Decision
+
+Relux is not only an AI company.
+
+Relux is not only a plugin manager.
+
+Relux is not only a chatbot.
+
+Relux is not only a workflow runner.
+
+Relux is a Prime-centered agentic control plane.
+
+Relux feels like Codex, but with more structure, more memory, more visibility,
+more permissions, more plugins, and the ability to create or coordinate other
+agents.
+
+The user should be able to talk to Prime the way they talk to Codex:
+
+```text
+hey
+what is going on?
+build this
+continue that
+run Claude on this
+hire another coding agent
+give this agent GitHub read access only
+show me active runs
+why is this blocked?
+retry the failed run
+turn this into a company
+```
+
+Prime should understand the user, inspect state, take allowed actions, ask for
+approval when needed, create tasks, start runs, call plugins, and coordinate
+agents.
+
+The product must preserve the things the user liked from the old Relix and
+Paperclip direction:
+
+- an issue/task board
+- active runs
+- task detail pages
+- transcripts
+- agents
+- ability to spawn/hire more agents
+- permissions
+- approvals
+- audit logs
+- dashboard visibility
+- work that can continue over time
+- product feeling like an actual app, not a pile of endpoints
+
+But the product must become more flexible than a fixed company metaphor.
+
+The company structure is a template/mode, not the whole identity.
+
+Relux can be:
+
+- a company of agents
+- a coding workspace
+- a research lab
+- a support automation hub
+- an enterprise internal agent network
+- a personal AI operating system
+- a plugin-powered workflow runner
+- a team of specialist agents
+- a control plane for agentic applications
+
+The same core system supports all of these.
+
+The short version:
+
+```text
+Relux = Codex-like Prime + task board + active runs + agents + plugins +
+permissions + approvals + audit + dashboard.
+```
+
+---
+
+## 2. The Product North Star
+
+Relux is the control plane for building and operating agentic systems.
+
+At the center is Prime.
+
+Prime is the main intelligent operator. Prime is an LLM-backed agent with a
+toolbelt, memory, state awareness, and authority limited by permissions.
+
+Around Prime is the control plane:
+
+- plugins
+- agents
+- tasks/issues
+- runs
+- permissions
+- approvals
+- audit logs
+- secrets
+- workspaces
+- dashboard
+- CLI
+- APIs
+
+Relux should make the user feel:
+
+```text
+I can tell Prime what I want.
+Prime understands.
+Prime can do work directly.
+Prime can create tasks.
+Prime can spawn or assign agents.
+Prime can use tools through plugins.
+Prime can show me what is happening.
+Prime cannot silently do dangerous things.
+Everything is visible, permissioned, and auditable.
+```
+
+The first successful version of Relux is not a massive marketplace. It is a
+working Prime loop:
+
+```text
+User talks to Prime.
+Prime creates or selects a task.
+Prime starts a run or assigns an agent.
+The run uses an adapter/tool plugin.
+Permissions are checked.
+Events are logged.
+The dashboard shows the task, run, transcript, result, and audit trail.
+Prime can summarize, retry, continue, or ask approval.
+```
+
+That loop is the foundation.
+
+---
+
+## 3. What Relux Is
+
+Relux is:
+
+1. A Prime-centered control plane for agentic applications.
+2. A plugin-first kernel for models, tools, agents, memory, storage, and
+   execution environments.
+3. A task and run system for durable work.
+4. A permissions and approval layer around agent actions.
+5. A dashboard for understanding what Prime and agents are doing.
+6. A CLI/API platform for developers building agentic systems.
+7. A flexible operating layer that can become a company, lab, automation hub,
+   coding workspace, or custom agent network.
+
+Relux is designed to answer these questions:
+
+```text
+Who can act?
+What can they access?
+Which plugin powers this capability?
+What task is being worked on?
+Which run is active?
+What tools were called?
+What was denied?
+What needs approval?
+What failed?
+What succeeded?
+What should happen next?
+```
+
+---
+
+## 4. What Relux Is Not
+
+Relux is not a fixed "AI company" product only.
+
+It can have a company template, but a company is one possible shape.
+
+Relux is not just a plugin manager.
+
+The plugin system is infrastructure. The user-facing product is Prime and the
+operating surface around Prime.
+
+Relux is not a generic chat app.
+
+Chat is the main command surface, but the source of truth is durable state:
+tasks, runs, agents, plugins, permissions, approvals, and audit logs.
+
+Relux is not a random collection of panels.
+
+Every dashboard screen must answer one of these:
+
+- What is Prime doing?
+- What are agents doing?
+- What work exists?
+- What is running?
+- What needs approval?
+- What can each actor access?
+- Which plugins power the system?
+- What happened?
+
+Relux is not a system where an LLM can do anything by vibes.
+
+Every meaningful action must pass through permissions, risk checks, and audit.
+
+---
+
+## 5. Why The Direction Changed
+
+The old Relix direction had many strong ideas:
+
+- secure mesh
+- policy gates
+- audit/Chronicle
+- Rigs/adapters
+- Prime
+- agents/operatives
+- Briefs
+- active runs
+- dashboard
+- budget/allowance
+- approvals/clearances
+
+But the old product felt too much like infrastructure and too little like a
+usable product. It had many capabilities, but the user had to connect them.
+
+Paperclip felt better because its execution was product-path first:
+
+- issue board
+- issue detail
+- chat/comments around an issue
+- runs attached to issues
+- agents assigned to work
+- live logs/transcripts
+- recovery states
+- approvals
+- a dashboard that made work legible
+
+The user liked:
+
+- the concept of Relix
+- the execution discipline of Paperclip
+- the feeling of Codex as a smart agent that can talk, act, and coordinate
+
+Relux combines those lessons:
+
+```text
+Relix concept and security discipline
++ Paperclip-style work/run visibility
++ Codex-like Prime
++ plugin-first extensibility
+= Relux
+```
+
+---
+
+## 6. The Correct Mental Model
+
+Prime is not a button.
+
+Prime is not a dumb state machine.
+
+Prime is not a generic chatbot that creates a plan from every message.
+
+Prime is a Codex-like intelligent operator inside Relux.
+
+Prime has:
+
+- conversation ability
+- state inspection
+- tool/action ability
+- permission awareness
+- task creation ability
+- run starting ability
+- agent spawning/hiring ability
+- delegation ability
+- approval request ability
+- explanation ability
+- recovery/retry ability
+
+Prime should behave like this:
+
+```text
+User: hey
+Prime: I am here. There are 2 active runs and 1 task waiting for approval.
+       What do you want to work on?
+
+User: build a coding agent that can open PRs
+Prime: I can do that. I need an adapter plugin, GitHub tool plugin, and
+       scoped GitHub permissions. I can create the agent with read/create-PR
+       permissions but not merge permission. Proceed?
+
+User: yes
+Prime: Created the agent, installed/configured the required plugins, granted
+       scoped permissions, and created a test task.
+
+User: why did the run fail?
+Prime: The terminal tool failed because the workspace path was missing. I can
+       retry after creating the workspace, or mark the task blocked.
+```
+
+Prime should not behave like this:
+
+```text
+User: hey
+Prime: Here is a full strategy and 12 subtasks.
+```
+
+Prime must understand intent before acting.
+
+---
+
+## 7. Product Layers
+
+Relux has six product layers.
+
+### 7.1 Prime Layer
+
+Prime is the main conversational and action-taking surface.
+
+Prime can:
+
+- chat with the user
+- inspect system state
+- create tasks
+- update tasks
+- start runs
+- assign tasks to agents
+- create/spawn/hire agents
+- install/configure plugins
+- grant/request permissions
+- ask for approval
+- summarize runs
+- explain blockers
+- retry or continue work
+
+Prime must route actions through the kernel, not bypass it.
+
+### 7.2 Work Layer
+
+The work layer contains tasks/issues, boards, and task detail.
+
+Core objects:
+
+- Task or Issue
+- Run
+- Active Run
+- Artifact
+- Comment/Event
+- Approval
+- Audit Event
+
+The board is central. The user likes the issue board. Keep it.
+
+The board should be understandable:
+
+```text
+Backlog
+Ready
+Running
+Waiting Approval
+Blocked
+Done
+Failed
+```
+
+Names can evolve, but the statuses must be obvious.
+
+### 7.3 Agent Layer
+
+Agents are configured actors inside Relux.
+
+An agent has:
+
+- name
+- role/purpose
+- adapter plugin
+- model/runtime config
+- permissions
+- available tools
+- memory settings
+- task queue
+- active run state
+- owner/namespace
+- audit history
+
+Prime may act directly, or Prime may create/assign work to agents.
+
+Agents are not necessarily "employees" unless the selected template is a
+company template. In generic Relux, they are specialist actors.
+
+### 7.4 Plugin Kernel Layer
+
+The plugin kernel owns:
+
+- plugin discovery
+- plugin installation
+- plugin manifests
+- plugin registry/local index
+- plugin enable/disable
+- plugin health
+- plugin routing
+- plugin permissions
+- plugin audit
+
+Plugins provide:
+
+- adapters
+- tools
+- service providers
+- memory providers
+- vector stores
+- execution environments
+- task brokers
+- UI panels
+- company/internal integrations
+
+### 7.5 Permission And Approval Layer
+
+Every meaningful action is permissioned.
+
+Examples:
+
+```text
+tool:relux-tools-github:create_pr
+tool:relux-tools-github:merge_pr
+tool:relux-tools-terminal:run_tests
+exec:relux-env-python-wasm:run
+plugin:relux-tools-github:configure
+agent:code-agent:assign_task
+task:task_123:start_run
+```
+
+Some actions require approval:
+
+- merging PRs
+- deleting files
+- changing production systems
+- sending external messages
+- issuing refunds
+- reading sensitive data
+- running destructive shell commands
+- granting broad permissions
+
+Prime and agents can request approval. They cannot silently bypass it.
+
+### 7.6 Dashboard Layer
+
+The dashboard supports the product. It should not replace Prime.
+
+Core dashboard pages:
+
+- Prime Chat
+- Board / Tasks
+- Active Runs
+- Task Detail
+- Agents
+- Plugins
+- Permissions
+- Approvals
+- Audit Logs
+- Settings
+
+The dashboard must feel like a real product, not generated placeholder UI.
+
+---
+
+## 8. Plugin Model
+
+Everything important should eventually be plugin-powered.
+
+### 8.1 Adapter Plugins
+
+Adapter plugins connect Relux to models or agent runtimes.
+
+Examples:
+
+- `relux-adapter-openai`
+- `relux-adapter-anthropic`
+- `relux-adapter-openrouter`
+- `relux-adapter-claude-cli`
+- `relux-adapter-codex-cli`
+- `relux-adapter-hermes`
+- `relux-adapter-ollama`
+- `relux-adapter-custom-http`
+
+Adapters answer:
+
+- How does this agent/model receive tasks?
+- How does it stream events?
+- How does it call tools?
+- How does it report usage/cost?
+- How does it resume?
+- How does it fail?
+
+### 8.2 ToolSet Plugins
+
+ToolSet plugins expose tools.
+
+Examples:
+
+- `relux-tools-github`
+- `relux-tools-terminal`
+- `relux-tools-browser`
+- `relux-tools-slack`
+- `relux-tools-discord`
+- `relux-tools-tavily`
+- `relux-tools-google-drive`
+- `relux-tools-zendesk`
+- `relux-tools-salesforce`
+
+Tools must declare:
+
+- name
+- description
+- input schema
+- output schema
+- risk level
+- required permission
+- approval requirement
+- timeout
+- retry policy
+
+### 8.3 Service Provider Plugins
+
+Service providers replace infrastructure backends.
+
+Examples:
+
+- `relux-provider-sqlite`
+- `relux-provider-postgres`
+- `relux-provider-redis`
+- `relux-provider-nats`
+- `relux-provider-qdrant`
+- `relux-provider-chromadb`
+- `relux-provider-s3`
+- `relux-provider-localfs`
+
+Provider traits may include:
+
+- PrimaryStorage
+- VectorStore
+- TaskBroker
+- BlobStorage
+- MemoryStore
+- SecretStore
+- EventBus
+
+### 8.4 Execution Environment Plugins
+
+Execution environments run code or programs.
+
+Examples:
+
+- `relux-env-python-wasm`
+- `relux-env-node-wasm`
+- `relux-env-docker`
+- `relux-env-firecracker`
+- `relux-env-sol`
+- `relux-env-shell`
+- `relux-env-browser`
+
+They must declare:
+
+- supported language/runtime
+- resource limits
+- network policy
+- filesystem policy
+- timeout
+- isolation mode
+- risk level
+
+### 8.5 UI Plugins
+
+Eventually, plugins may add dashboard panels or task detail cards.
+
+This is not MVP-critical. Do not build this before the basic Prime/task/plugin
+loop works.
+
+---
+
+## 9. Core Entities
+
+The first Relux data model should be simple and durable.
+
+### 9.1 User
+
+A human or service actor.
+
+Fields:
+
+- id
+- name
+- email or handle
+- role
+- namespace memberships
+- permissions
+- created_at
+
+### 9.2 Namespace
+
+A scope for resources.
+
+Examples:
+
+- personal workspace
+- company
+- project
+- team
+- customer
+- environment
+
+Fields:
+
+- id
+- name
+- kind
+- parent namespace
+- settings
+- created_at
+
+### 9.3 Agent
+
+A configured agent actor.
+
+Fields:
+
+- id
+- name
+- description
+- adapter plugin
+- adapter config
+- persona/instructions
+- namespace
+- owner
+- permissions
+- status
+- created_at
+
+### 9.4 Plugin
+
+An installed plugin record.
+
+Fields:
+
+- id
+- name
+- version
+- type
+- manifest
+- source
+- trust level
+- enabled
+- health
+- installed_at
+
+### 9.5 Task
+
+A durable unit of work.
+
+Fields:
+
+- id
+- title
+- input/body
+- status
+- priority
+- created_by
+- assigned_agent
+- namespace
+- required_permissions
+- parent_task
+- deadline
+- created_at
+- updated_at
+
+Statuses:
+
+```text
+created
+queued
+leased
+running
+waiting_for_tool
+waiting_for_approval
+blocked
+completed
+failed
+cancelled
+expired
+```
+
+### 9.6 Run
+
+One execution attempt for a task.
+
+Fields:
+
+- id
+- task_id
+- agent_id
+- adapter_plugin
+- status
+- started_at
+- ended_at
+- usage
+- cost
+- summary
+- error
+
+### 9.7 Run Event
+
+A transcript/log/timeline event inside a run.
+
+Fields:
+
+- id
+- run_id
+- ts
+- kind
+- source
+- message
+- structured_payload
+
+### 9.8 Tool Call
+
+A tool invocation routed through the kernel.
+
+Fields:
+
+- id
+- run_id
+- agent_id
+- plugin
+- tool
+- input
+- output
+- permission
+- risk
+- status
+- approval_id
+
+### 9.9 Approval
+
+A human approval request.
+
+Fields:
+
+- id
+- requested_by
+- action
+- reason
+- risk
+- status
+- approved_by
+- created_at
+- resolved_at
+
+### 9.10 Audit Event
+
+Immutable record of important actions.
+
+Fields:
+
+- id
+- ts
+- actor
+- action
+- target
+- namespace
+- result
+- metadata
+- hash/chain metadata if supported
+
+---
+
+## 10. Prime Behavior Specification
+
+Prime needs an intent layer, a planning layer, and an action layer.
+
+### 10.1 Intent Layer
+
+Prime should classify user messages before acting.
+
+Intent categories:
+
+- greeting
+- status question
+- task creation
+- task update
+- run start
+- run retry
+- agent creation
+- plugin installation
+- permission change
+- approval response
+- explanation request
+- dashboard/navigation request
+- brainstorming
+- direct answer/no action
+
+Examples:
+
+```text
+"hey" -> greeting
+"what is running?" -> status question
+"fix this bug" -> task creation
+"start it" -> run start, based on current context
+"hire a browser agent" -> agent creation
+"give it GitHub access" -> permission change, probably approval
+"why did it fail?" -> explanation request
+```
+
+### 10.2 Action Layer
+
+Prime can call kernel actions.
+
+Initial Prime actions:
+
+```text
+prime.inspect_state
+prime.create_task
+prime.update_task
+prime.assign_task
+prime.start_run
+prime.retry_run
+prime.create_agent
+prime.install_plugin
+prime.configure_plugin
+prime.grant_permission
+prime.request_approval
+prime.summarize_run
+prime.explain_blocker
+```
+
+Prime must never bypass the kernel.
+
+### 10.3 Approval Rules
+
+Prime may propose risky actions. Prime may request approval. Prime may explain
+why an action is needed.
+
+Prime must not silently:
+
+- grant broad permissions
+- run destructive tools
+- expose secrets
+- merge/deploy/delete
+- read sensitive data
+- install untrusted plugins
+- change production config
+
+### 10.4 Delegation Rules
+
+Prime can do work directly or delegate.
+
+Prime should delegate when:
+
+- the task is long-running
+- the task requires a specialist agent
+- multiple tasks can run in parallel
+- the user asks to hire/spawn/assign
+- a template says this work belongs to a specific role
+
+Prime should act directly when:
+
+- the user asks a simple question
+- the user wants a status summary
+- the action is small and within Prime's permissions
+- the system needs coordination or explanation
+
+### 10.5 Conversation Rules
+
+Prime should be natural, but not reckless.
+
+Prime should:
+
+- answer greetings normally
+- ask clarifying questions when needed
+- show what it is doing
+- explain why approval is needed
+- summarize results
+- keep state grounded in tasks/runs/plugins
+
+Prime should not:
+
+- create plans from casual greetings
+- invent completed work
+- hide failures
+- pretend plugins exist when they do not
+- silently perform dangerous actions
+
+---
+
+## 11. Dashboard Product Spec
+
+The dashboard should be operational, dense, and usable.
+
+It should not look like a marketing page.
+
+It should not be a pile of disconnected feature panels.
+
+It should be centered on Prime, work, runs, agents, plugins, and permissions.
+
+### 11.1 Prime Chat
+
+The main page or primary surface.
+
+It shows:
+
+- chat with Prime
+- Prime suggested next actions
+- current context
+- active tasks/runs summary
+- approval prompts
+- plugin/action results
+
+### 11.2 Board
+
+The board is core.
+
+Columns should be simple:
+
+- Backlog
+- Ready
+- Running
+- Waiting Approval
+- Blocked
+- Done
+- Failed
+
+Each card should show:
+
+- title
+- assigned agent
+- status
+- latest run
+- blockers
+- approval needed
+- plugin/tool summary
+
+### 11.3 Active Runs
+
+Shows live or recent runs.
+
+Each run should show:
+
+- task
+- agent
+- adapter
+- status
+- duration
+- tool calls
+- transcript snippet
+- cancel/retry/details actions
+
+### 11.4 Task Detail
+
+Task detail is where work becomes legible.
+
+It should show:
+
+- task title/input
+- assigned agent
+- status
+- comments/events
+- active run
+- run transcript
+- tool calls
+- approvals
+- artifacts/output
+- audit trail
+
+### 11.5 Agents
+
+Shows configured agents.
+
+Each agent should show:
+
+- adapter plugin
+- status
+- current task/run
+- permissions
+- tools
+- memory config
+- risk profile
+
+### 11.6 Plugins
+
+Shows installed plugins.
+
+Each plugin should show:
+
+- type
+- version
+- status
+- health
+- capabilities exposed
+- permissions exposed
+- configuration state
+
+### 11.7 Permissions
+
+Shows user/agent/plugin permissions.
+
+Must support:
+
+- searching permissions
+- granting/revoking
+- risk warnings
+- approval rules
+- permission templates
+
+### 11.8 Approvals
+
+Shows pending human approvals.
+
+Each approval should show:
+
+- requester
+- action
+- risk
+- reason
+- target
+- approve/reject/ask changes
+
+### 11.9 Audit Logs
+
+Searchable action history.
+
+Shows:
+
+- actor
+- action
+- target
+- result
+- plugin
+- task/run
+- timestamp
+- namespace
+
+---
+
+## 12. CLI Product Spec
+
+The CLI should make Relux feel easy to start.
+
+Ideal flow:
+
+```bash
+relux init
+relux plugins install relux-adapter-anthropic
+relux plugins install relux-tools-terminal
+relux agents create code-agent --adapter relux-adapter-anthropic
+relux permissions grant code-agent tool:relux-tools-terminal:run_tests
+relux up
+relux tasks create --agent code-agent --title "Run tests" --input "Run the test suite and summarize failures."
+relux tasks watch task_123
+```
+
+Eventually:
+
+```bash
+relux prime chat
+relux plugins search github
+relux plugins install relux-tools-github
+relux plugins configure relux-tools-github
+relux agents create
+relux tasks board
+relux runs list
+relux approvals list
+relux audit search
+```
+
+The CLI must be useful, but the dashboard and Prime chat should be the primary
+human operating surfaces.
+
+---
+
+## 13. Relationship To Existing Relix Code
+
+The current repository is a revised copy of the old Relix codebase.
+
+Do not blindly delete old systems.
+
+Do not blindly keep old names forever either.
+
+Old systems should be mapped into the new Relux product model.
+
+### 13.1 Naming Map
+
+Product-facing language should gradually move toward Relux terms.
+
+```text
+Relix -> Relux
+Rig -> Adapter plugin
+Operative -> Agent
+Brief -> Task or Issue
+Shift -> Run
+Chronicle -> Audit log or Timeline
+Clearance -> Approval
+Key -> Permission
+Guild/Company -> Namespace or Template
+Mandate -> Project/Goal/Task group, depending on context
+The Desk -> Dashboard
+```
+
+Internal Rust names do not all need to change immediately. Product-facing UI,
+docs, and APIs should move first. Internal renames should happen only when safe
+and useful.
+
+### 13.2 What To Keep
+
+Keep or adapt:
+
+- run ledger
+- active runs
+- task/brief store
+- dashboard auth
+- adapter/Rig code
+- policy/permission ideas
+- audit/Chronicle ideas
+- approval system
+- dashboard SPA
+- CLI boot/setup lessons
+- safe workspace execution ideas
+- tenant/namespace isolation
+- release/security discipline
+
+### 13.3 What To Demote
+
+Demote:
+
+- fixed company-only metaphors
+- mandatory Guild/Operative language
+- panel-per-capability dashboard structure
+- backend capabilities that have no product path
+- overly complex mesh-first UX
+
+### 13.4 What To Replace
+
+Replace:
+
+- "Relix is an AI company" as the main positioning
+- "Prime as one-step driver button" as the core behavior
+- "Rig" as product-facing adapter language
+- "Brief" as the only work object name if it confuses users
+- any behavior where "hey" creates a plan
+
+---
+
+## 14. MVP Definition
+
+The MVP must prove one loop:
+
+```text
+Prime receives a request.
+Prime creates or selects a task.
+Prime starts a run or assigns an agent.
+The agent/Prime uses an adapter plugin.
+The adapter requests a tool call.
+The kernel checks permission.
+The kernel routes the tool call to a ToolSet plugin.
+The tool returns a result.
+The run transcript updates.
+The task completes or fails.
+The audit log records everything.
+The dashboard shows the state.
+Prime explains the result.
+```
+
+Minimum plugins:
+
+- one adapter plugin
+- one tool plugin
+- one storage provider
+
+Recommended first set:
+
+- adapter: Claude CLI, Codex CLI, Anthropic, or OpenAI
+- tool: terminal/read-only shell or simple echo/weather tool
+- storage: SQLite
+
+Do not build a full marketplace before this loop works.
+
+Do not build many plugins before this loop works.
+
+Do not build advanced templates before this loop works.
+
+---
+
+## 15. Implementation Phases
+
+### Phase 0: Canonical Direction
+
+Goal:
+
+Make every AI and human understand what Relux is.
+
+Deliverables:
+
+- this master plan
+- corrected product name in primary docs
+- reconciliation between `docs/Relux spec.md` and existing Relix docs
+- decision on initial vocabulary: Task vs Issue, Namespace vs Space, Agent vs
+  Operative
+
+Success:
+
+No future agent should think Relux is only a plugin manager or only an AI
+company.
+
+### Phase 1: Core Kernel Shape
+
+Goal:
+
+Create the minimal Relux kernel API.
+
+Deliverables:
+
+- plugin manifest schema
+- plugin registry/local index
+- core entities: Namespace, Agent, Plugin, Task, Run, Permission, Approval,
+  AuditEvent
+- SQLite provider as default storage
+- basic CLI commands for init/list/create
+
+Success:
+
+Relux can start, load local plugin manifests, store entities, and show them.
+
+### Phase 2: Prime Core
+
+Goal:
+
+Make Prime the product center.
+
+Deliverables:
+
+- Prime chat endpoint
+- intent classification
+- state inspection
+- Prime action router
+- create task action
+- start run action
+- explain status/blocker action
+- safe approval request path
+
+Success:
+
+User can chat with Prime and Prime can perform simple grounded actions without
+randomly inventing plans.
+
+### Phase 3: First Plugin-Powered Run
+
+Goal:
+
+Prove the core loop.
+
+Deliverables:
+
+- one adapter plugin
+- one ToolSet plugin
+- permission check for tool calls
+- task leasing
+- run events/transcript
+- audit logging
+- integration test
+
+Success:
+
+An agent or Prime can run a task, call a tool through the kernel, get a result,
+and show it in the dashboard.
+
+### Phase 4: Dashboard MVP
+
+Goal:
+
+Make the system usable.
+
+Deliverables:
+
+- Prime Chat
+- Board
+- Active Runs
+- Task Detail
+- Agents
+- Plugins
+- Permissions
+- Approvals
+- Audit Logs
+
+Success:
+
+The user can understand and operate Relux without reading terminal logs.
+
+### Phase 5: Agent Spawning And Templates
+
+Goal:
+
+Let Prime create useful structures.
+
+Deliverables:
+
+- create agent flow
+- assign task flow
+- permission templates
+- optional company template
+- optional coding workspace template
+- optional research lab template
+
+Success:
+
+Prime can spawn/assign agents, but company structure remains optional.
+
+### Phase 6: Plugin Ecosystem
+
+Goal:
+
+Make plugins easy to build and share.
+
+Deliverables:
+
+- plugin SDK
+- plugin templates
+- plugin install/configure UX
+- private/local plugin support
+- plugin signing/checksums later
+
+Success:
+
+A developer can build a simple ToolSet or Adapter plugin without changing the
+kernel.
+
+### Phase 7: Reliability And Production
+
+Goal:
+
+Make Relux dependable.
+
+Deliverables:
+
+- plugin health checks
+- retries
+- run recovery
+- task broker provider
+- fallback adapters
+- OpenTelemetry
+- backup/restore
+- namespace scaling
+- plugin isolation
+
+Success:
+
+Relux can support real multi-agent workloads.
+
+---
+
+## 16. First Demo Target
+
+The first demo should be small but complete.
+
+Example:
+
+```text
+User: Prime, create a task to inspect this repo and summarize the README.
+
+Prime:
+  - classifies the message as task creation
+  - creates a task
+  - starts a run using a local adapter
+  - calls a filesystem/read tool through a ToolSet plugin
+  - summarizes the README
+  - writes run events
+  - writes audit events
+  - marks the task completed
+  - reports back in chat
+
+Dashboard:
+  - shows the task on the board
+  - shows the active/completed run
+  - shows transcript/tool call
+  - shows audit log
+```
+
+This demo is better than a big half-working product.
+
+---
+
+## 17. Hard Product Requirements
+
+These are non-negotiable.
+
+### 17.1 Prime Must Be Smart And Grounded
+
+Prime should feel like Codex with access to Relux actions.
+
+Prime must understand conversational intent.
+
+Prime must not blindly turn every message into a plan.
+
+### 17.2 The Board Must Stay
+
+The task/issue board is a core part of the product.
+
+The user specifically likes the issue board concept.
+
+### 17.3 Active Runs Must Stay
+
+Active runs are core.
+
+The user specifically likes seeing different runs and run states.
+
+### 17.4 Everything Important Must Become Pluginable
+
+Adapters, tools, storage, memory, execution, and integrations should all be
+plugin-powered over time.
+
+### 17.5 Permissions Must Be Central
+
+Agents and Prime must not have universal access by default.
+
+### 17.6 Dashboard Must Feel Like A Product
+
+No placeholder HTML dashboard.
+
+No random old control panel feeling.
+
+### 17.7 Company Must Be Optional
+
+Relux can be an AI company, but it is not only an AI company.
+
+Company is a template, not the entire identity.
+
+### 17.8 Do Not Lose The Existing Good Work
+
+Old Relix work around runs, adapters, audit, approvals, and dashboard should be
+salvaged where useful.
+
+---
+
+## 18. What Future AI Agents Must Not Do
+
+Do not:
+
+- build random features without reading this document
+- treat Relux as only a plugin marketplace
+- treat Relux as only an AI company
+- remove the board/active runs concept
+- make Prime a dumb endpoint wrapper
+- let Prime create plans from greetings
+- bypass permissions for convenience
+- hardcode one model provider
+- hardcode one database as the only future path
+- start with marketplace complexity before the first run loop
+- delete existing systems just because names are changing
+- push key-shaped literals or secrets
+- enable GitHub Actions unless explicitly needed
+- leave GitHub Actions enabled after using them
+- create branches unless the user explicitly asks
+
+The user prefers direct work on `main` in this repo unless explicitly stated
+otherwise.
+
+---
+
+## 19. How To Work In This Repository
+
+Active workspace:
+
+```text
+D:\DATA\WORK\OpenPrem\Apps\Relix-Revised
+```
+
+Product name:
+
+```text
+Relux
+```
+
+Remote:
+
+```text
+https://github.com/itsramananshul/Relux
+```
+
+General working rules:
+
+1. Read this document first.
+2. Check git status before edits.
+3. Do not overwrite unrelated user/Claude changes.
+4. Work on `main` unless explicitly told otherwise.
+5. Keep changes scoped.
+6. Commit and push meaningful completed slices.
+7. Do not enable workflows unless truly needed.
+8. Disable workflows again after using them.
+9. Avoid secret-shaped literals even in tests.
+10. Prefer product-loop work over abstract infrastructure.
+
+---
+
+## 20. Immediate Next Work
+
+The next work should not be random implementation.
+
+The next work should be a focused reconciliation and first-loop build.
+
+### 20.1 Documentation Reconciliation
+
+Tasks:
+
+- Rename product-facing docs from Relix to Relux where appropriate.
+- Mark old company-only docs as legacy/inspiration unless still canonical.
+- Update `docs/Relux spec.md` to say Relux, not Relix.
+- Add a short `docs/README.md` or index that points to this master plan.
+
+### 20.2 Codebase Reconciliation
+
+Tasks:
+
+- Identify current legacy Relix modules that map to new Relux concepts.
+- Keep useful run/adapter/audit/dashboard code.
+- Decide which internal names can stay temporarily.
+- Avoid giant rename-only commits unless they unblock product clarity.
+
+### 20.3 Kernel MVP
+
+Tasks:
+
+- define plugin manifest format
+- define plugin registry/local index
+- define Adapter, ToolSet, ServiceProvider, ExecutionEnvironment contracts
+- define permission strings
+- define audit event schema
+- wire SQLite provider or adapt existing storage
+
+### 20.4 Prime MVP
+
+Tasks:
+
+- Prime chat endpoint
+- intent classification
+- grounded state summary
+- create task action
+- start run action
+- explain run/task status
+
+### 20.5 First Tool Loop
+
+Tasks:
+
+- one local ToolSet plugin
+- one adapter path
+- permission check
+- run event transcript
+- audit log
+- dashboard visibility
+
+---
+
+## 21. Final Product Feeling
+
+Relux should feel like this:
+
+```text
+I open Relux.
+Prime is there.
+Prime knows what is happening.
+I can talk naturally.
+Prime can act.
+Prime can create work.
+Prime can spawn agents.
+Agents can run tasks.
+Every action goes through plugins.
+Every plugin is permissioned.
+Every run is visible.
+Every risky action asks approval.
+Every important event is audited.
+The board shows the work.
+Active runs show the motion.
+Task detail shows the truth.
+```
+
+That is the product.
+
+Not just an AI company.
+Not just a plugin manager.
+Not just a chatbot.
+
+Relux is the Codex-like Prime control plane for agentic systems.
