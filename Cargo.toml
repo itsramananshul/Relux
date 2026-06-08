@@ -1,0 +1,193 @@
+[workspace]
+resolver = "2"
+# examples/plugins/web-lookup is intentionally NOT a workspace
+# member — it has its own [workspace] block in its Cargo.toml so
+# the Docker build context (which copies only `crates/`) can load
+# the main workspace cleanly without needing the examples tree.
+# See `examples/plugins/web-lookup/Cargo.toml`.
+members = [
+    "crates/relix-core",
+    "crates/relix-runtime",
+    "crates/relix-controller",
+    "crates/relix-cli",
+    "crates/relix-flow-inspect",
+    "crates/relix-web-bridge",
+    "crates/relix-telegram",
+    "crates/relix-discord",
+    "crates/relix-slack",
+    "crates/relix-plugin-sdk",
+    "crates/relix-sdk",
+    "crates/relix-embedded",
+]
+# Stop Cargo from auto-discovering examples/ as workspace members
+# now that web-lookup is out of the list. Otherwise the resolver
+# would try to load examples/plugins/web-lookup as a member and
+# the standalone-workspace block would conflict.
+exclude = ["examples"]
+
+# Shared metadata applied to every crate via `package.workspace = true`.
+[workspace.package]
+edition = "2024"
+rust-version = "1.95"
+# Single source of truth for the build version. Every crate sets
+# `version.workspace = true`, so `env!("CARGO_PKG_VERSION")` — used by the
+# setup banner, `relix --version`, the bridge /v1/info, the MCP client
+# info, and the Discord/Slack user-agents — reports this. Keep it in lock
+# step with the release tag so no binary ever reports a stale version.
+version = "0.4.3-beta.1"
+license = "MIT OR Apache-2.0"
+publish = false
+repository = "https://github.com/itsramananshul/Relix"
+authors = ["Anshul Raman <ramanal@mail.uc.edu>"]
+
+# Pinned dependency versions. Per CONTRIBUTING.md, security-critical bumps require review.
+# See docs/security-critical-deps.md for rationale per crate.
+[workspace.dependencies]
+
+# Internal crates — version pinned so cargo-deny does not treat them as wildcards.
+relix-core        = { path = "crates/relix-core",        version = "0.4.3-beta.1" }
+relix-runtime     = { path = "crates/relix-runtime",     version = "0.4.3-beta.1" }
+relix-web-bridge  = { path = "crates/relix-web-bridge",  version = "0.4.3-beta.1" }
+# Channel crates — declared at the workspace level so binaries and the
+# bridge can opt in to one with `<crate>.workspace = true`.
+relix-telegram    = { path = "crates/relix-telegram",    version = "0.4.3-beta.1" }
+relix-discord     = { path = "crates/relix-discord",     version = "0.4.3-beta.1" }
+relix-slack       = { path = "crates/relix-slack",       version = "0.4.3-beta.1" }
+# Cryptography
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "rand_core", "zeroize"] }
+blake3        = { version = "1.5", default-features = false, features = ["std"] }
+sha2          = { version = "0.10", default-features = false }
+rand          = "0.8"
+zeroize       = { version = "1.8", default-features = false }
+# RELIX-7.30 PART 2 + 3 — symmetric-key encryption for the
+# credential store and HMAC-SHA256 for the session-identity
+# token signature.
+aes-gcm       = { version = "0.10", default-features = false, features = ["std", "aes"] }
+hmac          = { version = "0.12", default-features = false, features = ["std"] }
+# Argon2id KDF for the credential vault master key. Replaces
+# the pre-fix plain-SHA-256 derivation: salt + memory cost +
+# time cost + parallelism make a stolen vault file
+# computationally infeasible to brute-force offline.
+argon2        = { version = "0.5", default-features = false, features = ["std", "alloc", "password-hash"] }
+# Constant-time comparison primitives for token signature
+# verification. Pinned to the 2.x line — the constant-time
+# guarantee is the only thing we rely on.
+subtle        = { version = "2.6", default-features = false }
+
+# Archive handling for `relix update` self-replace
+tar    = { version = "0.4", default-features = false }
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
+
+# Serialization
+serde      = { version = "1.0", features = ["derive"] }
+serde_bytes = "0.11"
+serde_json = "1.0"
+ciborium   = "0.2"
+toml       = "0.8"
+saphyr = "0.0.6"
+hex        = "0.4"
+
+# Interactive CLI (used by `relix setup` wizard).
+crossterm = "0.28"
+
+# Errors
+thiserror = "1.0"
+
+# Time
+time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+
+# Storage
+rusqlite = { version = "0.34", features = ["bundled", "blob", "functions"] }
+
+# CORR PART 4: bounded LRU cache used by the per-tenant policy
+# resolver (max 1000 entries), the embedded chat HistoryStore (max
+# 10000 sessions), and the metrics-collector hint cache (PART 5).
+# Pinned to 0.16 because 0.12-0.15 carry RUSTSEC-2026-0002 (IterMut
+# soundness) — the advisory is hard-gated by PART 2.
+lru = "0.16"
+
+# Async runtime + transport
+tokio = { version = "1.40", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# libp2p (matched to OpenPrem INFRA reuse)
+libp2p = { version = "0.54", features = ["tokio", "cbor", "dns", "kad", "noise", "macros", "request-response", "tcp", "yamux"] }
+# Streaming substream protocol on top of the same libp2p
+# transport. Provides Behaviour + Control + IncomingStreams
+# for arbitrary stream-oriented protocols. The `0.4.0-alpha`
+# version label is libp2p's convention for crates that have
+# not yet promoted to 1.0; libp2p-swarm 0.47 (which libp2p
+# 0.54 depends on) is the matching baseline so the two crates
+# share a compatible swarm ABI.
+libp2p-stream = "=0.2.0-alpha"
+# Compat shim for bridging tokio AsyncRead/Write to the
+# futures AsyncRead/Write the libp2p Stream surface expects.
+# Needed in the transport::stream framing-helper tests.
+tokio-util = { version = "0.7", features = ["compat"] }
+
+# HTTP (AI node + web bridge + tool node)
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "multipart"] }
+axum    = { version = "0.7", features = ["macros", "ws"] }
+tower   = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
+hyper   = "1.4"
+bytes   = "1.7"
+
+# Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Testing
+proptest = "1.5"
+tempfile = "3.13"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# SSE / streaming helpers (bridge)
+async-stream = "0.3"
+
+# Unified-diff parse + apply for tool.patch. Tiny crate, no transitive
+# deps beyond std and nu-ansi-term (optional, default-off).
+diffy = { version = "0.4", default-features = false }
+
+# PDF parsing for tool.pdf. lopdf is pure-Rust and gives us page-count
+# + metadata + raw text streams; we extract text from those directly so
+# we don't have to drag in pdf-extract's freetype binding.
+lopdf = { version = "0.32", default-features = false, features = ["pom_parser"] }
+
+# base64 decode for binary tool inputs that have to travel over the
+# UTF-8 wire (SIMP-016). Currently only tool.pdf; if more binary tools
+# appear we can add a generic transport-layer encoding at Gate 2.
+base64 = "0.22"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.dev]
+opt-level = 0
+
+# relix-cli has a deeply-nested clap command tree (subcommand →
+# CronCmd / DelegateCmd / AgentCmd variants). At opt-level=0 the
+# generated parser blows the default Windows 1 MB stack. Bumping
+# to opt-level=1 lets the compiler collapse the per-variant
+# trampolines.
+[profile.dev.package."relix-cli"]
+opt-level = 1
+
+# Reduce libp2p compile time in dev
+[profile.dev.package."libp2p"]
+opt-level = 1
+[profile.dev.package."libp2p-core"]
+opt-level = 1
+[profile.dev.package."libp2p-swarm"]
+opt-level = 1
+[profile.dev.package."libp2p-tcp"]
+opt-level = 1
+[profile.dev.package."libp2p-yamux"]
+opt-level = 1
+[profile.dev.package."libp2p-noise"]
+opt-level = 1

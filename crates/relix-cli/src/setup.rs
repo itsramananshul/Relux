@@ -1,0 +1,1396 @@
+//! `relix setup` — guided interactive wizard. Also reachable as
+//! `relix reconfigure` (same flow, alias-only).
+//!
+//! Six pages: welcome → provider → API key → channels →
+//! confidence → confirm. Each page after the welcome supports
+//! left-arrow / `b` back navigation; the prior page re-renders
+//! with the user's last selection pre-filled so going back never
+//! costs the user any input they'd already given.
+//!
+//! When `~/.relix/config.toml` already exists the wizard loads it
+//! and pre-fills every field — provider selection, masked current
+//! API key (Enter to keep, type to replace), channel toggles,
+//! per-channel secrets — so an operator who just wants to flip
+//! one switch doesn't have to re-enter the rest.
+//!
+//! crossterm-driven raw input so the same flow works under Windows
+//! Terminal, PowerShell, macOS Terminal, GNOME Terminal, and any
+//! curl|bash piped invocation that still has `/dev/tty`. Ctrl-C at
+//! any page exits 130 with the terminal restored — every render
+//! path runs inside a RAII guard that disables raw mode on drop.
+
+use std::io::{self, IsTerminal, Write};
+
+use crossterm::{
+    cursor,
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    execute, queue,
+    style::{Color, Print, ResetColor, SetForegroundColor},
+    terminal::{self, Clear, ClearType},
+};
+
+use crate::config::{
+    ApprovalsBlock, ChannelsConfig, ConfidenceBlock, CredentialsBlock, MeshConfig, ProviderConfig,
+    RelixConfig, mask_api_key,
+};
+
+/// Top-level entry from `main.rs` for both `relix setup` and
+/// `relix reconfigure`.
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Load the existing config before we touch the terminal so we can
+    // pre-fill the wizard. A missing file is the install-time case
+    // and is fine; a real I/O / parse error is also non-fatal here —
+    // we just start from defaults and the operator overwrites
+    // whatever was broken.
+    let prior = RelixConfig::load_default().ok().flatten();
+
+    // Pre-flight: surface dependencies and let the operator choose
+    // WITH / WITHOUT memory (Qdrant via Docker) BEFORE we enter raw
+    // mode. This never hangs — a Docker-down "with memory" choice ends
+    // cleanly here with actionable re-run instructions.
+    let dep_statuses = match crate::install::status_for_setup().await {
+        crate::install::SetupPreflight::ExitStartDocker => {
+            // status_for_setup already printed the "Docker is not
+            // running…" message. Exit cleanly so the operator can start
+            // Docker and re-run setup.
+            return Ok(());
+        }
+        crate::install::SetupPreflight::Continue(statuses) => statuses,
+    };
+
+    // The interactive wizard uses crossterm raw-mode key reads. When
+    // stdin is NOT an interactive terminal — e.g. setup launched from a
+    // piped `curl | sh` / `irm | iex` installer, or run under a
+    // redirect — `event::read()` blocks forever (the reported
+    // post-banner "freeze"). Guard it: in a non-interactive shell, skip
+    // the wizard, persist a config (prior values, or defaults), and
+    // exit cleanly with instructions instead of hanging.
+    if !io::stdin().is_terminal() {
+        let cfg = prior.clone().unwrap_or_default();
+        let path = RelixConfig::default_path();
+        cfg.save_to(&path)?;
+        println!();
+        println!(
+            "Non-interactive shell — wrote {} ({}).",
+            path.display(),
+            if prior.is_some() {
+                "kept your existing settings"
+            } else {
+                "defaults: provider = mock, channels off"
+            }
+        );
+        println!(
+            "Run `relix setup` directly in a terminal to choose your provider, API key, and channels."
+        );
+        return Ok(());
+    }
+
+    let _raw = RawGuard::new()?;
+    let final_cfg = run_wizard(prior.as_ref())?;
+
+    let errs = final_cfg.validate();
+    if !errs.is_empty() {
+        leave_raw()?;
+        eprintln!("Configuration invalid:");
+        for e in &errs {
+            eprintln!("  - {e}");
+        }
+        return Err("invalid setup state".into());
+    }
+
+    let path = RelixConfig::default_path();
+    final_cfg.save_to(&path)?;
+
+    leave_raw()?;
+    let verb = if prior.is_some() { "Updated" } else { "Saved" };
+    println!();
+    println!("{verb} configuration at {}", path.display());
+
+    // Surface the credential-vault master key ONCE so the operator can
+    // save it. It is stored in config.toml for `relix boot` to forward,
+    // but we echo it here (like the bridge setup token) because it is a
+    // user secret and is never a hardcoded default.
+    if final_cfg.credentials.enabled && !final_cfg.credentials.master_key.is_empty() {
+        println!();
+        println!(
+            "Credential vault ENABLED. Master key (save this — required to decrypt the vault):"
+        );
+        println!("    {}", final_cfg.credentials.master_key);
+        println!(
+            "  Stored in {} and forwarded to the coordinator on `relix boot`.",
+            path.display()
+        );
+    }
+    if final_cfg.approvals.enabled {
+        println!();
+        println!(
+            "Approvals ENABLED (delivery channel: {}).",
+            final_cfg.approvals.channel
+        );
+    }
+
+    // Echo the dependency snapshot we captured before the
+    // wizard, so the closing screen reminds the operator of
+    // anything still missing. Operators who declined the
+    // pre-flight install or whose auto-install failed see
+    // exactly which dep(s) they still need to handle.
+    let missing: Vec<&crate::install::DependencyStatus> =
+        dep_statuses.iter().filter(|s| !s.found).collect();
+    if !missing.is_empty() {
+        println!();
+        println!("Outstanding dependencies — install before `relix boot`:");
+        for m in &missing {
+            println!(
+                "  [MISSING] {:<14}{}",
+                m.dependency.label(),
+                crate::install::manual_url(m.dependency)
+            );
+        }
+    }
+
+    print_first_run_checklist(&final_cfg, &missing);
+    println!();
+    Ok(())
+}
+
+// ---- page state machine --------------------------------------------------
+
+/// What a page returns to the run loop.
+enum PageResult<T> {
+    Next(T),
+    Back,
+}
+
+#[derive(Copy, Clone)]
+enum Page {
+    Welcome,
+    Provider,
+    ApiKey,
+    Channels,
+    /// RELIX-7.19 GAP 4: per-step confidence scoring + fallback
+    /// toggle. The page asks operators whether to enable the
+    /// `ConfidenceScorer` + `FallbackEngine` wiring; the
+    /// rolling-window depth + per-cap policies stay
+    /// edit-the-toml-yourself.
+    Confidence,
+    /// Opt-in credential vault + approval delivery. Both are off by
+    /// default; the credential vault generates a strong master key when
+    /// enabled without one (surfaced at the end to save).
+    Subsystems,
+    Confirm,
+}
+
+/// Mutable state threaded across pages so back-navigation always
+/// re-renders the prior page with the operator's last confirmed
+/// selection still in place.
+struct WizardState {
+    /// Index into `PROVIDER_CHOICES` — drives the provider page's
+    /// pre-selected row.
+    provider_idx: usize,
+    /// The current API key. Starts as the prior key on a reconfigure
+    /// (so "Enter to keep" works), or empty on a fresh install.
+    api_key: String,
+    /// Selected AI model id. Carried through unchanged until the model
+    /// page lands (RELA-45 frontend follow-up); preserving it here
+    /// keeps a dashboard-set or hand-edited model from being wiped on
+    /// a wizard re-run. Empty means "use the provider default".
+    model: String,
+    /// Per-channel toggles for the multi-select page.
+    channels_sel: [bool; 3],
+    /// Full channels block including tokens — kept across toggles so
+    /// disabling and re-enabling a channel doesn't drop the operator's
+    /// existing token.
+    channels: ChannelsConfig,
+    /// Mesh block carried straight through from the prior config (or
+    /// defaults) — the wizard doesn't expose these knobs.
+    mesh: MeshConfig,
+    /// Coordinator block (retention, ...) carried straight through —
+    /// the wizard doesn't expose these knobs either; preserving the
+    /// prior value lets operators edit `~/.relix/config.toml` by
+    /// hand and have the wizard not clobber their work.
+    coordinator: crate::config::CoordinatorBlock,
+    /// RELIX-7.19 GAP 4: confidence scoring + fallback block.
+    /// Carried through unchanged unless the wizard's
+    /// confidence page flips it. The wizard's UI only exposes
+    /// the `enabled` switch; the rolling-window depth +
+    /// per-cap policies stay edit-the-toml-yourself.
+    confidence: crate::config::ConfidenceBlock,
+    /// Opt-in credential vault. The wizard exposes the on/off switch
+    /// and generates a strong master key when the operator enables it
+    /// without one already saved (surfaced at the end to save).
+    credentials: CredentialsBlock,
+    /// Opt-in approval delivery. The wizard exposes the on/off switch;
+    /// the channel defaults to the in-process dashboard.
+    approvals: ApprovalsBlock,
+    /// True when we were initialised from an existing `config.toml`.
+    /// Drives diff hints on the confirm page and the "Updated" /
+    /// "Saved" verb at the end.
+    is_reconfigure: bool,
+    /// Snapshot of the prior config, only set on a reconfigure. Used
+    /// to diff the confirm page.
+    prior: Option<RelixConfig>,
+}
+
+impl WizardState {
+    fn from_prior(prior: Option<&RelixConfig>) -> Self {
+        let p = prior.cloned().unwrap_or_default();
+        let provider_idx = PROVIDER_CHOICES
+            .iter()
+            .position(|(slug, _)| *slug == p.provider.name.as_str())
+            .unwrap_or(0);
+        Self {
+            provider_idx,
+            api_key: p.provider.api_key.clone(),
+            model: p.provider.model.clone(),
+            channels_sel: [p.channels.telegram, p.channels.discord, p.channels.slack],
+            channels: p.channels.clone(),
+            mesh: p.mesh.clone(),
+            coordinator: p.coordinator.clone(),
+            confidence: p.confidence.clone(),
+            credentials: p.credentials.clone(),
+            approvals: p.approvals.clone(),
+            is_reconfigure: prior.is_some(),
+            prior: prior.cloned(),
+        }
+    }
+
+    fn provider_name(&self) -> &'static str {
+        PROVIDER_CHOICES[self.provider_idx].0
+    }
+
+    fn needs_key(&self) -> bool {
+        !matches!(self.provider_name(), "mock" | "local")
+    }
+
+    fn to_config(&self) -> RelixConfig {
+        let mut ch = self.channels.clone();
+        ch.telegram = self.channels_sel[0];
+        ch.discord = self.channels_sel[1];
+        ch.slack = self.channels_sel[2];
+        RelixConfig {
+            provider: ProviderConfig {
+                name: self.provider_name().to_string(),
+                api_key: self.api_key.clone(),
+                model: self.model.clone(),
+            },
+            channels: ch,
+            mesh: self.mesh.clone(),
+            coordinator: self.coordinator.clone(),
+            confidence: self.confidence.clone(),
+            credentials: self.credentials.clone(),
+            approvals: self.approvals.clone(),
+        }
+    }
+}
+
+fn run_wizard(prior: Option<&RelixConfig>) -> io::Result<RelixConfig> {
+    let mut state = WizardState::from_prior(prior);
+    let mut page = Page::Welcome;
+
+    loop {
+        match page {
+            Page::Welcome => match welcome()? {
+                PageResult::Next(()) => page = Page::Provider,
+                PageResult::Back => { /* welcome has no back; stay */ }
+            },
+            Page::Provider => match pick_provider(state.provider_idx)? {
+                PageResult::Next(idx) => {
+                    state.provider_idx = idx;
+                    page = if state.needs_key() {
+                        Page::ApiKey
+                    } else {
+                        Page::Channels
+                    };
+                }
+                PageResult::Back => page = Page::Welcome,
+            },
+            Page::ApiKey => match prompt_api_key(state.provider_name(), &state.api_key)? {
+                PageResult::Next(key) => {
+                    state.api_key = key;
+                    page = Page::Channels;
+                }
+                PageResult::Back => page = Page::Provider,
+            },
+            Page::Channels => match run_channels_stage(&mut state)? {
+                PageResult::Next(()) => page = Page::Confidence,
+                PageResult::Back => {
+                    page = if state.needs_key() {
+                        Page::ApiKey
+                    } else {
+                        Page::Provider
+                    };
+                }
+            },
+            Page::Confidence => match pick_confidence(state.confidence.clone())? {
+                PageResult::Next(updated) => {
+                    state.confidence = updated;
+                    page = Page::Subsystems;
+                }
+                PageResult::Back => page = Page::Channels,
+            },
+            Page::Subsystems => {
+                match pick_subsystems(state.credentials.clone(), state.approvals.clone())? {
+                    PageResult::Next((creds, approvals)) => {
+                        state.credentials = creds;
+                        state.approvals = approvals;
+                        page = Page::Confirm;
+                    }
+                    PageResult::Back => page = Page::Confidence,
+                }
+            }
+            Page::Confirm => match confirm(&state)? {
+                PageResult::Next(()) => break,
+                PageResult::Back => page = Page::Subsystems,
+            },
+        }
+    }
+
+    Ok(state.to_config())
+}
+
+// ---- pages ---------------------------------------------------------------
+
+fn welcome() -> io::Result<PageResult<()>> {
+    let mut out = io::stdout();
+    clear_screen(&mut out)?;
+    // Build the centred version line into the boxed panel.
+    let version_line = pad_box_line(&format!("Exchange  v{}", env!("CARGO_PKG_VERSION")));
+    let action_line = pad_box_line("starting guided setup…");
+    let lines: [&str; 9] = [
+        "╔══════════════════════════════════════════╗",
+        "║      RELIX — Relay Intelligence          ║",
+        version_line.as_str(),
+        "║                                          ║",
+        "║         The OS for AI Agents             ║",
+        "║                                          ║",
+        action_line.as_str(),
+        "║      (Ctrl-C anytime to cancel)          ║",
+        "╚══════════════════════════════════════════╝",
+    ];
+    for (i, line) in lines.iter().enumerate() {
+        queue!(out, cursor::MoveTo(2, 2 + i as u16))?;
+        queue!(out, SetForegroundColor(Color::Yellow))?;
+        queue!(out, Print(line))?;
+    }
+    queue!(out, ResetColor)?;
+    out.flush()?;
+    // No blocking "Press Enter to begin" wait. The pre-flight step
+    // already consumed the operator's Enter (cooked-mode memory prompt),
+    // so a second raw-mode key wait here looked like a freeze. Proceed
+    // straight to the first page; the page itself reads keys and Ctrl-C
+    // still cancels there.
+    Ok(PageResult::Next(()))
+}
+
+const PROVIDER_CHOICES: &[(&str, &str)] = &[
+    (
+        "openrouter",
+        "OpenRouter   (recommended — access to all models)",
+    ),
+    ("openai", "OpenAI"),
+    ("anthropic", "Anthropic"),
+    ("xai", "xAI (Grok)"),
+    ("gemini", "Gemini"),
+    (
+        "local",
+        "Local       (Ollama or any OpenAI-compatible endpoint)",
+    ),
+    ("mock", "Mock        (no API key — for testing)"),
+];
+
+fn pick_provider(initial_idx: usize) -> io::Result<PageResult<usize>> {
+    let mut idx = initial_idx.min(PROVIDER_CHOICES.len() - 1);
+    let mut out = io::stdout();
+    loop {
+        clear_screen(&mut out)?;
+        queue!(out, cursor::MoveTo(2, 1))?;
+        queue!(out, SetForegroundColor(Color::Cyan))?;
+        queue!(out, Print("Choose your AI provider"))?;
+        queue!(out, ResetColor)?;
+        queue!(out, cursor::MoveTo(2, 2))?;
+        queue!(out, Print("(arrow keys, Enter to confirm)"))?;
+        for (i, (_, label)) in PROVIDER_CHOICES.iter().enumerate() {
+            queue!(out, cursor::MoveTo(2, 4 + i as u16))?;
+            if i == idx {
+                queue!(out, SetForegroundColor(Color::Yellow))?;
+                queue!(out, Print(format!("> {label}")))?;
+                queue!(out, ResetColor)?;
+            } else {
+                queue!(out, Print(format!("  {label}")))?;
+            }
+        }
+        draw_nav_hint(&mut out, 4 + PROVIDER_CHOICES.len() as u16 + 1)?;
+        out.flush()?;
+
+        match read_key()? {
+            Key::Up => idx = idx.saturating_sub(1),
+            Key::Down if idx + 1 < PROVIDER_CHOICES.len() => idx += 1,
+            Key::Enter => return Ok(PageResult::Next(idx)),
+            Key::Left | Key::Char('b') | Key::Char('B') => return Ok(PageResult::Back),
+            Key::Cancel => cancel("Setup cancelled. Run `relix setup` to configure Relix."),
+            _ => {}
+        }
+    }
+}
+
+fn prompt_api_key(provider: &str, current: &str) -> io::Result<PageResult<String>> {
+    let mut buf = String::new();
+    let mut error: Option<String> = None;
+    let mut out = io::stdout();
+    let have_current = !current.trim().is_empty();
+    loop {
+        clear_screen(&mut out)?;
+        queue!(out, cursor::MoveTo(2, 1))?;
+        queue!(out, SetForegroundColor(Color::Cyan))?;
+        queue!(out, Print(format!("Enter your {provider} API key")))?;
+        queue!(out, ResetColor)?;
+        queue!(out, cursor::MoveTo(2, 2))?;
+        let hint = if have_current {
+            "(Enter to keep current key, or type to replace; ← back)"
+        } else {
+            "(input is hidden; Enter to confirm; ← back)"
+        };
+        queue!(out, Print(hint))?;
+        let input_row: u16 = if have_current {
+            queue!(out, cursor::MoveTo(2, 4))?;
+            queue!(out, Print(format!("Current:  {}", mask_api_key(current))))?;
+            6
+        } else {
+            4
+        };
+        queue!(out, cursor::MoveTo(2, input_row))?;
+        queue!(out, Print(format!("> {}", "•".repeat(buf.chars().count()))))?;
+        if let Some(e) = &error {
+            queue!(out, cursor::MoveTo(2, input_row + 2))?;
+            queue!(out, SetForegroundColor(Color::Red))?;
+            queue!(out, Print(e))?;
+            queue!(out, ResetColor)?;
+        }
+        draw_nav_hint(&mut out, input_row + 4)?;
+        out.flush()?;
+
+        match read_key()? {
+            // Input pages treat every printable character — including
+            // 'b'/'B' — as literal text. API keys regularly contain
+            // both. Back-nav on this page is left-arrow only.
+            Key::Char(c) => {
+                buf.push(c);
+                error = None;
+            }
+            Key::Space => {
+                buf.push(' ');
+                error = None;
+            }
+            Key::Backspace => {
+                buf.pop();
+                error = None;
+            }
+            Key::Enter => {
+                if buf.is_empty() {
+                    if have_current {
+                        return Ok(PageResult::Next(current.to_string()));
+                    }
+                    error = Some(
+                        "API key cannot be empty. Paste your key, or Ctrl-C to cancel.".into(),
+                    );
+                } else {
+                    return Ok(PageResult::Next(buf));
+                }
+            }
+            Key::Left => return Ok(PageResult::Back),
+            Key::Cancel => cancel("Setup cancelled. Run `relix setup` to configure Relix."),
+            _ => {}
+        }
+    }
+}
+
+const CHANNEL_LABELS: &[(&str, &str)] = &[
+    ("telegram", "Telegram"),
+    ("discord", "Discord"),
+    ("slack", "Slack"),
+];
+
+/// Channels stage: multi-select, then per-channel secret follow-ups
+/// for whatever the operator ticked. Treated as a single unit so back
+/// from any sub-prompt lands on the multi-select with toggles intact,
+/// and back from the multi-select itself lands on the prior wizard
+/// page.
+fn run_channels_stage(state: &mut WizardState) -> io::Result<PageResult<()>> {
+    'stage: loop {
+        match pick_channels(state.channels_sel)? {
+            PageResult::Back => return Ok(PageResult::Back),
+            PageResult::Next(sel) => state.channels_sel = sel,
+        }
+
+        // Telegram
+        if state.channels_sel[0] {
+            match prompt_keep_or_replace(
+                "Enter your Telegram bot token",
+                "(get one from @BotFather on Telegram)",
+                &state.channels.telegram_token,
+                /* sensitive */ true,
+            )? {
+                PageResult::Back => continue 'stage,
+                PageResult::Next(v) => state.channels.telegram_token = v,
+            }
+        }
+        // Discord
+        if state.channels_sel[1] {
+            match prompt_keep_or_replace(
+                "Enter your Discord bot token",
+                "(Developer Portal → Application → Bot → Reset Token)",
+                &state.channels.discord_token,
+                true,
+            )? {
+                PageResult::Back => continue 'stage,
+                PageResult::Next(v) => state.channels.discord_token = v,
+            }
+            match prompt_keep_or_replace(
+                "Enter your Discord channel ID",
+                "(right-click the channel → Copy Channel ID; enable Developer Mode if missing)",
+                &state.channels.discord_channel,
+                false,
+            )? {
+                PageResult::Back => continue 'stage,
+                PageResult::Next(v) => state.channels.discord_channel = v,
+            }
+        }
+        // Slack
+        if state.channels_sel[2] {
+            match prompt_keep_or_replace(
+                "Enter your Slack bot token",
+                "(starts with xoxb-...; OAuth & Permissions → Bot User OAuth Token)",
+                &state.channels.slack_token,
+                true,
+            )? {
+                PageResult::Back => continue 'stage,
+                PageResult::Next(v) => state.channels.slack_token = v,
+            }
+            match prompt_keep_or_replace(
+                "Enter your Slack channel ID",
+                "(right-click the channel → View channel details → bottom of the popout)",
+                &state.channels.slack_channel,
+                false,
+            )? {
+                PageResult::Back => continue 'stage,
+                PageResult::Next(v) => state.channels.slack_channel = v,
+            }
+        }
+
+        return Ok(PageResult::Next(()));
+    }
+}
+
+/// RELIX-7.19 GAP 4 wizard page: ask the operator whether to
+/// enable per-step confidence scoring + fallback. Renders the
+/// current state, the documented defaults the operator gets
+/// when it's on, and a single yes/no toggle. Space / arrows
+/// flip it; Enter confirms; Back returns to the channels
+/// page.
+fn pick_confidence(initial: ConfidenceBlock) -> io::Result<PageResult<ConfidenceBlock>> {
+    let mut enabled = initial.enabled;
+    let mut out = io::stdout();
+    loop {
+        clear_screen(&mut out)?;
+        queue!(out, cursor::MoveTo(2, 1))?;
+        queue!(out, SetForegroundColor(Color::Cyan))?;
+        queue!(
+            out,
+            Print("Per-step confidence scoring + fallback (optional)")
+        )?;
+        queue!(out, ResetColor)?;
+
+        queue!(out, cursor::MoveTo(2, 2))?;
+        queue!(out, Print("Space or arrows toggle, Enter to continue"))?;
+
+        queue!(out, cursor::MoveTo(2, 4))?;
+        let mark = if enabled { 'x' } else { ' ' };
+        queue!(out, SetForegroundColor(Color::Yellow))?;
+        queue!(
+            out,
+            Print(format!("> [{mark}] Enable [confidence] in this config"))
+        )?;
+        queue!(out, ResetColor)?;
+
+        queue!(out, cursor::MoveTo(2, 6))?;
+        queue!(out, SetForegroundColor(Color::DarkGrey))?;
+        queue!(out, Print("When enabled, every dispatched capability is"))?;
+        queue!(out, cursor::MoveTo(2, 7))?;
+        queue!(
+            out,
+            Print("scored on a 0.0–1.0 scale and configurable per-cap")
+        )?;
+        queue!(out, cursor::MoveTo(2, 8))?;
+        queue!(
+            out,
+            Print("policies fire fallback actions (retry / escalate /")
+        )?;
+        queue!(out, cursor::MoveTo(2, 9))?;
+        queue!(
+            out,
+            Print("safe_default / alert / abort) on low scores. SOL flows")
+        )?;
+        queue!(out, cursor::MoveTo(2, 10))?;
+        queue!(
+            out,
+            Print("can read the latest score via `last_confidence()`.")
+        )?;
+
+        queue!(out, cursor::MoveTo(2, 12))?;
+        queue!(
+            out,
+            Print(format!(
+                "Defaults: window_size = {}, p95_latency_baseline = {} ms",
+                initial.window_size, initial.p95_latency_baseline_ms
+            ))
+        )?;
+        queue!(out, cursor::MoveTo(2, 13))?;
+        queue!(
+            out,
+            Print("Per-cap policies live under [[confidence.policies]] —")
+        )?;
+        queue!(out, cursor::MoveTo(2, 14))?;
+        queue!(
+            out,
+            Print("edit ~/.relix/config.toml directly to add them.")
+        )?;
+        queue!(out, ResetColor)?;
+
+        draw_nav_hint(&mut out, 16)?;
+        out.flush()?;
+
+        match read_key()? {
+            Key::Up
+            | Key::Down
+            | Key::Space
+            | Key::Char('y')
+            | Key::Char('Y')
+            | Key::Char('n')
+            | Key::Char('N') => {
+                enabled = !enabled;
+            }
+            Key::Enter => {
+                let mut updated = initial.clone();
+                updated.enabled = enabled;
+                return Ok(PageResult::Next(updated));
+            }
+            Key::Left | Key::Char('b') | Key::Char('B') => return Ok(PageResult::Back),
+            Key::Cancel => cancel("Setup cancelled. Run `relix setup` to configure Relix."),
+            _ => {}
+        }
+    }
+}
+
+fn pick_channels(initial: [bool; 3]) -> io::Result<PageResult<[bool; 3]>> {
+    let mut selected = initial;
+    let mut idx: usize = 0;
+    let mut out = io::stdout();
+    loop {
+        clear_screen(&mut out)?;
+        queue!(out, cursor::MoveTo(2, 1))?;
+        queue!(out, SetForegroundColor(Color::Cyan))?;
+        queue!(out, Print("Connect messaging channels (optional)"))?;
+        queue!(out, ResetColor)?;
+        queue!(out, cursor::MoveTo(2, 2))?;
+        queue!(
+            out,
+            Print("Space to toggle, arrow keys to move, Enter to continue")
+        )?;
+        for (i, (_, label)) in CHANNEL_LABELS.iter().enumerate() {
+            queue!(out, cursor::MoveTo(2, 4 + i as u16))?;
+            let mark = if selected[i] { 'x' } else { ' ' };
+            let lead = if i == idx { "> " } else { "  " };
+            if i == idx {
+                queue!(out, SetForegroundColor(Color::Yellow))?;
+                queue!(out, Print(format!("{lead}[{mark}] {label}")))?;
+                queue!(out, ResetColor)?;
+            } else {
+                queue!(out, Print(format!("{lead}[{mark}] {label}")))?;
+            }
+        }
+        queue!(out, cursor::MoveTo(2, 8))?;
+        queue!(
+            out,
+            Print("(leave all unchecked to skip — channels can be added later)")
+        )?;
+        draw_nav_hint(&mut out, 10)?;
+        out.flush()?;
+
+        match read_key()? {
+            Key::Up => idx = idx.saturating_sub(1),
+            Key::Down if idx + 1 < CHANNEL_LABELS.len() => idx += 1,
+            Key::Space => selected[idx] = !selected[idx],
+            Key::Enter => return Ok(PageResult::Next(selected)),
+            Key::Left | Key::Char('b') | Key::Char('B') => return Ok(PageResult::Back),
+            Key::Cancel => cancel("Setup cancelled. Run `relix setup` to configure Relix."),
+            _ => {}
+        }
+    }
+}
+
+/// Single-line secret/value prompt with keep-or-replace semantics
+/// when `current` is non-empty. `sensitive` controls whether the
+/// current value is shown masked (API key / bot token) or in full
+/// (channel ID, which is non-secret and useful to verify visually).
+fn prompt_keep_or_replace(
+    title: &str,
+    hint: &str,
+    current: &str,
+    sensitive: bool,
+) -> io::Result<PageResult<String>> {
+    let mut buf = String::new();
+    let mut error: Option<String> = None;
+    let mut out = io::stdout();
+    let have_current = !current.trim().is_empty();
+    let render_current = if sensitive {
+        mask_api_key(current)
+    } else {
+        current.to_string()
+    };
+    loop {
+        clear_screen(&mut out)?;
+        queue!(out, cursor::MoveTo(2, 1))?;
+        queue!(out, SetForegroundColor(Color::Cyan))?;
+        queue!(out, Print(title))?;
+        queue!(out, ResetColor)?;
+        queue!(out, cursor::MoveTo(2, 2))?;
+        let input_row: u16 = if have_current {
+            queue!(
+                out,
+                Print(format!("{hint}  (Enter to keep current; ← back)"))
+            )?;
+            queue!(out, cursor::MoveTo(2, 4))?;
+            queue!(out, Print(format!("Current:  {render_current}")))?;
+            6
+        } else {
+            queue!(out, Print(format!("{hint}  (← back)")))?;
+            4
+        };
+        queue!(out, cursor::MoveTo(2, input_row))?;
+        let echo = if sensitive {
+            "•".repeat(buf.chars().count())
+        } else {
+            buf.clone()
+        };
+        queue!(out, Print(format!("> {echo}")))?;
+        if let Some(e) = &error {
+            queue!(out, cursor::MoveTo(2, input_row + 2))?;
+            queue!(out, SetForegroundColor(Color::Red))?;
+            queue!(out, Print(e))?;
+            queue!(out, ResetColor)?;
+        }
+        draw_nav_hint(&mut out, input_row + 4)?;
+        out.flush()?;
+
+        match read_key()? {
+            // Input pages treat every printable character — including
+            // 'b'/'B' — as literal text; back-nav is left-arrow only.
+            Key::Char(c) => {
+                buf.push(c);
+                error = None;
+            }
+            Key::Space => {
+                buf.push(' ');
+                error = None;
+            }
+            Key::Backspace => {
+                buf.pop();
+                error = None;
+            }
+            Key::Enter => {
+                if buf.is_empty() {
+                    if have_current {
+                        return Ok(PageResult::Next(current.to_string()));
+                    }
+                    error = Some("Required. Paste the value or Ctrl-C to cancel.".into());
+                } else {
+                    return Ok(PageResult::Next(buf));
+                }
+            }
+            Key::Left => return Ok(PageResult::Back),
+            Key::Cancel => cancel("Setup cancelled. Run `relix setup` to configure Relix."),
+            _ => {}
+        }
+    }
+}
+
+/// Generate a strong random vault master key (32 bytes, hex-encoded).
+/// Never a hardcoded/predictable value.
+fn generate_master_key() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Subsystems page — opt-in credential vault + approval delivery. Two
+/// toggle rows; up/down moves, space toggles, Enter continues. When the
+/// vault is turned on without a saved master key, a strong one is
+/// generated (surfaced at the end so the operator can save it). Turning
+/// the vault off clears the key so it is never persisted unused.
+fn pick_subsystems(
+    initial_creds: CredentialsBlock,
+    initial_approvals: ApprovalsBlock,
+) -> io::Result<PageResult<(CredentialsBlock, ApprovalsBlock)>> {
+    let mut vault_on = initial_creds.enabled;
+    let mut approvals_on = initial_approvals.enabled;
+    let mut master_key = initial_creds.master_key.clone();
+    let mut sel: usize = 0; // 0 = vault, 1 = approvals
+    let mut out = io::stdout();
+    loop {
+        clear_screen(&mut out)?;
+        queue!(out, cursor::MoveTo(2, 1))?;
+        queue!(out, SetForegroundColor(Color::Cyan))?;
+        queue!(out, Print("Optional subsystems"))?;
+        queue!(out, ResetColor)?;
+        queue!(out, cursor::MoveTo(2, 2))?;
+        queue!(
+            out,
+            Print("Up/Down to move, Space to toggle, Enter to continue")
+        )?;
+
+        let vmark = if vault_on { 'x' } else { ' ' };
+        let amark = if approvals_on { 'x' } else { ' ' };
+        let vptr = if sel == 0 { '>' } else { ' ' };
+        let aptr = if sel == 1 { '>' } else { ' ' };
+        queue!(out, cursor::MoveTo(2, 4))?;
+        queue!(out, SetForegroundColor(Color::Yellow))?;
+        queue!(out, Print(format!("{vptr} [{vmark}] Credential vault")))?;
+        queue!(out, cursor::MoveTo(2, 5))?;
+        queue!(out, Print(format!("{aptr} [{amark}] Approvals / delivery")))?;
+        queue!(out, ResetColor)?;
+
+        queue!(out, cursor::MoveTo(2, 7))?;
+        queue!(out, SetForegroundColor(Color::DarkGrey))?;
+        queue!(
+            out,
+            Print("Vault: encrypted store for agent credentials. Needs a")
+        )?;
+        queue!(out, cursor::MoveTo(2, 8))?;
+        queue!(
+            out,
+            Print("master key — generated for you when enabled and shown")
+        )?;
+        queue!(out, cursor::MoveTo(2, 9))?;
+        queue!(
+            out,
+            Print("once at the end to save (never recoverable later).")
+        )?;
+        queue!(out, cursor::MoveTo(2, 10))?;
+        queue!(
+            out,
+            Print("Approvals: in-process dashboard delivery (no secret).")
+        )?;
+        if vault_on && !master_key.is_empty() {
+            queue!(out, cursor::MoveTo(2, 12))?;
+            queue!(out, SetForegroundColor(Color::Green))?;
+            queue!(
+                out,
+                Print("Vault master key generated — shown after you save.")
+            )?;
+            queue!(out, ResetColor)?;
+        }
+        queue!(out, ResetColor)?;
+
+        draw_nav_hint(&mut out, 14)?;
+        out.flush()?;
+
+        match read_key()? {
+            Key::Up | Key::Down => sel = 1 - sel,
+            Key::Space | Key::Char('y') | Key::Char('Y') | Key::Char('n') | Key::Char('N') => {
+                if sel == 0 {
+                    vault_on = !vault_on;
+                    if vault_on {
+                        if master_key.is_empty() {
+                            master_key = generate_master_key();
+                        }
+                    } else {
+                        // Don't persist an unused key.
+                        master_key.clear();
+                    }
+                } else {
+                    approvals_on = !approvals_on;
+                }
+            }
+            Key::Enter => {
+                let creds = CredentialsBlock {
+                    enabled: vault_on,
+                    master_key: if vault_on {
+                        master_key.clone()
+                    } else {
+                        String::new()
+                    },
+                };
+                let approvals = ApprovalsBlock {
+                    enabled: approvals_on,
+                    channel: if initial_approvals.channel.is_empty() {
+                        "dashboard".to_string()
+                    } else {
+                        initial_approvals.channel.clone()
+                    },
+                };
+                return Ok(PageResult::Next((creds, approvals)));
+            }
+            Key::Left | Key::Char('b') | Key::Char('B') => return Ok(PageResult::Back),
+            Key::Cancel => cancel("Setup cancelled. Run `relix setup` to configure Relix."),
+            _ => {}
+        }
+    }
+}
+
+fn confirm(state: &WizardState) -> io::Result<PageResult<()>> {
+    let new_cfg = state.to_config();
+    let mut out = io::stdout();
+    clear_screen(&mut out)?;
+    let mut row = 1u16;
+    queue!(out, cursor::MoveTo(2, row))?;
+    queue!(out, SetForegroundColor(Color::Cyan))?;
+    queue!(
+        out,
+        Print(if state.is_reconfigure {
+            "Ready to save updated configuration"
+        } else {
+            "Ready to save configuration"
+        })
+    )?;
+    queue!(out, ResetColor)?;
+    row += 2;
+
+    let prior = state.prior.as_ref();
+
+    // Provider
+    let provider_changed = prior.is_some_and(|p| p.provider.name != new_cfg.provider.name);
+    queue!(out, cursor::MoveTo(2, row))?;
+    let provider_line = if let (true, Some(p)) = (provider_changed, prior) {
+        format!(
+            "Provider:  {} (was: {})",
+            new_cfg.provider.name, p.provider.name
+        )
+    } else {
+        format!("Provider:  {}", new_cfg.provider.name)
+    };
+    queue!(out, Print(provider_line))?;
+    row += 1;
+
+    // API key
+    if !new_cfg.provider.api_key.is_empty() {
+        let api_changed = prior.is_some_and(|p| p.provider.api_key != new_cfg.provider.api_key);
+        queue!(out, cursor::MoveTo(2, row))?;
+        let suffix = if api_changed { "  (updated)" } else { "" };
+        queue!(
+            out,
+            Print(format!(
+                "API key:   {}{suffix}",
+                mask_api_key(&new_cfg.provider.api_key)
+            ))
+        )?;
+        row += 1;
+    }
+
+    // Channels
+    let mut channel_summary: Vec<&str> = Vec::new();
+    if new_cfg.channels.telegram {
+        channel_summary.push("Telegram");
+    }
+    if new_cfg.channels.discord {
+        channel_summary.push("Discord");
+    }
+    if new_cfg.channels.slack {
+        channel_summary.push("Slack");
+    }
+    let channel_str = if channel_summary.is_empty() {
+        "(none)".to_string()
+    } else {
+        channel_summary.join(", ")
+    };
+    queue!(out, cursor::MoveTo(2, row))?;
+    queue!(out, Print(format!("Channels:  {channel_str}")))?;
+    row += 1;
+    if let Some(p) = prior {
+        let diffs = channel_diff(&p.channels, &new_cfg.channels);
+        if !diffs.is_empty() {
+            queue!(out, cursor::MoveTo(2, row))?;
+            queue!(out, SetForegroundColor(Color::Yellow))?;
+            queue!(out, Print(format!("           ({})", diffs.join(", "))))?;
+            queue!(out, ResetColor)?;
+            row += 1;
+        }
+    }
+
+    // RELIX-7.19 GAP 4: confidence summary + diff line.
+    let confidence_str = if new_cfg.confidence.enabled {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    queue!(out, cursor::MoveTo(2, row))?;
+    queue!(out, Print(format!("Confidence: {confidence_str}")))?;
+    row += 1;
+    if let Some(p) = prior
+        && p.confidence.enabled != new_cfg.confidence.enabled
+    {
+        let verb = if new_cfg.confidence.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        queue!(out, cursor::MoveTo(2, row))?;
+        queue!(out, SetForegroundColor(Color::Yellow))?;
+        queue!(out, Print(format!("           ({verb})")))?;
+        queue!(out, ResetColor)?;
+        row += 1;
+    }
+    row += 1;
+
+    queue!(out, cursor::MoveTo(2, row))?;
+    queue!(out, Print("Press Enter to save, ← back to edit."))?;
+    row += 1;
+    draw_nav_hint(&mut out, row + 1)?;
+    out.flush()?;
+
+    loop {
+        match read_key()? {
+            Key::Enter => return Ok(PageResult::Next(())),
+            Key::Left | Key::Char('b') | Key::Char('B') => return Ok(PageResult::Back),
+            Key::Cancel => cancel("Setup cancelled. Run `relix setup` to configure Relix."),
+            _ => {}
+        }
+    }
+}
+
+fn channel_diff(prior: &ChannelsConfig, now: &ChannelsConfig) -> Vec<String> {
+    let mut out = Vec::new();
+    for (name, was, is_now) in [
+        ("Telegram", prior.telegram, now.telegram),
+        ("Discord", prior.discord, now.discord),
+        ("Slack", prior.slack, now.slack),
+    ] {
+        match (was, is_now) {
+            (false, true) => out.push(format!("added: {name}")),
+            (true, false) => out.push(format!("removed: {name}")),
+            _ => {}
+        }
+    }
+    // Token-only changes on still-enabled channels
+    if prior.telegram && now.telegram && prior.telegram_token != now.telegram_token {
+        out.push("Telegram token updated".to_string());
+    }
+    if prior.discord
+        && now.discord
+        && (prior.discord_token != now.discord_token
+            || prior.discord_channel != now.discord_channel)
+    {
+        out.push("Discord credentials updated".to_string());
+    }
+    if prior.slack
+        && now.slack
+        && (prior.slack_token != now.slack_token || prior.slack_channel != now.slack_channel)
+    {
+        out.push("Slack credentials updated".to_string());
+    }
+    out
+}
+
+fn first_run_checklist(
+    cfg: &RelixConfig,
+    missing_deps: &[&crate::install::DependencyStatus],
+) -> Vec<String> {
+    let dashboard_url = format!("http://127.0.0.1:{}/dashboard", cfg.mesh.bridge_port);
+    let chat_url = format!("http://127.0.0.1:{}/v1/chat", cfg.mesh.bridge_port);
+    let mut out = vec![
+        "Next steps:".to_string(),
+        "  1. Start Relix:        relix boot".to_string(),
+        format!("  2. Open dashboard:     {dashboard_url}"),
+        "  3. Bridge token file:  ~/.relix/bridge-token (created on first boot)".to_string(),
+        format!(
+            "  4. First chat smoke:   curl -H \"Authorization: Bearer $(cat ~/.relix/bridge-token)\" -H \"Content-Type: application/json\" -d '{{\"message\":\"hello Relix\"}}' {chat_url}"
+        ),
+        "  5. Check health:       relix status".to_string(),
+        "  6. Reconfigure later:  relix reconfigure".to_string(),
+        "  7. Stop Relix:         relix stop".to_string(),
+    ];
+    if !missing_deps.is_empty() {
+        out.push("  ! Missing deps:        relix install --fix".to_string());
+    }
+    if cfg.provider.name != "mock" && cfg.provider.api_key.trim().is_empty() {
+        out.push(format!(
+            "  ! Provider key:        set the API key for provider `{}` or rerun `relix setup`",
+            cfg.provider.name
+        ));
+    }
+    if cfg.credentials.enabled && cfg.credentials.master_key.trim().is_empty() {
+        out.push(
+            "  ! Credential vault:    master key missing; rerun `relix setup` before using vault caps"
+                .to_string(),
+        );
+    }
+    out
+}
+
+fn print_first_run_checklist(
+    cfg: &RelixConfig,
+    missing_deps: &[&crate::install::DependencyStatus],
+) {
+    println!();
+    for line in first_run_checklist(cfg, missing_deps) {
+        println!("{line}");
+    }
+}
+
+// ---- key + terminal helpers ---------------------------------------------
+
+enum Key {
+    Char(char),
+    Up,
+    Down,
+    Left,
+    Enter,
+    Backspace,
+    Space,
+    Cancel,
+    Other,
+}
+
+fn read_key() -> io::Result<Key> {
+    loop {
+        match event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press || k.kind == KeyEventKind::Repeat => {
+                if k.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('C'))
+                {
+                    return Ok(Key::Cancel);
+                }
+                return Ok(match k.code {
+                    KeyCode::Up => Key::Up,
+                    KeyCode::Down => Key::Down,
+                    KeyCode::Left => Key::Left,
+                    KeyCode::Enter => Key::Enter,
+                    KeyCode::Backspace => Key::Backspace,
+                    KeyCode::Esc => Key::Cancel,
+                    KeyCode::Char(' ') => Key::Space,
+                    KeyCode::Char(c) => Key::Char(c),
+                    _ => Key::Other,
+                });
+            }
+            _ => continue,
+        }
+    }
+}
+
+fn clear_screen(out: &mut io::Stdout) -> io::Result<()> {
+    execute!(out, Clear(ClearType::All), cursor::MoveTo(0, 0))
+}
+
+fn draw_nav_hint(out: &mut io::Stdout, row: u16) -> io::Result<()> {
+    queue!(out, cursor::MoveTo(2, row))?;
+    queue!(out, SetForegroundColor(Color::DarkGrey))?;
+    queue!(out, Print("(← back  |  Ctrl-C cancel)"))?;
+    queue!(out, ResetColor)?;
+    Ok(())
+}
+
+/// Centre `content` inside the 42-char-wide welcome panel and wrap
+/// with the box-drawing border characters.
+fn pad_box_line(content: &str) -> String {
+    let inner = 42usize;
+    let len = content.chars().count();
+    if len >= inner {
+        return format!("║{content}║");
+    }
+    let total_pad = inner - len;
+    let left = total_pad / 2;
+    let right = total_pad - left;
+    format!("║{}{content}{}║", " ".repeat(left), " ".repeat(right))
+}
+
+fn leave_raw() -> io::Result<()> {
+    let _ = terminal::disable_raw_mode();
+    let mut out = io::stdout();
+    execute!(out, cursor::Show, ResetColor)?;
+    Ok(())
+}
+
+fn cancel(msg: &str) -> ! {
+    let _ = leave_raw();
+    eprintln!();
+    eprintln!("{msg}");
+    std::process::exit(130);
+}
+
+/// RAII guard that flips the terminal into raw mode on construction
+/// and unconditionally restores it on drop — so a panic mid-wizard
+/// doesn't leave the operator's shell in a broken state.
+struct RawGuard;
+
+impl RawGuard {
+    fn new() -> io::Result<Self> {
+        terminal::enable_raw_mode()?;
+        let mut out = io::stdout();
+        execute!(out, cursor::Hide)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawGuard {
+    fn drop(&mut self) {
+        let _ = terminal::disable_raw_mode();
+        let mut out = io::stdout();
+        let _ = execute!(out, cursor::Show, ResetColor);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_from_prior_pre_fills_every_field() {
+        let api_key = ["sk", "test", "1234567890abcdef"].join("-");
+        let mut prior = RelixConfig::default();
+        prior.provider.name = "openai".into();
+        prior.provider.api_key = api_key.clone();
+        prior.channels.telegram = true;
+        prior.channels.telegram_token = "tg-token".into();
+        prior.channels.discord = true;
+        prior.channels.discord_token = "dc-token".into();
+        prior.channels.discord_channel = "12345".into();
+        prior.confidence.enabled = true;
+        prior.confidence.window_size = 250;
+
+        let s = WizardState::from_prior(Some(&prior));
+        assert_eq!(s.provider_idx, 1, "openai is row 1 in PROVIDER_CHOICES");
+        assert_eq!(s.api_key, api_key);
+        assert_eq!(s.channels_sel, [true, true, false]);
+        assert_eq!(s.channels.telegram_token, "tg-token");
+        assert_eq!(s.channels.discord_token, "dc-token");
+        assert_eq!(s.channels.discord_channel, "12345");
+        assert!(s.is_reconfigure);
+        assert!(s.needs_key(), "openai needs a key");
+        // RELIX-7.19 GAP 4: confidence carries through.
+        assert!(s.confidence.enabled);
+        assert_eq!(s.confidence.window_size, 250);
+    }
+
+    #[test]
+    fn state_round_trips_confidence_block_through_to_config() {
+        let mut prior = RelixConfig::default();
+        prior.confidence.enabled = true;
+        prior.confidence.window_size = 75;
+        prior.confidence.p95_latency_baseline_ms = 999;
+        let s = WizardState::from_prior(Some(&prior));
+        let back = s.to_config();
+        assert!(back.confidence.enabled);
+        assert_eq!(back.confidence.window_size, 75);
+        assert_eq!(back.confidence.p95_latency_baseline_ms, 999);
+    }
+
+    #[test]
+    fn state_from_no_prior_uses_defaults() {
+        let s = WizardState::from_prior(None);
+        // Default config is `mock` provider; PROVIDER_CHOICES indexes
+        // mock at row 6.
+        assert_eq!(s.provider_idx, 6);
+        assert!(s.api_key.is_empty());
+        assert_eq!(s.channels_sel, [false; 3]);
+        assert!(!s.is_reconfigure);
+        assert!(!s.needs_key(), "mock skips the API-key page");
+    }
+
+    #[test]
+    fn state_round_trips_back_to_config_through_to_config() {
+        let mut prior = RelixConfig::default();
+        prior.provider.name = "openrouter".into();
+        prior.provider.api_key = "sk-or-abc".into();
+        prior.channels.slack = true;
+        prior.channels.slack_token = "xoxb-...".into();
+        prior.channels.slack_channel = "C123".into();
+        let s = WizardState::from_prior(Some(&prior));
+        let back = s.to_config();
+        assert_eq!(back, prior);
+    }
+
+    #[test]
+    fn channel_diff_flags_added_removed_and_token_changes() {
+        let prior = ChannelsConfig {
+            telegram: true,
+            telegram_token: "old".into(),
+            ..Default::default()
+        };
+        let now = ChannelsConfig {
+            telegram: true,
+            telegram_token: "new".into(),
+            discord: true,
+            discord_token: "x".into(),
+            discord_channel: "c".into(),
+            ..Default::default()
+        };
+
+        let diffs = channel_diff(&prior, &now);
+        assert!(diffs.iter().any(|d| d.contains("added: Discord")));
+        assert!(diffs.iter().any(|d| d.contains("Telegram token updated")));
+    }
+
+    #[test]
+    fn provider_index_unknown_falls_back_to_zero() {
+        let mut prior = RelixConfig::default();
+        prior.provider.name = "made-up-provider".into();
+        let s = WizardState::from_prior(Some(&prior));
+        assert_eq!(s.provider_idx, 0, "unknown provider lands on openrouter");
+    }
+
+    #[test]
+    fn pick_provider_initial_index_clamp_arithmetic() {
+        // `pick_provider` clamps an absurdly-high initial_idx. We
+        // can't drive the interactive loop in a unit test but we
+        // can at least confirm the clamp arithmetic that protects
+        // it from a corrupted on-disk index.
+        let init = 9999usize;
+        let clamped = init.min(PROVIDER_CHOICES.len() - 1);
+        assert_eq!(clamped, PROVIDER_CHOICES.len() - 1);
+    }
+
+    #[test]
+    fn first_run_checklist_uses_configured_bridge_port_and_chat_smoke() {
+        let mut cfg = RelixConfig::default();
+        cfg.mesh.bridge_port = 19999;
+        let lines = first_run_checklist(&cfg, &[]);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("http://127.0.0.1:19999/dashboard"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("http://127.0.0.1:19999/v1/chat"))
+        );
+        assert!(lines.iter().any(|l| l.contains("~/.relix/bridge-token")));
+        assert!(lines.iter().any(|l| l.contains("relix boot")));
+        assert!(!lines.iter().any(|l| l.contains("relix install --fix")));
+    }
+
+    #[test]
+    fn first_run_checklist_flags_missing_dependency_and_provider_key() {
+        let mut cfg = RelixConfig::default();
+        cfg.provider.name = "openai".into();
+        cfg.provider.api_key.clear();
+        let missing = crate::install::DependencyStatus {
+            dependency: crate::install::Dependency::Qdrant,
+            found: false,
+            version: None,
+            detail: "not running".into(),
+        };
+        let lines = first_run_checklist(&cfg, &[&missing]);
+        assert!(lines.iter().any(|l| l.contains("relix install --fix")));
+        assert!(lines.iter().any(|l| l.contains("provider `openai`")));
+    }
+
+    #[test]
+    fn first_run_checklist_flags_missing_vault_master_key() {
+        let mut cfg = RelixConfig::default();
+        cfg.credentials.enabled = true;
+        cfg.credentials.master_key.clear();
+        let lines = first_run_checklist(&cfg, &[]);
+        assert!(lines.iter().any(|l| l.contains("master key missing")));
+    }
+}

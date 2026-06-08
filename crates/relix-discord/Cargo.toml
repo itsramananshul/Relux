@@ -1,0 +1,30 @@
+[package]
+name        = "relix-discord"
+description = "Task-native Discord channel for Relix. Bot API trait + reqwest-backed live client + mock + identity derivation. Mirrors relix-telegram."
+edition.workspace      = true
+rust-version.workspace = true
+version.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[dependencies]
+relix-core.workspace = true
+blake3.workspace     = true
+serde.workspace      = true
+serde_json.workspace = true
+toml.workspace       = true
+thiserror.workspace  = true
+async-trait.workspace = true
+tokio                = { workspace = true, features = ["sync", "macros", "time", "rt", "net"] }
+tracing.workspace    = true
+reqwest.workspace    = true
+# PART 3: Ed25519 verification for Discord's
+# `X-Signature-Ed25519` interaction header.
+ed25519-dalek.workspace = true
+hex.workspace           = true
+
+[dev-dependencies]
+tempfile.workspace = true
+axum.workspace     = true
+tokio              = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net", "sync"] }

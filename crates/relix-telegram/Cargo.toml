@@ -1,0 +1,36 @@
+﻿[package]
+name        = "relix-telegram"
+description = "Task-native Telegram channel node for Relix. Scaffold: config, identity derivation, Bot API trait surface. Live HTTPS implementation lands when credentials are wired."
+edition.workspace      = true
+rust-version.workspace = true
+version.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[dependencies]
+relix-core.workspace = true
+blake3.workspace     = true
+serde.workspace      = true
+serde_json.workspace = true
+toml.workspace       = true
+thiserror.workspace  = true
+async-trait.workspace = true
+tokio                = { workspace = true, features = ["sync", "macros", "time", "rt", "net"] }
+tracing.workspace    = true
+# rusqlite for the optional persistent SessionStore. The
+# in-memory store still works without it (the default in
+# tests). Bundled SQLite — same as the Coordinator — so the
+# crate has no system dependency.
+rusqlite.workspace   = true
+# Live Bot API client (HTTPS, rustls — no openssl).
+reqwest.workspace    = true
+# Jitter on retry backoff so a swarm of bots retrying after a
+# Telegram blip don't synchronise into a thundering herd.
+rand.workspace       = true
+
+[dev-dependencies]
+tempfile.workspace = true
+# Spin a localhost test server for the live-client tests.
+axum.workspace     = true
+tokio              = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net", "sync", "test-util"] }

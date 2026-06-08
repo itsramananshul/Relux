@@ -1,0 +1,232 @@
+[package]
+name = "relix-runtime"
+description = "Relix runtime: transport (libp2p), SOL VM with RemoteCall, dispatch bridge, capability registry, manifest exchange, node implementations."
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints.rust]
+# Relaxed from `forbid` to `deny` (same rationale as relix-core's
+# CORR-D1) because the Linux plugin sandbox in `plugin::loader`
+# (`Command::pre_exec` + seccomp install + `libc::prctl`) is inherently
+# unsafe FFI. The two call sites carry a scoped `#[allow(unsafe_code)]`
+# with load-bearing `// SAFETY:` comments; every other site in the crate
+# remains denied by default. `forbid` is set on the command line by
+# Cargo's lint table, so it cannot be overridden per-item — `deny` can.
+unsafe_code = "deny"
+
+[dependencies]
+relix-core.workspace = true
+# Telegram channel scaffold + live Bot API client. The
+# `telegram` node_type lives in nodes/telegram/ and reaches
+# into this crate for LiveBotApi, identity derivation, and
+# message types.
+relix-telegram = { path = "../relix-telegram", version = "0.4.3-beta.1" }
+# Discord channel scaffold + live Bot API client. The
+# `discord` node_type lives in nodes/discord/ and reaches
+# into this crate for LiveDiscordApi, identity derivation,
+# and message types.
+relix-discord = { path = "../relix-discord", version = "0.4.3-beta.1" }
+# Slack channel scaffold + live Bot API client. The
+# `slack` node_type lives in nodes/slack/ and reaches
+# into this crate for LiveSlackApi, identity derivation,
+# and message types.
+relix-slack = { path = "../relix-slack", version = "0.4.3-beta.1" }
+
+# Async runtime + transport (libp2p inherited from OpenPrem INFRA reuse)
+tokio.workspace = true
+futures.workspace = true
+async-stream.workspace = true
+async-trait.workspace = true
+libp2p.workspace = true
+libp2p-stream.workspace = true
+
+# Codec / errors / time / serde
+serde.workspace = true
+serde_bytes.workspace = true
+serde_json.workspace = true
+ciborium.workspace = true
+thiserror.workspace = true
+time.workspace = true
+hex.workspace = true
+toml.workspace = true
+saphyr.workspace = true
+rand.workspace = true
+blake3.workspace = true
+ed25519-dalek.workspace = true
+bytes.workspace = true
+
+# Sflow `matches` operator uses regex. Direct dep (not workspace) — only
+# the sflow executor pulls it in, keeping the workspace dep list focused.
+regex = "1"
+
+# SEC PART 7: O(1) capability descriptor lookup. The dispatch
+# bridge's per-request `describe(method)` closure reads a shared
+# `Arc<DashMap<String, CapabilityDescriptor>>` populated at
+# capability-registration time, replacing the pre-fix linear scan
+# over the manifest's capability vector.
+dashmap = "6"
+# PART 5: drop-oldest semantics for the metrics collector's
+# request-id join caches. Replaces the prior clear-all-on-cap
+# behaviour so a single overflow no longer evicts every
+# in-flight hint.
+lru = { workspace = true }
+
+# RELIX-7.7 — production email channel.
+#
+# `lettre` is the production SMTP client (STARTTLS / TLS / plain on
+# 25/465/587, plain + OAuth2 auth, builder for MIME messages with
+# attachments and inline images, connection pooling with the `pool`
+# feature). Uses rustls-tls to match the workspace's reqwest posture
+# and avoid pulling openssl in.
+lettre = { version = "0.11", default-features = false, features = [
+    "builder",
+    "smtp-transport",
+    "pool",
+    "tokio1",
+    "tokio1-rustls-tls",
+    "hostname",
+] }
+# `async-imap` is the production IMAP client — runtime-tokio,
+# supports IDLE for push-style inbox notification with a 60s polling
+# fallback when the server doesn't advertise IDLE.
+async-imap = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
+# `async-native-tls` is async-imap's recommended TLS bridge. Pinned
+# to a version compatible with async-imap 0.11.
+async-native-tls = { version = "0.5", default-features = false, features = ["runtime-tokio"] }
+# `mail-parser` parses inbound MIME into typed parts (text, html,
+# attachments, inline images, headers including In-Reply-To /
+# References for thread detection).
+mail-parser = "0.11"
+# `rsa` + `sha2` + `base64` implement RFC 6376 DKIM-RSA-SHA256
+# signing using simple/relaxed canonicalisation. Optional path —
+# the email node falls back to unsigned delivery when DKIM is not
+# configured or the key cannot be parsed (never fails the send).
+rsa = { version = "0.9", default-features = false, features = ["std", "pem", "sha2"] }
+# `sha2` is also needed by the workspace's other crates; the
+# email DKIM signer uses it for the RSA-SHA256 message digest.
+sha2.workspace = true
+# RELIX-7.30 PART 2: AES-256-GCM authenticated encryption for
+# the credential store. Encrypts each credential value at rest
+# with a 32-byte key derived from the configured master secret.
+aes-gcm.workspace = true
+# SEC PART A: constant-time HMAC compare for the signed
+# ApprovalToken signature verification path AND used by the
+# credential vault Argon2id KDF + the session-identity HMAC.
+hmac.workspace = true
+# SEC PART A: constant-time HMAC compare for the signed
+# ApprovalToken signature verification path.
+subtle.workspace = true
+# SEC: Argon2id KDF for the credential vault master key —
+# replaces the pre-fix plain SHA-256 derivation (no salt, no
+# work factor). vault_metadata stores the random salt + the
+# configured (memory_cost, time_cost, parallelism) so two opens
+# of the same vault deterministically derive the same 32-byte
+# AES key.
+argon2.workspace = true
+# SEC: zero sensitive heap bytes on drop. Wraps the derived
+# AES key, decrypted credential plaintext, HMAC signing keys,
+# and any other private key / API key / secret material so the
+# memory is wiped immediately when its owner is dropped.
+zeroize.workspace = true
+# `async-trait` already in deps above. base64 already in deps above.
+# Globally-unique Message-ID generation.
+uuid = { version = "1", default-features = false, features = ["v4"] }
+
+# Node implementations (memory / ai / tool / web_bridge are modules of this crate)
+rusqlite.workspace = true
+reqwest.workspace = true
+axum.workspace = true
+diffy.workspace = true
+lopdf.workspace = true
+base64.workspace = true
+# SEC §11: the hardened plugin transport replaces plaintext
+# loopback HTTP with TLS on loopback. `tokio-rustls` provides
+# the client connector + server acceptor (re-exporting `rustls`,
+# compiled with the aws-lc-rs provider already in the tree);
+# `rcgen` mints the per-plugin self-signed cert the loader pins.
+# SEC §15 / supply-chain: rcgen uses the `aws_lc_rs` backend (already
+# in the tree via rustls) rather than its default `ring` — rcgen 0.11
+# pulled the unmaintained, unlicensed `ring 0.16` (RUSTSEC-2025-0010).
+# All safe Rust — the crate forbids `unsafe_code`.
+tokio-rustls = "0.26"
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs"] }
+tower.workspace = true
+tower-http.workspace = true
+hyper.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# PH-BROWSER-HC — optional Chrome DevTools Protocol driver.
+# Pulled in only when `--features browser-headless-chrome` is
+# set; default builds do NOT carry this dependency. The crate
+# is blocking (its websocket loop is synchronous) — the
+# backend wraps tab handles in a Mutex and uses
+# `tab.set_default_timeout` for per-call deadlines.
+headless_chrome = { version = "1.0", optional = true }
+
+# PH-BROWSER-WD: WebDriver client (chromedriver / geckodriver).
+# Only compiled in when `browser-webdriver` is enabled. Pinned
+# to fantoccini 0.21.x. Use rustls-tls (not default
+# native-tls) to avoid pulling openssl in — matches reqwest's
+# workspace-level rustls posture.
+fantoccini = { version = "0.21", default-features = false, features = ["rustls-tls"], optional = true }
+
+# PH-TERM-PTY: wezterm's cross-platform pseudoterminal crate.
+# Pulled in only when `--features terminal-pty` is set; default
+# builds do NOT carry this dependency. The crate is blocking
+# (its Child / reader / writer are synchronous), so the PTY
+# backend bridges to tokio via `tokio::task::spawn_blocking`
+# and channels. See `terminal/pty.rs` for the architecture.
+portable-pty = { version = "0.8", optional = true }
+
+# SEC PART 2: plugin-sandbox unix resource limits. `rlimit`
+# is Unix-only (Linux + macOS); on Windows the loader logs a
+# startup warning and skips resource caps. The dependency is
+# Unix-target-conditional so a Windows build does not even
+# attempt to compile it.
+[target.'cfg(unix)'.dependencies]
+rlimit = "0.10"
+
+# SEC PART 2 (Linux only): `libc` for `prctl(PR_SET_NO_NEW_PRIVS, 1)`
+# and `seccompiler` for the syscall allowlist filter applied
+# after the plugin process spawns. Both are gated to Linux so
+# macOS Unix builds carry only the rlimit dependency.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+seccompiler = "0.4"
+
+[features]
+# PH-BROWSER-FEATURES — per-backend opt-in flags. Default
+# build ships the NoneBackend honest scaffold only.
+# Selecting `backend = "<name>"` in `[tool.browser]` requires
+# the corresponding feature; otherwise the tool node fails
+# loudly at startup (no silent fallback to NoneBackend).
+default = []
+browser-headless-chrome = ["dep:headless_chrome"]
+browser-playwright = []
+# PH-BROWSER-WD: pulls in the fantoccini WebDriver client.
+browser-webdriver = ["dep:fantoccini"]
+# Convenience: turn on all three backend features at once.
+browser-all = [
+    "browser-headless-chrome",
+    "browser-playwright",
+    "browser-webdriver",
+]
+# PH-TERM-PTY: opt-in PTY backend for `tool.terminal.*`. When
+# enabled AND `[tool.terminal] pty = true` is set in the
+# controller TOML, terminal.run / spawn / shell.open use a real
+# pseudoterminal via `portable-pty` instead of pipe stdin/stdout.
+# Programs see isatty()=true; ANSI escape sequences may appear
+# in captured output. The default pipe-based path is unchanged.
+terminal-pty = ["dep:portable-pty"]
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+tokio-util.workspace = true

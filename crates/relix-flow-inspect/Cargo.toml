@@ -1,0 +1,38 @@
+[package]
+name = "relix-flow-inspect"
+description = "Read-only inspector for Relix flow event logs and audit logs."
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[[bin]]
+name = "relix-flow-inspect"
+path = "src/main.rs"
+
+[dependencies]
+relix-core.workspace = true
+# PART 7: read the per-tenant audit partition mirror through
+# the same `AuditPartitionStore` the runtime writes with.
+# Keeps the SQL + sanitiser logic in one place instead of
+# reimplementing it in the CLI.
+relix-runtime.workspace = true
+
+clap.workspace = true
+hex.workspace = true
+ed25519-dalek.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+# Zero the signing-key bytes from disk on drop so the raw
+# 32-byte secret material doesn't live in the inspector's heap
+# any longer than the verify call requires.
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

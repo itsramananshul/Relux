@@ -1,0 +1,60 @@
+name: heavy-ci
+
+# On-demand end-to-end check. The required hygiene gates (fmt, clippy,
+# test matrix, cargo deny) now run on every push and PR in ci.yml, so this
+# workflow carries only the heavy multi-process mesh bring-up, which is too
+# slow and port-bound to run on every push.
+#
+# Triggers:
+#   workflow_dispatch           operator runs it before a milestone push.
+#   pull_request labeled heavy  run the end-to-end demo against a PR.
+#
+# See docs/ci-strategy.md.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    # Only run on PRs labeled `heavy` to keep most PRs on the fast ci.yml gate.
+    types: [labeled, opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # Skip the job unless this is workflow_dispatch OR the PR carries `heavy`.
+  filter:
+    name: filter
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - id: decide
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ contains(github.event.pull_request.labels.*.name, 'heavy') }}" == "true" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::heavy-ci skipped (label 'heavy' not present); ci.yml runs the required gates."
+          fi
+
+  integration:
+    name: end-to-end M5 demo
+    needs: filter
+    if: needs.filter.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: heavy-ci
+      - run: bash scripts/alpha-bringup-m5.sh

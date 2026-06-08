@@ -1,0 +1,37 @@
+[package]
+name = "relix-embedded"
+description = "Embed Relix AI agent + four-layer memory in-process with zero external binary dependencies. Wraps the existing relix-runtime memory store + provider trait so an external Rust app gets chat + memory without standing up the full libp2p mesh + web bridge."
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[dependencies]
+# Workspace path deps carry an explicit version pin so cargo-deny
+# (which treats `path = ".."` without a `version` as a wildcard
+# dependency) doesn't flag them as `[wildcard]`. The other workspace
+# members already use the `version = "0.1.0"` pin via the workspace
+# `[workspace.dependencies]` block — these two were missed.
+relix-core = { path = "../relix-core", version = "0.4.3-beta.1" }
+relix-runtime = { path = "../relix-runtime", version = "0.4.3-beta.1" }
+
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+blake3 = { workspace = true }
+futures = { workspace = true }
+# CORR PART 4: bounded session cache for HistoryStore.
+lru = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
