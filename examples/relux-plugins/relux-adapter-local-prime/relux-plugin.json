@@ -1,0 +1,16 @@
+{
+  "id": "relux-adapter-local-prime",
+  "name": "Relux Local Prime Adapter",
+  "version": "0.1.0",
+  "kind": "Adapter",
+  "description": "A local, deterministic Adapter plugin that backs the built-in Prime agent. It performs no real API calls; it drives the in-memory control-plane loop only.",
+  "author": "Relux Labs",
+  "trust_level": "official",
+  "capabilities": {
+    "tools": [],
+    "permissions": [
+      "adapter:relux-adapter-local-prime:run"
+    ]
+  },
+  "health": "unknown"
+}

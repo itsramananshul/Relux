@@ -1,0 +1,18 @@
+[package]
+name = "relux-kernel"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Local, in-memory Relux control-plane kernel - wires relux-core domain types into the first deterministic Prime/task/run/tool loop."
+authors = ["Anshul Raman <ramanal@mail.uc.edu>"]
+
+[[bin]]
+name = "relux-kernel"
+path = "src/main.rs"
+
+[dependencies]
+relux-core = { path = "../relux-core" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"

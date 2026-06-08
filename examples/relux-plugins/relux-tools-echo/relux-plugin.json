@@ -1,0 +1,25 @@
+{
+  "id": "relux-tools-echo",
+  "name": "Relux Echo Tools",
+  "version": "0.1.0",
+  "kind": "ToolSet",
+  "description": "A trivial local ToolSet plugin whose single tool echoes its input back. Used to prove the kernel tool-call loop without any network access.",
+  "author": "Relux Labs",
+  "trust_level": "official",
+  "capabilities": {
+    "tools": [
+      {
+        "name": "echo.say",
+        "description": "Return the provided input unchanged.",
+        "risk": "low",
+        "permission": "tool:relux-tools-echo:say",
+        "approval": "never",
+        "timeout_secs": 5
+      }
+    ],
+    "permissions": [
+      "tool:relux-tools-echo:say"
+    ]
+  },
+  "health": "unknown"
+}

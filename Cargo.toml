@@ -7,6 +7,7 @@ resolver = "2"
 # See `examples/plugins/web-lookup/Cargo.toml`.
 members = [
     "crates/relux-core",
+    "crates/relux-kernel",
     "crates/relix-core",
     "crates/relix-runtime",
     "crates/relix-controller",
