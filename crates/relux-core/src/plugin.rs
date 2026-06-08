@@ -24,8 +24,8 @@ impl std::fmt::Display for PluginId {
 
 /// First-class plugin kinds from the Relux plugin model.
 ///
-/// Spec ref: `docs/RELUX_MASTER_PLAN.md` §8 (Plugin Model) and
-/// `docs/Relux spec.md` §9.3 (Plugin Types).
+/// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 8 (Plugin Model) and
+/// `docs/Relux spec.md` section 9.3 (Plugin Types).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum PluginKind {
@@ -43,7 +43,7 @@ pub enum PluginKind {
 
 /// How much the kernel should trust an installed plugin.
 ///
-/// Spec ref: `docs/RELUX_MASTER_PLAN.md` §8 (Plugin Model).
+/// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 8 (Plugin Model).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TrustLevel {
@@ -55,7 +55,7 @@ pub enum TrustLevel {
 
 /// Runtime health state reported by a plugin.
 ///
-/// Spec ref: `docs/RELUX_MASTER_PLAN.md` §7.4 (Plugin Kernel Layer).
+/// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 7.4 (Plugin Kernel Layer).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginHealth {
@@ -67,7 +67,7 @@ pub enum PluginHealth {
 
 /// Capabilities a plugin declares in its manifest.
 ///
-/// Spec ref: `docs/Relux spec.md` §9.2 (Plugin Manifest).
+/// Spec ref: `docs/Relux spec.md` section 9.2 (Plugin Manifest).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginCapability {
     pub tools: Vec<ToolDefinition>,
@@ -76,7 +76,7 @@ pub struct PluginCapability {
 
 /// The manifest every plugin must provide for kernel registration.
 ///
-/// Spec ref: `docs/RELUX_MASTER_PLAN.md` §8 and `docs/Relux spec.md` §9.2.
+/// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 8 and `docs/Relux spec.md` section 9.2.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginManifest {
     pub id: PluginId,
@@ -118,7 +118,7 @@ pub enum ManifestError {
 ///   but we re-validate the prefix here to catch deserialized manifests)
 /// - every declared `Permission` in `capabilities.permissions` must have a valid prefix
 ///
-/// Spec ref: `docs/RELUX_MASTER_PLAN.md` §8 and `docs/Relux spec.md` §9.2.
+/// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 8 and `docs/Relux spec.md` section 9.2.
 pub fn validate_manifest(manifest: &PluginManifest) -> Result<(), ManifestError> {
     if manifest.id.0.is_empty() {
         return Err(ManifestError::EmptyId);

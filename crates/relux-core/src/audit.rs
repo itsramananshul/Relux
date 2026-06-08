@@ -4,7 +4,7 @@ use crate::namespace::NamespaceId;
 
 /// The outcome of an audited action.
 ///
-/// Spec ref: `docs/RELUX_MASTER_PLAN.md` §9.10 (Audit Event).
+/// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 9.10 (Audit Event).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditResult {
@@ -17,7 +17,7 @@ pub enum AuditResult {
 
 /// An immutable record of an important system action.
 ///
-/// Spec ref: `docs/RELUX_MASTER_PLAN.md` §9.10 (Audit Event).
+/// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 9.10 (Audit Event).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {
     pub id: String,

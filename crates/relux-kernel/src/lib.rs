@@ -19,11 +19,13 @@
 pub mod clock;
 pub mod event;
 pub mod loader;
+pub mod prime;
 pub mod state;
 
 pub use clock::Clock;
 pub use event::RunEvent;
 pub use loader::{load_plugin_manifests, MANIFEST_FILENAME};
+pub use prime::{classify_intent, decide};
 pub use state::KernelState;
 
 use relux_core::ManifestError;
@@ -50,6 +52,8 @@ pub enum KernelError {
     UnknownTask(String),
     #[error("unknown run: {0}")]
     UnknownRun(String),
+    #[error("unknown approval: {0}")]
+    UnknownApproval(String),
     #[error("task {0} has no assigned agent")]
     TaskNotAssigned(String),
     #[error("plugin {plugin} has no tool named {tool}")]

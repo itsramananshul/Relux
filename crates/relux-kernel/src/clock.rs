@@ -44,7 +44,10 @@ mod tests {
         let first_a = a.tick();
         let first_b = b.tick();
         assert_eq!(first_a, "2026-06-08T00:00:00Z");
-        assert_eq!(first_a, first_b, "two fresh clocks must agree tick-for-tick");
+        assert_eq!(
+            first_a, first_b,
+            "two fresh clocks must agree tick-for-tick"
+        );
         assert_eq!(a.tick(), "2026-06-08T00:00:01Z");
     }
 

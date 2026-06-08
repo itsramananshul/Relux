@@ -3,8 +3,8 @@ use thiserror::Error;
 
 /// Valid permission prefixes from the Relux permission model.
 ///
-/// Spec ref: `docs/RELUX_MASTER_PLAN.md` §7.5 (Permission And Approval Layer)
-/// and `docs/Relux spec.md` §12.1 (Permission Philosophy).
+/// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 7.5 (Permission And Approval Layer)
+/// and `docs/Relux spec.md` section 12.1 (Permission Philosophy).
 ///
 /// Format: `<prefix>:<resource>:<action>`
 pub const VALID_PREFIXES: &[&str] = &[
@@ -29,7 +29,7 @@ pub enum PermissionError {
 
 /// A capability string that controls what an actor may do.
 ///
-/// Spec ref: `docs/RELUX_MASTER_PLAN.md` §7.5 and §12.1.
+/// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 7.5 and section 12.1.
 /// Format: `<category>:<resource>:<action>` e.g. `tool:relux-tools-github:create_pr`
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Permission(String);
@@ -65,7 +65,7 @@ impl std::fmt::Display for Permission {
 
 /// How dangerous a tool call or action is considered to be.
 ///
-/// Spec ref: `docs/Relux spec.md` §12.4 (Risk Levels).
+/// Spec ref: `docs/Relux spec.md` section 12.4 (Risk Levels).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RiskLevel {
@@ -77,7 +77,7 @@ pub enum RiskLevel {
 
 /// Whether an action requires a human approval gate before execution.
 ///
-/// Spec ref: `docs/Relux spec.md` §12.5 (Approval Rules).
+/// Spec ref: `docs/Relux spec.md` section 12.5 (Approval Rules).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalRequirement {
@@ -88,8 +88,8 @@ pub enum ApprovalRequirement {
 
 /// A single callable tool exposed by a ToolSet plugin.
 ///
-/// Spec ref: `docs/RELUX_MASTER_PLAN.md` §8.2 (ToolSet Plugins) and
-/// `docs/Relux spec.md` §10.2 (ToolSet Plugin).
+/// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 8.2 (ToolSet Plugins) and
+/// `docs/Relux spec.md` section 10.2 (ToolSet Plugin).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
     pub name: String,

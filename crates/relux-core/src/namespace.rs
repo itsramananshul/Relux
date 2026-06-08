@@ -33,7 +33,7 @@ pub enum NamespaceKind {
 
 /// An isolated resource scope.
 ///
-/// Spec ref: `docs/RELUX_MASTER_PLAN.md` §9.2 (Namespace).
+/// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 9.2 (Namespace).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Namespace {
     pub id: NamespaceId,

@@ -25,7 +25,7 @@ impl std::fmt::Display for TaskId {
 
 /// Lifecycle states for a durable unit of work.
 ///
-/// Spec ref: `docs/RELUX_MASTER_PLAN.md` §9.5 (Task) and §7.9 (Task).
+/// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 9.5 (Task) and section 7.9 (Task).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -44,7 +44,7 @@ pub enum TaskStatus {
 
 /// A durable unit of work.
 ///
-/// Spec ref: `docs/RELUX_MASTER_PLAN.md` §9.5 (Task).
+/// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 9.5 (Task).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: TaskId,

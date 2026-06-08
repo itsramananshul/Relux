@@ -25,7 +25,7 @@ impl std::fmt::Display for RunId {
 
 /// Lifecycle states for one execution attempt of a task.
 ///
-/// Spec ref: `docs/RELUX_MASTER_PLAN.md` §9.6 (Run).
+/// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 9.6 (Run).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
@@ -39,7 +39,7 @@ pub enum RunStatus {
 
 /// One execution attempt for a task.
 ///
-/// Spec ref: `docs/RELUX_MASTER_PLAN.md` §9.6 (Run).
+/// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 9.6 (Run).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Run {
     pub id: RunId,

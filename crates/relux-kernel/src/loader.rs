@@ -72,8 +72,7 @@ mod tests {
     /// from this crate's manifest dir so the test is independent of the working
     /// directory `cargo test` is invoked from.
     fn examples_dir() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/relux-plugins")
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/relux-plugins")
     }
 
     #[test]

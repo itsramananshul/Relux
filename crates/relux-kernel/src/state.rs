@@ -19,12 +19,15 @@ use std::collections::HashMap;
 use relux_core::agent::AgentStatus;
 use relux_core::namespace::NamespaceKind;
 use relux_core::{
-    Agent, AgentId, AuditEvent, AuditResult, Namespace, NamespaceId, Permission, PluginId,
-    PluginManifest, Run, RunId, RunStatus, Task, TaskId, TaskStatus,
+    Agent, AgentId, Approval, ApprovalId, ApprovalStatus, AuditEvent, AuditResult, Namespace,
+    NamespaceId, Permission, PluginId, PluginManifest, PrimeAction, PrimeContext, PrimeDisposition,
+    PrimePlan, PrimeTurn, RiskLevel, Run, RunId, RunStatus, StateSummary, Task, TaskBrief, TaskId,
+    TaskStatus,
 };
 
 use crate::clock::Clock;
 use crate::event::RunEvent;
+use crate::prime::{classify_intent, decide};
 use crate::KernelError;
 
 /// The local, in-memory Relux control plane.
@@ -35,6 +38,7 @@ pub struct KernelState {
     agents: HashMap<AgentId, Agent>,
     tasks: HashMap<TaskId, Task>,
     runs: HashMap<RunId, Run>,
+    approvals: HashMap<ApprovalId, Approval>,
     /// Per-run transcripts, in emission order.
     run_events: Vec<RunEvent>,
     /// The append-only audit log, in emission order.
@@ -43,6 +47,7 @@ pub struct KernelState {
     clock: Clock,
     next_task: u64,
     next_run: u64,
+    next_approval: u64,
     next_audit: u64,
     next_event: u64,
 }
@@ -462,6 +467,353 @@ impl KernelState {
         Ok(())
     }
 
+    // --- Approvals ---------------------------------------------------------
+
+    /// Raise a human approval request for a risky proposed action
+    /// (`docs/RELUX_MASTER_PLAN.md` section 9.9, section 10.3). The request is recorded as
+    /// `Pending` and audited; nothing about the proposed action is performed -
+    /// this is the seam that stops Prime (or an agent) acting silently.
+    pub fn request_approval(
+        &mut self,
+        requested_by: &str,
+        action: &str,
+        reason: &str,
+        risk: RiskLevel,
+        namespace: Option<&NamespaceId>,
+    ) -> ApprovalId {
+        self.next_approval += 1;
+        let id = ApprovalId::new(format!("appr_{:04}", self.next_approval));
+        let created = self.clock.tick();
+        let approval = Approval {
+            id: id.clone(),
+            requested_by: requested_by.to_string(),
+            action: action.to_string(),
+            reason: reason.to_string(),
+            risk: risk.clone(),
+            status: ApprovalStatus::Pending,
+            approved_by: None,
+            namespace_id: namespace.cloned(),
+            created_at: created,
+            resolved_at: None,
+        };
+        self.record_audit(
+            "agent",
+            requested_by,
+            "approval:request",
+            Some("approval"),
+            Some(id.as_str()),
+            namespace,
+            AuditResult::Success,
+            serde_json::json!({ "risk": format!("{:?}", risk), "action": action }),
+        );
+        self.approvals.insert(id.clone(), approval);
+        id
+    }
+
+    /// Record a human's decision on a pending approval
+    /// (`docs/RELUX_MASTER_PLAN.md` section 9.9). This records and audits the
+    /// decision only; re-running the originally proposed action on approval is
+    /// deliberately out of scope for this Prime Core slice (a later slice wires
+    /// deferred-action execution).
+    pub fn resolve_approval(
+        &mut self,
+        id: &ApprovalId,
+        approve: bool,
+        approver: &str,
+    ) -> Result<(), KernelError> {
+        let resolved = self.clock.tick();
+        let namespace = {
+            let approval = self
+                .approvals
+                .get_mut(id)
+                .ok_or_else(|| KernelError::UnknownApproval(id.to_string()))?;
+            approval.status = if approve {
+                ApprovalStatus::Approved
+            } else {
+                ApprovalStatus::Rejected
+            };
+            approval.approved_by = Some(approver.to_string());
+            approval.resolved_at = Some(resolved);
+            approval.namespace_id.clone()
+        };
+        self.record_audit(
+            "user",
+            approver,
+            "approval:resolve",
+            Some("approval"),
+            Some(id.as_str()),
+            namespace.as_ref(),
+            if approve {
+                AuditResult::Approved
+            } else {
+                AuditResult::Rejected
+            },
+            serde_json::Value::Null,
+        );
+        Ok(())
+    }
+
+    pub fn approval(&self, id: &ApprovalId) -> Option<&Approval> {
+        self.approvals.get(id)
+    }
+
+    pub fn pending_approval_count(&self) -> usize {
+        self.approvals
+            .values()
+            .filter(|a| matches!(a.status, ApprovalStatus::Pending))
+            .count()
+    }
+
+    // --- Prime -------------------------------------------------------------
+
+    /// Project the current control plane into the grounded [`StateSummary`] that
+    /// Prime reasons over (`docs/RELUX_MASTER_PLAN.md` section 10.1, section 17.1). This is
+    /// the in-memory stand-in for the context a real LLM Prime would receive.
+    pub fn inspect_state(&self) -> StateSummary {
+        let runs_active = self
+            .runs
+            .values()
+            .filter(|r| matches!(r.status, RunStatus::Running))
+            .count();
+
+        let mut tasks_open = 0usize;
+        let mut waiting = 0usize;
+        let mut blocked = 0usize;
+        let mut failed = 0usize;
+        for t in self.tasks.values() {
+            if !matches!(
+                t.status,
+                TaskStatus::Completed
+                    | TaskStatus::Failed
+                    | TaskStatus::Cancelled
+                    | TaskStatus::Expired
+            ) {
+                tasks_open += 1;
+            }
+            match t.status {
+                TaskStatus::WaitingForApproval => waiting += 1,
+                TaskStatus::Blocked => blocked += 1,
+                TaskStatus::Failed => failed += 1,
+                _ => {}
+            }
+        }
+
+        // Sort by id so `queued` and `recent` are deterministic regardless of the
+        // HashMap's iteration order; ids are zero-padded so lexical == numeric.
+        let mut sorted: Vec<&Task> = self.tasks.values().collect();
+        sorted.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+        let queued: Vec<TaskBrief> = sorted
+            .iter()
+            .filter(|t| matches!(t.status, TaskStatus::Queued))
+            .map(|t| task_brief(t))
+            .collect();
+        let recent: Vec<TaskBrief> = sorted.iter().rev().take(5).map(|t| task_brief(t)).collect();
+
+        StateSummary {
+            plugins: self.plugins.len(),
+            agents: self.agents.len(),
+            tasks_total: self.tasks.len(),
+            tasks_open,
+            runs_active,
+            tasks_waiting_approval: waiting,
+            tasks_blocked: blocked,
+            tasks_failed: failed,
+            pending_approvals: self.pending_approval_count(),
+            queued,
+            recent,
+        }
+    }
+
+    /// Handle one user message as Prime (`docs/RELUX_MASTER_PLAN.md` section 10, section 16).
+    ///
+    /// The flow is: inspect state -> classify intent -> decide a grounded plan ->
+    /// execute it through the kernel. Safe, in-scope actions (create task, start
+    /// the single ready run) run directly; risky actions become an approval
+    /// request and are never performed here; everything else is a grounded reply
+    /// or a clarifying question. Prime routes only through existing kernel
+    /// actions - it never mutates state behind their back (section 7.1, section 10.2).
+    pub fn prime_turn(
+        &mut self,
+        ctx: &PrimeContext,
+        message: &str,
+    ) -> Result<PrimeTurn, KernelError> {
+        let summary = self.inspect_state();
+        let intent = classify_intent(message);
+        let plan = decide(message, &intent, &summary);
+
+        self.record_audit(
+            "agent",
+            ctx.agent.as_str(),
+            "prime:turn",
+            Some("message"),
+            None,
+            Some(&ctx.namespace),
+            AuditResult::Success,
+            serde_json::json!({ "intent": format!("{:?}", intent) }),
+        );
+
+        match plan {
+            PrimePlan::Reply { text } => Ok(PrimeTurn {
+                intent,
+                reply: text,
+                disposition: PrimeDisposition::Answered,
+                action: None,
+                created_task: None,
+                started_run: None,
+                approval: None,
+            }),
+            PrimePlan::Clarify { text } => Ok(PrimeTurn {
+                intent,
+                reply: text,
+                disposition: PrimeDisposition::NeedsClarification,
+                action: None,
+                created_task: None,
+                started_run: None,
+                approval: None,
+            }),
+            PrimePlan::Act { action, text } => self.prime_execute(ctx, intent, action, text),
+            PrimePlan::Propose {
+                action,
+                reason,
+                risk,
+                text,
+            } => {
+                let rendered = describe_action(&action);
+                let approval = self.request_approval(
+                    ctx.agent.as_str(),
+                    &rendered,
+                    &reason,
+                    risk.clone(),
+                    Some(&ctx.namespace),
+                );
+                let reply = format!(
+                    "{text} I will not do this without approval. I have logged {approval} ({risk:?} risk): {reason}"
+                );
+                Ok(PrimeTurn {
+                    intent,
+                    reply,
+                    disposition: PrimeDisposition::AwaitingApproval,
+                    action: Some(action),
+                    created_task: None,
+                    started_run: None,
+                    approval: Some(approval),
+                })
+            }
+        }
+    }
+
+    /// Execute the safe `Act` actions Prime is allowed to perform directly.
+    ///
+    /// `decide` only ever emits `CreateTask` and `StartRun` as `Act`s; any other
+    /// action arriving here is treated as not-yet-wired and surfaced honestly
+    /// rather than silently dropped.
+    fn prime_execute(
+        &mut self,
+        ctx: &PrimeContext,
+        intent: relux_core::PrimeIntent,
+        action: PrimeAction,
+        text: String,
+    ) -> Result<PrimeTurn, KernelError> {
+        match &action {
+            PrimeAction::CreateTask { title } => {
+                let task = self.create_task(
+                    title,
+                    serde_json::json!({ "prime_request": title }),
+                    &ctx.actor,
+                    &ctx.namespace,
+                    vec![],
+                );
+                // Assign to Prime so the work is immediately runnable when the
+                // user says "start it"; assigning to self is within Prime's scope.
+                self.assign_task(&task, &ctx.agent)?;
+                let reply = format!(
+                    "{text} Created {task} and assigned it to {}. Say \"start it\" when you want me to run it.",
+                    ctx.agent
+                );
+                Ok(PrimeTurn {
+                    intent,
+                    reply,
+                    disposition: PrimeDisposition::Executed,
+                    action: Some(action),
+                    created_task: Some(task),
+                    started_run: None,
+                    approval: None,
+                })
+            }
+            PrimeAction::CreateAndRunTask { title } => {
+                let task = self.create_task(
+                    title,
+                    serde_json::json!({ "prime_request": title }),
+                    &ctx.actor,
+                    &ctx.namespace,
+                    vec![Permission::new("tool:relux-tools-echo:say").unwrap()],
+                );
+                self.assign_task(&task, &ctx.agent)?;
+                let run = self.start_run(&task)?;
+
+                // Perform the echo cycle on the task's own input, so the loop
+                // proves the real payload round-trips rather than a fixed string.
+                let echo_plugin = PluginId::new("relux-tools-echo");
+                let input = self
+                    .task(&task)
+                    .map(|t| t.input.clone())
+                    .unwrap_or_else(|| serde_json::json!({ "prime_request": title }));
+                self.call_tool(&run, &ctx.agent, &echo_plugin, "echo.say", input)?;
+                self.complete_run(&run, "echo.say returned the input unchanged")?;
+                self.complete_task(&task)?;
+
+                let reply =
+                    format!("{text} Created {task}, started {run}, and completed the echo cycle.");
+                Ok(PrimeTurn {
+                    intent,
+                    reply,
+                    disposition: PrimeDisposition::Executed,
+                    action: Some(action),
+                    created_task: Some(task),
+                    started_run: Some(run),
+                    approval: None,
+                })
+            }
+            PrimeAction::StartRun { task_id } => {
+                let tid = TaskId::new(task_id.clone());
+                let run = self.start_run(&tid)?;
+
+                // Plain start it on one queued task also completes run and task through echo.
+                let echo_plugin = PluginId::new("relux-tools-echo");
+                let input = self
+                    .task(&tid)
+                    .map(|t| t.input.clone())
+                    .unwrap_or_else(|| serde_json::json!({}));
+                self.call_tool(&run, &ctx.agent, &echo_plugin, "echo.say", input)?;
+                self.complete_run(&run, "echo.say returned the input unchanged")?;
+                self.complete_task(&tid)?;
+
+                let reply = format!("{text} Started {run} and completed the echo cycle.");
+                Ok(PrimeTurn {
+                    intent,
+                    reply,
+                    disposition: PrimeDisposition::Executed,
+                    action: Some(action),
+                    created_task: None,
+                    started_run: Some(run),
+                    approval: None,
+                })
+            }
+            other => Ok(PrimeTurn {
+                intent,
+                reply: format!(
+                    "I planned an action I cannot execute yet: {}.",
+                    describe_action(other)
+                ),
+                disposition: PrimeDisposition::NeedsClarification,
+                action: Some(action.clone()),
+                created_task: None,
+                started_run: None,
+                approval: None,
+            }),
+        }
+    }
+
     // --- Inspection --------------------------------------------------------
 
     pub fn run(&self, id: &RunId) -> Option<&Run> {
@@ -543,6 +895,36 @@ fn created_by_actor(created_by: &str) -> (&str, &str) {
         ("user", created_by)
     } else {
         ("agent", created_by)
+    }
+}
+
+/// Project a `Task` into the compact `TaskBrief` Prime speaks about.
+fn task_brief(t: &Task) -> TaskBrief {
+    TaskBrief {
+        id: t.id.clone(),
+        title: t.title.clone(),
+        status: t.status.clone(),
+        assigned_agent: t.assigned_agent.clone(),
+    }
+}
+
+/// Render a `PrimeAction` as a one-line human-readable string for approvals and
+/// audit metadata.
+fn describe_action(action: &PrimeAction) -> String {
+    match action {
+        PrimeAction::CreateTask { title } => format!("create task \"{title}\""),
+        PrimeAction::StartRun { task_id } => format!("start a run for {task_id}"),
+        PrimeAction::GrantPermission {
+            subject_id,
+            permission,
+        } => format!("grant {permission} to {subject_id}"),
+        PrimeAction::InstallPlugin { plugin_id } => format!("install plugin {plugin_id}"),
+        PrimeAction::ConfigurePlugin { plugin_id } => format!("configure plugin {plugin_id}"),
+        PrimeAction::CreateAgent {
+            name,
+            adapter_plugin,
+        } => format!("create agent {name} on adapter {adapter_plugin}"),
+        other => format!("{other:?}"),
     }
 }
 
@@ -653,8 +1035,7 @@ mod tests {
         assert!(k
             .audit_log()
             .iter()
-            .any(|e| e.action == "tool:relux-tools-echo:say"
-                && e.result == AuditResult::Success));
+            .any(|e| e.action == "tool:relux-tools-echo:say" && e.result == AuditResult::Success));
     }
 
     #[test]
@@ -671,7 +1052,10 @@ mod tests {
         let err = k
             .call_tool(&run, &weak, &echo, "echo.say", serde_json::json!({}))
             .unwrap_err();
-        assert!(matches!(err, KernelError::PermissionDenied { .. }), "got {err:?}");
+        assert!(
+            matches!(err, KernelError::PermissionDenied { .. }),
+            "got {err:?}"
+        );
 
         assert!(k
             .audit_log()
@@ -685,7 +1069,10 @@ mod tests {
         let err = k
             .call_tool(&run, &prime, &echo, "echo.nope", serde_json::json!({}))
             .unwrap_err();
-        assert!(matches!(err, KernelError::ToolNotFound { .. }), "got {err:?}");
+        assert!(
+            matches!(err, KernelError::ToolNotFound { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -704,5 +1091,136 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, KernelError::UnknownPlugin(_)), "got {err:?}");
+    }
+
+    /// A kernel with plugins, a workspace namespace, and a Prime agent - the
+    /// minimum for driving Prime chat - plus the matching `PrimeContext`.
+    fn prime_chat_kernel() -> (KernelState, PrimeContext) {
+        let mut k = KernelState::new();
+        k.register_plugin(echo_manifest());
+        k.register_plugin(adapter_manifest());
+        let ns = k.create_namespace("workspace", "Workspace", NamespaceKind::Personal);
+        let adapter = PluginId::new("relux-adapter-local-prime");
+        let prime = k
+            .create_agent(
+                "prime",
+                "Prime",
+                "The control-plane operator.",
+                &adapter,
+                &ns,
+                None,
+                vec![Permission::new("tool:relux-tools-echo:say").unwrap()],
+            )
+            .unwrap();
+        let ctx = PrimeContext {
+            namespace: ns,
+            agent: prime,
+            actor: "founder".to_string(),
+        };
+        (k, ctx)
+    }
+
+    #[test]
+    fn greeting_is_answered_without_changing_state() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let turn = k.prime_turn(&ctx, "hey").unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::Greeting);
+        assert_eq!(turn.disposition, PrimeDisposition::Answered);
+        assert!(turn.created_task.is_none());
+        assert_eq!(k.task_count(), 0, "a greeting must not create work");
+    }
+
+    #[test]
+    fn task_creation_then_run_start_walks_the_loop() {
+        let (mut k, ctx) = prime_chat_kernel();
+
+        let created = k
+            .prime_turn(&ctx, "create a task to summarize the README")
+            .unwrap();
+        assert_eq!(created.disposition, PrimeDisposition::Executed);
+        let task_id = created.created_task.expect("a task was created");
+        // Prime assigned it to itself, so it is Queued and runnable.
+        assert_eq!(k.task(&task_id).unwrap().status, TaskStatus::Queued);
+        assert_eq!(
+            k.task(&task_id).unwrap().assigned_agent.as_ref(),
+            Some(&ctx.agent)
+        );
+
+        let started = k.prime_turn(&ctx, "start it").unwrap();
+        assert_eq!(started.disposition, PrimeDisposition::Executed);
+        let run_id = started.started_run.expect("a run was started");
+        // start it now completes the task.
+        assert_eq!(k.run(&run_id).unwrap().status, RunStatus::Completed);
+        assert_eq!(k.task(&task_id).unwrap().status, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn create_and_run_task_completes_in_one_turn() {
+        let (mut k, ctx) = prime_chat_kernel();
+
+        let turn = k
+            .prime_turn(&ctx, "create a task to echo hello and run it")
+            .unwrap();
+        assert_eq!(turn.disposition, PrimeDisposition::Executed);
+        let task_id = turn.created_task.expect("a task was created");
+        let run_id = turn.started_run.expect("a run was started");
+
+        assert_eq!(k.task(&task_id).unwrap().status, TaskStatus::Completed);
+        assert_eq!(k.run(&run_id).unwrap().status, RunStatus::Completed);
+
+        // Transcript shows full cycle
+        let kinds: Vec<&str> = k
+            .run_events(&run_id)
+            .iter()
+            .map(|e| e.kind.as_str())
+            .collect();
+        assert_eq!(kinds, vec!["run_started", "tool_call", "run_completed"]);
+    }
+
+    #[test]
+    fn risky_permission_change_is_gated_behind_approval() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let turn = k.prime_turn(&ctx, "give this agent GitHub access").unwrap();
+        assert_eq!(turn.disposition, PrimeDisposition::AwaitingApproval);
+        let approval = turn.approval.expect("an approval was raised");
+        assert_eq!(
+            k.approval(&approval).unwrap().status,
+            ApprovalStatus::Pending
+        );
+        assert_eq!(k.pending_approval_count(), 1);
+        // Nothing was granted; the request is only logged.
+        assert!(k.audit_log().iter().any(|e| e.action == "approval:request"));
+    }
+
+    #[test]
+    fn resolving_an_approval_records_the_decision() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let turn = k.prime_turn(&ctx, "install relux-tools-github").unwrap();
+        let approval = turn.approval.expect("an approval was raised");
+
+        k.resolve_approval(&approval, true, "founder").unwrap();
+        assert_eq!(
+            k.approval(&approval).unwrap().status,
+            ApprovalStatus::Approved
+        );
+        assert_eq!(k.pending_approval_count(), 0);
+        assert!(k
+            .audit_log()
+            .iter()
+            .any(|e| e.action == "approval:resolve" && e.result == AuditResult::Approved));
+    }
+
+    #[test]
+    fn status_question_is_grounded_in_state() {
+        let (mut k, ctx) = prime_chat_kernel();
+        // No work yet -> Prime reports idle, does not invent runs.
+        let idle = k.prime_turn(&ctx, "what is going on?").unwrap();
+        assert_eq!(idle.intent, relux_core::PrimeIntent::StatusQuestion);
+        assert!(idle.reply.contains("idle"), "got: {}", idle.reply);
+
+        // After creating a task, the status reflects open work.
+        k.prime_turn(&ctx, "fix the flaky test").unwrap();
+        let busy = k.prime_turn(&ctx, "what is going on?").unwrap();
+        assert!(busy.reply.contains("open task"), "got: {}", busy.reply);
     }
 }

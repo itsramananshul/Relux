@@ -36,7 +36,7 @@ pub enum AgentStatus {
 
 /// A configured agent actor inside Relux.
 ///
-/// Spec ref: `docs/RELUX_MASTER_PLAN.md` §9.3 (Agent).
+/// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 9.3 (Agent).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
     pub id: AgentId,
