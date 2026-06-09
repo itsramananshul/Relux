@@ -54,13 +54,7 @@ kernel.
 
 Keys are read from the environment and are never returned by the API or shown in the UI.
 
-The dashboard opens on **Relux Home** (grounded control-plane state), where you
-can chat with **Prime** (`POST /v1/relux/prime`), ask Prime to create tasks,
-create crew members, and delegate tasks to agents, manage **work** (tasks and
-runs, including detailed views and audit logs), manage **crew** (agents), and
-install **plugins** - all backed by the local `/v1/relux` API, with no
-dependency on the legacy Relix bridge. It now also includes dedicated surfaces
-for managing pending approvals and granting permissions to agents. Delegated tasks can now be run by their assigned agent through the Work page, the API, or the CLI.
+The dashboard opens on **Relux Home**, featuring a dynamic first-run checklist to guide initial setup, direct action links to key sections, and an overview of installed plugins. From there, you can chat with **Prime** (`POST /v1/relux/prime`), which now includes an action strip with practical example prompts for creating tasks, agents, and assigning work. Manage your **work** (tasks and runs) on the dedicated Work page, which offers a clear assignment/run workflow, conditional "Run assigned" actions, and task filtering. The **crew** (agents) page allows you to create and manage agents, with each agent's card linking directly to their assigned tasks. You can also install **plugins** and manage **approvals** and permissions – all backed by the local `/v1/relux` API, with no dependency on the legacy Relix bridge. Delegated tasks can be run by their assigned agent through the Work page, the API, or the CLI.
 The served bundle is the committed build under
 `crates/relix-web-bridge/dashboard-dist` (rebuild with `npm run build` in
 `apps/dashboard`). See [`docs/RELUX_MASTER_PLAN.md`](docs/RELUX_MASTER_PLAN.md)

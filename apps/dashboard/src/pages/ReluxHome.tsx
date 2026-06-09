@@ -10,28 +10,74 @@ import { useAsync } from "../components/common";
 // plane) and points at the two things you can do right now: talk to Prime and
 // manage plugins.
 
-interface Stat {
+interface ChecklistItem {
+  id: string;
   label: string;
-  value: number;
-  hint: string;
+  status: "todo" | "done" | "info" | "link";
+  description: string;
+  linkTo?: string;
 }
 
-function statsFrom(s: ReluxState): Stat[] {
-  return [
-    { label: "Plugins", value: s.installed_plugins, hint: "installed capabilities" },
-    { label: "Agents", value: s.agents, hint: "configured actors" },
-    { label: "Tasks", value: s.tasks, hint: "units of work" },
-    { label: "Runs", value: s.runs, hint: "execution attempts" },
-    { label: "Open tasks", value: s.open_tasks, hint: "not yet done" },
-    { label: "Active runs", value: s.active_runs, hint: "running now" },
-    { label: "Waiting approval", value: s.waiting_approval, hint: "need a decision" },
-    { label: "Pending approvals", value: s.pending_approvals, hint: "queued for a human" },
+function getFirstRunChecklist(s: ReluxState | null): ChecklistItem[] {
+  if (!s) {
+    return [
+      { id: "loading", label: "Loading system state...", status: "info", description: "Fetching current Relux operational state." }
+    ];
+  }
+
+  const checklist: ChecklistItem[] = [
+    {
+      id: "prime-available",
+      label: "Prime is available",
+      status: "done", // Prime is always available in the local control plane
+      description: "Your local Relux operator is ready to chat.",
+      linkTo: "/prime"
+    },
+    {
+      id: "at-least-one-agent",
+      label: "At least one agent exists",
+      status: s.agents > 0 ? "done" : "todo",
+      description: s.agents > 0 ? `You have ${s.agents} configured agent(s).` : "Create your first agent to delegate tasks.",
+      linkTo: "/crew"
+    },
+    {
+      id: "at-least-one-task",
+      label: "At least one task exists",
+      status: s.tasks > 0 ? "done" : "todo",
+      description: s.tasks > 0 ? `You have ${s.tasks} total task(s).` : "Create a task for Prime or an agent to work on.",
+      linkTo: "/work"
+    },
+    {
+      id: "pending-approvals",
+      label: "Pending approvals",
+      status: s.pending_approvals > 0 ? "todo" : "done",
+      description: s.pending_approvals > 0 ? `You have ${s.pending_approvals} pending approval(s) requiring your decision.` : "No pending approvals at the moment.",
+      linkTo: "/approvals"
+    },
+    {
+      id: "installed-plugins",
+      label: "Plugins installed",
+      status: s.installed_plugins > 0 ? "done" : "todo",
+      description: s.installed_plugins > 0 ? `You have ${s.installed_plugins} plugin(s) installed, extending Relux capabilities.` : "Install plugins to add new tools and adapters.",
+      linkTo: "/plugins"
+    },
+    {
+      id: "health-status",
+      label: "Check system health",
+      status: "link",
+      description: "Monitor the operational status and diagnostics of your Relux instance.",
+      linkTo: "/health"
+    },
   ];
+
+  return checklist;
 }
 
 export function ReluxHome() {
   const state = useAsync<ReluxState>(() => reluxPlugins.state(), []);
   const plugins = useAsync<ReluxPlugin[]>(() => reluxPlugins.list(), []);
+
+  const checklist = getFirstRunChecklist(state.data);
 
   return (
     <div className="grid">
@@ -71,6 +117,12 @@ export function ReluxHome() {
           <Link to="/plugins">
             <button className="btn ghost sm">Manage plugins →</button>
           </Link>
+          <Link to="/approvals">
+            <button className="btn ghost sm">Manage approvals →</button>
+          </Link>
+          <Link to="/health">
+            <button className="btn ghost sm">Check health →</button>
+          </Link>
         </div>
       </div>
 
@@ -82,19 +134,46 @@ export function ReluxHome() {
             <span className="mono">127.0.0.1:19891</span>), then refresh.
           </div>
         </div>
-      ) : state.data ? (
-        <div className="grid cols-4">
-          {statsFrom(state.data).map((s) => (
-            <div className="card" key={s.label}>
-              <h3 style={{ marginBottom: 6 }}>{s.label}</h3>
-              <div className="stat">{s.value}</div>
-              <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>{s.hint}</div>
-            </div>
-          ))}
-        </div>
       ) : (
         <div className="card">
-          <div className="loading">Loading control-plane state...</div>
+          <h3>First-run checklist</h3>
+          <ul className="checklist">
+            {checklist.map((item) => (
+              <li key={item.id} className="checklist-item">
+                <span className={`checklist-icon ${item.status}`}>
+                  {item.status === "done" && "✓"}
+                  {item.status === "todo" && "✗"}
+                  {item.status === "info" && "…"}
+                  {item.status === "link" && "→"}
+                </span>
+                {item.linkTo ? (
+                  <Link to={item.linkTo} className="checklist-label">
+                    {item.label}
+                  </Link>
+                ) : (
+                  <span className="checklist-label">{item.label}</span>
+                )}
+                <span className="checklist-description">{item.description}</span>
+              </li>
+            ))}
+            <li className="checklist-item">
+              <span className="checklist-icon info">ℹ</span>
+              <span className="checklist-label">Tasks status overview</span>
+              <span className="checklist-description">
+                <Link to="/work" className="link">
+                  Open tasks: {state.data?.open_tasks ?? 0}
+                </Link>
+                {" · "}
+                <Link to="/work" className="link">
+                  Active runs: {state.data?.active_runs ?? 0}
+                </Link>
+                {" · "}
+                <Link to="/work" className="link">
+                  Waiting approval: {state.data?.waiting_approval ?? 0}
+                </Link>
+              </span>
+            </li>
+          </ul>
         </div>
       )}
 
@@ -146,3 +225,59 @@ export function ReluxHome() {
     </div>
   );
 }
+
+// Add some basic styles for the checklist
+const styleSheet = document.createElement("style");
+styleSheet.innerText = `
+  .checklist {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+  }
+  .checklist-item {
+    display: flex;
+    align-items: center;
+    margin-bottom: 8px;
+    font-size: 14px;
+  }
+  .checklist-icon {
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    margin-right: 8px;
+    font-weight: bold;
+    color: var(--text-color);
+  }
+  .checklist-icon.done {
+    background-color: var(--green-600); /* Example green */
+    color: white;
+  }
+  .checklist-icon.todo {
+    background-color: var(--yellow-600); /* Example yellow */
+    color: black;
+  }
+  .checklist-icon.info {
+    background-color: var(--blue-600); /* Example blue */
+    color: white;
+  }
+  .checklist-icon.link {
+    background-color: var(--gray-500); /* Example gray for links */
+    color: white;
+  }
+  .checklist-label {
+    flex-shrink: 0;
+    margin-right: 8px;
+    font-weight: 600;
+  }
+  .checklist-description {
+    color: var(--text-muted);
+  }
+  .checklist-item .link {
+    color: var(--link-color);
+    text-decoration: underline;
+  }
+`;
+document.head.appendChild(styleSheet);

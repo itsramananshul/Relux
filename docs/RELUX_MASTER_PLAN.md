@@ -1644,19 +1644,10 @@ Also available:
 Open `http://127.0.0.1:19891/dashboard`. The default surface is Relux Home,
 backed only by the local `/v1/relux` API:
 
-- **Home** - grounded control-plane state (plugins, agents, tasks, runs,
-  approvals) plus the installed-plugin list.
-- **Prime** - chat with the local operator. It runs the same grounded
-  `prime_turn` as the CLI: a greeting stays a greeting, "create a task to X"
-  creates that task, "create an agent named researcher" creates a durable crew
-  member on the local adapter, "assign task_0001 to researcher" delegates work
-  after validating the task and agent, and risky actions come back as a proposal
-  awaiting approval (section 10). Endpoint: `POST /v1/relux/prime { "message":
-  "..." }`.
-- **Work** - standalone task board and execution history. Backed by the
-  `/v1/relux/tasks` and `/v1/relux/runs` endpoints; allows creating tasks,
-  starting runs directly from the board, and running delegated tasks as their assigned agent.
-- **Crew** - create and manage local agents.
+- **Home** - The initial landing page, featuring a dynamic first-run checklist based on current system state (agents, tasks, plugins, approvals, health status) and providing direct action links to key sections. It also offers an overview of installed plugins.
+- **Prime** - Chat with the local operator, including an action strip with practical example prompts to guide users in creating tasks, agents, and assigning work. It runs the same grounded `prime_turn` as the CLI, ensuring consistency between chat interactions and core system actions.
+- **Work** - Standalone task board and execution history. Displays tasks with clear assignee information, enables conditional 'Run assigned' actions for delegated tasks, and supports filtering by agent and status via URL query parameters for improved navigation. Allows creating tasks and starting runs directly from the board.
+- **Crew** - Create and manage local agents. Each agent's card now includes direct links to their assigned queued and running tasks on the Work page, facilitating workload overview and navigation.
 - **Plugins** - install/remove plugins through the durable lifecycle
   (`/v1/relux/plugins/*`).
 - **Approvals** - manage pending approvals and agent permissions (`/v1/relux/approvals`, `/v1/relux/permissions`).

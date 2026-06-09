@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from "react";
-import { useLoaderData } from "react-router-dom";
+import { useLoaderData, Link } from "react-router-dom";
 import { fetchJson, postJson, reluxWork, type ReluxAgent, type ReluxTask } from "../api";
 import { useAsync } from "../components/common";
 
@@ -91,8 +91,18 @@ export function Crew() {
                 <p><strong>Status:</strong> {agent.status}</p>
                 <p><strong>Adapter:</strong> {agent.adapter_plugin}</p>
                 <p><strong>Permissions:</strong> {agent.permissions_summary}</p>
-                <p><strong>Queued Tasks:</strong> {agentTaskCounts[agent.id]?.queued || 0}</p>
-                <p><strong>Running Tasks:</strong> {agentTaskCounts[agent.id]?.running || 0}</p>
+                <p>
+                  <strong>Queued Tasks:</strong>{" "}
+                  <Link to={`/work?agentId=${agent.id}&status=queued`} className="link">
+                    {agentTaskCounts[agent.id]?.queued || 0}
+                  </Link>
+                </p>
+                <p>
+                  <strong>Running Tasks:</strong>{" "}
+                  <Link to={`/work?agentId=${agent.id}&status=running`} className="link">
+                    {agentTaskCounts[agent.id]?.running || 0}
+                  </Link>
+                </p>
                 <p className="created-at">Created: {new Date(agent.created_at).toLocaleString()}</p>
               </div>
             ))

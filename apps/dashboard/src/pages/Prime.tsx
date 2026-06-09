@@ -27,6 +27,9 @@ const DISPOSITION_TONE: Record<string, string> = {
 const SUGGESTIONS = [
   "what is going on?",
   "create a task to summarize the README",
+  "create a task to inspect this repo",
+  "create an agent named researcher",
+  "assign task_0001 to researcher",
   "start it",
   "why did it fail?",
 ];

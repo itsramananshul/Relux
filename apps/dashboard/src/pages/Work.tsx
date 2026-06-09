@@ -1,4 +1,5 @@
 import { useState, useMemo } from "react";
+import { useLocation } from "react-router-dom";
 import { reluxWork, reluxAudit, type ReluxTask, type ReluxRun, type ReluxAgent, type ReluxTaskDetail, type ReluxRunDetail, type ReluxAuditEntry, type RunEvent } from "../api";
 import { useAsync } from "../components/common";
 
@@ -6,6 +7,11 @@ import { useAsync } from "../components/common";
 // BACKED BY: /v1/relux/tasks, /v1/relux/runs.
 
 export function Work() {
+  const location = useLocation();
+  const queryParams = useMemo(() => new URLSearchParams(location.search), [location.search]);
+  const filterAgentId = queryParams.get("agentId");
+  const filterStatus = queryParams.get("status");
+
   const { data: tasks, loading: loadingTasks, error: errorTasks, reload: reloadTasks } = useAsync<ReluxTask[]>(
     () => reluxWork.listTasks(),
     [],
@@ -39,14 +45,22 @@ export function Work() {
   }
 
   const columns = useMemo(() => {
-    const list = tasks ?? [];
+    let list = tasks ?? [];
+
+    if (filterAgentId) {
+      list = list.filter(t => t.assigned_agent === filterAgentId);
+    }
+    if (filterStatus) {
+      list = list.filter(t => t.status === filterStatus);
+    }
+
     return {
       open: list.filter(t => t.status === "created" || t.status === "queued"),
       running: list.filter(t => t.status === "running"),
       done: list.filter(t => t.status === "completed"),
       other: list.filter(t => !["created", "queued", "running", "completed"].includes(t.status)),
     };
-  }, [tasks]);
+  }, [tasks, filterAgentId, filterStatus]);
 
   const error = errorTasks || errorRuns || errorAgents;
   const loading = (loadingTasks && !tasks) || (loadingRuns && !runs) || (loadingAgents && !agents);
@@ -232,7 +246,7 @@ function TaskCard({ task, onAction, onInspectTask, agents }: { task: ReluxTask; 
   }
 
   const isAssigned = !!task.assigned_agent;
-  const isRunnableByAssignedAgent = isAssigned && (task.status === "queued" || task.status === "running");
+  const isRunnableByAssignedAgent = isAssigned && task.status === "queued";
 
   return (
     <div className="card sm" style={{ padding: 12, border: "1px solid var(--border)" }}>
