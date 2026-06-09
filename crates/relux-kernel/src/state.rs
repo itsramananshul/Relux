@@ -23,7 +23,7 @@ use relux_core::{
     Namespace, NamespaceId, Permission, PluginId, PluginManifest, PluginSourceKind, PrimeAction,
     PrimeAutonomyConfig, PrimeAutonomyTickResult, PrimeContext, PrimeDisposition, PrimePlan,
     PrimeTurn, RiskLevel, Run, RunId, RunStatus, StateSummary, Task, TaskBrief, TaskId,
-    TaskStatus,
+    TaskStatus, ToolDescriptor, ToolExecutability, ToolInvocationResult,
 };
 use serde::{Deserialize, Serialize};
 
@@ -803,13 +803,19 @@ impl KernelState {
         Ok(run_id)
     }
 
-    /// Route a tool call from an agent through the kernel
+    /// Route a tool call from an agent through the kernel, inside a run
     /// (`docs/RELUX_MASTER_PLAN.md` section 13.6, section 10.2).
     ///
     /// The kernel resolves the tool on the named plugin, looks up the permission
     /// it requires, and verifies the agent holds it. Denials and successes are
-    /// both audited and recorded on the run transcript. The echo tool returns its
-    /// input unchanged - proof of the loop without any external effect.
+    /// both audited and recorded on the run transcript.
+    ///
+    /// This is honest about what the local runtime can actually do: only the
+    /// kernel's built-in deterministic handlers (`crate::builtin`) execute. An
+    /// installed-but-unimplemented tool is refused with
+    /// [`KernelError::ToolRuntimeUnavailable`] - audited as a failure, recorded on
+    /// the transcript, and never fabricating an output. Arbitrary downloaded
+    /// plugin code is not executed (master plan section 8.2).
     pub fn call_tool(
         &mut self,
         run_id: &RunId,
@@ -818,35 +824,9 @@ impl KernelState {
         tool_name: &str,
         input: serde_json::Value,
     ) -> Result<serde_json::Value, KernelError> {
-        let namespace = self
-            .agents
-            .get(agent_id)
-            .ok_or_else(|| KernelError::UnknownAgent(agent_id.to_string()))?
-            .namespace_id
-            .clone();
+        let (namespace, required) = self.resolve_tool_permission(agent_id, plugin_id, tool_name)?;
 
-        let manifest = self
-            .plugins
-            .get(plugin_id)
-            .ok_or_else(|| KernelError::UnknownPlugin(plugin_id.to_string()))?;
-        let tool = manifest
-            .capabilities
-            .tools
-            .iter()
-            .find(|t| t.name == tool_name)
-            .ok_or_else(|| KernelError::ToolNotFound {
-                plugin: plugin_id.to_string(),
-                tool: tool_name.to_string(),
-            })?;
-        let required = tool.permission.clone();
-
-        let agent = self
-            .agents
-            .get(agent_id)
-            .ok_or_else(|| KernelError::UnknownAgent(agent_id.to_string()))?;
-        let allowed = agent.permissions.iter().any(|p| p.matches_exact(&required));
-
-        if !allowed {
+        if !self.agent_holds_permission(agent_id, &required) {
             self.push_run_event(
                 run_id,
                 "tool_call_denied",
@@ -870,8 +850,38 @@ impl KernelState {
             });
         }
 
-        // The echo tool is the whole "plugin": it returns its input unchanged.
-        let output = input.clone();
+        // Only built-in deterministic handlers execute. An unimplemented tool is
+        // refused honestly - no fabricated output.
+        let output = match self.builtin_tool_output(plugin_id.as_str(), tool_name, &input) {
+            Some(output) => output,
+            None => {
+                self.push_run_event(
+                    run_id,
+                    "tool_call_unavailable",
+                    "kernel",
+                    &format!("no runtime handler for {tool_name} on {plugin_id}"),
+                    serde_json::json!({ "tool": tool_name, "plugin": plugin_id.as_str() }),
+                );
+                self.record_audit(
+                    "agent",
+                    agent_id.as_str(),
+                    required.as_str(),
+                    Some("tool"),
+                    Some(tool_name),
+                    Some(&namespace),
+                    AuditResult::Failed,
+                    serde_json::json!({
+                        "run": run_id.as_str(),
+                        "reason": "tool runtime not implemented"
+                    }),
+                );
+                return Err(KernelError::ToolRuntimeUnavailable {
+                    plugin: plugin_id.to_string(),
+                    tool: tool_name.to_string(),
+                });
+            }
+        };
+
         self.push_run_event(
             run_id,
             "tool_call",
@@ -890,6 +900,196 @@ impl KernelState {
             serde_json::json!({ "run": run_id.as_str() }),
         );
         Ok(output)
+    }
+
+    /// Invoke a tool through the kernel OUTSIDE a run
+    /// (`docs/RELUX_MASTER_PLAN.md` section 13.6, section 10.2).
+    ///
+    /// This is the clean audit path behind the `/v1/relux/tools/invoke` endpoint
+    /// and the `relux-kernel tool invoke` CLI: it runs the same permission check
+    /// and built-in-runtime gate as [`call_tool`] but does not invent a run/run
+    /// transcript. The invocation is recorded on the append-only audit log
+    /// (success, denial, or not-implemented) so nothing bypasses the kernel, and
+    /// the structured [`ToolInvocationResult`] carries only real output.
+    pub fn invoke_tool(
+        &mut self,
+        agent_id: &AgentId,
+        plugin_id: &PluginId,
+        tool_name: &str,
+        input: serde_json::Value,
+    ) -> Result<ToolInvocationResult, KernelError> {
+        let (namespace, required) = self.resolve_tool_permission(agent_id, plugin_id, tool_name)?;
+
+        if !self.agent_holds_permission(agent_id, &required) {
+            self.record_audit(
+                "agent",
+                agent_id.as_str(),
+                required.as_str(),
+                Some("tool"),
+                Some(tool_name),
+                Some(&namespace),
+                AuditResult::Denied,
+                serde_json::json!({ "via": "invoke", "plugin": plugin_id.as_str() }),
+            );
+            return Err(KernelError::PermissionDenied {
+                agent: agent_id.to_string(),
+                permission: required.to_string(),
+            });
+        }
+
+        let output = match self.builtin_tool_output(plugin_id.as_str(), tool_name, &input) {
+            Some(output) => output,
+            None => {
+                self.record_audit(
+                    "agent",
+                    agent_id.as_str(),
+                    required.as_str(),
+                    Some("tool"),
+                    Some(tool_name),
+                    Some(&namespace),
+                    AuditResult::Failed,
+                    serde_json::json!({
+                        "via": "invoke",
+                        "plugin": plugin_id.as_str(),
+                        "reason": "tool runtime not implemented"
+                    }),
+                );
+                return Err(KernelError::ToolRuntimeUnavailable {
+                    plugin: plugin_id.to_string(),
+                    tool: tool_name.to_string(),
+                });
+            }
+        };
+
+        self.record_audit(
+            "agent",
+            agent_id.as_str(),
+            required.as_str(),
+            Some("tool"),
+            Some(tool_name),
+            Some(&namespace),
+            AuditResult::Success,
+            serde_json::json!({ "via": "invoke", "plugin": plugin_id.as_str() }),
+        );
+        Ok(ToolInvocationResult {
+            plugin_id: plugin_id.to_string(),
+            tool_name: tool_name.to_string(),
+            agent_id: agent_id.to_string(),
+            permission: required.to_string(),
+            output,
+        })
+    }
+
+    /// Discover every installed plugin tool with its executable status
+    /// (`docs/RELUX_MASTER_PLAN.md` section 7.4, `docs/Relux spec.md` section 20.2
+    /// Tools view). Each descriptor marks `ready`, `not_implemented`, or - when
+    /// `agent_for_permission` is supplied and that agent lacks the permission -
+    /// `missing_permission`. Sorted by `(plugin_id, tool_name)` for deterministic
+    /// listing. Never leaks config/secrets - only manifest-declared tool metadata.
+    pub fn discover_tools(&self, agent_for_permission: Option<&AgentId>) -> Vec<ToolDescriptor> {
+        let mut out: Vec<ToolDescriptor> = Vec::new();
+        for installed in self.installed_plugins() {
+            let Some(manifest) = self.plugins.get(&installed.id) else {
+                continue;
+            };
+            let protected = installed.source_kind == PluginSourceKind::Bundled;
+            for tool in &manifest.capabilities.tools {
+                let builtin = crate::builtin::is_builtin_tool(installed.id.as_str(), &tool.name);
+                let executable = if !builtin {
+                    ToolExecutability::NotImplemented
+                } else if let Some(agent_id) = agent_for_permission {
+                    if self.agent_holds_permission(agent_id, &tool.permission) {
+                        ToolExecutability::Ready
+                    } else {
+                        ToolExecutability::MissingPermission
+                    }
+                } else {
+                    ToolExecutability::Ready
+                };
+                out.push(ToolDescriptor {
+                    plugin_id: installed.id.as_str().to_string(),
+                    tool_name: tool.name.clone(),
+                    description: tool.description.clone(),
+                    permission: tool.permission.as_str().to_string(),
+                    risk: tool.risk.clone(),
+                    source_kind: format!("{:?}", installed.source_kind),
+                    installed: true,
+                    enabled: installed.enabled,
+                    protected,
+                    executable,
+                });
+            }
+        }
+        out.sort_by(|a, b| {
+            a.plugin_id
+                .cmp(&b.plugin_id)
+                .then_with(|| a.tool_name.cmp(&b.tool_name))
+        });
+        out
+    }
+
+    /// Resolve `(agent namespace, required permission)` for a tool call, erroring
+    /// on an unknown agent, unknown plugin, or unknown tool. Shared by
+    /// [`call_tool`] and [`invoke_tool`] so both gate identically.
+    fn resolve_tool_permission(
+        &self,
+        agent_id: &AgentId,
+        plugin_id: &PluginId,
+        tool_name: &str,
+    ) -> Result<(NamespaceId, Permission), KernelError> {
+        let namespace = self
+            .agents
+            .get(agent_id)
+            .ok_or_else(|| KernelError::UnknownAgent(agent_id.to_string()))?
+            .namespace_id
+            .clone();
+        let manifest = self
+            .plugins
+            .get(plugin_id)
+            .ok_or_else(|| KernelError::UnknownPlugin(plugin_id.to_string()))?;
+        let required = manifest
+            .capabilities
+            .tools
+            .iter()
+            .find(|t| t.name == tool_name)
+            .ok_or_else(|| KernelError::ToolNotFound {
+                plugin: plugin_id.to_string(),
+                tool: tool_name.to_string(),
+            })?
+            .permission
+            .clone();
+        Ok((namespace, required))
+    }
+
+    /// True when `agent_id` exists and holds `permission` exactly.
+    fn agent_holds_permission(&self, agent_id: &AgentId, permission: &Permission) -> bool {
+        self.agents
+            .get(agent_id)
+            .map(|a| a.permissions.iter().any(|p| p.matches_exact(permission)))
+            .unwrap_or(false)
+    }
+
+    /// Execute a built-in deterministic tool handler, or `None` when the kernel
+    /// has no runtime for the `(plugin, tool)` pair.
+    ///
+    /// Membership MUST match [`crate::builtin::BUILTIN_TOOLS`]. Every handler here
+    /// is local-only and side-effect free: no network, no filesystem, no shelling
+    /// out (master plan section 8.2 safety rules).
+    fn builtin_tool_output(
+        &self,
+        plugin_id: &str,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        match (plugin_id, tool_name) {
+            // echo.say: return the input unchanged.
+            ("relux-tools-echo", "echo.say") => Some(input.clone()),
+            // status.summary: a deterministic snapshot of control-plane counts.
+            ("relux-tools-status", "status.summary") => {
+                Some(serde_json::to_value(self.inspect_state()).unwrap_or(serde_json::Value::Null))
+            }
+            _ => None,
+        }
     }
 
     /// Mark a run completed with a summary (`docs/RELUX_MASTER_PLAN.md` section 9.6).
@@ -1819,6 +2019,173 @@ mod tests {
             matches!(err, KernelError::ToolNotFound { .. }),
             "got {err:?}"
         );
+    }
+
+    /// A ToolSet manifest whose single tool has NO built-in kernel handler. Used
+    /// to prove the kernel refuses to execute (and never fabricates output for) an
+    /// installed-but-unimplemented tool.
+    fn unsupported_toolset_manifest() -> PluginManifest {
+        PluginManifest {
+            id: PluginId::new("relux-tools-ghost"),
+            name: "Ghost Tools".to_string(),
+            version: "0.1.0".to_string(),
+            kind: PluginKind::ToolSet,
+            description: "a tool with no runtime".to_string(),
+            author: "test".to_string(),
+            trust_level: TrustLevel::Community,
+            capabilities: PluginCapability {
+                tools: vec![ToolDefinition {
+                    name: "ghost.act".to_string(),
+                    description: "would do something if a runtime existed".to_string(),
+                    risk: RiskLevel::Medium,
+                    permission: Permission::new("tool:relux-tools-ghost:act").unwrap(),
+                    approval: ApprovalRequirement::Never,
+                    timeout_secs: Some(5),
+                }],
+                permissions: vec![Permission::new("tool:relux-tools-ghost:act").unwrap()],
+            },
+            health: PluginHealth::Unknown,
+        }
+    }
+
+    #[test]
+    fn unsupported_tool_is_refused_honestly_and_does_not_fabricate_output() {
+        let (mut k, prime, _task, run, _echo) = primed_kernel();
+        // Register a plugin whose tool has no built-in handler, and grant Prime
+        // the permission so the refusal is about runtime support, not permission.
+        k.register_plugin(unsupported_toolset_manifest());
+        let ghost_perm = Permission::new("tool:relux-tools-ghost:act").unwrap();
+        k.grant_permission_to_agent(&prime, ghost_perm).unwrap();
+        let ghost = PluginId::new("relux-tools-ghost");
+
+        let err = k
+            .call_tool(&run, &prime, &ghost, "ghost.act", serde_json::json!({ "x": 1 }))
+            .unwrap_err();
+        assert!(
+            matches!(err, KernelError::ToolRuntimeUnavailable { .. }),
+            "got {err:?}"
+        );
+
+        // The transcript shows the honest unavailable marker, NOT a tool_call with
+        // fabricated output.
+        let kinds: Vec<&str> = k.run_events(&run).iter().map(|e| e.kind.as_str()).collect();
+        assert!(kinds.contains(&"tool_call_unavailable"), "got {kinds:?}");
+        assert!(!kinds.contains(&"tool_call"), "must not fabricate a tool_call");
+
+        // It is audited as a failure with the not-implemented reason.
+        assert!(k.audit_log().iter().any(|e| e.action
+            == "tool:relux-tools-ghost:act"
+            && e.result == AuditResult::Failed
+            && e.metadata["reason"] == "tool runtime not implemented"));
+    }
+
+    #[test]
+    fn invoke_tool_runs_echo_and_audits_without_a_run() {
+        let (mut k, prime, _task, _run, _echo) = primed_kernel();
+        let echo = PluginId::new("relux-tools-echo");
+
+        let result = k
+            .invoke_tool(&prime, &echo, "echo.say", serde_json::json!({ "hi": "there" }))
+            .expect("echo invocation allowed");
+        assert_eq!(result.output, serde_json::json!({ "hi": "there" }));
+        assert_eq!(result.plugin_id, "relux-tools-echo");
+        assert_eq!(result.tool_name, "echo.say");
+        assert_eq!(result.agent_id, "prime");
+        assert_eq!(result.permission, "tool:relux-tools-echo:say");
+
+        // Audited as a success via the invoke path; no run/run-event was minted.
+        assert!(k.audit_log().iter().any(|e| e.action == "tool:relux-tools-echo:say"
+            && e.result == AuditResult::Success
+            && e.metadata["via"] == "invoke"));
+    }
+
+    #[test]
+    fn invoke_tool_denies_without_permission() {
+        let (mut k, _prime, _task, _run, _echo) = primed_kernel();
+        let ns = NamespaceId::new("workspace");
+        let adapter = PluginId::new("relux-adapter-local-prime");
+        let weak = k
+            .create_agent("weak", "Weak", "no perms", &adapter, &ns, None, vec![])
+            .unwrap();
+        let echo = PluginId::new("relux-tools-echo");
+
+        let err = k
+            .invoke_tool(&weak, &echo, "echo.say", serde_json::json!({}))
+            .unwrap_err();
+        assert!(matches!(err, KernelError::PermissionDenied { .. }), "got {err:?}");
+        assert!(k.audit_log().iter().any(|e| e.action == "tool:relux-tools-echo:say"
+            && e.result == AuditResult::Denied));
+    }
+
+    #[test]
+    fn invoke_tool_refuses_unsupported_runtime() {
+        let (mut k, prime, _task, _run, _echo) = primed_kernel();
+        k.register_plugin(unsupported_toolset_manifest());
+        k.grant_permission_to_agent(&prime, Permission::new("tool:relux-tools-ghost:act").unwrap())
+            .unwrap();
+        let ghost = PluginId::new("relux-tools-ghost");
+
+        let err = k
+            .invoke_tool(&prime, &ghost, "ghost.act", serde_json::json!({}))
+            .unwrap_err();
+        assert!(
+            matches!(err, KernelError::ToolRuntimeUnavailable { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn discover_tools_marks_ready_vs_not_implemented() {
+        let (mut k, prime, _task, _run, _echo) = primed_kernel();
+        // primed_kernel only registers manifests; install records back discovery,
+        // so install echo + the unsupported plugin as records.
+        k.install_plugin(
+            echo_manifest(),
+            PluginSourceKind::Bundled,
+            "bundled".to_string(),
+            "examples/relux-plugins/relux-tools-echo".to_string(),
+            true,
+        );
+        k.install_plugin(
+            unsupported_toolset_manifest(),
+            PluginSourceKind::LocalDir,
+            "/tmp/ghost".to_string(),
+            "/data/ghost".to_string(),
+            true,
+        );
+
+        // Without an agent context: echo is ready, ghost is not implemented.
+        let tools = k.discover_tools(None);
+        let echo = tools
+            .iter()
+            .find(|t| t.tool_name == "echo.say")
+            .expect("echo discovered");
+        assert_eq!(echo.executable, ToolExecutability::Ready);
+        assert!(echo.protected, "bundled echo is protected");
+        let ghost = tools
+            .iter()
+            .find(|t| t.tool_name == "ghost.act")
+            .expect("ghost discovered");
+        assert_eq!(ghost.executable, ToolExecutability::NotImplemented);
+        assert!(!ghost.protected);
+
+        // Scoped to an agent WITHOUT the echo permission: echo flips to
+        // missing_permission, ghost stays not_implemented (runtime trumps perms).
+        let ns = NamespaceId::new("workspace");
+        let adapter = PluginId::new("relux-adapter-local-prime");
+        let weak = k
+            .create_agent("weak", "Weak", "no perms", &adapter, &ns, None, vec![])
+            .unwrap();
+        let scoped = k.discover_tools(Some(&weak));
+        let echo = scoped.iter().find(|t| t.tool_name == "echo.say").unwrap();
+        assert_eq!(echo.executable, ToolExecutability::MissingPermission);
+        let ghost = scoped.iter().find(|t| t.tool_name == "ghost.act").unwrap();
+        assert_eq!(ghost.executable, ToolExecutability::NotImplemented);
+
+        // Scoped to Prime (which holds the echo permission): echo is ready.
+        let primed = k.discover_tools(Some(&prime));
+        let echo = primed.iter().find(|t| t.tool_name == "echo.say").unwrap();
+        assert_eq!(echo.executable, ToolExecutability::Ready);
     }
 
     #[test]

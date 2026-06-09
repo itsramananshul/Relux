@@ -13,6 +13,7 @@ pub mod plugin;
 pub mod prime;
 pub mod run;
 pub mod task;
+pub mod tool;
 
 pub use agent::{Agent, AgentId};
 pub use approval::{Approval, ApprovalId, ApprovalStatus};
@@ -29,3 +30,4 @@ pub use prime::{
 };
 pub use run::{Run, RunId, RunStatus};
 pub use task::{Task, TaskId, TaskStatus};
+pub use tool::{ToolDescriptor, ToolExecutability, ToolInvocationResult};

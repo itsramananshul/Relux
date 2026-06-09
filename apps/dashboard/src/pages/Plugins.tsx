@@ -1,5 +1,11 @@
 import { useState } from "react";
-import { reluxPlugins, type ReluxPlugin } from "../api";
+import {
+  reluxPlugins,
+  reluxTools,
+  type ReluxPlugin,
+  type ReluxToolDescriptor,
+  type ReluxToolInvocationResult,
+} from "../api";
 import { useAsync } from "../components/common";
 
 // Plugins page (RELUX_MASTER_PLAN section 11.6): the installed-plugin surface for
@@ -87,6 +93,204 @@ export function Plugins() {
           </div>
         )}
       </div>
+
+      <ToolsSection />
+    </div>
+  );
+}
+
+// Tools section (RELUX_MASTER_PLAN section 7.4; Relux spec section 20.2 Tools view):
+// the honest tool-invocation surface. It lists installed plugin tools with their
+// executable status - `ready`, `installed (runtime not implemented yet)`, or
+// `missing permission` - and lets the operator invoke a ready tool with JSON
+// input, showing the structured output or a clear error. Nothing is faked: a tool
+// with no kernel runtime is shown as such, never hidden, never pretend-run.
+function ToolsSection() {
+  const { data, loading, error, reload } = useAsync<ReluxToolDescriptor[]>(
+    () => reluxTools.list(),
+    [],
+  );
+  const tools = data ?? [];
+
+  return (
+    <div className="card">
+      <div className="row" style={{ marginBottom: 8, alignItems: "center" }}>
+        <h3 style={{ margin: 0 }}>Tools</h3>
+        <div className="spacer" style={{ flex: 1 }} />
+        <button className="btn ghost sm" onClick={() => reload()} disabled={loading}>
+          {loading ? "Loading..." : "Refresh"}
+        </button>
+      </div>
+      <p className="muted" style={{ marginTop: -2, marginBottom: 12, fontSize: 12 }}>
+        Callable capabilities from installed plugins. Only built-in deterministic
+        tools execute; an installed tool with no kernel runtime is shown as
+        installed but not implemented, not hidden or faked. Invocations are
+        permission-checked and audited.
+      </p>
+
+      {error ? (
+        <div className="banner err" style={{ fontSize: 12 }}>
+          Could not reach the Relux tools API ({error}). Start it with{" "}
+          <span className="mono">cargo run -p relux-kernel -- serve</span>.
+        </div>
+      ) : loading && data == null ? (
+        <div className="loading">Loading tools...</div>
+      ) : tools.length === 0 ? (
+        <div className="empty">No tools available from installed plugins.</div>
+      ) : (
+        <div className="table-scroll">
+          <table className="table">
+            <thead>
+              <tr>
+                <th>Tool</th>
+                <th>Risk</th>
+                <th>Status</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {tools.map((t) => (
+                <ToolRow key={`${t.plugin_id}/${t.tool_name}`} tool={t} />
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ToolRow({ tool }: { tool: ReluxToolDescriptor }) {
+  const [open, setOpen] = useState(false);
+  const ready = tool.executable === "ready";
+
+  const statusBadge =
+    tool.executable === "ready" ? (
+      <span className="badge done">ready</span>
+    ) : tool.executable === "missing_permission" ? (
+      <span className="badge backlog" title="The default agent lacks this tool's permission">
+        missing permission
+      </span>
+    ) : (
+      <span className="badge" title="Installed as metadata; the kernel has no runtime for it yet">
+        installed, runtime not implemented yet
+      </span>
+    );
+
+  return (
+    <>
+      <tr>
+        <td>
+          <div>
+            <strong>{tool.tool_name}</strong>
+          </div>
+          <div className="mono muted" style={{ fontSize: 11 }}>{tool.plugin_id}</div>
+          {tool.description && (
+            <div className="muted" style={{ fontSize: 12, marginTop: 2, maxWidth: 420 }}>
+              {tool.description}
+            </div>
+          )}
+          <div className="mono muted" style={{ fontSize: 11, marginTop: 2 }}>
+            {tool.permission}
+          </div>
+        </td>
+        <td className="muted" style={{ fontSize: 12 }}>{tool.risk}</td>
+        <td>{statusBadge}</td>
+        <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
+          {ready ? (
+            <button className="btn ghost sm" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
+              {open ? "Close" : "Invoke"}
+            </button>
+          ) : (
+            <span className="muted" style={{ fontSize: 11 }}>not callable</span>
+          )}
+        </td>
+      </tr>
+      {open && ready && (
+        <tr>
+          <td colSpan={4} style={{ background: "transparent" }}>
+            <InvokeTool tool={tool} />
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
+function InvokeTool({ tool }: { tool: ReluxToolDescriptor }) {
+  const [input, setInput] = useState('{\n  "message": "hello relux"\n}');
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<ReluxToolInvocationResult | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function run() {
+    setBusy(true);
+    setErr(null);
+    setResult(null);
+    let parsed: unknown = {};
+    const trimmed = input.trim();
+    if (trimmed) {
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch {
+        setErr("Input must be valid JSON (or empty).");
+        setBusy(false);
+        return;
+      }
+    }
+    try {
+      const res = await reluxTools.invoke({
+        plugin_id: tool.plugin_id,
+        tool_name: tool.tool_name,
+        input: parsed,
+      });
+      setResult(res);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Invocation failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="card" style={{ margin: "6px 0", padding: 12 }}>
+      <label className="field" style={{ margin: 0 }}>
+        <span style={{ fontSize: 12 }}>JSON input (invoked as Prime)</span>
+        <textarea
+          className="input"
+          style={{ minHeight: 90, fontFamily: "monospace", fontSize: 12 }}
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+        />
+      </label>
+      <div className="row wrap" style={{ gap: 8, marginTop: 10 }}>
+        <button className="btn" disabled={busy} onClick={() => void run()}>
+          {busy ? "Invoking..." : "Invoke"}
+        </button>
+      </div>
+      {err && (
+        <div className="banner err" style={{ fontSize: 12, marginTop: 10 }}>{err}</div>
+      )}
+      {result && (
+        <div style={{ marginTop: 10 }}>
+          <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>
+            Output (permission {result.permission}, agent {result.agent_id})
+          </div>
+          <pre
+            className="mono"
+            style={{
+              fontSize: 12,
+              background: "var(--panel, #111)",
+              padding: 10,
+              borderRadius: 6,
+              overflowX: "auto",
+              margin: 0,
+            }}
+          >
+            {JSON.stringify(result.output, null, 2)}
+          </pre>
+        </div>
+      )}
     </div>
   );
 }

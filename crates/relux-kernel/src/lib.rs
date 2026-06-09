@@ -17,6 +17,7 @@
 //! plugins will later sit behind.
 
 pub mod ai;
+pub mod builtin;
 pub mod clock;
 pub mod event;
 pub mod loader;
@@ -27,6 +28,7 @@ pub mod store;
 
 
 pub use ai::{shape_reply, AiConfig, AiMode, AiOutcome, AiStatus};
+pub use builtin::{is_builtin_tool, BUILTIN_TOOLS};
 pub use clock::Clock;
 pub use event::RunEvent;
 pub use loader::{load_plugin_manifests, MANIFEST_FILENAME};
@@ -76,6 +78,8 @@ pub enum KernelError {
     TaskNotAssigned(String),
     #[error("plugin {plugin} has no tool named {tool}")]
     ToolNotFound { plugin: String, tool: String },
+    #[error("tool {tool} on plugin {plugin} has no runtime handler yet (installed as metadata only; arbitrary plugin code is not executed)")]
+    ToolRuntimeUnavailable { plugin: String, tool: String },
     #[error("permission denied: agent {agent} lacks {permission}")]
     PermissionDenied { agent: String, permission: String },
     #[error("permission '{1}' already granted to agent {0}")]

@@ -76,12 +76,16 @@ mod tests {
     }
 
     #[test]
-    fn loads_both_example_manifests() {
+    fn loads_example_manifests_in_sorted_order() {
         let manifests = load_plugin_manifests(&examples_dir()).expect("load examples");
         let ids: Vec<&str> = manifests.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(
             ids,
-            vec!["relux-adapter-local-prime", "relux-tools-echo"],
+            vec![
+                "relux-adapter-local-prime",
+                "relux-tools-echo",
+                "relux-tools-status"
+            ],
             "manifests must load in sorted, deterministic order"
         );
     }

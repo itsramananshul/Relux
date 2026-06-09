@@ -12,6 +12,7 @@ use std::process::ExitCode;
 use relux_core::namespace::NamespaceKind;
 use relux_core::{
     AgentId, NamespaceId, Permission, PluginId, PluginSourceKind, PrimeContext, TaskId, TaskStatus,
+    ToolExecutability,
 };
 use relux_kernel::{
     install_from_dir, install_from_github, install_from_zip, load_plugin_manifests, remove_plugin,
@@ -44,6 +45,8 @@ fn main() -> ExitCode {
     //   relux-kernel plugin install-zip <p>  -> install a plugin from a .zip
     //   relux-kernel plugin install-github <url> -> install from a GitHub URL
     //   relux-kernel plugin remove <id>      -> remove an installed plugin
+    //   relux-kernel tools                   -> list installed tools + executable status
+    //   relux-kernel tool invoke <plugin> <tool> [json] -> invoke a built-in tool
     //
     // The persistent paths share one durable SQLite store so state survives
     // across invocations (`docs/RELUX_MASTER_PLAN.md` section 15 Phase 1, section 17.8). The
@@ -74,6 +77,8 @@ fn main() -> ExitCode {
         Some((cmd, _)) if cmd == "reset-local" => run_reset_local(),
         Some((cmd, _)) if cmd == "plugins" => run_plugins_list(),
         Some((cmd, rest)) if cmd == "plugin" => run_plugin_subcommand(rest),
+        Some((cmd, _)) if cmd == "tools" => run_tools_list(),
+        Some((cmd, rest)) if cmd == "tool" => run_tool_subcommand(rest),
         Some((cmd, rest)) if cmd == "task" => run_task_subcommand(rest),
         _ => run_demo(),
     };
@@ -394,8 +399,13 @@ fn ensure_bootstrapped(kernel: &mut KernelState) -> Result<PrimeContext, KernelE
             );
         }
         kernel.create_namespace(WORKSPACE_NS, "Workspace", NamespaceKind::Personal);
+        // Prime is granted exactly the two safe, built-in tool permissions so it
+        // can invoke the bundled echo and status tools through the kernel - least
+        // privilege (`docs/RELUX_MASTER_PLAN.md` section 17.5).
         let echo_permission = Permission::new("tool:relux-tools-echo:say")
             .expect("static echo permission is well-formed");
+        let status_permission = Permission::new("tool:relux-tools-status:summary")
+            .expect("static status permission is well-formed");
         kernel.create_agent(
             PRIME_AGENT,
             "Prime",
@@ -406,7 +416,7 @@ fn ensure_bootstrapped(kernel: &mut KernelState) -> Result<PrimeContext, KernelE
                 "You are Prime: understand intent, act through the kernel, never bypass permissions."
                     .to_string(),
             ),
-            vec![echo_permission],
+            vec![echo_permission, status_permission],
         )?;
     }
 
@@ -668,6 +678,98 @@ fn run_plugin_remove(plugin_id: &str) -> Result<(), KernelError> {
         remove_plugin(plugin_id, &root, kernel)?;
         Ok(format!("removed plugin {plugin_id}"))
     })
+}
+
+/// Render a tool's executable status as a short, honest label for the CLI.
+fn executability_label(e: &ToolExecutability) -> &'static str {
+    match e {
+        ToolExecutability::Ready => "ready",
+        ToolExecutability::NotImplemented => "not_implemented",
+        ToolExecutability::MissingPermission => "missing_permission",
+    }
+}
+
+/// List installed plugin tools and whether the kernel can actually run each one.
+///
+/// Bootstraps first (so a fresh DB shows the bundled tools), then prints each
+/// tool with its plugin, permission, risk, and honest executable status. Tools
+/// whose runtime is not implemented are listed - never hidden, never faked.
+fn run_tools_list() -> Result<(), KernelError> {
+    let path = db_path();
+    let mut store = SqliteStore::open(&path)?;
+    let mut kernel = store.load()?;
+    ensure_bootstrapped(&mut kernel)?;
+    store.save(&kernel)?;
+
+    let tools = kernel.discover_tools(None);
+    println!("== Relux installed tools ({}) ==", tools.len());
+    if tools.is_empty() {
+        println!("   (none)");
+    }
+    for t in &tools {
+        println!(
+            "   {:<24} {:<16} {:<8} {:<16} {}",
+            t.plugin_id,
+            t.tool_name,
+            format!("{:?}", t.risk).to_lowercase(),
+            executability_label(&t.executable),
+            t.permission,
+        );
+    }
+    println!();
+    println!("Only built-in deterministic tools are executable. Tools marked");
+    println!("'not_implemented' are installed as metadata; arbitrary plugin code is");
+    println!("not executed yet.");
+    Ok(())
+}
+
+/// Dispatch `relux-kernel tool <subcommand> ...`.
+fn run_tool_subcommand(args: &[String]) -> Result<(), KernelError> {
+    let usage = "usage: relux-kernel tool invoke <plugin-id> <tool-name> [json-input]";
+    match args.split_first() {
+        Some((sub, [plugin_id, tool_name, tail @ ..])) if sub == "invoke" => {
+            let input = tail.first().map(String::as_str);
+            run_tool_invoke(plugin_id, tool_name, input)
+        }
+        _ => Err(KernelError::Storage(usage.to_string())),
+    }
+}
+
+/// Invoke a built-in tool through the kernel as the Prime agent, then pretty-print
+/// the structured result. Routes through the same permission/audit path as the
+/// API; an unsupported tool returns a clear `ToolRuntimeUnavailable` error.
+fn run_tool_invoke(plugin_id: &str, tool_name: &str, input: Option<&str>) -> Result<(), KernelError> {
+    let input_value: serde_json::Value = match input {
+        Some(raw) if !raw.trim().is_empty() => serde_json::from_str(raw)
+            .map_err(|e| KernelError::Storage(format!("invalid JSON input: {e}")))?,
+        _ => serde_json::json!({}),
+    };
+
+    let path = db_path();
+    let mut store = SqliteStore::open(&path)?;
+    let mut kernel = store.load()?;
+    ensure_bootstrapped(&mut kernel)?;
+
+    let prime = kernel
+        .prime_agent_id()
+        .ok_or_else(|| KernelError::UnknownAgent("prime".to_string()))?;
+    let result = kernel.invoke_tool(
+        &prime,
+        &PluginId::new(plugin_id),
+        tool_name,
+        input_value,
+    )?;
+    store.save(&kernel)?;
+
+    println!("invoked {}/{} as {}", result.plugin_id, result.tool_name, result.agent_id);
+    println!("permission: {}", result.permission);
+    println!("output:");
+    let pretty = serde_json::to_string_pretty(&result.output)
+        .unwrap_or_else(|_| result.output.to_string());
+    for line in pretty.lines() {
+        println!("   {line}");
+    }
+    Ok(())
 }
 
 fn run_demo() -> Result<(), KernelError> {

@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use relux_core::{
     InstalledPlugin, PluginManifest, PluginSourceKind, PrimeAutonomyConfig, PrimeAutonomyTickResult,
-    PrimeTurn,
+    PrimeTurn, ToolInvocationResult,
 };
 use relux_kernel::{
     install_from_dir, install_from_github, install_from_zip, remove_plugin, AiConfig, AiMode,
@@ -129,6 +129,8 @@ async fn serve() -> Result<(), KernelError> {
     println!("   POST   /v1/relux/tasks                     {{ \"title\": \"...\" }}");
     println!("   POST   /v1/relux/tasks/:id/start");
     println!("   POST   /v1/relux/tasks/:id/execute-assigned");
+    println!("   GET    /v1/relux/tools                      (installed tools + executable status)");
+    println!("   POST   /v1/relux/tools/invoke              {{ \"plugin_id\":\"...\", \"tool_name\":\"...\", \"input\":{{}} }}");
     println!("   GET    /v1/relux/plugins");
     println!("   POST   /v1/relux/plugins/install-github   {{ \"url\": \"https://github.com/...\" }}");
     println!("   POST   /v1/relux/plugins/install-zip      (multipart field: file)");
@@ -228,6 +230,8 @@ fn router(state: AppState) -> Router {
         .route("/v1/relux/tasks/:id/start", post(start_task))
         .route("/v1/relux/tasks/:id/execute-assigned", post(execute_assigned_task))
         .route("/v1/relux/tasks/:id/assign", post(assign_task_to_agent))
+        .route("/v1/relux/tools", get(list_tools))
+        .route("/v1/relux/tools/invoke", post(invoke_tool))
         .route("/v1/relux/plugins", get(list_plugins))
         .route("/v1/relux/plugins/install-dir", post(install_dir))
         .route("/v1/relux/plugins/install-github", post(install_github))
@@ -372,6 +376,90 @@ async fn list_plugins(
 ) -> Result<Json<Vec<PluginRecord>>, ApiError> {
     let records = locked_read(&state, |kernel| Ok(plugin_records(kernel)))?;
     Ok(Json(records))
+}
+
+/// Optional `?agent=<id>` scoping for tool discovery: when supplied, each tool's
+/// executable status reflects whether THAT agent holds the permission
+/// (`ready`/`missing_permission`); when absent, discovery is permission-agnostic.
+#[derive(Debug, Deserialize)]
+struct ToolsQuery {
+    agent: Option<String>,
+}
+
+/// GET `/v1/relux/tools` - list installed plugin tools with their honest
+/// executable status (`docs/RELUX_MASTER_PLAN.md` section 7.4; `docs/Relux spec.md`
+/// section 20.2 Tools view). Returns only manifest-declared tool metadata; never
+/// plugin config or secrets.
+async fn list_tools(
+    State(state): State<AppState>,
+    query: axum::extract::Query<ToolsQuery>,
+) -> Result<Json<Vec<relux_core::ToolDescriptor>>, ApiError> {
+    let agent_id = query
+        .agent
+        .as_ref()
+        .map(|a| a.trim())
+        .filter(|a| !a.is_empty())
+        .map(relux_core::AgentId::new);
+    let tools = locked_read(&state, |kernel| {
+        Ok(kernel.discover_tools(agent_id.as_ref()))
+    })?;
+    Ok(Json(tools))
+}
+
+#[derive(Debug, Deserialize)]
+struct InvokeToolReq {
+    plugin_id: String,
+    tool_name: String,
+    /// JSON input passed to the tool; defaults to `{}` when omitted.
+    input: Option<serde_json::Value>,
+    /// Actor to attribute the call to; defaults to Prime when omitted.
+    agent_id: Option<String>,
+}
+
+/// POST `/v1/relux/tools/invoke` - invoke a supported built-in tool, permission-
+/// checked and audited (`docs/RELUX_MASTER_PLAN.md` section 13.6, section 10.2).
+///
+/// The actor defaults to Prime (when it exists and holds the permission);
+/// otherwise an explicit `agent_id` is required. An installed-but-unimplemented
+/// tool returns HTTP 501 with a clear error and never fabricates output; a
+/// permission denial returns HTTP 403.
+async fn invoke_tool(
+    State(state): State<AppState>,
+    Json(req): Json<InvokeToolReq>,
+) -> Result<Json<ToolInvocationResult>, ApiError> {
+    let plugin_id = req.plugin_id.trim().to_string();
+    if plugin_id.is_empty() {
+        return Err(ApiError::bad_request("plugin_id is required"));
+    }
+    let tool_name = req.tool_name.trim().to_string();
+    if tool_name.is_empty() {
+        return Err(ApiError::bad_request("tool_name is required"));
+    }
+    let input = req.input.unwrap_or_else(|| serde_json::json!({}));
+    let requested_agent = req
+        .agent_id
+        .as_ref()
+        .map(|a| a.trim())
+        .filter(|a| !a.is_empty())
+        .map(|a| a.to_string());
+
+    let result = locked_save(&state, |kernel| {
+        let agent_id = match requested_agent {
+            Some(a) => relux_core::AgentId::new(a),
+            None => kernel.prime_agent_id().ok_or_else(|| {
+                KernelError::UnknownAgent(
+                    "no agent_id supplied and Prime is not available".to_string(),
+                )
+            })?,
+        };
+        kernel.invoke_tool(
+            &agent_id,
+            &relux_core::PluginId::new(plugin_id.clone()),
+            &tool_name,
+            input,
+        )
+    })?;
+    Ok(Json(result))
 }
 
 async fn list_tasks(State(state): State<AppState>) -> Result<Json<Vec<TaskRecord>>, ApiError> {
@@ -1302,8 +1390,15 @@ impl From<KernelError> for ApiError {
 /// plugins are 404; protected (bundled) removal is 409; storage/io is 500.
 fn status_for(err: &KernelError) -> StatusCode {
     match err {
-        KernelError::PluginNotInstalled(_) => StatusCode::NOT_FOUND,
+        KernelError::PluginNotInstalled(_)
+        | KernelError::ToolNotFound { .. }
+        | KernelError::UnknownPlugin(_)
+        | KernelError::UnknownAgent(_) => StatusCode::NOT_FOUND,
         KernelError::BundledPluginProtected(_) => StatusCode::CONFLICT,
+        // A tool installed as metadata but with no runtime handler yet: honest
+        // "not implemented", not a server fault or a fabricated success.
+        KernelError::ToolRuntimeUnavailable { .. } => StatusCode::NOT_IMPLEMENTED,
+        KernelError::PermissionDenied { .. } => StatusCode::FORBIDDEN,
         KernelError::UnsafePluginPath(_)
         | KernelError::PluginInstall(_)
         | KernelError::ManifestParse { .. }
@@ -1437,6 +1532,29 @@ mod tests {
         assert_eq!(
             status_for(&KernelError::Storage("disk".into())),
             StatusCode::INTERNAL_SERVER_ERROR
+        );
+        // Tool invocation errors map honestly: not-implemented -> 501,
+        // permission denied -> 403, unknown tool -> 404.
+        assert_eq!(
+            status_for(&KernelError::ToolRuntimeUnavailable {
+                plugin: "p".into(),
+                tool: "t".into()
+            }),
+            StatusCode::NOT_IMPLEMENTED
+        );
+        assert_eq!(
+            status_for(&KernelError::PermissionDenied {
+                agent: "a".into(),
+                permission: "tool:x:y".into()
+            }),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            status_for(&KernelError::ToolNotFound {
+                plugin: "p".into(),
+                tool: "t".into()
+            }),
+            StatusCode::NOT_FOUND
         );
     }
 }

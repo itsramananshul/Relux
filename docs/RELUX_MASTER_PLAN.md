@@ -1639,6 +1639,8 @@ Also available:
   GET /v1/relux/runs/:id
   GET /v1/relux/runs/:id/events
   GET /v1/relux/audit?limit=N
+  GET /v1/relux/tools
+  POST /v1/relux/tools/invoke
 ```
 
 Open `http://127.0.0.1:19891/dashboard`. The default surface is Relux Home,
@@ -1721,6 +1723,52 @@ Dashboard: the Prime page exposes a Prime Autonomy panel with toggle, interval,
 max tasks per tick, auto-assign, last tick summary, and a "Run one tick now"
 control.
 
+### Tool Invocation Surface (First Honest Version)
+
+Installed ToolSet plugins are now visible, callable capabilities through the
+kernel, CLI, API, and dashboard - the first step toward Prime as a Codex-like
+operator with plugin abilities (sections 7.4, 8.2, 9.8).
+
+The first version is safe and honest by construction:
+
+- Only the kernel's **built-in deterministic tool handlers** execute. Two ship
+  today: `relux-tools-echo` / `echo.say` (returns input unchanged) and
+  `relux-tools-status` / `status.summary` (read-only control-plane counts). The
+  single source of truth for what is runnable is `relux_kernel::builtin`.
+- An installed tool with no built-in runtime is discoverable but reported as
+  `not_implemented` - it is never faked. Invoking it returns a clear
+  `ToolRuntimeUnavailable` error (HTTP 501) with no fabricated output.
+- Arbitrary downloaded plugin code (GitHub/zip/folder installs) is installable as
+  metadata/manifests but is **not executed**. No shelling out to plugin commands,
+  no filesystem/network side effects from installed plugins.
+- Every invocation routes through the kernel permission check and is written to
+  the audit log (success, denial, or not-implemented). Nothing bypasses the
+  kernel. A permission denial returns HTTP 403.
+- `KernelState::call_tool` runs inside a run (transcript + audit);
+  `KernelState::invoke_tool` is the run-free audit-only path behind the API/CLI;
+  `KernelState::discover_tools` powers capability discovery, optionally scoped to
+  one agent's permissions (`ready` / `not_implemented` / `missing_permission`).
+
+CLI:
+
+```powershell
+relux-kernel tools
+relux-kernel tool invoke relux-tools-echo echo.say '{"message":"hi"}'
+relux-kernel tool invoke relux-tools-status status.summary
+```
+
+API:
+
+```text
+GET  /v1/relux/tools            # installed tools + executable status (?agent=<id> to scope)
+POST /v1/relux/tools/invoke     # { "plugin_id", "tool_name", "input"?, "agent_id"? }
+```
+
+Dashboard: the Plugins page lists installed tools with an honest executable
+status and offers a small invoke panel (JSON input + output/error) for ready
+tools. An installed tool with no runtime shows "installed, runtime not
+implemented yet" rather than being hidden or pretend-run.
+
 ### Optional LLM-backed Prime (OpenRouter)
 
 As of Phase 2.1, Prime can optionally use an LLM (via OpenRouter) to shape its
@@ -1750,5 +1798,9 @@ The API never returns the key. The dashboard shows the current AI provider/mode.
   Relix web bridge + a login and degrade honestly when it is absent.
 - Prime has an optional LLM-backed path for conversational replies, but its
   core planning remains deterministic. Multi-agent autonomous execution is later.
+- Tool invocation executes only built-in deterministic handlers (echo, status).
+  Arbitrary installed plugin tools are discoverable and listed honestly as
+  `not_implemented`; running downloaded plugin code (real ToolSets, adapters,
+  execution environments) is intentionally not implemented yet.
 - The standalone API is local-only and unauthenticated by design; it binds
   loopback. It is not a multi-user or production surface.

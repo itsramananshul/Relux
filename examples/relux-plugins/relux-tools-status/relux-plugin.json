@@ -1,0 +1,25 @@
+{
+  "id": "relux-tools-status",
+  "name": "Relux Status Tools",
+  "version": "0.1.0",
+  "kind": "ToolSet",
+  "description": "A local, read-only ToolSet whose single tool returns a deterministic summary of the control-plane state (counts of plugins, agents, tasks, runs, and approvals). No network or filesystem access.",
+  "author": "Relux Labs",
+  "trust_level": "official",
+  "capabilities": {
+    "tools": [
+      {
+        "name": "status.summary",
+        "description": "Return a deterministic summary of the local control-plane state.",
+        "risk": "low",
+        "permission": "tool:relux-tools-status:summary",
+        "approval": "never",
+        "timeout_secs": 5
+      }
+    ],
+    "permissions": [
+      "tool:relux-tools-status:summary"
+    ]
+  },
+  "health": "unknown"
+}

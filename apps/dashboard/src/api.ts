@@ -1540,6 +1540,56 @@ export const reluxPlugins = {
     api.del<{ removed: string }>(`/v1/relux/plugins/${encodeURIComponent(id)}`),
 };
 
+// -- Relux Tools (the honest tool-invocation surface) ----------------------
+// Installed plugin tools, surfaced with an honest executable status. Only
+// built-in deterministic kernel handlers run; an installed-but-unimplemented
+// tool is listed as `not_implemented`, never faked. Invocation is permission-
+// checked and audited through the same kernel path as the CLI.
+
+// One discovered tool with its executable status.
+export interface ReluxToolDescriptor {
+  plugin_id: string;
+  tool_name: string;
+  description: string;
+  permission: string;
+  risk: string;
+  source_kind: string;
+  installed: boolean;
+  enabled: boolean;
+  protected: boolean;
+  // "ready" → invocable; "not_implemented" → installed metadata only, no runtime;
+  // "missing_permission" → the scoped agent lacks the permission.
+  executable: "ready" | "not_implemented" | "missing_permission";
+}
+
+// The structured result of a successful tool invocation.
+export interface ReluxToolInvocationResult {
+  plugin_id: string;
+  tool_name: string;
+  agent_id: string;
+  permission: string;
+  output: unknown;
+}
+
+export const reluxTools = {
+  // List installed tools + executable status. Pass `agent` to scope the status
+  // to one agent's permissions. Throws an ApiError on failure so the page can
+  // show the real reason (e.g. "relux-kernel serve" not running).
+  list: (agent?: string) =>
+    api.get<ReluxToolDescriptor[]>(
+      `/v1/relux/tools${agent ? `?agent=${encodeURIComponent(agent)}` : ""}`,
+    ),
+  // Invoke a supported built-in tool. `input` defaults to {} server-side; the
+  // actor defaults to Prime when `agent_id` is omitted. A not-implemented tool
+  // surfaces as an ApiError (HTTP 501); a permission denial as HTTP 403.
+  invoke: (body: {
+    plugin_id: string;
+    tool_name: string;
+    input?: unknown;
+    agent_id?: string;
+  }) => api.post<ReluxToolInvocationResult>("/v1/relux/tools/invoke", body),
+};
+
 // -- Relux Approvals --------------------------------------------------------
 
 export interface ReluxApproval {

@@ -38,7 +38,46 @@ Also available:
   GET /v1/relux/runs/:id
   GET /v1/relux/runs/:id/events
   GET /v1/relux/audit?limit=N
+  GET /v1/relux/tools
+  POST /v1/relux/tools/invoke
 ```
+
+### Tools (capability discovery + invocation)
+
+Installed ToolSet plugins are surfaced as callable capabilities through the
+kernel, CLI, API, and dashboard. The first version is deliberately safe and
+honest: **only built-in deterministic tool handlers execute.** An
+installed-but-unimplemented tool is listed as `not_implemented` rather than
+faked, and arbitrary downloaded plugin code is never run.
+
+Two built-in tools ship today:
+
+- `relux-tools-echo` / `echo.say` - returns its input unchanged.
+- `relux-tools-status` / `status.summary` - returns a deterministic summary of
+  control-plane counts (read-only; no network or filesystem access).
+
+Every invocation routes through the kernel permission check and the audit log.
+
+```powershell
+# List installed tools and whether the kernel can actually run each one.
+relux-kernel tools
+
+# Invoke a built-in tool as Prime (JSON input is optional, defaults to {}).
+relux-kernel tool invoke relux-tools-echo echo.say '{"message":"hi"}'
+relux-kernel tool invoke relux-tools-status status.summary
+```
+
+API:
+
+```text
+GET  /v1/relux/tools            # installed tools + executable status (?agent=<id> to scope)
+POST /v1/relux/tools/invoke     # { "plugin_id", "tool_name", "input"?, "agent_id"? }
+```
+
+A permission denial returns HTTP 403; an installed tool with no kernel runtime
+returns HTTP 501 (`ToolRuntimeUnavailable`) with a clear message and never
+fabricates output. The dashboard Plugins page lists tools with their status and
+provides a small invoke panel (JSON input + output/error) for ready tools.
 
 ### First Local Release
 
