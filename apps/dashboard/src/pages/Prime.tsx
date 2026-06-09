@@ -174,7 +174,7 @@ function PrimeTurnCard({ turn }: { turn: ReluxPrimeTurn }) {
       </div>
       <div style={{ whiteSpace: "pre-wrap" }}>{turn.reply}</div>
 
-      {(turn.created_task || turn.started_run || turn.approval) && (
+      {(turn.created_task || turn.started_run || turn.created_agent || turn.approval) && (
         <div className="row wrap" style={{ gap: 10, marginTop: 10, fontSize: 11 }}>
           {turn.created_task && (
             <span className="muted">
@@ -184,6 +184,11 @@ function PrimeTurnCard({ turn }: { turn: ReluxPrimeTurn }) {
           {turn.started_run && (
             <span className="muted">
               run <Link to="/work" className="mono" title="View execution history">{turn.started_run}</Link>
+            </span>
+          )}
+          {turn.created_agent && (
+            <span className="muted">
+              agent <Link to={`/crew/${turn.created_agent}`} className="mono" title="View agent details">{turn.created_agent}</Link>
             </span>
           )}
           {turn.approval && (

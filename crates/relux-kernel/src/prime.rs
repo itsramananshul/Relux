@@ -49,7 +49,7 @@ const CREATION_VERBS: &[&str] = &[
 ///
 /// Deterministic and rule-based: the checks are ordered and the first match
 /// wins, so more specific intents (status, explanation, run control) are tested
-/// before the broad "this is work" task-creation catch, and a bare greeting is
+/// before the broad "this is work" task creation catch, and a bare greeting is
 /// only matched once nothing more actionable has. This is the seam a real
 /// classifier model will sit behind.
 pub fn classify_intent(message: &str) -> PrimeIntent {
@@ -78,6 +78,26 @@ pub fn classify_intent(message: &str) -> PrimeIntent {
             || CREATION_VERBS.contains(&first_word.as_str()))
     {
         return PrimeIntent::CreateAndRunTask;
+    }
+    if has(&[
+        "hire",
+        "spawn",
+        "create an agent",
+        "create agent",
+        "new agent",
+        "another agent",
+        "add an agent",
+        "crew member",
+        "run claude on",
+        "run codex on",
+    ]) {
+        return PrimeIntent::AgentCreation;
+    }
+    if starts("assign")
+        || starts("delegate")
+        || has(&["assign task", "delegate task", "assign ", "delegate "])
+    {
+        return PrimeIntent::AssignTask;
     }
     if has(&[
         "create a task",
@@ -138,21 +158,6 @@ pub fn classify_intent(message: &str) -> PrimeIntent {
         ])
     {
         return PrimeIntent::RunStart;
-    }
-    if has(&[
-        "hire",
-        "spawn",
-        "create an agent",
-        "create agent",
-        "new agent",
-        "another agent",
-        "add an agent",
-        "run claude on",
-        "run codex on",
-        "delegate this",
-        "delegate to",
-    ]) {
-        return PrimeIntent::AgentCreation;
     }
     if has(&[
         "install ",
@@ -307,15 +312,12 @@ pub fn decide(message: &str, intent: &PrimeIntent, summary: &StateSummary) -> Pr
         }
         PrimeIntent::AgentCreation => {
             let name = derive_agent_name(message);
-            PrimePlan::Propose {
+            PrimePlan::Act {
                 action: PrimeAction::CreateAgent {
                     name: name.clone(),
                     adapter_plugin: "relux-adapter-local-prime".to_string(),
                 },
-                reason: "Creating an agent adds a new actor with its own permissions and the ability to run work."
-                    .to_string(),
-                risk: RiskLevel::Medium,
-                text: format!("I can create an agent \"{name}\" on the local adapter."),
+                text: format!("Creating agent \"{name}\" on the local adapter."),
             }
         }
         PrimeIntent::PluginInstallation => {
@@ -348,6 +350,45 @@ pub fn decide(message: &str, intent: &PrimeIntent, summary: &StateSummary) -> Pr
                 text: format!("I can grant {permission} to {subject}."),
             }
         }
+        PrimeIntent::AssignTask => {
+            let parsed_task_id = extract_task_id(message);
+            let parsed_agent_id = extract_agent_id_from_assignment(message);
+
+            match (parsed_task_id, parsed_agent_id) {
+                (Some(task_id_str), Some(agent_id_str)) => {
+                    // Validate task and agent existence using summary
+                    let task_exists = summary.all_task_ids.contains(&task_id_str);
+                    let agent_exists = summary.all_agent_ids.contains(&agent_id_str);
+
+                    if !task_exists {
+                        PrimePlan::Reply {
+                            text: format!("Task with ID '{}' does not exist. Please provide a valid task ID.", task_id_str),
+                        }
+                    } else if !agent_exists {
+                        PrimePlan::Reply {
+                            text: format!("Agent with ID '{}' does not exist. Please provide a valid agent name.", agent_id_str),
+                        }
+                    } else {
+                        PrimePlan::Act {
+                            action: PrimeAction::AssignTask {
+                                task_id: task_id_str.clone(),
+                                agent_id: agent_id_str.clone(),
+                            },
+                            text: format!("Assigning task {} to agent {}.", task_id_str, agent_id_str),
+                        }
+                    }
+                }
+                (None, Some(_)) => PrimePlan::Clarify {
+                    text: "I couldn't find a task ID in your request. Please specify the task to assign.".to_string(),
+                },
+                (Some(_), None) => PrimePlan::Clarify {
+                    text: "I couldn't find an agent name in your request. Please specify which agent to assign the task to.".to_string(),
+                },
+                (None, None) => PrimePlan::Clarify {
+                    text: "I need both a task ID and an agent name to assign a task. Please rephrase your request.".to_string(),
+                },
+            }
+        },
         PrimeIntent::TaskUpdate => PrimePlan::Clarify {
             text: "Which task should I update, and what should change?".to_string(),
         },
@@ -517,6 +558,18 @@ fn task_title(message: &str) -> Option<String> {
 
 fn derive_agent_name(message: &str) -> String {
     let m = message.to_lowercase();
+    for marker in [" named ", " called ", " as "] {
+        if let Some(idx) = m.find(marker) {
+            let raw = m[idx + marker.len()..]
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_');
+            if !raw.is_empty() {
+                return raw.replace('_', "-");
+            }
+        }
+    }
     if m.contains("browser") {
         "browser-agent".to_string()
     } else if m.contains("research") {
@@ -552,6 +605,58 @@ fn derive_permission_label(message: &str) -> String {
     }
 }
 
+fn extract_task_id(message: &str) -> Option<String> {
+    let m = message.to_lowercase();
+    if let Some(start_idx) = m.find("task_") {
+        let remainder = &m[start_idx + "task_".len()..];
+        let id: String = remainder
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
+        if !id.is_empty() {
+            return Some(format!("task_{}", id));
+        }
+    }
+    None
+}
+
+fn extract_agent_id_from_assignment(message: &str) -> Option<String> {
+    let m = message.to_lowercase();
+    if let Some(to_idx) = m.find(" to ") {
+        let remainder = &m[to_idx + " to ".len()..];
+        let agent_name: String = remainder
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string();
+        if !agent_name.is_empty() {
+            return Some(agent_name);
+        }
+        return None;
+    }
+    if let Some(assign_idx) = m.find("assign ") {
+        let remainder = &m[assign_idx + "assign ".len()..];
+        let words: Vec<&str> = remainder.split_whitespace().collect();
+        if let Some(last_word) = words.last() {
+            if !last_word.starts_with("task_") && *last_word != "to" {
+                return Some(last_word.to_string());
+            }
+        }
+    }
+    if let Some(named_idx) = m.find("agent named ") {
+        let remainder = &m[named_idx + "agent named ".len()..];
+        let agent_name: String = remainder
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string();
+        if !agent_name.is_empty() {
+            return Some(agent_name);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,6 +672,8 @@ mod tests {
             tasks_blocked: 0,
             tasks_failed: 0,
             pending_approvals: 0,
+            all_agent_ids: vec![],
+            all_task_ids: vec![],
             queued: vec![],
             recent: vec![],
         }

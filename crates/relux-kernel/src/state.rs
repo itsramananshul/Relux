@@ -148,7 +148,9 @@ impl KernelState {
             state.plugins.insert(plugin.id.clone(), plugin);
         }
         for installed in snapshot.installed_plugins {
-            state.installed_plugins.insert(installed.id.clone(), installed);
+            state
+                .installed_plugins
+                .insert(installed.id.clone(), installed);
         }
         for namespace in snapshot.namespaces {
             state.namespaces.insert(namespace.id.clone(), namespace);
@@ -892,6 +894,8 @@ impl KernelState {
             tasks_blocked: blocked,
             tasks_failed: failed,
             pending_approvals: self.pending_approval_count(),
+            all_agent_ids: self.agents.keys().map(|id| id.0.clone()).collect(),
+            all_task_ids: self.tasks.keys().map(|id| id.0.clone()).collect(),
             queued,
             recent,
         }
@@ -933,6 +937,7 @@ impl KernelState {
                 action: None,
                 created_task: None,
                 started_run: None,
+                created_agent: None,
                 approval: None,
             }),
             PrimePlan::Clarify { text } => Ok(PrimeTurn {
@@ -942,6 +947,7 @@ impl KernelState {
                 action: None,
                 created_task: None,
                 started_run: None,
+                created_agent: None,
                 approval: None,
             }),
             PrimePlan::Act { action, text } => self.prime_execute(ctx, intent, action, text),
@@ -969,6 +975,7 @@ impl KernelState {
                     action: Some(action),
                     created_task: None,
                     started_run: None,
+                    created_agent: None,
                     approval: Some(approval),
                 })
             }
@@ -1010,6 +1017,7 @@ impl KernelState {
                     action: Some(action),
                     created_task: Some(task),
                     started_run: None,
+                    created_agent: None,
                     approval: None,
                 })
             }
@@ -1044,6 +1052,7 @@ impl KernelState {
                     action: Some(action),
                     created_task: Some(task),
                     started_run: Some(run),
+                    created_agent: None,
                     approval: None,
                 })
             }
@@ -1069,6 +1078,50 @@ impl KernelState {
                     action: Some(action),
                     created_task: None,
                     started_run: Some(run),
+                    created_agent: None,
+                    approval: None,
+                })
+            }
+            PrimeAction::CreateAgent {
+                name,
+                adapter_plugin,
+            } => {
+                let agent_id_str = name.to_lowercase().replace(" ", "-");
+                let adapter = PluginId::new(adapter_plugin.clone());
+                let agent_id = self.create_agent(
+                    &agent_id_str,
+                    name,
+                    "Agent created by Prime", // Default description
+                    &adapter,
+                    &ctx.namespace,
+                    None,   // No persona
+                    vec![], // No special permissions by default
+                )?;
+                let reply = format!("{text} Created agent {agent_id}.");
+                Ok(PrimeTurn {
+                    intent,
+                    reply,
+                    disposition: PrimeDisposition::Executed,
+                    action: Some(action),
+                    created_task: None,
+                    started_run: None,
+                    created_agent: Some(agent_id),
+                    approval: None,
+                })
+            }
+            PrimeAction::AssignTask { task_id, agent_id } => {
+                let task_obj_id = TaskId::new(task_id.clone());
+                let agent_obj_id = AgentId::new(agent_id.clone());
+                self.assign_task(&task_obj_id, &agent_obj_id)?;
+                let reply = format!("{text} Assigned task {} to agent {}.", task_id, agent_id);
+                Ok(PrimeTurn {
+                    intent,
+                    reply,
+                    disposition: PrimeDisposition::Executed,
+                    action: Some(action),
+                    created_task: None,
+                    started_run: None,
+                    created_agent: None,
                     approval: None,
                 })
             }
@@ -1082,6 +1135,7 @@ impl KernelState {
                 action: Some(action.clone()),
                 created_task: None,
                 started_run: None,
+                created_agent: None,
                 approval: None,
             }),
         }
@@ -1287,6 +1341,94 @@ mod tests {
     }
 
     #[test]
+    fn prime_create_agent_success() {
+        let (mut k, ctx) = prime_chat_kernel();
+
+        let turn = k
+            .prime_turn(&ctx, "create an agent named researcher-bot")
+            .unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::AgentCreation);
+        assert_eq!(turn.disposition, PrimeDisposition::Executed);
+        let created_agent_id = turn.created_agent.expect("an agent was created");
+        assert_eq!(created_agent_id.as_str(), "researcher-bot");
+        assert_eq!(k.agent_count(), 2, "agent count should increase by 1"); // prime + researcher-bot
+        assert!(k.agent(&created_agent_id).is_some());
+    }
+
+    #[test]
+    fn prime_assign_task_success() {
+        let (mut k, ctx) = prime_chat_kernel();
+
+        // Create a task and an agent first
+        let create_task_turn = k.prime_turn(&ctx, "create a task to research AI").unwrap();
+        let task_id = create_task_turn.created_task.expect("task created");
+        let create_agent_turn = k
+            .prime_turn(&ctx, "create an agent named research-agent")
+            .unwrap();
+        let agent_id = create_agent_turn.created_agent.expect("agent created");
+
+        let assign_turn = k
+            .prime_turn(&ctx, &format!("assign {} to {}", task_id, agent_id))
+            .unwrap();
+        assert_eq!(assign_turn.intent, relux_core::PrimeIntent::AssignTask);
+        assert_eq!(assign_turn.disposition, PrimeDisposition::Executed);
+        assert!(assign_turn
+            .reply
+            .contains(&format!("Assigned task {} to agent {}", task_id, agent_id)));
+        assert_eq!(
+            k.task(&task_id).unwrap().assigned_agent.as_ref(),
+            Some(&agent_id)
+        );
+    }
+
+    #[test]
+    fn prime_assign_task_clarifies_incomplete_intent() {
+        let (mut k, ctx) = prime_chat_kernel();
+
+        let turn = k.prime_turn(&ctx, "assign to research-agent").unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::AssignTask);
+        assert_eq!(turn.disposition, PrimeDisposition::NeedsClarification);
+        assert!(turn.reply.contains("I couldn't find a task ID"));
+
+        let turn = k.prime_turn(&ctx, "assign task_0001 to").unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::AssignTask);
+        assert_eq!(turn.disposition, PrimeDisposition::NeedsClarification);
+        assert!(turn.reply.contains("I couldn't find an agent name"));
+
+        let turn = k.prime_turn(&ctx, "assign").unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::AssignTask);
+        assert_eq!(turn.disposition, PrimeDisposition::NeedsClarification);
+        assert!(turn
+            .reply
+            .contains("I need both a task ID and an agent name"));
+    }
+
+    #[test]
+    fn prime_assign_task_fails_for_non_existent_task_or_agent() {
+        let (mut k, ctx) = prime_chat_kernel();
+
+        // Non-existent task
+        let turn = k.prime_turn(&ctx, "assign task_9999 to prime").unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::AssignTask);
+        assert_eq!(turn.disposition, PrimeDisposition::Answered); // Disposition for reply
+        assert!(turn
+            .reply
+            .contains("Task with ID 'task_9999' does not exist."));
+
+        // Non-existent agent
+        let create_task_turn = k.prime_turn(&ctx, "create a task to research AI").unwrap();
+        let task_id = create_task_turn.created_task.expect("task created");
+        let turn = k
+            .prime_turn(&ctx, &format!("assign {} to missing-agent", task_id))
+            .unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::AssignTask);
+        assert_eq!(turn.disposition, PrimeDisposition::Answered); // Disposition for reply
+        assert!(turn
+            .reply
+            .contains("Agent with ID 'missing-agent' does not exist."));
+    }
+
+    #[test]
     fn full_loop_completes_and_audits() {
         let (mut k, prime, task, run, echo) = primed_kernel();
 
@@ -1478,7 +1620,8 @@ mod tests {
         let turn = k.prime_turn(&ctx, "install relux-tools-github").unwrap();
         let approval = turn.approval.expect("an approval was raised");
 
-        k.resolve_approval(&approval, true, "founder", None).unwrap();
+        k.resolve_approval(&approval, true, "founder", None)
+            .unwrap();
         assert_eq!(
             k.approval(&approval).unwrap().status,
             ApprovalStatus::Approved
@@ -1524,15 +1667,9 @@ mod tests {
         assert_eq!(restored.agent_count(), k.agent_count());
         assert_eq!(restored.task_count(), k.task_count());
         assert_eq!(restored.run_count(), k.run_count());
-        assert_eq!(
-            restored.task(&task).unwrap().status,
-            TaskStatus::Completed
-        );
+        assert_eq!(restored.task(&task).unwrap().status, TaskStatus::Completed);
         assert_eq!(restored.run(&run).unwrap().status, RunStatus::Completed);
-        assert_eq!(
-            restored.run_events(&run).len(),
-            k.run_events(&run).len()
-        );
+        assert_eq!(restored.run_events(&run).len(), k.run_events(&run).len());
         assert_eq!(restored.audit_log().len(), k.audit_log().len());
 
         // Counters resume: the next snapshot from the restored kernel is identical,

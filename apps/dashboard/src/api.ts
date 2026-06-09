@@ -1336,6 +1336,7 @@ export interface ReluxPrimeTurn {
   action: ReluxPrimeAction | null;
   created_task: string | null;
   started_run: string | null;
+  created_agent: string | null;
   approval: string | null;
   state: ReluxState;
   /// Which path produced the reply (deterministic or LLM).

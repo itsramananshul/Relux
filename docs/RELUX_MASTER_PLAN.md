@@ -1647,8 +1647,11 @@ backed only by the local `/v1/relux` API:
   approvals) plus the installed-plugin list.
 - **Prime** - chat with the local operator. It runs the same grounded
   `prime_turn` as the CLI: a greeting stays a greeting, "create a task to X"
-  creates that task, and risky actions come back as a proposal awaiting
-  approval (section 10). Endpoint: `POST /v1/relux/prime { "message": "..." }`.
+  creates that task, "create an agent named researcher" creates a durable crew
+  member on the local adapter, "assign task_0001 to researcher" delegates work
+  after validating the task and agent, and risky actions come back as a proposal
+  awaiting approval (section 10). Endpoint: `POST /v1/relux/prime { "message":
+  "..." }`.
 - **Work** - standalone task board and execution history. Backed by the
   `/v1/relux/tasks` and `/v1/relux/runs` endpoints; allows creating tasks
   and starting runs directly from the board.

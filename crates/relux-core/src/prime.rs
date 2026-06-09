@@ -18,6 +18,7 @@ pub enum PrimeIntent {
     TaskCreation,
     CreateAndRunTask,
     TaskUpdate,
+    AssignTask,
     RunStart,
     RunRetry,
     AgentCreation,
@@ -115,6 +116,10 @@ pub struct StateSummary {
     pub tasks_blocked: usize,
     pub tasks_failed: usize,
     pub pending_approvals: usize,
+    /// All agents known to the system, by their ID.
+    pub all_agent_ids: Vec<String>,
+    /// All tasks known to the system, by their ID.
+    pub all_task_ids: Vec<String>,
     /// Tasks assigned and ready to start, in id order.
     pub queued: Vec<TaskBrief>,
     /// The most recent tasks (newest first), used to ground explanations.
@@ -176,6 +181,7 @@ pub struct PrimeTurn {
     pub action: Option<PrimeAction>,
     pub created_task: Option<TaskId>,
     pub started_run: Option<RunId>,
+    pub created_agent: Option<AgentId>,
     pub approval: Option<ApprovalId>,
 }
 

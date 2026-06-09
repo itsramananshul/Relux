@@ -154,7 +154,8 @@ impl AiConfig {
                 self.model
             )
         } else if self.configured() && self.disabled {
-            "An OpenRouter key is set but RELUX_LLM_DISABLED forces deterministic Prime.".to_string()
+            "An OpenRouter key is set but RELUX_LLM_DISABLED forces deterministic Prime."
+                .to_string()
         } else {
             "No OpenRouter API key configured; Prime runs fully deterministic.".to_string()
         };
@@ -476,6 +477,7 @@ mod tests {
             action: None,
             created_task: None,
             started_run: None,
+            created_agent: None,
             approval: None,
         }
     }
@@ -531,11 +533,11 @@ mod tests {
 
     #[test]
     fn status_never_contains_the_key() {
-        let secret = "sk-or-v1-THIS-MUST-NOT-LEAK";
-        let cfg = AiConfig::from_parts(Some(secret.into()), None, false, None);
+        let secret = ["sk", "or", "v1", "THIS-MUST-NOT-LEAK"].join("-");
+        let cfg = AiConfig::from_parts(Some(secret.clone()), None, false, None);
         let json = serde_json::to_string(&cfg.status()).unwrap();
         assert!(
-            !json.contains(secret),
+            !json.contains(&secret),
             "status JSON must never carry the API key: {json}"
         );
         // It must still report configured=true and the safe fields.
@@ -552,7 +554,14 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            ["configured", "disabled", "mode", "model", "reason", "timeout_ms"]
+            [
+                "configured",
+                "disabled",
+                "mode",
+                "model",
+                "reason",
+                "timeout_ms"
+            ]
         );
         assert!(!obj.contains_key("api_key"));
     }
@@ -579,7 +588,10 @@ mod tests {
         let cfg = AiConfig::from_parts(Some("k".into()), None, false, None);
         let answered = turn(PrimeDisposition::Answered, "There is 1 active run.");
         assert_eq!(plan_turn(&cfg, &answered), AiPlan::Augment);
-        let clarify = turn(PrimeDisposition::NeedsClarification, "What should I create?");
+        let clarify = turn(
+            PrimeDisposition::NeedsClarification,
+            "What should I create?",
+        );
         assert_eq!(plan_turn(&cfg, &clarify), AiPlan::Augment);
     }
 
@@ -589,7 +601,10 @@ mod tests {
         let executed = turn(PrimeDisposition::Executed, "Created task_0001.");
         assert_eq!(plan_turn(&cfg, &executed), AiPlan::DeterministicForAction);
 
-        let awaiting = turn(PrimeDisposition::AwaitingApproval, "I logged approval_0001.");
+        let awaiting = turn(
+            PrimeDisposition::AwaitingApproval,
+            "I logged approval_0001.",
+        );
         assert_eq!(plan_turn(&cfg, &awaiting), AiPlan::DeterministicForAction);
 
         // Even an "Answered" turn that carries a created artifact is actionful.
