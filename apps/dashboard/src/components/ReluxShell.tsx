@@ -20,6 +20,7 @@ const RELUX_NAV: NavEntry[] = [
   { to: "/", label: "Home", icon: "◈" },
   { to: "/prime", label: "Prime", icon: "✦" },
   { to: "/work", label: "Work", icon: "⚙" },
+  { to: "/crew", label: "Crew", icon: "⨈" },
   { to: "/plugins", label: "Plugins", icon: "#" },
 ];
 
@@ -37,6 +38,7 @@ const TITLES: Record<string, { title: string; sub: string }> = {
   "/": { title: "Relux", sub: "Local control plane - Prime, plugins, tasks, runs" },
   "/prime": { title: "Prime", sub: "Talk to your local operator" },
   "/work": { title: "Work", sub: "Manage tasks and view execution history" },
+  "/crew": { title: "Crew", sub: "Manage your agent workforce" },
   "/plugins": { title: "Plugins", sub: "Capabilities installed in the control plane" },
 };
 

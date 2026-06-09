@@ -1380,9 +1380,15 @@ export interface ReluxTask {
   priority: number;
   created_by: string;
   assigned_agent?: string;
+  assignee_name?: string; // New field for assignee's name
   namespace_id: string;
   created_at: string;
   updated_at: string;
+}
+
+export interface ReluxAgent {
+  id: string;
+  name: string;
 }
 
 export interface ReluxRun {
@@ -1402,6 +1408,8 @@ export const reluxWork = {
   listTasks: () => api.get<ReluxTask[]>("/v1/relux/tasks"),
   // All runs, sorted by id.
   listRuns: () => api.get<ReluxRun[]>("/v1/relux/runs"),
+  // All agents, sorted by id.
+  listAgents: () => api.get<ReluxAgent[]>("/v1/relux/agents"),
   // Create a new task and assign it to Prime.
   createTask: (title: string) => api.post<ReluxTask>("/v1/relux/tasks", { title }),
   // Start an execution attempt for a task.
@@ -1409,6 +1417,9 @@ export const reluxWork = {
     api.post<{ task: ReluxTask; run: ReluxRun }>(
       `/v1/relux/tasks/${encodeURIComponent(id)}/start`,
     ),
+  // Assign a task to an agent.
+  assignTask: (taskId: string, agentId: string) =>
+    api.post<ReluxTask>(`/v1/relux/tasks/${encodeURIComponent(taskId)}/assign`, { agent_id: agentId }),
 };
 
 export const reluxPlugins = {
@@ -1475,4 +1486,12 @@ export async function probe(path: string): Promise<Probe> {
       detail: e instanceof Error ? e.message : "bridge unreachable",
     };
   }
+}
+
+export async function fetchJson<T>(path: string): Promise<T> {
+  return await api.get<T>(path);
+}
+
+export async function postJson<T>(path: string, body: unknown): Promise<T> {
+  return await api.post<T>(path, body);
 }

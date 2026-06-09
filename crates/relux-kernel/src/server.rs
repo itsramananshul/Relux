@@ -152,10 +152,12 @@ fn router(state: AppState) -> Router {
         // The /v1/relux control-plane API the dashboard calls on the same origin.
         .route("/v1/relux/state", get(get_state))
         .route("/v1/relux/ai/status", get(get_ai_status))
+        .route("/v1/relux/agents", get(list_agents).post(create_agent))
         .route("/v1/relux/prime", post(run_prime))
         .route("/v1/relux/tasks", get(list_tasks).post(create_task))
         .route("/v1/relux/runs", get(list_runs))
         .route("/v1/relux/tasks/:id/start", post(start_task))
+        .route("/v1/relux/tasks/:id/assign", post(assign_task_to_agent))
         .route("/v1/relux/plugins", get(list_plugins))
         .route("/v1/relux/plugins/install-dir", post(install_dir))
         .route("/v1/relux/plugins/install-github", post(install_github))
@@ -283,6 +285,13 @@ async fn get_ai_status(State(state): State<AppState>) -> Json<AiStatus> {
     Json(state.ai_config.status())
 }
 
+async fn list_agents(State(state): State<AppState>) -> Result<Json<Vec<AgentRecord>>, ApiError> {
+    let records = locked_read(&state, |kernel| {
+        Ok(kernel.agents().into_iter().map(agent_record).collect())
+    })?;
+    Ok(Json(records))
+}
+
 async fn list_plugins(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<PluginRecord>>, ApiError> {
@@ -290,11 +299,21 @@ async fn list_plugins(
     Ok(Json(records))
 }
 
-async fn list_tasks(State(state): State<AppState>) -> Result<Json<Vec<relux_core::Task>>, ApiError> {
-    let tasks = locked_read(&state, |kernel| {
-        Ok(kernel.tasks().into_iter().cloned().collect())
+async fn list_tasks(State(state): State<AppState>) -> Result<Json<Vec<TaskRecord>>, ApiError> {
+    let records = locked_read(&state, |kernel| {
+        let tasks = kernel.tasks();
+        let agents_by_id: std::collections::HashMap<_, _> =
+            kernel.agents().into_iter().map(|a| (a.id.clone(), a)).collect();
+        let task_records: Vec<TaskRecord> = tasks
+            .into_iter()
+            .map(|t| {
+                let agent = t.assigned_agent.as_ref().and_then(|id| agents_by_id.get(id));
+                task_record(t, agent.map(|v| &**v))
+            })
+            .collect();
+        Ok(task_records)
     })?;
-    Ok(Json(tasks))
+    Ok(Json(records))
 }
 
 async fn list_runs(State(state): State<AppState>) -> Result<Json<Vec<relux_core::Run>>, ApiError> {
@@ -307,6 +326,57 @@ async fn list_runs(State(state): State<AppState>) -> Result<Json<Vec<relux_core:
 #[derive(Debug, Deserialize)]
 struct CreateTaskReq {
     title: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateAgentReq {
+    id: Option<String>,
+    name: String,
+    role: Option<String>,
+    adapter_plugin: Option<String>,
+}
+
+async fn create_agent(
+    State(state): State<AppState>,
+    Json(req): Json<CreateAgentReq>,
+) -> Result<Json<AgentRecord>, ApiError> {
+    let name = req.name.trim().to_string();
+    if name.is_empty() {
+        return Err(ApiError::bad_request("name is required"));
+    }
+
+    let agent_id_str = match req.id {
+        Some(id) if !id.trim().is_empty() => id.trim().to_string(),
+        _ => name.to_lowercase().replace(' ', "-"), // Sanitize/derive id if omitted
+    };
+
+    let description = req.role.unwrap_or_default();
+    let adapter_plugin = req
+        .adapter_plugin
+        .unwrap_or_else(|| "relux-adapter-local-prime".to_string());
+    let adapter_plugin_id = relux_core::PluginId::new(adapter_plugin);
+
+    let agent = locked_save(&state, |kernel| {
+        let ctx = crate::ensure_bootstrapped(kernel)?;
+        if kernel.agent(&relux_core::AgentId::new(&agent_id_str)).is_some() {
+            return Err(KernelError::AgentExists(agent_id_str.clone()));
+        }
+
+        // Grant minimal safe permissions for MVP
+        let permissions = vec![relux_core::Permission::new("tool:relux-tools-echo:say").unwrap()];
+
+        let id = kernel.create_agent(
+            &agent_id_str,
+            &name,
+            &description,
+            &adapter_plugin_id,
+            &ctx.namespace,
+            None, // persona
+            permissions,
+        )?;
+        Ok(agent_record(kernel.agent(&id).unwrap()))
+    })?;
+    Ok(Json(agent))
 }
 
 async fn create_task(
@@ -329,6 +399,26 @@ async fn create_task(
         // Automatically assign to Prime so it is ready to run.
         kernel.assign_task(&id, &ctx.agent)?;
         Ok(kernel.task(&id).cloned().unwrap())
+    })?;
+    Ok(Json(task))
+}
+
+#[derive(Debug, Deserialize)]
+struct AssignTaskReq {
+    agent_id: String,
+}
+
+async fn assign_task_to_agent(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<AssignTaskReq>,
+) -> Result<Json<relux_core::Task>, ApiError> {
+    let task_id = relux_core::TaskId::new(id);
+    let agent_id = relux_core::AgentId::new(req.agent_id);
+
+    let task = locked_save(&state, |kernel| {
+        kernel.assign_task(&task_id, &agent_id)?;
+        Ok(kernel.task(&task_id).cloned().unwrap())
     })?;
     Ok(Json(task))
 }
@@ -609,6 +699,50 @@ fn state_response(kernel: &KernelState, db_path: &std::path::Path) -> StateRespo
         blocked: s.tasks_blocked,
         failed: s.tasks_failed,
         pending_approvals: s.pending_approvals,
+    }
+}
+
+/// One task, flattened for the dashboard table.
+#[derive(Debug, Serialize)]
+struct TaskRecord {
+    #[serde(flatten)]
+    task: relux_core::Task,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    assignee_name: Option<String>,
+}
+
+/// Build a [`TaskRecord`] from a `Task` and its assigned `Agent` (if any).
+fn task_record(task: &relux_core::Task, agent: Option<&relux_core::Agent>) -> TaskRecord {
+    TaskRecord {
+        task: task.clone(),
+        assignee_name: agent.map(|a| a.name.clone()),
+    }
+}
+
+/// One agent record, flattened for the dashboard table.
+#[derive(Debug, Serialize)]
+struct AgentRecord {
+    id: String,
+    name: String,
+    description: String,
+    adapter_plugin: String,
+    namespace: String,
+    status: String,
+    permissions_summary: String,
+    created_at: String,
+}
+
+/// Build a [`AgentRecord`] from an `Agent`.
+fn agent_record(agent: &relux_core::Agent) -> AgentRecord {
+    AgentRecord {
+        id: agent.id.as_str().to_string(),
+        name: agent.name.clone(),
+        description: agent.description.clone(),
+        adapter_plugin: agent.adapter_plugin.as_str().to_string(),
+        namespace: agent.namespace_id.as_str().to_string(),
+        status: format!("{:?}", agent.status),
+        permissions_summary: format!("{} permissions", agent.permissions.len()),
+        created_at: agent.created_at.clone(),
     }
 }
 

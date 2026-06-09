@@ -1637,6 +1637,7 @@ backed only by the local `/v1/relux` API:
 - **Work** - standalone task board and execution history. Backed by the
   `/v1/relux/tasks` and `/v1/relux/runs` endpoints; allows creating tasks
   and starting runs directly from the board.
+- **Crew** - create and manage local agents.
 - **Plugins** - install/remove plugins through the durable lifecycle
   (`/v1/relux/plugins/*`).
 

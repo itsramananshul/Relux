@@ -56,6 +56,8 @@ pub enum KernelError {
     UnknownPlugin(String),
     #[error("unknown agent: {0}")]
     UnknownAgent(String),
+    #[error("agent already exists: {0}")]
+    AgentExists(String),
     #[error("unknown task: {0}")]
     UnknownTask(String),
     #[error("unknown run: {0}")]

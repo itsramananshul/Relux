@@ -352,6 +352,9 @@ impl KernelState {
             return Err(KernelError::UnknownPlugin(adapter_plugin.to_string()));
         }
         let agent_id = AgentId::new(id);
+        if self.agents.contains_key(&agent_id) {
+            return Err(KernelError::AgentExists(agent_id.to_string()));
+        }
         let agent = Agent {
             id: agent_id.clone(),
             name: name.to_string(),
@@ -385,6 +388,13 @@ impl KernelState {
 
     pub fn agent_count(&self) -> usize {
         self.agents.len()
+    }
+
+    /// All agents, sorted by id for deterministic listing.
+    pub fn agents(&self) -> Vec<&Agent> {
+        let mut out: Vec<&Agent> = self.agents.values().collect();
+        out.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+        out
     }
 
     // --- Tasks -------------------------------------------------------------
@@ -1522,5 +1532,51 @@ mod tests {
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].id, run);
         assert_eq!(runs[1].id, r2);
+    }
+
+    #[test]
+    fn listing_agents_is_sorted_and_complete_and_can_be_created() {
+        let (mut k, prime, task, _run, _echo) = primed_kernel();
+        let ns = NamespaceId::new("workspace");
+        let adapter = PluginId::new("relux-adapter-local-prime");
+
+        // Create another agent
+        let agent2_id = k
+            .create_agent(
+                "agent-two",
+                "Agent Two",
+                "Second agent.",
+                &adapter,
+                &ns,
+                None,
+                vec![],
+            )
+            .unwrap();
+
+        let agents = k.agents();
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[0].id, agent2_id);
+        assert_eq!(agents[1].id, prime);
+
+        // Try to create an agent with a colliding ID
+        let err = k
+            .create_agent(
+                "agent-two",
+                "Agent Two Collision",
+                "Should fail.",
+                &adapter,
+                &ns,
+                None,
+                vec![],
+            )
+            .unwrap_err();
+        assert!(matches!(err, KernelError::AgentExists(_)));
+
+        // Assign task to agent2
+        k.assign_task(&task, &agent2_id).unwrap();
+        assert_eq!(
+            k.task(&task).unwrap().assigned_agent.as_ref(),
+            Some(&agent2_id)
+        );
     }
 }
