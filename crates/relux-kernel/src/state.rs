@@ -1355,6 +1355,9 @@ impl KernelState {
                 started_run: None,
                 created_agent: None,
                 approval: None,
+                invoked_tool: None,
+                tool_output: None,
+                tool_error: None,
             }),
             PrimePlan::Clarify { text } => Ok(PrimeTurn {
                 intent,
@@ -1365,6 +1368,9 @@ impl KernelState {
                 started_run: None,
                 created_agent: None,
                 approval: None,
+                invoked_tool: None,
+                tool_output: None,
+                tool_error: None,
             }),
             PrimePlan::Act { action, text } => self.prime_execute(ctx, intent, action, text),
             PrimePlan::Propose {
@@ -1393,6 +1399,9 @@ impl KernelState {
                     started_run: None,
                     created_agent: None,
                     approval: Some(approval),
+                    invoked_tool: None,
+                    tool_output: None,
+                    tool_error: None,
                 })
             }
         }
@@ -1435,6 +1444,9 @@ impl KernelState {
                     started_run: None,
                     created_agent: None,
                     approval: None,
+                    invoked_tool: None,
+                    tool_output: None,
+                    tool_error: None,
                 })
             }
             PrimeAction::CreateAndRunTask { title } => {
@@ -1460,6 +1472,9 @@ impl KernelState {
                     started_run: Some(run),
                     created_agent: None,
                     approval: None,
+                    invoked_tool: None,
+                    tool_output: None,
+                    tool_error: None,
                 })
             }
             PrimeAction::StartRun { task_id } => {
@@ -1478,6 +1493,9 @@ impl KernelState {
                     started_run: Some(run),
                     created_agent: None,
                     approval: None,
+                    invoked_tool: None,
+                    tool_output: None,
+                    tool_error: None,
                 })
             }
             PrimeAction::CreateAgent {
@@ -1505,6 +1523,9 @@ impl KernelState {
                     started_run: None,
                     created_agent: Some(agent_id),
                     approval: None,
+                    invoked_tool: None,
+                    tool_output: None,
+                    tool_error: None,
                 })
             }
             PrimeAction::AssignTask { task_id, agent_id } => {
@@ -1521,8 +1542,33 @@ impl KernelState {
                     started_run: None,
                     created_agent: None,
                     approval: None,
+                    invoked_tool: None,
+                    tool_output: None,
+                    tool_error: None,
                 })
             }
+            PrimeAction::DiscoverTools => {
+                let tools = self.discover_tools(Some(&ctx.agent));
+                let reply = render_tool_catalog(&text, &tools);
+                Ok(PrimeTurn {
+                    intent,
+                    reply,
+                    disposition: PrimeDisposition::Answered,
+                    action: Some(action),
+                    created_task: None,
+                    started_run: None,
+                    created_agent: None,
+                    approval: None,
+                    invoked_tool: None,
+                    tool_output: None,
+                    tool_error: None,
+                })
+            }
+            PrimeAction::InvokeTool {
+                plugin_id,
+                tool_name,
+                input_json,
+            } => self.prime_invoke_tool(ctx, intent, &action, &text, plugin_id, tool_name, input_json),
             other => Ok(PrimeTurn {
                 intent,
                 reply: format!(
@@ -1535,7 +1581,169 @@ impl KernelState {
                 started_run: None,
                 created_agent: None,
                 approval: None,
+                invoked_tool: None,
+                tool_output: None,
+                tool_error: None,
             }),
+        }
+    }
+
+    /// Run one tool for a Prime `ToolInvocation`/`StatusQuestion` turn, honestly.
+    ///
+    /// Resolution is grounded in [`Self::discover_tools`]: an empty `tool_name`
+    /// resolves to the named plugin's first installed tool, and the tool's
+    /// executable status decides the outcome. Only a `Ready` tool is actually
+    /// invoked (through [`Self::invoke_tool`], the same permission/audit path as
+    /// `/v1/relux/tools/invoke`). A `not_implemented` or `missing_permission`
+    /// tool - or an unknown one - is reported with a clear `tool_error` and NO
+    /// fabricated output, never erroring the whole turn
+    /// (`docs/RELUX_MASTER_PLAN.md` §11.1, "Tool Invocation Surface").
+    #[allow(clippy::too_many_arguments)]
+    fn prime_invoke_tool(
+        &mut self,
+        ctx: &PrimeContext,
+        intent: relux_core::PrimeIntent,
+        action: &PrimeAction,
+        text: &str,
+        plugin_id: &str,
+        tool_name: &str,
+        input_json: &str,
+    ) -> Result<PrimeTurn, KernelError> {
+        // Prose answers (status) ride along on `text`; keep it as the fallback so
+        // a status reply stays readable even if the tool cannot run.
+        let prose = if plugin_id == "relux-tools-status" {
+            text.trim().to_string()
+        } else {
+            String::new()
+        };
+        let with_prose = |note: String| -> String {
+            if prose.is_empty() {
+                note
+            } else {
+                format!("{prose} ({note})")
+            }
+        };
+        let turn = |reply: String,
+                    disposition: PrimeDisposition,
+                    invoked_tool: Option<String>,
+                    tool_output: Option<serde_json::Value>,
+                    tool_error: Option<String>|
+         -> PrimeTurn {
+            PrimeTurn {
+                intent: intent.clone(),
+                reply,
+                disposition,
+                action: Some(action.clone()),
+                created_task: None,
+                started_run: None,
+                created_agent: None,
+                approval: None,
+                invoked_tool,
+                tool_output,
+                tool_error,
+            }
+        };
+
+        let descriptors = self.discover_tools(Some(&ctx.agent));
+        // Resolve an empty tool name to the plugin's first installed tool.
+        let resolved_tool = if tool_name.is_empty() {
+            descriptors
+                .iter()
+                .find(|d| d.plugin_id == plugin_id)
+                .map(|d| d.tool_name.clone())
+        } else {
+            Some(tool_name.to_string())
+        };
+        let Some(tool) = resolved_tool else {
+            let note = format!(
+                "no installed tool named {plugin_id}; ask \"what tools can you use?\" to see what is available"
+            );
+            return Ok(turn(
+                with_prose(note.clone()),
+                PrimeDisposition::NeedsClarification,
+                None,
+                None,
+                Some(note),
+            ));
+        };
+        let label = format!("{plugin_id}/{tool}");
+
+        let descriptor = descriptors
+            .iter()
+            .find(|d| d.plugin_id == plugin_id && d.tool_name == tool);
+        match descriptor.map(|d| d.executable.clone()) {
+            None => {
+                let note = format!("I could not find {label} among the installed tools");
+                Ok(turn(
+                    with_prose(note.clone()),
+                    PrimeDisposition::NeedsClarification,
+                    None,
+                    None,
+                    Some(note),
+                ))
+            }
+            Some(ToolExecutability::NotImplemented) => {
+                let note = format!(
+                    "{label} is installed and discoverable, but this local runtime cannot execute it yet"
+                );
+                Ok(turn(
+                    with_prose(note.clone()),
+                    PrimeDisposition::NeedsClarification,
+                    None,
+                    None,
+                    Some(note),
+                ))
+            }
+            Some(ToolExecutability::MissingPermission) => {
+                let note = format!(
+                    "I cannot run {label}: I do not hold the permission it requires - grant it first, then ask me again"
+                );
+                Ok(turn(
+                    with_prose(note.clone()),
+                    PrimeDisposition::NeedsClarification,
+                    None,
+                    None,
+                    Some(note),
+                ))
+            }
+            Some(ToolExecutability::Ready) => {
+                let input: serde_json::Value =
+                    serde_json::from_str(input_json).unwrap_or_else(|_| serde_json::json!({}));
+                match self.invoke_tool(
+                    &ctx.agent,
+                    &PluginId::new(plugin_id.to_string()),
+                    &tool,
+                    input,
+                ) {
+                    Ok(result) => {
+                        // The reply stays concise ("Running <tool>." / the status
+                        // prose); the real JSON rides in `tool_output`, so it is
+                        // never restated in prose.
+                        let reply = if prose.is_empty() {
+                            text.trim().to_string()
+                        } else {
+                            prose.clone()
+                        };
+                        Ok(turn(
+                            reply.trim().to_string(),
+                            PrimeDisposition::Executed,
+                            Some(label),
+                            Some(result.output),
+                            None,
+                        ))
+                    }
+                    Err(e) => {
+                        let note = format!("{label} could not run: {e}");
+                        Ok(turn(
+                            with_prose(note.clone()),
+                            PrimeDisposition::NeedsClarification,
+                            None,
+                            None,
+                            Some(note),
+                        ))
+                    }
+                }
+            }
         }
     }
 
@@ -1685,8 +1893,49 @@ fn describe_action(action: &PrimeAction) -> String {
             name,
             adapter_plugin,
         } => format!("create agent {name} on adapter {adapter_plugin}"),
+        PrimeAction::DiscoverTools => "list the installed tools".to_string(),
+        PrimeAction::InvokeTool {
+            plugin_id,
+            tool_name,
+            ..
+        } => {
+            if tool_name.is_empty() {
+                format!("invoke the {plugin_id} tool")
+            } else {
+                format!("invoke {plugin_id}/{tool_name}")
+            }
+        }
         other => format!("{other:?}"),
     }
+}
+
+/// Render a grounded tool-catalogue reply for a `DiscoverTools` turn.
+///
+/// Lists only tools the kernel actually discovered (it invents nothing), each
+/// with its honest executable status: `ready` tools Prime can run now,
+/// `not implemented` tools that are installed but have no local runtime, and
+/// `needs permission` tools Prime would need a grant for. Disabled tools are
+/// marked so the list never implies a disabled tool is runnable.
+fn render_tool_catalog(intro: &str, tools: &[ToolDescriptor]) -> String {
+    if tools.is_empty() {
+        return "No tools are installed yet. Install a ToolSet plugin and I will list it here."
+            .to_string();
+    }
+    let mut lines: Vec<String> = Vec::with_capacity(tools.len() + 1);
+    lines.push(intro.trim().to_string());
+    for t in tools {
+        let status = match t.executable {
+            ToolExecutability::Ready => "ready",
+            ToolExecutability::NotImplemented => "installed, runtime not implemented yet",
+            ToolExecutability::MissingPermission => "needs permission",
+        };
+        let disabled = if t.enabled { "" } else { ", disabled" };
+        lines.push(format!(
+            "- {}/{} - {} [{}{}]",
+            t.plugin_id, t.tool_name, t.description, status, disabled
+        ));
+    }
+    lines.join("\n")
 }
 
 #[cfg(test)]
@@ -1731,6 +1980,56 @@ mod tests {
             capabilities: PluginCapability {
                 tools: vec![],
                 permissions: vec![Permission::new("adapter:relux-adapter-local-prime:run").unwrap()],
+            },
+            health: PluginHealth::Unknown,
+        }
+    }
+
+    fn status_manifest() -> PluginManifest {
+        PluginManifest {
+            id: PluginId::new("relux-tools-status"),
+            name: "Status".to_string(),
+            version: "0.1.0".to_string(),
+            kind: PluginKind::ToolSet,
+            description: "control-plane status".to_string(),
+            author: "test".to_string(),
+            trust_level: TrustLevel::Official,
+            capabilities: PluginCapability {
+                tools: vec![ToolDefinition {
+                    name: "status.summary".to_string(),
+                    description: "deterministic control-plane counts".to_string(),
+                    risk: RiskLevel::Low,
+                    permission: Permission::new("tool:relux-tools-status:summary").unwrap(),
+                    approval: ApprovalRequirement::Never,
+                    timeout_secs: Some(5),
+                }],
+                permissions: vec![Permission::new("tool:relux-tools-status:summary").unwrap()],
+            },
+            health: PluginHealth::Unknown,
+        }
+    }
+
+    /// A ToolSet plugin with NO built-in runtime handler - discoverable but not
+    /// executable. Stands in for an installed-but-unimplemented tool.
+    fn github_manifest() -> PluginManifest {
+        PluginManifest {
+            id: PluginId::new("relux-tools-github"),
+            name: "GitHub".to_string(),
+            version: "0.1.0".to_string(),
+            kind: PluginKind::ToolSet,
+            description: "GitHub operations".to_string(),
+            author: "test".to_string(),
+            trust_level: TrustLevel::Community,
+            capabilities: PluginCapability {
+                tools: vec![ToolDefinition {
+                    name: "github.create_pr".to_string(),
+                    description: "open a pull request".to_string(),
+                    risk: RiskLevel::High,
+                    permission: Permission::new("tool:relux-tools-github:create_pr").unwrap(),
+                    approval: ApprovalRequirement::Required,
+                    timeout_secs: Some(30),
+                }],
+                permissions: vec![Permission::new("tool:relux-tools-github:create_pr").unwrap()],
             },
             health: PluginHealth::Unknown,
         }
@@ -2210,10 +2509,15 @@ mod tests {
     /// minimum for driving Prime chat - plus the matching `PrimeContext`.
     fn prime_chat_kernel() -> (KernelState, PrimeContext) {
         let mut k = KernelState::new();
-        k.register_plugin(echo_manifest());
-        k.register_plugin(adapter_manifest());
+        // Install (not just register) the bundled tools so capability discovery
+        // and Prime's tool invocation see them, exactly like `ensure_bootstrapped`.
+        install_bundled(&mut k, echo_manifest());
+        install_bundled(&mut k, status_manifest());
+        install_bundled(&mut k, adapter_manifest());
         let ns = k.create_namespace("workspace", "Workspace", NamespaceKind::Personal);
         let adapter = PluginId::new("relux-adapter-local-prime");
+        // Prime holds exactly the two safe built-in tool permissions, matching the
+        // production bootstrap (least privilege).
         let prime = k
             .create_agent(
                 "prime",
@@ -2222,7 +2526,10 @@ mod tests {
                 &adapter,
                 &ns,
                 None,
-                vec![Permission::new("tool:relux-tools-echo:say").unwrap()],
+                vec![
+                    Permission::new("tool:relux-tools-echo:say").unwrap(),
+                    Permission::new("tool:relux-tools-status:summary").unwrap(),
+                ],
             )
             .unwrap();
         let ctx = PrimeContext {
@@ -2231,6 +2538,18 @@ mod tests {
             actor: "founder".to_string(),
         };
         (k, ctx)
+    }
+
+    /// Install a manifest as a bundled, enabled plugin (test convenience).
+    fn install_bundled(k: &mut KernelState, manifest: PluginManifest) {
+        let id = manifest.id.as_str().to_string();
+        k.install_plugin(
+            manifest,
+            PluginSourceKind::Bundled,
+            "bundled example".to_string(),
+            format!("examples/relux-plugins/{id}"),
+            true,
+        );
     }
 
     #[test]
@@ -2535,6 +2854,130 @@ mod tests {
         k.prime_turn(&ctx, "fix the flaky test").unwrap();
         let busy = k.prime_turn(&ctx, "what is going on?").unwrap();
         assert!(busy.reply.contains("open task"), "got: {}", busy.reply);
+    }
+
+    // --- Prime tool awareness (master plan §11.1, Tool Invocation Surface) ----
+
+    #[test]
+    fn greeting_does_not_invoke_a_tool() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let turn = k.prime_turn(&ctx, "hey").unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::Greeting);
+        assert!(turn.invoked_tool.is_none(), "a greeting must not run a tool");
+        assert!(turn.tool_output.is_none());
+        assert!(turn.tool_error.is_none());
+        assert_eq!(k.run_count(), 0, "a greeting must not start a run");
+    }
+
+    #[test]
+    fn tool_discovery_lists_only_grounded_installed_tools() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let turn = k.prime_turn(&ctx, "what tools can you use?").unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::ToolDiscovery);
+        assert_eq!(turn.disposition, PrimeDisposition::Answered);
+        // The two installed built-in tools are listed, with honest status.
+        assert!(turn.reply.contains("relux-tools-echo/echo.say"), "got: {}", turn.reply);
+        assert!(
+            turn.reply.contains("relux-tools-status/status.summary"),
+            "got: {}",
+            turn.reply
+        );
+        assert!(turn.reply.contains("ready"), "ready tools marked: {}", turn.reply);
+        // It must not fabricate a tool that is not installed.
+        assert!(!turn.reply.contains("github"), "no fabricated tools: {}", turn.reply);
+        assert!(turn.invoked_tool.is_none(), "discovery lists, it does not invoke");
+    }
+
+    #[test]
+    fn status_request_invokes_status_summary_tool() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let turn = k.prime_turn(&ctx, "give me a status summary").unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::StatusQuestion);
+        assert_eq!(turn.disposition, PrimeDisposition::Executed);
+        assert_eq!(
+            turn.invoked_tool.as_deref(),
+            Some("relux-tools-status/status.summary")
+        );
+        // The real tool output is present and is the grounded state summary.
+        let output = turn.tool_output.expect("status tool returned output");
+        assert!(output.get("tasks_total").is_some(), "got: {output}");
+        assert!(turn.tool_error.is_none());
+    }
+
+    #[test]
+    fn echo_request_invokes_echo_say_with_input_and_output() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let turn = k.prime_turn(&ctx, "echo hello").unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::ToolInvocation);
+        assert_eq!(turn.disposition, PrimeDisposition::Executed);
+        assert_eq!(
+            turn.invoked_tool.as_deref(),
+            Some("relux-tools-echo/echo.say")
+        );
+        // echo.say returns its input unchanged; the input was the message text.
+        assert_eq!(
+            turn.tool_output,
+            Some(serde_json::json!({ "message": "hello" }))
+        );
+        assert!(turn.tool_error.is_none());
+    }
+
+    #[test]
+    fn echo_request_accepts_inline_json_input() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let turn = k
+            .prime_turn(&ctx, "use echo.say with {\"n\": 7}")
+            .unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::ToolInvocation);
+        assert_eq!(
+            turn.invoked_tool.as_deref(),
+            Some("relux-tools-echo/echo.say")
+        );
+        assert_eq!(turn.tool_output, Some(serde_json::json!({ "n": 7 })));
+    }
+
+    #[test]
+    fn unsupported_installed_tool_is_reported_not_fabricated() {
+        let (mut k, ctx) = prime_chat_kernel();
+        // Install a real ToolSet plugin with no built-in runtime handler.
+        install_bundled(&mut k, github_manifest());
+        let turn = k.prime_turn(&ctx, "use the github tool").unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::ToolInvocation);
+        assert_eq!(turn.disposition, PrimeDisposition::NeedsClarification);
+        // It is honest: installed/discoverable but no local runtime, and NO output.
+        assert!(turn.invoked_tool.is_none(), "nothing actually ran");
+        assert!(turn.tool_output.is_none(), "no fabricated output");
+        let err = turn.tool_error.expect("an honest tool_error");
+        assert!(err.contains("relux-tools-github"), "got: {err}");
+        assert!(
+            err.contains("cannot execute it yet") || err.contains("not implemented"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn tool_invocation_denied_when_prime_lacks_permission() {
+        // A Prime that holds NO echo permission cannot run the (built-in) echo tool.
+        let mut k = KernelState::new();
+        install_bundled(&mut k, echo_manifest());
+        install_bundled(&mut k, adapter_manifest());
+        let ns = k.create_namespace("workspace", "Workspace", NamespaceKind::Personal);
+        let adapter = PluginId::new("relux-adapter-local-prime");
+        let prime = k
+            .create_agent("prime", "Prime", "op", &adapter, &ns, None, vec![])
+            .unwrap();
+        let ctx = PrimeContext {
+            namespace: ns,
+            agent: prime,
+            actor: "founder".to_string(),
+        };
+        let turn = k.prime_turn(&ctx, "echo hello").unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::ToolInvocation);
+        assert_eq!(turn.disposition, PrimeDisposition::NeedsClarification);
+        assert!(turn.invoked_tool.is_none(), "denied call must not run");
+        assert!(turn.tool_output.is_none(), "no fabricated output on denial");
+        let err = turn.tool_error.expect("an honest tool_error");
+        assert!(err.contains("permission"), "got: {err}");
     }
 
     #[test]

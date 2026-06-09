@@ -1338,6 +1338,12 @@ export interface ReluxPrimeTurn {
   started_run: string | null;
   created_agent: string | null;
   approval: string | null;
+  // Tool fields: present only when Prime ran (or honestly refused) a tool this
+  // turn. `invoked_tool` is "<plugin_id>/<tool_name>"; `tool_output` carries the
+  // real kernel output; `tool_error` is an honest reason a tool did NOT run.
+  invoked_tool?: string | null;
+  tool_output?: unknown;
+  tool_error?: string | null;
   state: ReluxState;
   /// Which path produced the reply (deterministic or LLM).
   ai_mode: "deterministic" | "deterministic_for_action" | "openrouter";

@@ -11,8 +11,8 @@ use std::process::ExitCode;
 
 use relux_core::namespace::NamespaceKind;
 use relux_core::{
-    AgentId, NamespaceId, Permission, PluginId, PluginSourceKind, PrimeContext, TaskId, TaskStatus,
-    ToolExecutability,
+    AgentId, NamespaceId, Permission, PluginId, PluginSourceKind, PrimeContext, PrimeTurn, TaskId,
+    TaskStatus, ToolExecutability,
 };
 use relux_kernel::{
     install_from_dir, install_from_github, install_from_zip, load_plugin_manifests, remove_plugin,
@@ -449,8 +449,27 @@ fn run_prime_message(message: &str) -> Result<(), KernelError> {
         "   prime [{:?}/{:?}] {}",
         turn.intent, turn.disposition, turn.reply
     );
+    print_tool_result(&turn);
 
     Ok(())
+}
+
+/// Print the tool a Prime turn invoked (and its JSON output) or the honest
+/// reason a requested tool did not run, when either is present. Nothing prints
+/// for a turn that touched no tool.
+fn print_tool_result(turn: &PrimeTurn) {
+    if let Some(tool) = &turn.invoked_tool {
+        println!("   tool  > {tool}");
+        if let Some(output) = &turn.tool_output {
+            let pretty =
+                serde_json::to_string_pretty(output).unwrap_or_else(|_| output.to_string());
+            for line in pretty.lines() {
+                println!("           {line}");
+            }
+        }
+    } else if let Some(err) = &turn.tool_error {
+        println!("   tool  > (not run) {err}");
+    }
 }
 
 /// Print a concise summary of the persistent control plane.
@@ -793,7 +812,14 @@ fn run_demo() -> Result<(), KernelError> {
         );
     }
     for manifest in manifests {
-        kernel.register_plugin(manifest);
+        let install_dir = dir.join(manifest.id.as_str()).display().to_string();
+        kernel.install_plugin(
+            manifest,
+            PluginSourceKind::Bundled,
+            "bundled example".to_string(),
+            install_dir,
+            true,
+        );
     }
     println!();
 
@@ -801,6 +827,8 @@ fn run_demo() -> Result<(), KernelError> {
     let prime_adapter = PluginId::new("relux-adapter-local-prime");
     let echo_permission = Permission::new("tool:relux-tools-echo:say")
         .expect("static echo permission is well-formed");
+    let status_permission = Permission::new("tool:relux-tools-status:summary")
+        .expect("static status permission is well-formed");
 
     // 2. Create a namespace (a personal workspace scope).
     let workspace = kernel.create_namespace("workspace", "Workspace", NamespaceKind::Personal);
@@ -818,7 +846,7 @@ fn run_demo() -> Result<(), KernelError> {
             "You are Prime: understand intent, act through the kernel, never bypass permissions."
                 .to_string(),
         ),
-        vec![echo_permission.clone()],
+        vec![echo_permission.clone(), status_permission],
     )?;
     println!("[3] Created Prime agent: {prime} (adapter {prime_adapter})");
 
@@ -860,7 +888,9 @@ fn run_demo() -> Result<(), KernelError> {
     };
     let script = [
         "hey",
+        "what tools can you use?",
         "what is going on?",
+        "echo hello",
         "create a task to summarize the README",
         "start it",
         "give the code agent GitHub access",
@@ -873,6 +903,7 @@ fn run_demo() -> Result<(), KernelError> {
             "   prime [{:?}/{:?}] {}",
             turn.intent, turn.disposition, turn.reply
         );
+        print_tool_result(&turn);
     }
     println!();
 

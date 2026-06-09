@@ -26,9 +26,10 @@ const DISPOSITION_TONE: Record<string, string> = {
 };
 
 const SUGGESTIONS = [
+  "what tools can you use?",
   "what is going on?",
+  "echo hello",
   "create a task to summarize the README",
-  "create a task to inspect this repo",
   "create an agent named researcher",
   "assign task_0001 to researcher",
   "start it",
@@ -145,6 +146,60 @@ export function Prime() {
   );
 }
 
+// The tool a Prime turn actually ran (with its real JSON output) or the honest
+// reason a requested tool did NOT run. Rendered straight from the turn — the UI
+// never fabricates a tool result. Nothing renders for a turn that touched no tool.
+function ToolResult({ turn }: { turn: ReluxPrimeTurn }) {
+  if (turn.invoked_tool) {
+    let output = "";
+    if (turn.tool_output !== undefined && turn.tool_output !== null) {
+      try {
+        output = JSON.stringify(turn.tool_output, null, 2);
+      } catch {
+        output = String(turn.tool_output);
+      }
+    }
+    return (
+      <div style={{ marginTop: 8 }}>
+        <div className="row wrap" style={{ gap: 6, alignItems: "center", fontSize: 11 }}>
+          <span className="badge done" style={{ fontSize: 9 }} title="Tool invoked through the kernel">
+            tool
+          </span>
+          <span className="mono muted">{turn.invoked_tool}</span>
+        </div>
+        {output && (
+          <pre
+            className="mono"
+            style={{
+              margin: "6px 0 0",
+              padding: "6px 8px",
+              fontSize: 11,
+              maxHeight: 220,
+              overflow: "auto",
+              border: "1px solid var(--border)",
+              borderRadius: 4,
+              whiteSpace: "pre-wrap",
+            }}
+          >
+            {output}
+          </pre>
+        )}
+      </div>
+    );
+  }
+  if (turn.tool_error) {
+    return (
+      <div className="row wrap" style={{ gap: 6, marginTop: 8, alignItems: "center", fontSize: 11 }}>
+        <span className="badge todo" style={{ fontSize: 9 }} title="Requested tool did not run">
+          tool not run
+        </span>
+        <span className="muted">{turn.tool_error}</span>
+      </div>
+    );
+  }
+  return null;
+}
+
 function AiStatusBanner({ status }: { status: ReluxAiStatus | null }) {
   if (!status) return null;
   const isLlm = status.mode === "openrouter";
@@ -180,6 +235,8 @@ function PrimeTurnCard({ turn }: { turn: ReluxPrimeTurn }) {
         )}
       </div>
       <div style={{ whiteSpace: "pre-wrap" }}>{turn.reply}</div>
+
+      <ToolResult turn={turn} />
 
       {(turn.created_task || turn.started_run || turn.created_agent || turn.approval) && (
         <div className="row wrap" style={{ gap: 10, marginTop: 10, fontSize: 11 }}>

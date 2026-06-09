@@ -73,6 +73,43 @@ pub fn classify_intent(message: &str) -> PrimeIntent {
     if starts("why") || has(&["explain", "what went wrong", "what happened"]) {
         return PrimeIntent::ExplanationRequest;
     }
+    // Tool discovery: the user wants to know which tools Prime can use. Checked
+    // before task creation so "what tools can you use?" never mints a task.
+    if has(&[
+        "what tools",
+        "which tools",
+        "list tools",
+        "list your tools",
+        "available tools",
+        "your tools",
+        "tools do you have",
+        "tools can you",
+        "what can you run",
+        "show me your tools",
+        "show your tools",
+    ]) {
+        return PrimeIntent::ToolDiscovery;
+    }
+    // Tool invocation: the user wants Prime to RUN a specific tool. An explicit
+    // `plugin/tool` reference, an echo/status request, or an "<verb> the X tool"
+    // phrasing. Checked before task creation/run control so "echo hello" runs the
+    // echo tool instead of being read as new work, while "run it"/"start it"
+    // (no tool referenced) still fall through to run control.
+    let invoke_verb = first_word == "echo"
+        || starts("use ")
+        || starts("run ")
+        || starts("invoke ")
+        || starts("call ")
+        || starts("test ")
+        || starts("execute ");
+    if has(&["echo.say", "status.summary"])
+        || (first_word == "echo")
+        || (invoke_verb && has(&[" tool", "echo", "status tool"]))
+        || (invoke_verb && m.contains("relux-tools-"))
+        || has(&["use the echo", "use the status", "the echo tool", "the status tool"])
+    {
+        return PrimeIntent::ToolInvocation;
+    }
     if has(&["and run it", "and start it", "and execute it"])
         && (has(&["create", "make", "add", "new task"])
             || CREATION_VERBS.contains(&first_word.as_str()))
@@ -236,7 +273,16 @@ pub fn decide(message: &str, intent: &PrimeIntent, summary: &StateSummary) -> Pr
         PrimeIntent::Greeting => PrimePlan::Reply {
             text: format!("I am here. {} What do you want to work on?", headline(summary)),
         },
-        PrimeIntent::StatusQuestion => PrimePlan::Reply {
+        // A status question is grounded by actually consulting the read-only
+        // `status.summary` tool through the kernel (§11.1 plugin/action results).
+        // The prose answer rides along as `text` so the reply stays readable and
+        // falls back cleanly to prose if the tool cannot run.
+        PrimeIntent::StatusQuestion => PrimePlan::Act {
+            action: PrimeAction::InvokeTool {
+                plugin_id: "relux-tools-status".to_string(),
+                tool_name: "status.summary".to_string(),
+                input_json: "{}".to_string(),
+            },
             text: status_text(summary),
         },
         PrimeIntent::ExplanationRequest => PrimePlan::Reply {
@@ -403,6 +449,38 @@ pub fn decide(message: &str, intent: &PrimeIntent, summary: &StateSummary) -> Pr
         PrimeIntent::ApprovalResponse => PrimePlan::Clarify {
             text: "Tell me the approval id to approve or reject.".to_string(),
         },
+        // Listing tools needs the live installed-plugin index, which `decide`
+        // (pure) does not hold - the kernel fills it from `discover_tools` when it
+        // executes this safe, read-only action (§7.4, §11.1).
+        PrimeIntent::ToolDiscovery => PrimePlan::Act {
+            action: PrimeAction::DiscoverTools,
+            text: "Here are the tools I can use right now.".to_string(),
+        },
+        // Running a tool is a safe, in-scope `Act`: the kernel executes only the
+        // resolved built-in handler through the permission/audit path, and reports
+        // an installed-but-unimplemented tool honestly. When the message names no
+        // tool Prime can map, ask instead of guessing.
+        PrimeIntent::ToolInvocation => match parse_tool_request(message) {
+            Some((plugin_id, tool_name, input_json)) => {
+                let label = if tool_name.is_empty() {
+                    format!("the {plugin_id} tool")
+                } else {
+                    format!("{plugin_id}/{tool_name}")
+                };
+                PrimePlan::Act {
+                    action: PrimeAction::InvokeTool {
+                        plugin_id,
+                        tool_name,
+                        input_json,
+                    },
+                    text: format!("Running {label}."),
+                }
+            }
+            None => PrimePlan::Clarify {
+                text: "Which tool should I run? I can run relux-tools-echo/echo.say and relux-tools-status/status.summary; other installed tools are listed but not runnable here yet."
+                    .to_string(),
+            },
+        },
         PrimeIntent::DirectAnswer => PrimePlan::Reply {
             text: "I can inspect state, create tasks, start runs, explain blockers, and request approvals for risky actions. What would you like to do?"
                 .to_string(),
@@ -554,6 +632,125 @@ fn task_title(message: &str) -> Option<String> {
         }
     }
     Some(title.to_string())
+}
+
+/// Map a tool-invocation message onto `(plugin_id, tool_name, input_json)`, or
+/// `None` when nothing nameable was requested.
+///
+/// Deterministic and conservative: it only emits a `(plugin, tool)` it can name
+/// with confidence - an explicit `plugin/tool` reference, the two built-in tools
+/// (echo/status), or a known ToolSet keyword (github/terminal/...). For a keyword
+/// match the `tool_name` is left empty; the kernel resolves the plugin's first
+/// installed tool and reports it honestly (it will not be runnable here, which is
+/// the truthful answer). The input is the first JSON object found in the message,
+/// or - for an `echo <text>` request with no JSON - `{ "message": "<text>" }`.
+fn parse_tool_request(message: &str) -> Option<(String, String, String)> {
+    let trimmed = message.trim();
+    let lower = trimmed.to_lowercase();
+    let json = extract_json(trimmed);
+
+    // 1. Explicit "<plugin>/<tool>" reference, e.g. "relux-tools-github/github.create_pr".
+    if let Some(tok) = lower
+        .split(|c: char| c.is_whitespace())
+        .find(|t| t.contains('/') && t.starts_with("relux-"))
+    {
+        let mut parts = tok.splitn(2, '/');
+        if let (Some(plugin), Some(tool)) = (parts.next(), parts.next()) {
+            let plugin = trim_token(plugin);
+            let tool = trim_token(tool);
+            if !plugin.is_empty() && !tool.is_empty() {
+                return Some((plugin, tool, json.unwrap_or_else(|| "{}".to_string())));
+            }
+        }
+    }
+
+    // 2. The two built-in tools, by name or by plain-language reference.
+    if lower.contains("echo.say") || lower.contains("echo") {
+        let input = json.unwrap_or_else(|| echo_input_from(trimmed));
+        return Some((
+            "relux-tools-echo".to_string(),
+            "echo.say".to_string(),
+            input,
+        ));
+    }
+    if lower.contains("status.summary") || lower.contains("status tool") || lower.contains("status")
+    {
+        return Some((
+            "relux-tools-status".to_string(),
+            "status.summary".to_string(),
+            json.unwrap_or_else(|| "{}".to_string()),
+        ));
+    }
+
+    // 3. A known ToolSet keyword -> name the plugin; the kernel resolves the tool
+    //    and reports it (these are installed-but-not-runnable here).
+    const KEYWORD_PLUGINS: &[(&str, &str)] = &[
+        ("github", "relux-tools-github"),
+        ("terminal", "relux-tools-terminal"),
+        ("shell", "relux-tools-terminal"),
+        ("browser", "relux-tools-browser"),
+        ("slack", "relux-tools-slack"),
+        ("discord", "relux-tools-discord"),
+        ("tavily", "relux-tools-tavily"),
+        ("salesforce", "relux-tools-salesforce"),
+        ("zendesk", "relux-tools-zendesk"),
+    ];
+    for (kw, plugin) in KEYWORD_PLUGINS {
+        if lower.contains(kw) {
+            return Some((
+                (*plugin).to_string(),
+                String::new(),
+                json.unwrap_or_else(|| "{}".to_string()),
+            ));
+        }
+    }
+
+    None
+}
+
+/// Trim a token down to a plugin/tool-id shape (ASCII alnum, `-`, `_`, `.`).
+fn trim_token(tok: &str) -> String {
+    tok.trim_matches(|c: char| {
+        !c.is_ascii_alphanumeric() && c != '-' && c != '_' && c != '.'
+    })
+    .to_string()
+}
+
+/// Pull the first balanced-looking JSON object (`{ ... }`) out of a message and
+/// return it only if it parses. Naive first-`{`..last-`}` slice - enough to lift
+/// an inline `{"message":"hi"}` the user typed.
+fn extract_json(message: &str) -> Option<String> {
+    let start = message.find('{')?;
+    let end = message.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    let candidate = &message[start..=end];
+    serde_json::from_str::<serde_json::Value>(candidate)
+        .ok()
+        .map(|_| candidate.to_string())
+}
+
+/// Build the echo input for an `echo <text>` request that carried no JSON: the
+/// text after a leading "echo" becomes `{ "message": "<text>" }`; a bare "echo"
+/// echoes an empty object.
+fn echo_input_from(message: &str) -> String {
+    let lower = message.to_lowercase();
+    let rest = match lower.find("echo") {
+        Some(idx) => message[idx + "echo".len()..].trim(),
+        None => message.trim(),
+    };
+    // Drop a polite/imperative lead-in like "echo say " / "echo the message ".
+    let rest = rest
+        .trim_start_matches("say ")
+        .trim_start_matches("the message ")
+        .trim_start_matches(": ")
+        .trim();
+    if rest.is_empty() {
+        "{}".to_string()
+    } else {
+        serde_json::json!({ "message": rest }).to_string()
+    }
 }
 
 fn derive_agent_name(message: &str) -> String {
@@ -728,6 +925,78 @@ mod tests {
     fn greeting_only_matches_whole_words() {
         // "this" contains "hi" but is not a greeting.
         assert_ne!(classify_intent("is this thing on"), PrimeIntent::Greeting);
+    }
+
+    #[test]
+    fn classifies_tool_discovery_and_invocation() {
+        // Discovery: the user wants the list of usable tools.
+        assert_eq!(
+            classify_intent("what tools can you use?"),
+            PrimeIntent::ToolDiscovery
+        );
+        assert_eq!(
+            classify_intent("list your tools"),
+            PrimeIntent::ToolDiscovery
+        );
+        // Invocation: explicit echo/status/tool requests.
+        assert_eq!(classify_intent("echo hello"), PrimeIntent::ToolInvocation);
+        assert_eq!(
+            classify_intent("use echo.say with {\"x\":1}"),
+            PrimeIntent::ToolInvocation
+        );
+        assert_eq!(
+            classify_intent("run the status tool"),
+            PrimeIntent::ToolInvocation
+        );
+        assert_eq!(
+            classify_intent("use the github tool"),
+            PrimeIntent::ToolInvocation
+        );
+        // "start it"/"run it" reference no tool - run control, not tool use.
+        assert_eq!(classify_intent("start it"), PrimeIntent::RunStart);
+        assert_eq!(classify_intent("run it"), PrimeIntent::RunStart);
+        // A plain status question and task creation are untouched.
+        assert_eq!(
+            classify_intent("what is going on?"),
+            PrimeIntent::StatusQuestion
+        );
+        assert_eq!(
+            classify_intent("fix the login bug"),
+            PrimeIntent::TaskCreation
+        );
+    }
+
+    #[test]
+    fn parses_tool_requests_into_plugin_tool_input() {
+        // echo by name, with the trailing text as the message.
+        assert_eq!(
+            parse_tool_request("echo hello"),
+            Some((
+                "relux-tools-echo".to_string(),
+                "echo.say".to_string(),
+                "{\"message\":\"hello\"}".to_string()
+            ))
+        );
+        // explicit plugin/tool with inline JSON input.
+        assert_eq!(
+            parse_tool_request("use relux-tools-github/github.create_pr {\"n\":1}"),
+            Some((
+                "relux-tools-github".to_string(),
+                "github.create_pr".to_string(),
+                "{\"n\":1}".to_string()
+            ))
+        );
+        // a known ToolSet keyword names the plugin; the kernel resolves the tool.
+        assert_eq!(
+            parse_tool_request("use the github tool"),
+            Some((
+                "relux-tools-github".to_string(),
+                String::new(),
+                "{}".to_string()
+            ))
+        );
+        // nothing nameable -> None (Prime will ask).
+        assert_eq!(parse_tool_request("do the thing"), None);
     }
 
     #[test]

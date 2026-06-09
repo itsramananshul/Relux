@@ -1769,6 +1769,21 @@ status and offers a small invoke panel (JSON input + output/error) for ready
 tools. An installed tool with no runtime shows "installed, runtime not
 implemented yet" rather than being hidden or pretend-run.
 
+Prime chat (§10, §11.1): Prime is now tool-aware and can list/invoke the safe
+built-in tools directly from chat, so simple tool use does not require leaving
+Prime for the Tools panel. Two new intents drive this - `tool_discovery`
+("what tools can you use?" → grounded `discover_tools`, never a fabricated list)
+and `tool_invocation` ("echo hello", "use echo.say with {json}", "run the status
+tool"). A status question also grounds itself by consulting
+`relux-tools-status/status.summary`. Every Prime tool call routes through
+`KernelState::invoke_tool` - the SAME permission/audit path as
+`/v1/relux/tools/invoke` - and the turn carries structured `invoked_tool` /
+`tool_output` / `tool_error` fields. Prime stays honest: a greeting never becomes
+a tool call; an installed-but-unimplemented tool is reported as not runnable here
+(no fabricated output); a missing permission is surfaced, never bypassed; and
+**arbitrary downloaded plugin runtime execution remains intentionally not
+implemented.**
+
 ### Optional LLM-backed Prime (OpenRouter)
 
 As of Phase 2.1, Prime can optionally use an LLM (via OpenRouter) to shape its
@@ -1798,7 +1813,8 @@ The API never returns the key. The dashboard shows the current AI provider/mode.
   Relix web bridge + a login and degrade honestly when it is absent.
 - Prime has an optional LLM-backed path for conversational replies, but its
   core planning remains deterministic. Multi-agent autonomous execution is later.
-- Tool invocation executes only built-in deterministic handlers (echo, status).
+- Tool invocation executes only built-in deterministic handlers (echo, status),
+  whether driven from the Tools panel, the CLI/API, or now Prime chat itself.
   Arbitrary installed plugin tools are discoverable and listed honestly as
   `not_implemented`; running downloaded plugin code (real ToolSets, adapters,
   execution environments) is intentionally not implemented yet.

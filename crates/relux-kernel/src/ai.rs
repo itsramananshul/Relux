@@ -38,7 +38,7 @@
 
 use std::time::Duration;
 
-use relux_core::{PrimeDisposition, PrimeTurn};
+use relux_core::{PrimeDisposition, PrimeIntent, PrimeTurn};
 use serde::Serialize;
 
 /// OpenRouter's OpenAI-compatible chat-completions endpoint.
@@ -262,6 +262,13 @@ pub fn is_actionful(turn: &PrimeTurn) -> bool {
     ) || turn.created_task.is_some()
         || turn.started_run.is_some()
         || turn.approval.is_some()
+        // Tool turns are grounded in real kernel output / a real refusal; the LLM
+        // must never narrate (and possibly overclaim) a tool result or a tool
+        // catalogue, so keep these deterministic too.
+        || turn.invoked_tool.is_some()
+        || turn.tool_output.is_some()
+        || turn.tool_error.is_some()
+        || matches!(turn.intent, PrimeIntent::ToolDiscovery)
 }
 
 /// Decide the path for a turn given the config. Pure: no env, no network.
@@ -467,7 +474,7 @@ fn truncate_chars(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use relux_core::{PrimeIntent, TaskId};
+    use relux_core::TaskId;
 
     fn turn(disposition: PrimeDisposition, reply: &str) -> PrimeTurn {
         PrimeTurn {
@@ -479,6 +486,9 @@ mod tests {
             started_run: None,
             created_agent: None,
             approval: None,
+            invoked_tool: None,
+            tool_output: None,
+            tool_error: None,
         }
     }
 

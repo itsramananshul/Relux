@@ -88,6 +88,14 @@ pub enum PrimeIntent {
     ExplanationRequest,
     DashboardNavigation,
     Brainstorming,
+    /// The user asked which tools Prime can use ("what tools can you use?").
+    /// Answered with grounded capability discovery, never a fabricated list.
+    ToolDiscovery,
+    /// The user asked Prime to run a specific built-in tool ("echo hello",
+    /// "use echo.say with {json}", "run the status tool"). Executed through the
+    /// kernel's permission/audit path; an installed-but-unimplemented tool is
+    /// reported honestly, never faked.
+    ToolInvocation,
     DirectAnswer,
 }
 
@@ -98,6 +106,17 @@ pub enum PrimeIntent {
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum PrimeAction {
     InspectState,
+    /// List the installed plugin tools and their honest executable status
+    /// (`ready` / `not_implemented` / `missing_permission`). Read-only.
+    DiscoverTools,
+    /// Invoke one tool through the kernel's permission/audit path. `input_json`
+    /// is the JSON-encoded tool input (kept as text so the action stays `Eq`);
+    /// it is parsed back to a value immediately before invocation.
+    InvokeTool {
+        plugin_id: String,
+        tool_name: String,
+        input_json: String,
+    },
     CreateTask {
         title: String,
     },
@@ -243,6 +262,19 @@ pub struct PrimeTurn {
     pub started_run: Option<RunId>,
     pub created_agent: Option<AgentId>,
     pub approval: Option<ApprovalId>,
+    /// When Prime ran a tool this turn, its `"<plugin_id>/<tool_name>"` label.
+    /// Set only on a real, kernel-executed invocation - never on a fabricated or
+    /// refused one (`docs/RELUX_MASTER_PLAN.md` §11.1 plugin/action results).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invoked_tool: Option<String>,
+    /// The deterministic JSON output of the invoked tool, when one ran. Carries
+    /// only real kernel output; absent on a refusal or not-implemented reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_output: Option<serde_json::Value>,
+    /// An honest, non-fabricated reason a requested tool did NOT run (installed
+    /// but runtime not implemented, missing permission, or unknown tool).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_error: Option<String>,
 }
 
 /// The scope a Prime turn runs in: which namespace work lands in, which agent
@@ -278,6 +310,18 @@ mod tests {
     }
 
     #[test]
+    fn invoke_tool_action_round_trips() {
+        let action = PrimeAction::InvokeTool {
+            plugin_id: "relux-tools-echo".to_string(),
+            tool_name: "echo.say".to_string(),
+            input_json: "{\"message\":\"hi\"}".to_string(),
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        let back: PrimeAction = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, action);
+    }
+
+    #[test]
     fn all_prime_intents_round_trip() {
         let intents = [
             PrimeIntent::Greeting,
@@ -294,6 +338,8 @@ mod tests {
             PrimeIntent::ExplanationRequest,
             PrimeIntent::DashboardNavigation,
             PrimeIntent::Brainstorming,
+            PrimeIntent::ToolDiscovery,
+            PrimeIntent::ToolInvocation,
             PrimeIntent::DirectAnswer,
         ];
         for intent in intents {

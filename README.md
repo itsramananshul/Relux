@@ -79,6 +79,35 @@ returns HTTP 501 (`ToolRuntimeUnavailable`) with a clear message and never
 fabricates output. The dashboard Plugins page lists tools with their status and
 provides a small invoke panel (JSON input + output/error) for ready tools.
 
+#### Prime can use tools from chat
+
+You no longer need to leave Prime for the Tools panel for simple, safe tool use.
+Prime chat is tool-aware and runs the built-in tools through the **same**
+permission/audit path as `/v1/relux/tools/invoke`:
+
+- "what tools can you use?" - lists the installed tools with their honest
+  executable status (grounded discovery; it never invents a tool).
+- "give me a status summary" / "what is going on?" - consults
+  `relux-tools-status/status.summary` and answers from the real output.
+- "echo hello" / "use echo.say with {\"n\":1}" - runs `relux-tools-echo/echo.say`
+  with the parsed input and shows the returned JSON.
+
+Prime stays honest: a plain "hey" never becomes a tool call, and a request to use
+an installed-but-unimplemented tool (e.g. a GitHub ToolSet) is reported as
+"installed and discoverable, but this local runtime cannot execute it yet" with
+no fabricated output. A missing permission is surfaced, never bypassed.
+**Arbitrary downloaded plugin runtime execution remains intentionally not
+implemented.** The CLI prints the invoked tool and its output too:
+
+```powershell
+relux-kernel prime "what tools can you use?"
+relux-kernel prime "echo hello"
+relux-kernel prime "give me a status summary"
+```
+
+The dashboard Prime page renders the invoked tool and its JSON output (or the
+honest "tool not run" reason) compactly in the chat transcript.
+
 ### First Local Release
 
 Use the local release check before cutting or sharing a Windows bundle:
