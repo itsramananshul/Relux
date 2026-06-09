@@ -23,12 +23,22 @@ use crate::permission::RiskLevel;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolExecutability {
-    /// A built-in deterministic handler exists and (if an agent context was
-    /// supplied) that agent holds the tool's permission. The tool can be invoked.
+    /// Either a built-in deterministic handler exists, or the backing plugin has
+    /// an enabled HTTP loopback runtime configured. If an agent context was
+    /// supplied, that agent also holds the tool's permission. The tool can be
+    /// invoked.
     Ready,
-    /// The tool is installed (its manifest is in the local index) but the kernel
-    /// has no built-in runtime handler for it yet. It is listed honestly as not
-    /// executable instead of pretending it works.
+    /// The backing plugin has no built-in handler and no runtime configured yet.
+    /// The operator can make it executable by configuring an HTTP loopback
+    /// endpoint for the plugin. Listed honestly as not (yet) executable.
+    RuntimeNotConfigured,
+    /// The backing plugin has an HTTP loopback runtime configured but it is
+    /// disabled. The tool stays discoverable but refuses invocation until the
+    /// runtime is re-enabled.
+    RuntimeDisabled,
+    /// No supported runtime exists for this tool at all (reserved for plugin
+    /// kinds the loopback runtime does not cover). Listed honestly instead of
+    /// pretending it works.
     NotImplemented,
     /// A specific agent context was supplied and that agent lacks the tool's
     /// required permission. Only reported when discovery is scoped to an agent.

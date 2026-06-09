@@ -23,6 +23,7 @@ pub mod event;
 pub mod loader;
 pub mod plugin_install;
 pub mod prime;
+pub mod runtime;
 pub mod state;
 pub mod store;
 
@@ -36,6 +37,7 @@ pub use plugin_install::{
     install_from_dir, install_from_github, install_from_zip, list_installed, remove_plugin,
 };
 pub use prime::{classify_intent, decide};
+pub use runtime::{invoke_http_loopback, RuntimeClientError};
 pub use state::{KernelCounters, KernelSnapshot, KernelState};
 pub use store::SqliteStore;
 
@@ -80,6 +82,18 @@ pub enum KernelError {
     ToolNotFound { plugin: String, tool: String },
     #[error("tool {tool} on plugin {plugin} has no runtime handler yet (installed as metadata only; arbitrary plugin code is not executed)")]
     ToolRuntimeUnavailable { plugin: String, tool: String },
+    #[error("plugin {plugin} has an HTTP loopback runtime configured but it is disabled")]
+    ToolRuntimeDisabled { plugin: String },
+    #[error("loopback runtime for {tool} on {plugin} failed: {message}")]
+    ToolRuntimeInvocation {
+        plugin: String,
+        tool: String,
+        message: String,
+    },
+    #[error("invalid tool runtime config for plugin {plugin}: {message}")]
+    InvalidRuntimeConfig { plugin: String, message: String },
+    #[error("no tool runtime configured for plugin {plugin}")]
+    RuntimeNotConfigured { plugin: String },
     #[error("permission denied: agent {agent} lacks {permission}")]
     PermissionDenied { agent: String, permission: String },
     #[error("permission '{1}' already granted to agent {0}")]

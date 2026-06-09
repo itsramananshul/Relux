@@ -19,11 +19,12 @@ use std::collections::HashMap;
 use relux_core::agent::AgentStatus;
 use relux_core::namespace::NamespaceKind;
 use relux_core::{
-    Agent, AgentId, Approval, ApprovalId, ApprovalStatus, AuditEvent, AuditResult, InstalledPlugin,
-    Namespace, NamespaceId, Permission, PluginId, PluginManifest, PluginSourceKind, PrimeAction,
-    PrimeAutonomyConfig, PrimeAutonomyTickResult, PrimeContext, PrimeDisposition, PrimePlan,
-    PrimeTurn, RiskLevel, Run, RunId, RunStatus, StateSummary, Task, TaskBrief, TaskId,
-    TaskStatus, ToolDescriptor, ToolExecutability, ToolInvocationResult,
+    clamp_runtime_timeout, validate_loopback_url, Agent, AgentId, Approval, ApprovalId,
+    ApprovalStatus, AuditEvent, AuditResult, InstalledPlugin, Namespace, NamespaceId, Permission,
+    PluginId, PluginManifest, PluginSourceKind, PrimeAction, PrimeAutonomyConfig,
+    PrimeAutonomyTickResult, PrimeContext, PrimeDisposition, PrimePlan, PrimeTurn, RiskLevel,
+    RuntimeKind, Run, RunId, RunStatus, StateSummary, Task, TaskBrief, TaskId, TaskStatus,
+    ToolDescriptor, ToolExecutability, ToolInvocationResult, ToolRuntimeConfig,
 };
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +59,9 @@ pub struct KernelSnapshot {
     pub plugins: Vec<PluginManifest>,
     /// Install-lifecycle records, one per installed plugin, sorted by id.
     pub installed_plugins: Vec<InstalledPlugin>,
+    /// Per-plugin tool runtime configs (HTTP loopback), sorted by plugin id.
+    #[serde(default)]
+    pub tool_runtime_configs: Vec<ToolRuntimeConfig>,
     pub namespaces: Vec<Namespace>,
     pub agents: Vec<Agent>,
     pub tasks: Vec<Task>,
@@ -76,6 +80,8 @@ pub struct KernelSnapshot {
 pub struct KernelState {
     plugins: HashMap<PluginId, PluginManifest>,
     installed_plugins: HashMap<PluginId, InstalledPlugin>,
+    /// Per-plugin tool runtime configs (HTTP loopback), keyed by plugin id.
+    tool_runtime_configs: HashMap<PluginId, ToolRuntimeConfig>,
     namespaces: HashMap<NamespaceId, Namespace>,
     agents: HashMap<AgentId, Agent>,
     tasks: HashMap<TaskId, Task>,
@@ -120,6 +126,7 @@ impl KernelState {
         KernelSnapshot {
             plugins: sorted(&self.plugins, |p| p.id.as_str()),
             installed_plugins: sorted(&self.installed_plugins, |p| p.id.as_str()),
+            tool_runtime_configs: sorted(&self.tool_runtime_configs, |c| c.plugin_id.as_str()),
             namespaces: sorted(&self.namespaces, |n| n.id.as_str()),
             agents: sorted(&self.agents, |a| a.id.as_str()),
             tasks: sorted(&self.tasks, |t| t.id.as_str()),
@@ -154,6 +161,11 @@ impl KernelState {
             state
                 .installed_plugins
                 .insert(installed.id.clone(), installed);
+        }
+        for cfg in snapshot.tool_runtime_configs {
+            state
+                .tool_runtime_configs
+                .insert(PluginId::new(cfg.plugin_id.clone()), cfg);
         }
         for namespace in snapshot.namespaces {
             state.namespaces.insert(namespace.id.clone(), namespace);
@@ -274,6 +286,9 @@ impl KernelState {
             .remove(id)
             .ok_or_else(|| KernelError::PluginNotInstalled(id.to_string()))?;
         self.plugins.remove(id);
+        // Drop any runtime config so a re-install of the same id does not inherit
+        // a stale loopback endpoint.
+        self.tool_runtime_configs.remove(id);
         self.record_audit(
             "kernel",
             "kernel",
@@ -300,6 +315,126 @@ impl KernelState {
 
     pub fn installed_plugin_count(&self) -> usize {
         self.installed_plugins.len()
+    }
+
+    // --- Tool runtime config (HTTP loopback) -------------------------------
+
+    /// Configure (or update) the HTTP loopback runtime for an installed plugin
+    /// (`docs/RELUX_MASTER_PLAN.md` section 8.2, section 18). Validates the
+    /// loopback URL, clamps the timeout, and persists the config as enabled by
+    /// default. The plugin must be installed and must NOT be a bundled fixture -
+    /// the built-in echo/status tools already run deterministically and a runtime
+    /// config could only confuse that.
+    ///
+    /// This never stores secrets: only the base URL, the enabled flag, and the
+    /// timeout. The actual loopback server is started separately by the operator.
+    pub fn configure_tool_runtime(
+        &mut self,
+        plugin_id: &PluginId,
+        base_url: &str,
+        enabled: bool,
+        timeout_ms: Option<u64>,
+    ) -> Result<ToolRuntimeConfig, KernelError> {
+        let installed = self
+            .installed_plugins
+            .get(plugin_id)
+            .ok_or_else(|| KernelError::PluginNotInstalled(plugin_id.to_string()))?;
+        if installed.source_kind == PluginSourceKind::Bundled {
+            return Err(KernelError::InvalidRuntimeConfig {
+                plugin: plugin_id.to_string(),
+                message: "bundled plugins already run as built-in deterministic tools; \
+                          configuring a loopback runtime for them is not allowed"
+                    .to_string(),
+            });
+        }
+        let base_url = base_url.trim().to_string();
+        validate_loopback_url(&base_url).map_err(|e| KernelError::InvalidRuntimeConfig {
+            plugin: plugin_id.to_string(),
+            message: e.to_string(),
+        })?;
+
+        let config = ToolRuntimeConfig {
+            plugin_id: plugin_id.as_str().to_string(),
+            kind: RuntimeKind::HttpLoopback,
+            base_url,
+            enabled,
+            timeout_ms: clamp_runtime_timeout(timeout_ms),
+        };
+        self.record_audit(
+            "kernel",
+            "kernel",
+            "plugin:runtime_configure",
+            Some("plugin"),
+            Some(plugin_id.as_str()),
+            None,
+            AuditResult::Success,
+            serde_json::json!({
+                "kind": config.kind.as_str(),
+                "enabled": config.enabled,
+                "timeout_ms": config.timeout_ms,
+            }),
+        );
+        self.tool_runtime_configs
+            .insert(plugin_id.clone(), config.clone());
+        Ok(config)
+    }
+
+    /// Disable the runtime for a plugin, keeping its base URL so it can be
+    /// re-enabled. Errors if no runtime is configured.
+    pub fn disable_tool_runtime(
+        &mut self,
+        plugin_id: &PluginId,
+    ) -> Result<ToolRuntimeConfig, KernelError> {
+        let config = self
+            .tool_runtime_configs
+            .get_mut(plugin_id)
+            .ok_or_else(|| KernelError::RuntimeNotConfigured {
+                plugin: plugin_id.to_string(),
+            })?;
+        config.enabled = false;
+        let config = config.clone();
+        self.record_audit(
+            "kernel",
+            "kernel",
+            "plugin:runtime_disable",
+            Some("plugin"),
+            Some(plugin_id.as_str()),
+            None,
+            AuditResult::Success,
+            serde_json::Value::Null,
+        );
+        Ok(config)
+    }
+
+    /// Remove a plugin's runtime config entirely. Errors if none is configured.
+    pub fn remove_tool_runtime(&mut self, plugin_id: &PluginId) -> Result<(), KernelError> {
+        self.tool_runtime_configs
+            .remove(plugin_id)
+            .ok_or_else(|| KernelError::RuntimeNotConfigured {
+                plugin: plugin_id.to_string(),
+            })?;
+        self.record_audit(
+            "kernel",
+            "kernel",
+            "plugin:runtime_remove",
+            Some("plugin"),
+            Some(plugin_id.as_str()),
+            None,
+            AuditResult::Success,
+            serde_json::Value::Null,
+        );
+        Ok(())
+    }
+
+    pub fn tool_runtime_config(&self, plugin_id: &PluginId) -> Option<&ToolRuntimeConfig> {
+        self.tool_runtime_configs.get(plugin_id)
+    }
+
+    /// All runtime configs, sorted by plugin id for deterministic listing.
+    pub fn tool_runtime_configs(&self) -> Vec<&ToolRuntimeConfig> {
+        let mut out: Vec<&ToolRuntimeConfig> = self.tool_runtime_configs.values().collect();
+        out.sort_by(|a, b| a.plugin_id.cmp(&b.plugin_id));
+        out
     }
 
     // --- Namespaces --------------------------------------------------------
@@ -850,16 +985,18 @@ impl KernelState {
             });
         }
 
-        // Only built-in deterministic handlers execute. An unimplemented tool is
-        // refused honestly - no fabricated output.
-        let output = match self.builtin_tool_output(plugin_id.as_str(), tool_name, &input) {
-            Some(output) => output,
-            None => {
+        // Execute via a built-in deterministic handler or the plugin's configured
+        // HTTP loopback runtime. Any failure (unconfigured, disabled, or a
+        // loopback error) is audited and recorded on the transcript - no
+        // fabricated output. Arbitrary downloaded plugin code is never executed.
+        let output = match self.execute_tool_runtime(plugin_id, tool_name, &input) {
+            Ok(output) => output,
+            Err(e) => {
                 self.push_run_event(
                     run_id,
-                    "tool_call_unavailable",
+                    "tool_call_failed",
                     "kernel",
-                    &format!("no runtime handler for {tool_name} on {plugin_id}"),
+                    &format!("{tool_name} on {plugin_id} did not run: {e}"),
                     serde_json::json!({ "tool": tool_name, "plugin": plugin_id.as_str() }),
                 );
                 self.record_audit(
@@ -870,15 +1007,9 @@ impl KernelState {
                     Some(tool_name),
                     Some(&namespace),
                     AuditResult::Failed,
-                    serde_json::json!({
-                        "run": run_id.as_str(),
-                        "reason": "tool runtime not implemented"
-                    }),
+                    serde_json::json!({ "run": run_id.as_str(), "reason": e.to_string() }),
                 );
-                return Err(KernelError::ToolRuntimeUnavailable {
-                    plugin: plugin_id.to_string(),
-                    tool: tool_name.to_string(),
-                });
+                return Err(e);
             }
         };
 
@@ -937,9 +1068,9 @@ impl KernelState {
             });
         }
 
-        let output = match self.builtin_tool_output(plugin_id.as_str(), tool_name, &input) {
-            Some(output) => output,
-            None => {
+        let output = match self.execute_tool_runtime(plugin_id, tool_name, &input) {
+            Ok(output) => output,
+            Err(e) => {
                 self.record_audit(
                     "agent",
                     agent_id.as_str(),
@@ -951,13 +1082,10 @@ impl KernelState {
                     serde_json::json!({
                         "via": "invoke",
                         "plugin": plugin_id.as_str(),
-                        "reason": "tool runtime not implemented"
+                        "reason": e.to_string()
                     }),
                 );
-                return Err(KernelError::ToolRuntimeUnavailable {
-                    plugin: plugin_id.to_string(),
-                    tool: tool_name.to_string(),
-                });
+                return Err(e);
             }
         };
 
@@ -993,18 +1121,27 @@ impl KernelState {
                 continue;
             };
             let protected = installed.source_kind == PluginSourceKind::Bundled;
+            let runtime = self.tool_runtime_configs.get(&installed.id);
             for tool in &manifest.capabilities.tools {
                 let builtin = crate::builtin::is_builtin_tool(installed.id.as_str(), &tool.name);
-                let executable = if !builtin {
-                    ToolExecutability::NotImplemented
-                } else if let Some(agent_id) = agent_for_permission {
-                    if self.agent_holds_permission(agent_id, &tool.permission) {
-                        ToolExecutability::Ready
-                    } else {
-                        ToolExecutability::MissingPermission
+                // A tool is runnable when a built-in handler exists OR the plugin
+                // has an enabled HTTP loopback runtime configured. Otherwise the
+                // status is honest about WHY it cannot run.
+                let runnable = builtin || runtime.map(|c| c.enabled).unwrap_or(false);
+                let executable = if runnable {
+                    match agent_for_permission {
+                        Some(agent_id) if !self.agent_holds_permission(agent_id, &tool.permission) => {
+                            ToolExecutability::MissingPermission
+                        }
+                        _ => ToolExecutability::Ready,
                     }
+                } else if runtime.is_some() {
+                    // Configured but disabled.
+                    ToolExecutability::RuntimeDisabled
                 } else {
-                    ToolExecutability::Ready
+                    // No built-in handler and no runtime yet: the operator can
+                    // make it runnable by configuring an HTTP loopback endpoint.
+                    ToolExecutability::RuntimeNotConfigured
                 };
                 out.push(ToolDescriptor {
                     plugin_id: installed.id.as_str().to_string(),
@@ -1067,6 +1204,52 @@ impl KernelState {
             .get(agent_id)
             .map(|a| a.permissions.iter().any(|p| p.matches_exact(permission)))
             .unwrap_or(false)
+    }
+
+    /// Execute a tool through a supported runtime and return its output JSON.
+    ///
+    /// Resolution order: a built-in deterministic handler first, then the plugin's
+    /// configured HTTP loopback runtime. Honest by construction:
+    /// - no built-in and no runtime configured -> [`KernelError::ToolRuntimeUnavailable`]
+    /// - a runtime is configured but disabled -> [`KernelError::ToolRuntimeDisabled`]
+    /// - a loopback failure (connect/timeout/non-200/invalid-JSON/tool error) ->
+    ///   [`KernelError::ToolRuntimeInvocation`]
+    ///
+    /// Arbitrary downloaded plugin code is never executed - only the operator's
+    /// loopback server is ever called (`docs/RELUX_MASTER_PLAN.md` section 8.2,
+    /// section 18).
+    fn execute_tool_runtime(
+        &self,
+        plugin_id: &PluginId,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) -> Result<serde_json::Value, KernelError> {
+        if let Some(output) = self.builtin_tool_output(plugin_id.as_str(), tool_name, input) {
+            return Ok(output);
+        }
+        match self.tool_runtime_configs.get(plugin_id) {
+            None => Err(KernelError::ToolRuntimeUnavailable {
+                plugin: plugin_id.to_string(),
+                tool: tool_name.to_string(),
+            }),
+            Some(cfg) if !cfg.enabled => Err(KernelError::ToolRuntimeDisabled {
+                plugin: plugin_id.to_string(),
+            }),
+            Some(cfg) => match cfg.kind {
+                RuntimeKind::HttpLoopback => crate::runtime::invoke_http_loopback(
+                    &cfg.base_url,
+                    plugin_id.as_str(),
+                    tool_name,
+                    input,
+                    cfg.timeout_ms,
+                )
+                .map_err(|e| KernelError::ToolRuntimeInvocation {
+                    plugin: plugin_id.to_string(),
+                    tool: tool_name.to_string(),
+                    message: e.to_string(),
+                }),
+            },
+        }
     }
 
     /// Execute a built-in deterministic tool handler, or `None` when the kernel
@@ -1694,6 +1877,30 @@ impl KernelState {
                     Some(note),
                 ))
             }
+            Some(ToolExecutability::RuntimeNotConfigured) => {
+                let note = format!(
+                    "{label} is installed but has no runtime configured; an operator must set an HTTP loopback endpoint for {plugin_id} before it can run"
+                );
+                Ok(turn(
+                    with_prose(note.clone()),
+                    PrimeDisposition::NeedsClarification,
+                    None,
+                    None,
+                    Some(note),
+                ))
+            }
+            Some(ToolExecutability::RuntimeDisabled) => {
+                let note = format!(
+                    "{label} has an HTTP loopback runtime configured but it is disabled; re-enable it first"
+                );
+                Ok(turn(
+                    with_prose(note.clone()),
+                    PrimeDisposition::NeedsClarification,
+                    None,
+                    None,
+                    Some(note),
+                ))
+            }
             Some(ToolExecutability::MissingPermission) => {
                 let note = format!(
                     "I cannot run {label}: I do not hold the permission it requires - grant it first, then ask me again"
@@ -1926,6 +2133,10 @@ fn render_tool_catalog(intro: &str, tools: &[ToolDescriptor]) -> String {
     for t in tools {
         let status = match t.executable {
             ToolExecutability::Ready => "ready",
+            ToolExecutability::RuntimeNotConfigured => {
+                "installed, runtime not configured (set a loopback endpoint)"
+            }
+            ToolExecutability::RuntimeDisabled => "installed, runtime disabled",
             ToolExecutability::NotImplemented => "installed, runtime not implemented yet",
             ToolExecutability::MissingPermission => "needs permission",
         };
@@ -2365,17 +2576,20 @@ mod tests {
             "got {err:?}"
         );
 
-        // The transcript shows the honest unavailable marker, NOT a tool_call with
+        // The transcript shows the honest failure marker, NOT a tool_call with
         // fabricated output.
         let kinds: Vec<&str> = k.run_events(&run).iter().map(|e| e.kind.as_str()).collect();
-        assert!(kinds.contains(&"tool_call_unavailable"), "got {kinds:?}");
+        assert!(kinds.contains(&"tool_call_failed"), "got {kinds:?}");
         assert!(!kinds.contains(&"tool_call"), "must not fabricate a tool_call");
 
-        // It is audited as a failure with the not-implemented reason.
+        // It is audited as a failure whose reason names the missing runtime.
         assert!(k.audit_log().iter().any(|e| e.action
             == "tool:relux-tools-ghost:act"
             && e.result == AuditResult::Failed
-            && e.metadata["reason"] == "tool runtime not implemented"));
+            && e.metadata["reason"]
+                .as_str()
+                .map(|r| r.contains("no runtime handler"))
+                .unwrap_or(false)));
     }
 
     #[test]
@@ -2433,8 +2647,202 @@ mod tests {
         );
     }
 
+    /// Spawn a one-shot loopback HTTP server returning `response`, and return its
+    /// `http://127.0.0.1:<port>` base URL.
+    fn one_shot_http(response: &'static str) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                // Drain the full request (headers + Content-Length body) before
+                // responding, so the server never closes the socket mid-write.
+                let mut data: Vec<u8> = Vec::new();
+                let mut buf = [0u8; 4096];
+                let header_end = loop {
+                    if let Some(i) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break i + 4;
+                    }
+                    match sock.read(&mut buf) {
+                        Ok(0) => break data.len(),
+                        Ok(n) => data.extend_from_slice(&buf[..n]),
+                        Err(_) => break data.len(),
+                    }
+                };
+                let headers = String::from_utf8_lossy(&data[..header_end]).to_lowercase();
+                let content_length = headers
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                while data.len() - header_end < content_length {
+                    match sock.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => data.extend_from_slice(&buf[..n]),
+                        Err(_) => break,
+                    }
+                }
+                let _ = sock.write_all(response.as_bytes());
+                let _ = sock.flush();
+            }
+        });
+        base
+    }
+
+    /// Install ghost as a removable LocalDir plugin and grant Prime its permission.
+    fn primed_with_installed_ghost() -> (KernelState, AgentId, PluginId) {
+        let (mut k, prime, _task, _run, _echo) = primed_kernel();
+        k.install_plugin(
+            unsupported_toolset_manifest(),
+            PluginSourceKind::LocalDir,
+            "/tmp/ghost".to_string(),
+            "/data/ghost".to_string(),
+            true,
+        );
+        k.grant_permission_to_agent(&prime, Permission::new("tool:relux-tools-ghost:act").unwrap())
+            .unwrap();
+        (k, prime, PluginId::new("relux-tools-ghost"))
+    }
+
     #[test]
-    fn discover_tools_marks_ready_vs_not_implemented() {
+    fn configured_runtime_invokes_manifest_tool_and_returns_output() {
+        let (mut k, prime, ghost) = primed_with_installed_ghost();
+        let base = one_shot_http(
+            "HTTP/1.1 200 OK\r\nContent-Length: 31\r\nConnection: close\r\n\r\n{\"output\":{\"pong\":true}}\n\n\n\n",
+        );
+        k.configure_tool_runtime(&ghost, &base, true, Some(2_000))
+            .expect("configure runtime");
+
+        let result = k
+            .invoke_tool(&prime, &ghost, "ghost.act", serde_json::json!({ "ping": 1 }))
+            .expect("loopback invocation ok");
+        assert_eq!(result.output, serde_json::json!({ "pong": true }));
+        // Audited as a success through the invoke path.
+        assert!(k.audit_log().iter().any(|e| e.action
+            == "tool:relux-tools-ghost:act"
+            && e.result == AuditResult::Success));
+    }
+
+    #[test]
+    fn disabled_runtime_refuses_invocation() {
+        let (mut k, prime, ghost) = primed_with_installed_ghost();
+        k.configure_tool_runtime(&ghost, "http://127.0.0.1:19999", true, None)
+            .unwrap();
+        k.disable_tool_runtime(&ghost).unwrap();
+
+        let err = k
+            .invoke_tool(&prime, &ghost, "ghost.act", serde_json::json!({}))
+            .unwrap_err();
+        assert!(
+            matches!(err, KernelError::ToolRuntimeDisabled { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn permission_denied_happens_before_the_http_call() {
+        // Configure a runtime that points at a dead loopback port. A denied agent
+        // must fail with PermissionDenied, NOT a connect/timeout error - proving
+        // the permission gate runs before any HTTP work.
+        let (mut k, _prime, ghost) = primed_with_installed_ghost();
+        k.configure_tool_runtime(&ghost, "http://127.0.0.1:1", true, Some(500))
+            .unwrap();
+        let ns = NamespaceId::new("workspace");
+        let adapter = PluginId::new("relux-adapter-local-prime");
+        let weak = k
+            .create_agent("weak", "Weak", "no perms", &adapter, &ns, None, vec![])
+            .unwrap();
+
+        let err = k
+            .invoke_tool(&weak, &ghost, "ghost.act", serde_json::json!({}))
+            .unwrap_err();
+        assert!(
+            matches!(err, KernelError::PermissionDenied { .. }),
+            "permission must be checked before the HTTP call, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_returning_error_payload_is_surfaced_honestly() {
+        let (mut k, prime, ghost) = primed_with_installed_ghost();
+        let base = one_shot_http(
+            "HTTP/1.1 200 OK\r\nContent-Length: 24\r\nConnection: close\r\n\r\n{\"error\":\"nope\"}\n\n\n\n\n\n",
+        );
+        k.configure_tool_runtime(&ghost, &base, true, Some(2_000))
+            .unwrap();
+        let err = k
+            .invoke_tool(&prime, &ghost, "ghost.act", serde_json::json!({}))
+            .unwrap_err();
+        match err {
+            KernelError::ToolRuntimeInvocation { message, .. } => {
+                assert!(message.contains("nope"), "got {message}")
+            }
+            other => panic!("expected ToolRuntimeInvocation, got {other:?}"),
+        }
+        // Audited as a failure - never a fabricated success.
+        assert!(k.audit_log().iter().any(|e| e.action
+            == "tool:relux-tools-ghost:act"
+            && e.result == AuditResult::Failed));
+    }
+
+    #[test]
+    fn runtime_config_rejects_bundled_and_bad_url_and_uninstalled() {
+        let (mut k, _prime, ghost) = primed_with_installed_ghost();
+        // Bundled echo cannot get a loopback runtime.
+        k.install_plugin(
+            echo_manifest(),
+            PluginSourceKind::Bundled,
+            "bundled".to_string(),
+            "examples/relux-plugins/relux-tools-echo".to_string(),
+            true,
+        );
+        let echo = PluginId::new("relux-tools-echo");
+        let err = k
+            .configure_tool_runtime(&echo, "http://127.0.0.1:19999", true, None)
+            .unwrap_err();
+        assert!(matches!(err, KernelError::InvalidRuntimeConfig { .. }), "got {err:?}");
+
+        // A non-loopback URL is refused for an installed plugin.
+        let err = k
+            .configure_tool_runtime(&ghost, "https://example.com:443", true, None)
+            .unwrap_err();
+        assert!(matches!(err, KernelError::InvalidRuntimeConfig { .. }), "got {err:?}");
+
+        // An uninstalled plugin cannot be configured.
+        let err = k
+            .configure_tool_runtime(
+                &PluginId::new("relux-tools-nope"),
+                "http://127.0.0.1:19999",
+                true,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err, KernelError::PluginNotInstalled(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn runtime_config_survives_snapshot_roundtrip_and_clears_on_remove() {
+        let (mut k, _prime, ghost) = primed_with_installed_ghost();
+        k.configure_tool_runtime(&ghost, "http://127.0.0.1:19999", true, Some(1_234))
+            .unwrap();
+
+        // Snapshot -> restore preserves the config.
+        let restored = KernelState::from_snapshot(k.snapshot());
+        let cfg = restored.tool_runtime_config(&ghost).expect("config survives");
+        assert_eq!(cfg.base_url, "http://127.0.0.1:19999");
+        assert_eq!(cfg.timeout_ms, 1_234);
+        assert!(cfg.enabled);
+
+        // Removing the installed plugin clears its runtime config.
+        k.remove_installed_plugin(&ghost).unwrap();
+        assert!(k.tool_runtime_config(&ghost).is_none());
+    }
+
+    #[test]
+    fn discover_tools_marks_ready_vs_runtime_status() {
         let (mut k, prime, _task, _run, _echo) = primed_kernel();
         // primed_kernel only registers manifests; install records back discovery,
         // so install echo + the unsupported plugin as records.
@@ -2453,7 +2861,8 @@ mod tests {
             true,
         );
 
-        // Without an agent context: echo is ready, ghost is not implemented.
+        // Without an agent context: echo is ready (built-in), ghost has no runtime
+        // configured yet.
         let tools = k.discover_tools(None);
         let echo = tools
             .iter()
@@ -2465,11 +2874,29 @@ mod tests {
             .iter()
             .find(|t| t.tool_name == "ghost.act")
             .expect("ghost discovered");
-        assert_eq!(ghost.executable, ToolExecutability::NotImplemented);
+        assert_eq!(ghost.executable, ToolExecutability::RuntimeNotConfigured);
         assert!(!ghost.protected);
 
+        // Configure + enable an HTTP loopback runtime for ghost: it becomes ready.
+        let ghost_id = PluginId::new("relux-tools-ghost");
+        k.configure_tool_runtime(&ghost_id, "http://127.0.0.1:19999", true, None)
+            .expect("configure runtime");
+        let tools = k.discover_tools(None);
+        let ghost = tools.iter().find(|t| t.tool_name == "ghost.act").unwrap();
+        assert_eq!(ghost.executable, ToolExecutability::Ready);
+
+        // Disable it: it flips to runtime_disabled.
+        k.disable_tool_runtime(&ghost_id).unwrap();
+        let tools = k.discover_tools(None);
+        let ghost = tools.iter().find(|t| t.tool_name == "ghost.act").unwrap();
+        assert_eq!(ghost.executable, ToolExecutability::RuntimeDisabled);
+
+        // Re-enable for the permission-scoping checks below.
+        k.configure_tool_runtime(&ghost_id, "http://127.0.0.1:19999", true, None)
+            .unwrap();
+
         // Scoped to an agent WITHOUT the echo permission: echo flips to
-        // missing_permission, ghost stays not_implemented (runtime trumps perms).
+        // missing_permission; ghost (enabled runtime, no perm) also flips.
         let ns = NamespaceId::new("workspace");
         let adapter = PluginId::new("relux-adapter-local-prime");
         let weak = k
@@ -2479,7 +2906,7 @@ mod tests {
         let echo = scoped.iter().find(|t| t.tool_name == "echo.say").unwrap();
         assert_eq!(echo.executable, ToolExecutability::MissingPermission);
         let ghost = scoped.iter().find(|t| t.tool_name == "ghost.act").unwrap();
-        assert_eq!(ghost.executable, ToolExecutability::NotImplemented);
+        assert_eq!(ghost.executable, ToolExecutability::MissingPermission);
 
         // Scoped to Prime (which holds the echo permission): echo is ready.
         let primed = k.discover_tools(Some(&prime));
@@ -2950,7 +3377,9 @@ mod tests {
         let err = turn.tool_error.expect("an honest tool_error");
         assert!(err.contains("relux-tools-github"), "got: {err}");
         assert!(
-            err.contains("cannot execute it yet") || err.contains("not implemented"),
+            err.contains("cannot execute it yet")
+                || err.contains("not implemented")
+                || err.contains("no runtime configured"),
             "got: {err}"
         );
     }

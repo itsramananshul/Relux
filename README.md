@@ -108,6 +108,80 @@ relux-kernel prime "give me a status summary"
 The dashboard Prime page renders the invoked tool and its JSON output (or the
 honest "tool not run" reason) compactly in the chat transcript.
 
+### Plugin Runtime v1 (HTTP loopback ToolSet runtime)
+
+By default only the built-in `echo`/`status` tools execute, and an installed
+ToolSet plugin's tools are listed as `runtime_not_configured`. **Relux never
+auto-runs downloaded plugin code** - it does not shell out to plugin commands,
+does not run code from GitHub/zip/folder installs, and never calls a remote host.
+
+A ToolSet plugin becomes executable only when an operator **explicitly points it
+at a loopback HTTP server they run themselves**. The plugin author/operator runs
+their own local server; Relux calls it through a narrow, permission-checked,
+audited protocol.
+
+The protocol is one stable endpoint:
+
+```text
+POST <base_url>/invoke
+Content-Type: application/json
+{ "plugin_id": "relux-tools-demo", "tool_name": "demo.ping", "input": <json> }
+
+200 OK  { "output": <json> }     -> success
+200 OK  { "error": "..." }       -> the tool refused/failed (surfaced honestly)
+```
+
+Safety limits (all enforced by the kernel):
+
+- **Loopback only.** Only `http://127.0.0.1:<port>`, `http://localhost:<port>`, or
+  `http://[::1]:<port>` are accepted - with an explicit port. `https`, remote
+  hosts, embedded credentials, query/fragment, and `..` paths are rejected.
+- **Bounded.** A per-call timeout (default 5000 ms, clamped 100-60000), a request
+  body cap, and a response body cap. JSON in, JSON out. No TLS, no redirects.
+- **Permission-checked + audited.** Every invocation passes the same kernel
+  permission check and audit-log path as the built-in tools. A connection
+  failure, timeout, non-200, oversized body, invalid JSON, or `{ "error": ... }`
+  becomes a clear error - never a fabricated success.
+- **No secrets stored.** The per-plugin config holds only the loopback base URL,
+  the enabled flag, and the timeout.
+
+Bundled plugins (`echo`/`status`) cannot be given a loopback runtime - they
+already run as built-in deterministic tools.
+
+CLI:
+
+```powershell
+# Show a plugin's runtime config/status.
+relux-kernel plugin runtime relux-tools-demo
+
+# Configure + enable an HTTP loopback runtime (optional --timeout-ms).
+relux-kernel plugin runtime set relux-tools-demo http://127.0.0.1:19999 --timeout-ms 5000
+
+# Disable the runtime (keeps the URL so it can be re-enabled).
+relux-kernel plugin runtime disable relux-tools-demo
+```
+
+API:
+
+```text
+GET    /v1/relux/plugins/:id/runtime   # runtime status/config (no secrets)
+PUT    /v1/relux/plugins/:id/runtime   # { "base_url", "enabled"?, "timeout_ms"? }
+PATCH  /v1/relux/plugins/:id/runtime   # partial update (toggle enabled / timeout)
+DELETE /v1/relux/plugins/:id/runtime   # clear the runtime config
+```
+
+`/v1/relux/tools` reflects the runtime status (`ready` once an enabled loopback
+runtime is configured, otherwise `runtime_not_configured` / `runtime_disabled`),
+and `/v1/relux/tools/invoke` routes configured loopback tools through the runtime.
+A disabled runtime returns HTTP 409; a loopback failure returns HTTP 502; a
+non-loopback URL is rejected with HTTP 400.
+
+Dashboard: each non-bundled plugin on the Plugins page has a **Runtime** panel to
+set the loopback URL + timeout, disable, or clear it. Configured-and-enabled
+tools then show as `ready` in the Tools section and can be invoked from the
+existing invoke panel; unconfigured tools show `runtime not configured` with a
+configure affordance.
+
 ### First Local Release
 
 Use the local release check before cutting or sharing a Windows bundle:

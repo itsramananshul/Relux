@@ -45,6 +45,9 @@ fn main() -> ExitCode {
     //   relux-kernel plugin install-zip <p>  -> install a plugin from a .zip
     //   relux-kernel plugin install-github <url> -> install from a GitHub URL
     //   relux-kernel plugin remove <id>      -> remove an installed plugin
+    //   relux-kernel plugin runtime <id>     -> show a plugin's HTTP loopback runtime
+    //   relux-kernel plugin runtime set <id> <url> [--timeout-ms N] -> configure+enable
+    //   relux-kernel plugin runtime disable <id> -> disable a plugin's runtime
     //   relux-kernel tools                   -> list installed tools + executable status
     //   relux-kernel tool invoke <plugin> <tool> [json] -> invoke a built-in tool
     //
@@ -616,11 +619,113 @@ fn run_plugin_subcommand(args: &[String]) -> Result<(), KernelError> {
             let id = first_arg(rest, "plugin remove <plugin-id>")?;
             run_plugin_remove(&id)
         }
+        Some((sub, rest)) if sub == "runtime" => run_plugin_runtime(rest),
         _ => Err(KernelError::PluginInstall(
-            "usage: relux-kernel plugin <install-dir|install-zip|install-github|remove> <arg>"
+            "usage: relux-kernel plugin <install-dir|install-zip|install-github|remove|runtime> <arg>"
                 .to_string(),
         )),
     }
+}
+
+/// Dispatch `relux-kernel plugin runtime <show|set|disable> ...`.
+///
+/// The HTTP loopback ToolSet runtime (`docs/RELUX_MASTER_PLAN.md` section 8.2,
+/// section 18). Relux never auto-runs downloaded plugin code; an operator opts a
+/// plugin into execution by pointing it at a loopback server they run themselves.
+fn run_plugin_runtime(args: &[String]) -> Result<(), KernelError> {
+    match args.split_first() {
+        // `runtime set <id> <url> [--timeout-ms N]`
+        Some((sub, rest)) if sub == "set" => {
+            let (id, tail) = rest
+                .split_first()
+                .ok_or_else(|| usage_err("plugin runtime set <plugin-id> <base-url> [--timeout-ms N]"))?;
+            let (url, flags) = tail
+                .split_first()
+                .ok_or_else(|| usage_err("plugin runtime set <plugin-id> <base-url> [--timeout-ms N]"))?;
+            let timeout_ms = parse_timeout_flag(flags)?;
+            run_plugin_runtime_set(id, url, timeout_ms)
+        }
+        // `runtime disable <id>`
+        Some((sub, rest)) if sub == "disable" => {
+            let id = first_arg(rest, "plugin runtime disable <plugin-id>")?;
+            run_plugin_runtime_disable(&id)
+        }
+        // `runtime <id>` (bare) shows the config/status.
+        Some((id, _)) if !id.trim().is_empty() => run_plugin_runtime_show(id),
+        _ => Err(usage_err(
+            "plugin runtime <plugin-id> | plugin runtime set <plugin-id> <base-url> [--timeout-ms N] | plugin runtime disable <plugin-id>",
+        )),
+    }
+}
+
+fn usage_err(usage: &str) -> KernelError {
+    KernelError::PluginInstall(format!("usage: relux-kernel {usage}"))
+}
+
+/// Parse an optional trailing `--timeout-ms N` flag.
+fn parse_timeout_flag(flags: &[String]) -> Result<Option<u64>, KernelError> {
+    match flags.split_first() {
+        None => Ok(None),
+        Some((flag, rest)) if flag == "--timeout-ms" => {
+            let val = rest
+                .first()
+                .ok_or_else(|| KernelError::PluginInstall("missing value for --timeout-ms".to_string()))?;
+            let parsed = val
+                .parse::<u64>()
+                .map_err(|_| KernelError::PluginInstall(format!("invalid --timeout-ms: {val}")))?;
+            Ok(Some(parsed))
+        }
+        Some((other, _)) => Err(KernelError::PluginInstall(format!("unknown flag: {other}"))),
+    }
+}
+
+fn run_plugin_runtime_show(plugin_id: &str) -> Result<(), KernelError> {
+    let path = db_path();
+    let mut store = SqliteStore::open(&path)?;
+    let mut kernel = store.load()?;
+    ensure_bootstrapped(&mut kernel)?;
+    store.save(&kernel)?;
+
+    let id = PluginId::new(plugin_id);
+    if kernel.installed_plugin(&id).is_none() {
+        return Err(KernelError::PluginNotInstalled(plugin_id.to_string()));
+    }
+    println!("== Tool runtime: {plugin_id} ==");
+    match kernel.tool_runtime_config(&id) {
+        Some(cfg) => {
+            println!("   kind:      {}", cfg.kind.as_str());
+            println!("   base_url:  {}", cfg.base_url);
+            println!("   enabled:   {}", cfg.enabled);
+            println!("   timeout:   {} ms", cfg.timeout_ms);
+        }
+        None => {
+            println!("   (no runtime configured)");
+            println!("   Configure one with: relux-kernel plugin runtime set {plugin_id} http://127.0.0.1:<port>");
+        }
+    }
+    Ok(())
+}
+
+fn run_plugin_runtime_set(plugin_id: &str, base_url: &str, timeout_ms: Option<u64>) -> Result<(), KernelError> {
+    let id = PluginId::new(plugin_id);
+    with_persistent_kernel(|kernel| {
+        let cfg = kernel.configure_tool_runtime(&id, base_url, true, timeout_ms)?;
+        Ok(format!(
+            "configured {} runtime for {} -> {} (enabled, timeout {} ms)",
+            cfg.kind.as_str(),
+            cfg.plugin_id,
+            cfg.base_url,
+            cfg.timeout_ms
+        ))
+    })
+}
+
+fn run_plugin_runtime_disable(plugin_id: &str) -> Result<(), KernelError> {
+    let id = PluginId::new(plugin_id);
+    with_persistent_kernel(|kernel| {
+        kernel.disable_tool_runtime(&id)?;
+        Ok(format!("disabled runtime for {plugin_id}"))
+    })
 }
 
 /// Return the first argument, or a usage error naming the expected form.
@@ -703,6 +808,8 @@ fn run_plugin_remove(plugin_id: &str) -> Result<(), KernelError> {
 fn executability_label(e: &ToolExecutability) -> &'static str {
     match e {
         ToolExecutability::Ready => "ready",
+        ToolExecutability::RuntimeNotConfigured => "runtime_not_configured",
+        ToolExecutability::RuntimeDisabled => "runtime_disabled",
         ToolExecutability::NotImplemented => "not_implemented",
         ToolExecutability::MissingPermission => "missing_permission",
     }
@@ -736,9 +843,10 @@ fn run_tools_list() -> Result<(), KernelError> {
         );
     }
     println!();
-    println!("Only built-in deterministic tools are executable. Tools marked");
-    println!("'not_implemented' are installed as metadata; arbitrary plugin code is");
-    println!("not executed yet.");
+    println!("Built-in deterministic tools (echo/status) are always executable. A");
+    println!("'runtime_not_configured' tool becomes 'ready' once you point it at an");
+    println!("operator-run loopback server: relux-kernel plugin runtime set <id>");
+    println!("http://127.0.0.1:<port>. Relux never auto-runs downloaded plugin code.");
     Ok(())
 }
 

@@ -134,6 +134,9 @@ async fn serve() -> Result<(), KernelError> {
     println!("   GET    /v1/relux/plugins");
     println!("   POST   /v1/relux/plugins/install-github   {{ \"url\": \"https://github.com/...\" }}");
     println!("   POST   /v1/relux/plugins/install-zip      (multipart field: file)");
+    println!("   GET    /v1/relux/plugins/:id/runtime      (HTTP loopback runtime status)");
+    println!("   PUT    /v1/relux/plugins/:id/runtime      {{ \"base_url\":\"http://127.0.0.1:<port>\", \"enabled\"?, \"timeout_ms\"? }}");
+    println!("   DELETE /v1/relux/plugins/:id/runtime      (clear runtime config)");
     println!("   DELETE /v1/relux/plugins/:id");
 
     // Start background autonomy loop
@@ -236,6 +239,13 @@ fn router(state: AppState) -> Router {
         .route("/v1/relux/plugins/install-dir", post(install_dir))
         .route("/v1/relux/plugins/install-github", post(install_github))
         .route("/v1/relux/plugins/install-zip", post(install_zip))
+        .route(
+            "/v1/relux/plugins/:id/runtime",
+            get(get_plugin_runtime)
+                .put(set_plugin_runtime)
+                .patch(set_plugin_runtime)
+                .delete(delete_plugin_runtime),
+        )
         .route("/v1/relux/plugins/:id", delete(remove))
         // Relux Approvals and Permissions
         .route("/v1/relux/approvals", get(list_approvals))
@@ -1055,6 +1065,136 @@ async fn remove(
     Ok(Json(RemovedResponse { removed: id }))
 }
 
+// --- Tool runtime (HTTP loopback) ------------------------------------------
+
+/// The runtime status/config for one plugin. Carries no secrets - just the
+/// loopback base URL, the enabled flag, and the timeout.
+#[derive(Debug, Serialize)]
+struct RuntimeConfigResponse {
+    plugin_id: String,
+    /// Whether a runtime is configured at all.
+    configured: bool,
+    /// The runtime kind, e.g. `"http_loopback"` (only when configured).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_url: Option<String>,
+    enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout_ms: Option<u64>,
+}
+
+fn runtime_response(
+    plugin_id: &str,
+    config: Option<&relux_core::ToolRuntimeConfig>,
+) -> RuntimeConfigResponse {
+    match config {
+        Some(c) => RuntimeConfigResponse {
+            plugin_id: plugin_id.to_string(),
+            configured: true,
+            kind: Some(c.kind.as_str().to_string()),
+            base_url: Some(c.base_url.clone()),
+            enabled: c.enabled,
+            timeout_ms: Some(c.timeout_ms),
+        },
+        None => RuntimeConfigResponse {
+            plugin_id: plugin_id.to_string(),
+            configured: false,
+            kind: None,
+            base_url: None,
+            enabled: false,
+            timeout_ms: None,
+        },
+    }
+}
+
+/// GET `/v1/relux/plugins/:id/runtime` - the current runtime config/status.
+async fn get_plugin_runtime(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<RuntimeConfigResponse>, ApiError> {
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err(ApiError::bad_request("plugin id is required"));
+    }
+    let plugin_id = relux_core::PluginId::new(id.clone());
+    let resp = locked_read(&state, |kernel| {
+        // 404 for an unknown plugin so the UI can tell "not installed" from
+        // "installed, no runtime".
+        if kernel.installed_plugin(&plugin_id).is_none() {
+            return Err(KernelError::PluginNotInstalled(id.clone()));
+        }
+        Ok(runtime_response(&id, kernel.tool_runtime_config(&plugin_id)))
+    })?;
+    Ok(Json(resp))
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeConfigReq {
+    /// The loopback base URL. Required when no runtime exists yet; optional on a
+    /// PATCH that only toggles `enabled`/`timeout_ms`.
+    base_url: Option<String>,
+    /// Defaults to enabled when configuring; can be set false to disable.
+    enabled: Option<bool>,
+    timeout_ms: Option<u64>,
+}
+
+/// PUT/PATCH `/v1/relux/plugins/:id/runtime` - configure (or update) the HTTP
+/// loopback runtime. The base URL is validated as loopback-only; the plugin must
+/// be installed and non-bundled. No secrets are accepted or stored.
+async fn set_plugin_runtime(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<RuntimeConfigReq>,
+) -> Result<Json<RuntimeConfigResponse>, ApiError> {
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err(ApiError::bad_request("plugin id is required"));
+    }
+    let plugin_id = relux_core::PluginId::new(id.clone());
+    let resp = locked_save(&state, |kernel| {
+        // Merge with any existing config so a PATCH can omit base_url/timeout.
+        let existing = kernel.tool_runtime_config(&plugin_id).cloned();
+        let base_url = req
+            .base_url
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| existing.as_ref().map(|c| c.base_url.clone()))
+            .ok_or_else(|| KernelError::InvalidRuntimeConfig {
+                plugin: id.clone(),
+                message: "base_url is required to configure a runtime".to_string(),
+            })?;
+        let timeout_ms = req
+            .timeout_ms
+            .or_else(|| existing.as_ref().map(|c| c.timeout_ms));
+        let enabled = req
+            .enabled
+            .or_else(|| existing.as_ref().map(|c| c.enabled))
+            .unwrap_or(true);
+        let cfg = kernel.configure_tool_runtime(&plugin_id, &base_url, enabled, timeout_ms)?;
+        Ok(runtime_response(&id, Some(&cfg)))
+    })?;
+    Ok(Json(resp))
+}
+
+/// DELETE `/v1/relux/plugins/:id/runtime` - clear the runtime config entirely.
+async fn delete_plugin_runtime(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<RuntimeConfigResponse>, ApiError> {
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err(ApiError::bad_request("plugin id is required"));
+    }
+    let plugin_id = relux_core::PluginId::new(id.clone());
+    locked_save(&state, |kernel| {
+        kernel.remove_tool_runtime(&plugin_id)?;
+        Ok(())
+    })?;
+    Ok(Json(runtime_response(&id, None)))
+}
+
 // --- Store access (serialized) ---------------------------------------------
 
 /// Lock, open the store, load + bootstrap, run `f`, then SAVE. For mutations.
@@ -1395,12 +1535,19 @@ fn status_for(err: &KernelError) -> StatusCode {
         | KernelError::UnknownPlugin(_)
         | KernelError::UnknownAgent(_) => StatusCode::NOT_FOUND,
         KernelError::BundledPluginProtected(_) => StatusCode::CONFLICT,
-        // A tool installed as metadata but with no runtime handler yet: honest
-        // "not implemented", not a server fault or a fabricated success.
+        KernelError::RuntimeNotConfigured { .. } => StatusCode::NOT_FOUND,
+        // A tool installed as metadata but with no runtime handler/config yet:
+        // honest "not implemented", not a server fault or a fabricated success.
         KernelError::ToolRuntimeUnavailable { .. } => StatusCode::NOT_IMPLEMENTED,
+        // A configured-but-disabled runtime: a conflict the operator can resolve.
+        KernelError::ToolRuntimeDisabled { .. } => StatusCode::CONFLICT,
+        // The operator's loopback server failed/timed out/returned bad data: this
+        // is an upstream (bad gateway) failure, surfaced honestly.
+        KernelError::ToolRuntimeInvocation { .. } => StatusCode::BAD_GATEWAY,
         KernelError::PermissionDenied { .. } => StatusCode::FORBIDDEN,
         KernelError::UnsafePluginPath(_)
         | KernelError::PluginInstall(_)
+        | KernelError::InvalidRuntimeConfig { .. }
         | KernelError::ManifestParse { .. }
         | KernelError::ManifestInvalid { .. } => StatusCode::BAD_REQUEST,
         KernelError::Io { .. } | KernelError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -1555,6 +1702,30 @@ mod tests {
                 tool: "t".into()
             }),
             StatusCode::NOT_FOUND
+        );
+        // Runtime config + invocation errors map honestly.
+        assert_eq!(
+            status_for(&KernelError::InvalidRuntimeConfig {
+                plugin: "p".into(),
+                message: "bad url".into()
+            }),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status_for(&KernelError::RuntimeNotConfigured { plugin: "p".into() }),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            status_for(&KernelError::ToolRuntimeDisabled { plugin: "p".into() }),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            status_for(&KernelError::ToolRuntimeInvocation {
+                plugin: "p".into(),
+                tool: "t".into(),
+                message: "timeout".into()
+            }),
+            StatusCode::BAD_GATEWAY
         );
     }
 }

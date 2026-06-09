@@ -1,8 +1,10 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
+  reluxPluginRuntime,
   reluxPlugins,
   reluxTools,
   type ReluxPlugin,
+  type ReluxPluginRuntime,
   type ReluxToolDescriptor,
   type ReluxToolInvocationResult,
 } from "../api";
@@ -171,6 +173,20 @@ function ToolRow({ tool }: { tool: ReluxToolDescriptor }) {
       <span className="badge backlog" title="The default agent lacks this tool's permission">
         missing permission
       </span>
+    ) : tool.executable === "runtime_not_configured" ? (
+      <span
+        className="badge backlog"
+        title="Installed, but no runtime is configured. Configure an HTTP loopback endpoint for the plugin to make it executable."
+      >
+        runtime not configured
+      </span>
+    ) : tool.executable === "runtime_disabled" ? (
+      <span
+        className="badge backlog"
+        title="An HTTP loopback runtime is configured for this plugin but it is disabled."
+      >
+        runtime disabled
+      </span>
     ) : (
       <span className="badge" title="Installed as metadata; the kernel has no runtime for it yet">
         installed, runtime not implemented yet
@@ -298,6 +314,7 @@ function InvokeTool({ tool }: { tool: ReluxToolDescriptor }) {
 function PluginRow({ plugin, onChanged }: { plugin: ReluxPlugin; onChanged: () => void }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [runtimeOpen, setRuntimeOpen] = useState(false);
 
   async function remove() {
     setBusy(true);
@@ -312,53 +329,220 @@ function PluginRow({ plugin, onChanged }: { plugin: ReluxPlugin; onChanged: () =
   }
 
   return (
-    <tr>
-      <td>
-        <div>
-          <strong>{plugin.name || plugin.id}</strong>
-        </div>
-        <div className="mono muted" style={{ fontSize: 11 }}>{plugin.id}</div>
-        {plugin.description && (
-          <div className="muted" style={{ fontSize: 12, marginTop: 2, maxWidth: 380 }}>
-            {plugin.description}
+    <>
+      <tr>
+        <td>
+          <div>
+            <strong>{plugin.name || plugin.id}</strong>
           </div>
-        )}
-        {err && (
-          <div className="banner err" style={{ fontSize: 11, marginTop: 6, marginBottom: 0 }}>
-            {err}
+          <div className="mono muted" style={{ fontSize: 11 }}>{plugin.id}</div>
+          {plugin.description && (
+            <div className="muted" style={{ fontSize: 12, marginTop: 2, maxWidth: 380 }}>
+              {plugin.description}
+            </div>
+          )}
+          {err && (
+            <div className="banner err" style={{ fontSize: 11, marginTop: 6, marginBottom: 0 }}>
+              {err}
+            </div>
+          )}
+        </td>
+        <td className="muted" style={{ fontSize: 12 }}>{plugin.kind}</td>
+        <td className="mono" style={{ fontSize: 12 }}>v{plugin.version}</td>
+        <td className="muted" style={{ fontSize: 12, maxWidth: 240 }}>
+          <div>{plugin.source_kind}</div>
+          <div className="mono muted" style={{ fontSize: 11, wordBreak: "break-all" }}>
+            {plugin.source_label}
           </div>
-        )}
-      </td>
-      <td className="muted" style={{ fontSize: 12 }}>{plugin.kind}</td>
-      <td className="mono" style={{ fontSize: 12 }}>v{plugin.version}</td>
-      <td className="muted" style={{ fontSize: 12, maxWidth: 240 }}>
-        <div>{plugin.source_kind}</div>
-        <div className="mono muted" style={{ fontSize: 11, wordBreak: "break-all" }}>
-          {plugin.source_label}
-        </div>
-      </td>
-      <td>
-        <span className={"badge " + (plugin.enabled ? "done" : "backlog")}>
-          {plugin.enabled ? "enabled" : "disabled"}
-        </span>
-        {plugin.protected && (
-          <span className="badge" style={{ marginLeft: 6 }} title="Bundled fixture; cannot be removed">
-            protected
+        </td>
+        <td>
+          <span className={"badge " + (plugin.enabled ? "done" : "backlog")}>
+            {plugin.enabled ? "enabled" : "disabled"}
           </span>
-        )}
-      </td>
-      <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
-        {plugin.protected ? (
-          <span className="muted" style={{ fontSize: 11 }} title="Bundled plugins are locked">
-            locked
+          {plugin.protected && (
+            <span className="badge" style={{ marginLeft: 6 }} title="Bundled fixture; cannot be removed">
+              protected
+            </span>
+          )}
+        </td>
+        <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
+          {plugin.protected ? (
+            <span className="muted" style={{ fontSize: 11 }} title="Bundled plugins are locked">
+              locked
+            </span>
+          ) : (
+            <>
+              <button
+                className="btn ghost sm"
+                onClick={() => setRuntimeOpen((v) => !v)}
+                aria-expanded={runtimeOpen}
+                title="Configure an HTTP loopback runtime for this plugin"
+              >
+                {runtimeOpen ? "Close" : "Runtime"}
+              </button>
+              <button
+                className="btn ghost sm"
+                style={{ marginLeft: 6 }}
+                disabled={busy}
+                onClick={() => void remove()}
+              >
+                {busy ? "..." : "Remove"}
+              </button>
+            </>
+          )}
+        </td>
+      </tr>
+      {runtimeOpen && !plugin.protected && (
+        <tr>
+          <td colSpan={6} style={{ background: "transparent" }}>
+            <RuntimePanel plugin={plugin} />
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
+// Per-plugin HTTP loopback runtime config (RELUX_MASTER_PLAN section 8.2, 18).
+// Relux never auto-runs downloaded plugin code: a ToolSet plugin becomes
+// executable only when the operator points it at a loopback HTTP server they run
+// themselves. This panel shows the current status and lets the operator set the
+// loopback URL + timeout, disable, or clear it. No secrets are stored.
+function RuntimePanel({ plugin }: { plugin: ReluxPlugin }) {
+  const { data, loading, error, reload } = useAsync<ReluxPluginRuntime>(
+    () => reluxPluginRuntime.get(plugin.id),
+    [plugin.id],
+  );
+  const [url, setUrl] = useState("");
+  const [timeout, setTimeoutMs] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [banner, setBanner] = useState<{ kind: string; msg: string } | null>(null);
+
+  const configured = data?.configured ?? false;
+
+  // Seed the inputs from the loaded config when it (re)loads.
+  useEffect(() => {
+    if (!data) return;
+    if (data.base_url) setUrl(data.base_url);
+    if (data.timeout_ms != null) setTimeoutMs(String(data.timeout_ms));
+  }, [data]);
+
+  async function save(enabled: boolean) {
+    setBusy(true);
+    setBanner(null);
+    const body: { base_url?: string; enabled?: boolean; timeout_ms?: number } = {
+      enabled,
+    };
+    if (url.trim()) body.base_url = url.trim();
+    if (timeout.trim()) {
+      const n = Number(timeout.trim());
+      if (!Number.isFinite(n) || n <= 0) {
+        setBanner({ kind: "err", msg: "Timeout must be a positive number of ms." });
+        setBusy(false);
+        return;
+      }
+      body.timeout_ms = Math.floor(n);
+    }
+    try {
+      await reluxPluginRuntime.set(plugin.id, body);
+      setBanner({
+        kind: "ok",
+        msg: enabled ? "Runtime configured and enabled." : "Runtime disabled.",
+      });
+      reload();
+    } catch (e) {
+      setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Save failed" });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function clear() {
+    setBusy(true);
+    setBanner(null);
+    try {
+      await reluxPluginRuntime.remove(plugin.id);
+      setBanner({ kind: "ok", msg: "Runtime config cleared." });
+      setUrl("");
+      setTimeoutMs("");
+      reload();
+    } catch (e) {
+      setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Clear failed" });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="card" style={{ margin: "6px 0", padding: 12 }}>
+      <div className="row" style={{ marginBottom: 8, alignItems: "center" }}>
+        <strong style={{ fontSize: 13 }}>HTTP loopback runtime</strong>
+        <div className="spacer" style={{ flex: 1 }} />
+        {loading ? (
+          <span className="muted" style={{ fontSize: 11 }}>Loading...</span>
+        ) : configured ? (
+          <span className={"badge " + (data?.enabled ? "done" : "backlog")}>
+            {data?.enabled ? "enabled" : "disabled"}
           </span>
         ) : (
-          <button className="btn ghost sm" disabled={busy} onClick={() => void remove()}>
-            {busy ? "..." : "Remove"}
+          <span className="badge backlog">not configured</span>
+        )}
+      </div>
+      <p className="muted" style={{ marginTop: 0, marginBottom: 10, fontSize: 11 }}>
+        Relux does not run downloaded plugin code. To make this plugin's tools
+        executable, run your own plugin server locally and point Relux at it. Only
+        loopback URLs are allowed: <span className="mono">http://127.0.0.1:&lt;port&gt;</span>,{" "}
+        <span className="mono">http://localhost:&lt;port&gt;</span>, or{" "}
+        <span className="mono">http://[::1]:&lt;port&gt;</span>. Relux POSTs{" "}
+        <span className="mono">{"{ plugin_id, tool_name, input }"}</span> to{" "}
+        <span className="mono">&lt;base_url&gt;/invoke</span>.
+      </p>
+
+      {error && (
+        <div className="banner err" style={{ fontSize: 12 }}>
+          Could not load runtime config ({error}).
+        </div>
+      )}
+      {banner && (
+        <div className={"banner " + banner.kind} style={{ fontSize: 12 }}>{banner.msg}</div>
+      )}
+
+      <label className="field" style={{ margin: 0 }}>
+        <span style={{ fontSize: 12 }}>Loopback base URL</span>
+        <input
+          className="input"
+          value={url}
+          placeholder="http://127.0.0.1:19999"
+          onChange={(e) => setUrl(e.target.value)}
+        />
+      </label>
+      <label className="field" style={{ margin: "8px 0 0" }}>
+        <span style={{ fontSize: 12 }}>Per-call timeout (ms, optional)</span>
+        <input
+          className="input"
+          value={timeout}
+          placeholder="5000"
+          inputMode="numeric"
+          onChange={(e) => setTimeoutMs(e.target.value)}
+        />
+      </label>
+
+      <div className="row wrap" style={{ gap: 8, marginTop: 10 }}>
+        <button className="btn" disabled={busy} onClick={() => void save(true)}>
+          {busy ? "Saving..." : configured ? "Save & enable" : "Enable runtime"}
+        </button>
+        {configured && data?.enabled && (
+          <button className="btn ghost" disabled={busy} onClick={() => void save(false)}>
+            Disable
           </button>
         )}
-      </td>
-    </tr>
+        {configured && (
+          <button className="btn ghost" disabled={busy} onClick={() => void clear()}>
+            Clear
+          </button>
+        )}
+      </div>
+    </div>
   );
 }
 

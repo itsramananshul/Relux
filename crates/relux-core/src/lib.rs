@@ -12,6 +12,7 @@ pub mod permission;
 pub mod plugin;
 pub mod prime;
 pub mod run;
+pub mod runtime;
 pub mod task;
 pub mod tool;
 
@@ -29,5 +30,10 @@ pub use prime::{
     PrimeIntent, PrimePlan, PrimeTurn, StateSummary, TaskBrief,
 };
 pub use run::{Run, RunId, RunStatus};
+pub use runtime::{
+    clamp_runtime_timeout, parse_loopback_url, validate_loopback_url, LoopbackUrl, LoopbackUrlError,
+    RuntimeKind, ToolRuntimeConfig, DEFAULT_RUNTIME_TIMEOUT_MS, MAX_RUNTIME_TIMEOUT_MS,
+    MIN_RUNTIME_TIMEOUT_MS,
+};
 pub use task::{Task, TaskId, TaskStatus};
 pub use tool::{ToolDescriptor, ToolExecutability, ToolInvocationResult};

@@ -1546,6 +1546,45 @@ export const reluxPlugins = {
     api.del<{ removed: string }>(`/v1/relux/plugins/${encodeURIComponent(id)}`),
 };
 
+// -- Relux plugin tool runtime (HTTP loopback) ------------------------------
+// A ToolSet plugin becomes executable only when an operator points it at a
+// loopback HTTP server they run themselves. Relux never auto-runs downloaded
+// plugin code. The config carries no secrets - only the loopback base URL, the
+// enabled flag, and the per-call timeout.
+
+export interface ReluxPluginRuntime {
+  plugin_id: string;
+  configured: boolean;
+  kind?: string | null;
+  base_url?: string | null;
+  enabled: boolean;
+  timeout_ms?: number | null;
+}
+
+export const reluxPluginRuntime = {
+  // Current runtime config/status for one plugin (404 if the plugin is not
+  // installed; `configured: false` when installed with no runtime yet).
+  get: (id: string) =>
+    api.get<ReluxPluginRuntime>(
+      `/v1/relux/plugins/${encodeURIComponent(id)}/runtime`,
+    ),
+  // Configure (or update) the HTTP loopback runtime. `base_url` is validated as
+  // loopback-only; bundled plugins are refused (HTTP 400).
+  set: (
+    id: string,
+    body: { base_url?: string; enabled?: boolean; timeout_ms?: number },
+  ) =>
+    api.put<ReluxPluginRuntime>(
+      `/v1/relux/plugins/${encodeURIComponent(id)}/runtime`,
+      body,
+    ),
+  // Clear the runtime config entirely.
+  remove: (id: string) =>
+    api.del<ReluxPluginRuntime>(
+      `/v1/relux/plugins/${encodeURIComponent(id)}/runtime`,
+    ),
+};
+
 // -- Relux Tools (the honest tool-invocation surface) ----------------------
 // Installed plugin tools, surfaced with an honest executable status. Only
 // built-in deterministic kernel handlers run; an installed-but-unimplemented
@@ -1563,9 +1602,17 @@ export interface ReluxToolDescriptor {
   installed: boolean;
   enabled: boolean;
   protected: boolean;
-  // "ready" → invocable; "not_implemented" → installed metadata only, no runtime;
+  // "ready" → invocable (built-in handler or an enabled HTTP loopback runtime);
+  // "runtime_not_configured" → installed, but needs a loopback endpoint set;
+  // "runtime_disabled" → has a loopback runtime configured but it is disabled;
+  // "not_implemented" → no supported runtime exists at all;
   // "missing_permission" → the scoped agent lacks the permission.
-  executable: "ready" | "not_implemented" | "missing_permission";
+  executable:
+    | "ready"
+    | "runtime_not_configured"
+    | "runtime_disabled"
+    | "not_implemented"
+    | "missing_permission";
 }
 
 // The structured result of a successful tool invocation.

@@ -107,6 +107,9 @@ impl SqliteStore {
             prime_autonomy_config: self
                 .load_meta_json("prime_autonomy_config")?
                 .unwrap_or_default(),
+            tool_runtime_configs: self
+                .load_meta_json("tool_runtime_configs")?
+                .unwrap_or_default(),
             counters: self.load_counters()?,
         })
     }
@@ -161,6 +164,7 @@ impl SqliteStore {
         put_counter(&tx, "next_audit", c.next_audit)?;
         put_counter(&tx, "next_event", c.next_event)?;
         put_meta_json(&tx, "prime_autonomy_config", &snapshot.prime_autonomy_config)?;
+        put_meta_json(&tx, "tool_runtime_configs", &snapshot.tool_runtime_configs)?;
 
         tx.commit().map_err(storage_err)?;
         Ok(())

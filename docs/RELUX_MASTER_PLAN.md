@@ -1769,6 +1769,68 @@ status and offers a small invoke panel (JSON input + output/error) for ready
 tools. An installed tool with no runtime shows "installed, runtime not
 implemented yet" rather than being hidden or pretend-run.
 
+### Plugin Runtime v1 (HTTP loopback ToolSet runtime)
+
+Installed ToolSet plugins can now become executable through an **explicitly
+configured loopback HTTP endpoint** (§8.2, §18: Relux does not auto-run
+downloaded plugin code). Relux still never shells out to plugin commands, never
+runs code from GitHub/zip/folder installs in-process, and never calls a remote
+host. Instead, the plugin author/operator runs their own local server and opts a
+plugin into execution by configuring a loopback URL for it; Relux calls that
+server through a narrow, permission-checked, audited protocol.
+
+Protocol (one stable endpoint):
+
+```text
+POST <base_url>/invoke
+Content-Type: application/json
+{ "plugin_id": "...", "tool_name": "...", "input": <json> }
+
+200 { "output": <json> }   -> success
+200 { "error": "..." }     -> the tool refused/failed (surfaced honestly)
+```
+
+Safety (enforced by the kernel):
+
+- Loopback only: `http://127.0.0.1|localhost|[::1]:<port>` with an explicit port.
+  `https`, remote hosts, embedded credentials, query/fragment, and `..` paths are
+  rejected (`relux_core::validate_loopback_url`, re-validated on every call).
+- Per-call timeout (default 5000 ms, clamped 100-60000), request/response body
+  caps, JSON-only. No TLS, no redirects.
+- Every invocation routes through the SAME kernel permission check + audit path as
+  the built-ins; a connect failure, timeout, non-200, oversized body, invalid
+  JSON, or `{ "error": ... }` becomes a clear error, never a fabricated success.
+- The per-plugin config is persisted locally and stores NO secrets (only the base
+  URL, enabled flag, timeout). Bundled plugins cannot be given a loopback runtime.
+
+Tool discovery now reports `ready` (built-in or enabled loopback runtime),
+`runtime_not_configured` (installed, no runtime yet), `runtime_disabled`, or
+`missing_permission`. `not_implemented` is reserved for a tool with no supported
+runtime at all.
+
+CLI:
+
+```powershell
+relux-kernel plugin runtime <plugin-id>
+relux-kernel plugin runtime set <plugin-id> <base-url> [--timeout-ms N]
+relux-kernel plugin runtime disable <plugin-id>
+```
+
+API:
+
+```text
+GET    /v1/relux/plugins/:id/runtime
+PUT    /v1/relux/plugins/:id/runtime    { "base_url", "enabled"?, "timeout_ms"? }
+PATCH  /v1/relux/plugins/:id/runtime    (partial update)
+DELETE /v1/relux/plugins/:id/runtime
+```
+
+`/v1/relux/tools` reflects the runtime status and `/v1/relux/tools/invoke` routes
+configured loopback tools through the runtime client. Dashboard: each non-bundled
+plugin on the Plugins page has a Runtime panel (set loopback URL + timeout,
+disable, clear); configured tools show as `ready` and are invokable from the
+existing invoke panel.
+
 Prime chat (§10, §11.1): Prime is now tool-aware and can list/invoke the safe
 built-in tools directly from chat, so simple tool use does not require leaving
 Prime for the Tools panel. Two new intents drive this - `tool_discovery`
@@ -1813,10 +1875,12 @@ The API never returns the key. The dashboard shows the current AI provider/mode.
   Relix web bridge + a login and degrade honestly when it is absent.
 - Prime has an optional LLM-backed path for conversational replies, but its
   core planning remains deterministic. Multi-agent autonomous execution is later.
-- Tool invocation executes only built-in deterministic handlers (echo, status),
-  whether driven from the Tools panel, the CLI/API, or now Prime chat itself.
-  Arbitrary installed plugin tools are discoverable and listed honestly as
-  `not_implemented`; running downloaded plugin code (real ToolSets, adapters,
-  execution environments) is intentionally not implemented yet.
+- Tool invocation executes built-in deterministic handlers (echo, status) plus
+  installed ToolSet plugins that an operator has explicitly pointed at a loopback
+  HTTP server (Plugin Runtime v1). Relux still does NOT auto-run downloaded plugin
+  code: it never shells out, never runs GitHub/zip/folder install code in-process,
+  and never calls a remote host - a plugin becomes executable only via an
+  operator-run `http://127.0.0.1|localhost|[::1]:<port>` endpoint. Adapter and
+  execution-environment runtimes remain not implemented yet.
 - The standalone API is local-only and unauthenticated by design; it binds
   loopback. It is not a multi-user or production surface.
