@@ -1917,6 +1917,33 @@ Adapters supported/detected in v1: `relux-adapter-claude-cli` (Claude CLI),
 `relux-adapter-codex-cli` (Codex CLI), and a generic command adapter. Detection
 probes `PATH` (and `PATHEXT` on Windows) read-only for the configured binary.
 
+### Bundled plugin refresh is idempotent (existing stores pick up new capabilities)
+
+The shipped bundled plugins/adapters under `examples/relux-plugins`
+(`relux-tools-echo`, `relux-tools-status`, `relux-adapter-local-prime`,
+`relux-adapter-claude-cli`, `relux-adapter-codex-cli`) are reconciled into the
+durable store on **every** load through a single central seam,
+`relux_kernel::refresh_bundled_plugins` (called from `ensure_bootstrapped`). It is
+no longer keyed on Prime's existence, so an existing local DB - not just a fresh
+one - picks up newly shipped bundled plugins without a `reset-local`. Every CLI/API
+path that ensures Prime/company also runs this refresh: `doctor`/`health`, `serve`,
+`plugins`, `adapters`, `tools`, Prime/chat, and task execution.
+
+The refresh is safe by construction (§9.4, §7.4):
+
+- A bundled id that is not installed is added as a protected
+  `PluginSourceKind::Bundled` record (enabled), and remains non-removable.
+- A bundled id already installed as `Bundled` is updated **in place** only when the
+  shipped manifest or its install metadata changed - no duplicate records - and the
+  operator's `enabled` flag and per-plugin runtime config (HTTP loopback / CLI
+  adapter) are preserved.
+- An already-current store is a no-op: no re-registration, no audit noise.
+- A plugin installed from a non-bundled source (a user install) that shares an id
+  with a bundled plugin is **never** overwritten.
+
+`relux-kernel doctor` and `relux-kernel plugins` refresh-and-save an older store on
+the spot, so newly shipped bundled plugins appear without any manual reset.
+
 ### Optional LLM-backed Prime (OpenRouter)
 
 As of Phase 2.1, Prime can optionally use an LLM (via OpenRouter) to shape its

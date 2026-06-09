@@ -27,7 +27,8 @@ use std::process::Command;
 use relux_core::plugin::validate_manifest;
 use relux_core::{InstalledPlugin, PluginId, PluginManifest, PluginSourceKind};
 
-use crate::loader::MANIFEST_FILENAME;
+use crate::loader::{load_plugin_manifests, MANIFEST_FILENAME};
+use crate::state::{BundledRefresh, BundledRefreshSummary};
 use crate::{KernelError, KernelState};
 
 /// Install a plugin from a local folder.
@@ -173,6 +174,40 @@ pub fn remove_plugin(
 /// List all installed plugin records (sorted by id).
 pub fn list_installed(kernel: &KernelState) -> Vec<&InstalledPlugin> {
     kernel.installed_plugins()
+}
+
+/// Idempotently refresh every shipped bundled plugin manifest under
+/// `examples_dir` into `kernel` (`docs/RELUX_MASTER_PLAN.md` section 9.4, section
+/// 7.4).
+///
+/// This is the central, restart-safe bootstrap seam: it loads the bundled
+/// manifests from disk and reconciles each against the live control plane via
+/// [`KernelState::refresh_bundled_plugin`]. It is safe to call on EVERY load -
+/// fresh store or long-lived one - so an existing local DB picks up newly shipped
+/// adapters/tools without a reset, while never duplicating records, downgrading
+/// the protected `Bundled` source, overwriting a user-installed plugin, or
+/// touching per-plugin runtime config / local user state.
+///
+/// The `install_dir`/`source_label` recorded for each bundled plugin match the
+/// original bootstrap (`<examples_dir>/<plugin-id>`, `"bundled example"`) so an
+/// already-current record is recognized as unchanged and emits no audit noise.
+pub fn refresh_bundled_plugins(
+    kernel: &mut KernelState,
+    examples_dir: &Path,
+) -> Result<BundledRefreshSummary, KernelError> {
+    let manifests = load_plugin_manifests(examples_dir)?;
+    let mut summary = BundledRefreshSummary::default();
+    for manifest in manifests {
+        let id = manifest.id.as_str().to_string();
+        let install_dir = examples_dir.join(&id).display().to_string();
+        match kernel.refresh_bundled_plugin(manifest, "bundled example".to_string(), install_dir) {
+            BundledRefresh::Added => summary.added.push(id),
+            BundledRefresh::Updated => summary.updated.push(id),
+            BundledRefresh::Unchanged => summary.unchanged += 1,
+            BundledRefresh::SkippedUserInstalled => summary.skipped_user_installed.push(id),
+        }
+    }
+    Ok(summary)
 }
 
 // --- Internals -------------------------------------------------------------
@@ -424,9 +459,25 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    use relux_core::PluginId;
+    use relux_core::namespace::NamespaceKind;
+    use relux_core::{AgentId, NamespaceId, PluginId};
 
     use crate::SqliteStore;
+
+    /// The workspace's shipped example plugins, resolved from this crate's
+    /// manifest dir so the test is independent of the invoking working directory.
+    fn examples_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/relux-plugins")
+    }
+
+    /// The five plugin ids shipped under `examples/relux-plugins`, sorted.
+    const BUNDLED_IDS: &[&str] = &[
+        "relux-adapter-claude-cli",
+        "relux-adapter-codex-cli",
+        "relux-adapter-local-prime",
+        "relux-tools-echo",
+        "relux-tools-status",
+    ];
 
     /// A valid ToolSet `relux-plugin.json` body for a test plugin id.
     fn manifest_json(id: &str) -> String {
@@ -632,5 +683,209 @@ mod tests {
         assert!(safe_plugin_id("a\\b").is_err());
         assert!(safe_plugin_id("..evil").is_err());
         assert!(safe_plugin_id("").is_err());
+    }
+
+    /// Record a plugin as installed with the given source, mirroring a store row.
+    fn install_recorded(
+        kernel: &mut KernelState,
+        id: &str,
+        source_kind: PluginSourceKind,
+        source_label: &str,
+        install_dir: &str,
+        enabled: bool,
+    ) {
+        let manifest: PluginManifest = serde_json::from_str(&manifest_json(id)).unwrap();
+        kernel.install_plugin(
+            manifest,
+            source_kind,
+            source_label.to_string(),
+            install_dir.to_string(),
+            enabled,
+        );
+    }
+
+    /// An OLDER store (Prime present, only the original three bundled plugins
+    /// recorded) gains the newly shipped bundled plugins on refresh - protected,
+    /// persisted, without duplicating records or dropping Prime.
+    #[test]
+    fn older_store_with_prime_gains_new_bundled_plugins_on_refresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("local.db");
+
+        // 1. Simulate the older store and persist it.
+        {
+            let mut kernel = KernelState::new();
+            for id in [
+                "relux-tools-echo",
+                "relux-tools-status",
+                "relux-adapter-local-prime",
+            ] {
+                install_recorded(
+                    &mut kernel,
+                    id,
+                    PluginSourceKind::Bundled,
+                    "bundled example",
+                    &format!("examples/relux-plugins/{id}"),
+                    true,
+                );
+            }
+            kernel.create_namespace("workspace", "Workspace", NamespaceKind::Personal);
+            kernel
+                .create_agent(
+                    "prime",
+                    "Prime",
+                    "operator",
+                    &PluginId::new("relux-adapter-local-prime"),
+                    &NamespaceId::new("workspace"),
+                    None,
+                    vec![],
+                )
+                .unwrap();
+            let mut store = SqliteStore::open(&db).unwrap();
+            store.save(&kernel).unwrap();
+        }
+
+        // 2. Boot against the older store: the CLI adapters are missing.
+        let mut kernel = SqliteStore::open(&db).unwrap().load().unwrap();
+        assert!(
+            kernel
+                .installed_plugin(&PluginId::new("relux-adapter-claude-cli"))
+                .is_none(),
+            "older store is missing the new CLI adapter before refresh"
+        );
+
+        let summary = refresh_bundled_plugins(&mut kernel, &examples_dir()).unwrap();
+        SqliteStore::open(&db).unwrap().save(&kernel).unwrap();
+
+        // 3. Reload and assert the new bundled plugins are present + protected,
+        //    Prime survived, and there are no duplicates.
+        let mut kernel = SqliteStore::open(&db).unwrap().load().unwrap();
+        for id in ["relux-adapter-claude-cli", "relux-adapter-codex-cli"] {
+            let rec = kernel
+                .installed_plugin(&PluginId::new(id))
+                .expect("new bundled plugin present after refresh");
+            assert_eq!(rec.source_kind, PluginSourceKind::Bundled);
+            assert!(summary.added.contains(&id.to_string()));
+        }
+        let ids: Vec<String> = kernel
+            .installed_plugins()
+            .iter()
+            .map(|p| p.id.as_str().to_string())
+            .collect();
+        assert_eq!(ids, BUNDLED_IDS, "exactly the five shipped bundled plugins");
+        assert!(
+            kernel.agent(&AgentId::new("prime")).is_some(),
+            "Prime survived the refresh"
+        );
+
+        // The newly added bundled plugin is non-removable.
+        let err = remove_plugin("relux-adapter-claude-cli", tmp.path(), &mut kernel).unwrap_err();
+        assert!(
+            matches!(err, KernelError::BundledPluginProtected(_)),
+            "got {err:?}"
+        );
+    }
+
+    /// Refresh against an already-current store is a pure no-op: nothing added or
+    /// updated, every bundled plugin unchanged, and no duplicate records.
+    #[test]
+    fn refresh_is_idempotent_on_a_current_store() {
+        let mut kernel = KernelState::new();
+
+        let first = refresh_bundled_plugins(&mut kernel, &examples_dir()).unwrap();
+        assert_eq!(first.added.len(), BUNDLED_IDS.len(), "fresh store installs all");
+        assert_eq!(kernel.installed_plugin_count(), BUNDLED_IDS.len());
+
+        let second = refresh_bundled_plugins(&mut kernel, &examples_dir()).unwrap();
+        assert!(second.added.is_empty());
+        assert!(second.updated.is_empty());
+        assert_eq!(second.unchanged, BUNDLED_IDS.len());
+        assert!(!second.changed(), "a current store needs no save");
+        assert_eq!(
+            kernel.installed_plugin_count(),
+            BUNDLED_IDS.len(),
+            "still no duplicate records"
+        );
+    }
+
+    /// A stale bundled manifest is updated in place (not duplicated) and the
+    /// operator's `enabled` choice is preserved across the update.
+    #[test]
+    fn refresh_updates_changed_bundled_manifest_in_place() {
+        let mut kernel = KernelState::new();
+        // A stale, operator-disabled bundled echo at the install dir refresh uses.
+        let install_dir = examples_dir()
+            .join("relux-tools-echo")
+            .display()
+            .to_string();
+        install_recorded(
+            &mut kernel,
+            "relux-tools-echo",
+            PluginSourceKind::Bundled,
+            "bundled example",
+            &install_dir,
+            false,
+        );
+
+        let summary = refresh_bundled_plugins(&mut kernel, &examples_dir()).unwrap();
+
+        assert!(
+            summary.updated.contains(&"relux-tools-echo".to_string()),
+            "the stale manifest was updated, got {summary:?}"
+        );
+        let echoes = kernel
+            .installed_plugins()
+            .iter()
+            .filter(|p| p.id.as_str() == "relux-tools-echo")
+            .count();
+        assert_eq!(echoes, 1, "update in place, not a duplicate");
+
+        // The shipped manifest replaced the stale one.
+        let shipped = load_plugin_manifests(&examples_dir())
+            .unwrap()
+            .into_iter()
+            .find(|m| m.id.as_str() == "relux-tools-echo")
+            .unwrap();
+        let stored = kernel.plugin(&PluginId::new("relux-tools-echo")).unwrap();
+        assert_eq!(stored.name, shipped.name, "manifest was refreshed");
+
+        // The operator's enabled=false choice survives the update.
+        assert!(
+            !kernel
+                .installed_plugin(&PluginId::new("relux-tools-echo"))
+                .unwrap()
+                .enabled,
+            "enabled choice preserved across refresh"
+        );
+    }
+
+    /// A user-installed plugin that happens to share a bundled id is NEVER
+    /// overwritten by the refresh; the other bundled plugins still install.
+    #[test]
+    fn refresh_does_not_overwrite_user_installed_plugin() {
+        let mut kernel = KernelState::new();
+        install_recorded(
+            &mut kernel,
+            "relux-tools-status",
+            PluginSourceKind::LocalDir,
+            "/home/me/my-status",
+            "installed/relux-tools-status",
+            true,
+        );
+
+        let summary = refresh_bundled_plugins(&mut kernel, &examples_dir()).unwrap();
+
+        let rec = kernel
+            .installed_plugin(&PluginId::new("relux-tools-status"))
+            .unwrap();
+        assert_eq!(rec.source_kind, PluginSourceKind::LocalDir, "left as user install");
+        assert_eq!(rec.source_label, "/home/me/my-status", "user metadata untouched");
+        assert!(summary
+            .skipped_user_installed
+            .contains(&"relux-tools-status".to_string()));
+        // The genuinely-bundled plugins still get installed.
+        assert!(kernel
+            .installed_plugin(&PluginId::new("relux-tools-echo"))
+            .is_some());
     }
 }

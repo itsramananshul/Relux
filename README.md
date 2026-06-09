@@ -255,6 +255,26 @@ an assigned task starts*. On the **Work** page, the "Run (Assigned)" action now
 dispatches through the assigned agent's adapter, and the run detail shows the
 adapter's (redacted) output or the honest failure reason.
 
+### Bundled plugins refresh idempotently (no reset needed)
+
+The shipped bundled plugins and adapters (`relux-tools-echo`, `relux-tools-status`,
+`relux-adapter-local-prime`, `relux-adapter-claude-cli`, `relux-adapter-codex-cli`)
+are reconciled into your local store on **every** startup/load path - `doctor`,
+`serve`, `plugins`, `adapters`, Prime/chat, and task execution all run the same
+idempotent refresh. An existing local DB therefore picks up newly shipped
+capabilities automatically, with **no `reset-local` required**:
+
+- A missing bundled plugin is added (protected, non-removable).
+- An existing bundled plugin whose shipped manifest changed is updated in place -
+  no duplicate records, and your `enabled` choice and per-plugin runtime config are
+  preserved.
+- An up-to-date store is a no-op (no audit noise).
+- A plugin you installed yourself is never overwritten, even if it shares an id
+  with a bundled one.
+
+`relux-kernel doctor` and `relux-kernel plugins` will refresh-and-save an older
+store on the spot, so the new bundled plugins show up the next time you list them.
+
 ### First Local Release
 
 Use the local release check before cutting or sharing a Windows bundle:

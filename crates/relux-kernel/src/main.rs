@@ -15,8 +15,8 @@ use relux_core::{
     ToolExecutability,
 };
 use relux_kernel::{
-    install_from_dir, install_from_github, install_from_zip, load_plugin_manifests, remove_plugin,
-    KernelError, KernelState, SqliteStore,
+    install_from_dir, install_from_github, install_from_zip, load_plugin_manifests,
+    refresh_bundled_plugins, remove_plugin, KernelError, KernelState, SqliteStore,
 };
 
 mod dashboard;
@@ -260,11 +260,26 @@ fn run_health() -> ExitCode {
     let db_path = db_path();
     let store_result = SqliteStore::open(&db_path);
     match store_result {
-        Ok(store) => {
+        Ok(mut store) => {
             println!("PASS: DB path: {}", db_path.display());
             let kernel_result = store.load();
             match kernel_result {
-                Ok(kernel) => {
+                Ok(mut kernel) => {
+                    // Idempotently refresh the bundled plugins so an older DB
+                    // picks up newly shipped capabilities, then persist. A refresh
+                    // failure is a warning (e.g. examples dir absent), never a
+                    // hard fail of the health check.
+                    match ensure_bootstrapped(&mut kernel).and_then(|_| store.save(&kernel)) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            warnings.push(format!(
+                                "WARN: bundled plugin refresh/save skipped: {e}"
+                            ));
+                            if exit_code == ExitCode::SUCCESS {
+                                exit_code = ExitCode::from(1);
+                            }
+                        }
+                    }
                     println!("PASS: DB loaded successfully.");
                     println!("   Installed plugins: {}", kernel.installed_plugin_count());
                     println!("   Agents: {}", kernel.agent_count());
@@ -380,29 +395,26 @@ fn uploads_root() -> PathBuf {
 
 /// Ensure the loaded `kernel` has the baseline control plane (plugins, the
 /// workspace namespace, and the Prime agent), and return the `PrimeContext` to
-/// act with. Bootstrapping is keyed on Prime's existence, so it runs exactly
-/// once on a fresh store and is skipped on every subsequent load - no duplicate
-/// plugin registrations or audit noise.
+/// act with.
+///
+/// The bundled plugin manifests are refreshed idempotently on EVERY load
+/// (`docs/RELUX_MASTER_PLAN.md` section 9.4, section 7.4): a fresh store gets the
+/// shipped plugins, and a long-lived store picks up newly shipped capabilities
+/// (new adapters/tools) without a reset - while never duplicating records,
+/// downgrading the protected `Bundled` source, overwriting a user-installed
+/// plugin, or touching per-plugin runtime config. Creating the workspace
+/// namespace and the Prime agent stays keyed on Prime's absence, so it runs
+/// exactly once on a fresh store.
 fn ensure_bootstrapped(kernel: &mut KernelState) -> Result<PrimeContext, KernelError> {
     let ns_id = NamespaceId::new(WORKSPACE_NS);
     let prime_id = AgentId::new(PRIME_AGENT);
 
+    // Idempotently reconcile the shipped bundled plugins into the store. Safe to
+    // run on every load: it adds missing bundled plugins, updates changed ones in
+    // place, and is a no-op (no audit noise) when everything is already current.
+    refresh_bundled_plugins(kernel, &examples_dir())?;
+
     if kernel.agent(&prime_id).is_none() {
-        // Mark the shipped example plugins as installed/enabled with source kind
-        // Bundled (`docs/RELUX_MASTER_PLAN.md` section 9.4). Keyed on Prime's absence,
-        // so this runs exactly once on a fresh store - no duplicate installed
-        // records or audit noise on later loads.
-        let dir = examples_dir();
-        for manifest in load_plugin_manifests(&dir)? {
-            let install_dir = dir.join(manifest.id.as_str()).display().to_string();
-            kernel.install_plugin(
-                manifest,
-                PluginSourceKind::Bundled,
-                "bundled example".to_string(),
-                install_dir,
-                true,
-            );
-        }
         kernel.create_namespace(WORKSPACE_NS, "Workspace", NamespaceKind::Personal);
         // Prime is granted exactly the two safe, built-in tool permissions so it
         // can invoke the bundled echo and status tools through the kernel - least
@@ -574,9 +586,10 @@ fn examples_dir() -> PathBuf {
 
 /// List installed plugins from the persistent store.
 ///
-/// Ensures the store is bootstrapped first so a fresh DB shows the bundled
-/// example plugins; the (idempotent) bootstrap result is saved so the bundled
-/// install records are durable.
+/// Ensures the store is bootstrapped first, which idempotently refreshes the
+/// bundled plugin manifests, so a fresh DB shows the bundled example plugins and
+/// an older DB picks up any newly shipped bundled plugins. The result is saved so
+/// the install records stay durable.
 fn run_plugins_list() -> Result<(), KernelError> {
     let path = db_path();
     let mut store = SqliteStore::open(&path)?;

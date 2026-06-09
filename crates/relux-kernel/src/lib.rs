@@ -39,11 +39,12 @@ pub use clock::Clock;
 pub use event::RunEvent;
 pub use loader::{load_plugin_manifests, MANIFEST_FILENAME};
 pub use plugin_install::{
-    install_from_dir, install_from_github, install_from_zip, list_installed, remove_plugin,
+    install_from_dir, install_from_github, install_from_zip, list_installed,
+    refresh_bundled_plugins, remove_plugin,
 };
 pub use prime::{classify_intent, decide};
 pub use runtime::{invoke_http_loopback, RuntimeClientError};
-pub use state::{KernelCounters, KernelSnapshot, KernelState};
+pub use state::{BundledRefresh, BundledRefreshSummary, KernelCounters, KernelSnapshot, KernelState};
 pub use store::SqliteStore;
 
 use relux_core::ManifestError;

@@ -111,6 +111,56 @@ pub struct KernelState {
     next_event: u64,
 }
 
+/// The outcome of idempotently refreshing one bundled plugin manifest into the
+/// live control plane (`docs/RELUX_MASTER_PLAN.md` section 9.4, section 7.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BundledRefresh {
+    /// The bundled plugin was not present and was installed.
+    Added,
+    /// The bundled plugin was already installed; its manifest/metadata changed
+    /// and the record was updated in place (no duplicate).
+    Updated,
+    /// The bundled plugin was already installed and is byte-identical; nothing
+    /// changed, so no audit noise was emitted.
+    Unchanged,
+    /// A plugin with this id is installed from a non-bundled source (a user
+    /// install); it was left untouched rather than being overwritten.
+    SkippedUserInstalled,
+}
+
+/// A tally of what an idempotent bundled-plugin refresh did across all shipped
+/// manifests. Used by the CLI/boot path to report (and persist) changes.
+#[derive(Debug, Clone, Default)]
+pub struct BundledRefreshSummary {
+    /// Ids of newly installed bundled plugins.
+    pub added: Vec<String>,
+    /// Ids of bundled plugins whose record was updated in place.
+    pub updated: Vec<String>,
+    /// Count of bundled plugins that were already up to date.
+    pub unchanged: usize,
+    /// Ids skipped because a same-id user-installed plugin exists.
+    pub skipped_user_installed: Vec<String>,
+}
+
+impl BundledRefreshSummary {
+    /// True if the refresh added or updated any bundled record (i.e. the store
+    /// must be saved to persist the change).
+    pub fn changed(&self) -> bool {
+        !self.added.is_empty() || !self.updated.is_empty()
+    }
+}
+
+/// True if two manifests are logically identical (compared by their canonical
+/// JSON form, since [`PluginManifest`] does not derive `PartialEq`).
+fn manifests_equal(a: &PluginManifest, b: &PluginManifest) -> bool {
+    match (serde_json::to_value(a), serde_json::to_value(b)) {
+        (Ok(va), Ok(vb)) => va == vb,
+        // If either fails to serialize (it never should), treat as different so
+        // the refresh re-installs rather than silently skipping an update.
+        _ => false,
+    }
+}
+
 impl KernelState {
     pub fn new() -> Self {
         Self::default()
@@ -335,6 +385,81 @@ impl KernelState {
 
     pub fn installed_plugin_count(&self) -> usize {
         self.installed_plugins.len()
+    }
+
+    /// Idempotently refresh ONE shipped bundled plugin manifest into the live
+    /// control plane (`docs/RELUX_MASTER_PLAN.md` section 9.4, section 7.4).
+    ///
+    /// This is the per-manifest core behind [`crate::refresh_bundled_plugins`].
+    /// It is safe to call on every load, for an existing store as much as a fresh
+    /// one:
+    ///
+    /// - If the id is not installed, it is installed as a protected
+    ///   [`PluginSourceKind::Bundled`] record (enabled) - this is how an older DB
+    ///   picks up newly shipped capabilities without a reset.
+    /// - If it is already installed as `Bundled`, the record is updated in place
+    ///   ONLY when the manifest or its install metadata changed, preserving the
+    ///   operator's `enabled` choice and never duplicating records. An unchanged
+    ///   manifest is a no-op (no audit noise).
+    /// - If a plugin with the same id is installed from a NON-bundled source (a
+    ///   user install), it is left untouched - the refresh never overwrites a
+    ///   user-installed plugin.
+    ///
+    /// Per-plugin runtime config (HTTP loopback / CLI adapter) and all other
+    /// local state are untouched: this only ever re-registers the manifest and
+    /// re-stamps the install record.
+    pub fn refresh_bundled_plugin(
+        &mut self,
+        manifest: PluginManifest,
+        source_label: String,
+        install_dir: String,
+    ) -> BundledRefresh {
+        let id = manifest.id.clone();
+        let existing = match self.installed_plugins.get(&id) {
+            Some(existing) if existing.source_kind != PluginSourceKind::Bundled => {
+                return BundledRefresh::SkippedUserInstalled;
+            }
+            Some(existing) => Some((
+                existing.enabled,
+                existing.version == manifest.version
+                    && existing.install_dir == install_dir
+                    && existing.source_label == source_label,
+            )),
+            None => None,
+        };
+
+        match existing {
+            None => {
+                self.install_plugin(
+                    manifest,
+                    PluginSourceKind::Bundled,
+                    source_label,
+                    install_dir,
+                    true,
+                );
+                BundledRefresh::Added
+            }
+            Some((enabled, meta_same)) => {
+                let manifest_same = self
+                    .plugins
+                    .get(&id)
+                    .map(|stored| manifests_equal(stored, &manifest))
+                    .unwrap_or(false);
+                if meta_same && manifest_same {
+                    BundledRefresh::Unchanged
+                } else {
+                    // Preserve the operator's enabled choice; re-stamp the rest.
+                    self.install_plugin(
+                        manifest,
+                        PluginSourceKind::Bundled,
+                        source_label,
+                        install_dir,
+                        enabled,
+                    );
+                    BundledRefresh::Updated
+                }
+            }
+        }
     }
 
     // --- Tool runtime config (HTTP loopback) -------------------------------
