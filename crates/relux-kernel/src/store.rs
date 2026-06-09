@@ -28,9 +28,10 @@ const SCHEMA_VERSION: i64 = 1;
 /// The schema for the local store. `IF NOT EXISTS` everywhere so `open` is
 /// idempotent against an existing database file.
 const SCHEMA: &str = "\
-CREATE TABLE IF NOT EXISTS meta         (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS plugins      (id TEXT PRIMARY KEY, json TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS namespaces   (id TEXT PRIMARY KEY, json TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS meta              (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS plugins           (id TEXT PRIMARY KEY, json TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS installed_plugins (id TEXT PRIMARY KEY, json TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS namespaces        (id TEXT PRIMARY KEY, json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS agents       (id TEXT PRIMARY KEY, json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS tasks        (id TEXT PRIMARY KEY, json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS runs         (id TEXT PRIMARY KEY, json TEXT NOT NULL);
@@ -43,6 +44,7 @@ CREATE TABLE IF NOT EXISTS counters     (key TEXT PRIMARY KEY, value INTEGER NOT
 /// The id-keyed JSON tables, cleared in order on every save.
 const JSON_TABLES: &[&str] = &[
     "plugins",
+    "installed_plugins",
     "namespaces",
     "agents",
     "tasks",
@@ -94,6 +96,7 @@ impl SqliteStore {
     pub fn load_snapshot(&self) -> Result<KernelSnapshot, KernelError> {
         Ok(KernelSnapshot {
             plugins: self.load_json("plugins")?,
+            installed_plugins: self.load_json("installed_plugins")?,
             namespaces: self.load_json("namespaces")?,
             agents: self.load_json("agents")?,
             tasks: self.load_json("tasks")?,
@@ -121,6 +124,9 @@ impl SqliteStore {
 
         for plugin in &snapshot.plugins {
             put_json(&tx, "plugins", plugin.id.as_str(), plugin)?;
+        }
+        for installed in &snapshot.installed_plugins {
+            put_json(&tx, "installed_plugins", installed.id.as_str(), installed)?;
         }
         for namespace in &snapshot.namespaces {
             put_json(&tx, "namespaces", namespace.id.as_str(), namespace)?;

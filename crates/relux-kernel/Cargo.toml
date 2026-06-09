@@ -19,6 +19,10 @@ thiserror = "1.0"
 # Local durable storage for KernelState. Reuses the workspace-pinned rusqlite
 # (bundled SQLite - no system dependency) rather than introducing a new version.
 rusqlite = { workspace = true }
+# Local .zip plugin install/extract. default-features off keeps it minimal:
+# only the deflate codec (via flate2, already in the tree) is pulled in - no
+# bzip2/zstd/lzma C dependencies.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 # Temp directories for the SqliteStore round-trip tests.

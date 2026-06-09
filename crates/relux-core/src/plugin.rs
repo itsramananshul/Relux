@@ -74,6 +74,48 @@ pub struct PluginCapability {
     pub permissions: Vec<Permission>,
 }
 
+/// Where an installed plugin's source came from.
+///
+/// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 9.4 (Plugin entity `source`) and
+/// section 7.4 (Plugin Kernel Layer: plugin installation). This is the durable
+/// record of how a plugin entered the local index so the Plugins tab can show it
+/// and `remove` can clean up the right place.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginSourceKind {
+    /// A plugin shipped with Relux (the `examples/relux-plugins` fixtures).
+    Bundled,
+    /// Installed from a local folder on disk.
+    LocalDir,
+    /// Installed from a local `.zip` archive.
+    Zip,
+    /// Installed from a GitHub repository URL.
+    Github,
+}
+
+/// A durable record that a plugin is installed in the local control plane.
+///
+/// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 9.4 (Plugin entity: id, version,
+/// type, source, enabled, installed_at) and section 7.4. The full
+/// [`PluginManifest`] still lives in the plugin index; this is the lighter
+/// install-lifecycle record persisted alongside it so the future Plugins tab can
+/// list what is installed, from where, and whether it is enabled - and so an
+/// install survives across process restarts until explicitly removed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstalledPlugin {
+    pub id: PluginId,
+    pub version: String,
+    pub kind: PluginKind,
+    /// Deterministic install timestamp, stamped by the kernel's logical clock.
+    pub installed_at: String,
+    pub source_kind: PluginSourceKind,
+    /// A human-readable label for the source: the folder path, zip path, or URL.
+    pub source_label: String,
+    /// The durable directory the plugin was copied/extracted into.
+    pub install_dir: String,
+    pub enabled: bool,
+}
+
 /// The manifest every plugin must provide for kernel registration.
 ///
 /// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 8 and `docs/Relux spec.md` section 9.2.

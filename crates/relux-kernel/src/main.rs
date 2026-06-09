@@ -10,8 +10,11 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use relux_core::namespace::NamespaceKind;
-use relux_core::{AgentId, NamespaceId, Permission, PluginId, PrimeContext};
-use relux_kernel::{load_plugin_manifests, KernelError, KernelState, SqliteStore};
+use relux_core::{AgentId, NamespaceId, Permission, PluginId, PluginSourceKind, PrimeContext};
+use relux_kernel::{
+    install_from_dir, install_from_github, install_from_zip, load_plugin_manifests, remove_plugin,
+    KernelError, KernelState, SqliteStore,
+};
 
 /// The stable ids the local control plane is bootstrapped with.
 const WORKSPACE_NS: &str = "workspace";
@@ -20,14 +23,19 @@ const PRIME_ADAPTER: &str = "relux-adapter-local-prime";
 
 fn main() -> ExitCode {
     // CLI:
-    //   relux-kernel                     -> deterministic in-memory demo loop
-    //   relux-kernel prime <message...>  -> one Prime turn against PERSISTENT state
-    //   relux-kernel state               -> summarize the persistent store
-    //   relux-kernel reset-local         -> wipe + reinit the local dev DB
+    //   relux-kernel                         -> deterministic in-memory demo loop
+    //   relux-kernel prime <message...>      -> one Prime turn against PERSISTENT state
+    //   relux-kernel state                   -> summarize the persistent store
+    //   relux-kernel reset-local             -> wipe + reinit the local dev DB
+    //   relux-kernel plugins                 -> list installed plugins
+    //   relux-kernel plugin install-dir <p>  -> install a plugin from a folder
+    //   relux-kernel plugin install-zip <p>  -> install a plugin from a .zip
+    //   relux-kernel plugin install-github <url> -> install from a GitHub URL
+    //   relux-kernel plugin remove <id>      -> remove an installed plugin
     //
-    // The `prime`/`state`/`reset-local` paths share one durable SQLite store so
-    // state survives across invocations (`docs/RELUX_MASTER_PLAN.md` section 15 Phase 1,
-    // section 17.8). The no-arg demo stays fully in-memory and deterministic.
+    // The persistent paths share one durable SQLite store so state survives
+    // across invocations (`docs/RELUX_MASTER_PLAN.md` section 15 Phase 1, section 17.8). The
+    // no-arg demo stays fully in-memory and deterministic.
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
         Some((cmd, rest)) if cmd == "prime" => {
@@ -40,6 +48,8 @@ fn main() -> ExitCode {
         }
         Some((cmd, _)) if cmd == "state" => run_state(),
         Some((cmd, _)) if cmd == "reset-local" => run_reset_local(),
+        Some((cmd, _)) if cmd == "plugins" => run_plugins_list(),
+        Some((cmd, rest)) if cmd == "plugin" => run_plugin_subcommand(rest),
         _ => run_demo(),
     };
     match result {
@@ -60,6 +70,17 @@ fn db_path() -> PathBuf {
     }
 }
 
+/// The durable root for installed plugin directories: a `plugins/` folder next
+/// to the local dev database (`dev-data/relux/plugins/<plugin-id>` by default,
+/// already gitignored). Spec ref: `docs/RELUX_MASTER_PLAN.md` section 7.4.
+fn plugins_root() -> PathBuf {
+    let db = db_path();
+    match db.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join("plugins"),
+        _ => PathBuf::from("dev-data/relux/plugins"),
+    }
+}
+
 /// Ensure the loaded `kernel` has the baseline control plane (plugins, the
 /// workspace namespace, and the Prime agent), and return the `PrimeContext` to
 /// act with. Bootstrapping is keyed on Prime's existence, so it runs exactly
@@ -70,8 +91,20 @@ fn ensure_bootstrapped(kernel: &mut KernelState) -> Result<PrimeContext, KernelE
     let prime_id = AgentId::new(PRIME_AGENT);
 
     if kernel.agent(&prime_id).is_none() {
-        for manifest in load_plugin_manifests(&examples_dir())? {
-            kernel.register_plugin(manifest);
+        // Mark the shipped example plugins as installed/enabled with source kind
+        // Bundled (`docs/RELUX_MASTER_PLAN.md` section 9.4). Keyed on Prime's absence,
+        // so this runs exactly once on a fresh store - no duplicate installed
+        // records or audit noise on later loads.
+        let dir = examples_dir();
+        for manifest in load_plugin_manifests(&dir)? {
+            let install_dir = dir.join(manifest.id.as_str()).display().to_string();
+            kernel.install_plugin(
+                manifest,
+                PluginSourceKind::Bundled,
+                "bundled example".to_string(),
+                install_dir,
+                true,
+            );
         }
         kernel.create_namespace(WORKSPACE_NS, "Workspace", NamespaceKind::Personal);
         let echo_permission = Permission::new("tool:relux-tools-echo:say")
@@ -132,8 +165,9 @@ fn run_state() -> Result<(), KernelError> {
 
     println!("== Relux local state ({}) ==", path.display());
     println!(
-        "plugins={} namespaces={} agents={} tasks={} runs={} approvals={}",
+        "plugins={} installed_plugins={} namespaces={} agents={} tasks={} runs={} approvals={}",
         kernel.plugin_count(),
+        kernel.installed_plugin_count(),
         kernel.namespace_count(),
         kernel.agent_count(),
         kernel.task_count(),
@@ -215,6 +249,138 @@ fn examples_dir() -> PathBuf {
         return cwd_path;
     }
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/relux-plugins")
+}
+
+/// List installed plugins from the persistent store.
+///
+/// Ensures the store is bootstrapped first so a fresh DB shows the bundled
+/// example plugins; the (idempotent) bootstrap result is saved so the bundled
+/// install records are durable.
+fn run_plugins_list() -> Result<(), KernelError> {
+    let path = db_path();
+    let mut store = SqliteStore::open(&path)?;
+    let mut kernel = store.load()?;
+    ensure_bootstrapped(&mut kernel)?;
+    store.save(&kernel)?;
+
+    let installed = kernel.installed_plugins();
+    println!("== Relux installed plugins ({}) ==", installed.len());
+    if installed.is_empty() {
+        println!("   (none)");
+    }
+    for p in installed {
+        println!(
+            "   {:<28} v{:<8} {:<10} {:<8} {}",
+            p.id,
+            p.version,
+            format!("{:?}", p.source_kind),
+            if p.enabled { "enabled" } else { "disabled" },
+            p.source_label,
+        );
+    }
+    Ok(())
+}
+
+/// Dispatch `relux-kernel plugin <subcommand> ...`.
+fn run_plugin_subcommand(args: &[String]) -> Result<(), KernelError> {
+    match args.split_first() {
+        Some((sub, rest)) if sub == "install-dir" => {
+            let path = first_arg(rest, "plugin install-dir <path>")?;
+            run_plugin_install_dir(&path)
+        }
+        Some((sub, rest)) if sub == "install-zip" => {
+            let path = first_arg(rest, "plugin install-zip <path>")?;
+            run_plugin_install_zip(&path)
+        }
+        Some((sub, rest)) if sub == "install-github" => {
+            let url = first_arg(rest, "plugin install-github <url>")?;
+            run_plugin_install_github(&url)
+        }
+        Some((sub, rest)) if sub == "remove" => {
+            let id = first_arg(rest, "plugin remove <plugin-id>")?;
+            run_plugin_remove(&id)
+        }
+        _ => Err(KernelError::PluginInstall(
+            "usage: relux-kernel plugin <install-dir|install-zip|install-github|remove> <arg>"
+                .to_string(),
+        )),
+    }
+}
+
+/// Return the first argument, or a usage error naming the expected form.
+fn first_arg(rest: &[String], usage: &str) -> Result<String, KernelError> {
+    match rest.first() {
+        Some(a) if !a.trim().is_empty() => Ok(a.clone()),
+        _ => Err(KernelError::PluginInstall(format!("usage: relux-kernel {usage}"))),
+    }
+}
+
+/// Open the persistent store, ensure bootstrap, run `action`, save, and report.
+fn with_persistent_kernel<F>(action: F) -> Result<(), KernelError>
+where
+    F: FnOnce(&mut KernelState) -> Result<String, KernelError>,
+{
+    let path = db_path();
+    let mut store = SqliteStore::open(&path)?;
+    let mut kernel = store.load()?;
+    ensure_bootstrapped(&mut kernel)?;
+    let message = action(&mut kernel)?;
+    store.save(&kernel)?;
+    println!("{message}");
+    Ok(())
+}
+
+fn run_plugin_install_dir(path: &str) -> Result<(), KernelError> {
+    let root = plugins_root();
+    with_persistent_kernel(|kernel| {
+        let installed = install_from_dir(Path::new(path), &root, kernel)?;
+        Ok(format!(
+            "installed {} v{} ({:?}) from {} -> {}",
+            installed.id,
+            installed.version,
+            installed.source_kind,
+            installed.source_label,
+            installed.install_dir
+        ))
+    })
+}
+
+fn run_plugin_install_zip(path: &str) -> Result<(), KernelError> {
+    let root = plugins_root();
+    with_persistent_kernel(|kernel| {
+        let installed = install_from_zip(Path::new(path), &root, kernel)?;
+        Ok(format!(
+            "installed {} v{} ({:?}) from {} -> {}",
+            installed.id,
+            installed.version,
+            installed.source_kind,
+            installed.source_label,
+            installed.install_dir
+        ))
+    })
+}
+
+fn run_plugin_install_github(url: &str) -> Result<(), KernelError> {
+    let root = plugins_root();
+    with_persistent_kernel(|kernel| {
+        let installed = install_from_github(url, &root, kernel)?;
+        Ok(format!(
+            "installed {} v{} ({:?}) from {} -> {}",
+            installed.id,
+            installed.version,
+            installed.source_kind,
+            installed.source_label,
+            installed.install_dir
+        ))
+    })
+}
+
+fn run_plugin_remove(plugin_id: &str) -> Result<(), KernelError> {
+    let root = plugins_root();
+    with_persistent_kernel(|kernel| {
+        remove_plugin(plugin_id, &root, kernel)?;
+        Ok(format!("removed plugin {plugin_id}"))
+    })
 }
 
 fn run_demo() -> Result<(), KernelError> {

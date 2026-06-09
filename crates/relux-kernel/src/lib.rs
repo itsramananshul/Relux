@@ -19,6 +19,7 @@
 pub mod clock;
 pub mod event;
 pub mod loader;
+pub mod plugin_install;
 pub mod prime;
 pub mod state;
 pub mod store;
@@ -26,6 +27,9 @@ pub mod store;
 pub use clock::Clock;
 pub use event::RunEvent;
 pub use loader::{load_plugin_manifests, MANIFEST_FILENAME};
+pub use plugin_install::{
+    install_from_dir, install_from_github, install_from_zip, list_installed, remove_plugin,
+};
 pub use prime::{classify_intent, decide};
 pub use state::{KernelCounters, KernelSnapshot, KernelState};
 pub use store::SqliteStore;
@@ -64,4 +68,12 @@ pub enum KernelError {
     PermissionDenied { agent: String, permission: String },
     #[error("storage error: {0}")]
     Storage(String),
+    #[error("plugin install failed: {0}")]
+    PluginInstall(String),
+    #[error("plugin not installed: {0}")]
+    PluginNotInstalled(String),
+    #[error("plugin {0} is bundled and cannot be removed")]
+    BundledPluginProtected(String),
+    #[error("unsafe plugin path rejected: {0}")]
+    UnsafePluginPath(String),
 }

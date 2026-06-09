@@ -19,10 +19,10 @@ use std::collections::HashMap;
 use relux_core::agent::AgentStatus;
 use relux_core::namespace::NamespaceKind;
 use relux_core::{
-    Agent, AgentId, Approval, ApprovalId, ApprovalStatus, AuditEvent, AuditResult, Namespace,
-    NamespaceId, Permission, PluginId, PluginManifest, PrimeAction, PrimeContext, PrimeDisposition,
-    PrimePlan, PrimeTurn, RiskLevel, Run, RunId, RunStatus, StateSummary, Task, TaskBrief, TaskId,
-    TaskStatus,
+    Agent, AgentId, Approval, ApprovalId, ApprovalStatus, AuditEvent, AuditResult, InstalledPlugin,
+    Namespace, NamespaceId, Permission, PluginId, PluginManifest, PluginSourceKind, PrimeAction,
+    PrimeContext, PrimeDisposition, PrimePlan, PrimeTurn, RiskLevel, Run, RunId, RunStatus,
+    StateSummary, Task, TaskBrief, TaskId, TaskStatus,
 };
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +55,8 @@ pub struct KernelCounters {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct KernelSnapshot {
     pub plugins: Vec<PluginManifest>,
+    /// Install-lifecycle records, one per installed plugin, sorted by id.
+    pub installed_plugins: Vec<InstalledPlugin>,
     pub namespaces: Vec<Namespace>,
     pub agents: Vec<Agent>,
     pub tasks: Vec<Task>,
@@ -71,6 +73,7 @@ pub struct KernelSnapshot {
 #[derive(Debug, Default)]
 pub struct KernelState {
     plugins: HashMap<PluginId, PluginManifest>,
+    installed_plugins: HashMap<PluginId, InstalledPlugin>,
     namespaces: HashMap<NamespaceId, Namespace>,
     agents: HashMap<AgentId, Agent>,
     tasks: HashMap<TaskId, Task>,
@@ -114,6 +117,7 @@ impl KernelState {
 
         KernelSnapshot {
             plugins: sorted(&self.plugins, |p| p.id.as_str()),
+            installed_plugins: sorted(&self.installed_plugins, |p| p.id.as_str()),
             namespaces: sorted(&self.namespaces, |n| n.id.as_str()),
             agents: sorted(&self.agents, |a| a.id.as_str()),
             tasks: sorted(&self.tasks, |t| t.id.as_str()),
@@ -142,6 +146,9 @@ impl KernelState {
         let mut state = KernelState::new();
         for plugin in snapshot.plugins {
             state.plugins.insert(plugin.id.clone(), plugin);
+        }
+        for installed in snapshot.installed_plugins {
+            state.installed_plugins.insert(installed.id.clone(), installed);
         }
         for namespace in snapshot.namespaces {
             state.namespaces.insert(namespace.id.clone(), namespace);
@@ -196,6 +203,97 @@ impl KernelState {
 
     pub fn plugin_count(&self) -> usize {
         self.plugins.len()
+    }
+
+    // --- Installed plugin lifecycle ----------------------------------------
+
+    /// Register an already-validated manifest AND record its durable install
+    /// metadata (`docs/RELUX_MASTER_PLAN.md` section 9.4, section 7.4).
+    ///
+    /// This is the kernel half of the plugin installation lifecycle that backs
+    /// the future Plugins tab: the manifest enters the live index (so the plugin
+    /// can be used) and an [`InstalledPlugin`] record is persisted (so the
+    /// install survives restarts and is listable until removed). The install
+    /// timestamp is stamped from the deterministic logical clock. Re-installing
+    /// the same id cleanly replaces both records rather than duplicating them
+    /// (the maps are id-keyed). The filesystem copy/extract is done by
+    /// [`crate::plugin_install`]; this method does not touch disk.
+    pub fn install_plugin(
+        &mut self,
+        manifest: PluginManifest,
+        source_kind: PluginSourceKind,
+        source_label: String,
+        install_dir: String,
+        enabled: bool,
+    ) -> InstalledPlugin {
+        let id = manifest.id.clone();
+        let version = manifest.version.clone();
+        let kind = manifest.kind.clone();
+        self.register_plugin(manifest);
+
+        let installed = InstalledPlugin {
+            id: id.clone(),
+            version,
+            kind,
+            installed_at: self.clock.tick(),
+            source_kind,
+            source_label,
+            install_dir,
+            enabled,
+        };
+        self.record_audit(
+            "kernel",
+            "kernel",
+            "plugin:install",
+            Some("plugin"),
+            Some(id.as_str()),
+            None,
+            AuditResult::Success,
+            serde_json::json!({ "source": format!("{:?}", installed.source_kind) }),
+        );
+        self.installed_plugins.insert(id, installed.clone());
+        installed
+    }
+
+    /// Remove an installed plugin's metadata and unregister its manifest
+    /// (`docs/RELUX_MASTER_PLAN.md` section 7.4). The on-disk install directory is
+    /// removed by [`crate::plugin_install::remove_plugin`]; this method only
+    /// mutates kernel state and audits the removal. Returns the removed record.
+    pub fn remove_installed_plugin(
+        &mut self,
+        id: &PluginId,
+    ) -> Result<InstalledPlugin, KernelError> {
+        let removed = self
+            .installed_plugins
+            .remove(id)
+            .ok_or_else(|| KernelError::PluginNotInstalled(id.to_string()))?;
+        self.plugins.remove(id);
+        self.record_audit(
+            "kernel",
+            "kernel",
+            "plugin:remove",
+            Some("plugin"),
+            Some(id.as_str()),
+            None,
+            AuditResult::Success,
+            serde_json::Value::Null,
+        );
+        Ok(removed)
+    }
+
+    pub fn installed_plugin(&self, id: &PluginId) -> Option<&InstalledPlugin> {
+        self.installed_plugins.get(id)
+    }
+
+    /// All installed plugin records, sorted by id for deterministic listing.
+    pub fn installed_plugins(&self) -> Vec<&InstalledPlugin> {
+        let mut out: Vec<&InstalledPlugin> = self.installed_plugins.values().collect();
+        out.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+        out
+    }
+
+    pub fn installed_plugin_count(&self) -> usize {
+        self.installed_plugins.len()
     }
 
     // --- Namespaces --------------------------------------------------------

@@ -20,7 +20,8 @@ pub use audit::{AuditEvent, AuditResult};
 pub use namespace::{Namespace, NamespaceId};
 pub use permission::{ApprovalRequirement, Permission, PermissionError, RiskLevel, ToolDefinition};
 pub use plugin::{
-    ManifestError, PluginCapability, PluginHealth, PluginId, PluginKind, PluginManifest, TrustLevel,
+    InstalledPlugin, ManifestError, PluginCapability, PluginHealth, PluginId, PluginKind,
+    PluginManifest, PluginSourceKind, TrustLevel,
 };
 pub use prime::{
     PrimeAction, PrimeContext, PrimeDisposition, PrimeIntent, PrimePlan, PrimeTurn, StateSummary,
