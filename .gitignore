@@ -39,6 +39,7 @@ reference/
 *.profraw
 *.profdata
 coverage/
+dist/
 
 # Claude harness scratch
 .claude/

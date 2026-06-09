@@ -1664,6 +1664,21 @@ Configuration:
 - `RELUX_HTTP_ADDR` - the bind address (default `127.0.0.1:19891`).
 - `RELUX_DASHBOARD_DIST` - override the dashboard bundle directory.
 
+Local first-release checks:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\relux-first-release-check.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\relux-package-local.ps1
+```
+
+The check script builds the dashboard, tests and lints the Relux kernel/core,
+builds the release binary, runs `doctor`, and smoke-tests Prime task creation
+plus assigned-task execution against a temporary `RELUX_DB`. The package script
+creates `dist\relux-local-<version>-windows-x64\` with the release binary,
+dashboard dist, bundled example plugins, docs, and `Start-Relux.ps1`. These are
+local release helpers only; GitHub Actions remain disabled unless explicitly
+enabled by the user.
+
 ### Optional LLM-backed Prime (OpenRouter)
 
 As of Phase 2.1, Prime can optionally use an LLM (via OpenRouter) to shape its

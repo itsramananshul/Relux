@@ -40,6 +40,24 @@ Also available:
   GET /v1/relux/audit?limit=N
 ```
 
+### First Local Release
+
+Use the local release check before cutting or sharing a Windows bundle:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\relux-first-release-check.ps1
+```
+
+Create a portable local bundle:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\relux-package-local.ps1
+```
+
+The package script writes `dist\relux-local-<version>-windows-x64\` and a zip
+next to it. The bundle includes `relux-kernel.exe`, the built dashboard,
+bundled example plugins, docs, and `Start-Relux.ps1`.
+
 ### Optional LLM-backed Prime
 
 By default, Prime is deterministic and rule-based. You can enable a natural,
