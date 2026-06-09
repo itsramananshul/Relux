@@ -1,5 +1,5 @@
 import { useState, useMemo } from "react";
-import { reluxWork, type ReluxTask, type ReluxRun, type ReluxAgent } from "../api";
+import { reluxWork, reluxAudit, type ReluxTask, type ReluxRun, type ReluxAgent, type ReluxTaskDetail, type ReluxRunDetail, type ReluxAuditEntry, type RunEvent } from "../api";
 import { useAsync } from "../components/common";
 
 // Relux Work page: standalone surface for tasks and runs.
@@ -21,6 +21,8 @@ export function Work() {
 
   const [newTaskTitle, setNewTaskTitle] = useState("");
   const [creating, setCreating] = useState(false);
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
 
   async function createTask() {
     if (!newTaskTitle.trim()) return;
@@ -53,6 +55,16 @@ export function Work() {
     reloadTasks();
     reloadRuns();
     reloadAgents();
+  };
+
+  const handleInspectTask = (taskId: string) => {
+    setSelectedTaskId(taskId);
+    setSelectedRunId(null);
+  };
+
+  const handleInspectRun = (runId: string) => {
+    setSelectedRunId(runId);
+    setSelectedTaskId(null);
   };
 
   return (
@@ -90,10 +102,21 @@ export function Work() {
             </div>
 
             <div className="row wrap" style={{ gap: 16, alignItems: "flex-start" }}>
-              <Column title="Open" tasks={columns.open} onAction={handleReload} agents={agents || []} />
-              <Column title="Running" tasks={columns.running} onAction={handleReload} agents={agents || []} />
-              <Column title="Done" tasks={columns.done} onAction={handleReload} agents={agents || []} />
+              <Column title="Open" tasks={columns.open} onAction={handleReload} onInspectTask={handleInspectTask} agents={agents || []} />
+              <Column title="Running" tasks={columns.running} onAction={handleReload} onInspectTask={handleInspectTask} agents={agents || []} />
+              <Column title="Done" tasks={columns.done} onAction={handleReload} onInspectTask={handleInspectTask} agents={agents || []} />
             </div>
+
+            {(selectedTaskId || selectedRunId) && (
+              <div className="card" style={{ marginTop: 24, padding: 16 }}>
+                {selectedTaskId && (
+                  <TaskDetailPanel taskId={selectedTaskId} onClose={() => setSelectedTaskId(null)} />
+                )}
+                {selectedRunId && (
+                  <RunDetailPanel runId={selectedRunId} onClose={() => setSelectedRunId(null)} />
+                )}
+              </div>
+            )}
 
             <div className="card" style={{ marginTop: 24, padding: 16 }}>
               <h4 style={{ marginTop: 0 }}>Recent Runs</h4>
@@ -107,6 +130,7 @@ export function Work() {
                         <th>Agent</th>
                         <th>Status</th>
                         <th>Summary</th>
+                        <th>Actions</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -123,6 +147,9 @@ export function Work() {
                             </span>
                           </td>
                           <td className="muted" style={{ fontSize: 11 }}>{run.summary || run.error || "-"}</td>
+                          <td>
+                            <button className="btn ghost sm" onClick={() => handleInspectRun(run.id)}>Inspect</button>
+                          </td>
                         </tr>
                       ))}
                     </tbody>
@@ -132,6 +159,8 @@ export function Work() {
                 <div className="empty sm">No runs yet.</div>
               )}
             </div>
+
+            <AuditPanel />
           </>
         )}
       </div>
@@ -139,7 +168,7 @@ export function Work() {
   );
 }
 
-function Column({ title, tasks, onAction, agents }: { title: string; tasks: ReluxTask[]; onAction: () => void; agents: ReluxAgent[] }) {
+function Column({ title, tasks, onAction, onInspectTask, agents }: { title: string; tasks: ReluxTask[]; onAction: () => void; onInspectTask: (taskId: string) => void; agents: ReluxAgent[] }) {
   return (
     <div style={{ flex: 1, minWidth: 280 }}>
       <h4 style={{ marginBottom: 8, fontSize: 13, textTransform: "uppercase", letterSpacing: "0.05em" }}>
@@ -147,7 +176,7 @@ function Column({ title, tasks, onAction, agents }: { title: string; tasks: Relu
       </h4>
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
         {tasks.map(t => (
-          <TaskCard key={t.id} task={t} onAction={onAction} agents={agents} />
+          <TaskCard key={t.id} task={t} onAction={onAction} onInspectTask={onInspectTask} agents={agents} />
         ))}
         {tasks.length === 0 && <div className="empty sm" style={{ padding: 16 }}>No {title.toLowerCase()} tasks</div>}
       </div>
@@ -155,7 +184,7 @@ function Column({ title, tasks, onAction, agents }: { title: string; tasks: Relu
   );
 }
 
-function TaskCard({ task, onAction, agents }: { task: ReluxTask; onAction: () => void; agents: ReluxAgent[] }) {
+function TaskCard({ task, onAction, onInspectTask, agents }: { task: ReluxTask; onAction: () => void; onInspectTask: (taskId: string) => void; agents: ReluxAgent[] }) {
   const [busy, setBusy] = useState(false);
   const [selectedAgent, setSelectedAgent] = useState(task.assigned_agent || "");
   
@@ -225,7 +254,179 @@ function TaskCard({ task, onAction, agents }: { task: ReluxTask; onAction: () =>
             {busy ? "..." : "Start"}
           </button>
         )}
+        <button className="btn ghost sm" style={{ height: 24, padding: "0 8px" }} onClick={() => onInspectTask(task.id)}>Inspect</button>
       </div>
+    </div>
+  );
+}
+
+function TaskDetailPanel({ taskId, onClose }: { taskId: string; onClose: () => void }) {
+  const { data: task, loading, error } = useAsync<ReluxTaskDetail>(
+    () => reluxWork.getTask(taskId),
+    [taskId],
+  );
+
+  return (
+    <div style={{ paddingBottom: 16 }}>
+      <div className="row" style={{ alignItems: "center", marginBottom: 12 }}>
+        <h4 style={{ margin: 0 }}>Task Detail</h4>
+        <div className="spacer" style={{ flex: 1 }} />
+        <button className="btn ghost sm" onClick={onClose}>Close</button>
+      </div>
+      {loading ? (
+        <div className="loading">Loading task details...</div>
+      ) : error ? (
+        <div className="banner err" style={{ fontSize: 12 }}>
+          Error loading task: {String(error)}
+        </div>
+      ) : task ? (
+        <div className="grid" style={{ gap: 8, fontSize: 12 }}>
+          <div className="kv"><span>ID:</span><span className="mono">{task.id}</span></div>
+          <div className="kv"><span>Title:</span><span>{task.title}</span></div>
+          <div className="kv"><span>Status:</span><span>{task.status}</span></div>
+          <div className="kv"><span>Priority:</span><span>{task.priority}</span></div>
+          <div className="kv"><span>Created By:</span><span>{task.created_by}</span></div>
+          <div className="kv"><span>Assigned Agent:</span><span>{task.assignee_name || task.assigned_agent || "N/A"}</span></div>
+          <div className="kv"><span>Namespace ID:</span><span className="mono">{task.namespace_id}</span></div>
+          <div className="kv"><span>Created At:</span><span>{new Date(task.created_at).toLocaleString()}</span></div>
+          <div className="kv"><span>Updated At:</span><span>{new Date(task.updated_at).toLocaleString()}</span></div>
+          <div className="kv stretch"><span>Input:</span><pre className="code" style={{ whiteSpace: "pre-wrap" }}>{JSON.stringify(task.input, null, 2)}</pre></div>
+        </div>
+      ) : (
+        <div className="empty sm">No task details found.</div>
+      )}
+    </div>
+  );
+}
+
+function RunDetailPanel({ runId, onClose }: { runId: string; onClose: () => void }) {
+  const { data: run, loading: loadingRun, error: errorRun } = useAsync<ReluxRunDetail>(
+    () => reluxWork.getRun(runId),
+    [runId],
+  );
+  const { data: events, loading: loadingEvents, error: errorEvents } = useAsync<RunEvent[]>(
+    () => reluxWork.getRunEvents(runId),
+    [runId],
+  );
+
+  const error = errorRun || errorEvents;
+  const loading = loadingRun || loadingEvents;
+
+  return (
+    <div style={{ paddingBottom: 16 }}>
+      <div className="row" style={{ alignItems: "center", marginBottom: 12 }}>
+        <h4 style={{ margin: 0 }}>Run Detail</h4>
+        <div className="spacer" style={{ flex: 1 }} />
+        <button className="btn ghost sm" onClick={onClose}>Close</button>
+      </div>
+      {loading ? (
+        <div className="loading">Loading run details...</div>
+      ) : error ? (
+        <div className="banner err" style={{ fontSize: 12 }}>
+          Error loading run: {String(error)}
+        </div>
+      ) : run ? (
+        <div className="grid" style={{ gap: 8, fontSize: 12 }}>
+          <div className="kv"><span>ID:</span><span className="mono">{run.id}</span></div>
+          <div className="kv"><span>Task ID:</span><span className="mono">{run.task_id}</span></div>
+          <div className="kv"><span>Agent ID:</span><span className="mono">{run.agent_id}</span></div>
+          <div className="kv"><span>Adapter Plugin:</span><span>{run.adapter_plugin}</span></div>
+          <div className="kv"><span>Status:</span><span>{run.status}</span></div>
+          <div className="kv"><span>Started At:</span><span>{run.started_at ? new Date(run.started_at).toLocaleString() : "N/A"}</span></div>
+          <div className="kv"><span>Ended At:</span><span>{run.ended_at ? new Date(run.ended_at).toLocaleString() : "N/A"}</span></div>
+          {run.summary && <div className="kv stretch"><span>Summary:</span><pre className="code" style={{ whiteSpace: "pre-wrap" }}>{run.summary}</pre></div>}
+          {run.error && <div className="kv stretch"><span>Error:</span><pre className="code" style={{ whiteSpace: "pre-wrap" }}>{run.error}</pre></div>}
+          <h5 style={{ marginTop: 16, marginBottom: 8 }}>Events</h5>
+          {loadingEvents ? (
+            <div className="loading">Loading events...</div>
+          ) : errorEvents ? (
+            <div className="banner err" style={{ fontSize: 12 }}>
+              Error loading events: {String(errorEvents)}
+            </div>
+          ) : events && events.length > 0 ? (
+            <div className="table-scroll" style={{ maxHeight: 300 }}>
+              <table className="table sm">
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Kind</th>
+                    <th>Source</th>
+                    <th>Message</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {events.map((event, index) => (
+                    <tr key={index}>
+                      <td>{event.ts ? new Date(event.ts * 1000).toLocaleTimeString() : "N/A"}</td>
+                      <td>{event.kind}</td>
+                      <td>{event.source}</td>
+                      <td className="muted" style={{ fontSize: 11 }}>
+                        {event.message}
+                        {event.payload_json && (
+                          <pre className="code" style={{ whiteSpace: "pre-wrap", marginTop: 4 }}>
+                            {JSON.stringify(JSON.parse(event.payload_json), null, 2)}
+                          </pre>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <div className="empty sm">No events found for this run.</div>
+          )}
+        </div>
+      ) : (
+        <div className="empty sm">No run details found.</div>
+      )}
+    </div>
+  );
+}
+
+function AuditPanel() {
+  const { data: auditEntries, loading, error } = useAsync<ReluxAuditEntry[]>(
+    () => reluxAudit.list(20),
+    [],
+  );
+
+  return (
+    <div className="card" style={{ marginTop: 24, padding: 16 }}>
+      <h4 style={{ marginTop: 0 }}>Recent Audit</h4>
+      {loading ? (
+        <div className="loading">Loading audit entries...</div>
+      ) : error ? (
+        <div className="banner err" style={{ fontSize: 12 }}>
+          Error loading audit entries: {String(error)}
+        </div>
+      ) : auditEntries && auditEntries.length > 0 ? (
+        <div className="table-scroll" style={{ maxHeight: 300 }}>
+          <table className="table sm">
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Actor</th>
+                <th>Action</th>
+                <th>Target</th>
+                <th>Result</th>
+              </tr>
+            </thead>
+            <tbody>
+              {auditEntries.map((entry, index) => (
+                <tr key={index}>
+                  <td>{new Date(entry.ts).toLocaleString()}</td>
+                  <td>{entry.actor}</td>
+                  <td>{entry.action}</td>
+                  <td>{entry.target}</td>
+                  <td>{entry.result}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <div className="empty sm">No audit entries found.</div>
+      )}
     </div>
   );
 }

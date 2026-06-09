@@ -1403,11 +1403,37 @@ export interface ReluxRun {
   error?: string;
 }
 
+export interface ReluxAuditEntry {
+  id: string;
+  ts: string; // Assuming timestamp as string for now, could be number
+  actor: string;
+  action: string;
+  target: string;
+  namespace: string;
+  result: string;
+  metadata?: Record<string, unknown>; // Optional metadata object
+  hash?: string; // Optional hash/chain metadata
+}
+
+export interface ReluxTaskDetail extends ReluxTask {
+  // Potentially more fields for a detailed view, e.g., full input, events
+}
+
+export interface ReluxRunDetail extends ReluxRun {
+  // Potentially more fields for a detailed view, e.g., full transcript, tool calls
+}
+
 export const reluxWork = {
   // All tasks, sorted by id.
   listTasks: () => api.get<ReluxTask[]>("/v1/relux/tasks"),
+  // Get a specific task by id.
+  getTask: (id: string) => api.get<ReluxTaskDetail>(`/v1/relux/tasks/${encodeURIComponent(id)}`),
   // All runs, sorted by id.
   listRuns: () => api.get<ReluxRun[]>("/v1/relux/runs"),
+  // Get a specific run by id.
+  getRun: (id: string) => api.get<ReluxRunDetail>(`/v1/relux/runs/${encodeURIComponent(id)}`),
+  // Get events for a specific run.
+  getRunEvents: (id: string) => api.get<RunEvent[]>(`/v1/relux/runs/${encodeURIComponent(id)}/events`),
   // All agents, sorted by id.
   listAgents: () => api.get<ReluxAgent[]>("/v1/relux/agents"),
   // Create a new task and assign it to Prime.
@@ -1420,6 +1446,11 @@ export const reluxWork = {
   // Assign a task to an agent.
   assignTask: (taskId: string, agentId: string) =>
     api.post<ReluxTask>(`/v1/relux/tasks/${encodeURIComponent(taskId)}/assign`, { agent_id: agentId }),
+};
+
+export const reluxAudit = {
+  // Get audit entries.
+  list: (limit = 20) => api.get<ReluxAuditEntry[]>(`/v1/relux/audit?limit=${limit}`),
 };
 
 export const reluxPlugins = {
