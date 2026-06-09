@@ -104,6 +104,9 @@ impl SqliteStore {
             approvals: self.load_json("approvals")?,
             run_events: self.load_json("run_events")?,
             audit_events: self.load_json("audit_events")?,
+            prime_autonomy_config: self
+                .load_meta_json("prime_autonomy_config")?
+                .unwrap_or_default(),
             counters: self.load_counters()?,
         })
     }
@@ -157,6 +160,7 @@ impl SqliteStore {
         put_counter(&tx, "next_approval", c.next_approval)?;
         put_counter(&tx, "next_audit", c.next_audit)?;
         put_counter(&tx, "next_event", c.next_event)?;
+        put_meta_json(&tx, "prime_autonomy_config", &snapshot.prime_autonomy_config)?;
 
         tx.commit().map_err(storage_err)?;
         Ok(())
@@ -213,6 +217,19 @@ impl SqliteStore {
         }
         Ok(counters)
     }
+
+    fn load_meta_json<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, KernelError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT value FROM meta WHERE key = ?1")
+            .map_err(storage_err)?;
+        let mut rows = stmt.query(params![key]).map_err(storage_err)?;
+        let Some(row) = rows.next().map_err(storage_err)? else {
+            return Ok(None);
+        };
+        let json: String = row.get(0).map_err(storage_err)?;
+        Ok(Some(serde_json::from_str(&json).map_err(json_err)?))
+    }
 }
 
 fn put_json<T: Serialize>(
@@ -235,6 +252,21 @@ fn put_run_event(conn: &Connection, event: &RunEvent) -> Result<(), KernelError>
     conn.execute(
         "INSERT INTO run_events(id, run_id, json) VALUES(?1, ?2, ?3)",
         params![event.id, event.run_id.as_str(), json],
+    )
+    .map_err(storage_err)?;
+    Ok(())
+}
+
+fn put_meta_json<T: Serialize>(
+    conn: &Connection,
+    key: &str,
+    value: &T,
+) -> Result<(), KernelError> {
+    let json = serde_json::to_string(value).map_err(json_err)?;
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES(?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, json],
     )
     .map_err(storage_err)?;
     Ok(())

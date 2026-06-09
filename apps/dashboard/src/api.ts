@@ -1353,6 +1353,52 @@ export const reluxPrime = {
   send: (message: string) => api.post<ReluxPrimeTurn>("/v1/relux/prime", { message }),
 };
 
+// -- Relux Prime Autonomy --------------------------------------------------
+
+// For /v1/relux/prime/autonomy GET response
+export interface ReluxPrimeAutonomyConfig {
+  enabled: boolean;
+  interval_seconds: number;
+  max_tasks_per_tick: number;
+  auto_assign_unassigned: boolean;
+  last_tick_at: string | null; // ISO 8601 string
+  last_tick_summary: string | null;
+}
+
+// For /v1/relux/prime/autonomy GET response
+export interface ReluxPrimeAutonomyTickResult {
+  tick_at: string; // ISO 8601 string
+  tasks_run: number;
+  tasks_assigned: number;
+  actions_taken: number;
+  summary: string;
+  skipped_reasons: string[];
+}
+
+// For /v1/relux/prime/autonomy GET response
+export interface ReluxPrimeAutonomyStatusResponse {
+  config: ReluxPrimeAutonomyConfig;
+  last_tick_result: ReluxPrimeAutonomyTickResult | null;
+}
+
+// For /v1/relux/prime/autonomy PUT/PATCH request
+export interface UpdateReluxPrimeAutonomyConfigReq {
+  enabled?: boolean;
+  interval_seconds?: number;
+  max_tasks_per_tick?: number;
+  auto_assign_unassigned?: boolean;
+}
+
+export const reluxPrimeAutonomy = {
+  // Get current autonomy configuration and last tick result.
+  getStatus: () => api.get<ReluxPrimeAutonomyStatusResponse>("/v1/relux/prime/autonomy"),
+  // Update autonomy configuration.
+  updateConfig: (config: UpdateReluxPrimeAutonomyConfigReq) =>
+    api.patch<ReluxPrimeAutonomyConfig>("/v1/relux/prime/autonomy", config),
+  // Trigger one autonomy tick manually.
+  runTick: () => api.post<ReluxPrimeAutonomyTickResult>("/v1/relux/prime/autonomy/tick"),
+};
+
 // -- Relux AI (OpenRouter) -------------------------------------------------
 
 export interface ReluxAiStatus {

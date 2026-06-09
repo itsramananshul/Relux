@@ -1679,6 +1679,48 @@ dashboard dist, bundled example plugins, docs, and `Start-Relux.ps1`. These are
 local release helpers only; GitHub Actions remain disabled unless explicitly
 enabled by the user.
 
+### Prime Autonomy Loop (First Local Version)
+
+Relux now has a first safe autonomy loop for Prime:
+
+- Durable config lives in the kernel snapshot/store: `enabled`,
+  `interval_seconds`, `max_tasks_per_tick`, `auto_assign_unassigned`,
+  `last_tick_at`, and `last_tick_summary`.
+- Defaults are conservative: disabled, 60 second interval, one task per tick,
+  and no auto-assignment.
+- `relux-kernel serve` starts a background loop that reads the persisted config
+  and runs one tick only when enabled.
+- One tick uses the same governed assigned-task execution path as the Work page:
+  ready assigned tasks are started, executed through the local adapter/tool path,
+  completed, and audited.
+- If `auto_assign_unassigned` is enabled, Prime may assign queued unassigned
+  tasks to Prime before running them, capped by `max_tasks_per_tick`.
+- Prime autonomy does not install/remove plugins, grant permissions, delete
+  data, call paid LLMs, or bypass approvals.
+
+CLI:
+
+```powershell
+relux-kernel prime autonomy status
+relux-kernel prime autonomy enable
+relux-kernel prime autonomy disable
+relux-kernel prime autonomy configure --interval 60 --max-tasks 1 --auto-assign false
+relux-kernel prime autonomy tick
+```
+
+API:
+
+```text
+GET   /v1/relux/prime/autonomy
+PATCH /v1/relux/prime/autonomy
+PUT   /v1/relux/prime/autonomy
+POST  /v1/relux/prime/autonomy/tick
+```
+
+Dashboard: the Prime page exposes a Prime Autonomy panel with toggle, interval,
+max tasks per tick, auto-assign, last tick summary, and a "Run one tick now"
+control.
+
 ### Optional LLM-backed Prime (OpenRouter)
 
 As of Phase 2.1, Prime can optionally use an LLM (via OpenRouter) to shape its

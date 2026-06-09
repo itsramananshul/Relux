@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { reluxAi, reluxPrime, type ReluxAiStatus, type ReluxPrimeTurn } from "../api";
+import { PrimeAutonomyPanel } from "../components/PrimeAutonomyPanel";
 
 // Prime page (RELUX_MASTER_PLAN section 10 Prime Behavior, section 11.1 Prime Chat): the
 // conversational command surface for the local Relux control plane. It POSTs
@@ -87,6 +88,9 @@ export function Prime() {
   return (
     <div className="chat" style={{ height: "calc(100vh - 96px)" }}>
       <AiStatusBanner status={aiStatus} />
+      <div style={{ padding: "0 10px 10px" }}>
+        <PrimeAutonomyPanel />
+      </div>
       <div className="chat-log" ref={logRef}>
         <div className="msg assistant">{GREETING}</div>
         {log.map((m, i) => {

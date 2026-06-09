@@ -58,6 +58,26 @@ The package script writes `dist\relux-local-<version>-windows-x64\` and a zip
 next to it. The bundle includes `relux-kernel.exe`, the built dashboard,
 bundled example plugins, docs, and `Start-Relux.ps1`.
 
+### Prime Autonomy
+
+Prime can now keep safe local work moving while `relux-kernel serve` is running.
+Autonomy is disabled by default. Enable it only when you want Prime to poll for
+ready assigned tasks and execute them through the same governed assigned-run path
+used by the Work page:
+
+```powershell
+relux-kernel prime autonomy status
+relux-kernel prime autonomy configure --interval 60 --max-tasks 1 --auto-assign false
+relux-kernel prime autonomy enable
+relux-kernel prime autonomy tick
+relux-kernel prime autonomy disable
+```
+
+The dashboard Prime page includes the same controls: enabled/disabled,
+interval, max tasks per tick, optional auto-assignment, and a manual one-tick
+button. Prime autonomy never installs plugins, grants permissions, deletes data,
+or bypasses approvals.
+
 ### Optional LLM-backed Prime
 
 By default, Prime is deterministic and rule-based. You can enable a natural,

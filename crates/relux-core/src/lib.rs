@@ -24,8 +24,8 @@ pub use plugin::{
     PluginManifest, PluginSourceKind, TrustLevel,
 };
 pub use prime::{
-    PrimeAction, PrimeContext, PrimeDisposition, PrimeIntent, PrimePlan, PrimeTurn, StateSummary,
-    TaskBrief,
+    PrimeAction, PrimeAutonomyConfig, PrimeAutonomyTickResult, PrimeContext, PrimeDisposition,
+    PrimeIntent, PrimePlan, PrimeTurn, StateSummary, TaskBrief,
 };
 pub use run::{Run, RunId, RunStatus};
 pub use task::{Task, TaskId, TaskStatus};

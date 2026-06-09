@@ -7,6 +7,66 @@ use crate::permission::RiskLevel;
 use crate::run::RunId;
 use crate::task::{TaskId, TaskStatus};
 
+/// Configuration for Prime's autonomous operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrimeAutonomyConfig {
+    /// Whether Prime's autonomy loop is enabled.
+    pub enabled: bool,
+    /// The interval in seconds between autonomy ticks.
+    pub interval_seconds: u64,
+    /// The maximum number of tasks Prime will process in a single tick.
+    pub max_tasks_per_tick: u32,
+    /// Whether Prime should automatically assign unassigned queued tasks.
+    pub auto_assign_unassigned: bool,
+    /// The kernel timestamp of the last autonomy tick.
+    pub last_tick_at: Option<String>,
+    /// A summary of what happened during the last autonomy tick.
+    pub last_tick_summary: Option<String>,
+}
+
+impl Default for PrimeAutonomyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_seconds: 60, // Conservative default: tick every minute
+            max_tasks_per_tick: 1, // Small per-tick limit
+            auto_assign_unassigned: false, // Disabled by default
+            last_tick_at: None,
+            last_tick_summary: None,
+        }
+    }
+}
+
+/// The result of a single Prime autonomy tick.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrimeAutonomyTickResult {
+    /// Kernel timestamp of when this tick occurred.
+    pub tick_at: String,
+    /// Number of tasks successfully run in this tick.
+    pub tasks_run: u32,
+    /// Number of tasks successfully assigned in this tick.
+    pub tasks_assigned: u32,
+    /// Number of actions taken (e.g., runs started, tasks assigned).
+    pub actions_taken: u32,
+    /// A summary of what happened during this tick.
+    pub summary: String,
+    /// Reasons why some tasks were skipped or actions refused.
+    pub skipped_reasons: Vec<String>,
+}
+
+impl Default for PrimeAutonomyTickResult {
+    fn default() -> Self {
+        Self {
+            tick_at: String::new(),
+            tasks_run: 0,
+            tasks_assigned: 0,
+            actions_taken: 0,
+            summary: "No actions taken.".to_string(),
+            skipped_reasons: Vec::new(),
+        }
+    }
+}
+
 /// What Prime understood the user to intend before taking any action.
 ///
 /// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 10.1 (Intent Layer).

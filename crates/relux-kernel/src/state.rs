@@ -21,8 +21,9 @@ use relux_core::namespace::NamespaceKind;
 use relux_core::{
     Agent, AgentId, Approval, ApprovalId, ApprovalStatus, AuditEvent, AuditResult, InstalledPlugin,
     Namespace, NamespaceId, Permission, PluginId, PluginManifest, PluginSourceKind, PrimeAction,
-    PrimeContext, PrimeDisposition, PrimePlan, PrimeTurn, RiskLevel, Run, RunId, RunStatus,
-    StateSummary, Task, TaskBrief, TaskId, TaskStatus,
+    PrimeAutonomyConfig, PrimeAutonomyTickResult, PrimeContext, PrimeDisposition, PrimePlan,
+    PrimeTurn, RiskLevel, Run, RunId, RunStatus, StateSummary, Task, TaskBrief, TaskId,
+    TaskStatus,
 };
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +67,7 @@ pub struct KernelSnapshot {
     pub run_events: Vec<RunEvent>,
     /// The append-only audit log, in emission order.
     pub audit_events: Vec<AuditEvent>,
+    pub prime_autonomy_config: PrimeAutonomyConfig,
     pub counters: KernelCounters,
 }
 
@@ -83,7 +85,7 @@ pub struct KernelState {
     run_events: Vec<RunEvent>,
     /// The append-only audit log, in emission order.
     audit_log: Vec<AuditEvent>,
-
+    pub prime_autonomy_config: PrimeAutonomyConfig,
     clock: Clock,
     next_task: u64,
     next_run: u64,
@@ -125,6 +127,7 @@ impl KernelState {
             approvals: sorted(&self.approvals, |a| a.id.as_str()),
             run_events: self.run_events.clone(),
             audit_events: self.audit_log.clone(),
+            prime_autonomy_config: self.prime_autonomy_config.clone(),
             counters: KernelCounters {
                 clock_secs: self.clock.secs(),
                 next_task: self.next_task,
@@ -175,6 +178,7 @@ impl KernelState {
         state.next_approval = snapshot.counters.next_approval;
         state.next_audit = snapshot.counters.next_audit;
         state.next_event = snapshot.counters.next_event;
+        state.prime_autonomy_config = snapshot.prime_autonomy_config;
         state
     }
 
@@ -520,6 +524,193 @@ impl KernelState {
         let mut out: Vec<&Task> = self.tasks.values().collect();
         out.sort_by(|a, b| a.id.0.cmp(&b.id.0));
         out
+    }
+
+    /// Returns the AgentId of the Prime agent, if it exists.
+    pub fn prime_agent_id(&self) -> Option<AgentId> {
+        self.agents.values().find(|a| a.id.as_str() == "prime").map(|a| a.id.clone())
+    }
+
+    /// Executes one safe tick of Prime's autonomy loop.
+    pub fn one_autonomy_tick(&mut self) -> PrimeAutonomyTickResult {
+        let mut result = PrimeAutonomyTickResult {
+            tick_at: self.clock.tick(),
+            ..Default::default()
+        };
+        let config = self.prime_autonomy_config.clone();
+        let max_tasks = config.max_tasks_per_tick.max(1) as usize;
+
+        if !config.enabled {
+            result.summary = "Autonomy is disabled.".to_string();
+            self.finish_autonomy_tick(&result);
+            self.record_audit(
+                "kernel",
+                "prime",
+                "autonomy:tick_skipped",
+                None,
+                None,
+                None,
+                AuditResult::Denied,
+                serde_json::json!({ "reason": "autonomy disabled" }),
+            );
+            return result;
+        }
+
+        let prime_agent_id = match self.prime_agent_id() {
+            Some(id) => id,
+            None => {
+                result.summary = "Prime agent not found.".to_string();
+                self.finish_autonomy_tick(&result);
+                self.record_audit(
+                    "kernel",
+                    "prime",
+                    "autonomy:tick_skipped",
+                    None,
+                    None,
+                    None,
+                    AuditResult::Denied,
+                    serde_json::json!({ "reason": "prime agent not found" }),
+                );
+                return result;
+            }
+        };
+
+        let mut candidates: Vec<TaskId> = self
+            .tasks
+            .values()
+            .filter(|task| {
+                matches!(task.status, TaskStatus::Created | TaskStatus::Queued)
+                    && task.assigned_agent.is_some()
+            })
+            .map(|task| task.id.clone())
+            .collect();
+        candidates.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+
+        if config.auto_assign_unassigned && candidates.len() < max_tasks {
+            let mut unassigned: Vec<TaskId> = self
+                .tasks
+                .values()
+                .filter(|task| {
+                    matches!(task.status, TaskStatus::Created | TaskStatus::Queued)
+                        && task.assigned_agent.is_none()
+                })
+                .map(|task| task.id.clone())
+                .collect();
+            unassigned.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+
+            for task_id in unassigned {
+                if candidates.len() >= max_tasks {
+                    break;
+                }
+                let namespace = self.tasks.get(&task_id).map(|t| t.namespace_id.clone());
+                match self.assign_task(&task_id, &prime_agent_id) {
+                    Ok(()) => {
+                        result.tasks_assigned += 1;
+                        result.actions_taken += 1;
+                        candidates.push(task_id.clone());
+                        self.record_audit(
+                            "kernel",
+                            "prime",
+                            "autonomy:task_assigned",
+                            Some("task"),
+                            Some(task_id.as_str()),
+                            namespace.as_ref(),
+                            AuditResult::Success,
+                            serde_json::json!({ "agent": prime_agent_id.as_str() }),
+                        );
+                    }
+                    Err(e) => {
+                        let reason = format!("Failed to auto-assign task {task_id}: {e}");
+                        result.skipped_reasons.push(reason.clone());
+                        self.record_audit(
+                            "kernel",
+                            "prime",
+                            "autonomy:task_assign_failed",
+                            Some("task"),
+                            Some(task_id.as_str()),
+                            namespace.as_ref(),
+                            AuditResult::Failed,
+                            serde_json::json!({ "reason": reason }),
+                        );
+                    }
+                }
+            }
+        }
+
+        for task_id in candidates.into_iter().take(max_tasks) {
+            let namespace = self.tasks.get(&task_id).map(|t| t.namespace_id.clone());
+            let status = self.tasks.get(&task_id).map(|t| t.status.clone());
+            if matches!(status, Some(TaskStatus::Created | TaskStatus::Queued)) {
+                if let Err(e) = self.start_run(&task_id) {
+                    let reason = format!("Failed to start run for task {task_id}: {e}");
+                    result.skipped_reasons.push(reason.clone());
+                    self.record_audit(
+                        "kernel",
+                        "prime",
+                        "autonomy:run_start_failed",
+                        Some("task"),
+                        Some(task_id.as_str()),
+                        namespace.as_ref(),
+                        AuditResult::Failed,
+                        serde_json::json!({ "reason": reason }),
+                    );
+                    continue;
+                }
+            }
+
+            match self.execute_local_run(&task_id) {
+                Ok(run_id) => {
+                    result.tasks_run += 1;
+                    result.actions_taken += 1;
+                    self.record_audit(
+                        "kernel",
+                        "prime",
+                        "autonomy:run_completed",
+                        Some("run"),
+                        Some(run_id.as_str()),
+                        namespace.as_ref(),
+                        AuditResult::Success,
+                        serde_json::json!({ "task": task_id.as_str() }),
+                    );
+                }
+                Err(e) => {
+                    let reason = format!("Failed to execute task {task_id}: {e}");
+                    result.skipped_reasons.push(reason.clone());
+                    self.record_audit(
+                        "kernel",
+                        "prime",
+                        "autonomy:run_failed",
+                        Some("task"),
+                        Some(task_id.as_str()),
+                        namespace.as_ref(),
+                        AuditResult::Failed,
+                        serde_json::json!({ "reason": reason }),
+                    );
+                }
+            }
+        }
+
+        if result.actions_taken == 0 {
+            result.summary = "No safe assigned work was ready for Prime autonomy.".to_string();
+        } else {
+            result.summary = format!(
+                "{} task(s) run, {} task(s) assigned.",
+                result.tasks_run, result.tasks_assigned
+            );
+        }
+        if !result.skipped_reasons.is_empty() {
+            result
+                .summary
+                .push_str(&format!(" Skipped: {}", result.skipped_reasons.join("; ")));
+        }
+
+        self.finish_autonomy_tick(&result);
+        result
+    }
+
+    fn finish_autonomy_tick(&mut self, result: &PrimeAutonomyTickResult) {
+        self.prime_autonomy_config.last_tick_at = Some(result.tick_at.clone());
+        self.prime_autonomy_config.last_tick_summary = Some(result.summary.clone());
     }
 
     // --- Runs --------------------------------------------------------------
@@ -1765,6 +1956,205 @@ mod tests {
             .iter()
             .any(|e| e.action == "approval:resolve" && e.result == AuditResult::Approved));
     }
+
+    #[test]
+    fn prime_autonomy_config_defaults() {
+        let config = PrimeAutonomyConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.interval_seconds, 60);
+        assert_eq!(config.max_tasks_per_tick, 1);
+        assert!(!config.auto_assign_unassigned);
+        assert!(config.last_tick_at.is_none());
+        assert!(config.last_tick_summary.is_none());
+    }
+
+    #[test]
+    fn prime_autonomy_config_persistence() {
+        let (mut k, _ctx) = prime_chat_kernel();
+        let now = "2026-06-08T00:00:00Z".to_string();
+
+        // Modify config
+        k.prime_autonomy_config.enabled = true;
+        k.prime_autonomy_config.interval_seconds = 120;
+        k.prime_autonomy_config.max_tasks_per_tick = 5;
+        k.prime_autonomy_config.auto_assign_unassigned = true;
+        k.prime_autonomy_config.last_tick_at = Some(now.clone());
+        k.prime_autonomy_config.last_tick_summary = Some("Test summary".to_string());
+
+        let snapshot = k.snapshot();
+        let restored_k = KernelState::from_snapshot(snapshot);
+
+        let restored_config = restored_k.prime_autonomy_config;
+        assert!(restored_config.enabled);
+        assert_eq!(restored_config.interval_seconds, 120);
+        assert_eq!(restored_config.max_tasks_per_tick, 5);
+        assert!(restored_config.auto_assign_unassigned);
+        assert_eq!(restored_config.last_tick_at, Some(now));
+        assert_eq!(restored_config.last_tick_summary, Some("Test summary".to_string()));
+    }
+
+    #[test]
+    fn one_autonomy_tick_disabled() {
+        let (mut k, _ctx) = prime_chat_kernel();
+        k.prime_autonomy_config.enabled = false; // Ensure it's disabled
+
+        let result = k.one_autonomy_tick();
+
+        assert!(!k.prime_autonomy_config.enabled);
+        assert_eq!(result.summary, "Autonomy is disabled.".to_string());
+        assert_eq!(result.actions_taken, 0);
+        assert!(k.prime_autonomy_config.last_tick_at.is_some());
+        assert_eq!(
+            k.prime_autonomy_config.last_tick_summary,
+            Some("Autonomy is disabled.".to_string())
+        );
+
+        // Verify audit event
+        assert!(k
+            .audit_log()
+            .iter()
+            .any(|e| e.action == "autonomy:tick_skipped"
+                && e.result == AuditResult::Denied
+                && e.metadata["reason"] == "autonomy disabled"));
+    }
+
+    #[test]
+    fn one_autonomy_tick_prime_not_found() {
+        let mut k = KernelState::new(); // No prime agent created
+        k.prime_autonomy_config.enabled = true;
+
+        let result = k.one_autonomy_tick();
+
+        assert_eq!(result.summary, "Prime agent not found.".to_string());
+        assert_eq!(result.actions_taken, 0);
+        assert!(k.prime_autonomy_config.last_tick_at.is_some());
+        assert_eq!(
+            k.prime_autonomy_config.last_tick_summary,
+            Some("Prime agent not found.".to_string())
+        );
+
+        // Verify audit event
+        assert!(k
+            .audit_log()
+            .iter()
+            .any(|e| e.action == "autonomy:tick_skipped"
+                && e.result == AuditResult::Denied
+                && e.metadata["reason"] == "prime agent not found"));
+    }
+
+    #[test]
+    fn one_autonomy_tick_runs_assigned_tasks() {
+        let (mut k, ctx) = prime_chat_kernel();
+        k.prime_autonomy_config.enabled = true;
+        k.prime_autonomy_config.max_tasks_per_tick = 1;
+
+        // Create a queued task assigned to Prime
+        let task1 = k.create_task("Task 1", serde_json::json!({}), "founder", &ctx.namespace, vec![]);
+        k.assign_task(&task1, &ctx.agent).unwrap();
+
+        // Create another queued task assigned to Prime, which should be skipped due to max_tasks_per_tick
+        let task2 = k.create_task("Task 2", serde_json::json!({}), "founder", &ctx.namespace, vec![]);
+        k.assign_task(&task2, &ctx.agent).unwrap();
+
+        let result = k.one_autonomy_tick();
+
+        assert_eq!(result.actions_taken, 1);
+        assert_eq!(result.tasks_run, 1);
+        assert_eq!(result.tasks_assigned, 0); // No tasks assigned
+        assert!(k.task(&task1).unwrap().status == TaskStatus::Completed); // Task 1 should be completed
+        assert!(k.task(&task2).unwrap().status == TaskStatus::Queued); // Task 2 should still be queued
+        assert!(result.summary.contains("1 task(s) run, 0 task(s) assigned."));
+
+        // Verify audit events
+        assert!(k
+            .audit_log()
+            .iter()
+            .any(|e| e.action == "autonomy:run_completed" && e.result == AuditResult::Success));
+    }
+
+    #[test]
+    fn one_autonomy_tick_auto_assigns_unassigned_tasks() {
+        let (mut k, ctx) = prime_chat_kernel();
+        k.prime_autonomy_config.enabled = true;
+        k.prime_autonomy_config.max_tasks_per_tick = 1;
+        k.prime_autonomy_config.auto_assign_unassigned = true;
+
+        // Create an unassigned queued task
+        let task1 = k.create_task("Unassigned Task 1", serde_json::json!({}), "founder", &ctx.namespace, vec![]);
+        let task_obj1 = k.tasks.get_mut(&task1).unwrap();
+        task_obj1.status = TaskStatus::Queued;
+        task_obj1.assigned_agent = None;
+
+        // Create another unassigned queued task, to be skipped
+        let task2 = k.create_task("Unassigned Task 2", serde_json::json!({}), "founder", &ctx.namespace, vec![]);
+        let task_obj2 = k.tasks.get_mut(&task2).unwrap();
+        task_obj2.status = TaskStatus::Queued;
+        task_obj2.assigned_agent = None;
+
+
+        let result = k.one_autonomy_tick();
+
+        assert_eq!(result.actions_taken, 2);
+        assert_eq!(result.tasks_run, 1);
+        assert_eq!(result.tasks_assigned, 1); // Task 1 should be assigned
+        assert!(k.task(&task1).unwrap().assigned_agent.is_some());
+        assert!(k.task(&task1).unwrap().status == TaskStatus::Completed);
+        assert!(k.task(&task2).unwrap().assigned_agent.is_none());
+        assert!(k.task(&task2).unwrap().status == TaskStatus::Queued);
+        assert!(result.summary.contains("1 task(s) run, 1 task(s) assigned."));
+
+        // Verify audit events
+        assert!(k
+            .audit_log()
+            .iter()
+            .any(|e| e.action == "autonomy:task_assigned"
+                && e.target_id.as_deref() == Some(task1.as_str())
+                && e.result == AuditResult::Success));
+        assert!(k
+            .audit_log()
+            .iter()
+            .any(|e| e.action == "autonomy:run_completed"
+                && e.metadata["task"] == task1.as_str()
+                && e.result == AuditResult::Success));
+    }
+
+    #[test]
+    fn one_autonomy_tick_handles_mix_of_assigned_and_unassigned() {
+        let (mut k, ctx) = prime_chat_kernel();
+        k.prime_autonomy_config.enabled = true;
+        k.prime_autonomy_config.max_tasks_per_tick = 2; // Can handle 2 actions
+        k.prime_autonomy_config.auto_assign_unassigned = true;
+
+        // Task 1: Already assigned, will be run
+        let task1 = k.create_task("Assigned Task", serde_json::json!({}), "founder", &ctx.namespace, vec![]);
+        k.assign_task(&task1, &ctx.agent).unwrap();
+
+        // Task 2: Unassigned, will be auto-assigned
+        let task2 = k.create_task("Unassigned Task", serde_json::json!({}), "founder", &ctx.namespace, vec![]);
+        let task_obj2 = k.tasks.get_mut(&task2).unwrap();
+        task_obj2.status = TaskStatus::Queued;
+        task_obj2.assigned_agent = None;
+
+        // Task 3: Another unassigned, will be skipped due to max_tasks_per_tick
+        let task3 = k.create_task("Another Unassigned Task", serde_json::json!({}), "founder", &ctx.namespace, vec![]);
+        let task_obj3 = k.tasks.get_mut(&task3).unwrap();
+        task_obj3.status = TaskStatus::Queued;
+        task_obj3.assigned_agent = None;
+
+        let result = k.one_autonomy_tick();
+
+        assert_eq!(result.actions_taken, 3);
+        assert_eq!(result.tasks_run, 2);
+        assert_eq!(result.tasks_assigned, 1);
+        assert!(result.summary.contains("2 task(s) run, 1 task(s) assigned."));
+
+        assert!(k.task(&task1).unwrap().status == TaskStatus::Completed); // Task 1 ran
+        assert!(k.task(&task2).unwrap().assigned_agent.is_some()); // Task 2 assigned
+        assert!(k.task(&task2).unwrap().status == TaskStatus::Completed); // Task 2 ran after assignment
+        assert!(k.task(&task3).unwrap().assigned_agent.is_none()); // Task 3 skipped
+        assert!(k.task(&task3).unwrap().status == TaskStatus::Queued);
+    }
+
 
     #[test]
     fn status_question_is_grounded_in_state() {

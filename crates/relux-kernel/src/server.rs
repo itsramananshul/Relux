@@ -31,7 +31,10 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
-use relux_core::{InstalledPlugin, PluginManifest, PluginSourceKind, PrimeTurn};
+use relux_core::{
+    InstalledPlugin, PluginManifest, PluginSourceKind, PrimeAutonomyConfig, PrimeAutonomyTickResult,
+    PrimeTurn,
+};
 use relux_kernel::{
     install_from_dir, install_from_github, install_from_zip, remove_plugin, AiConfig, AiMode,
     AiStatus, KernelError, KernelState, SqliteStore,
@@ -89,7 +92,7 @@ async fn serve() -> Result<(), KernelError> {
 
     let addr = bind_addr()?;
     let dashboard_missing = state.dashboard_dir.is_none();
-    let app = router(state);
+    let app = router(state.clone()); // Clone state for the background task
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -131,10 +134,63 @@ async fn serve() -> Result<(), KernelError> {
     println!("   POST   /v1/relux/plugins/install-zip      (multipart field: file)");
     println!("   DELETE /v1/relux/plugins/:id");
 
+    // Start background autonomy loop
+    let background_state = state.clone();
+    tokio::spawn(async move {
+        run_autonomy_loop(background_state).await;
+    });
+
     axum::serve(listener, app)
         .await
         .map_err(|e| KernelError::Storage(format!("server error: {e}")))?;
     Ok(())
+}
+
+async fn run_autonomy_loop(state: AppState) {
+    loop {
+        let current_config = {
+            let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
+            let store = match SqliteStore::open(&state.db_path) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    eprintln!("ERROR: Autonomy loop failed to open store: {}", e);
+                    None
+                }
+            };
+            match store {
+                Some(store) => match store.load() {
+                    Ok(kernel) => Some(kernel.prime_autonomy_config.clone()),
+                    Err(e) => {
+                        eprintln!("ERROR: Autonomy loop failed to load kernel state: {}", e);
+                        None
+                    }
+                },
+                None => None,
+            }
+        };
+
+        let sleep_seconds = current_config
+            .as_ref()
+            .map(|config| config.interval_seconds.clamp(5, 3600))
+            .unwrap_or(60);
+
+        if current_config.as_ref().is_some_and(|config| config.enabled) {
+            println!("INFO: Running Prime autonomy tick...");
+            match locked_save(&state, |kernel| Ok(kernel.one_autonomy_tick())) {
+                Ok(result) => {
+                    println!("INFO: Prime autonomy tick complete: {}", result.summary);
+                    for reason in result.skipped_reasons {
+                        println!("  - Skipped: {}", reason);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("ERROR: Prime autonomy tick failed: {:?}", e);
+                }
+            }
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(sleep_seconds)).await;
+    }
 }
 
 /// Resolve the bind address from `RELUX_HTTP_ADDR`, falling back to loopback.
@@ -160,6 +216,8 @@ fn router(state: AppState) -> Router {
         .route("/v1/relux/ai/status", get(get_ai_status))
         .route("/v1/relux/agents", get(list_agents).post(create_agent))
         .route("/v1/relux/prime", post(run_prime))
+        .route("/v1/relux/prime/autonomy", get(get_autonomy_config).put(update_autonomy_config).patch(update_autonomy_config))
+        .route("/v1/relux/prime/autonomy/tick", post(run_autonomy_tick))
         .route("/v1/relux/tasks", get(list_tasks).post(create_task))
         .route("/v1/relux/tasks/:id", get(get_task))
         .route("/v1/relux/runs", get(list_runs))
@@ -742,6 +800,74 @@ async fn run_prime(
         ai_model: outcome.model,
         ai_note: outcome.note,
     }))
+}
+
+#[derive(Debug, Serialize)]
+struct PrimeAutonomyResponse {
+    config: PrimeAutonomyConfig,
+    last_tick_result: Option<PrimeAutonomyTickResult>,
+}
+
+async fn get_autonomy_config(
+    State(state): State<AppState>,
+) -> Result<Json<PrimeAutonomyResponse>, ApiError> {
+    let config = locked_read(&state, |kernel| Ok(kernel.prime_autonomy_config.clone()))?;
+    // The last_tick_summary and last_tick_at are already part of PrimeAutonomyConfig,
+    // so we can reconstruct PrimeAutonomyTickResult from them if available.
+    let last_tick_result = config.last_tick_at.clone().map(|tick_at| {
+        PrimeAutonomyTickResult {
+            tick_at,
+            summary: config.last_tick_summary.clone().unwrap_or_default(),
+            ..Default::default() // Fill other fields with default as they are not stored in config
+        }
+    });
+
+    Ok(Json(PrimeAutonomyResponse {
+        config,
+        last_tick_result,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateAutonomyConfigReq {
+    enabled: Option<bool>,
+    interval_seconds: Option<u64>,
+    max_tasks_per_tick: Option<u32>,
+    auto_assign_unassigned: Option<bool>,
+}
+
+async fn update_autonomy_config(
+    State(state): State<AppState>,
+    Json(req): Json<UpdateAutonomyConfigReq>,
+) -> Result<Json<PrimeAutonomyConfig>, ApiError> {
+    let updated_config = locked_save(&state, |kernel| {
+        let mut config = kernel.prime_autonomy_config.clone();
+        if let Some(enabled) = req.enabled {
+            config.enabled = enabled;
+        }
+        if let Some(interval_seconds) = req.interval_seconds {
+            config.interval_seconds = interval_seconds.clamp(5, 3600);
+        }
+        if let Some(max_tasks_per_tick) = req.max_tasks_per_tick {
+            config.max_tasks_per_tick = max_tasks_per_tick.clamp(1, 25);
+        }
+        if let Some(auto_assign_unassigned) = req.auto_assign_unassigned {
+            config.auto_assign_unassigned = auto_assign_unassigned;
+        }
+        kernel.prime_autonomy_config = config.clone();
+        Ok(config)
+    })?;
+    Ok(Json(updated_config))
+}
+
+async fn run_autonomy_tick(
+    State(state): State<AppState>,
+) -> Result<Json<PrimeAutonomyTickResult>, ApiError> {
+    let result = locked_save(&state, |kernel| {
+        let tick_result = kernel.one_autonomy_tick();
+        Ok(tick_result)
+    })?;
+    Ok(Json(result))
 }
 
 #[derive(Debug, Deserialize)]

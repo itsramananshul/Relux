@@ -50,13 +50,16 @@ fn main() -> ExitCode {
     // no-arg demo stays fully in-memory and deterministic.
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
-        Some((cmd, rest)) if cmd == "prime" => {
-            let message = rest.join(" ");
-            if message.trim().is_empty() {
-                eprintln!("usage: relux-kernel prime <message>");
-                return ExitCode::FAILURE;
+        Some((cmd, rest)) if cmd == "prime" => match rest.split_first() {
+            Some((prime_sub, prime_rest)) if prime_sub == "autonomy" => run_prime_autonomy(prime_rest),
+            _ => {
+                let message = rest.join(" ");
+                if message.trim().is_empty() {
+                    eprintln!("usage: relux-kernel prime <message>");
+                    return ExitCode::FAILURE;
+                }
+                run_prime_message(&message)
             }
-            run_prime_message(&message)
         }
         Some((cmd, _)) if cmd == "state" => run_state(),
         Some((cmd, _)) if cmd == "serve" => server::run(),
@@ -93,6 +96,124 @@ fn run_task_subcommand(args: &[String]) -> Result<(), KernelError> {
             "usage: relux-kernel task <run-assigned> <task_id>".to_string(),
         )),
     }
+}
+
+/// Dispatches `relux-kernel prime autonomy <subcommand> ...`.
+fn run_prime_autonomy(args: &[String]) -> Result<(), KernelError> {
+    match args.split_first() {
+        Some((sub, _)) if sub == "status" => run_autonomy_status(),
+        Some((sub, _)) if sub == "enable" => run_autonomy_enable(),
+        Some((sub, _)) if sub == "disable" => run_autonomy_disable(),
+        Some((sub, _)) if sub == "tick" => run_autonomy_tick(),
+        Some((sub, rest)) if sub == "configure" => run_autonomy_configure(rest),
+        _ => Err(KernelError::Storage(
+            "usage: relux-kernel prime autonomy <status|enable|disable|tick|configure>".to_string(),
+        )),
+    }
+}
+
+fn run_autonomy_status() -> Result<(), KernelError> {
+    with_persistent_kernel(|kernel| {
+        let config = &kernel.prime_autonomy_config;
+        let mut output = "Prime Autonomy Status:\n".to_string();
+        output.push_str(&format!("  Enabled: {}\n", config.enabled));
+        output.push_str(&format!("  Interval: {} seconds\n", config.interval_seconds));
+        output.push_str(&format!("  Max Tasks per Tick: {}\n", config.max_tasks_per_tick));
+        output.push_str(&format!("  Auto-assign Unassigned Tasks: {}\n", config.auto_assign_unassigned));
+        if let Some(last_tick_at) = &config.last_tick_at {
+            output.push_str(&format!("  Last Tick At: {}\n", last_tick_at));
+        } else {
+            output.push_str("  Last Tick At: Never\n");
+        }
+        if let Some(ref last_tick_summary) = config.last_tick_summary {
+            output.push_str(&format!("  Last Tick Summary: {}\n", last_tick_summary));
+        } else {
+            output.push_str("  Last Tick Summary: (empty)\n");
+        }
+        Ok(output)
+    })
+}
+
+fn run_autonomy_enable() -> Result<(), KernelError> {
+    with_persistent_kernel(|kernel| {
+        kernel.prime_autonomy_config.enabled = true;
+        Ok("Prime autonomy enabled.".to_string())
+    })
+}
+
+fn run_autonomy_disable() -> Result<(), KernelError> {
+    with_persistent_kernel(|kernel| {
+        kernel.prime_autonomy_config.enabled = false;
+        Ok("Prime autonomy disabled.".to_string())
+    })
+}
+
+fn run_autonomy_tick() -> Result<(), KernelError> {
+    with_persistent_kernel(|kernel| {
+        let result = kernel.one_autonomy_tick();
+        let mut output = "Prime Autonomy Manual Tick Result:\n".to_string();
+        output.push_str(&format!("  Summary: {}\n", result.summary));
+        output.push_str(&format!("  Tasks Run: {}\n", result.tasks_run));
+        output.push_str(&format!("  Tasks Assigned: {}\n", result.tasks_assigned));
+        if !result.skipped_reasons.is_empty() {
+            output.push_str("  Skipped Reasons:\n");
+            for reason in result.skipped_reasons {
+                output.push_str(&format!("    - {}\n", reason));
+            }
+        }
+        Ok(output)
+    })
+}
+
+fn run_autonomy_configure(args: &[String]) -> Result<(), KernelError> {
+    let mut interval: Option<u64> = None;
+    let mut max_tasks: Option<u32> = None;
+    let mut auto_assign: Option<bool> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--interval" => {
+                i += 1;
+                let val = args.get(i).ok_or_else(|| KernelError::Storage("Missing value for --interval".to_string()))?;
+                interval = Some(val.parse().map_err(|_| KernelError::Storage(format!("Invalid interval: {}", val)))?);
+            },
+            "--max-tasks" => {
+                i += 1;
+                let val = args.get(i).ok_or_else(|| KernelError::Storage("Missing value for --max-tasks".to_string()))?;
+                max_tasks = Some(val.parse().map_err(|_| KernelError::Storage(format!("Invalid max-tasks: {}", val)))?);
+            },
+            "--auto-assign" => {
+                i += 1;
+                let val = args.get(i).ok_or_else(|| KernelError::Storage("Missing value for --auto-assign".to_string()))?;
+                auto_assign = Some(val.parse().map_err(|_| KernelError::Storage(format!("Invalid auto-assign: {}", val)))?);
+            },
+            _ => return Err(KernelError::Storage(format!("Unknown argument: {}", args[i]))),
+        }
+        i += 1;
+    }
+
+    with_persistent_kernel(|kernel| {
+        let mut config_changed = false;
+        if let Some(val) = interval {
+            kernel.prime_autonomy_config.interval_seconds = val.clamp(5, 3600);
+            config_changed = true;
+        }
+        if let Some(val) = max_tasks {
+            kernel.prime_autonomy_config.max_tasks_per_tick = val.clamp(1, 25);
+            config_changed = true;
+        }
+        if let Some(val) = auto_assign {
+            kernel.prime_autonomy_config.auto_assign_unassigned = val;
+            config_changed = true;
+        }
+
+        if config_changed {
+            Ok("Prime autonomy configuration updated.".to_string())
+        } else {
+            Ok("No changes applied to Prime autonomy configuration.".to_string())
+        }
+    })
 }
 
 fn run_assigned_task(task_id_str: &str) -> Result<(), KernelError> {
