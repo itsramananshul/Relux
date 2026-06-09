@@ -355,7 +355,7 @@ Prime must route actions through the kernel, not bypass it.
 
 ### 7.2 Work Layer
 
-The work layer contains tasks/issues, boards, and task detail.
+The work layer contains tasks/issues, boards, and task detail, including detailed views for individual tasks and runs.
 
 Core objects:
 
@@ -1043,7 +1043,7 @@ Each approval should show:
 
 ### 11.9 Audit Logs
 
-Searchable action history.
+Searchable action history, now accessible via `GET /v1/relux/audit?limit=N` (default 100, max 500).
 
 Shows:
 
@@ -1623,6 +1623,12 @@ That starts the local control plane and prints:
 ```text
 Relux dashboard: http://127.0.0.1:19891/dashboard
 Relux API:       http://127.0.0.1:19891/v1/relux/state
+
+Also available:
+  GET /v1/relux/tasks/:id
+  GET /v1/relux/runs/:id
+  GET /v1/relux/runs/:id/events
+  GET /v1/relux/audit?limit=N
 ```
 
 Open `http://127.0.0.1:19891/dashboard`. The default surface is Relux Home,

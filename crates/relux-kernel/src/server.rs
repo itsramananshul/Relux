@@ -116,7 +116,11 @@ async fn serve() -> Result<(), KernelError> {
     println!("   GET    /v1/relux/state");
     println!("   GET    /v1/relux/ai/status");
     println!("   GET    /v1/relux/tasks");
+    println!("   GET    /v1/relux/tasks/:id");
     println!("   GET    /v1/relux/runs");
+    println!("   GET    /v1/relux/runs/:id");
+    println!("   GET    /v1/relux/runs/:id/events");
+    println!("   GET    /v1/relux/audit");
     println!("   POST   /v1/relux/prime                     {{ \"message\": \"...\" }}");
     println!("   POST   /v1/relux/tasks                     {{ \"title\": \"...\" }}");
     println!("   POST   /v1/relux/tasks/:id/start");
@@ -155,7 +159,11 @@ fn router(state: AppState) -> Router {
         .route("/v1/relux/agents", get(list_agents).post(create_agent))
         .route("/v1/relux/prime", post(run_prime))
         .route("/v1/relux/tasks", get(list_tasks).post(create_task))
+        .route("/v1/relux/tasks/:id", get(get_task))
         .route("/v1/relux/runs", get(list_runs))
+        .route("/v1/relux/runs/:id", get(get_run))
+        .route("/v1/relux/runs/:id/events", get(get_run_events))
+        .route("/v1/relux/audit", get(list_audit_events))
         .route("/v1/relux/tasks/:id/start", post(start_task))
         .route("/v1/relux/tasks/:id/assign", post(assign_task_to_agent))
         .route("/v1/relux/plugins", get(list_plugins))
@@ -321,6 +329,90 @@ async fn list_runs(State(state): State<AppState>) -> Result<Json<Vec<relux_core:
         Ok(kernel.runs().into_iter().cloned().collect())
     })?;
     Ok(Json(runs))
+}
+
+async fn get_task(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<TaskRecord>, ApiError> {
+    let task_id = relux_core::TaskId::new(id);
+    let record = locked_read(&state, |kernel| {
+        let task = kernel
+            .task(&task_id)
+            .ok_or_else(|| KernelError::UnknownTask(task_id.to_string()))?;
+        let agent = task
+            .assigned_agent
+            .as_ref()
+            .and_then(|id| kernel.agent(id));
+        Ok(task_record(task, agent))
+    })?;
+    Ok(Json(record))
+}
+
+async fn get_run(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<RunRecord>, ApiError> {
+    let run_id = relux_core::RunId::new(id);
+    let record = locked_read(&state, |kernel| {
+        let run = kernel
+            .run(&run_id)
+            .ok_or_else(|| KernelError::UnknownRun(run_id.to_string()))?
+            .clone();
+
+        let task_title = kernel
+            .task(&run.task_id)
+            .map(|t| t.title.clone());
+
+        Ok(RunRecord { run, task_title })
+    })?;
+    Ok(Json(record))
+}
+
+async fn get_run_events(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Vec<relux_kernel::RunEvent>>, ApiError> {
+    let run_id = relux_core::RunId::new(id);
+    let events = locked_read(&state, |kernel| {
+        // Check if the run exists to return 404 if not.
+        kernel
+            .run(&run_id)
+            .ok_or_else(|| KernelError::UnknownRun(run_id.to_string()))?;
+        Ok(kernel.run_events(&run_id).into_iter().cloned().collect())
+    })?;
+    Ok(Json(events))
+}
+
+#[derive(Debug, Deserialize)]
+struct AuditQueryParams {
+    #[serde(default = "default_audit_limit")]
+    limit: usize,
+}
+
+fn default_audit_limit() -> usize {
+    100
+}
+
+async fn list_audit_events(
+    State(state): State<AppState>,
+    query: axum::extract::Query<AuditQueryParams>,
+) -> Result<Json<Vec<relux_core::AuditEvent>>, ApiError> {
+    let limit = query.limit.min(500); // Cap at 500 as per requirement
+    let events = locked_read(&state, |kernel| {
+        let audit_log = kernel.audit_log();
+        let num_events = audit_log.len();
+        let start_index = num_events.saturating_sub(limit);
+
+        let recent_events: Vec<relux_core::AuditEvent> = audit_log
+            .iter()
+            .skip(start_index)
+            .rev() // Reverse to get newest first
+            .cloned()
+            .collect();
+        Ok(recent_events)
+    })?;
+    Ok(Json(events))
 }
 
 #[derive(Debug, Deserialize)]
@@ -709,6 +801,15 @@ struct TaskRecord {
     task: relux_core::Task,
     #[serde(skip_serializing_if = "Option::is_none")]
     assignee_name: Option<String>,
+}
+
+/// One run, flattened for the dashboard table.
+#[derive(Debug, Serialize)]
+struct RunRecord {
+    #[serde(flatten)]
+    run: relux_core::Run,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_title: Option<String>,
 }
 
 /// Build a [`TaskRecord`] from a `Task` and its assigned `Agent` (if any).

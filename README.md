@@ -31,6 +31,12 @@ Then open the dashboard it prints:
 ```text
 Relux dashboard: http://127.0.0.1:19891/dashboard
 Relux API:       http://127.0.0.1:19891/v1/relux/state
+
+Also available:
+  GET /v1/relux/tasks/:id
+  GET /v1/relux/runs/:id
+  GET /v1/relux/runs/:id/events
+  GET /v1/relux/audit?limit=N
 ```
 
 ### Optional LLM-backed Prime
@@ -48,8 +54,8 @@ kernel.
 Keys are read from the environment and are never returned by the API or shown in the UI.
 
 The dashboard opens on **Relux Home** (grounded control-plane state), where you
-can chat with **Prime** (`POST /v1/relux/prime`), manage **work** (tasks and runs),
-and manage **crew** (agents) and install **plugins** - all backed by the local `/v1/relux` API, with no dependency on the legacy Relix bridge.
+can chat with **Prime** (`POST /v1/relux/prime`), manage **work** (tasks and runs,
+including detailed views and audit logs), and manage **crew** (agents) and install **plugins** - all backed by the local `/v1/relux` API, with no dependency on the legacy Relix bridge.
  The served bundle is the committed build under
 `crates/relix-web-bridge/dashboard-dist` (rebuild with `npm run build` in
 `apps/dashboard`). See [`docs/RELUX_MASTER_PLAN.md`](docs/RELUX_MASTER_PLAN.md)
