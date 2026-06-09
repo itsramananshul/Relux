@@ -280,8 +280,53 @@ store on the spot, so the new bundled plugins show up the next time you list the
 Use the local release check before cutting or sharing a Windows bundle:
 
 ```powershell
+# Quick gate: build dashboard, test + lint core/kernel, build the release binary,
+# run doctor, and smoke Prime task creation + assigned-task execution.
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\relux-first-release-check.ps1
+
+# Full product gate: everything above PLUS the standalone end-to-end smoke.
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\relux-first-release-check.ps1 -FullE2E
 ```
+
+#### Standalone end-to-end smoke
+
+`scripts\relux-e2e-smoke.ps1` proves the first version of the standalone Relux
+product is actually usable - not just unit-tested - by driving the release
+binary through every critical local flow against a **throwaway temporary
+`RELUX_DB`** (it never touches your real `dev-data\relux\local.db` or any real
+`serve` instance). Run it directly any time after a big chunk lands:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\relux-e2e-smoke.ps1
+```
+
+It records PASS/FAIL/SKIP for each flow and proves:
+
+- **doctor** reports healthy and the bundled plugin/adapter count includes every
+  shipped bundle (echo, status, local-prime, claude-cli, codex-cli).
+- **Prime chat**: a greeting creates no work and calls no tool; "what tools can
+  you use?" lists the real built-in tools; a status question invokes the status
+  tool; an echo request invokes the echo tool and returns the input.
+- **Tool CLI**: `tools` lists the built-ins as ready; `tool invoke
+  relux-tools-echo echo.say {json}` returns the same JSON.
+- **Plugin Runtime v1 (HTTP loopback)**: it installs a temporary non-bundled
+  ToolSet plugin, points it at a tiny loopback HTTP server the script runs
+  itself, grants Prime its permission, invokes it through the kernel, and
+  confirms the loopback server's output flowed back (`-SkipLoopback` to skip).
+- **Adapter runtime controls**: `adapters` shows the claude/codex/local-prime
+  records; enabling an adapter with a deliberately fake command persists and
+  reports the runtime config, then disabling clears it - **no real Claude/Codex
+  is ever spawned**.
+- **Autonomy**: it creates a ready task through Prime, enables autonomy with safe
+  settings, runs one tick, and verifies the task honestly moved Queued ->
+  Completed with a run.
+- **HTTP serve**: it starts `relux-kernel serve` on a free loopback port, hits
+  `/dashboard`, `/v1/relux/state`, `/v1/relux/prime/autonomy`, and
+  `/v1/relux/tools`, then stops the server (`-SkipServe` to skip).
+
+Flags: `-SkipBuild` (reuse the existing release binary), `-SkipServe`,
+`-SkipLoopback`, `-KeepTemp`. The script always cleans up its temp DB, server,
+jobs, and processes, and exits non-zero on any failure.
 
 Create a portable local bundle:
 

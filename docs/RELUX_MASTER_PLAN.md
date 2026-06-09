@@ -1669,17 +1669,45 @@ Configuration:
 Local first-release checks:
 
 ```powershell
+# Quick gate.
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\relux-first-release-check.ps1
+# Quick gate + the full standalone end-to-end smoke (run before cutting a release).
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\relux-first-release-check.ps1 -FullE2E
+# The end-to-end smoke on its own.
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\relux-e2e-smoke.ps1
+# Package a portable local bundle.
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\relux-package-local.ps1
 ```
 
 The check script builds the dashboard, tests and lints the Relux kernel/core,
 builds the release binary, runs `doctor`, and smoke-tests Prime task creation
-plus assigned-task execution against a temporary `RELUX_DB`. The package script
-creates `dist\relux-local-<version>-windows-x64\` with the release binary,
-dashboard dist, bundled example plugins, docs, and `Start-Relux.ps1`. These are
-local release helpers only; GitHub Actions remain disabled unless explicitly
-enabled by the user.
+plus assigned-task execution against a temporary `RELUX_DB`. `-SkipSmoke` skips
+that quick Prime smoke; `-FullE2E` additionally runs `scripts\relux-e2e-smoke.ps1`
+(it reuses the just-built release binary).
+
+`scripts\relux-e2e-smoke.ps1` is the standalone first-release end-to-end smoke.
+It proves the first version of the product is actually usable - not just
+unit-tested - by driving the release binary through every critical local flow
+against a **throwaway temporary `RELUX_DB`** (it never touches the real
+`dev-data\relux\local.db` or any real `serve` instance). It records PASS/FAIL/SKIP
+and proves: `doctor` health plus full bundled plugin/adapter coverage (echo,
+status, local-prime, claude-cli, codex-cli); Prime chat (a greeting calls no
+tool, "what tools can you use?" lists the real tools, a status request invokes
+the status tool, an echo request invokes the echo tool); the tool CLI (`tools`
+listing + `tool invoke ... echo.say {json}` round trip); Plugin Runtime v1 (an
+in-script loopback HTTP server is installed/configured/invoked through the
+kernel and its output flows back); adapter runtime controls (enable with a fake
+command + disable, **never spawning real Claude/Codex**); the autonomy loop (a
+ready task created through Prime moves Queued -> Completed via one tick); and the
+`serve` HTTP endpoints (`/dashboard`, `/v1/relux/state`, `/v1/relux/prime/autonomy`,
+`/v1/relux/tools`). Flags: `-SkipBuild`, `-SkipServe`, `-SkipLoopback`, `-KeepTemp`.
+It always cleans up its temp DB, server, jobs, and processes, and exits non-zero
+on any failure.
+
+The package script creates `dist\relux-local-<version>-windows-x64\` with the
+release binary, dashboard dist, bundled example plugins, docs, and
+`Start-Relux.ps1`. These are local release helpers only; GitHub Actions remain
+disabled unless explicitly enabled by the user.
 
 ### Prime Autonomy Loop (First Local Version)
 

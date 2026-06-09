@@ -1,5 +1,6 @@
 param(
     [switch]$SkipSmoke,
+    [switch]$FullE2E,
     [switch]$KeepTemp
 )
 
@@ -98,6 +99,21 @@ if ($SkipSmoke) {
     }
 } else {
     Write-Step "prime assigned-run smoke" "FAIL" "release exe missing"
+}
+
+# Full product end-to-end smoke (opt-in). The quick checks above keep the normal
+# gate fast; pass -FullE2E to also run scripts\relux-e2e-smoke.ps1, which drives
+# the release binary through doctor, Prime chat, the tool CLI, the HTTP loopback
+# ToolSet runtime, adapter runtime controls, autonomy, and the `serve` HTTP
+# endpoints against a throwaway RELUX_DB. Run this before cutting a release.
+if ($FullE2E) {
+    $e2e = Join-Path $PSScriptRoot "relux-e2e-smoke.ps1"
+    $e2eArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $e2e, "-SkipBuild")
+    if ($KeepTemp) { $e2eArgs += "-KeepTemp" }
+    # Invoke-NativeStep records PASS/FAIL (and increments $Failures on non-zero exit).
+    [void](Invoke-NativeStep -Name "full e2e smoke" -Exe "powershell" -Arguments $e2eArgs)
+} else {
+    Write-Step "full e2e smoke" "SKIP" "pass -FullE2E to run scripts\relux-e2e-smoke.ps1"
 }
 
 Write-Host ""
