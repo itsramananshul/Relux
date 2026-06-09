@@ -23,6 +23,12 @@ rusqlite = { workspace = true }
 # only the deflate codec (via flate2, already in the tree) is pulled in - no
 # bzip2/zstd/lzma C dependencies.
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# Local HTTP API for the dashboard Plugins tab (`relux-kernel serve`). Reuses the
+# workspace-pinned axum/tokio so no new HTTP stack enters the tree; `multipart`
+# is enabled here for the zip-upload route (feature is additive, scoped to this
+# crate's view of axum).
+axum = { workspace = true, features = ["multipart"] }
+tokio = { workspace = true }
 
 [dev-dependencies]
 # Temp directories for the SqliteStore round-trip tests.

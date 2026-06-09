@@ -21,7 +21,12 @@ export default defineConfig({
   server: {
     port: 5273,
     // During `npm run dev`, proxy API + auth to a locally running bridge.
+    // The Relux plugin API is served by a SEPARATE local process
+    // (`relux-kernel serve`, default 127.0.0.1:19891), so `/v1/relux` is routed
+    // there. It is listed BEFORE `/v1` so the more specific prefix wins; every
+    // other `/v1` route still targets the bridge on 19791.
     proxy: {
+      "/v1/relux": { target: "http://127.0.0.1:19891", changeOrigin: false },
       "/v1": { target: "http://127.0.0.1:19791", changeOrigin: false },
       "/health": { target: "http://127.0.0.1:19791", changeOrigin: false },
     },

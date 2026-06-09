@@ -1262,6 +1262,93 @@ export const skills = {
 
 // Outcome of probing one health dimension. `status` is the HTTP code (null
 // when the request never reached the bridge — a network/DNS/TLS failure).
+// -- Relux plugins (the /v1/relux plugin API server) -----------------------
+// These talk to the local `relux-kernel serve` process (default
+// 127.0.0.1:19891), routed by the dev proxy's `/v1/relux` rule (and, in a
+// hosted setup, by whatever fronts that prefix). It is a SEPARATE backend from
+// the bridge's `/v1` routes: no session cookie is required, so a failure here
+// is a plain unavailable Relux API, not a lapsed login. The Plugins page reads
+// the installed list and drives install/remove through these helpers.
+
+// One installed plugin, flattened for the Plugins table. `protected`/`bundled`
+// mark the shipped fixtures that cannot be removed.
+export interface ReluxPlugin {
+  id: string;
+  name: string;
+  description: string;
+  kind: string;
+  version: string;
+  enabled: boolean;
+  source_kind: string;
+  source_label: string;
+  install_dir: string;
+  protected: boolean;
+  bundled: boolean;
+  trust_level?: string | null;
+  health?: string | null;
+}
+
+// Concise Relux control-plane state (the JSON twin of `relux-kernel state`).
+export interface ReluxState {
+  db_path: string;
+  plugins: number;
+  installed_plugins: number;
+  namespaces: number;
+  agents: number;
+  tasks: number;
+  runs: number;
+  approvals: number;
+  open_tasks: number;
+  active_runs: number;
+  waiting_approval: number;
+  blocked: number;
+  failed: number;
+  pending_approvals: number;
+}
+
+// Read an honest JSON error body from a failed Relux API response, falling back
+// to the raw text or the status line. Mirrors `request`'s error extraction.
+async function reluxError(res: Response): Promise<ApiError> {
+  const data = await parse(res);
+  const msg =
+    (data && typeof data === "object" && "error" in data
+      ? String((data as Record<string, unknown>).error)
+      : typeof data === "string" && data
+        ? data
+        : `HTTP ${res.status}`) || `HTTP ${res.status}`;
+  return new ApiError(res.status, msg);
+}
+
+export const reluxPlugins = {
+  // The installed plugin list (array). Throws an ApiError on failure so the page
+  // can show the real reason (e.g. "relux-kernel serve" not running).
+  list: () => api.get<ReluxPlugin[]>("/v1/relux/plugins"),
+  // Concise control-plane state summary.
+  state: () => api.get<ReluxState>("/v1/relux/state"),
+  // Install from a local folder path (resolved on the Relux process host).
+  installDir: (path: string) =>
+    api.post<ReluxPlugin>("/v1/relux/plugins/install-dir", { path }),
+  // Install from a GitHub repository URL.
+  installGithub: (url: string) =>
+    api.post<ReluxPlugin>("/v1/relux/plugins/install-github", { url }),
+  // Upload a .zip archive (multipart field `file`) and install it. Uses a raw
+  // fetch so the browser sets the multipart boundary; errors surface as ApiError.
+  installZip: async (file: File): Promise<ReluxPlugin> => {
+    const form = new FormData();
+    form.append("file", file, file.name);
+    const res = await fetch("/v1/relux/plugins/install-zip", {
+      method: "POST",
+      credentials: "include",
+      body: form,
+    });
+    if (!res.ok) throw await reluxError(res);
+    return (await parse(res)) as ReluxPlugin;
+  },
+  // Remove an installed plugin by id. Bundled plugins are refused (HTTP 409).
+  remove: (id: string) =>
+    api.del<{ removed: string }>(`/v1/relux/plugins/${encodeURIComponent(id)}`),
+};
+
 export interface Probe {
   ok: boolean;
   status: number | null;

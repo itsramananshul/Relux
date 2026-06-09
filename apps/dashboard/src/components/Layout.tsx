@@ -18,6 +18,7 @@ const TITLES: Record<string, { title: string; sub: string }> = {
   "/costs": { title: "Costs", sub: "Spend, budgets & billing" },
   "/assign": { title: "Assign Work", sub: "Hand a Brief to an Operative" },
   "/scheduled": { title: "Scheduled Jobs", sub: "Cron-driven work" },
+  "/plugins": { title: "Plugins", sub: "Installed Relux plugins" },
   "/settings": { title: "Settings", sub: "Providers, account & bridge info" },
 };
 

@@ -28,6 +28,7 @@ export const ORG: NavEntry[] = [
 
 export const SYSTEM: NavEntry[] = [
   { to: "/scheduled", label: "Scheduled", icon: "◷" },
+  { to: "/plugins", label: "Plugins", icon: "#" },
   { to: "/settings", label: "Settings", icon: "⚙" },
 ];
 

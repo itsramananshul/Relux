@@ -14,6 +14,7 @@ import { Runs } from "./pages/Runs";
 import { Approvals } from "./pages/Approvals";
 import { Chat } from "./pages/Chat";
 import { Scheduled } from "./pages/Scheduled";
+import { Plugins } from "./pages/Plugins";
 import { Settings } from "./pages/Settings";
 
 export function App() {
@@ -43,6 +44,7 @@ export function App() {
         <Route path="/approvals" element={<Approvals />} />
         <Route path="/chat" element={<Chat />} />
         <Route path="/scheduled" element={<Scheduled />} />
+        <Route path="/plugins" element={<Plugins />} />
         <Route path="/settings" element={<Settings />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>

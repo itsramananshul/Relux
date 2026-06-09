@@ -16,6 +16,8 @@ use relux_kernel::{
     KernelError, KernelState, SqliteStore,
 };
 
+mod server;
+
 /// The stable ids the local control plane is bootstrapped with.
 const WORKSPACE_NS: &str = "workspace";
 const PRIME_AGENT: &str = "prime";
@@ -26,6 +28,7 @@ fn main() -> ExitCode {
     //   relux-kernel                         -> deterministic in-memory demo loop
     //   relux-kernel prime <message...>      -> one Prime turn against PERSISTENT state
     //   relux-kernel state                   -> summarize the persistent store
+    //   relux-kernel serve                   -> run the local /v1/relux HTTP API
     //   relux-kernel reset-local             -> wipe + reinit the local dev DB
     //   relux-kernel plugins                 -> list installed plugins
     //   relux-kernel plugin install-dir <p>  -> install a plugin from a folder
@@ -47,6 +50,7 @@ fn main() -> ExitCode {
             run_prime_message(&message)
         }
         Some((cmd, _)) if cmd == "state" => run_state(),
+        Some((cmd, _)) if cmd == "serve" => server::run(),
         Some((cmd, _)) if cmd == "reset-local" => run_reset_local(),
         Some((cmd, _)) if cmd == "plugins" => run_plugins_list(),
         Some((cmd, rest)) if cmd == "plugin" => run_plugin_subcommand(rest),
@@ -78,6 +82,18 @@ fn plugins_root() -> PathBuf {
     match db.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.join("plugins"),
         _ => PathBuf::from("dev-data/relux/plugins"),
+    }
+}
+
+/// The durable root for staged plugin uploads: an `uploads/` folder next to the
+/// local dev database (`dev-data/relux/uploads` by default, already gitignored).
+/// The HTTP `install-zip` route writes each upload here, installs it, then
+/// removes the temp file.
+fn uploads_root() -> PathBuf {
+    let db = db_path();
+    match db.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join("uploads"),
+        _ => PathBuf::from("dev-data/relux/uploads"),
     }
 }
 

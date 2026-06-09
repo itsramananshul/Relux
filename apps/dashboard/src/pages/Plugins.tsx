@@ -1,0 +1,288 @@
+import { useState } from "react";
+import { reluxPlugins, type ReluxPlugin } from "../api";
+import { useAsync } from "../components/common";
+
+// Plugins page (RELUX_MASTER_PLAN section 11.6): the installed-plugin surface for
+// the local Relux control plane. It lists what is installed (id, kind, version,
+// source, enabled, protected/bundled, description) and drives the durable
+// install lifecycle through the `/v1/relux` API: a plus button opens an install
+// panel with three sources (GitHub URL, ZIP upload, local folder path); a Remove
+// button clears a non-protected plugin. Everything refreshes after an install or
+// remove so the table never drifts from the backend.
+
+type Source = "github" | "zip" | "dir";
+
+export function Plugins() {
+  const { data, loading, error, reload } = useAsync<ReluxPlugin[]>(
+    () => reluxPlugins.list(),
+    [],
+  );
+  const plugins = data ?? [];
+  const [open, setOpen] = useState(false);
+
+  return (
+    <div className="grid">
+      <div className="card">
+        <div className="row" style={{ marginBottom: 8, alignItems: "center" }}>
+          <h3 style={{ margin: 0 }}>Installed plugins</h3>
+          <div className="spacer" style={{ flex: 1 }} />
+          <button className="btn ghost sm" onClick={() => reload()} disabled={loading}>
+            {loading ? "Loading..." : "Refresh"}
+          </button>
+          <button
+            className="btn sm"
+            style={{ marginLeft: 8 }}
+            onClick={() => setOpen((v) => !v)}
+            aria-expanded={open}
+            title="Install a plugin"
+          >
+            {open ? "Close" : "+ Install"}
+          </button>
+        </div>
+        <p className="muted" style={{ marginTop: -2, marginBottom: 12, fontSize: 12 }}>
+          Plugins installed in the local Relux control plane. They stay installed
+          across restarts until removed. Bundled fixtures are protected and cannot
+          be removed.
+        </p>
+
+        {open && (
+          <InstallPanel
+            onClose={() => setOpen(false)}
+            onInstalled={() => {
+              setOpen(false);
+              reload();
+            }}
+          />
+        )}
+
+        {error ? (
+          <div className="banner err" style={{ fontSize: 12 }}>
+            Could not reach the Relux plugin API ({error}). Start it with{" "}
+            <span className="mono">cargo run -p relux-kernel -- serve</span> (listens on{" "}
+            <span className="mono">127.0.0.1:19891</span>).
+          </div>
+        ) : loading && data == null ? (
+          <div className="loading">Loading plugins...</div>
+        ) : plugins.length === 0 ? (
+          <div className="empty">No plugins installed yet. Use + Install to add one.</div>
+        ) : (
+          <div className="table-scroll">
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>Plugin</th>
+                  <th>Kind</th>
+                  <th>Version</th>
+                  <th>Source</th>
+                  <th>Status</th>
+                  <th />
+                </tr>
+              </thead>
+              <tbody>
+                {plugins.map((p) => (
+                  <PluginRow key={p.id} plugin={p} onChanged={reload} />
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function PluginRow({ plugin, onChanged }: { plugin: ReluxPlugin; onChanged: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function remove() {
+    setBusy(true);
+    setErr(null);
+    try {
+      await reluxPlugins.remove(plugin.id);
+      onChanged();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Remove failed");
+      setBusy(false);
+    }
+  }
+
+  return (
+    <tr>
+      <td>
+        <div>
+          <strong>{plugin.name || plugin.id}</strong>
+        </div>
+        <div className="mono muted" style={{ fontSize: 11 }}>{plugin.id}</div>
+        {plugin.description && (
+          <div className="muted" style={{ fontSize: 12, marginTop: 2, maxWidth: 380 }}>
+            {plugin.description}
+          </div>
+        )}
+        {err && (
+          <div className="banner err" style={{ fontSize: 11, marginTop: 6, marginBottom: 0 }}>
+            {err}
+          </div>
+        )}
+      </td>
+      <td className="muted" style={{ fontSize: 12 }}>{plugin.kind}</td>
+      <td className="mono" style={{ fontSize: 12 }}>v{plugin.version}</td>
+      <td className="muted" style={{ fontSize: 12, maxWidth: 240 }}>
+        <div>{plugin.source_kind}</div>
+        <div className="mono muted" style={{ fontSize: 11, wordBreak: "break-all" }}>
+          {plugin.source_label}
+        </div>
+      </td>
+      <td>
+        <span className={"badge " + (plugin.enabled ? "done" : "backlog")}>
+          {plugin.enabled ? "enabled" : "disabled"}
+        </span>
+        {plugin.protected && (
+          <span className="badge" style={{ marginLeft: 6 }} title="Bundled fixture; cannot be removed">
+            protected
+          </span>
+        )}
+      </td>
+      <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
+        {plugin.protected ? (
+          <span className="muted" style={{ fontSize: 11 }} title="Bundled plugins are locked">
+            locked
+          </span>
+        ) : (
+          <button className="btn ghost sm" disabled={busy} onClick={() => void remove()}>
+            {busy ? "..." : "Remove"}
+          </button>
+        )}
+      </td>
+    </tr>
+  );
+}
+
+function InstallPanel({
+  onClose,
+  onInstalled,
+}: {
+  onClose: () => void;
+  onInstalled: (p: ReluxPlugin) => void;
+}) {
+  const [source, setSource] = useState<Source>("github");
+  const [url, setUrl] = useState("");
+  const [dir, setDir] = useState("");
+  const [file, setFile] = useState<File | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [banner, setBanner] = useState<{ kind: string; msg: string } | null>(null);
+
+  async function submit() {
+    setBusy(true);
+    setBanner(null);
+    try {
+      let installed: ReluxPlugin;
+      if (source === "github") {
+        if (!url.trim()) throw new Error("Enter a GitHub URL.");
+        installed = await reluxPlugins.installGithub(url.trim());
+      } else if (source === "zip") {
+        if (!file) throw new Error("Choose a .zip file to upload.");
+        installed = await reluxPlugins.installZip(file);
+      } else {
+        if (!dir.trim()) throw new Error("Enter a local folder path.");
+        installed = await reluxPlugins.installDir(dir.trim());
+      }
+      setBanner({ kind: "ok", msg: `Installed ${installed.name || installed.id} v${installed.version}.` });
+      onInstalled(installed);
+    } catch (e) {
+      setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Install failed" });
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="card" style={{ marginBottom: 12, padding: 12 }}>
+      <div className="row" style={{ marginBottom: 10, alignItems: "center" }}>
+        <strong style={{ fontSize: 13 }}>Install a plugin</strong>
+        <div className="spacer" style={{ flex: 1 }} />
+        <div className="seg">
+          <button
+            className={"seg-btn" + (source === "github" ? " active" : "")}
+            onClick={() => setSource("github")}
+          >
+            GitHub URL
+          </button>
+          <button
+            className={"seg-btn" + (source === "zip" ? " active" : "")}
+            onClick={() => setSource("zip")}
+          >
+            ZIP upload
+          </button>
+          <button
+            className={"seg-btn" + (source === "dir" ? " active" : "")}
+            onClick={() => setSource("dir")}
+          >
+            Local folder
+          </button>
+        </div>
+      </div>
+
+      {banner && (
+        <div className={"banner " + banner.kind} style={{ fontSize: 12 }}>{banner.msg}</div>
+      )}
+
+      {source === "github" && (
+        <label className="field" style={{ margin: 0 }}>
+          <span>GitHub repository URL</span>
+          <input
+            className="input"
+            value={url}
+            placeholder="https://github.com/owner/repo"
+            onChange={(e) => setUrl(e.target.value)}
+          />
+          <p className="muted" style={{ fontSize: 11, marginTop: 6 }}>
+            Cloned with <span className="mono">git clone --depth 1</span> on the Relux host.
+            The repo must contain a <span className="mono">relux-plugin.json</span> manifest.
+          </p>
+        </label>
+      )}
+
+      {source === "zip" && (
+        <label className="field" style={{ margin: 0 }}>
+          <span>Plugin .zip archive</span>
+          <input
+            className="input"
+            type="file"
+            accept=".zip,application/zip"
+            onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+          />
+          <p className="muted" style={{ fontSize: 11, marginTop: 6 }}>
+            The archive is uploaded, extracted, and validated on the Relux host.
+            Path-traversal entries are refused.
+          </p>
+        </label>
+      )}
+
+      {source === "dir" && (
+        <label className="field" style={{ margin: 0 }}>
+          <span>Local folder path</span>
+          <input
+            className="input"
+            value={dir}
+            placeholder="/path/to/plugin-folder"
+            onChange={(e) => setDir(e.target.value)}
+          />
+          <p className="muted" style={{ fontSize: 11, marginTop: 6 }}>
+            Browser folder picking is not available yet; this path is read on the
+            Relux process host, not your machine. The folder (or its single plugin
+            subfolder) must contain a <span className="mono">relux-plugin.json</span>.
+          </p>
+        </label>
+      )}
+
+      <div className="row wrap" style={{ gap: 8, marginTop: 12 }}>
+        <button className="btn" disabled={busy} onClick={() => void submit()}>
+          {busy ? "Installing..." : "Install"}
+        </button>
+        <button className="btn ghost" disabled={busy} onClick={onClose}>
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
