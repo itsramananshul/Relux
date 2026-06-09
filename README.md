@@ -16,6 +16,34 @@
 
 ---
 
+## Relux (preview): one-command local control plane
+
+Relux is the current product direction: a Prime-centered, plugin-first control
+plane for agentic work that runs locally and serves its own dashboard. Boot it
+with one command - no web bridge, no login:
+
+```bash
+cargo run -p relux-kernel -- serve
+```
+
+Then open the dashboard it prints:
+
+```text
+Relux dashboard: http://127.0.0.1:19891/dashboard
+Relux API:       http://127.0.0.1:19891/v1/relux/state
+```
+
+The dashboard opens on **Relux Home** (grounded control-plane state), where you
+can chat with **Prime** (`POST /v1/relux/prime`) and install **plugins** -
+all backed by the local `/v1/relux` API, with no dependency on the legacy Relix
+bridge. The served bundle is the committed build under
+`crates/relix-web-bridge/dashboard-dist` (rebuild with `npm run build` in
+`apps/dashboard`). See [`docs/RELUX_MASTER_PLAN.md`](docs/RELUX_MASTER_PLAN.md)
+section 22 for the full MVP boot guide and its honest limitations (Prime is still
+the deterministic stand-in; the legacy bridge pages remain but need the bridge).
+
+---
+
 Relix is a local mesh of peer processes for running AI agents safely on
 your own machine. Every call between peers carries a signed identity
 bundle, passes a policy check, and writes a hash-chained audit record

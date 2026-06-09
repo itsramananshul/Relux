@@ -25,13 +25,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{DefaultBodyLimit, Multipart, Path as AxumPath, State};
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
-use relux_core::{InstalledPlugin, PluginManifest, PluginSourceKind};
+use relux_core::{InstalledPlugin, PluginManifest, PluginSourceKind, PrimeTurn};
 use relux_kernel::{
     install_from_dir, install_from_github, install_from_zip, remove_plugin, KernelError,
     KernelState, SqliteStore,
@@ -51,6 +51,10 @@ struct AppState {
     db_path: PathBuf,
     plugins_root: PathBuf,
     uploads_root: PathBuf,
+    /// The resolved dashboard bundle directory, or `None` when no bundle was
+    /// built (a source-only checkout). `None` makes every dashboard route serve
+    /// the honest missing-bundle notice instead of panicking.
+    dashboard_dir: Option<PathBuf>,
     lock: Arc<Mutex<()>>,
 }
 
@@ -72,6 +76,7 @@ async fn serve() -> Result<(), KernelError> {
         db_path: crate::db_path(),
         plugins_root: crate::plugins_root(),
         uploads_root: crate::uploads_root(),
+        dashboard_dir: crate::dashboard::resolve_dist_dir(),
         lock: Arc::new(Mutex::new(())),
     };
 
@@ -81,6 +86,7 @@ async fn serve() -> Result<(), KernelError> {
         .map_err(|e| KernelError::Storage(format!("bootstrap failed: {}", e.message)))?;
 
     let addr = bind_addr()?;
+    let dashboard_missing = state.dashboard_dir.is_none();
     let app = router(state);
 
     let listener = tokio::net::TcpListener::bind(addr)
@@ -90,11 +96,24 @@ async fn serve() -> Result<(), KernelError> {
         .local_addr()
         .map_err(|e| KernelError::Storage(format!("failed to read bound address: {e}")))?;
 
-    println!("relux-kernel serve: listening on http://{bound}");
+    println!("relux-kernel serve: Relux local control plane is up.");
+    println!();
+    println!("   Relux dashboard: http://{bound}/dashboard");
+    println!("   Relux API:       http://{bound}/v1/relux/state");
+    println!();
+    if dashboard_missing {
+        println!(
+            "   note: the dashboard bundle is not built; /dashboard will return a build notice."
+        );
+        println!("         build it with `npm run build` in apps/dashboard, then reload.");
+        println!();
+    }
     println!("   db      {}", crate::db_path().display());
     println!("   plugins {}", crate::plugins_root().display());
+    println!("   GET    /dashboard                          (standalone Relux shell)");
     println!("   GET    /v1/relux/state");
     println!("   GET    /v1/relux/plugins");
+    println!("   POST   /v1/relux/prime                     {{ \"message\": \"...\" }}");
     println!("   POST   /v1/relux/plugins/install-dir     {{ \"path\": \"...\" }}");
     println!("   POST   /v1/relux/plugins/install-github   {{ \"url\": \"https://github.com/...\" }}");
     println!("   POST   /v1/relux/plugins/install-zip      (multipart field: file)");
@@ -119,7 +138,14 @@ fn bind_addr() -> Result<SocketAddr, KernelError> {
 /// Assemble the `/v1/relux` router with the shared state.
 fn router(state: AppState) -> Router {
     Router::new()
+        // Standalone Relux dashboard shell, served by the kernel itself.
+        .route("/", get(root_redirect))
+        .route("/dashboard", get(dashboard_index))
+        .route("/dashboard/", get(dashboard_index))
+        .route("/dashboard/*path", get(dashboard_path))
+        // The /v1/relux control-plane API the dashboard calls on the same origin.
         .route("/v1/relux/state", get(get_state))
+        .route("/v1/relux/prime", post(run_prime))
         .route("/v1/relux/plugins", get(list_plugins))
         .route("/v1/relux/plugins/install-dir", post(install_dir))
         .route("/v1/relux/plugins/install-github", post(install_github))
@@ -128,6 +154,112 @@ fn router(state: AppState) -> Router {
         // Bound the request body so a large zip upload is refused cleanly.
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .with_state(state)
+}
+
+// --- Static dashboard serving ----------------------------------------------
+
+/// `/` redirects to the dashboard so a bare visit lands on the product, not a
+/// blank 404. Temporary (307) so it is never cached as permanent.
+async fn root_redirect() -> Redirect {
+    Redirect::temporary("/dashboard")
+}
+
+/// Serve the SPA `index.html` for `/dashboard` and `/dashboard/`.
+async fn dashboard_index(State(state): State<AppState>) -> Response {
+    serve_index(&state).await
+}
+
+/// Serve one path under `/dashboard/*`: a real bundle file when it exists,
+/// otherwise the SPA `index.html` (history fallback) for client routes like
+/// `/dashboard/prime`. A missing path under `assets/` is an honest 404 rather
+/// than the shell, so a stale asset reference surfaces instead of silently
+/// returning HTML.
+async fn dashboard_path(State(state): State<AppState>, AxumPath(path): AxumPath<String>) -> Response {
+    let Some(dir) = state.dashboard_dir.as_ref() else {
+        return missing_bundle_notice();
+    };
+    if let Some(file) = crate::dashboard::resolve_asset(dir, &path) {
+        return serve_file(&file).await;
+    }
+    if path.starts_with("assets/") {
+        return (StatusCode::NOT_FOUND, "asset not found").into_response();
+    }
+    serve_index(&state).await
+}
+
+/// Read + return the SPA index, or the honest missing-bundle notice when the
+/// bundle is absent or unreadable. `index.html` is never cached so a rebuilt
+/// bundle (new hashed asset names) is picked up on the next load.
+async fn serve_index(state: &AppState) -> Response {
+    let Some(dir) = state.dashboard_dir.as_ref() else {
+        return missing_bundle_notice();
+    };
+    match tokio::fs::read(dir.join("index.html")).await {
+        Ok(bytes) => (
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => missing_bundle_notice(),
+    }
+}
+
+/// Read + return one bundle file with an honest content type. Hashed assets are
+/// immutable, so they carry a long-lived cache header; `index.html` never does
+/// (whether reached via the SPA routes or a direct `/dashboard/index.html`),
+/// because a rebuilt bundle changes the hashed asset names it references and a
+/// stale immutable copy would point at files that no longer exist.
+async fn serve_file(file: &std::path::Path) -> Response {
+    let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let ctype = crate::dashboard::content_type_for(name);
+    let cache = if name.eq_ignore_ascii_case("index.html") {
+        "no-store"
+    } else {
+        "public, max-age=31536000, immutable"
+    };
+    match tokio::fs::read(file).await {
+        Ok(bytes) => (
+            [(header::CONTENT_TYPE, ctype), (header::CACHE_CONTROL, cache)],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => ApiError::internal(format!("failed to read asset: {e}")).into_response(),
+    }
+}
+
+/// Honest 503 served when no dashboard bundle is present. It is deliberately NOT
+/// a dashboard (no app shell, no asset bundle) so a missing build reads as a
+/// build/setup step, not a broken product. The `/v1/relux` API is unaffected.
+fn missing_bundle_notice() -> Response {
+    const BODY: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+<title>Relux - dashboard not built</title></head><body>\
+<h1>Relux dashboard bundle not found</h1>\
+<p>The Relux dashboard is a React app that must be built before relux-kernel can \
+serve it. This is a build/setup step, not a product error.</p>\
+<p>Build it, then reload:</p>\
+<pre>cd apps/dashboard\nnpm install\nnpm run build</pre>\
+<p>That emits <code>crates/relix-web-bridge/dashboard-dist/</code>, which the \
+<code>/dashboard</code> route serves. Set <code>RELUX_DASHBOARD_DIST</code> to \
+point at a bundle elsewhere.</p>\
+<p>The Relux API at <code>/v1/relux/*</code> is unaffected.</p>\
+</body></html>";
+    match Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(axum::body::Body::from(BODY))
+    {
+        Ok(r) => r,
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "dashboard bundle not built - run `npm run build` in apps/dashboard",
+        )
+            .into_response(),
+    }
 }
 
 // --- Handlers --------------------------------------------------------------
@@ -142,6 +274,49 @@ async fn list_plugins(
 ) -> Result<Json<Vec<PluginRecord>>, ApiError> {
     let records = locked_read(&state, |kernel| Ok(plugin_records(kernel)))?;
     Ok(Json(records))
+}
+
+#[derive(Debug, Deserialize)]
+struct PrimeReq {
+    message: String,
+}
+
+/// The result of one Prime turn plus a fresh state summary, so the chat UI can
+/// show what Prime did AND the updated control-plane counts in one round trip.
+#[derive(Debug, Serialize)]
+struct PrimeResponse {
+    /// Flattened so the JSON carries `intent`, `reply`, `disposition`, `action`,
+    /// `created_task`, `started_run`, `approval` at the top level.
+    #[serde(flatten)]
+    turn: PrimeTurn,
+    state: StateResponse,
+}
+
+/// Run exactly one durable Prime turn (`docs/RELUX_MASTER_PLAN.md` section 10) over
+/// HTTP: the same grounded `prime_turn` the CLI uses, so a greeting stays a
+/// greeting and "create a task to X" creates that task. Persisted under the lock
+/// so the next turn (and the dashboard) sees the result.
+async fn run_prime(
+    State(state): State<AppState>,
+    Json(req): Json<PrimeReq>,
+) -> Result<Json<PrimeResponse>, ApiError> {
+    let message = req.message.trim().to_string();
+    if message.is_empty() {
+        return Err(ApiError::bad_request("message is required"));
+    }
+    // Mirror locked_save, but capture the PrimeContext bootstrap returns so the
+    // turn runs as Prime in the workspace namespace.
+    let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut store = SqliteStore::open(&state.db_path)?;
+    let mut kernel = store.load()?;
+    let ctx = crate::ensure_bootstrapped(&mut kernel)?;
+    let turn = kernel.prime_turn(&ctx, &message)?;
+    let summary = state_response(&kernel, &state.db_path);
+    store.save(&kernel)?;
+    Ok(Json(PrimeResponse {
+        turn,
+        state: summary,
+    }))
 }
 
 #[derive(Debug, Deserialize)]

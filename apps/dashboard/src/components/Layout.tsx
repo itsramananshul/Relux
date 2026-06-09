@@ -6,7 +6,7 @@ import { PRIMARY, ORG, SYSTEM, type NavEntry } from "./nav";
 import { CommandPalette } from "./CommandPalette";
 
 const TITLES: Record<string, { title: string; sub: string }> = {
-  "/": { title: "Command Center", sub: "Mesh overview & what needs attention" },
+  "/overview": { title: "Command Center", sub: "Mesh overview & what needs attention" },
   "/mandates": { title: "Mandates", sub: "Turn a big goal into a Brief tree" },
   "/briefs": { title: "Briefs", sub: "The issue board — your unit of work" },
   "/runs": { title: "Active Runs", sub: "Execution & activity status" },

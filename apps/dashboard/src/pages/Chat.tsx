@@ -187,7 +187,7 @@ const QUICK_CHIPS: Chip[] = [
 // "the chat hands off to the board"). Maps the validated action name to the
 // surface where that work is seen — never a mutation.
 const COMPANION_ROUTES: Record<string, { to: string; label: string }> = {
-  attention: { to: "/", label: "Open The Desk →" },
+  attention: { to: "/overview", label: "Open The Desk →" },
   blocked: { to: "/briefs", label: "Open board →" },
   running: { to: "/runs", label: "Open Shifts →" },
   roster: { to: "/agents", label: "Open Crew →" },

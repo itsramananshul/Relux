@@ -1319,6 +1319,33 @@ async function reluxError(res: Response): Promise<ApiError> {
   return new ApiError(res.status, msg);
 }
 
+// One Prime turn over the local Relux control plane (POST /v1/relux/prime).
+// Mirrors the kernel's grounded `prime_turn`: Prime classifies intent, then
+// either answers, acts, proposes a risky action behind approval, or asks to
+// clarify. `disposition` is the durable outcome; `created_task`/`started_run`/
+// `approval` name what (if anything) landed. `state` is a fresh control-plane
+// summary so the chat can show updated counts without a second round trip.
+export interface ReluxPrimeAction {
+  type: string;
+  [k: string]: unknown;
+}
+export interface ReluxPrimeTurn {
+  intent: string;
+  reply: string;
+  disposition: string;
+  action: ReluxPrimeAction | null;
+  created_task: string | null;
+  started_run: string | null;
+  approval: string | null;
+  state: ReluxState;
+}
+
+export const reluxPrime = {
+  // Send one message to Prime. Throws an ApiError on failure so the chat can
+  // show the real reason (e.g. "relux-kernel serve" not running).
+  send: (message: string) => api.post<ReluxPrimeTurn>("/v1/relux/prime", { message }),
+};
+
 export const reluxPlugins = {
   // The installed plugin list (array). Throws an ApiError on failure so the page
   // can show the real reason (e.g. "relux-kernel serve" not running).

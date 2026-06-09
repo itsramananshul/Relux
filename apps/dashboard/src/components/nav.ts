@@ -10,7 +10,10 @@ export interface NavEntry {
 }
 
 export const PRIMARY: NavEntry[] = [
-  { to: "/", label: "Command Center", icon: "◈" },
+  // The legacy Command Center lives at /overview now: "/" is the standalone
+  // Relux-local Home (served by relux-kernel), so pointing this at "/" would
+  // eject an operator out of the bridge console into the Relux shell.
+  { to: "/overview", label: "Command Center", icon: "◈" },
   { to: "/mandates", label: "Mandates", icon: "◎" },
   { to: "/briefs", label: "Briefs", icon: "▤" },
   { to: "/runs", label: "Active Runs", icon: "◐" },

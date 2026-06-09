@@ -1605,3 +1605,56 @@ Not just a plugin manager.
 Not just a chatbot.
 
 Relux is the Codex-like Prime control plane for agentic systems.
+
+---
+
+## 22. Running The Standalone MVP
+
+The first usable Relux product boots from one command and serves its own
+dashboard - no old Relix web bridge, no login, no token for the local
+developer product.
+
+```bash
+cargo run -p relux-kernel -- serve
+```
+
+That starts the local control plane and prints:
+
+```text
+Relux dashboard: http://127.0.0.1:19891/dashboard
+Relux API:       http://127.0.0.1:19891/v1/relux/state
+```
+
+Open `http://127.0.0.1:19891/dashboard`. The default surface is Relux Home,
+backed only by the local `/v1/relux` API:
+
+- **Home** - grounded control-plane state (plugins, agents, tasks, runs,
+  approvals) plus the installed-plugin list.
+- **Prime** - chat with the local operator. It runs the same grounded
+  `prime_turn` as the CLI: a greeting stays a greeting, "create a task to X"
+  creates that task, and risky actions come back as a proposal awaiting
+  approval (section 10). Endpoint: `POST /v1/relux/prime { "message": "..." }`.
+- **Plugins** - install/remove plugins through the durable lifecycle
+  (`/v1/relux/plugins/*`).
+
+The dashboard bundle is the committed Vite build at
+`crates/relix-web-bridge/dashboard-dist`; `relux-kernel` serves it directly
+(SPA history fallback included). Rebuild it with `npm run build` in
+`apps/dashboard` after changing the frontend. If the bundle is missing,
+`/dashboard` returns an honest "not built" notice (HTTP 503), never a panic.
+
+Configuration:
+
+- `RELUX_DB` - the durable SQLite store (default `dev-data/relux/local.db`).
+- `RELUX_HTTP_ADDR` - the bind address (default `127.0.0.1:19891`).
+- `RELUX_DASHBOARD_DIST` - override the dashboard bundle directory.
+
+### MVP limitations (honest)
+
+- The Relux-local shell covers Home, Prime, and Plugins. The legacy
+  bridge-backed pages (Board, Active Runs, Crew, Approvals) are still in the
+  bundle and reachable from the "Bridge (legacy)" nav, but they require the old
+  Relix web bridge + a login and degrade honestly when it is absent.
+- Prime is the deterministic, rule-based stand-in from Phase 2 - no LLM yet.
+- The standalone API is local-only and unauthenticated by design; it binds
+  loopback. It is not a multi-user or production surface.

@@ -16,6 +16,7 @@ use relux_kernel::{
     KernelError, KernelState, SqliteStore,
 };
 
+mod dashboard;
 mod server;
 
 /// The stable ids the local control plane is bootstrapped with.
