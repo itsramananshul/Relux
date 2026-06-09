@@ -33,8 +33,8 @@ use serde::{Deserialize, Serialize};
 
 use relux_core::{InstalledPlugin, PluginManifest, PluginSourceKind, PrimeTurn};
 use relux_kernel::{
-    install_from_dir, install_from_github, install_from_zip, remove_plugin, KernelError,
-    KernelState, SqliteStore,
+    install_from_dir, install_from_github, install_from_zip, remove_plugin, AiConfig, AiMode,
+    AiStatus, KernelError, KernelState, SqliteStore,
 };
 
 /// The default loopback bind address; override with `RELUX_HTTP_ADDR`.
@@ -55,6 +55,7 @@ struct AppState {
     /// built (a source-only checkout). `None` makes every dashboard route serve
     /// the honest missing-bundle notice instead of panicking.
     dashboard_dir: Option<PathBuf>,
+    ai_config: AiConfig,
     lock: Arc<Mutex<()>>,
 }
 
@@ -77,6 +78,7 @@ async fn serve() -> Result<(), KernelError> {
         plugins_root: crate::plugins_root(),
         uploads_root: crate::uploads_root(),
         dashboard_dir: crate::dashboard::resolve_dist_dir(),
+        ai_config: AiConfig::from_env(),
         lock: Arc::new(Mutex::new(())),
     };
 
@@ -112,6 +114,7 @@ async fn serve() -> Result<(), KernelError> {
     println!("   plugins {}", crate::plugins_root().display());
     println!("   GET    /dashboard                          (standalone Relux shell)");
     println!("   GET    /v1/relux/state");
+    println!("   GET    /v1/relux/ai/status");
     println!("   GET    /v1/relux/plugins");
     println!("   POST   /v1/relux/prime                     {{ \"message\": \"...\" }}");
     println!("   POST   /v1/relux/plugins/install-dir     {{ \"path\": \"...\" }}");
@@ -145,6 +148,7 @@ fn router(state: AppState) -> Router {
         .route("/dashboard/*path", get(dashboard_path))
         // The /v1/relux control-plane API the dashboard calls on the same origin.
         .route("/v1/relux/state", get(get_state))
+        .route("/v1/relux/ai/status", get(get_ai_status))
         .route("/v1/relux/prime", post(run_prime))
         .route("/v1/relux/plugins", get(list_plugins))
         .route("/v1/relux/plugins/install-dir", post(install_dir))
@@ -269,6 +273,10 @@ async fn get_state(State(state): State<AppState>) -> Result<Json<StateResponse>,
     Ok(Json(resp))
 }
 
+async fn get_ai_status(State(state): State<AppState>) -> Json<AiStatus> {
+    Json(state.ai_config.status())
+}
+
 async fn list_plugins(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<PluginRecord>>, ApiError> {
@@ -290,12 +298,23 @@ struct PrimeResponse {
     #[serde(flatten)]
     turn: PrimeTurn,
     state: StateResponse,
+    /// Which path produced the reply (deterministic or LLM).
+    ai_mode: AiMode,
+    /// The model used, if LLM-backed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ai_model: Option<String>,
+    /// A safe, non-secret note (e.g. why LLM was skipped or fell back).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ai_note: Option<String>,
 }
 
 /// Run exactly one durable Prime turn (`docs/RELUX_MASTER_PLAN.md` section 10) over
 /// HTTP: the same grounded `prime_turn` the CLI uses, so a greeting stays a
 /// greeting and "create a task to X" creates that task. Persisted under the lock
 /// so the next turn (and the dashboard) sees the result.
+///
+/// If OpenRouter is configured, the conversational parts of the reply are
+/// shaped by the LLM (while actions stay grounded and deterministic).
 async fn run_prime(
     State(state): State<AppState>,
     Json(req): Json<PrimeReq>,
@@ -304,18 +323,33 @@ async fn run_prime(
     if message.is_empty() {
         return Err(ApiError::bad_request("message is required"));
     }
-    // Mirror locked_save, but capture the PrimeContext bootstrap returns so the
-    // turn runs as Prime in the workspace namespace.
-    let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
-    let mut store = SqliteStore::open(&state.db_path)?;
-    let mut kernel = store.load()?;
-    let ctx = crate::ensure_bootstrapped(&mut kernel)?;
-    let turn = kernel.prime_turn(&ctx, &message)?;
-    let summary = state_response(&kernel, &state.db_path);
-    store.save(&kernel)?;
+
+    // 1. Run the deterministic kernel turn (must happen under the lock).
+    let (turn, summary) = {
+        let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut store = SqliteStore::open(&state.db_path)?;
+        let mut kernel = store.load()?;
+        let ctx = crate::ensure_bootstrapped(&mut kernel)?;
+        let turn = kernel.prime_turn(&ctx, &message)?;
+        let summary = state_response(&kernel, &state.db_path);
+        store.save(&kernel)?;
+        (turn, summary)
+    };
+
+    // 2. Shape the reply (LLM or deterministic fallback). This happens OUTSIDE
+    // the lock because it might involve a slow network call.
+    let outcome = relux_kernel::shape_reply(&state.ai_config, &message, &turn).await;
+
+    // 3. Merge the outcome into the response.
+    let mut final_turn = turn;
+    final_turn.reply = outcome.reply;
+
     Ok(Json(PrimeResponse {
-        turn,
+        turn: final_turn,
         state: summary,
+        ai_mode: outcome.mode,
+        ai_model: outcome.model,
+        ai_note: outcome.note,
     }))
 }
 

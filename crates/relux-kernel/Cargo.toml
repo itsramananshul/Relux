@@ -29,6 +29,10 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # crate's view of axum).
 axum = { workspace = true, features = ["multipart"] }
 tokio = { workspace = true }
+# Optional LLM-backed Prime path (OpenRouter). Reuses the workspace-pinned
+# reqwest (rustls-tls, json) so no new HTTP/TLS stack enters the tree; the
+# deterministic Prime path never touches it.
+reqwest = { workspace = true }
 
 [dev-dependencies]
 # Temp directories for the SqliteStore round-trip tests.

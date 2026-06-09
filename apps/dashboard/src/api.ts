@@ -1338,12 +1338,36 @@ export interface ReluxPrimeTurn {
   started_run: string | null;
   approval: string | null;
   state: ReluxState;
+  /// Which path produced the reply (deterministic or LLM).
+  ai_mode: "deterministic" | "deterministic_for_action" | "openrouter";
+  /// The model used, if LLM-backed.
+  ai_model?: string;
+  /// A safe, non-secret note (e.g. why LLM was skipped or fell back).
+  ai_note?: string;
 }
 
 export const reluxPrime = {
   // Send one message to Prime. Throws an ApiError on failure so the chat can
   // show the real reason (e.g. "relux-kernel serve" not running).
   send: (message: string) => api.post<ReluxPrimeTurn>("/v1/relux/prime", { message }),
+};
+
+// -- Relux AI (OpenRouter) -------------------------------------------------
+
+export interface ReluxAiStatus {
+  mode: "deterministic" | "deterministic_for_action" | "openrouter";
+  /// Whether an API key is present (never the key itself).
+  configured: boolean;
+  disabled: boolean;
+  model: string;
+  timeout_ms: number;
+  /// A human-readable, secret-free explanation of the current mode.
+  reason: string;
+}
+
+export const reluxAi = {
+  // Current AI configuration/status.
+  status: () => api.get<ReluxAiStatus>("/v1/relux/ai/status"),
 };
 
 export const reluxPlugins = {

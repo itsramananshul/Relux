@@ -33,14 +33,27 @@ Relux dashboard: http://127.0.0.1:19891/dashboard
 Relux API:       http://127.0.0.1:19891/v1/relux/state
 ```
 
+### Optional LLM-backed Prime
+
+By default, Prime is deterministic and rule-based. You can enable a natural,
+LLM-backed chat path by configuring an OpenRouter API key. In this mode,
+conversational replies (greetings, status, explanations) are shaped by the model
+while actions (task creation, starting runs) stay grounded and deterministic in the
+kernel.
+
+1. Set `RELUX_OPENROUTER_API_KEY` to your OpenRouter key.
+2. (Optional) Set `RELUX_OPENROUTER_MODEL` (default: `openai/gpt-4o-mini`).
+3. (Optional) Set `RELUX_LLM_DISABLED=1` to force deterministic mode.
+
+Keys are read from the environment and are never returned by the API or shown in the UI.
+
 The dashboard opens on **Relux Home** (grounded control-plane state), where you
 can chat with **Prime** (`POST /v1/relux/prime`) and install **plugins** -
 all backed by the local `/v1/relux` API, with no dependency on the legacy Relix
 bridge. The served bundle is the committed build under
 `crates/relix-web-bridge/dashboard-dist` (rebuild with `npm run build` in
 `apps/dashboard`). See [`docs/RELUX_MASTER_PLAN.md`](docs/RELUX_MASTER_PLAN.md)
-section 22 for the full MVP boot guide and its honest limitations (Prime is still
-the deterministic stand-in; the legacy bridge pages remain but need the bridge).
+section 22 for the full MVP boot guide.
 
 ---
 

@@ -16,6 +16,7 @@
 //! no real API calls. It is the seam that ServiceProvider / Adapter / ToolSet
 //! plugins will later sit behind.
 
+pub mod ai;
 pub mod clock;
 pub mod event;
 pub mod loader;
@@ -24,6 +25,7 @@ pub mod prime;
 pub mod state;
 pub mod store;
 
+pub use ai::{shape_reply, AiConfig, AiMode, AiOutcome, AiStatus};
 pub use clock::Clock;
 pub use event::RunEvent;
 pub use loader::{load_plugin_manifests, MANIFEST_FILENAME};

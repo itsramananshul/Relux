@@ -1649,12 +1649,34 @@ Configuration:
 - `RELUX_HTTP_ADDR` - the bind address (default `127.0.0.1:19891`).
 - `RELUX_DASHBOARD_DIST` - override the dashboard bundle directory.
 
+### Optional LLM-backed Prime (OpenRouter)
+
+As of Phase 2.1, Prime can optionally use an LLM (via OpenRouter) to shape its
+conversational replies, making it feel more natural while remaining grounded
+in kernel state.
+
+- **Deterministic Fallback**: If no key is configured or `RELUX_LLM_DISABLED=1` is
+  set, Prime remains fully deterministic.
+- **Actionful Safety**: If a turn results in a state change (task creation, run
+  start, etc.) or awaits approval, the reply remains deterministic to ensure
+  absolute grounding. The LLM is never asked to narrate real state changes.
+- **Conversational Shaping**: For greetings, status queries, and general chat, the
+  LLM rephrases the kernel's grounded facts into natural dialogue.
+- **Configuration**:
+  - `RELUX_OPENROUTER_API_KEY`: Enables OpenRouter when set.
+  - `RELUX_OPENROUTER_MODEL`: Model ID (default `openai/gpt-4o-mini`).
+  - `RELUX_LLM_DISABLED`: Forces deterministic mode even if a key exists.
+  - `RELUX_LLM_TIMEOUT_MS`: Request timeout (default 15000ms).
+
+The API never returns the key. The dashboard shows the current AI provider/mode.
+
 ### MVP limitations (honest)
 
 - The Relux-local shell covers Home, Prime, and Plugins. The legacy
   bridge-backed pages (Board, Active Runs, Crew, Approvals) are still in the
   bundle and reachable from the "Bridge (legacy)" nav, but they require the old
   Relix web bridge + a login and degrade honestly when it is absent.
-- Prime is the deterministic, rule-based stand-in from Phase 2 - no LLM yet.
+- Prime has an optional LLM-backed path for conversational replies, but its
+  core planning remains deterministic. Multi-agent autonomous execution is later.
 - The standalone API is local-only and unauthenticated by design; it binds
   loopback. It is not a multi-user or production surface.

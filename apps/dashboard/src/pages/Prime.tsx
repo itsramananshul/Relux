@@ -1,5 +1,5 @@
-import { useRef, useState } from "react";
-import { reluxPrime, type ReluxPrimeTurn } from "../api";
+import { useEffect, useRef, useState } from "react";
+import { reluxAi, reluxPrime, type ReluxAiStatus, type ReluxPrimeTurn } from "../api";
 
 // Prime page (RELUX_MASTER_PLAN section 10 Prime Behavior, section 11.1 Prime Chat): the
 // conversational command surface for the local Relux control plane. It POSTs
@@ -38,8 +38,22 @@ export function Prime() {
   const [log, setLog] = useState<Entry[]>([]);
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
+  const [aiStatus, setAiStatus] = useState<ReluxAiStatus | null>(null);
   const logRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  async function refreshAi() {
+    try {
+      const s = await reluxAi.status();
+      setAiStatus(s);
+    } catch {
+      setAiStatus(null);
+    }
+  }
+
+  useEffect(() => {
+    void refreshAi();
+  }, []);
 
   function scroll() {
     requestAnimationFrame(() => logRef.current?.scrollTo(0, logRef.current.scrollHeight));
@@ -54,6 +68,7 @@ export function Prime() {
     try {
       const turn = await reluxPrime.send(message);
       setLog((l) => [...l, { role: "prime", turn }]);
+      void refreshAi();
     } catch (e) {
       setLog((l) => [
         ...l,
@@ -67,6 +82,7 @@ export function Prime() {
 
   return (
     <div className="chat" style={{ height: "calc(100vh - 96px)" }}>
+      <AiStatusBanner status={aiStatus} />
       <div className="chat-log" ref={logRef}>
         <div className="msg assistant">{GREETING}</div>
         {log.map((m, i) => {
@@ -121,6 +137,19 @@ export function Prime() {
   );
 }
 
+function AiStatusBanner({ status }: { status: ReluxAiStatus | null }) {
+  if (!status) return null;
+  const isLlm = status.mode === "openrouter";
+  const icon = isLlm ? "✨" : "🤖";
+  const label = isLlm ? `Prime: OpenRouter (${status.model})` : "Prime: deterministic";
+  return (
+    <div className="row wrap muted" style={{ gap: 8, fontSize: 10, padding: "4px 8px", borderBottom: "1px solid var(--border)", marginBottom: 8 }} title={status.reason}>
+      <span>{icon} {label}</span>
+      {status.disabled && status.configured && <span className="badge todo" style={{fontSize: 8}}>LLM disabled</span>}
+    </div>
+  );
+}
+
 // One Prime turn rendered as a compact card: the reply text, an intent +
 // disposition chip, and any durable artifact (task created, run started, or an
 // approval that is now pending). All of it is read straight from the turn — the
@@ -136,6 +165,11 @@ function PrimeTurnCard({ turn }: { turn: ReluxPrimeTurn }) {
         <span className={"badge " + tone} style={{ fontSize: 9 }} title="How the turn resolved">
           {turn.disposition.replace(/_/g, " ")}
         </span>
+        {turn.ai_mode !== "openrouter" && turn.ai_note && (
+           <span className="muted" style={{ fontSize: 9, marginLeft: "auto" }}>
+             {turn.ai_note.includes("Action executed") ? "deterministic for action" : "deterministic fallback"}
+           </span>
+        )}
       </div>
       <div style={{ whiteSpace: "pre-wrap" }}>{turn.reply}</div>
 
