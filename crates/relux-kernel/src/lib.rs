@@ -40,6 +40,11 @@ pub use store::SqliteStore;
 use relux_core::ManifestError;
 use thiserror::Error;
 
+/// Returns the relux-kernel crate version.
+pub fn get_kernel_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
 /// Errors produced by the kernel and its manifest loader.
 #[derive(Debug, Error)]
 pub enum KernelError {

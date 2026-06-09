@@ -19,6 +19,11 @@ use relux_kernel::{
 mod dashboard;
 mod server;
 
+/// Returns the relux-kernel crate version.
+fn get_kernel_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
 /// The stable ids the local control plane is bootstrapped with.
 const WORKSPACE_NS: &str = "workspace";
 const PRIME_AGENT: &str = "prime";
@@ -30,6 +35,7 @@ fn main() -> ExitCode {
     //   relux-kernel prime <message...>      -> one Prime turn against PERSISTENT state
     //   relux-kernel state                   -> summarize the persistent store
     //   relux-kernel serve                   -> run the local /v1/relux HTTP API
+    //   relux-kernel health|doctor          -> check local health, return zero on PASS
     //   relux-kernel reset-local             -> wipe + reinit the local dev DB
     //   relux-kernel plugins                 -> list installed plugins
     //   relux-kernel plugin install-dir <p>  -> install a plugin from a folder
@@ -52,6 +58,14 @@ fn main() -> ExitCode {
         }
         Some((cmd, _)) if cmd == "state" => run_state(),
         Some((cmd, _)) if cmd == "serve" => server::run(),
+        Some((cmd, _)) if cmd == "health" || cmd == "doctor" => {
+            let exit_code = run_health();
+            if exit_code == ExitCode::SUCCESS {
+                Ok(())
+            } else {
+                Err(KernelError::Storage(format!("Health check failed with code {:?}", exit_code)))
+            }
+        }
         Some((cmd, _)) if cmd == "reset-local" => run_reset_local(),
         Some((cmd, _)) if cmd == "plugins" => run_plugins_list(),
         Some((cmd, rest)) if cmd == "plugin" => run_plugin_subcommand(rest),
@@ -64,6 +78,104 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Print local Relux health. Exits 0 on PASS, 1 on WARN, 2 on FAIL.
+fn run_health() -> ExitCode {
+    let mut exit_code = ExitCode::SUCCESS;
+    let mut warnings = vec![];
+    let mut errors = vec![];
+
+    println!("== Relux kernel health ({}) ==", get_kernel_version());
+
+    // DB path and status
+    let db_path = db_path();
+    let store_result = SqliteStore::open(&db_path);
+    match store_result {
+        Ok(store) => {
+            println!("PASS: DB path: {}", db_path.display());
+            let kernel_result = store.load();
+            match kernel_result {
+                Ok(kernel) => {
+                    println!("PASS: DB loaded successfully.");
+                    println!("   Installed plugins: {}", kernel.installed_plugin_count());
+                    println!("   Agents: {}", kernel.agent_count());
+                    println!("   Tasks: {}", kernel.task_count());
+                    println!("   Runs: {}", kernel.run_count());
+                    println!("   Approvals: {}", kernel.approval_count());
+                }
+                Err(e) => {
+                    errors.push(format!("FAIL: Failed to load kernel state from DB: {}", e));
+                    exit_code = ExitCode::from(2);
+                }
+            }
+        }
+        Err(e) => {
+            errors.push(format!("FAIL: Failed to open DB at {}: {}", db_path.display(), e));
+            exit_code = ExitCode::from(2);
+        }
+    }
+
+    // Dashboard bundle status
+    let dashboard_dir = crate::dashboard::resolve_dist_dir();
+    if let Some(path) = dashboard_dir {
+        println!("PASS: Dashboard bundle present at {}", path.display());
+    } else {
+        warnings.push("WARN: Dashboard bundle not found. Run `npm run build` in `apps/dashboard`".to_string());
+        if exit_code == ExitCode::SUCCESS {
+            exit_code = ExitCode::from(1);
+        }
+    }
+
+    // AI status
+    let ai_config = relux_kernel::AiConfig::from_env();
+    let ai_status = ai_config.status();
+    match ai_status.mode {
+        relux_kernel::AiMode::Openrouter => {
+            if ai_status.configured {
+                println!("PASS: AI mode: OpenRouter (configured)");
+            } else {
+                warnings.push("WARN: AI mode: OpenRouter (not configured, set RELUX_OPENROUTER_API_KEY)".to_string());
+                if exit_code == ExitCode::SUCCESS {
+                    exit_code = ExitCode::from(1);
+                }
+            }
+        }
+        relux_kernel::AiMode::Deterministic => {
+            println!("INFO: AI mode: Deterministic (no OpenRouter config found)");
+        }
+        relux_kernel::AiMode::DeterministicForAction => {
+            println!("INFO: AI mode: Deterministic (for action)");
+        }
+    }
+
+    // Output warnings and errors
+    if !warnings.is_empty() {
+        println!("
+--- Warnings ---");
+        for warn in &warnings {
+            println!("{}", warn);
+        }
+    }
+    if !errors.is_empty() {
+        println!("
+--- Errors ---");
+        for err in &errors {
+            println!("{}", err);
+        }
+
+    }
+
+    let label = if exit_code == ExitCode::SUCCESS {
+        "PASS"
+    } else if errors.is_empty() {
+        "WARN"
+    } else {
+        "FAIL"
+    };
+    println!("
+Health check complete. Status: {label}");
+    exit_code
 }
 
 /// Resolve the local dev database path: `$RELUX_DB` if set and non-empty,
@@ -403,7 +515,8 @@ fn run_plugin_remove(plugin_id: &str) -> Result<(), KernelError> {
 fn run_demo() -> Result<(), KernelError> {
     let mut kernel = KernelState::new();
 
-    println!("== Relux kernel: first local control-plane loop ==\n");
+    println!("== Relux kernel: first local control-plane loop ==
+");
 
     // 1. Load the static example plugin manifests and register them.
     let dir = examples_dir();
@@ -473,7 +586,8 @@ fn run_demo() -> Result<(), KernelError> {
     // 7. Complete the run and the task.
     kernel.complete_run(&run, "echo.say returned the input unchanged")?;
     kernel.complete_task(&task)?;
-    println!("[7] Completed run {run} and task {task}\n");
+    println!("[7] Completed run {run} and task {task}
+");
 
     // --- Prime chat: the first Prime Core slice (master plan section 10, section 16) ----
     //
@@ -535,7 +649,8 @@ fn run_demo() -> Result<(), KernelError> {
     println!();
 
     println!(
-        "-- State summary --\n   plugins={} namespaces={} agents={} tasks={} runs={}",
+        "-- State summary --
+   plugins={} namespaces={} agents={} tasks={} runs={}",
         kernel.plugin_count(),
         kernel.namespace_count(),
         kernel.agent_count(),

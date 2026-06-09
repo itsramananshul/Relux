@@ -1614,8 +1614,16 @@ The first usable Relux product boots from one command and serves its own
 dashboard - no old Relix web bridge, no login, no token for the local
 developer product.
 
+To boot the Relux kernel and serve the dashboard:
+
 ```bash
 cargo run -p relux-kernel -- serve
+```
+
+To run a health check on the Relux kernel:
+
+```bash
+cargo run -p relux-kernel -- health
 ```
 
 That starts the local control plane and prints:
@@ -1625,6 +1633,7 @@ Relux dashboard: http://127.0.0.1:19891/dashboard
 Relux API:       http://127.0.0.1:19891/v1/relux/state
 
 Also available:
+  GET /v1/relux/health
   GET /v1/relux/tasks/:id
   GET /v1/relux/runs/:id
   GET /v1/relux/runs/:id/events

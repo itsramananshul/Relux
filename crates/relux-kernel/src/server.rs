@@ -121,6 +121,7 @@ async fn serve() -> Result<(), KernelError> {
     println!("   GET    /v1/relux/runs/:id");
     println!("   GET    /v1/relux/runs/:id/events");
     println!("   GET    /v1/relux/audit");
+    println!("   GET    /v1/relux/health");
     println!("   POST   /v1/relux/prime                     {{ \"message\": \"...\" }}");
     println!("   POST   /v1/relux/tasks                     {{ \"title\": \"...\" }}");
     println!("   POST   /v1/relux/tasks/:id/start");
@@ -164,6 +165,7 @@ fn router(state: AppState) -> Router {
         .route("/v1/relux/runs/:id", get(get_run))
         .route("/v1/relux/runs/:id/events", get(get_run_events))
         .route("/v1/relux/audit", get(list_audit_events))
+        .route("/v1/relux/health", get(get_health))
         .route("/v1/relux/tasks/:id/start", post(start_task))
         .route("/v1/relux/tasks/:id/assign", post(assign_task_to_agent))
         .route("/v1/relux/plugins", get(list_plugins))
@@ -901,6 +903,90 @@ fn state_response(kernel: &KernelState, db_path: &std::path::Path) -> StateRespo
         failed: s.tasks_failed,
         pending_approvals: s.pending_approvals,
     }
+}
+
+/// Consolidated health and readiness status for the Relux kernel.
+#[allow(dead_code)]
+#[derive(Debug, Serialize)]
+struct HealthResponse {
+    ok: bool,
+    version: String,
+    db_path: String,
+    db_ok: bool,
+    dashboard_bundle_present: bool,
+    installed_plugin_count: usize,
+    agent_count: usize,
+    task_count: usize,
+    run_count: usize,
+    ai_status: AiStatus,
+    warnings: Vec<String>,
+    errors: Vec<String>,
+}
+
+async fn get_health(State(state): State<AppState>) -> Result<Json<HealthResponse>, ApiError> {
+    let mut ok = true;
+    let mut warnings = vec![];
+    let mut errors = vec![];
+
+    let version = crate::get_kernel_version().to_string();
+    let db_path = state.db_path.display().to_string();
+    let dashboard_bundle_present = state.dashboard_dir.is_some();
+    let ai_status = state.ai_config.status();
+
+    if !dashboard_bundle_present {
+        warnings.push("Dashboard bundle not found. Run `npm run build` in `apps/dashboard`".to_string());
+        ok = false; // Missing dashboard bundle is a hard failure for readiness
+    }
+
+    if ai_status.mode == AiMode::Openrouter && !ai_status.configured {
+        warnings.push("AI mode: OpenRouter (not configured, set OPENROUTER_API_KEY)".to_string());
+    }
+
+    let (
+        db_ok,
+        installed_plugin_count,
+        agent_count,
+        task_count,
+        run_count,
+    ) = {
+        let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
+        match SqliteStore::open(&state.db_path) {
+            Ok(store) => match store.load() {
+                Ok(kernel) => (
+                    true,
+                    kernel.installed_plugin_count(),
+                    kernel.agent_count(),
+                    kernel.task_count(),
+                    kernel.run_count(),
+                ),
+                Err(e) => {
+                    errors.push(format!("Failed to load kernel state from DB: {}", e));
+                    ok = false;
+                    (false, 0, 0, 0, 0)
+                }
+            },
+            Err(e) => {
+                errors.push(format!("Failed to open DB at {}: {}", state.db_path.display(), e));
+                ok = false;
+                (false, 0, 0, 0, 0)
+            }
+        }
+    };
+
+    Ok(Json(HealthResponse {
+        ok,
+        version,
+        db_path,
+        db_ok,
+        dashboard_bundle_present,
+        installed_plugin_count,
+        agent_count,
+        task_count,
+        run_count,
+        ai_status,
+        warnings,
+        errors,
+    }))
 }
 
 /// One task, flattened for the dashboard table.
