@@ -1709,6 +1709,56 @@ release binary, dashboard dist, bundled example plugins, docs, and
 `Start-Relux.ps1`. These are local release helpers only; GitHub Actions remain
 disabled unless explicitly enabled by the user.
 
+### Release Candidate Packaging (local-first)
+
+`scripts\relux-package-local.ps1` produces the first shareable Relux release
+candidate as a self-contained Windows bundle. It is deliberately local-first: a
+portable folder + zip you hand to someone, not an installer, signed artifact, or
+hosted download.
+
+Commands:
+
+```powershell
+# Quick package: quick readiness gate, then package.
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\relux-package-local.ps1
+# Full verified package: quick gate + standalone end-to-end smoke, then package.
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\relux-package-local.ps1 -FullE2E
+# Fast repackage, no gate (still builds the release binary if missing).
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\relux-package-local.ps1 -SkipChecks
+```
+
+What the bundle includes (`dist\relux-local-<version>-windows-x64\`, plus a zip):
+
+- `relux-kernel.exe` - the control-plane binary.
+- `dashboard-dist\` - the built dashboard served at `/dashboard`.
+- `examples\relux-plugins\` - bundled example plugins/adapters.
+- `docs\RELUX_MASTER_PLAN.md` + `README.md` - the design plan and reference.
+- `Start-Relux.ps1` - a robust launcher: it sets `RELUX_HTTP_ADDR`, `RELUX_DB`
+  (under `.\data\local.db` in the bundle), and `RELUX_DASHBOARD_DIST`, prints the
+  dashboard URL, supports `-Port`, and fails clearly if `relux-kernel.exe` is
+  missing.
+- `VERSION.txt` (machine-friendly) + `RELEASE-NOTES.txt` (human-friendly) -
+  release metadata: version, git commit (short + full), git branch, working-tree
+  cleanliness, build timestamp (UTC), the verification mode that produced the
+  artifact (`full-e2e` / `quick` / `skipped`), and the supported core loops:
+  Prime chat, Work/task run, plugins, loopback tool runtime, adapter runtime
+  controls, and autonomy.
+
+Hygiene: `dist\` is gitignored and never committed. The package step itself never
+spawns a server or writes a temp DB; the readiness gate it invokes runs all
+smokes against a throwaway `RELUX_DB` and always cleans up its temp DB, server,
+jobs, and processes.
+
+What remains intentionally local-first (out of scope for this RC):
+
+- No installer, code signing, auto-update, or hosted/download distribution - you
+  share the folder/zip directly.
+- Windows x64 only (the script builds and labels a `windows-x64` bundle). No
+  cross-OS bundles are produced here.
+- The standalone API binds loopback and is unauthenticated by design - it is not
+  a multi-user or production surface.
+- GitHub Actions stay disabled; releases are cut by hand with this script.
+
 ### Prime Autonomy Loop (First Local Version)
 
 Relux now has a first safe autonomy loop for Prime:

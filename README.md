@@ -331,12 +331,40 @@ jobs, and processes, and exits non-zero on any failure.
 Create a portable local bundle:
 
 ```powershell
+# Quick package: run the quick readiness gate, then package.
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\relux-package-local.ps1
+
+# Full verified package: run the quick gate PLUS the standalone end-to-end smoke,
+# then package. Use this when cutting a release candidate to share.
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\relux-package-local.ps1 -FullE2E
+
+# Fast repackage with no gate (still builds the release binary if missing).
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\relux-package-local.ps1 -SkipChecks
 ```
 
 The package script writes `dist\relux-local-<version>-windows-x64\` and a zip
-next to it. The bundle includes `relux-kernel.exe`, the built dashboard,
-bundled example plugins, docs, and `Start-Relux.ps1`.
+next to it (`dist\` stays gitignored and is never committed). The bundle is
+self-describing:
+
+- `relux-kernel.exe` - the Relux control-plane binary.
+- `dashboard-dist\` - the built dashboard served at `/dashboard`.
+- `examples\relux-plugins\` - the bundled example plugins/adapters.
+- `docs\RELUX_MASTER_PLAN.md` and `README.md` - the design plan + reference.
+- `Start-Relux.ps1` - a robust launcher that sets `RELUX_HTTP_ADDR`, `RELUX_DB`,
+  and `RELUX_DASHBOARD_DIST`, prints the dashboard URL, and fails clearly if
+  `relux-kernel.exe` is missing (`-Port` overrides the default 19891).
+- `VERSION.txt` + `RELEASE-NOTES.txt` - release metadata: version, git commit,
+  build timestamp (UTC), the verification mode used (full e2e / quick / skipped),
+  and the supported core loops (Prime chat, Work/task run, plugins, loopback tool
+  runtime, adapter runtime controls, autonomy).
+
+Run the bundle:
+
+```powershell
+cd dist\relux-local-<version>-windows-x64
+powershell -NoProfile -ExecutionPolicy Bypass -File .\Start-Relux.ps1
+# then open http://127.0.0.1:19891/dashboard
+```
 
 ### Prime Autonomy
 
