@@ -78,7 +78,7 @@ pub struct KernelState {
     agents: HashMap<AgentId, Agent>,
     tasks: HashMap<TaskId, Task>,
     runs: HashMap<RunId, Run>,
-    approvals: HashMap<ApprovalId, Approval>,
+    pub approvals: HashMap<ApprovalId, Approval>,
     /// Per-run transcripts, in emission order.
     run_events: Vec<RunEvent>,
     /// The append-only audit log, in emission order.
@@ -395,6 +395,41 @@ impl KernelState {
         let mut out: Vec<&Agent> = self.agents.values().collect();
         out.sort_by(|a, b| a.id.0.cmp(&b.id.0));
         out
+    }
+
+    /// Grant a permission to an existing agent.
+    pub fn grant_permission_to_agent(
+        &mut self,
+        agent_id: &AgentId,
+        permission: Permission,
+    ) -> Result<(), KernelError> {
+        let agent = self
+            .agents
+            .get_mut(agent_id)
+            .ok_or_else(|| KernelError::UnknownAgent(agent_id.to_string()))?;
+
+        if agent.permissions.contains(&permission) {
+            return Err(KernelError::PermissionAlreadyGranted(
+                agent_id.to_string(),
+                permission.to_string(),
+            ));
+        }
+
+        agent.permissions.push(permission.clone());
+        let namespace_id = agent.namespace_id.clone();
+
+        self.record_audit(
+            "kernel",
+            "kernel",
+            "agent:grant_permission",
+            Some("agent"),
+            Some(agent_id.as_str()),
+            Some(&namespace_id),
+            AuditResult::Success,
+            serde_json::json!({ "permission": permission.as_str() }),
+        );
+
+        Ok(())
     }
 
     // --- Tasks -------------------------------------------------------------
@@ -726,6 +761,7 @@ impl KernelState {
             namespace_id: namespace.cloned(),
             created_at: created,
             resolved_at: None,
+            note: None,
         };
         self.record_audit(
             "agent",
@@ -751,6 +787,7 @@ impl KernelState {
         id: &ApprovalId,
         approve: bool,
         approver: &str,
+        note: Option<String>,
     ) -> Result<(), KernelError> {
         let resolved = self.clock.tick();
         let namespace = {
@@ -765,6 +802,7 @@ impl KernelState {
             };
             approval.approved_by = Some(approver.to_string());
             approval.resolved_at = Some(resolved);
+            approval.note = note;
             approval.namespace_id.clone()
         };
         self.record_audit(
@@ -1440,7 +1478,7 @@ mod tests {
         let turn = k.prime_turn(&ctx, "install relux-tools-github").unwrap();
         let approval = turn.approval.expect("an approval was raised");
 
-        k.resolve_approval(&approval, true, "founder").unwrap();
+        k.resolve_approval(&approval, true, "founder", None).unwrap();
         assert_eq!(
             k.approval(&approval).unwrap().status,
             ApprovalStatus::Approved
@@ -1577,6 +1615,31 @@ mod tests {
         assert_eq!(
             k.task(&task).unwrap().assigned_agent.as_ref(),
             Some(&agent2_id)
+        );
+    }
+
+    #[test]
+    fn grant_permission_to_agent_works_and_audits() {
+        let (mut k, prime, _task, _run, _echo) = primed_kernel();
+        let new_permission = Permission::new("tool:relux-tools-github:read").unwrap();
+
+        // Grant a new permission
+        k.grant_permission_to_agent(&prime, new_permission.clone())
+            .expect("should grant new permission");
+        let updated_prime = k.agent(&prime).unwrap();
+        assert!(updated_prime.permissions.contains(&new_permission));
+        assert!(k
+            .audit_log()
+            .iter()
+            .any(|e| e.action == "agent:grant_permission" && e.result == AuditResult::Success));
+
+        // Try to grant the same permission again
+        let err = k
+            .grant_permission_to_agent(&prime, new_permission.clone())
+            .unwrap_err();
+        assert!(
+            matches!(err, KernelError::PermissionAlreadyGranted(..)),
+            "got {err:?}"
         );
     }
 }

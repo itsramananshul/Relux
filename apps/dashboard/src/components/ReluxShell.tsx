@@ -22,6 +22,7 @@ const RELUX_NAV: NavEntry[] = [
   { to: "/work", label: "Work", icon: "⚙" },
   { to: "/crew", label: "Crew", icon: "⨈" },
   { to: "/plugins", label: "Plugins", icon: "#" },
+  { to: "/approvals", label: "Approvals", icon: "✔" },
 ];
 
 // Legacy bridge-backed surfaces (the old Relix dashboard). Kept reachable for
@@ -40,6 +41,7 @@ const TITLES: Record<string, { title: string; sub: string }> = {
   "/work": { title: "Work", sub: "Manage tasks and view execution history" },
   "/crew": { title: "Crew", sub: "Manage your agent workforce" },
   "/plugins": { title: "Plugins", sub: "Capabilities installed in the control plane" },
+  "/approvals": { title: "Approvals", sub: "Manage pending approvals and agent permissions" },
 };
 
 function Group({ label, items }: { label: string; items: NavEntry[] }) {

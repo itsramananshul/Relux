@@ -1483,6 +1483,47 @@ export const reluxPlugins = {
     api.del<{ removed: string }>(`/v1/relux/plugins/${encodeURIComponent(id)}`),
 };
 
+// -- Relux Approvals --------------------------------------------------------
+
+export interface ReluxApproval {
+  id: string;
+  requested_by: string;
+  status: "Pending" | "Approved" | "Rejected";
+  created_at: string;
+  resolved_at?: string;
+  approver?: string;
+  note?: string;
+}
+
+export const reluxApprovals = {
+  // List all approvals, pending first.
+  list: () => api.get<ReluxApproval[]>("/v1/relux/approvals"),
+  // Decide on an approval.
+  decide: (id: string, decision: "approved" | "rejected", note?: string) =>
+    api.post<ReluxApproval>(`/v1/relux/approvals/${encodeURIComponent(id)}/decide`, {
+      decision,
+      note,
+    }),
+};
+
+// -- Relux Permissions ------------------------------------------------------
+
+export interface ReluxAgentPermissions {
+  agent_id: string;
+  permissions: string[];
+}
+
+export const reluxPermissions = {
+  // List all agents and their permissions.
+  list: () => api.get<ReluxAgentPermissions[]>("/v1/relux/permissions"),
+  // Grant a permission to an agent.
+  grant: (agentId: string, permission: string) =>
+    api.post<ReluxAgentPermissions>(
+      `/v1/relux/agents/${encodeURIComponent(agentId)}/permissions`,
+      { permission },
+    ),
+};
+
 export interface Probe {
   ok: boolean;
   status: number | null;

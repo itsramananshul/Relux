@@ -71,6 +71,8 @@ pub enum KernelError {
     ToolNotFound { plugin: String, tool: String },
     #[error("permission denied: agent {agent} lacks {permission}")]
     PermissionDenied { agent: String, permission: String },
+    #[error("permission '{1}' already granted to agent {0}")]
+    PermissionAlreadyGranted(String, String),
     #[error("storage error: {0}")]
     Storage(String),
     #[error("plugin install failed: {0}")]

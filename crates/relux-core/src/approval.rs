@@ -50,6 +50,7 @@ pub struct Approval {
     pub namespace_id: Option<NamespaceId>,
     pub created_at: String,
     pub resolved_at: Option<String>,
+    pub note: Option<String>,
 }
 
 #[cfg(test)]
@@ -69,6 +70,7 @@ mod tests {
             namespace_id: Some(NamespaceId::new("workspace")),
             created_at: "2026-06-08T00:00:00Z".to_string(),
             resolved_at: None,
+            note: None,
         };
         let json = serde_json::to_string(&approval).expect("serialize");
         let back: Approval = serde_json::from_str(&json).expect("deserialize");

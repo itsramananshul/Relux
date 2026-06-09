@@ -171,6 +171,11 @@ fn router(state: AppState) -> Router {
         .route("/v1/relux/plugins/install-github", post(install_github))
         .route("/v1/relux/plugins/install-zip", post(install_zip))
         .route("/v1/relux/plugins/:id", delete(remove))
+        // Relux Approvals and Permissions
+        .route("/v1/relux/approvals", get(list_approvals))
+        .route("/v1/relux/approvals/:id/decide", post(decide_approval))
+        .route("/v1/relux/permissions", get(list_permissions))
+        .route("/v1/relux/agents/:id/permissions", post(grant_agent_permission))
         // Bound the request body so a large zip upload is refused cleanly.
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .with_state(state)
@@ -413,6 +418,110 @@ async fn list_audit_events(
         Ok(recent_events)
     })?;
     Ok(Json(events))
+}
+
+async fn list_approvals(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<relux_core::Approval>>, ApiError> {
+    let approvals = locked_read(&state, |kernel| {
+        let mut all_approvals: Vec<relux_core::Approval> =
+            kernel.approvals.values().cloned().collect();
+        // Sort approvals: pending first, then by created_at descending
+        all_approvals.sort_by(|a, b| {
+            let order_a = match a.status {
+                relux_core::ApprovalStatus::Pending => 0,
+                relux_core::ApprovalStatus::Approved => 1,
+                relux_core::ApprovalStatus::Rejected => 2,
+            };
+            let order_b = match b.status {
+                relux_core::ApprovalStatus::Pending => 0,
+                relux_core::ApprovalStatus::Approved => 1,
+                relux_core::ApprovalStatus::Rejected => 2,
+            };
+
+            order_a
+                .cmp(&order_b)
+                .then_with(|| b.created_at.cmp(&a.created_at))
+        });
+        Ok(all_approvals)
+    })?;
+    Ok(Json(approvals))
+}
+
+#[derive(Debug, Deserialize)]
+struct DecideApprovalReq {
+    decision: String,
+    note: Option<String>,
+}
+
+async fn decide_approval(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<DecideApprovalReq>,
+) -> Result<Json<relux_core::Approval>, ApiError> {
+    let approval_id = relux_core::ApprovalId::new(id);
+    let approve = match req.decision.as_str() {
+        "approved" => true,
+        "rejected" => false,
+        _ => return Err(ApiError::bad_request("decision must be 'approved' or 'rejected'")),
+    };
+
+    let approval = locked_save(&state, |kernel| {
+        // TODO: Pass actual user or Prime agent id for approver
+        kernel.resolve_approval(&approval_id, approve, "dashboard_user", req.note)?;
+        Ok(kernel.approval(&approval_id).cloned().unwrap())
+    })?;
+    Ok(Json(approval))
+}
+
+#[derive(Debug, Serialize)]
+struct AgentPermissionsRecord {
+    agent_id: String,
+    permissions: Vec<String>,
+}
+
+async fn list_permissions(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<AgentPermissionsRecord>>, ApiError> {
+    let records = locked_read(&state, |kernel| {
+        let agent_permissions: Vec<AgentPermissionsRecord> = kernel
+            .agents()
+            .into_iter()
+            .map(|agent| AgentPermissionsRecord {
+                agent_id: agent.id.to_string(),
+                permissions: agent.permissions.iter().map(|p| p.to_string()).collect(),
+            })
+            .collect();
+        Ok(agent_permissions)
+    })?;
+    Ok(Json(records))
+}
+
+#[derive(Debug, Deserialize)]
+struct GrantPermissionReq {
+    permission: String,
+}
+
+async fn grant_agent_permission(
+    State(state): State<AppState>,
+    AxumPath(agent_id_str): AxumPath<String>,
+    Json(req): Json<GrantPermissionReq>,
+) -> Result<Json<AgentPermissionsRecord>, ApiError> {
+    let agent_id = relux_core::AgentId::new(agent_id_str.clone());
+    let permission = relux_core::Permission::new(&req.permission)
+        .map_err(|e| ApiError::bad_request(format!("invalid permission string: {e}")))?;
+
+    let updated_agent_permissions = locked_save(&state, |kernel| {
+        kernel.grant_permission_to_agent(&agent_id, permission)?;
+        let agent = kernel
+            .agent(&agent_id)
+            .ok_or_else(|| KernelError::UnknownAgent(agent_id.to_string()))?; // Should not happen after successful grant
+        Ok(AgentPermissionsRecord {
+            agent_id: agent.id.to_string(),
+            permissions: agent.permissions.iter().map(|p| p.to_string()).collect(),
+        })
+    })?;
+    Ok(Json(updated_agent_permissions))
 }
 
 #[derive(Debug, Deserialize)]

@@ -1646,6 +1646,7 @@ backed only by the local `/v1/relux` API:
 - **Crew** - create and manage local agents.
 - **Plugins** - install/remove plugins through the durable lifecycle
   (`/v1/relux/plugins/*`).
+- **Approvals** - manage pending approvals and agent permissions (`/v1/relux/approvals`, `/v1/relux/permissions`).
 
 The dashboard bundle is the committed Vite build at
 `crates/relix-web-bridge/dashboard-dist`; `relux-kernel` serves it directly
@@ -1682,8 +1683,8 @@ The API never returns the key. The dashboard shows the current AI provider/mode.
 
 ### MVP limitations (honest)
 
-- The Relux-local shell covers Home, Prime, Work, and Plugins. The legacy
-  bridge-backed pages (Board, Active Runs, Crew, Approvals) are still in the
+- The Relux-local shell covers Home, Prime, Work, Plugins, and Approvals. The legacy
+  bridge-backed pages (Board, Active Runs, Crew) are still in the
   bundle and reachable from the "Bridge (legacy)" nav, but they require the old
   Relix web bridge + a login and degrade honestly when it is absent.
 - Prime has an optional LLM-backed path for conversational replies, but its

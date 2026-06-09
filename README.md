@@ -55,8 +55,8 @@ Keys are read from the environment and are never returned by the API or shown in
 
 The dashboard opens on **Relux Home** (grounded control-plane state), where you
 can chat with **Prime** (`POST /v1/relux/prime`), manage **work** (tasks and runs,
-including detailed views and audit logs), and manage **crew** (agents) and install **plugins** - all backed by the local `/v1/relux` API, with no dependency on the legacy Relix bridge.
- The served bundle is the committed build under
+including detailed views and audit logs), and manage **crew** (agents) and install **plugins** - all backed by the local `/v1/relux` API, with no dependency on the legacy Relix bridge. It now also includes dedicated surfaces for managing pending approvals and granting permissions to agents.
+The served bundle is the committed build under
 `crates/relix-web-bridge/dashboard-dist` (rebuild with `npm run build` in
 `apps/dashboard`). See [`docs/RELUX_MASTER_PLAN.md`](docs/RELUX_MASTER_PLAN.md)
 section 22 for the full MVP boot guide.
