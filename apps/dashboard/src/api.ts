@@ -1585,6 +1585,66 @@ export const reluxPluginRuntime = {
     ),
 };
 
+// -- Relux adapter runtime (local coding-agent CLIs) ------------------------
+// An Adapter plugin drives an assigned task. The local-prime adapter runs the
+// deterministic echo path; a CLI adapter (Claude/Codex/generic command) spawns
+// a local binary in a non-interactive, non-bypass mode. CLI adapters are
+// DISABLED BY DEFAULT and carry no secrets - only how to launch the binary,
+// whether it is enabled, the timeout, and the output cap.
+
+export interface ReluxAdapterStatus {
+  plugin_id: string;
+  adapter_name: string;
+  kind: string | null;
+  configured: boolean;
+  enabled: boolean;
+  command: string | null;
+  available_on_path: boolean;
+  resolved_path: string | null;
+  timeout_seconds: number | null;
+  max_output_bytes: number | null;
+  working_dir: string | null;
+  // local_deterministic | available | missing_binary | disabled | needs_configuration
+  state:
+    | "local_deterministic"
+    | "available"
+    | "missing_binary"
+    | "disabled"
+    | "needs_configuration";
+  detail: string;
+}
+
+export const reluxAdapters = {
+  // All installed Adapter plugins with their honest runtime status.
+  list: () => api.get<ReluxAdapterStatus[]>("/v1/relux/adapters"),
+  // One adapter's runtime status (404 if not an installed Adapter).
+  get: (id: string) =>
+    api.get<ReluxAdapterStatus>(
+      `/v1/relux/adapters/${encodeURIComponent(id)}/runtime`,
+    ),
+  // Configure (or update) the CLI runtime. CLI adapters are disabled by
+  // default; pass enabled:true to turn one on. No secrets are accepted.
+  set: (
+    id: string,
+    body: {
+      enabled?: boolean;
+      command?: string;
+      timeout_seconds?: number;
+      max_output_bytes?: number;
+      working_dir?: string;
+    },
+  ) =>
+    api.put<ReluxAdapterStatus>(
+      `/v1/relux/adapters/${encodeURIComponent(id)}/runtime`,
+      body,
+    ),
+  // Clear the runtime config entirely.
+  remove: (id: string) =>
+    api.del<ReluxAdapterStatus>(
+      `/v1/relux/adapters/${encodeURIComponent(id)}/runtime`,
+    ),
+};
+
 // -- Relux Tools (the honest tool-invocation surface) ----------------------
 // Installed plugin tools, surfaced with an honest executable status. Only
 // built-in deterministic kernel handlers run; an installed-but-unimplemented

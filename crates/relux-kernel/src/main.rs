@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use relux_core::namespace::NamespaceKind;
 use relux_core::{
     AgentId, NamespaceId, Permission, PluginId, PluginSourceKind, PrimeContext, PrimeTurn, TaskId,
-    TaskStatus, ToolExecutability,
+    ToolExecutability,
 };
 use relux_kernel::{
     install_from_dir, install_from_github, install_from_zip, load_plugin_manifests, remove_plugin,
@@ -50,6 +50,10 @@ fn main() -> ExitCode {
     //   relux-kernel plugin runtime disable <id> -> disable a plugin's runtime
     //   relux-kernel tools                   -> list installed tools + executable status
     //   relux-kernel tool invoke <plugin> <tool> [json] -> invoke a built-in tool
+    //   relux-kernel adapters                -> list adapter plugins + runtime status
+    //   relux-kernel adapter runtime <id>    -> show one adapter's CLI runtime
+    //   relux-kernel adapter runtime enable <id> [--timeout-seconds N] [--max-output-bytes N] [--command C] [--working-dir D]
+    //   relux-kernel adapter runtime disable <id> -> disable an adapter's CLI runtime
     //
     // The persistent paths share one durable SQLite store so state survives
     // across invocations (`docs/RELUX_MASTER_PLAN.md` section 15 Phase 1, section 17.8). The
@@ -82,6 +86,8 @@ fn main() -> ExitCode {
         Some((cmd, rest)) if cmd == "plugin" => run_plugin_subcommand(rest),
         Some((cmd, _)) if cmd == "tools" => run_tools_list(),
         Some((cmd, rest)) if cmd == "tool" => run_tool_subcommand(rest),
+        Some((cmd, _)) if cmd == "adapters" => run_adapters_list(),
+        Some((cmd, rest)) if cmd == "adapter" => run_adapter_subcommand(rest),
         Some((cmd, rest)) if cmd == "task" => run_task_subcommand(rest),
         _ => run_demo(),
     };
@@ -231,16 +237,12 @@ fn run_assigned_task(task_id_str: &str) -> Result<(), KernelError> {
     let mut kernel = store.load()?;
     ensure_bootstrapped(&mut kernel)?;
 
-    let status = kernel
-        .task(&task_id)
-        .ok_or_else(|| KernelError::UnknownTask(task_id.to_string()))?
-        .status
-        .clone();
-    if matches!(status, TaskStatus::Created | TaskStatus::Queued) {
-        kernel.start_run(&task_id)?;
-    }
-    let run_id = kernel.execute_local_run(&task_id)?;
+    // Dispatch on the assigned agent's adapter: local Prime echoes; an enabled
+    // CLI adapter spawns its local binary; anything else fails honestly. The run
+    // is persisted either way so the transcript/audit survive.
+    let result = kernel.execute_assigned_run(&task_id);
     store.save(&kernel)?;
+    let run_id = result?;
 
     println!("Successfully executed task {} as assigned agent. New run: {}", task_id, run_id);
     Ok(())
@@ -725,6 +727,189 @@ fn run_plugin_runtime_disable(plugin_id: &str) -> Result<(), KernelError> {
     with_persistent_kernel(|kernel| {
         kernel.disable_tool_runtime(&id)?;
         Ok(format!("disabled runtime for {plugin_id}"))
+    })
+}
+
+// --- Adapter runtime CLI (local coding-agent CLIs) -------------------------
+
+/// List every installed Adapter plugin with its honest runtime status: whether
+/// it is the local deterministic adapter, configured/enabled, and whether its
+/// binary is on PATH (`docs/RELUX_MASTER_PLAN.md` section 8.1, Adapter Runtime v1).
+fn run_adapters_list() -> Result<(), KernelError> {
+    let path = db_path();
+    let mut store = SqliteStore::open(&path)?;
+    let mut kernel = store.load()?;
+    ensure_bootstrapped(&mut kernel)?;
+    store.save(&kernel)?;
+
+    let adapters = kernel.adapter_runtime_status();
+    println!("== Relux adapters ({}) ==", adapters.len());
+    if adapters.is_empty() {
+        println!("   (none)");
+    }
+    for a in &adapters {
+        let onpath = if a.available_on_path { "on-path" } else { "no-binary" };
+        println!(
+            "   {:<28} {:<14} enabled={:<5} {:<10} {}",
+            a.plugin_id,
+            a.state.as_str(),
+            a.enabled,
+            onpath,
+            a.command.clone().unwrap_or_else(|| "-".to_string()),
+        );
+    }
+    println!();
+    println!("CLI adapters are DISABLED by default. Enable one with:");
+    println!("   relux-kernel adapter runtime enable <adapter-id>");
+    println!("Relux runs the local CLI in a non-interactive, non-bypass mode and never");
+    println!("passes --dangerously-skip-permissions.");
+    Ok(())
+}
+
+/// Dispatch `relux-kernel adapter runtime <show|enable|disable> ...`.
+fn run_adapter_subcommand(args: &[String]) -> Result<(), KernelError> {
+    match args.split_first() {
+        Some((sub, rest)) if sub == "runtime" => run_adapter_runtime(rest),
+        _ => Err(usage_err(
+            "adapter runtime <adapter-id> | adapter runtime enable <adapter-id> [flags] | adapter runtime disable <adapter-id>",
+        )),
+    }
+}
+
+fn run_adapter_runtime(args: &[String]) -> Result<(), KernelError> {
+    match args.split_first() {
+        Some((sub, rest)) if sub == "enable" => {
+            let (id, flags) = rest.split_first().ok_or_else(|| {
+                usage_err("adapter runtime enable <adapter-id> [--timeout-seconds N] [--max-output-bytes N] [--command C] [--working-dir D]")
+            })?;
+            let opts = parse_adapter_flags(flags)?;
+            run_adapter_runtime_enable(id, opts)
+        }
+        Some((sub, rest)) if sub == "disable" => {
+            let id = first_arg(rest, "adapter runtime disable <adapter-id>")?;
+            run_adapter_runtime_disable(&id)
+        }
+        Some((id, _)) if !id.trim().is_empty() => run_adapter_runtime_show(id),
+        _ => Err(usage_err(
+            "adapter runtime <adapter-id> | adapter runtime enable <adapter-id> [flags] | adapter runtime disable <adapter-id>",
+        )),
+    }
+}
+
+/// Flags accepted by `adapter runtime enable`.
+#[derive(Default)]
+struct AdapterFlags {
+    timeout_seconds: Option<u64>,
+    max_output_bytes: Option<u64>,
+    command: Option<String>,
+    working_dir: Option<String>,
+}
+
+/// Parse `--timeout-seconds N`, `--max-output-bytes N`, `--command C`,
+/// `--working-dir D` in any order.
+fn parse_adapter_flags(flags: &[String]) -> Result<AdapterFlags, KernelError> {
+    let mut out = AdapterFlags::default();
+    let mut i = 0;
+    while i < flags.len() {
+        let flag = &flags[i];
+        let value = flags.get(i + 1).cloned().ok_or_else(|| {
+            KernelError::PluginInstall(format!("missing value for {flag}"))
+        })?;
+        match flag.as_str() {
+            "--timeout-seconds" => {
+                out.timeout_seconds = Some(value.parse::<u64>().map_err(|_| {
+                    KernelError::PluginInstall(format!("invalid --timeout-seconds: {value}"))
+                })?);
+            }
+            "--max-output-bytes" => {
+                out.max_output_bytes = Some(value.parse::<u64>().map_err(|_| {
+                    KernelError::PluginInstall(format!("invalid --max-output-bytes: {value}"))
+                })?);
+            }
+            "--command" => out.command = Some(value),
+            "--working-dir" => out.working_dir = Some(value),
+            other => {
+                return Err(KernelError::PluginInstall(format!("unknown flag: {other}")))
+            }
+        }
+        i += 2;
+    }
+    Ok(out)
+}
+
+fn run_adapter_runtime_show(plugin_id: &str) -> Result<(), KernelError> {
+    let path = db_path();
+    let mut store = SqliteStore::open(&path)?;
+    let mut kernel = store.load()?;
+    ensure_bootstrapped(&mut kernel)?;
+    store.save(&kernel)?;
+
+    let id = PluginId::new(plugin_id);
+    let status = kernel
+        .adapter_runtime_status()
+        .into_iter()
+        .find(|a| a.plugin_id == plugin_id)
+        .ok_or_else(|| KernelError::NotAnAdapter {
+            plugin: plugin_id.to_string(),
+        })?;
+    println!("== Adapter runtime: {plugin_id} ==");
+    println!("   state:        {}", status.state.as_str());
+    println!("   kind:         {}", status.kind.clone().unwrap_or_else(|| "-".to_string()));
+    println!("   configured:   {}", status.configured);
+    println!("   enabled:      {}", status.enabled);
+    println!("   command:      {}", status.command.clone().unwrap_or_else(|| "-".to_string()));
+    println!("   on PATH:      {}", status.available_on_path);
+    if let Some(p) = &status.resolved_path {
+        println!("   resolved:     {p}");
+    }
+    if let Some(t) = status.timeout_seconds {
+        println!("   timeout:      {t} s");
+    }
+    if let Some(m) = status.max_output_bytes {
+        println!("   max output:   {m} bytes");
+    }
+    if let Some(w) = &status.working_dir {
+        println!("   working dir:  {w}");
+    }
+    println!("   {}", status.detail);
+    let _ = id;
+    Ok(())
+}
+
+fn run_adapter_runtime_enable(plugin_id: &str, opts: AdapterFlags) -> Result<(), KernelError> {
+    let id = PluginId::new(plugin_id);
+    with_persistent_kernel(|kernel| {
+        let cfg = kernel.configure_adapter_runtime(
+            &id,
+            Some(true),
+            opts.command,
+            opts.timeout_seconds,
+            opts.max_output_bytes,
+            opts.working_dir,
+        )?;
+        let binary = cfg.resolved_command().unwrap_or_default();
+        let on_path = relux_kernel::find_on_path(&binary).is_some();
+        let note = if on_path {
+            format!("'{binary}' is on PATH")
+        } else {
+            format!("WARNING: '{binary}' was NOT found on PATH; install it before running tasks")
+        };
+        Ok(format!(
+            "enabled {} adapter runtime for {} (timeout {}s, max output {} bytes). {}",
+            cfg.kind.as_str(),
+            cfg.plugin_id,
+            cfg.timeout_seconds,
+            cfg.max_output_bytes,
+            note,
+        ))
+    })
+}
+
+fn run_adapter_runtime_disable(plugin_id: &str) -> Result<(), KernelError> {
+    let id = PluginId::new(plugin_id);
+    with_persistent_kernel(|kernel| {
+        kernel.disable_adapter_runtime(&id)?;
+        Ok(format!("disabled adapter runtime for {plugin_id}"))
     })
 }
 

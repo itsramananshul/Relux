@@ -1,6 +1,14 @@
 import { useState, useEffect, useMemo } from "react";
 import { useLoaderData, Link } from "react-router-dom";
-import { fetchJson, postJson, reluxWork, type ReluxAgent, type ReluxTask } from "../api";
+import {
+  fetchJson,
+  postJson,
+  reluxWork,
+  reluxAdapters,
+  type ReluxAgent,
+  type ReluxTask,
+  type ReluxAdapterStatus,
+} from "../api";
 import { useAsync } from "../components/common";
 
 type Agent = ReluxAgent;
@@ -110,6 +118,8 @@ export function Crew() {
         </div>
       </div>
 
+      <AdaptersSection />
+
       <div className="section">
         <h2>Create New Crew Member</h2>
         <form onSubmit={handleCreateAgent} className="create-agent-form">
@@ -135,6 +145,126 @@ export function Crew() {
           <button type="submit" className="btn primary">Create Agent</button>
         </form>
       </div>
+    </div>
+  );
+}
+
+// Adapter runtime controls: which adapters can actually run an assigned task.
+// CLI adapters are DISABLED BY DEFAULT and spawn a local binary only when an
+// operator explicitly enables them. Relux runs them in a non-interactive,
+// non-bypass mode and never passes --dangerously-skip-permissions.
+function AdaptersSection() {
+  const { data: adapters, loading, error, reload } = useAsync<ReluxAdapterStatus[]>(
+    () => reluxAdapters.list(),
+    [],
+  );
+
+  return (
+    <div className="section">
+      <h2>Adapters</h2>
+      <p className="muted" style={{ fontSize: 13, marginTop: -8 }}>
+        Adapters decide how an assigned task runs. The local Prime adapter is
+        deterministic. A CLI adapter (Claude / Codex / generic command) spawns a
+        local binary &mdash; <strong>disabled by default</strong>. Enabling one
+        means <em>Relux will run that local CLI when an assigned task starts</em>,
+        in a non-interactive, non-bypass mode.
+      </p>
+      {error && (
+        <div className="error-message">Error loading adapters: {String(error)}</div>
+      )}
+      {loading && !adapters ? (
+        <p>Loading adapters&hellip;</p>
+      ) : adapters && adapters.length > 0 ? (
+        <div className="agent-list">
+          {adapters.map((a) => (
+            <AdapterCard key={a.plugin_id} adapter={a} onChange={reload} />
+          ))}
+        </div>
+      ) : (
+        <p>No adapter plugins installed.</p>
+      )}
+    </div>
+  );
+}
+
+function AdapterCard({
+  adapter,
+  onChange,
+}: {
+  adapter: ReluxAdapterStatus;
+  onChange: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const isLocal = adapter.state === "local_deterministic";
+
+  const stateLabel: Record<ReluxAdapterStatus["state"], string> = {
+    local_deterministic: "Local (deterministic)",
+    available: "Enabled — ready",
+    missing_binary: "Enabled — binary missing",
+    disabled: "Configured — disabled",
+    needs_configuration: "Disabled (default)",
+  };
+
+  async function enable() {
+    setBusy(true);
+    setError(null);
+    try {
+      await reluxAdapters.set(adapter.plugin_id, { enabled: true });
+      onChange();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Enable failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function disable() {
+    setBusy(true);
+    setError(null);
+    try {
+      await reluxAdapters.set(adapter.plugin_id, { enabled: false });
+      onChange();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Disable failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="agent-card">
+      <h3>{adapter.adapter_name}</h3>
+      <p className="mono" style={{ fontSize: 11, opacity: 0.7 }}>{adapter.plugin_id}</p>
+      <p><strong>Status:</strong> {stateLabel[adapter.state]}</p>
+      {!isLocal && (
+        <>
+          <p><strong>Kind:</strong> {adapter.kind ?? "—"}</p>
+          <p>
+            <strong>Binary:</strong> {adapter.command ?? "—"}{" "}
+            {adapter.command &&
+              (adapter.available_on_path ? "(on PATH)" : "(NOT on PATH)")}
+          </p>
+          {adapter.timeout_seconds != null && (
+            <p><strong>Timeout:</strong> {adapter.timeout_seconds}s</p>
+          )}
+        </>
+      )}
+      <p className="muted" style={{ fontSize: 12 }}>{adapter.detail}</p>
+      {error && <div className="error-message">{error}</div>}
+      {!isLocal && (
+        <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+          {adapter.enabled ? (
+            <button className="btn ghost sm" onClick={() => void disable()} disabled={busy}>
+              {busy ? "…" : "Disable"}
+            </button>
+          ) : (
+            <button className="btn sm" onClick={() => void enable()} disabled={busy}>
+              {busy ? "…" : "Enable"}
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }

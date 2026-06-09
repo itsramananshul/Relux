@@ -4,6 +4,7 @@
 //! `docs/RELUX_MASTER_PLAN.md` section 9 (Core Entities) and section 7.1-7.5 (Product Layers).
 //! No runtime, no storage, no dashboard - pure types + validation.
 
+pub mod adapter;
 pub mod agent;
 pub mod approval;
 pub mod audit;
@@ -11,11 +12,18 @@ pub mod namespace;
 pub mod permission;
 pub mod plugin;
 pub mod prime;
+pub mod redact;
 pub mod run;
 pub mod runtime;
 pub mod task;
 pub mod tool;
 
+pub use adapter::{
+    clamp_adapter_max_output, clamp_adapter_timeout, recognize_adapter_kind, AdapterKind,
+    AdapterRuntimeConfig, AdapterRuntimeState, AdapterRuntimeStatus, CLAUDE_CLI_ADAPTER_ID,
+    CODEX_CLI_ADAPTER_ID, DEFAULT_ADAPTER_MAX_OUTPUT_BYTES, DEFAULT_ADAPTER_TIMEOUT_SECONDS,
+    LOCAL_PRIME_ADAPTER_ID,
+};
 pub use agent::{Agent, AgentId};
 pub use approval::{Approval, ApprovalId, ApprovalStatus};
 pub use audit::{AuditEvent, AuditResult};
@@ -29,6 +37,7 @@ pub use prime::{
     PrimeAction, PrimeAutonomyConfig, PrimeAutonomyTickResult, PrimeContext, PrimeDisposition,
     PrimeIntent, PrimePlan, PrimeTurn, StateSummary, TaskBrief,
 };
+pub use redact::redact_secrets;
 pub use run::{Run, RunId, RunStatus};
 pub use runtime::{
     clamp_runtime_timeout, parse_loopback_url, validate_loopback_url, LoopbackUrl, LoopbackUrlError,

@@ -82,6 +82,8 @@ mod tests {
         assert_eq!(
             ids,
             vec![
+                "relux-adapter-claude-cli",
+                "relux-adapter-codex-cli",
                 "relux-adapter-local-prime",
                 "relux-tools-echo",
                 "relux-tools-status"

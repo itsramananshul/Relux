@@ -16,6 +16,7 @@
 //! no real API calls. It is the seam that ServiceProvider / Adapter / ToolSet
 //! plugins will later sit behind.
 
+pub mod adapter;
 pub mod ai;
 pub mod builtin;
 pub mod clock;
@@ -28,6 +29,10 @@ pub mod state;
 pub mod store;
 
 
+pub use adapter::{
+    build_adapter_args, compose_prompt, find_on_path, run_adapter_command, AdapterCommandSpec,
+    AdapterRunOutcome,
+};
 pub use ai::{shape_reply, AiConfig, AiMode, AiOutcome, AiStatus};
 pub use builtin::{is_builtin_tool, BUILTIN_TOOLS};
 pub use clock::Clock;
@@ -94,6 +99,20 @@ pub enum KernelError {
     InvalidRuntimeConfig { plugin: String, message: String },
     #[error("no tool runtime configured for plugin {plugin}")]
     RuntimeNotConfigured { plugin: String },
+    #[error("plugin {plugin} is not an Adapter plugin")]
+    NotAnAdapter { plugin: String },
+    #[error("adapter {plugin} cannot be configured as a CLI runtime: {message}")]
+    AdapterNotConfigurable { plugin: String, message: String },
+    #[error("invalid adapter runtime config for {plugin}: {message}")]
+    InvalidAdapterConfig { plugin: String, message: String },
+    #[error("no adapter runtime configured for {plugin}; enable it first (disabled by default)")]
+    AdapterRuntimeNotConfigured { plugin: String },
+    #[error("adapter runtime for {plugin} is configured but disabled")]
+    AdapterRuntimeDisabled { plugin: String },
+    #[error("adapter {plugin} binary '{binary}' was not found on PATH; install it or set an explicit command")]
+    AdapterBinaryMissing { plugin: String, binary: String },
+    #[error("adapter {plugin} run failed: {message}")]
+    AdapterExecutionFailed { plugin: String, message: String },
     #[error("permission denied: agent {agent} lacks {permission}")]
     PermissionDenied { agent: String, permission: String },
     #[error("permission '{1}' already granted to agent {0}")]

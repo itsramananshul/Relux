@@ -1,0 +1,16 @@
+{
+  "id": "relux-adapter-codex-cli",
+  "name": "Relux Codex CLI Adapter",
+  "version": "0.1.0",
+  "kind": "Adapter",
+  "description": "Drives an assigned task through the locally installed Codex CLI in non-interactive mode (codex exec ...). Disabled by default; the operator must explicitly enable the adapter runtime. Relux never passes bypass/danger flags.",
+  "author": "Relux Labs",
+  "trust_level": "official",
+  "capabilities": {
+    "tools": [],
+    "permissions": [
+      "adapter:relux-adapter-codex-cli:run"
+    ]
+  },
+  "health": "unknown"
+}

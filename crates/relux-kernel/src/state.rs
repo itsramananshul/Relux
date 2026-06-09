@@ -16,8 +16,13 @@
 
 use std::collections::HashMap;
 
+use relux_core::adapter::{
+    clamp_adapter_max_output, clamp_adapter_timeout, recognize_adapter_kind, AdapterKind,
+    AdapterRuntimeConfig, AdapterRuntimeState, AdapterRuntimeStatus,
+};
 use relux_core::agent::AgentStatus;
 use relux_core::namespace::NamespaceKind;
+use relux_core::plugin::PluginKind;
 use relux_core::{
     clamp_runtime_timeout, validate_loopback_url, Agent, AgentId, Approval, ApprovalId,
     ApprovalStatus, AuditEvent, AuditResult, InstalledPlugin, Namespace, NamespaceId, Permission,
@@ -62,6 +67,10 @@ pub struct KernelSnapshot {
     /// Per-plugin tool runtime configs (HTTP loopback), sorted by plugin id.
     #[serde(default)]
     pub tool_runtime_configs: Vec<ToolRuntimeConfig>,
+    /// Per-adapter CLI runtime configs (local coding-agent CLIs), sorted by
+    /// plugin id. Defaulted so older snapshots load cleanly.
+    #[serde(default)]
+    pub adapter_runtime_configs: Vec<AdapterRuntimeConfig>,
     pub namespaces: Vec<Namespace>,
     pub agents: Vec<Agent>,
     pub tasks: Vec<Task>,
@@ -82,6 +91,8 @@ pub struct KernelState {
     installed_plugins: HashMap<PluginId, InstalledPlugin>,
     /// Per-plugin tool runtime configs (HTTP loopback), keyed by plugin id.
     tool_runtime_configs: HashMap<PluginId, ToolRuntimeConfig>,
+    /// Per-adapter CLI runtime configs, keyed by plugin id.
+    adapter_runtime_configs: HashMap<PluginId, AdapterRuntimeConfig>,
     namespaces: HashMap<NamespaceId, Namespace>,
     agents: HashMap<AgentId, Agent>,
     tasks: HashMap<TaskId, Task>,
@@ -127,6 +138,9 @@ impl KernelState {
             plugins: sorted(&self.plugins, |p| p.id.as_str()),
             installed_plugins: sorted(&self.installed_plugins, |p| p.id.as_str()),
             tool_runtime_configs: sorted(&self.tool_runtime_configs, |c| c.plugin_id.as_str()),
+            adapter_runtime_configs: sorted(&self.adapter_runtime_configs, |c| {
+                c.plugin_id.as_str()
+            }),
             namespaces: sorted(&self.namespaces, |n| n.id.as_str()),
             agents: sorted(&self.agents, |a| a.id.as_str()),
             tasks: sorted(&self.tasks, |t| t.id.as_str()),
@@ -165,6 +179,11 @@ impl KernelState {
         for cfg in snapshot.tool_runtime_configs {
             state
                 .tool_runtime_configs
+                .insert(PluginId::new(cfg.plugin_id.clone()), cfg);
+        }
+        for cfg in snapshot.adapter_runtime_configs {
+            state
+                .adapter_runtime_configs
                 .insert(PluginId::new(cfg.plugin_id.clone()), cfg);
         }
         for namespace in snapshot.namespaces {
@@ -287,8 +306,9 @@ impl KernelState {
             .ok_or_else(|| KernelError::PluginNotInstalled(id.to_string()))?;
         self.plugins.remove(id);
         // Drop any runtime config so a re-install of the same id does not inherit
-        // a stale loopback endpoint.
+        // a stale loopback endpoint or CLI adapter runtime.
         self.tool_runtime_configs.remove(id);
+        self.adapter_runtime_configs.remove(id);
         self.record_audit(
             "kernel",
             "kernel",
@@ -435,6 +455,266 @@ impl KernelState {
         let mut out: Vec<&ToolRuntimeConfig> = self.tool_runtime_configs.values().collect();
         out.sort_by(|a, b| a.plugin_id.cmp(&b.plugin_id));
         out
+    }
+
+    // --- Adapter runtime config (local CLI adapters) -----------------------
+
+    /// Configure (or update) the local CLI runtime for an installed Adapter
+    /// plugin (`docs/RELUX_MASTER_PLAN.md` section 8.1, Adapter Runtime v1).
+    ///
+    /// The plugin must be installed and of kind `Adapter`. The local-prime
+    /// deterministic adapter is refused (it has no external binary). For an
+    /// unrecognized adapter the kind is a generic [`AdapterKind::Command`], which
+    /// requires an explicit `command`. Partial updates merge with any existing
+    /// config; the result is persisted and audited. No secrets are stored.
+    ///
+    /// CLI adapters are **disabled by default**: a brand-new config defaults to
+    /// `enabled = false` unless the caller explicitly enables it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn configure_adapter_runtime(
+        &mut self,
+        plugin_id: &PluginId,
+        enabled: Option<bool>,
+        command: Option<String>,
+        timeout_seconds: Option<u64>,
+        max_output_bytes: Option<u64>,
+        working_dir: Option<String>,
+    ) -> Result<AdapterRuntimeConfig, KernelError> {
+        let manifest = self
+            .plugins
+            .get(plugin_id)
+            .ok_or_else(|| KernelError::PluginNotInstalled(plugin_id.to_string()))?;
+        if manifest.kind != PluginKind::Adapter {
+            return Err(KernelError::NotAnAdapter {
+                plugin: plugin_id.to_string(),
+            });
+        }
+
+        // Resolve the runtime kind from the well-known id, defaulting to a generic
+        // command adapter for an unrecognized adapter plugin.
+        let kind = match recognize_adapter_kind(plugin_id.as_str()) {
+            Some(AdapterKind::LocalPrime) => {
+                return Err(KernelError::AdapterNotConfigurable {
+                    plugin: plugin_id.to_string(),
+                    message: "the local Prime adapter runs the deterministic echo path and \
+                              has no external CLI to configure"
+                        .to_string(),
+                });
+            }
+            Some(k) => k,
+            None => AdapterKind::Command,
+        };
+
+        let existing = self.adapter_runtime_configs.get(plugin_id).cloned();
+        let command = command
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty())
+            .or_else(|| existing.as_ref().and_then(|c| c.command.clone()));
+        let working_dir = working_dir
+            .map(|w| w.trim().to_string())
+            .filter(|w| !w.is_empty())
+            .or_else(|| existing.as_ref().and_then(|c| c.working_dir.clone()));
+        let timeout_seconds =
+            clamp_adapter_timeout(timeout_seconds.or(existing.as_ref().map(|c| c.timeout_seconds)));
+        let max_output_bytes = clamp_adapter_max_output(
+            max_output_bytes.or(existing.as_ref().map(|c| c.max_output_bytes)),
+        );
+        // Disabled by default on first configure; preserve prior state otherwise.
+        let enabled = enabled
+            .or_else(|| existing.as_ref().map(|c| c.enabled))
+            .unwrap_or(false);
+
+        let config = AdapterRuntimeConfig {
+            plugin_id: plugin_id.as_str().to_string(),
+            kind: kind.clone(),
+            enabled,
+            command,
+            timeout_seconds,
+            max_output_bytes,
+            working_dir,
+        };
+
+        // A generic command adapter must resolve to a launchable binary.
+        if config.resolved_command().is_none() {
+            return Err(KernelError::InvalidAdapterConfig {
+                plugin: plugin_id.to_string(),
+                message: "a generic command adapter requires an explicit command".to_string(),
+            });
+        }
+
+        self.record_audit(
+            "kernel",
+            "kernel",
+            "adapter:runtime_configure",
+            Some("adapter"),
+            Some(plugin_id.as_str()),
+            None,
+            AuditResult::Success,
+            serde_json::json!({
+                "kind": config.kind.as_str(),
+                "enabled": config.enabled,
+                "timeout_seconds": config.timeout_seconds,
+                "max_output_bytes": config.max_output_bytes,
+            }),
+        );
+        self.adapter_runtime_configs
+            .insert(plugin_id.clone(), config.clone());
+        Ok(config)
+    }
+
+    /// Disable an adapter's CLI runtime, keeping its config so it can be
+    /// re-enabled. Errors if no runtime is configured.
+    pub fn disable_adapter_runtime(
+        &mut self,
+        plugin_id: &PluginId,
+    ) -> Result<AdapterRuntimeConfig, KernelError> {
+        let config = self.adapter_runtime_configs.get_mut(plugin_id).ok_or_else(|| {
+            KernelError::AdapterRuntimeNotConfigured {
+                plugin: plugin_id.to_string(),
+            }
+        })?;
+        config.enabled = false;
+        let config = config.clone();
+        self.record_audit(
+            "kernel",
+            "kernel",
+            "adapter:runtime_disable",
+            Some("adapter"),
+            Some(plugin_id.as_str()),
+            None,
+            AuditResult::Success,
+            serde_json::Value::Null,
+        );
+        Ok(config)
+    }
+
+    /// Remove an adapter's runtime config entirely. Errors if none is configured.
+    pub fn remove_adapter_runtime(&mut self, plugin_id: &PluginId) -> Result<(), KernelError> {
+        self.adapter_runtime_configs.remove(plugin_id).ok_or_else(|| {
+            KernelError::AdapterRuntimeNotConfigured {
+                plugin: plugin_id.to_string(),
+            }
+        })?;
+        self.record_audit(
+            "kernel",
+            "kernel",
+            "adapter:runtime_remove",
+            Some("adapter"),
+            Some(plugin_id.as_str()),
+            None,
+            AuditResult::Success,
+            serde_json::Value::Null,
+        );
+        Ok(())
+    }
+
+    pub fn adapter_runtime_config(&self, plugin_id: &PluginId) -> Option<&AdapterRuntimeConfig> {
+        self.adapter_runtime_configs.get(plugin_id)
+    }
+
+    /// The honest status of every installed Adapter plugin: whether it is the
+    /// local deterministic adapter, configured/enabled, and whether its binary is
+    /// present on PATH (`docs/RELUX_MASTER_PLAN.md` section 8.1, section 20.4).
+    /// Probes PATH read-only; sorted by plugin id for deterministic listing.
+    pub fn adapter_runtime_status(&self) -> Vec<AdapterRuntimeStatus> {
+        let mut out: Vec<AdapterRuntimeStatus> = Vec::new();
+        for installed in self.installed_plugins() {
+            let Some(manifest) = self.plugins.get(&installed.id) else {
+                continue;
+            };
+            if manifest.kind != PluginKind::Adapter {
+                continue;
+            }
+            out.push(self.adapter_status_for(&installed.id, &manifest.name));
+        }
+        out.sort_by(|a, b| a.plugin_id.cmp(&b.plugin_id));
+        out
+    }
+
+    /// Build the [`AdapterRuntimeStatus`] for one adapter plugin.
+    fn adapter_status_for(&self, plugin_id: &PluginId, adapter_name: &str) -> AdapterRuntimeStatus {
+        let recognized = recognize_adapter_kind(plugin_id.as_str());
+        let config = self.adapter_runtime_configs.get(plugin_id);
+
+        // The local deterministic adapter is always usable and never has a CLI.
+        if recognized == Some(AdapterKind::LocalPrime) {
+            return AdapterRuntimeStatus {
+                plugin_id: plugin_id.as_str().to_string(),
+                adapter_name: adapter_name.to_string(),
+                kind: Some(AdapterKind::LocalPrime.as_str().to_string()),
+                configured: false,
+                enabled: false,
+                command: None,
+                available_on_path: false,
+                resolved_path: None,
+                timeout_seconds: None,
+                max_output_bytes: None,
+                working_dir: None,
+                state: AdapterRuntimeState::LocalDeterministic,
+                detail: "Local deterministic Prime adapter (echo path); always available, no CLI."
+                    .to_string(),
+            };
+        }
+
+        let kind = config
+            .map(|c| c.kind.clone())
+            .or_else(|| recognized.clone());
+        let command = config
+            .and_then(|c| c.resolved_command())
+            .or_else(|| recognized.as_ref().and_then(|k| k.default_command().map(str::to_string)));
+        let resolved_path = command
+            .as_ref()
+            .and_then(|bin| crate::adapter::find_on_path(bin));
+        let available_on_path = resolved_path.is_some();
+        let enabled = config.map(|c| c.enabled).unwrap_or(false);
+
+        let (state, detail) = if let Some(cfg) = config {
+            if !cfg.enabled {
+                (
+                    AdapterRuntimeState::Disabled,
+                    "Runtime configured but disabled. Enable it to run assigned tasks."
+                        .to_string(),
+                )
+            } else if available_on_path {
+                (
+                    AdapterRuntimeState::Available,
+                    format!(
+                        "Enabled. Relux will run '{}' for assigned tasks.",
+                        command.clone().unwrap_or_default()
+                    ),
+                )
+            } else {
+                (
+                    AdapterRuntimeState::MissingBinary,
+                    format!(
+                        "Enabled, but the binary '{}' was not found on PATH.",
+                        command.clone().unwrap_or_default()
+                    ),
+                )
+            }
+        } else {
+            (
+                AdapterRuntimeState::NeedsConfiguration,
+                "No runtime configured. CLI adapters are disabled by default; enable it to use it."
+                    .to_string(),
+            )
+        };
+
+        AdapterRuntimeStatus {
+            plugin_id: plugin_id.as_str().to_string(),
+            adapter_name: adapter_name.to_string(),
+            kind: kind.as_ref().map(|k| k.as_str().to_string()),
+            configured: config.is_some(),
+            enabled,
+            command,
+            available_on_path,
+            resolved_path: resolved_path.map(|p| p.display().to_string()),
+            timeout_seconds: config.map(|c| c.timeout_seconds),
+            max_output_bytes: config.map(|c| c.max_output_bytes),
+            working_dir: config.and_then(|c| c.working_dir.clone()),
+            state,
+            detail,
+        }
     }
 
     // --- Namespaces --------------------------------------------------------
@@ -1983,6 +2263,319 @@ impl KernelState {
         Ok(run_id)
     }
 
+    /// Execute an assigned task through its agent's adapter, dispatching on the
+    /// adapter kind (`docs/RELUX_MASTER_PLAN.md` section 8.1, Adapter Runtime v1):
+    ///
+    /// - the local Prime adapter runs the deterministic echo path;
+    /// - a CLI adapter (Claude/Codex/generic command) with an **enabled** runtime
+    ///   spawns that local CLI in a bounded, non-interactive, non-bypass mode;
+    /// - anything else fails honestly (disabled, not configured, binary missing,
+    ///   timeout, or non-zero exit) - never a fabricated success.
+    ///
+    /// This is the entry point behind the Work page's "Run (Assigned)" action and
+    /// the `task run-assigned` CLI. It starts a run first if the task is still
+    /// `Created`/`Queued` (permission-checked in [`start_run`]).
+    pub fn execute_assigned_run(&mut self, task_id: &TaskId) -> Result<RunId, KernelError> {
+        let (agent_id, status) = {
+            let task = self
+                .tasks
+                .get(task_id)
+                .ok_or_else(|| KernelError::UnknownTask(task_id.to_string()))?;
+            let agent_id = task
+                .assigned_agent
+                .clone()
+                .ok_or_else(|| KernelError::TaskNotAssigned(task_id.to_string()))?;
+            (agent_id, task.status.clone())
+        };
+        let adapter = self
+            .agents
+            .get(&agent_id)
+            .ok_or_else(|| KernelError::UnknownAgent(agent_id.to_string()))?
+            .adapter_plugin
+            .clone();
+
+        if matches!(status, TaskStatus::Created | TaskStatus::Queued) {
+            self.start_run(task_id)?;
+        }
+
+        match recognize_adapter_kind(adapter.as_str()) {
+            Some(AdapterKind::LocalPrime) => self.execute_local_run(task_id),
+            // Every other adapter (recognized CLI or generic) runs through the CLI
+            // path, which requires an explicitly enabled runtime.
+            _ => self.execute_cli_run(task_id, &adapter),
+        }
+    }
+
+    /// Execute the assigned task by spawning the adapter's local CLI. Gated on an
+    /// enabled runtime + a binary on PATH; every outcome is recorded on the run
+    /// transcript and audit log. On failure the run and task are marked failed.
+    fn execute_cli_run(
+        &mut self,
+        task_id: &TaskId,
+        adapter: &PluginId,
+    ) -> Result<RunId, KernelError> {
+        let run_id = self
+            .runs
+            .values()
+            .filter(|r| r.task_id == *task_id && r.status == RunStatus::Running)
+            .max_by_key(|r| r.started_at.clone())
+            .map(|r| r.id.clone())
+            .ok_or_else(|| KernelError::NoActiveRun(task_id.to_string()))?;
+        let namespace = self.tasks.get(task_id).map(|t| t.namespace_id.clone());
+
+        // 1. Require an enabled runtime (CLI adapters are disabled by default).
+        let config = match self.adapter_runtime_configs.get(adapter).cloned() {
+            Some(c) if c.enabled => c,
+            Some(_) => {
+                let err = KernelError::AdapterRuntimeDisabled {
+                    plugin: adapter.to_string(),
+                };
+                self.fail_cli_run(&run_id, task_id, namespace.as_ref(), adapter, &err.to_string());
+                return Err(err);
+            }
+            None => {
+                let err = KernelError::AdapterRuntimeNotConfigured {
+                    plugin: adapter.to_string(),
+                };
+                self.fail_cli_run(&run_id, task_id, namespace.as_ref(), adapter, &err.to_string());
+                return Err(err);
+            }
+        };
+
+        // 2. Resolve the binary and confirm it is on PATH.
+        let binary = match config.resolved_command() {
+            Some(b) => b,
+            None => {
+                let err = KernelError::InvalidAdapterConfig {
+                    plugin: adapter.to_string(),
+                    message: "no command configured".to_string(),
+                };
+                self.fail_cli_run(&run_id, task_id, namespace.as_ref(), adapter, &err.to_string());
+                return Err(err);
+            }
+        };
+        if crate::adapter::find_on_path(&binary).is_none() {
+            let err = KernelError::AdapterBinaryMissing {
+                plugin: adapter.to_string(),
+                binary: binary.clone(),
+            };
+            self.fail_cli_run(&run_id, task_id, namespace.as_ref(), adapter, &err.to_string());
+            return Err(err);
+        }
+
+        // 3. Compose the prompt from the agent persona + task title/input.
+        let (agent_name, persona) = {
+            let agent = self
+                .runs
+                .get(&run_id)
+                .and_then(|r| self.agents.get(&r.agent_id))
+                .ok_or_else(|| KernelError::UnknownRun(run_id.to_string()))?;
+            (agent.name.clone(), agent.persona.clone())
+        };
+        let (task_title, task_input) = {
+            let task = self
+                .tasks
+                .get(task_id)
+                .ok_or_else(|| KernelError::UnknownTask(task_id.to_string()))?;
+            (task.title.clone(), task.input.clone())
+        };
+        let prompt = crate::adapter::compose_prompt(
+            &agent_name,
+            persona.as_deref(),
+            &task_title,
+            &task_input,
+        );
+        let args = crate::adapter::build_adapter_args(&config.kind);
+        let spec = crate::adapter::AdapterCommandSpec {
+            program: binary.clone(),
+            args,
+            stdin: prompt,
+            working_dir: config.working_dir.clone(),
+            timeout: std::time::Duration::from_secs(config.timeout_seconds),
+            max_output_bytes: config.max_output_bytes as usize,
+        };
+
+        self.push_run_event(
+            &run_id,
+            "adapter_spawn",
+            "kernel",
+            &format!(
+                "spawning {} adapter '{}' ({} arg(s))",
+                config.kind.as_str(),
+                binary,
+                spec.args.len()
+            ),
+            serde_json::json!({
+                "adapter": adapter.as_str(),
+                "kind": config.kind.as_str(),
+                "program": binary,
+                "arg_count": spec.args.len(),
+            }),
+        );
+
+        // 4. Run the process (the one place the kernel touches a real CLI).
+        match crate::adapter::run_adapter_command(&spec) {
+            Ok(outcome) if outcome.success => {
+                let summary = render_adapter_summary(&binary, &outcome);
+                self.push_run_event(
+                    &run_id,
+                    "adapter_output",
+                    "adapter",
+                    &summary,
+                    serde_json::json!({
+                        "exit_code": outcome.exit_code,
+                        "stdout": outcome.stdout,
+                        "stderr": outcome.stderr,
+                        "stdout_truncated": outcome.stdout_truncated,
+                        "stderr_truncated": outcome.stderr_truncated,
+                    }),
+                );
+                self.complete_run(&run_id, &summary)?;
+                self.complete_task(task_id)?;
+                let agent = self
+                    .runs
+                    .get(&run_id)
+                    .map(|r| r.agent_id.as_str().to_string())
+                    .unwrap_or_else(|| "agent".to_string());
+                self.record_audit(
+                    "agent",
+                    &agent,
+                    "adapter:execute",
+                    Some("adapter"),
+                    Some(adapter.as_str()),
+                    namespace.as_ref(),
+                    AuditResult::Success,
+                    serde_json::json!({ "run": run_id.as_str(), "exit_code": outcome.exit_code }),
+                );
+                Ok(run_id)
+            }
+            Ok(outcome) => {
+                let reason = if outcome.timed_out {
+                    format!(
+                        "adapter '{}' timed out after {}s",
+                        binary, config.timeout_seconds
+                    )
+                } else {
+                    format!(
+                        "adapter '{}' exited with code {}",
+                        binary,
+                        outcome
+                            .exit_code
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "unknown".to_string())
+                    )
+                };
+                self.push_run_event(
+                    &run_id,
+                    "adapter_output",
+                    "adapter",
+                    &reason,
+                    serde_json::json!({
+                        "exit_code": outcome.exit_code,
+                        "timed_out": outcome.timed_out,
+                        "stdout": outcome.stdout,
+                        "stderr": outcome.stderr,
+                    }),
+                );
+                self.fail_cli_run(&run_id, task_id, namespace.as_ref(), adapter, &reason);
+                Err(KernelError::AdapterExecutionFailed {
+                    plugin: adapter.to_string(),
+                    message: reason,
+                })
+            }
+            Err(e) => {
+                let reason = format!("failed to spawn adapter '{binary}': {e}");
+                self.fail_cli_run(&run_id, task_id, namespace.as_ref(), adapter, &reason);
+                Err(KernelError::AdapterExecutionFailed {
+                    plugin: adapter.to_string(),
+                    message: reason,
+                })
+            }
+        }
+    }
+
+    /// Mark a CLI run + its task failed and audit the failure. Shared by every
+    /// honest failure exit of [`execute_cli_run`].
+    fn fail_cli_run(
+        &mut self,
+        run_id: &RunId,
+        task_id: &TaskId,
+        namespace: Option<&NamespaceId>,
+        adapter: &PluginId,
+        reason: &str,
+    ) {
+        let agent = self
+            .runs
+            .get(run_id)
+            .map(|r| r.agent_id.as_str().to_string())
+            .unwrap_or_else(|| "agent".to_string());
+        let _ = self.fail_run(run_id, reason);
+        let _ = self.fail_task(task_id);
+        self.record_audit(
+            "agent",
+            &agent,
+            "adapter:execute",
+            Some("adapter"),
+            Some(adapter.as_str()),
+            namespace,
+            AuditResult::Failed,
+            serde_json::json!({ "run": run_id.as_str(), "reason": reason }),
+        );
+    }
+
+    /// Mark a run failed with an error message and record it on the transcript.
+    pub fn fail_run(&mut self, run_id: &RunId, error: &str) -> Result<(), KernelError> {
+        let ended = self.clock.tick();
+        let (agent_id, task_id) = {
+            let run = self
+                .runs
+                .get_mut(run_id)
+                .ok_or_else(|| KernelError::UnknownRun(run_id.to_string()))?;
+            run.status = RunStatus::Failed;
+            run.ended_at = Some(ended);
+            run.error = Some(error.to_string());
+            (run.agent_id.clone(), run.task_id.clone())
+        };
+        let task_namespace = self.tasks.get(&task_id).map(|t| t.namespace_id.clone());
+        self.push_run_event(run_id, "run_failed", "kernel", error, serde_json::Value::Null);
+        self.record_audit(
+            "agent",
+            agent_id.as_str(),
+            "run:fail",
+            Some("run"),
+            Some(run_id.as_str()),
+            task_namespace.as_ref(),
+            AuditResult::Failed,
+            serde_json::Value::Null,
+        );
+        Ok(())
+    }
+
+    /// Mark a task failed.
+    pub fn fail_task(&mut self, task_id: &TaskId) -> Result<(), KernelError> {
+        let now = self.clock.tick();
+        let namespace = {
+            let task = self
+                .tasks
+                .get_mut(task_id)
+                .ok_or_else(|| KernelError::UnknownTask(task_id.to_string()))?;
+            task.status = TaskStatus::Failed;
+            task.updated_at = now;
+            task.namespace_id.clone()
+        };
+        self.record_audit(
+            "kernel",
+            "kernel",
+            "task:fail",
+            Some("task"),
+            Some(task_id.as_str()),
+            Some(&namespace),
+            AuditResult::Failed,
+            serde_json::Value::Null,
+        );
+        Ok(())
+    }
+
     // --- Inspection --------------------------------------------------------
 
     pub fn run(&self, id: &RunId) -> Option<&Run> {
@@ -2072,6 +2665,22 @@ fn created_by_actor(created_by: &str) -> (&str, &str) {
     } else {
         ("agent", created_by)
     }
+}
+
+/// Render a concise, already-redacted run summary from an adapter outcome. The
+/// stdout snippet is bounded so a long transcript never bloats the summary.
+fn render_adapter_summary(binary: &str, outcome: &crate::adapter::AdapterRunOutcome) -> String {
+    let mut s = format!("adapter '{binary}' completed (exit 0)");
+    let stdout = outcome.stdout.trim();
+    if !stdout.is_empty() {
+        let snippet: String = stdout.chars().take(280).collect();
+        s.push_str(": ");
+        s.push_str(&snippet);
+        if outcome.stdout_truncated || stdout.chars().count() > 280 {
+            s.push_str(" …");
+        }
+    }
+    s
 }
 
 /// Project a `Task` into the compact `TaskBrief` Prime speaks about.
@@ -3540,5 +4149,315 @@ mod tests {
             matches!(err, KernelError::PermissionAlreadyGranted(..)),
             "got {err:?}"
         );
+    }
+
+    // --- Adapter runtime tests --------------------------------------------
+
+    fn claude_adapter_manifest() -> PluginManifest {
+        PluginManifest {
+            id: PluginId::new("relux-adapter-claude-cli"),
+            name: "Claude CLI".to_string(),
+            version: "0.1.0".to_string(),
+            kind: PluginKind::Adapter,
+            description: "Claude CLI adapter".to_string(),
+            author: "test".to_string(),
+            trust_level: TrustLevel::Official,
+            capabilities: PluginCapability {
+                tools: vec![],
+                permissions: vec![
+                    Permission::new("adapter:relux-adapter-claude-cli:run").unwrap()
+                ],
+            },
+            health: PluginHealth::Unknown,
+        }
+    }
+
+    /// Install the echo, local-prime, and claude-cli adapters as Bundled, create
+    /// the workspace namespace, and return the kernel.
+    fn adapter_kernel() -> KernelState {
+        let mut k = KernelState::new();
+        k.install_plugin(
+            echo_manifest(),
+            PluginSourceKind::Bundled,
+            "bundled".to_string(),
+            "examples/relux-plugins/relux-tools-echo".to_string(),
+            true,
+        );
+        k.install_plugin(
+            adapter_manifest(),
+            PluginSourceKind::Bundled,
+            "bundled".to_string(),
+            "examples/relux-plugins/relux-adapter-local-prime".to_string(),
+            true,
+        );
+        k.install_plugin(
+            claude_adapter_manifest(),
+            PluginSourceKind::Bundled,
+            "bundled".to_string(),
+            "examples/relux-plugins/relux-adapter-claude-cli".to_string(),
+            true,
+        );
+        k.create_namespace("workspace", "Workspace", NamespaceKind::Personal);
+        k
+    }
+
+    /// Write a fake CLI that prints `output` and exits 0 (cross-platform).
+    fn write_fake_cli(dir: &std::path::Path, name: &str, output: &str) -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            let path = dir.join(format!("{name}.cmd"));
+            std::fs::write(&path, format!("@echo off\r\necho {output}\r\n")).unwrap();
+            path
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\necho '{output}'\n")).unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+            path
+        }
+    }
+
+    #[test]
+    fn configure_adapter_runtime_rejects_local_prime() {
+        let mut k = adapter_kernel();
+        let err = k
+            .configure_adapter_runtime(
+                &PluginId::new("relux-adapter-local-prime"),
+                Some(true),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err, KernelError::AdapterNotConfigurable { .. }));
+    }
+
+    #[test]
+    fn configure_adapter_runtime_rejects_non_adapter() {
+        let mut k = adapter_kernel();
+        let err = k
+            .configure_adapter_runtime(
+                &PluginId::new("relux-tools-echo"),
+                Some(true),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err, KernelError::NotAnAdapter { .. }));
+    }
+
+    #[test]
+    fn configure_adapter_runtime_is_disabled_by_default_and_clamps() {
+        let mut k = adapter_kernel();
+        let cfg = k
+            .configure_adapter_runtime(
+                &PluginId::new("relux-adapter-claude-cli"),
+                None,
+                None,
+                Some(1),         // below MIN -> clamped up
+                Some(u64::MAX),  // above MAX -> clamped down
+                None,
+            )
+            .unwrap();
+        assert!(!cfg.enabled, "CLI adapters must be disabled by default");
+        assert_eq!(cfg.kind, AdapterKind::ClaudeCli);
+        assert_eq!(cfg.resolved_command().as_deref(), Some("claude"));
+        assert_eq!(
+            cfg.timeout_seconds,
+            relux_core::adapter::MIN_ADAPTER_TIMEOUT_SECONDS
+        );
+        assert_eq!(
+            cfg.max_output_bytes,
+            relux_core::adapter::MAX_ADAPTER_MAX_OUTPUT_BYTES
+        );
+    }
+
+    #[test]
+    fn generic_command_adapter_requires_a_command() {
+        let mut k = adapter_kernel();
+        // Install an unrecognized adapter plugin.
+        let mut manifest = claude_adapter_manifest();
+        manifest.id = PluginId::new("relux-adapter-mystery");
+        manifest.capabilities.permissions =
+            vec![Permission::new("adapter:relux-adapter-mystery:run").unwrap()];
+        k.install_plugin(
+            manifest,
+            PluginSourceKind::LocalDir,
+            "local".to_string(),
+            "/tmp/mystery".to_string(),
+            true,
+        );
+        let id = PluginId::new("relux-adapter-mystery");
+        // No command -> invalid.
+        let err = k
+            .configure_adapter_runtime(&id, Some(true), None, None, None, None)
+            .unwrap_err();
+        assert!(matches!(err, KernelError::InvalidAdapterConfig { .. }));
+        // With a command -> ok, generic kind.
+        let cfg = k
+            .configure_adapter_runtime(
+                &id,
+                Some(true),
+                Some("my-agent".to_string()),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(cfg.kind, AdapterKind::Command);
+        assert_eq!(cfg.resolved_command().as_deref(), Some("my-agent"));
+    }
+
+    /// Build a claude-cli agent + an assigned task ready to run.
+    fn cli_task(k: &mut KernelState) -> (AgentId, TaskId) {
+        let ns = NamespaceId::new("workspace");
+        let adapter = PluginId::new("relux-adapter-claude-cli");
+        let agent = k
+            .create_agent(
+                "coder",
+                "Coder",
+                "writes code",
+                &adapter,
+                &ns,
+                Some("You are careful.".to_string()),
+                vec![],
+            )
+            .unwrap();
+        let task = k.create_task(
+            "Summarize the repo",
+            serde_json::json!({ "path": "." }),
+            "founder",
+            &ns,
+            vec![],
+        );
+        k.assign_task(&task, &agent).unwrap();
+        (agent, task)
+    }
+
+    #[test]
+    fn execute_assigned_run_refuses_unconfigured_cli_adapter() {
+        let mut k = adapter_kernel();
+        let (_agent, task) = cli_task(&mut k);
+        let err = k.execute_assigned_run(&task).unwrap_err();
+        assert!(matches!(
+            err,
+            KernelError::AdapterRuntimeNotConfigured { .. }
+        ));
+        // The run and task are honestly marked failed (no fabricated success).
+        assert_eq!(k.task(&task).unwrap().status, TaskStatus::Failed);
+        assert!(k
+            .audit_log()
+            .iter()
+            .any(|e| e.action == "adapter:execute" && e.result == AuditResult::Failed));
+    }
+
+    #[test]
+    fn execute_assigned_run_refuses_disabled_cli_adapter() {
+        let mut k = adapter_kernel();
+        // Configure but leave disabled (default).
+        k.configure_adapter_runtime(
+            &PluginId::new("relux-adapter-claude-cli"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let (_agent, task) = cli_task(&mut k);
+        let err = k.execute_assigned_run(&task).unwrap_err();
+        assert!(matches!(err, KernelError::AdapterRuntimeDisabled { .. }));
+        assert_eq!(k.task(&task).unwrap().status, TaskStatus::Failed);
+    }
+
+    #[test]
+    fn execute_assigned_run_spawns_enabled_cli_adapter() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = write_fake_cli(dir.path(), "fake-claude", "RAN_OK_42");
+        let mut k = adapter_kernel();
+        // Enable the claude adapter, but override the binary with our fake CLI.
+        k.configure_adapter_runtime(
+            &PluginId::new("relux-adapter-claude-cli"),
+            Some(true),
+            Some(fake.to_string_lossy().to_string()),
+            Some(30),
+            Some(4096),
+            None,
+        )
+        .unwrap();
+        let (_agent, task) = cli_task(&mut k);
+        let run_id = k.execute_assigned_run(&task).expect("adapter run ok");
+
+        assert_eq!(k.task(&task).unwrap().status, TaskStatus::Completed);
+        assert_eq!(k.run(&run_id).unwrap().status, RunStatus::Completed);
+        // The transcript records the spawn and the (redacted) output.
+        let kinds: Vec<&str> = k.run_events(&run_id).iter().map(|e| e.kind.as_str()).collect();
+        assert!(kinds.contains(&"adapter_spawn"));
+        assert!(kinds.contains(&"adapter_output"));
+        assert!(k
+            .run(&run_id)
+            .unwrap()
+            .summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("RAN_OK_42"));
+        assert!(k
+            .audit_log()
+            .iter()
+            .any(|e| e.action == "adapter:execute" && e.result == AuditResult::Success));
+    }
+
+    #[test]
+    fn execute_assigned_run_still_echoes_for_local_prime() {
+        // A local-prime agent uses the deterministic echo path unchanged.
+        let (mut k, _prime, task, run, _echo) = primed_kernel();
+        let completed = k.execute_assigned_run(&task).expect("echo path ok");
+        assert_eq!(completed, run);
+        assert_eq!(k.task(&task).unwrap().status, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn adapter_runtime_status_reports_local_and_cli() {
+        let mut k = adapter_kernel();
+        let statuses = k.adapter_runtime_status();
+        // local-prime + claude-cli are both adapters.
+        let local = statuses
+            .iter()
+            .find(|s| s.plugin_id == "relux-adapter-local-prime")
+            .unwrap();
+        assert_eq!(local.state, AdapterRuntimeState::LocalDeterministic);
+        let claude = statuses
+            .iter()
+            .find(|s| s.plugin_id == "relux-adapter-claude-cli")
+            .unwrap();
+        // Disabled-by-default safe state before any configuration.
+        assert_eq!(claude.state, AdapterRuntimeState::NeedsConfiguration);
+        assert!(!claude.enabled);
+
+        // After enabling with a missing binary, status flips to MissingBinary.
+        k.configure_adapter_runtime(
+            &PluginId::new("relux-adapter-claude-cli"),
+            Some(true),
+            Some("relux-not-a-real-binary-xyz".to_string()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let claude = k
+            .adapter_runtime_status()
+            .into_iter()
+            .find(|s| s.plugin_id == "relux-adapter-claude-cli")
+            .unwrap();
+        assert_eq!(claude.state, AdapterRuntimeState::MissingBinary);
+        assert!(claude.enabled);
+        assert!(!claude.available_on_path);
     }
 }

@@ -138,6 +138,10 @@ async fn serve() -> Result<(), KernelError> {
     println!("   PUT    /v1/relux/plugins/:id/runtime      {{ \"base_url\":\"http://127.0.0.1:<port>\", \"enabled\"?, \"timeout_ms\"? }}");
     println!("   DELETE /v1/relux/plugins/:id/runtime      (clear runtime config)");
     println!("   DELETE /v1/relux/plugins/:id");
+    println!("   GET    /v1/relux/adapters                  (adapter plugins + CLI runtime status)");
+    println!("   GET    /v1/relux/adapters/:id/runtime");
+    println!("   PUT    /v1/relux/adapters/:id/runtime     {{ \"enabled\":true, \"command\"?, \"timeout_seconds\"?, \"max_output_bytes\"? }}");
+    println!("   DELETE /v1/relux/adapters/:id/runtime     (clear adapter runtime config)");
 
     // Start background autonomy loop
     let background_state = state.clone();
@@ -247,6 +251,15 @@ fn router(state: AppState) -> Router {
                 .delete(delete_plugin_runtime),
         )
         .route("/v1/relux/plugins/:id", delete(remove))
+        // Adapter runtime controls (local coding-agent CLIs).
+        .route("/v1/relux/adapters", get(list_adapters))
+        .route(
+            "/v1/relux/adapters/:id/runtime",
+            get(get_adapter_runtime)
+                .put(set_adapter_runtime)
+                .patch(set_adapter_runtime)
+                .delete(delete_adapter_runtime),
+        )
         // Relux Approvals and Permissions
         .route("/v1/relux/approvals", get(list_approvals))
         .route("/v1/relux/approvals/:id/decide", post(decide_approval))
@@ -814,20 +827,10 @@ async fn execute_assigned_task(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<ExecuteAssignedTaskResponse>, ApiError> {
     let task_id = relux_core::TaskId::new(id);
-    let run_id = locked_save(&state, |kernel| {
-        let status = kernel
-            .task(&task_id)
-            .ok_or_else(|| KernelError::UnknownTask(task_id.to_string()))?
-            .status
-            .clone();
-        if matches!(
-            status,
-            relux_core::TaskStatus::Created | relux_core::TaskStatus::Queued
-        ) {
-            kernel.start_run(&task_id)?;
-        }
-        kernel.execute_local_run(&task_id)
-    })?;
+    // Dispatch on the assigned agent's adapter: local Prime echoes; an enabled
+    // CLI adapter (Claude/Codex/generic) spawns its local binary; anything else
+    // fails honestly. The run/transcript is persisted either way.
+    let run_id = locked_save(&state, |kernel| kernel.execute_assigned_run(&task_id))?;
     Ok(Json(ExecuteAssignedTaskResponse { run_id }))
 }
 
@@ -1195,6 +1198,102 @@ async fn delete_plugin_runtime(
     Ok(Json(runtime_response(&id, None)))
 }
 
+// --- Adapter runtime (local coding-agent CLIs) -----------------------------
+
+/// GET `/v1/relux/adapters` - every installed Adapter plugin with its honest
+/// runtime status (`docs/RELUX_MASTER_PLAN.md` section 8.1, Adapter Runtime v1).
+/// No secrets - just kind/enabled/binary-on-PATH/limits.
+async fn list_adapters(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<relux_core::AdapterRuntimeStatus>>, ApiError> {
+    let adapters = locked_read(&state, |kernel| Ok(kernel.adapter_runtime_status()))?;
+    Ok(Json(adapters))
+}
+
+/// GET `/v1/relux/adapters/:id/runtime` - one adapter's runtime status. 404 when
+/// the plugin is not an installed Adapter.
+async fn get_adapter_runtime(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<relux_core::AdapterRuntimeStatus>, ApiError> {
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err(ApiError::bad_request("adapter id is required"));
+    }
+    let status = locked_read(&state, |kernel| {
+        kernel
+            .adapter_runtime_status()
+            .into_iter()
+            .find(|a| a.plugin_id == id)
+            .ok_or_else(|| KernelError::NotAnAdapter { plugin: id.clone() })
+    })?;
+    Ok(Json(status))
+}
+
+#[derive(Debug, Deserialize)]
+struct AdapterRuntimeReq {
+    /// Whether the CLI runtime is enabled. Omitted on a configure PUT means the
+    /// kernel keeps the prior value (or `false` on first configure).
+    enabled: Option<bool>,
+    /// Optional binary override (required for a generic command adapter).
+    command: Option<String>,
+    timeout_seconds: Option<u64>,
+    max_output_bytes: Option<u64>,
+    working_dir: Option<String>,
+}
+
+/// PUT/PATCH `/v1/relux/adapters/:id/runtime` - configure (or update) an
+/// adapter's local CLI runtime. Disabled by default; the local-prime adapter and
+/// non-Adapter plugins are refused. No secrets are accepted or stored.
+async fn set_adapter_runtime(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<AdapterRuntimeReq>,
+) -> Result<Json<relux_core::AdapterRuntimeStatus>, ApiError> {
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err(ApiError::bad_request("adapter id is required"));
+    }
+    let plugin_id = relux_core::PluginId::new(id.clone());
+    let status = locked_save(&state, |kernel| {
+        kernel.configure_adapter_runtime(
+            &plugin_id,
+            req.enabled,
+            req.command,
+            req.timeout_seconds,
+            req.max_output_bytes,
+            req.working_dir,
+        )?;
+        kernel
+            .adapter_runtime_status()
+            .into_iter()
+            .find(|a| a.plugin_id == id)
+            .ok_or_else(|| KernelError::NotAnAdapter { plugin: id.clone() })
+    })?;
+    Ok(Json(status))
+}
+
+/// DELETE `/v1/relux/adapters/:id/runtime` - clear an adapter's runtime config.
+async fn delete_adapter_runtime(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<relux_core::AdapterRuntimeStatus>, ApiError> {
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err(ApiError::bad_request("adapter id is required"));
+    }
+    let plugin_id = relux_core::PluginId::new(id.clone());
+    let status = locked_save(&state, |kernel| {
+        kernel.remove_adapter_runtime(&plugin_id)?;
+        kernel
+            .adapter_runtime_status()
+            .into_iter()
+            .find(|a| a.plugin_id == id)
+            .ok_or_else(|| KernelError::NotAnAdapter { plugin: id.clone() })
+    })?;
+    Ok(Json(status))
+}
+
 // --- Store access (serialized) ---------------------------------------------
 
 /// Lock, open the store, load + bootstrap, run `f`, then SAVE. For mutations.
@@ -1536,6 +1635,19 @@ fn status_for(err: &KernelError) -> StatusCode {
         | KernelError::UnknownAgent(_) => StatusCode::NOT_FOUND,
         KernelError::BundledPluginProtected(_) => StatusCode::CONFLICT,
         KernelError::RuntimeNotConfigured { .. } => StatusCode::NOT_FOUND,
+        // Adapter runtime errors, mapped honestly. "Not an adapter" / "not
+        // configured" are 404; disabled is a resolvable conflict (409); a missing
+        // binary the operator must install is 422; a failed/timed-out process is
+        // an upstream failure (502); a bad config is a 400.
+        KernelError::NotAnAdapter { .. } | KernelError::AdapterRuntimeNotConfigured { .. } => {
+            StatusCode::NOT_FOUND
+        }
+        KernelError::AdapterRuntimeDisabled { .. } => StatusCode::CONFLICT,
+        KernelError::AdapterBinaryMissing { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+        KernelError::AdapterExecutionFailed { .. } => StatusCode::BAD_GATEWAY,
+        KernelError::AdapterNotConfigurable { .. } | KernelError::InvalidAdapterConfig { .. } => {
+            StatusCode::BAD_REQUEST
+        }
         // A tool installed as metadata but with no runtime handler/config yet:
         // honest "not implemented", not a server fault or a fabricated success.
         KernelError::ToolRuntimeUnavailable { .. } => StatusCode::NOT_IMPLEMENTED,

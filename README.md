@@ -182,6 +182,79 @@ tools then show as `ready` in the Tools section and can be invoked from the
 existing invoke panel; unconfigured tools show `runtime not configured` with a
 configure affordance.
 
+### Adapter Runtime v1 (local coding-agent CLIs)
+
+An **Adapter** plugin decides how an assigned task runs. The bundled
+`relux-adapter-local-prime` runs the deterministic echo path. Adapter Runtime v1
+adds bundled adapters that drive a **local coding-agent CLI** you already have
+installed:
+
+- `relux-adapter-claude-cli` &rarr; runs `claude -p --permission-mode default`
+- `relux-adapter-codex-cli` &rarr; runs `codex exec`
+- any other Adapter plugin can be driven as a **generic command** by configuring
+  an explicit binary.
+
+Safe by construction:
+
+- **Disabled by default.** Relux never spawns a paid/interactive CLI unless you
+  explicitly enable that adapter's runtime (via CLI, API, or the dashboard).
+- **No bypass.** Relux uses the Claude CLI's safe `--permission-mode default` and
+  **never** passes `--dangerously-skip-permissions` or any danger/bypass flag.
+- **argv only, prompt on stdin.** Commands are built as an argv array (no shell);
+  the composed task prompt is fed on the child's stdin, so there is no arg-escaping
+  surface and it works the same for native binaries and Windows `.cmd` shims.
+- **Bounded + redacted.** Each run has a wall-clock timeout (the child is killed on
+  expiry) and a stdout/stderr byte cap; captured output is scrubbed of obvious
+  secrets before it is stored on the run transcript.
+- **Honest failures.** If the adapter is disabled, unconfigured, the binary is not
+  on PATH, it times out, or it exits non-zero, the run and task are marked
+  **failed** with the reason on the transcript &mdash; never a fabricated success.
+- **No secrets stored.** The per-adapter config holds only the kind/command,
+  enabled flag, timeout, output cap, and an optional working dir.
+
+The composed prompt includes the agent's name + persona and the task title/JSON
+input, and asks the CLI to do the work and report concisely. The local Prime
+adapter is not configurable here (it has no external binary). Prime autonomy keeps
+running only the deterministic local path &mdash; it never spawns a CLI.
+
+CLI:
+
+```powershell
+# List installed adapters + their runtime status (on-PATH, enabled, ...).
+relux-kernel adapters
+
+# Show one adapter's runtime status.
+relux-kernel adapter runtime relux-adapter-claude-cli
+
+# Enable a CLI adapter (optional overrides). Disabled by default until you do this.
+relux-kernel adapter runtime enable relux-adapter-claude-cli --timeout-seconds 120 --max-output-bytes 1000000
+relux-kernel adapter runtime enable relux-adapter-codex-cli
+
+# Disable it again (keeps the config so it can be re-enabled).
+relux-kernel adapter runtime disable relux-adapter-claude-cli
+```
+
+API:
+
+```text
+GET    /v1/relux/adapters                 # all adapters + runtime status (no secrets)
+GET    /v1/relux/adapters/:id/runtime     # one adapter's status
+PUT    /v1/relux/adapters/:id/runtime     # { "enabled":true, "command"?, "timeout_seconds"?, "max_output_bytes"?, "working_dir"? }
+PATCH  /v1/relux/adapters/:id/runtime     # partial update
+DELETE /v1/relux/adapters/:id/runtime     # clear the runtime config
+```
+
+A non-Adapter plugin or the local-prime adapter is refused (HTTP 400/404); a
+disabled adapter on execute returns HTTP 409; a missing binary returns HTTP 422; a
+failed/timed-out process returns HTTP 502.
+
+Dashboard: the **Crew** page has an **Adapters** section showing each adapter's
+status (local / disabled / enabled-ready / enabled-but-binary-missing) with an
+Enable/Disable control and the clear note that *Relux will run this local CLI when
+an assigned task starts*. On the **Work** page, the "Run (Assigned)" action now
+dispatches through the assigned agent's adapter, and the run detail shows the
+adapter's (redacted) output or the honest failure reason.
+
 ### First Local Release
 
 Use the local release check before cutting or sharing a Windows bundle:

@@ -1,0 +1,16 @@
+{
+  "id": "relux-adapter-claude-cli",
+  "name": "Relux Claude CLI Adapter",
+  "version": "0.1.0",
+  "kind": "Adapter",
+  "description": "Drives an assigned task through the locally installed Claude CLI in non-interactive print mode (claude -p ... --permission-mode default). Disabled by default; the operator must explicitly enable the adapter runtime. Relux never passes bypass/danger permission flags.",
+  "author": "Relux Labs",
+  "trust_level": "official",
+  "capabilities": {
+    "tools": [],
+    "permissions": [
+      "adapter:relux-adapter-claude-cli:run"
+    ]
+  },
+  "health": "unknown"
+}

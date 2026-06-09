@@ -1846,6 +1846,77 @@ a tool call; an installed-but-unimplemented tool is reported as not runnable her
 **arbitrary downloaded plugin runtime execution remains intentionally not
 implemented.**
 
+### Adapter Runtime v1 (local coding-agent CLIs)
+
+An Adapter plugin (§8.1) decides how an assigned task runs. The bundled
+`relux-adapter-local-prime` runs the deterministic echo path. Adapter Runtime v1
+adds bundled adapters that drive a **local coding-agent CLI** the operator already
+has installed, plus a generic command shape:
+
+- `relux-adapter-claude-cli` &rarr; `claude -p --permission-mode default`
+- `relux-adapter-codex-cli` &rarr; `codex exec`
+- any other installed Adapter plugin &rarr; a generic command (requires an
+  explicit binary).
+
+Safety properties (the product safety bar, §17.5):
+
+- **Disabled by default.** A CLI adapter never runs until the operator explicitly
+  enables its runtime (CLI/API/dashboard). Relux never silently spawns a paid or
+  interactive CLI.
+- **No bypass.** Relux uses the Claude CLI's safe `--permission-mode default` and
+  never passes `--dangerously-skip-permissions` or any danger/bypass flag.
+- **argv only; prompt on stdin.** Commands are argv arrays (no shell string
+  concatenation). The composed prompt (agent persona + task title/input) is fed on
+  the child's stdin, so there is no arg-escaping surface and it works uniformly for
+  native binaries and Windows `.cmd` shims.
+- **Bounded + redacted.** Per-run wall-clock timeout (the child is killed on
+  expiry), stdout/stderr byte cap, stderr capture, and obvious-secret redaction
+  before output is persisted to the run transcript.
+- **Permission/audit/run-event tracked.** Starting the run is permission-checked
+  (`start_run`); the spawn, output, and every honest failure are written to the
+  run transcript and the audit log.
+- **Honest failures.** Disabled, unconfigured, missing binary, timeout, or
+  non-zero exit marks the run AND task failed with the reason &mdash; never a
+  fabricated success.
+- **No secrets stored.** The per-adapter config persists only kind/command, the
+  enabled flag, timeout, output cap, and an optional working dir.
+
+Execution dispatch: `KernelState::execute_assigned_run` resolves the assigned
+agent's adapter. The local-prime adapter runs the existing deterministic echo
+path; a recognized/enabled CLI adapter spawns its local binary via
+`relux_kernel::adapter`; anything else fails honestly. The Work page's
+"Run (Assigned)" action and the `task run-assigned` CLI both route through this
+dispatcher. **Prime autonomy is unchanged**: it still runs only the deterministic
+local path and never spawns a CLI (§17, "autonomy does not call paid LLMs").
+
+CLI:
+
+```powershell
+relux-kernel adapters
+relux-kernel adapter runtime <adapter-id>
+relux-kernel adapter runtime enable <adapter-id> [--timeout-seconds N] [--max-output-bytes N] [--command C] [--working-dir D]
+relux-kernel adapter runtime disable <adapter-id>
+```
+
+API:
+
+```text
+GET    /v1/relux/adapters
+GET    /v1/relux/adapters/:id/runtime
+PUT    /v1/relux/adapters/:id/runtime    { "enabled", "command"?, "timeout_seconds"?, "max_output_bytes"?, "working_dir"? }
+PATCH  /v1/relux/adapters/:id/runtime
+DELETE /v1/relux/adapters/:id/runtime
+```
+
+Dashboard: the Crew page has an Adapters section with each adapter's honest status
+(local / disabled / enabled-ready / enabled-but-binary-missing) and an
+Enable/Disable control carrying the explicit note that Relux will run the local CLI
+when an assigned task starts.
+
+Adapters supported/detected in v1: `relux-adapter-claude-cli` (Claude CLI),
+`relux-adapter-codex-cli` (Codex CLI), and a generic command adapter. Detection
+probes `PATH` (and `PATHEXT` on Windows) read-only for the configured binary.
+
 ### Optional LLM-backed Prime (OpenRouter)
 
 As of Phase 2.1, Prime can optionally use an LLM (via OpenRouter) to shape its
@@ -1880,7 +1951,14 @@ The API never returns the key. The dashboard shows the current AI provider/mode.
   HTTP server (Plugin Runtime v1). Relux still does NOT auto-run downloaded plugin
   code: it never shells out, never runs GitHub/zip/folder install code in-process,
   and never calls a remote host - a plugin becomes executable only via an
-  operator-run `http://127.0.0.1|localhost|[::1]:<port>` endpoint. Adapter and
-  execution-environment runtimes remain not implemented yet.
+  operator-run `http://127.0.0.1|localhost|[::1]:<port>` endpoint.
+- Adapter Runtime v1 can drive an assigned task through a local coding-agent CLI
+  (Claude CLI, Codex CLI, or a generic command), but only when the operator
+  explicitly enables that adapter (disabled by default) and the binary is on PATH.
+  Relux runs the CLI non-interactively with a safe, non-bypass permission mode and
+  never passes `--dangerously-skip-permissions`. It does not parse the CLI's output
+  into structured tool calls, stream events live, or resume a partial CLI run; the
+  run records the CLI's (redacted, capped) output and an honest pass/fail.
+  Execution-environment runtimes remain not implemented yet.
 - The standalone API is local-only and unauthenticated by design; it binds
   loopback. It is not a multi-user or production surface.
