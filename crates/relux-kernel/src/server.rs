@@ -125,6 +125,7 @@ async fn serve() -> Result<(), KernelError> {
     println!("   POST   /v1/relux/prime                     {{ \"message\": \"...\" }}");
     println!("   POST   /v1/relux/tasks                     {{ \"title\": \"...\" }}");
     println!("   POST   /v1/relux/tasks/:id/start");
+    println!("   POST   /v1/relux/tasks/:id/execute-assigned");
     println!("   GET    /v1/relux/plugins");
     println!("   POST   /v1/relux/plugins/install-github   {{ \"url\": \"https://github.com/...\" }}");
     println!("   POST   /v1/relux/plugins/install-zip      (multipart field: file)");
@@ -167,6 +168,7 @@ fn router(state: AppState) -> Router {
         .route("/v1/relux/audit", get(list_audit_events))
         .route("/v1/relux/health", get(get_health))
         .route("/v1/relux/tasks/:id/start", post(start_task))
+        .route("/v1/relux/tasks/:id/execute-assigned", post(execute_assigned_task))
         .route("/v1/relux/tasks/:id/assign", post(assign_task_to_agent))
         .route("/v1/relux/plugins", get(list_plugins))
         .route("/v1/relux/plugins/install-dir", post(install_dir))
@@ -644,6 +646,33 @@ async fn start_task(
         Ok((task, run))
     })?;
     Ok(Json(StartTaskResponse { task, run }))
+}
+
+#[derive(Debug, Serialize)]
+struct ExecuteAssignedTaskResponse {
+    run_id: relux_core::RunId,
+}
+
+async fn execute_assigned_task(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<ExecuteAssignedTaskResponse>, ApiError> {
+    let task_id = relux_core::TaskId::new(id);
+    let run_id = locked_save(&state, |kernel| {
+        let status = kernel
+            .task(&task_id)
+            .ok_or_else(|| KernelError::UnknownTask(task_id.to_string()))?
+            .status
+            .clone();
+        if matches!(
+            status,
+            relux_core::TaskStatus::Created | relux_core::TaskStatus::Queued
+        ) {
+            kernel.start_run(&task_id)?;
+        }
+        kernel.execute_local_run(&task_id)
+    })?;
+    Ok(Json(ExecuteAssignedTaskResponse { run_id }))
 }
 
 #[derive(Debug, Deserialize)]

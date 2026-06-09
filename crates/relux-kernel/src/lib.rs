@@ -68,6 +68,8 @@ pub enum KernelError {
     UnknownTask(String),
     #[error("unknown run: {0}")]
     UnknownRun(String),
+    #[error("no active run found for task: {0}")]
+    NoActiveRun(String),
     #[error("unknown approval: {0}")]
     UnknownApproval(String),
     #[error("task {0} has no assigned agent")]

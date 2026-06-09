@@ -1390,6 +1390,12 @@ export interface ReluxTask {
 export interface ReluxAgent {
   id: string;
   name: string;
+  description: string;
+  adapter_plugin: string;
+  namespace: string;
+  status: string;
+  permissions_summary: string;
+  created_at: string;
 }
 
 export interface ReluxRun {
@@ -1447,6 +1453,10 @@ export const reluxWork = {
   // Assign a task to an agent.
   assignTask: (taskId: string, agentId: string) =>
     api.post<ReluxTask>(`/v1/relux/tasks/${encodeURIComponent(taskId)}/assign`, { agent_id: agentId }),
+
+  // Execute a running task locally as its assigned agent.
+  executeAssignedTask: (id: string) =>
+    api.post<{ run_id: string }>(`/v1/relux/tasks/${encodeURIComponent(id)}/execute-assigned`),
 };
 
 export const reluxAudit = {

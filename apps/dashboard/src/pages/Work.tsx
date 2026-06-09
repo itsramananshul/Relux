@@ -187,14 +187,33 @@ function Column({ title, tasks, onAction, onInspectTask, agents }: { title: stri
 function TaskCard({ task, onAction, onInspectTask, agents }: { task: ReluxTask; onAction: () => void; onInspectTask: (taskId: string) => void; agents: ReluxAgent[] }) {
   const [busy, setBusy] = useState(false);
   const [selectedAgent, setSelectedAgent] = useState(task.assigned_agent || "");
-  
-  async function start() {
+
+  const assignedAgent = useMemo(() => agents.find(a => a.id === task.assigned_agent), [agents, task.assigned_agent]);
+
+  async function startRun() {
     setBusy(true);
     try {
       await reluxWork.startTask(task.id);
-      onAction();
+      onAction(); // Reload tasks to reflect the change to Running
     } catch (e) {
       alert(e instanceof Error ? e.message : "Start failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function executeAssignedRun() {
+    setBusy(true);
+    try {
+      if (task.status === "created" || task.status === "queued") {
+        // If task is created/queued, first start the run (moves it to Running status)
+        await reluxWork.startTask(task.id);
+      }
+      // Then execute the run, which will complete it
+      await reluxWork.executeAssignedTask(task.id);
+      onAction(); // Reload tasks to reflect the completion
+    } catch (e) {
+      alert(e instanceof Error ? e.message : "Execution failed");
     } finally {
       setBusy(false);
     }
@@ -212,7 +231,8 @@ function TaskCard({ task, onAction, onInspectTask, agents }: { task: ReluxTask; 
     }
   }
 
-  const isStartable = task.status === "created" || task.status === "queued";
+  const isAssigned = !!task.assigned_agent;
+  const isRunnableByAssignedAgent = isAssigned && (task.status === "queued" || task.status === "running");
 
   return (
     <div className="card sm" style={{ padding: 12, border: "1px solid var(--border)" }}>
@@ -225,8 +245,8 @@ function TaskCard({ task, onAction, onInspectTask, agents }: { task: ReluxTask; 
       </div>
       <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 10, lineHeight: 1.4 }}>{task.title}</div>
       <div className="row" style={{ alignItems: "center", flexWrap: "wrap", gap: 8 }}>
-        {task.assignee_name ? (
-          <div className="mono muted" style={{ fontSize: 10 }}>Assigned: {task.assignee_name}</div>
+        {isAssigned ? (
+          <div className="mono muted" style={{ fontSize: 10 }}>Assigned: {assignedAgent?.name || task.assigned_agent}</div>
         ) : (
           <select
             className="input sm"
@@ -249,9 +269,14 @@ function TaskCard({ task, onAction, onInspectTask, agents }: { task: ReluxTask; 
           </select>
         )}
         <div className="spacer" style={{ flex: 1 }} />
-        {isStartable && (
-          <button className="btn sm" style={{ height: 24, padding: "0 8px" }} onClick={() => void start()} disabled={busy}>
-            {busy ? "..." : "Start"}
+        {(task.status === "created" || task.status === "queued") && !isAssigned && (
+          <button className="btn sm" style={{ height: 24, padding: "0 8px" }} onClick={() => void startRun()} disabled={busy}>
+            {busy ? "..." : "Start (Prime)"}
+          </button>
+        )}
+        {isRunnableByAssignedAgent && (
+          <button className="btn sm" style={{ height: 24, padding: "0 8px" }} onClick={() => void executeAssignedRun()} disabled={busy}>
+            {busy ? "..." : "Run (Assigned)"}
           </button>
         )}
         <button className="btn ghost sm" style={{ height: 24, padding: "0 8px" }} onClick={() => onInspectTask(task.id)}>Inspect</button>

@@ -1,17 +1,9 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { useLoaderData } from "react-router-dom";
-import { fetchJson, postJson } from "../api";
+import { fetchJson, postJson, reluxWork, type ReluxAgent, type ReluxTask } from "../api";
+import { useAsync } from "../components/common";
 
-interface Agent {
-  id: string;
-  name: string;
-  description: string;
-  adapter_plugin: string;
-  namespace: string;
-  status: string;
-  permissions_summary: string;
-  created_at: string;
-}
+type Agent = ReluxAgent;
 
 export async function loader() {
   return await fetchJson("/v1/relux/agents");
@@ -24,10 +16,36 @@ export function Crew() {
   const [role, setRole] = useState("");
   const [error, setError] = useState<string | null>(null);
 
+  const { data: tasks, error: tasksError, reload: reloadTasks } = useAsync<ReluxTask[]>(
+    () => reluxWork.listTasks(),
+    [],
+  );
+
+  const agentTaskCounts = useMemo(() => {
+    const counts: Record<string, { queued: number; running: number }> = {};
+    if (tasks) {
+      for (const task of tasks) {
+        if (task.assigned_agent) {
+          if (!counts[task.assigned_agent]) {
+            counts[task.assigned_agent] = { queued: 0, running: 0 };
+          }
+          if (task.status === "queued") {
+            counts[task.assigned_agent].queued++;
+          } else if (task.status === "running") {
+            counts[task.assigned_agent].running++;
+          }
+        }
+      }
+    }
+    return counts;
+  }, [tasks]);
+
+
   const fetchAgents = async () => {
     try {
       const data = (await fetchJson("/v1/relux/agents")) as Agent[];
       setAgents(data);
+      void reloadTasks(); // Also reload tasks to update counts for agents
     } catch (err) {
       console.error("Failed to fetch agents:", err);
       setError("Failed to load agents.");
@@ -57,6 +75,11 @@ export function Crew() {
       <div className="section">
         <h2>Your Crew</h2>
         {error && <div className="error-message">{error}</div>}
+        {tasksError && (
+          <div className="error-message">
+            Error loading tasks: {String(tasksError)}
+          </div>
+        )}
         <div className="agent-list">
           {agents.length === 0 ? (
             <p>No agents found. Create one below!</p>
@@ -68,6 +91,8 @@ export function Crew() {
                 <p><strong>Status:</strong> {agent.status}</p>
                 <p><strong>Adapter:</strong> {agent.adapter_plugin}</p>
                 <p><strong>Permissions:</strong> {agent.permissions_summary}</p>
+                <p><strong>Queued Tasks:</strong> {agentTaskCounts[agent.id]?.queued || 0}</p>
+                <p><strong>Running Tasks:</strong> {agentTaskCounts[agent.id]?.running || 0}</p>
                 <p className="created-at">Created: {new Date(agent.created_at).toLocaleString()}</p>
               </div>
             ))

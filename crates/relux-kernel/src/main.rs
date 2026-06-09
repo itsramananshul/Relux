@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use relux_core::namespace::NamespaceKind;
-use relux_core::{AgentId, NamespaceId, Permission, PluginId, PluginSourceKind, PrimeContext};
+use relux_core::{
+    AgentId, NamespaceId, Permission, PluginId, PluginSourceKind, PrimeContext, TaskId, TaskStatus,
+};
 use relux_kernel::{
     install_from_dir, install_from_github, install_from_zip, load_plugin_manifests, remove_plugin,
     KernelError, KernelState, SqliteStore,
@@ -69,6 +71,7 @@ fn main() -> ExitCode {
         Some((cmd, _)) if cmd == "reset-local" => run_reset_local(),
         Some((cmd, _)) if cmd == "plugins" => run_plugins_list(),
         Some((cmd, rest)) if cmd == "plugin" => run_plugin_subcommand(rest),
+        Some((cmd, rest)) if cmd == "task" => run_task_subcommand(rest),
         _ => run_demo(),
     };
     match result {
@@ -78,6 +81,40 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn run_task_subcommand(args: &[String]) -> Result<(), KernelError> {
+    match args.split_first() {
+        Some((sub, rest)) if sub == "run-assigned" => {
+            let task_id_str = first_arg(rest, "task run-assigned <task_id>")?;
+            run_assigned_task(&task_id_str)
+        }
+        _ => Err(KernelError::Storage(
+            "usage: relux-kernel task <run-assigned> <task_id>".to_string(),
+        )),
+    }
+}
+
+fn run_assigned_task(task_id_str: &str) -> Result<(), KernelError> {
+    let task_id = TaskId::new(task_id_str);
+    let path = db_path();
+    let mut store = SqliteStore::open(&path)?;
+    let mut kernel = store.load()?;
+    ensure_bootstrapped(&mut kernel)?;
+
+    let status = kernel
+        .task(&task_id)
+        .ok_or_else(|| KernelError::UnknownTask(task_id.to_string()))?
+        .status
+        .clone();
+    if matches!(status, TaskStatus::Created | TaskStatus::Queued) {
+        kernel.start_run(&task_id)?;
+    }
+    let run_id = kernel.execute_local_run(&task_id)?;
+    store.save(&kernel)?;
+
+    println!("Successfully executed task {} as assigned agent. New run: {}", task_id, run_id);
+    Ok(())
 }
 
 /// Print local Relux health. Exits 0 on PASS, 1 on WARN, 2 on FAIL.
@@ -537,7 +574,7 @@ fn run_demo() -> Result<(), KernelError> {
     }
     println!();
 
-    let echo_plugin = PluginId::new("relux-tools-echo");
+
     let prime_adapter = PluginId::new("relux-adapter-local-prime");
     let echo_permission = Permission::new("tool:relux-tools-echo:say")
         .expect("static echo permission is well-formed");
@@ -577,16 +614,12 @@ fn run_demo() -> Result<(), KernelError> {
     let run = kernel.start_run(&task)?;
     println!("[5] Started run {run}");
 
-    // 6. Prime calls the echo tool through the kernel. The kernel checks the
-    //    permission, routes to the ToolSet plugin, and the tool echoes the input.
-    let input = serde_json::json!({ "message": "hello relux" });
-    let output = kernel.call_tool(&run, &prime, &echo_plugin, "echo.say", input)?;
-    println!("[6] Prime called echo.say -> {output}");
+    // 6. Execute the run locally using the new mechanism (echo tool, complete run/task).
+    kernel.execute_local_run(&task)?; // This implicitly performs echo.say, completes run, and task
+    println!("[6] Executed run {run} locally as assigned agent (echo.say, completed).");
 
-    // 7. Complete the run and the task.
-    kernel.complete_run(&run, "echo.say returned the input unchanged")?;
-    kernel.complete_task(&task)?;
-    println!("[7] Completed run {run} and task {task}
+    // No separate step 7 needed, as execute_local_run completes both run and task.
+    println!("[7] Completed run {run} and task {task} (via local execution)
 ");
 
     // --- Prime chat: the first Prime Core slice (master plan section 10, section 16) ----

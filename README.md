@@ -34,6 +34,7 @@ Relux API:       http://127.0.0.1:19891/v1/relux/state
 
 Also available:
   GET /v1/relux/tasks/:id
+  POST /v1/relux/tasks/:id/execute-assigned
   GET /v1/relux/runs/:id
   GET /v1/relux/runs/:id/events
   GET /v1/relux/audit?limit=N
@@ -59,7 +60,7 @@ create crew members, and delegate tasks to agents, manage **work** (tasks and
 runs, including detailed views and audit logs), manage **crew** (agents), and
 install **plugins** - all backed by the local `/v1/relux` API, with no
 dependency on the legacy Relix bridge. It now also includes dedicated surfaces
-for managing pending approvals and granting permissions to agents.
+for managing pending approvals and granting permissions to agents. Delegated tasks can now be run by their assigned agent through the Work page, the API, or the CLI.
 The served bundle is the committed build under
 `crates/relix-web-bridge/dashboard-dist` (rebuild with `npm run build` in
 `apps/dashboard`). See [`docs/RELUX_MASTER_PLAN.md`](docs/RELUX_MASTER_PLAN.md)

@@ -528,7 +528,7 @@ impl KernelState {
     /// (`docs/RELUX_MASTER_PLAN.md` section 9.6, section 13.6). The run inherits the assigned
     /// agent's adapter plugin and the task moves to `Running`.
     pub fn start_run(&mut self, task_id: &TaskId) -> Result<RunId, KernelError> {
-        let (agent_id, namespace) = {
+        let (agent_id, namespace, required_permissions) = {
             let task = self
                 .tasks
                 .get(task_id)
@@ -537,14 +537,39 @@ impl KernelState {
                 .assigned_agent
                 .clone()
                 .ok_or_else(|| KernelError::TaskNotAssigned(task_id.to_string()))?;
-            (agent_id, task.namespace_id.clone())
+            (agent_id, task.namespace_id.clone(), task.required_permissions.clone())
         };
-        let adapter_plugin = self
+
+        let agent = self
             .agents
             .get(&agent_id)
-            .ok_or_else(|| KernelError::UnknownAgent(agent_id.to_string()))?
-            .adapter_plugin
-            .clone();
+            .ok_or_else(|| KernelError::UnknownAgent(agent_id.to_string()))?;
+
+        // --- Permission check: Agent must have all permissions required by the task ---
+        for required_perm in &required_permissions {
+            if !agent.permissions.iter().any(|p| p.matches_exact(required_perm)) {
+                self.record_audit(
+                    "agent",
+                    agent_id.as_str(),
+                    "task:start_run",
+                    Some("run"),
+                    None, // No run_id yet
+                    Some(&namespace),
+                    AuditResult::Denied,
+                    serde_json::json!({
+                        "task": task_id.as_str(),
+                        "reason": format!("agent lacks required permission: {}", required_perm.as_str())
+                    }),
+                );
+                return Err(KernelError::PermissionDenied {
+                    agent: agent_id.to_string(),
+                    permission: required_perm.to_string(),
+                });
+            }
+        }
+        // --- End permission check ---
+
+        let adapter_plugin = agent.adapter_plugin.clone();
 
         self.next_run += 1;
         let run_id = RunId::new(format!("run_{:04}", self.next_run));
@@ -1032,19 +1057,9 @@ impl KernelState {
                 self.assign_task(&task, &ctx.agent)?;
                 let run = self.start_run(&task)?;
 
-                // Perform the echo cycle on the task's own input, so the loop
-                // proves the real payload round-trips rather than a fixed string.
-                let echo_plugin = PluginId::new("relux-tools-echo");
-                let input = self
-                    .task(&task)
-                    .map(|t| t.input.clone())
-                    .unwrap_or_else(|| serde_json::json!({ "prime_request": title }));
-                self.call_tool(&run, &ctx.agent, &echo_plugin, "echo.say", input)?;
-                self.complete_run(&run, "echo.say returned the input unchanged")?;
-                self.complete_task(&task)?;
-
-                let reply =
-                    format!("{text} Created {task}, started {run}, and completed the echo cycle.");
+                let reply = format!(
+                    "{text} Created {task} and started {run}. The task is now running and awaiting further action from the assigned agent."
+                );
                 Ok(PrimeTurn {
                     intent,
                     reply,
@@ -1060,17 +1075,9 @@ impl KernelState {
                 let tid = TaskId::new(task_id.clone());
                 let run = self.start_run(&tid)?;
 
-                // Plain start it on one queued task also completes run and task through echo.
-                let echo_plugin = PluginId::new("relux-tools-echo");
-                let input = self
-                    .task(&tid)
-                    .map(|t| t.input.clone())
-                    .unwrap_or_else(|| serde_json::json!({}));
-                self.call_tool(&run, &ctx.agent, &echo_plugin, "echo.say", input)?;
-                self.complete_run(&run, "echo.say returned the input unchanged")?;
-                self.complete_task(&tid)?;
-
-                let reply = format!("{text} Started {run} and completed the echo cycle.");
+                let reply = format!(
+                    "{text} Started {run}. The task is now running and awaiting further action from the assigned agent."
+                );
                 Ok(PrimeTurn {
                     intent,
                     reply,
@@ -1139,6 +1146,35 @@ impl KernelState {
                 approval: None,
             }),
         }
+    }
+
+    /// Executes a running task locally using the echo tool and completes it.
+    /// This is a temporary deterministic local execution path for MVP.
+    pub fn execute_local_run(&mut self, task_id: &TaskId) -> Result<RunId, KernelError> {
+        let task = self.task(task_id).ok_or_else(|| KernelError::UnknownTask(task_id.to_string()))?;
+        let assigned_agent_id = task.assigned_agent.clone().ok_or_else(|| KernelError::TaskNotAssigned(task_id.to_string()))?;
+
+        // Find the most recent run for this task that is currently running
+        let run_id = self.runs.values()
+            .filter(|r| r.task_id == *task_id && r.status == RunStatus::Running)
+            .max_by_key(|r| r.started_at.clone())
+            .map(|r| r.id.clone())
+            .ok_or_else(|| KernelError::NoActiveRun(task_id.to_string()))?;
+
+        let agent = self.agent(&assigned_agent_id).ok_or_else(|| KernelError::UnknownAgent(assigned_agent_id.to_string()))?;
+        let agent_id_for_call = agent.id.clone();
+
+        // Perform the echo cycle on the task's own input.
+        let echo_plugin = PluginId::new("relux-tools-echo");
+        let input = self.task(task_id)
+            .map(|t| t.input.clone())
+            .unwrap_or_else(|| serde_json::json!({})); // Fallback to empty JSON if no input
+
+        self.call_tool(&run_id, &agent_id_for_call, &echo_plugin, "echo.say", input)?;
+        self.complete_run(&run_id, "echo.say returned the input unchanged")?;
+        self.complete_task(task_id)?;
+
+        Ok(run_id)
     }
 
     // --- Inspection --------------------------------------------------------
@@ -1461,6 +1497,103 @@ mod tests {
     }
 
     #[test]
+    fn execute_local_run_completes_task_and_run() {
+        let (mut k, _prime, task, run, _echo) = primed_kernel(); // primed_kernel sets up a run, but it's not completed by default anymore
+
+        // Before calling execute_local_run, the run and task should be Running
+        assert_eq!(k.task(&task).unwrap().status, TaskStatus::Running);
+        assert_eq!(k.run(&run).unwrap().status, RunStatus::Running);
+
+        // Execute the run locally
+        let completed_run_id = k.execute_local_run(&task).expect("local run should succeed");
+        assert_eq!(completed_run_id, run);
+
+        // After local execution, the run and task should be Completed
+        assert_eq!(k.task(&task).unwrap().status, TaskStatus::Completed);
+        assert_eq!(k.run(&run).unwrap().status, RunStatus::Completed);
+
+        // Verify run transcript
+        let kinds: Vec<&str> = k.run_events(&run).iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["run_started", "tool_call", "run_completed"]);
+
+        // Verify audit log for tool call and run completion
+        assert!(k
+            .audit_log()
+            .iter()
+            .any(|e| e.action == "tool:relux-tools-echo:say" && e.result == AuditResult::Success));
+        assert!(k
+            .audit_log()
+            .iter()
+            .any(|e| e.action == "run:complete" && e.result == AuditResult::Success));
+
+        // Negative test: calling execute_local_run on a completed task should fail
+        let err = k.execute_local_run(&task).unwrap_err();
+        assert!(matches!(err, KernelError::NoActiveRun(_)));
+    }
+
+    #[test]
+    fn unpermissioned_start_run_is_denied_and_audited() {
+        let mut k = KernelState::new();
+        k.register_plugin(echo_manifest());
+        k.register_plugin(adapter_manifest());        let ns = k.create_namespace("workspace", "Workspace", NamespaceKind::Personal);
+        let adapter = PluginId::new("relux-adapter-local-prime");
+
+        // Agent with no permissions
+        let weak_agent = k
+            .create_agent("weak", "Weak Agent", "no perms", &adapter, &ns, None, vec![])
+            .unwrap();
+
+        // Task with required permissions
+        let echo_permission = Permission::new("tool:relux-tools-echo:say").unwrap();
+        let task = k.create_task(
+            "Task requiring echo",
+            serde_json::json!({ "message": "hello" }),
+            "founder",
+            &ns,
+            vec![echo_permission.clone()],
+        );
+        k.assign_task(&task, &weak_agent).unwrap();
+
+        // Attempt to start run with unpermissioned agent
+        let err = k.start_run(&task).unwrap_err();
+        assert!(
+            matches!(err, KernelError::PermissionDenied { .. }),
+            "Expected PermissionDenied, got {:?}", err
+        );
+
+        // Verify audit log records denial
+        assert!(k
+            .audit_log()
+            .iter()
+            .any(|e| e.action == "task:start_run" && e.result == AuditResult::Denied));
+
+        // Agent with permission, task without assigned agent
+        let _strong_agent = k
+            .create_agent("strong", "Strong Agent", "has perms", &adapter, &ns, None, vec![echo_permission])
+            .unwrap();
+        let unassigned_task = k.create_task(
+            "Unassigned task",
+            serde_json::json!({ "message": "hello" }),
+            "founder",
+            &ns,
+            vec![],
+        );
+        let err = k.start_run(&unassigned_task).unwrap_err();
+        assert!(
+            matches!(err, KernelError::TaskNotAssigned(_)),
+            "Expected TaskNotAssigned, got {:?}", err
+        );
+
+        // Try execute_local_run on an unassigned task
+        let err = k.execute_local_run(&unassigned_task).unwrap_err();
+        assert!(
+            matches!(err, KernelError::TaskNotAssigned(_)),
+            "Expected TaskNotAssigned, got {:?}", err
+        );
+
+    }
+
+    #[test]
     fn unpermissioned_tool_call_is_denied_and_audited() {
         let (mut k, _prime, _task, run, echo) = primed_kernel();
 
@@ -1482,7 +1615,7 @@ mod tests {
         assert!(k
             .audit_log()
             .iter()
-            .any(|e| e.result == AuditResult::Denied));
+            .any(|e| e.action == "tool:relux-tools-echo:say" && e.result == AuditResult::Denied));
     }
 
     #[test]
@@ -1571,9 +1704,9 @@ mod tests {
         let started = k.prime_turn(&ctx, "start it").unwrap();
         assert_eq!(started.disposition, PrimeDisposition::Executed);
         let run_id = started.started_run.expect("a run was started");
-        // start it now completes the task.
-        assert_eq!(k.run(&run_id).unwrap().status, RunStatus::Completed);
-        assert_eq!(k.task(&task_id).unwrap().status, TaskStatus::Completed);
+        // start it now only starts the run, does not complete it.
+        assert_eq!(k.run(&run_id).unwrap().status, RunStatus::Running);
+        assert_eq!(k.task(&task_id).unwrap().status, TaskStatus::Running);
     }
 
     #[test]
@@ -1587,16 +1720,16 @@ mod tests {
         let task_id = turn.created_task.expect("a task was created");
         let run_id = turn.started_run.expect("a run was started");
 
-        assert_eq!(k.task(&task_id).unwrap().status, TaskStatus::Completed);
-        assert_eq!(k.run(&run_id).unwrap().status, RunStatus::Completed);
+        assert_eq!(k.task(&task_id).unwrap().status, TaskStatus::Running);
+        assert_eq!(k.run(&run_id).unwrap().status, RunStatus::Running);
 
-        // Transcript shows full cycle
+        // Transcript shows run_started event, but no tool_call or run_completed yet
         let kinds: Vec<&str> = k
             .run_events(&run_id)
             .iter()
             .map(|e| e.kind.as_str())
             .collect();
-        assert_eq!(kinds, vec!["run_started", "tool_call", "run_completed"]);
+        assert_eq!(kinds, vec!["run_started"]);
     }
 
     #[test]
@@ -1667,8 +1800,8 @@ mod tests {
         assert_eq!(restored.agent_count(), k.agent_count());
         assert_eq!(restored.task_count(), k.task_count());
         assert_eq!(restored.run_count(), k.run_count());
-        assert_eq!(restored.task(&task).unwrap().status, TaskStatus::Completed);
-        assert_eq!(restored.run(&run).unwrap().status, RunStatus::Completed);
+        assert_eq!(restored.task(&task).unwrap().status, TaskStatus::Running);
+        assert_eq!(restored.run(&run).unwrap().status, RunStatus::Running);
         assert_eq!(restored.run_events(&run).len(), k.run_events(&run).len());
         assert_eq!(restored.audit_log().len(), k.audit_log().len());
 

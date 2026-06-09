@@ -1635,6 +1635,7 @@ Relux API:       http://127.0.0.1:19891/v1/relux/state
 Also available:
   GET /v1/relux/health
   GET /v1/relux/tasks/:id
+  POST /v1/relux/tasks/:id/execute-assigned
   GET /v1/relux/runs/:id
   GET /v1/relux/runs/:id/events
   GET /v1/relux/audit?limit=N
@@ -1653,8 +1654,8 @@ backed only by the local `/v1/relux` API:
   awaiting approval (section 10). Endpoint: `POST /v1/relux/prime { "message":
   "..." }`.
 - **Work** - standalone task board and execution history. Backed by the
-  `/v1/relux/tasks` and `/v1/relux/runs` endpoints; allows creating tasks
-  and starting runs directly from the board.
+  `/v1/relux/tasks` and `/v1/relux/runs` endpoints; allows creating tasks,
+  starting runs directly from the board, and running delegated tasks as their assigned agent.
 - **Crew** - create and manage local agents.
 - **Plugins** - install/remove plugins through the durable lifecycle
   (`/v1/relux/plugins/*`).
