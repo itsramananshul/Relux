@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import { reluxAi, reluxPrime, type ReluxAiStatus, type ReluxPrimeTurn } from "../api";
 
 // Prime page (RELUX_MASTER_PLAN section 10 Prime Behavior, section 11.1 Prime Chat): the
@@ -174,15 +175,15 @@ function PrimeTurnCard({ turn }: { turn: ReluxPrimeTurn }) {
       <div style={{ whiteSpace: "pre-wrap" }}>{turn.reply}</div>
 
       {(turn.created_task || turn.started_run || turn.approval) && (
-        <div className="row wrap" style={{ gap: 10, marginTop: 8, fontSize: 11 }}>
+        <div className="row wrap" style={{ gap: 10, marginTop: 10, fontSize: 11 }}>
           {turn.created_task && (
             <span className="muted">
-              task <span className="mono">{turn.created_task}</span>
+              task <Link to="/work" className="mono" title="View on work board">{turn.created_task}</Link>
             </span>
           )}
           {turn.started_run && (
             <span className="muted">
-              run <span className="mono">{turn.started_run}</span>
+              run <Link to="/work" className="mono" title="View execution history">{turn.started_run}</Link>
             </span>
           )}
           {turn.approval && (

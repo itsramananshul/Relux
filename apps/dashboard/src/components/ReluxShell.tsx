@@ -19,6 +19,7 @@ interface NavEntry {
 const RELUX_NAV: NavEntry[] = [
   { to: "/", label: "Home", icon: "◈" },
   { to: "/prime", label: "Prime", icon: "✦" },
+  { to: "/work", label: "Work", icon: "⚙" },
   { to: "/plugins", label: "Plugins", icon: "#" },
 ];
 
@@ -35,6 +36,7 @@ const LEGACY_NAV: NavEntry[] = [
 const TITLES: Record<string, { title: string; sub: string }> = {
   "/": { title: "Relux", sub: "Local control plane - Prime, plugins, tasks, runs" },
   "/prime": { title: "Prime", sub: "Talk to your local operator" },
+  "/work": { title: "Work", sub: "Manage tasks and view execution history" },
   "/plugins": { title: "Plugins", sub: "Capabilities installed in the control plane" },
 };
 

@@ -115,9 +115,12 @@ async fn serve() -> Result<(), KernelError> {
     println!("   GET    /dashboard                          (standalone Relux shell)");
     println!("   GET    /v1/relux/state");
     println!("   GET    /v1/relux/ai/status");
-    println!("   GET    /v1/relux/plugins");
+    println!("   GET    /v1/relux/tasks");
+    println!("   GET    /v1/relux/runs");
     println!("   POST   /v1/relux/prime                     {{ \"message\": \"...\" }}");
-    println!("   POST   /v1/relux/plugins/install-dir     {{ \"path\": \"...\" }}");
+    println!("   POST   /v1/relux/tasks                     {{ \"title\": \"...\" }}");
+    println!("   POST   /v1/relux/tasks/:id/start");
+    println!("   GET    /v1/relux/plugins");
     println!("   POST   /v1/relux/plugins/install-github   {{ \"url\": \"https://github.com/...\" }}");
     println!("   POST   /v1/relux/plugins/install-zip      (multipart field: file)");
     println!("   DELETE /v1/relux/plugins/:id");
@@ -150,6 +153,9 @@ fn router(state: AppState) -> Router {
         .route("/v1/relux/state", get(get_state))
         .route("/v1/relux/ai/status", get(get_ai_status))
         .route("/v1/relux/prime", post(run_prime))
+        .route("/v1/relux/tasks", get(list_tasks).post(create_task))
+        .route("/v1/relux/runs", get(list_runs))
+        .route("/v1/relux/tasks/:id/start", post(start_task))
         .route("/v1/relux/plugins", get(list_plugins))
         .route("/v1/relux/plugins/install-dir", post(install_dir))
         .route("/v1/relux/plugins/install-github", post(install_github))
@@ -282,6 +288,69 @@ async fn list_plugins(
 ) -> Result<Json<Vec<PluginRecord>>, ApiError> {
     let records = locked_read(&state, |kernel| Ok(plugin_records(kernel)))?;
     Ok(Json(records))
+}
+
+async fn list_tasks(State(state): State<AppState>) -> Result<Json<Vec<relux_core::Task>>, ApiError> {
+    let tasks = locked_read(&state, |kernel| {
+        Ok(kernel.tasks().into_iter().cloned().collect())
+    })?;
+    Ok(Json(tasks))
+}
+
+async fn list_runs(State(state): State<AppState>) -> Result<Json<Vec<relux_core::Run>>, ApiError> {
+    let runs = locked_read(&state, |kernel| {
+        Ok(kernel.runs().into_iter().cloned().collect())
+    })?;
+    Ok(Json(runs))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateTaskReq {
+    title: String,
+}
+
+async fn create_task(
+    State(state): State<AppState>,
+    Json(req): Json<CreateTaskReq>,
+) -> Result<Json<relux_core::Task>, ApiError> {
+    let title = req.title.trim().to_string();
+    if title.is_empty() {
+        return Err(ApiError::bad_request("title is required"));
+    }
+    let task = locked_save(&state, |kernel| {
+        let ctx = crate::ensure_bootstrapped(kernel)?;
+        let id = kernel.create_task(
+            &title,
+            serde_json::json!({}),
+            &ctx.actor,
+            &ctx.namespace,
+            vec![],
+        );
+        // Automatically assign to Prime so it is ready to run.
+        kernel.assign_task(&id, &ctx.agent)?;
+        Ok(kernel.task(&id).cloned().unwrap())
+    })?;
+    Ok(Json(task))
+}
+
+#[derive(Debug, Serialize)]
+struct StartTaskResponse {
+    task: relux_core::Task,
+    run: relux_core::Run,
+}
+
+async fn start_task(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<StartTaskResponse>, ApiError> {
+    let task_id = relux_core::TaskId::new(id);
+    let (task, run) = locked_save(&state, |kernel| {
+        let run_id = kernel.start_run(&task_id)?;
+        let task = kernel.task(&task_id).cloned().unwrap();
+        let run = kernel.run(&run_id).cloned().unwrap();
+        Ok((task, run))
+    })?;
+    Ok(Json(StartTaskResponse { task, run }))
 }
 
 #[derive(Debug, Deserialize)]

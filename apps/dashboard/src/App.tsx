@@ -18,13 +18,14 @@ import { Approvals } from "./pages/Approvals";
 import { Chat } from "./pages/Chat";
 import { Scheduled } from "./pages/Scheduled";
 import { Plugins } from "./pages/Plugins";
+import { Work } from "./pages/Work";
 import { Settings } from "./pages/Settings";
 
 // Routes served entirely by the local Relux control plane (/v1/relux). They need
 // no web bridge and no login, so they render in the standalone ReluxShell — this
 // is what makes `relux-kernel serve` open into a usable product instead of an
 // old Relix login wall.
-const RELUX_LOCAL = new Set(["/", "/prime", "/plugins"]);
+const RELUX_LOCAL = new Set(["/", "/prime", "/work", "/plugins"]);
 
 export function App() {
   const loc = useLocation();
@@ -38,6 +39,7 @@ export function App() {
         <Routes>
           <Route path="/" element={<ReluxHome />} />
           <Route path="/prime" element={<Prime />} />
+          <Route path="/work" element={<Work />} />
           <Route path="/plugins" element={<Plugins />} />
         </Routes>
       </ReluxShell>

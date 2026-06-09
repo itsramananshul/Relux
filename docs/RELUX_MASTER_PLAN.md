@@ -1634,6 +1634,9 @@ backed only by the local `/v1/relux` API:
   `prime_turn` as the CLI: a greeting stays a greeting, "create a task to X"
   creates that task, and risky actions come back as a proposal awaiting
   approval (section 10). Endpoint: `POST /v1/relux/prime { "message": "..." }`.
+- **Work** - standalone task board and execution history. Backed by the
+  `/v1/relux/tasks` and `/v1/relux/runs` endpoints; allows creating tasks
+  and starting runs directly from the board.
 - **Plugins** - install/remove plugins through the durable lifecycle
   (`/v1/relux/plugins/*`).
 
@@ -1672,7 +1675,7 @@ The API never returns the key. The dashboard shows the current AI provider/mode.
 
 ### MVP limitations (honest)
 
-- The Relux-local shell covers Home, Prime, and Plugins. The legacy
+- The Relux-local shell covers Home, Prime, Work, and Plugins. The legacy
   bridge-backed pages (Board, Active Runs, Crew, Approvals) are still in the
   bundle and reachable from the "Bridge (legacy)" nav, but they require the old
   Relix web bridge + a login and degrade honestly when it is absent.

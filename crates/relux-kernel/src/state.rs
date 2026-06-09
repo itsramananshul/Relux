@@ -468,6 +468,13 @@ impl KernelState {
         self.tasks.len()
     }
 
+    /// All tasks, sorted by id for deterministic listing.
+    pub fn tasks(&self) -> Vec<&Task> {
+        let mut out: Vec<&Task> = self.tasks.values().collect();
+        out.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+        out
+    }
+
     // --- Runs --------------------------------------------------------------
 
     /// Start an execution attempt for an assigned task
@@ -1042,6 +1049,13 @@ impl KernelState {
         self.runs.len()
     }
 
+    /// All runs, sorted by id for deterministic listing.
+    pub fn runs(&self) -> Vec<&Run> {
+        let mut out: Vec<&Run> = self.runs.values().collect();
+        out.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+        out
+    }
+
     /// The transcript for one run, in emission order.
     pub fn run_events(&self, run_id: &RunId) -> Vec<&RunEvent> {
         self.run_events
@@ -1487,5 +1501,26 @@ mod tests {
             .created_task
             .expect("a second task was created");
         assert_ne!(next, task, "resumed kernel must not reuse a task id");
+    }
+
+    #[test]
+    fn listing_tasks_and_runs_is_sorted_and_complete() {
+        let (mut k, prime, task, run, _echo) = primed_kernel();
+        let ns = NamespaceId::new("workspace");
+
+        // Add another task and run.
+        let t2 = k.create_task("t2", serde_json::json!({}), "founder", &ns, vec![]);
+        k.assign_task(&t2, &prime).unwrap();
+        let r2 = k.start_run(&t2).unwrap();
+
+        let tasks = k.tasks();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].id, task);
+        assert_eq!(tasks[1].id, t2);
+
+        let runs = k.runs();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].id, run);
+        assert_eq!(runs[1].id, r2);
     }
 }

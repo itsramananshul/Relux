@@ -62,6 +62,9 @@ export function ReluxHome() {
           <Link to="/prime">
             <button className="btn sm">Talk to Prime →</button>
           </Link>
+          <Link to="/work">
+            <button className="btn ghost sm">Go to Work →</button>
+          </Link>
           <Link to="/plugins">
             <button className="btn ghost sm">Manage plugins →</button>
           </Link>

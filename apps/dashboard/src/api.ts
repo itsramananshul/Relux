@@ -1370,6 +1370,47 @@ export const reluxAi = {
   status: () => api.get<ReluxAiStatus>("/v1/relux/ai/status"),
 };
 
+// -- Relux Work (tasks + runs) ---------------------------------------------
+
+export interface ReluxTask {
+  id: string;
+  title: string;
+  input: any;
+  status: string;
+  priority: number;
+  created_by: string;
+  assigned_agent?: string;
+  namespace_id: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ReluxRun {
+  id: string;
+  task_id: string;
+  agent_id: string;
+  adapter_plugin: string;
+  status: string;
+  started_at?: string;
+  ended_at?: string;
+  summary?: string;
+  error?: string;
+}
+
+export const reluxWork = {
+  // All tasks, sorted by id.
+  listTasks: () => api.get<ReluxTask[]>("/v1/relux/tasks"),
+  // All runs, sorted by id.
+  listRuns: () => api.get<ReluxRun[]>("/v1/relux/runs"),
+  // Create a new task and assign it to Prime.
+  createTask: (title: string) => api.post<ReluxTask>("/v1/relux/tasks", { title }),
+  // Start an execution attempt for a task.
+  startTask: (id: string) =>
+    api.post<{ task: ReluxTask; run: ReluxRun }>(
+      `/v1/relux/tasks/${encodeURIComponent(id)}/start`,
+    ),
+};
+
 export const reluxPlugins = {
   // The installed plugin list (array). Throws an ApiError on failure so the page
   // can show the real reason (e.g. "relux-kernel serve" not running).
