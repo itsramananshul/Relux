@@ -100,6 +100,27 @@ once a stable release is cut.
   synchronous `POST …/run` and `prime orchestration run` CLI were brought onto the
   same shared parallel executor in the follow-up entry above — they are no longer
   single-lock sequential.)*
+- **Cooperative cancel/stop for orchestration jobs.** A running non-blocking job
+  can be stopped honestly (master plan §15). `POST
+  /v1/relux/orchestration-jobs/:job_id/cancel` sets a `cancel_requested` flag the
+  worker checks **between** rounds (lock free, the prior round already persisted);
+  it does **not** kill an adapter process mid-flight. The round already running
+  finishes — every brief in it keeps its real recorded outcome — and the worker then
+  stops *before* the next round and marks the job terminal `canceled`, leaving the
+  remaining briefs `pending` for a human to resume with a fresh run. The endpoint
+  only sets the flag (the worker owns the state transition, so cancel never races
+  the worker on the state field): 200 + the updated job while active, 404 for an
+  unknown job, 409 for an already-finished job; a cancel that arrives after the job
+  finished leaves it `completed` — never a faked cancellation. The dashboard gains a
+  Cancel button (disabled + "Canceling…" once requested) and surfaces the canceling
+  phase and the canceled state. The cancel state machine and the cooperative worker
+  stop (with a positive control proving the same plan runs to completion without a
+  cancel) are unit-tested; a dedicated **live mid-flight cancel** HTTP smoke
+  (`scripts/smoke-orchestration-cancel.ps1`) routes the first brief to a slow local
+  CLI adapter spawned through the **real** adapter path, polls until it is genuinely
+  `running`, cancels, observes `cancel_requested` while still `running`, then asserts
+  the terminal `canceled` state with the in-flight brief recorded `completed` and
+  every downstream brief left `pending`.
 - **Non-blocking orchestration jobs + live, pollable progress.** Running an
   orchestration no longer blocks on one long request (master plan "Orchestration
   (First Multi-Agent Slice)" — the previously-deferred non-blocking job model).

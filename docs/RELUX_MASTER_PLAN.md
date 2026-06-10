@@ -2061,7 +2061,14 @@ the same plan runs to completion without a cancel)** are unit-tested in
 `crates/relux-kernel/src/server.rs`; an end-to-end HTTP smoke
 (`scripts/smoke-orchestration-job.ps1`, plus a real-Claude-CLI variant
 `scripts/smoke-orchestration-job-claude.ps1`) proves the start → poll → terminal
-path against a live kernel.
+path against a live kernel. A dedicated **live mid-flight cancel** smoke
+(`scripts/smoke-orchestration-cancel.ps1`) closes the last gap: it routes the first
+brief to a deliberately slow local CLI adapter (a fake `ping`-based command spawned
+through the **real** adapter path, not test-only internals), polls until that brief
+is genuinely `running`, requests cancel, observes `cancel_requested` while the job is
+still `running` (the canceling phase), then asserts the terminal `canceled` state
+with the in-flight brief recorded `completed` honestly and every downstream brief
+left `pending`.
 
 ### Tool Invocation Surface (First Honest Version)
 
