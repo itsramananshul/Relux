@@ -1260,6 +1260,50 @@ fn shape_cli_brain_reply(
     Ok(reply)
 }
 
+/// Build an honest advisory note when a *conversational* brain envelope declared
+/// structured **proposed file changes**, or `None` when it declared none.
+///
+/// Design decision (master plan §15 + the AI "Conversational Shaping / Actionful
+/// Safety" section): the Prime chat/brain path is **action-free by design** — it
+/// only runs on non-actionful turns ([`relux_kernel::is_actionful`]), the chat
+/// prompt ([`relux_kernel::compose_chat_prompt`]) forbids claiming any state
+/// change, and [`run_cli_brain`] "only ever shapes a conversational reply; it
+/// never performs a durable action". So, unlike the assigned-run path
+/// ([`relux_core::Run::proposed_changes`], master plan §15), a chat turn does NOT
+/// capture proposed changes into a run: there is no documented chat-turn run to
+/// hang a review/apply flow on, and synthesizing one would manufacture hidden,
+/// mutable work from a casual chat message (explicitly out of scope). Read-only
+/// `artifacts` references are likewise not captured on this path.
+///
+/// Dropping them *silently* would be dishonest, though — so when an envelope from
+/// a chat turn does declare proposed changes, we surface a bounded, secret-free
+/// note telling the operator what was proposed and how to get a real, reviewable/
+/// applyable run (the documented assigned-run path on Work). Pure: parses the
+/// already-redacted stdout, spawns nothing, and persists nothing.
+fn brain_envelope_advisory(
+    stdout: &str,
+    kind: relux_core::AdapterKind,
+    label: &str,
+) -> Option<String> {
+    let parsed = relux_core::parse_adapter_result(stdout, kind);
+    let changes = parsed.proposed_changes.len();
+    if changes == 0 {
+        return None;
+    }
+    let noun = if changes == 1 {
+        "file change"
+    } else {
+        "file changes"
+    };
+    Some(format!(
+        "{label} proposed {changes} {noun} during this chat turn. Chat turns are \
+         action-free, so nothing was captured for review or applied. To get \
+         reviewable, applyable changes, create a task assigned to this adapter and \
+         run it on Work — that path captures proposed changes with the safe \
+         review/apply flow."
+    ))
+}
+
 /// Delegate one conversational Prime turn to a local CLI brain (Claude / Codex).
 ///
 /// Safety + honesty contract (`docs/RELUX_MASTER_PLAN.md` section 8.1, section
@@ -1347,12 +1391,15 @@ async fn run_cli_brain(
 
     match run {
         Ok(Ok(outcome)) if outcome.success && !outcome.stdout.trim().is_empty() => {
-            match shape_cli_brain_reply(&outcome.stdout, outcome.stdout_truncated, kind, label) {
+            match shape_cli_brain_reply(&outcome.stdout, outcome.stdout_truncated, kind.clone(), label) {
                 Ok(reply) => AiOutcome {
                     mode,
                     reply,
                     model: Some(label.to_string()),
-                    note: None,
+                    // The chat path never captures proposed changes into a run
+                    // (action-free by design); if the envelope declared any, say
+                    // so honestly and point at the documented assigned-run path.
+                    note: brain_envelope_advisory(&outcome.stdout, kind, label),
                 },
                 Err(note) => fallback(note),
             }
@@ -4317,5 +4364,98 @@ mod tests {
             .expect("structured reply");
         assert_eq!(structured, "complete answer");
         assert!(!structured.contains("[output truncated]"), "no marker: {structured}");
+    }
+
+    #[test]
+    fn brain_chat_envelope_with_proposed_changes_shows_only_reply_no_json() {
+        // A chat-turn envelope that ALSO declares proposed_changes must still show
+        // only the human `result` text in the bubble — never the structured change
+        // payload (path/content/baseline) and never the raw JSON envelope.
+        let base = relux_core::proposed_change::sha256_hex(b"old\n");
+        let stdout = format!(
+            r#"{{
+                "type": "result",
+                "is_error": false,
+                "result": "I would rewrite src/lib.rs to add the helper.",
+                "proposed_changes": [
+                    {{ "path": "src/lib.rs", "content": "new\n", "baseline_sha256": "{base}" }}
+                ]
+            }}"#
+        );
+        let reply = shape_cli_brain_reply(&stdout, false, relux_core::AdapterKind::ClaudeCli, "Claude CLI")
+            .expect("a success envelope yields a human reply");
+        assert_eq!(reply, "I would rewrite src/lib.rs to add the helper.");
+        // The applyable change payload never leaks into the chat bubble.
+        assert!(!reply.contains('{'), "no JSON braces: {reply}");
+        assert!(!reply.contains("proposed_changes"), "no field name: {reply}");
+        assert!(!reply.contains("baseline_sha256"), "no baseline field: {reply}");
+        assert!(!reply.contains("new\n"), "no raw new_content: {reply}");
+        assert!(!reply.contains(base.as_str()), "no baseline hash: {reply}");
+    }
+
+    #[test]
+    fn brain_chat_envelope_with_proposed_changes_surfaces_honest_advisory() {
+        // The proposed change is NOT silently dropped: the operator gets a bounded,
+        // secret-free note that it was proposed and how to get a real review/apply
+        // run (the documented assigned-run path). No run/state is created here.
+        let base = relux_core::proposed_change::sha256_hex(b"old\n");
+        let stdout = format!(
+            r#"{{"type":"result","is_error":false,"result":"sure","proposed_changes":[{{"path":"src/lib.rs","content":"new\n","baseline_sha256":"{base}"}}]}}"#
+        );
+        let note = brain_envelope_advisory(&stdout, relux_core::AdapterKind::ClaudeCli, "Claude CLI")
+            .expect("an envelope with proposed changes yields an advisory note");
+        assert!(note.contains("Claude CLI proposed 1 file change"), "counts honestly: {note}");
+        assert!(note.contains("action-free"), "explains why not captured: {note}");
+        assert!(note.contains("create a task assigned to this adapter"), "points at the documented path: {note}");
+        // The note carries no raw JSON, no on-disk content, and no baseline hash.
+        assert!(!note.contains('{'), "no JSON in the note: {note}");
+        assert!(!note.contains(base.as_str()), "no baseline hash in the note: {note}");
+        assert!(!note.contains("new\n"), "no proposed content in the note: {note}");
+    }
+
+    #[test]
+    fn brain_chat_greeting_envelope_has_no_advisory() {
+        // A plain greeting/chat turn (no proposed_changes) stays artifact-free: no
+        // advisory note, so casual chat never nags about review/apply.
+        let stdout = r#"{"type":"result","is_error":false,"result":"Hey! How can I help?"}"#;
+        assert!(
+            brain_envelope_advisory(stdout, relux_core::AdapterKind::ClaudeCli, "Claude CLI").is_none(),
+            "a greeting must not produce an advisory"
+        );
+        // Plain prose (Codex/text mode) likewise has nothing to advise about.
+        assert!(
+            brain_envelope_advisory("just a friendly reply", relux_core::AdapterKind::CodexCli, "Codex CLI").is_none(),
+            "plain prose must not produce an advisory"
+        );
+    }
+
+    #[test]
+    fn prime_response_wire_can_never_carry_proposed_changes() {
+        // Structural guarantee: the chat response flattens PrimeTurn + state +
+        // ai_* fields. PrimeTurn has no proposed_changes field, so a proposed
+        // change can never reach the chat wire even if an envelope declared one —
+        // the only review/apply surface is the assigned-run path (GET …/runs/:id).
+        let turn = PrimeTurn {
+            intent: relux_core::PrimeIntent::Greeting,
+            reply: "Hey!".to_string(),
+            disposition: relux_core::PrimeDisposition::Answered,
+            action: None,
+            created_task: None,
+            started_run: None,
+            created_agent: None,
+            approval: None,
+            invoked_tool: None,
+            tool_output: None,
+            tool_error: None,
+        };
+        let wire = serde_json::to_value(&turn).expect("PrimeTurn serializes");
+        assert!(
+            wire.get("proposed_changes").is_none(),
+            "the Prime chat turn wire must not carry proposed_changes"
+        );
+        assert!(
+            wire.get("artifacts").is_none(),
+            "the Prime chat turn wire must not carry artifacts"
+        );
     }
 }

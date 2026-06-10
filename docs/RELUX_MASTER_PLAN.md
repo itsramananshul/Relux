@@ -2613,7 +2613,23 @@ remain, in rough priority for the next slices:
    (per-change status, content preview, approve / reject / apply, honest refused
    reasons / conflicts), and `reviewApplyAvailability` now returns
    `available:true` when a run proposed changes (apply is real for them); a run
-   with only read-only references keeps the honest "no diff/apply" reason. What is
+   with only read-only references keeps the honest "no diff/apply" reason.
+   **Proposed changes are captured ONLY on the assigned-run execution path.** The
+   Prime *conversational brain* path (Claude/Codex CLI answering a chat turn) is
+   **action-free by design** — it only runs on non-actionful turns
+   (`is_actionful`), the chat prompt forbids claiming any state change, and
+   `run_cli_brain` "only ever shapes a conversational reply; it never performs a
+   durable action". So even if a chat-turn envelope declares `proposed_changes`,
+   the kernel does **not** capture them into a run: there is no chat-turn run to
+   hang review/apply on, and synthesizing one would manufacture hidden, mutable
+   work from a casual message. The chat bubble still shows only the human `result`
+   text (`shape_cli_brain_reply`, never the raw JSON), and rather than drop the
+   change silently the kernel surfaces a bounded, secret-free **advisory note**
+   (`brain_envelope_advisory`) telling the operator a change was proposed and to
+   create a task assigned to that adapter and run it — the documented path that
+   captures proposed changes with the safe review/apply flow. Structurally, the
+   Prime chat response wire (`PrimeTurn`) carries no `proposed_changes`/`artifacts`
+   field, so a proposed change can never reach the chat surface. What is
    still **not** done: multi-file/transactional apply, file create/rename/delete
    (v1 is single-file full-content replacement over an existing baseline — a
    missing target is a conflict); arbitrary patch/diff parsing (deliberately not

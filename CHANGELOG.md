@@ -9,6 +9,28 @@ once a stable release is cut.
 
 ### Added
 
+- **Prime conversational brain handles a `proposed_changes` envelope honestly —
+  no silent drop, no hidden work (master plan §15 + the AI "Conversational
+  Shaping / Actionful Safety" section).** The Prime chat/brain path is
+  **action-free by design** (it only runs on non-actionful turns, the chat prompt
+  forbids claiming any state change, and `run_cli_brain` never performs a durable
+  action), so — unlike the assigned-run path — it does **not** capture proposed
+  changes into a run: there is no chat-turn run to hang a review/apply flow on,
+  and synthesizing one would manufacture hidden, mutable work from a casual
+  message. The chat bubble already shows only the human `result` text
+  (`shape_cli_brain_reply`); now, rather than drop a declared change silently, the
+  kernel surfaces a bounded, secret-free **advisory note** (`brain_envelope_advisory`)
+  telling the operator a change was proposed during chat and to **create a task
+  assigned to that adapter and run it** — the documented path that captures
+  proposed changes with the safe review/apply flow. **Nothing is auto-created and
+  nothing is auto-applied.** Hard tests pin the contract: a chat envelope carrying
+  `proposed_changes` shows only the reply (no JSON, no `path`/`content`/baseline
+  leak), the advisory is honest and secret-free, a plain greeting produces **no**
+  advisory, and the `PrimeTurn` chat wire structurally carries no
+  `proposed_changes`/`artifacts` field. (Considered and rejected: auto-attaching
+  chat-turn changes to a synthetic run — it invents an undocumented surface and
+  creates hidden mutable work; the assigned-run path is the real review/apply
+  model.)
 - **First real Relux diff/apply model — reviewed, applyable proposed changes
   (master plan §15 / §9.6).** Builds directly on the read-only artifact-reference
   capture below: a run can now carry **proposed file changes** an adapter declares
