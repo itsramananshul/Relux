@@ -9,6 +9,13 @@
 
 import type { RunEvent } from "./api";
 
+// The honest "no activity"/stalled signal is shared with the Relux Work Run
+// Detail surface — it's pure time math over two wall-clock instants, so both
+// surfaces get the identical threshold + `No activity for Xs` copy without
+// coupling their (different) event models. Re-exported here so `<RunTranscript>`
+// imports it co-located with the other transcript helpers.
+export { RUN_STALL_SECS, noActivityLabel } from "./runstall.ts";
+
 // Humanize a relix/codex lifecycle kind for the "nice" view + the progress
 // summary. Mirrors the durable `run_events.kind` vocabulary.
 export const KIND_LABEL: Record<string, string> = {

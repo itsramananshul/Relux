@@ -12,6 +12,14 @@
 // real events the kernel already recorded. No fabricated progress.
 
 import type { ReluxRunEvent } from "./api";
+import { RUN_STALL_SECS, noActivityLabel } from "./runstall.ts";
+
+// The stalled-run signal is event-model-agnostic (pure time math), so it lives
+// in the shared `./runstall` module and is used identically by the legacy
+// `<RunTranscript>` surface. Re-exported here so existing Relux imports/tests
+// keep their co-located names; `RELUX_RUN_STALL_SECS` is the historical alias.
+export { noActivityLabel };
+export const RELUX_RUN_STALL_SECS = RUN_STALL_SECS;
 
 // Parse the numeric sequence from a `revent_NNNN` event id. The kernel mints ids
 // off a monotonic counter, so the numeric suffix orders events even past the
@@ -66,30 +74,4 @@ export function mergeReluxRunEvents(
     return (sa ?? Number.MAX_SAFE_INTEGER) - (sb ?? Number.MAX_SAFE_INTEGER);
   });
   return merged;
-}
-
-// The default quiet-period threshold (seconds) before an in-flight run is
-// flagged as showing no activity. Short enough to be honest about a stall, long
-// enough to not flicker between two normal 1.5s polls.
-export const RELUX_RUN_STALL_SECS = 10;
-
-// An honest "no activity" signal for an in-flight run: when the run is still
-// running but no new transcript event (and no phase change) has arrived for at
-// least `thresholdSecs`, return human text like `No activity for 14s`. Returns
-// null while activity is recent (or unknown), so the UI shows the normal live
-// indicator instead. `lastActivityAtMs` / `nowMs` are real wall-clock millis
-// (injected so the helper stays pure + testable). This is NOT a progress bar —
-// it only reports elapsed silence, never fabricated forward motion.
-export function noActivityLabel(
-  lastActivityAtMs: number | null,
-  nowMs: number,
-  thresholdSecs: number = RELUX_RUN_STALL_SECS,
-): string | null {
-  if (lastActivityAtMs == null) return null;
-  const elapsed = Math.floor((nowMs - lastActivityAtMs) / 1000);
-  if (elapsed < thresholdSecs) return null;
-  if (elapsed < 60) return `No activity for ${elapsed}s`;
-  const mins = Math.floor(elapsed / 60);
-  const secs = elapsed % 60;
-  return `No activity for ${mins}m ${secs}s`;
 }

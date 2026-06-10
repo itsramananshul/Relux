@@ -5,8 +5,11 @@ import {
   latestEventId,
   lastEventAgo,
   mergeRunEvents,
+  noActivityLabel,
+  RUN_STALL_SECS,
   runTranscriptProgress,
 } from "../src/runtranscript.ts";
+import { noActivityLabel as reluxNoActivityLabel } from "../src/reluxruntranscript.ts";
 import type { RunEvent } from "../src/api.ts";
 
 function ev(event_id: number, kind: string, message = "", ts = 1000 + event_id): RunEvent {
@@ -78,4 +81,26 @@ test("lastEventAgo formats the last-event clock (pure, injected now)", () => {
   assert.equal(lastEventAgo(100, 100 + 185), "3m ago");
   // A clock skew (future ts) never goes negative.
   assert.equal(lastEventAgo(200, 100), "just now");
+});
+
+test("noActivityLabel drives the legacy stalled cue (shared with the Relux surface)", () => {
+  // The legacy `<RunTranscript>` re-exports the SAME pure helper the Relux Work
+  // Run Detail uses, so the threshold + `No activity for Xs` copy stay identical
+  // across both transcript surfaces.
+  assert.equal(noActivityLabel, reluxNoActivityLabel);
+  assert.equal(RUN_STALL_SECS, 10);
+
+  // Unknown / recent activity → no signal (normal live chip shows instead).
+  assert.equal(noActivityLabel(null, 100_000), null);
+  assert.equal(noActivityLabel(100_000, 105_000), null); // under threshold
+  // At/over the shared threshold → honest elapsed silence; minutes format as Xm Ys.
+  assert.equal(noActivityLabel(100_000, 100_000 + 10_000), "No activity for 10s");
+  assert.equal(noActivityLabel(100_000, 100_000 + 90_000), "No activity for 1m 30s");
+  // Clock skew (now before last) never fabricates a signal.
+  assert.equal(noActivityLabel(100_000, 90_000), null);
+  // Legacy drives it from the real wall-clock event `ts` (seconds → millis): an
+  // event 12s old at a threshold of 10 is stale; the same event at 8s old isn't.
+  const lastTsSecs = 1000;
+  assert.equal(noActivityLabel(lastTsSecs * 1000, (lastTsSecs + 12) * 1000), "No activity for 12s");
+  assert.equal(noActivityLabel(lastTsSecs * 1000, (lastTsSecs + 8) * 1000), null);
 });

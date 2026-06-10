@@ -9,6 +9,27 @@ once a stable release is cut.
 
 ### Added
 
+- **Honest stalled / no-activity signal on the legacy Run transcript too
+  (relix-dashboard-design §8 / §11).** The Relux Work Run Detail already showed a
+  `No activity for Xs` cue when an in-flight run went quiet; the **legacy bridge**
+  `<RunTranscript>` (Runs page + the Brief workroom embed) had the efficient
+  `?since=` live-tail but no equivalent stalled hint. It now shows the same honest
+  cue: while a Shift is `running`, a once-a-second wall clock ages the transcript
+  bar so the last-event "ago" advances smoothly between the 2.5 s tail polls, and
+  when no new transcript event has landed for **≥ 10 s** the bar shows a
+  **`◌ No activity for Xs`** badge. The legacy `run_events.ts` is a real
+  wall-clock unix time, so staleness is measured **directly against the live
+  clock** off the last event (unlike the Relux surface, whose `ts` is a logical
+  clock and is therefore aged against a client wall clock). **No fabricated
+  progress bar** — it only reports elapsed silence, and the badge title is honest
+  that it's *observed* silence, not a guaranteed stall. The threshold + the
+  `No activity for Xs` copy are now a **single shared pure helper**
+  (`noActivityLabel` + `RUN_STALL_SECS` in `apps/dashboard/src/runstall.ts`),
+  re-exported by both `runtranscript.ts` (legacy) and `reluxruntranscript.ts`
+  (Relux) so the two surfaces read identically without coupling their (different)
+  event models. Unit-tested on the legacy surface (shared-helper identity, the
+  threshold, and the wall-clock-`ts`-driven label); the dashboard bundle was
+  rebuilt.
 - **Incremental live-tail + honest stalled signal for the Relux Work Run Detail
   (relix-dashboard-design §8 / §11).** The previous transcript live-tail slice
   improved only the **legacy bridge** surface (`/v1/runs/:id/events`, the

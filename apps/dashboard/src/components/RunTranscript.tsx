@@ -5,6 +5,7 @@ import {
   latestEventId,
   lastEventAgo,
   mergeRunEvents,
+  noActivityLabel,
   runTranscriptProgress,
 } from "../runtranscript";
 
@@ -249,6 +250,10 @@ export function RunTranscript({ runId, status, compact, refreshKey, onEvents }: 
   const [loading, setLoading] = useState(true);
   const [mode, setMode] = useState<"nice" | "raw">("nice");
   const [liveConn, setLiveConn] = useState<RunEventConn>("connecting");
+  // A live wall clock, ticked once a second while the Shift is in flight, so the
+  // last-event "ago" and the honest stalled signal age smoothly between the 2.5s
+  // tail polls (a poll that finds nothing new doesn't re-render on its own).
+  const [nowMs, setNowMs] = useState<number>(() => Date.now());
   const running = status === "running";
 
   const onEventsRef = useRef(onEvents);
@@ -329,11 +334,30 @@ export function RunTranscript({ runId, status, compact, refreshKey, onEvents }: 
     return () => clearInterval(t);
   }, [running]);
 
+  // Tick a wall clock once a second while in flight so the "ago" chip and the
+  // "no activity for Xs" signal advance live without re-fetching anything. Stops
+  // (and re-syncs) the moment the run settles.
+  useEffect(() => {
+    if (!running) return;
+    setNowMs(Date.now());
+    const t = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [running]);
+
   const blocks = useMemo(() => groupEvents(events), [events]);
   // Honest in-flight summary: real event count, current phase (latest event,
   // humanized), and when the last event landed. No fabricated progress bar.
   const progress = runTranscriptProgress(events);
-  const ago = lastEventAgo(progress.lastTs, Math.floor(Date.now() / 1000));
+  const ago = lastEventAgo(progress.lastTs, Math.floor(nowMs / 1000));
+  // Honest stalled signal: in-flight but no new transcript event for a while.
+  // The legacy `run_events.ts` is a real wall-clock unix time, so staleness is
+  // measured directly against the live clock (unlike the Relux surface, whose
+  // `ts` is logical). Null while activity is recent → the normal live chip
+  // shows instead. Never a fabricated progress bar — only elapsed silence.
+  const stalledNote =
+    running && progress.lastTs != null
+      ? noActivityLabel(progress.lastTs * 1000, nowMs)
+      : null;
 
   return (
     <div className="xtr">
@@ -357,6 +381,15 @@ export function RunTranscript({ runId, status, compact, refreshKey, onEvents }: 
             {progress.count} event{progress.count === 1 ? "" : "s"}
             {progress.phase ? ` · ${progress.phase}` : ""}
             {ago ? ` · ${ago}` : ""}
+          </span>
+        )}
+        {running && stalledNote && (
+          <span
+            className="badge in_progress"
+            style={{ fontSize: 9 }}
+            title="real elapsed silence — no new transcript event has arrived for a while (not a guaranteed stall, just no observed activity)"
+          >
+            ◌ {stalledNote}
           </span>
         )}
         <div className="spacer" style={{ flex: 1 }} />
