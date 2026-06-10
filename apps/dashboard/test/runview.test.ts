@@ -20,6 +20,8 @@ import {
   proposedChangeStatusTone,
   proposedChangeActionLabel,
   isCreateProposedChange,
+  isRenameProposedChange,
+  proposedChangePathLabel,
   canReviewProposedChange,
   canApplyProposedChange,
   reviewableProposedChangeIndices,
@@ -177,24 +179,58 @@ test("runProposedChanges parses the action field and normalizes unknown/absent t
       { path: "old.txt", action: "replace", new_content: "yo", new_sha256: "h", bytes: 2, source: "x", status: "proposed", baseline_sha256: "b" },
       { path: "weird.txt", action: "delete", new_content: "z", new_sha256: "h", bytes: 1, source: "x", status: "proposed" }, // unknown → replace
       { path: "legacy.txt", new_content: "q", new_sha256: "h", bytes: 1, source: "x", status: "proposed" }, // absent → replace
+      { path: "old.rs", action: "rename", dest_path: "new.rs", new_content: "", new_sha256: "h", bytes: 0, source: "x", status: "proposed", baseline_sha256: "b" },
     ],
   } as any;
   const cs = runProposedChanges(run);
-  assert.equal(cs.length, 4);
+  assert.equal(cs.length, 5);
   assert.equal(cs[0].action, "create");
   assert.equal(cs[1].action, "replace");
   assert.equal(cs[2].action, "replace"); // unknown normalized
   assert.equal(cs[3].action, "replace"); // absent normalized
+  assert.equal(cs[4].action, "rename");
+  assert.equal(cs[4].dest_path, "new.rs"); // destination is carried through
 });
 
-test("proposedChangeActionLabel and isCreateProposedChange classify the action honestly", () => {
+test("proposedChangeActionLabel and isCreate/isRename classify the action honestly", () => {
   assert.equal(proposedChangeActionLabel("create"), "Create");
   assert.equal(proposedChangeActionLabel("replace"), "Replace");
+  assert.equal(proposedChangeActionLabel("rename"), "Rename");
   assert.equal(proposedChangeActionLabel(undefined), "Replace");
   assert.equal(proposedChangeActionLabel("zzz"), "Replace");
   assert.equal(isCreateProposedChange({ action: "create" } as any), true);
   assert.equal(isCreateProposedChange({ action: "replace" } as any), false);
   assert.equal(isCreateProposedChange({} as any), false); // missing → replace
+  assert.equal(isRenameProposedChange({ action: "rename" } as any), true);
+  assert.equal(isRenameProposedChange({ action: "replace" } as any), false);
+});
+
+test("proposedChangePathLabel shows source → destination only for a rename", () => {
+  assert.equal(
+    proposedChangePathLabel({ action: "rename", path: "old.rs", dest_path: "new.rs" } as any),
+    "old.rs → new.rs",
+  );
+  // A rename missing its destination falls back to just the source path.
+  assert.equal(
+    proposedChangePathLabel({ action: "rename", path: "old.rs" } as any),
+    "old.rs",
+  );
+  assert.equal(
+    proposedChangePathLabel({ action: "replace", path: "keep.rs" } as any),
+    "keep.rs",
+  );
+  assert.equal(
+    proposedChangePathLabel({ action: "create", path: "new.rs" } as any),
+    "new.rs",
+  );
+});
+
+test("canApply gates a rename on approval AND a source baseline (like a replace)", () => {
+  const mkRename = (status: string, baseline?: string) =>
+    ({ path: "old", action: "rename", dest_path: "new", new_content: "", new_sha256: "h", bytes: 0, source: "x", status, baseline_sha256: baseline }) as any;
+  assert.equal(canApplyProposedChange(mkRename("approved", "abc")), true);
+  assert.equal(canApplyProposedChange(mkRename("approved")), false); // no baseline → not applyable
+  assert.equal(canApplyProposedChange(mkRename("proposed", "abc")), false);
 });
 
 test("runProposedChanges is empty for a run with none or a bad shape", () => {

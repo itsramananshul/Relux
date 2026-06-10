@@ -1731,15 +1731,19 @@ export interface ReluxRunArtifact {
 export interface ReluxProposedChange {
   // Safe, relative, `/`-separated target path inside the run's workspace root.
   path: string;
-  // The filesystem action: "replace" (over an existing baseline file) or
-  // "create" (a new file that must not already exist). Absent on older records;
-  // a missing action is treated as "replace".
+  // The filesystem action: "replace" (over an existing baseline file),
+  // "create" (a new file that must not already exist), or "rename" (move `path`
+  // to `dest_path`). Absent on older records; a missing action is "replace".
   action?: string;
-  // The full proposed new content of the file (text).
+  // For a "rename" (move) action, the destination path the source `path` is
+  // moved to. Absent for replace/create.
+  dest_path?: string;
+  // The full proposed new content of the file (text). Empty for a rename, which
+  // moves the file intact.
   new_content: string;
   // SHA-256 (hex) of the content the agent based its edit on. Absent for a
-  // create (no prior file) or when a replace declared none — a replace apply
-  // refuses without it (no force in v1).
+  // create (no prior file) or when a replace/rename declared none — a replace or
+  // rename apply refuses without it (no force in v1).
   baseline_sha256?: string;
   // SHA-256 (hex) of `new_content`, computed at capture (integrity/display).
   new_sha256: string;

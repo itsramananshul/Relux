@@ -9,6 +9,56 @@ once a stable release is cut.
 
 ### Added
 
+- **Safe `rename`/move action for proposed changes (master plan §15 / §9.6).**
+  Extends the proposed-change model with a third action that relocates an existing
+  file: a change now carries `action: "replace"` (default), `"create"`, or
+  `"rename"` (alias `"move"`). A rename names a source `path`, a destination
+  `dest_path` (aliases `to`/`to_path`/`dest`/`destination`/`new_path`), and the
+  **source baseline hash**; it moves the file **intact** (no new content).
+  **Backward compatible** — `dest_path` is a `#[serde(default)]` optional field, so
+  older envelopes and persisted records (replace/create) stay valid. (1) **Core** —
+  a `Rename` variant on `ProposedChangeAction` (+ `requires_baseline()` /
+  `has_destination()` helpers) and a `dest_path: Option<String>` on
+  `ProposedChange`; capture requires a **safe, relative, non-excluded destination
+  distinct from the source** (else the change is dropped), drops any declared
+  content (a move preserves bytes), and keeps the source baseline like a replace.
+  (2) **Kernel apply (the safety bar)** — a rename requires the same explicit
+  **approval**, the same strict **safe relative / excluded-path** gate on **both**
+  source and destination, and the same **workspace-root confinement** (resolve
+  inside the canonical `working_dir`, no `..`/symlink escape) as a replace; it
+  **refuses without a baseline** (no force in v1), verifies the **source still
+  matches its baseline** (a mismatch is an honest **conflict**, nothing moved),
+  refuses if the **destination already exists** (a conflict — never overwritten) or
+  equals the source, creates any **missing destination parent directories** (same
+  safe policy as create), and then moves the file with `std::fs::rename` (atomic
+  within the root's filesystem). The **transactional set apply** treats a rename as
+  occupying **two** paths (source consumed + destination produced): both must be
+  **distinct across the whole set** (no two changes may write/create/rename onto an
+  overlapping path), all changes are validated **together first** (no writes), and a
+  mid-apply fault rolls back — replaces restored, creates deleted, **renames moved
+  back** to their source — leaving no net change. (3) **API** — unchanged routes; a
+  rename's applied result reports the **destination** path and the moved file's
+  size; a dest-exists / baseline conflict maps to the existing `409`, structural
+  refusals (unsafe/overlapping path, no baseline) to `422`. (4) **Dashboard** — Run
+  Detail shows the **Rename** action, the **`source → destination`** path, a "move"
+  marker instead of a byte count, a move-specific helper note, and no content
+  preview (the file is moved intact). (5) **Tests** — core: rename capture with a
+  destination + no content, `move` alias + destination aliases, rename on the wire,
+  drop on missing/unsafe/same-path destination, baseline-optional capture; kernel:
+  rename moves a file / makes dest parent dirs / refuses a dest-exists,
+  baseline-mismatch, missing-source, unsafe-destination, or same-path rename,
+  end-to-end review→apply rename, a **mixed rename+replace+create set** applied
+  atomically, a rename-dest-conflict and rename-baseline-conflict set leaving
+  everything untouched, **overlapping rename/create + rename/replace targets**
+  refused, a genuine **phase-2 rollback that moves a renamed file back**, and a
+  **fake-CLI envelope with one rename** captured, approved, and applied into a temp
+  workspace; dashboard `runview` rename parsing/labels/`source → destination`
+  helper + rename apply-eligibility; and the PowerShell smoke
+  (`scripts/smoke-proposed-change-apply.ps1`) extended with the ten new rename
+  kernel tests. **Caveats / still not done:** `delete` is still not modeled (the
+  next recommended action); a rename ignores any declared content (use a separate
+  replace to also change content); and the transaction is still over **one run's**
+  changes (one adapter → one workspace root).
 - **Safe new-file `create` action for proposed changes (master plan §15 / §9.6).**
   Extends the proposed-change model beyond replace-over-an-existing-baseline with a
   second action: a change now carries `action: "replace"` (the default and the

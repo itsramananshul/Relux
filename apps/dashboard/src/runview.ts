@@ -170,7 +170,7 @@ const KNOWN_CHANGE_STATUSES = new Set(["proposed", "approved", "rejected", "appl
 
 // The set of known proposed-change actions; anything else (or absent) normalizes
 // to "replace" so older records and unknown future actions still render honestly.
-const KNOWN_CHANGE_ACTIONS = new Set(["replace", "create"]);
+const KNOWN_CHANGE_ACTIONS = new Set(["replace", "create", "rename"]);
 
 // The reviewable proposed file changes a run captured from its adapter result
 // envelope (master plan §15 / §9.6). Defensive: only accepts well-formed entries
@@ -204,6 +204,7 @@ export function runProposedChanges(
     out.push({
       path: rec.path,
       action,
+      dest_path: typeof rec.dest_path === "string" ? rec.dest_path : undefined,
       new_content: rec.new_content,
       new_sha256: typeof rec.new_sha256 === "string" ? rec.new_sha256 : "",
       bytes: typeof rec.bytes === "number" ? rec.bytes : rec.new_content.length,
@@ -218,10 +219,11 @@ export function runProposedChanges(
   return out;
 }
 
-// A short, human label for a proposed-change action ("replace" / "create").
-// Anything unrecognized reads as "Replace" (the default), matching the parser.
+// A short, human label for a proposed-change action ("replace" / "create" /
+// "rename"). Anything unrecognized reads as "Replace" (the default parser value).
 export function proposedChangeActionLabel(action: string | undefined): string {
   if (action === "create") return "Create";
+  if (action === "rename") return "Rename";
   return "Replace";
 }
 
@@ -229,6 +231,21 @@ export function proposedChangeActionLabel(action: string | undefined): string {
 // A create needs no baseline; a replace does. Treats a missing action as replace.
 export function isCreateProposedChange(change: ReluxProposedChange): boolean {
   return change.action === "create";
+}
+
+// Whether this change moves a file (a rename). A rename has a destination path
+// and, like a replace, needs the source baseline to apply.
+export function isRenameProposedChange(change: ReluxProposedChange): boolean {
+  return change.action === "rename";
+}
+
+// A "source → destination" label for a rename, or just the path for a
+// replace/create. Used by the run view to show what a change touches at a glance.
+export function proposedChangePathLabel(change: ReluxProposedChange): string {
+  if (isRenameProposedChange(change) && change.dest_path) {
+    return `${change.path} → ${change.dest_path}`;
+  }
+  return change.path;
 }
 
 // A short, human label for a proposed-change status.
@@ -260,9 +277,9 @@ export function canReviewProposedChange(change: ReluxProposedChange): boolean {
 }
 
 // Whether an operator can apply this change from the UI: it must be `approved`,
-// and a `replace` additionally needs a baseline hash (apply refuses without one in
-// v1). A `create` needs no baseline (there is no prior file). The backend
-// re-checks everything; this just avoids offering a dead button.
+// and a `replace` or `rename` additionally needs a baseline hash (apply refuses
+// without one in v1). A `create` needs no baseline (there is no prior file). The
+// backend re-checks everything; this just avoids offering a dead button.
 export function canApplyProposedChange(change: ReluxProposedChange): boolean {
   if (change.status !== "approved") return false;
   if (isCreateProposedChange(change)) return true;

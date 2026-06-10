@@ -20,6 +20,8 @@ import {
   proposedChangeStatusTone,
   proposedChangeActionLabel,
   isCreateProposedChange,
+  isRenameProposedChange,
+  proposedChangePathLabel,
   canReviewProposedChange,
   canApplyProposedChange,
   reviewableProposedChangeIndices,
@@ -739,14 +741,22 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
               {proposedChanges.map((c, i) => (
                 <div key={`${c.path}-${i}`} className="card" style={{ padding: 10 }}>
                   <div className="row" style={{ alignItems: "center", gap: 8 }}>
-                    <span className="mono" style={{ fontSize: 12 }}>{c.path}</span>
+                    <span
+                      className="mono"
+                      style={{ fontSize: 12 }}
+                      title={isRenameProposedChange(c) ? "Source → destination" : undefined}
+                    >
+                      {proposedChangePathLabel(c)}
+                    </span>
                     <span className="badge backlog" title="The filesystem action this change applies">
                       {proposedChangeActionLabel(c.action)}
                     </span>
                     <span className={`badge ${proposedChangeStatusTone(c.status)}`}>
                       {proposedChangeStatusLabel(c.status)}
                     </span>
-                    <span className="muted" style={{ fontSize: 10 }}>{c.bytes} B · {c.source}</span>
+                    <span className="muted" style={{ fontSize: 10 }}>
+                      {isRenameProposedChange(c) ? "move" : `${c.bytes} B`} · {c.source}
+                    </span>
                     <div className="spacer" style={{ flex: 1 }} />
                     {canReviewProposedChange(c) && (
                       <>
@@ -774,7 +784,9 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
                           canApplyProposedChange(c)
                             ? isCreateProposedChange(c)
                               ? "Create the new file in the run's workspace root"
-                              : "Write the new content into the run's workspace root"
+                              : isRenameProposedChange(c)
+                                ? "Move the file to its destination in the run's workspace root"
+                                : "Write the new content into the run's workspace root"
                             : "Apply needs a baseline hash (none was recorded)"
                         }
                         onClick={() => void applyChange(i)}
@@ -787,6 +799,18 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
                     <div className="muted" style={{ fontSize: 10, marginTop: 4 }}>
                       New file — created only if it does not already exist (no baseline needed).
                     </div>
+                  ) : isRenameProposedChange(c) ? (
+                    <>
+                      <div className="muted" style={{ fontSize: 10, marginTop: 4 }}>
+                        Move — applied only if {c.dest_path ?? "the destination"} does not already
+                        exist and the source still matches its baseline.
+                      </div>
+                      {!c.baseline_sha256 && (
+                        <div className="muted" style={{ fontSize: 10, marginTop: 4 }}>
+                          No baseline hash — apply is refused (no force in v1).
+                        </div>
+                      )}
+                    </>
                   ) : (
                     !c.baseline_sha256 && (
                       <div className="muted" style={{ fontSize: 10, marginTop: 4 }}>
@@ -809,16 +833,23 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
                       Note: {c.review_note}
                     </div>
                   )}
-                  {/* Read-only preview of the full proposed content. */}
-                  <details style={{ marginTop: 6 }}>
-                    <summary style={{ cursor: "pointer", fontSize: 11 }}>Preview new content</summary>
-                    <pre
-                      className="mono"
-                      style={{ fontSize: 11, maxHeight: 240, overflow: "auto", whiteSpace: "pre-wrap", marginTop: 6 }}
-                    >
-                      {c.new_content}
-                    </pre>
-                  </details>
+                  {/* Read-only preview of the full proposed content. A rename moves
+                      the file intact, so it has no new content to preview. */}
+                  {isRenameProposedChange(c) ? (
+                    <div className="muted" style={{ fontSize: 10, marginTop: 6 }}>
+                      No content change — the file is moved intact.
+                    </div>
+                  ) : (
+                    <details style={{ marginTop: 6 }}>
+                      <summary style={{ cursor: "pointer", fontSize: 11 }}>Preview new content</summary>
+                      <pre
+                        className="mono"
+                        style={{ fontSize: 11, maxHeight: 240, overflow: "auto", whiteSpace: "pre-wrap", marginTop: 6 }}
+                      >
+                        {c.new_content}
+                      </pre>
+                    </details>
+                  )}
                 </div>
               ))}
             </div>

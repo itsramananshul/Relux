@@ -3461,6 +3461,7 @@ mod tests {
         run.proposed_changes = vec![relux_core::ProposedChange {
             path: "src/main.rs".into(),
             action: relux_core::ProposedChangeAction::Replace,
+            dest_path: None,
             new_content: "fn main() {}\n".into(),
             baseline_sha256: Some(relux_core::sha256_hex(b"old")),
             new_sha256: relux_core::sha256_hex(b"fn main() {}\n"),

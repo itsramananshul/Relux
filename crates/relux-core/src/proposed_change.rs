@@ -28,10 +28,16 @@
 //! - a `baseline_sha256`, when present, is validated as 64 lowercase hex chars
 //!   (anything else is dropped to `None`);
 //! - the `action` is `replace` (the default — full-content replacement over an
-//!   existing baseline file) or `create` (a brand-new file that must NOT already
-//!   exist at apply time). A missing `action` defaults to `replace` so older
-//!   envelopes and persisted records stay valid; an unknown action string drops
-//!   the change (we never store a change we could not safely interpret).
+//!   existing baseline file), `create` (a brand-new file that must NOT already
+//!   exist at apply time), or `rename`/`move` (relocate an existing baseline file
+//!   to a `dest_path` that must NOT already exist, preserving its content). A
+//!   missing `action` defaults to `replace` so older envelopes and persisted
+//!   records stay valid; an unknown action string drops the change (we never store
+//!   a change we could not safely interpret).
+//! - a `rename` additionally needs a `dest_path` (alias `to`/`to_path`/`dest`/
+//!   `destination`/`new_path`) that is itself relative + safe + not excluded and
+//!   distinct from the source `path`; otherwise the change is dropped. A rename
+//!   carries NO new content (the move preserves the file's bytes).
 //!
 //! Apply itself lives in the kernel ([`crate::ProposedChange`] is the durable
 //! record it works from) and adds the rest of the bar. A `replace` apply requires
@@ -39,8 +45,12 @@
 //! in v1), and verifies the baseline still matches the on-disk file (**conflict**
 //! otherwise). A `create` apply also requires **approval**, needs **no baseline**
 //! (there is no prior content), and refuses if the target **already exists** (a
-//! conflict — it never overwrites). Both only ever write inside the run's
-//! controlled workspace root. Capturing a proposed change NEVER applies it.
+//! conflict — it never overwrites). A `rename` apply requires **approval**, also
+//! **refuses without a baseline hash** for the source, verifies the source still
+//! matches it (**conflict** otherwise), and refuses if the `dest_path` **already
+//! exists** (a conflict — it never overwrites); it then moves the file. All only
+//! ever write inside the run's controlled workspace root. Capturing a proposed
+//! change NEVER applies it.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -111,9 +121,11 @@ impl ProposedChangeStatus {
 ///
 /// `Replace` (the default) is a **full-content replacement** of an *existing*
 /// file, gated by a baseline hash. `Create` is a **brand-new file** that must NOT
-/// already exist at apply time and needs no baseline. The two-variant set is kept
-/// deliberately small — no rename/delete in this slice — so every apply maps to
-/// exactly one strict, well-understood write.
+/// already exist at apply time and needs no baseline. `Rename` (move) relocates an
+/// *existing* baseline file from `path` to a new `dest_path` that must NOT already
+/// exist — content is preserved, so it carries no new content. The set is kept
+/// deliberately small — no delete in this slice — so every apply maps to exactly
+/// one strict, well-understood write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProposedChangeAction {
@@ -123,6 +135,9 @@ pub enum ProposedChangeAction {
     Replace,
     /// Create a new file that must not already exist at apply time.
     Create,
+    /// Move an existing baseline file from `path` to `dest_path`, where the
+    /// destination must not already exist. Content is preserved (no new content).
+    Rename,
 }
 
 impl ProposedChangeAction {
@@ -131,7 +146,24 @@ impl ProposedChangeAction {
         match self {
             ProposedChangeAction::Replace => "replace",
             ProposedChangeAction::Create => "create",
+            ProposedChangeAction::Rename => "rename",
         }
+    }
+
+    /// Whether this action verifies an existing file against a declared baseline
+    /// hash (and so requires one at apply time — no force in v1). A `replace`
+    /// overwrites that file; a `rename` moves it; a `create` has no prior file.
+    pub fn requires_baseline(&self) -> bool {
+        matches!(
+            self,
+            ProposedChangeAction::Replace | ProposedChangeAction::Rename
+        )
+    }
+
+    /// Whether this action carries a destination path (a `rename`/move). Replace
+    /// and create write a single `path`; only a rename has a distinct `dest_path`.
+    pub fn has_destination(&self) -> bool {
+        matches!(self, ProposedChangeAction::Rename)
     }
 }
 
@@ -145,17 +177,26 @@ pub struct ProposedChange {
     /// Safe, relative, `/`-separated target path inside the run's workspace root.
     pub path: String,
     /// The filesystem action this change applies — `replace` (over an existing
-    /// baseline file) or `create` (a new file). `#[serde(default)]` means an older
-    /// record or envelope with no `action` deserializes as `replace`.
+    /// baseline file), `create` (a new file), or `rename` (move `path` to
+    /// `dest_path`). `#[serde(default)]` means an older record or envelope with no
+    /// `action` deserializes as `replace`.
     #[serde(default)]
     pub action: ProposedChangeAction,
+    /// For a `rename` (move) action, the safe, relative, `/`-separated destination
+    /// path the source `path` is moved to. It must NOT already exist at apply time
+    /// and must differ from the source. `None` for `replace`/`create` (which write
+    /// a single `path`). `#[serde(default)]` keeps older records without it valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dest_path: Option<String>,
     /// The full proposed new content of the file (text, within
-    /// [`MAX_CONTENT_BYTES`]). Stored verbatim so apply writes exactly this.
+    /// [`MAX_CONTENT_BYTES`]). Stored verbatim so apply writes exactly this. A
+    /// `rename` preserves the file's bytes, so it carries no new content (empty).
     pub new_content: String,
     /// SHA-256 (lowercase hex) of the content the agent based its edit on, when
-    /// the envelope declared it. A `replace` apply **refuses without this** (no
-    /// force in v1) and refuses when it no longer matches the on-disk file (a
-    /// conflict). A `create` change carries no baseline (there is no prior file).
+    /// the envelope declared it. A `replace` or `rename` apply **refuses without
+    /// this** (no force in v1) and refuses when it no longer matches the on-disk
+    /// source file (a conflict). A `create` change carries no baseline (there is no
+    /// prior file).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline_sha256: Option<String>,
     /// SHA-256 (lowercase hex) of `new_content`, computed at capture. Display +
@@ -239,9 +280,10 @@ fn capture_one(item: &serde_json::Value, source: &str) -> Option<ProposedChange>
         .and_then(|v| v.as_str())?;
     let path = sanitize_change_path(raw_path)?;
 
-    // Action: `replace` (default) or `create`. A missing action defaults to
-    // replace (backward compatibility); an unknown action drops the change — we
-    // never store a change we could not safely interpret as a known write.
+    // Action: `replace` (default), `create`, or `rename`/`move`. A missing action
+    // defaults to replace (backward compatibility); an unknown action drops the
+    // change — we never store a change we could not safely interpret as a known
+    // write.
     let action = match obj
         .get("action")
         .and_then(|v| v.as_str())
@@ -250,39 +292,76 @@ fn capture_one(item: &serde_json::Value, source: &str) -> Option<ProposedChange>
     {
         None | Some("") | Some("replace") => ProposedChangeAction::Replace,
         Some("create") => ProposedChangeAction::Create,
+        Some("rename") | Some("move") => ProposedChangeAction::Rename,
         Some(_) => return None,
     };
 
-    // Content: must be present text within the cap, and not binary (no NUL).
-    let content = obj
-        .get("content")
-        .or_else(|| obj.get("new_content"))
-        .or_else(|| obj.get("text"))
-        .and_then(|v| v.as_str())?;
-    if content.is_empty() || content.len() > MAX_CONTENT_BYTES || content.contains('\0') {
-        return None;
-    }
+    // Destination: required (safe, relative, distinct) for a `rename`; meaningless
+    // for replace/create, so it is dropped there to keep the record honest.
+    let dest_path = match action {
+        ProposedChangeAction::Replace | ProposedChangeAction::Create => None,
+        ProposedChangeAction::Rename => {
+            let raw_dest = obj
+                .get("dest_path")
+                .or_else(|| obj.get("to"))
+                .or_else(|| obj.get("to_path"))
+                .or_else(|| obj.get("dest"))
+                .or_else(|| obj.get("destination"))
+                .or_else(|| obj.get("new_path"))
+                .and_then(|v| v.as_str())?;
+            let dest = sanitize_change_path(raw_dest)?;
+            // A rename to the source path is a no-op; never store one.
+            if dest == path {
+                return None;
+            }
+            Some(dest)
+        }
+    };
 
-    // Baseline hash: a `replace` may carry one (validated as 64 lowercase hex
-    // chars or dropped); a `create` has no prior file, so any declared baseline is
-    // meaningless and is dropped to keep the record honest.
-    let baseline_sha256 = match action {
-        ProposedChangeAction::Create => None,
-        ProposedChangeAction::Replace => obj
-            .get("baseline_sha256")
+    // Content: required text within the cap for `replace`/`create`. A `rename`
+    // moves the file intact, so it carries no new content (empty) and any declared
+    // content is ignored.
+    let (new_content, new_sha256, bytes) = match action {
+        ProposedChangeAction::Rename => {
+            let empty = String::new();
+            let hash = sha256_hex(empty.as_bytes());
+            (empty, hash, 0u64)
+        }
+        ProposedChangeAction::Replace | ProposedChangeAction::Create => {
+            let content = obj
+                .get("content")
+                .or_else(|| obj.get("new_content"))
+                .or_else(|| obj.get("text"))
+                .and_then(|v| v.as_str())?;
+            if content.is_empty() || content.len() > MAX_CONTENT_BYTES || content.contains('\0') {
+                return None;
+            }
+            let new_content = content.to_string();
+            let new_sha256 = sha256_hex(new_content.as_bytes());
+            let bytes = new_content.len() as u64;
+            (new_content, new_sha256, bytes)
+        }
+    };
+
+    // Baseline hash: a `replace` or `rename` may carry one (validated as 64
+    // lowercase hex chars or dropped); a `create` has no prior file, so any
+    // declared baseline is meaningless and is dropped to keep the record honest.
+    let baseline_sha256 = if action.requires_baseline() {
+        obj.get("baseline_sha256")
             .or_else(|| obj.get("baseline"))
             .or_else(|| obj.get("base_sha256"))
             .and_then(|v| v.as_str())
             .map(|s| s.trim().to_ascii_lowercase())
-            .filter(|s| is_sha256_hex(s)),
+            .filter(|s| is_sha256_hex(s))
+    } else {
+        None
     };
 
-    let new_content = content.to_string();
-    let new_sha256 = sha256_hex(new_content.as_bytes());
     Some(ProposedChange {
-        bytes: new_content.len() as u64,
+        bytes,
         path,
         action,
+        dest_path,
         new_content,
         baseline_sha256,
         new_sha256,
@@ -448,11 +527,104 @@ mod tests {
 
     #[test]
     fn unknown_action_drops_the_change() {
+        // `delete` is not a known action in this slice; `frobnicate` is nonsense.
+        // Both drop (we never store a change we could not interpret as a write).
         let value = json!([
             { "path": "f.txt", "action": "delete", "content": "x" },
-            { "path": "g.txt", "action": "rename", "content": "y" }
+            { "path": "g.txt", "action": "frobnicate", "content": "y" }
         ]);
         assert!(capture_proposed_changes(Some(&value), "x").is_empty());
+    }
+
+    #[test]
+    fn rename_action_is_captured_with_a_destination_and_no_content() {
+        // A rename carries a source `path`, a distinct `dest_path`, and the source
+        // baseline; it moves the file intact, so it stores no new content.
+        let base = sha256_hex(b"old\n");
+        let value = json!([
+            { "path": "src/old.rs", "action": "rename", "to": "src/new.rs",
+              "baseline_sha256": base }
+        ]);
+        let cs = capture_proposed_changes(Some(&value), "claude-cli");
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].action, ProposedChangeAction::Rename);
+        assert_eq!(cs[0].path, "src/old.rs");
+        assert_eq!(cs[0].dest_path.as_deref(), Some("src/new.rs"));
+        assert_eq!(cs[0].baseline_sha256.as_deref(), Some(base.as_str()));
+        assert_eq!(cs[0].new_content, "");
+        assert_eq!(cs[0].bytes, 0);
+        assert_eq!(cs[0].new_sha256, sha256_hex(b""));
+    }
+
+    #[test]
+    fn move_is_an_alias_for_rename_and_accepts_dest_aliases() {
+        // `move` maps to the rename action, and the destination accepts the
+        // `dest_path`/`destination`/`new_path` aliases too.
+        for dest_key in ["dest_path", "to", "to_path", "dest", "destination", "new_path"] {
+            let value = json!([
+                { "path": "a.txt", "action": "move", dest_key: "b.txt",
+                  "baseline_sha256": sha256_hex(b"a") }
+            ]);
+            let cs = capture_proposed_changes(Some(&value), "x");
+            assert_eq!(cs.len(), 1, "dest alias {dest_key} should be accepted");
+            assert_eq!(cs[0].action, ProposedChangeAction::Rename);
+            assert_eq!(cs[0].dest_path.as_deref(), Some("b.txt"));
+        }
+    }
+
+    #[test]
+    fn rename_appears_on_the_wire_with_its_destination() {
+        let value = json!([
+            { "path": "a.txt", "action": "rename", "to": "b.txt",
+              "baseline_sha256": sha256_hex(b"a") }
+        ]);
+        let c = &capture_proposed_changes(Some(&value), "x")[0];
+        let v = serde_json::to_value(c).unwrap();
+        assert_eq!(v.get("action").and_then(|s| s.as_str()), Some("rename"));
+        assert_eq!(v.get("dest_path").and_then(|s| s.as_str()), Some("b.txt"));
+    }
+
+    #[test]
+    fn rename_without_a_destination_drops_the_change() {
+        let value = json!([{ "path": "a.txt", "action": "rename",
+                             "baseline_sha256": sha256_hex(b"a") }]);
+        assert!(capture_proposed_changes(Some(&value), "x").is_empty());
+    }
+
+    #[test]
+    fn rename_to_an_unsafe_or_excluded_destination_drops_the_change() {
+        let value = json!([
+            { "path": "a.txt", "action": "rename", "to": "../escape.txt",
+              "baseline_sha256": sha256_hex(b"a") },
+            { "path": "b.txt", "action": "rename", "to": ".git/config",
+              "baseline_sha256": sha256_hex(b"b") },
+            { "path": "c.txt", "action": "rename", "to": "deploy/prod.pem",
+              "baseline_sha256": sha256_hex(b"c") }
+        ]);
+        assert!(capture_proposed_changes(Some(&value), "x").is_empty());
+    }
+
+    #[test]
+    fn rename_to_the_same_path_is_a_noop_and_dropped() {
+        let value = json!([
+            { "path": "a.txt", "action": "rename", "to": "a.txt",
+              "baseline_sha256": sha256_hex(b"a") },
+            // backslash-normalized source/dest collapse to the same path too.
+            { "path": "src/a.txt", "action": "rename", "to": "src\\a.txt",
+              "baseline_sha256": sha256_hex(b"a") }
+        ]);
+        assert!(capture_proposed_changes(Some(&value), "x").is_empty());
+    }
+
+    #[test]
+    fn rename_without_a_baseline_is_still_captured() {
+        // Apply refuses a rename without a baseline, but capture keeps it so the
+        // operator can see what was proposed (and why it cannot be applied).
+        let value = json!([{ "path": "a.txt", "action": "rename", "to": "b.txt" }]);
+        let cs = capture_proposed_changes(Some(&value), "x");
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].action, ProposedChangeAction::Rename);
+        assert_eq!(cs[0].baseline_sha256, None);
     }
 
     #[test]

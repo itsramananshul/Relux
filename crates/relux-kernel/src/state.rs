@@ -2605,10 +2605,10 @@ impl KernelState {
         };
         let task_namespace = self.tasks.get(&task_id).map(|t| t.namespace_id.clone());
 
-        // Snapshot the change fields we need (status/action/baseline/path/content)
-        // so the borrow of `self.runs` is released before we read other kernel
-        // state.
-        let (status, action, baseline, rel_path, content) = {
+        // Snapshot the change fields we need (status/action/baseline/path/dest/
+        // content) so the borrow of `self.runs` is released before we read other
+        // kernel state.
+        let (status, action, baseline, rel_path, dest_path, content) = {
             let run = self
                 .runs
                 .get(run_id)
@@ -2624,6 +2624,7 @@ impl KernelState {
                 change.action,
                 change.baseline_sha256.clone(),
                 change.path.clone(),
+                change.dest_path.clone(),
                 change.new_content.clone(),
             )
         };
@@ -2637,11 +2638,10 @@ impl KernelState {
             });
         }
 
-        // 2. A `replace` requires a baseline hash (no force in v1); a `create` has
-        // no prior file, so it needs none.
-        let baseline = match action {
-            relux_core::ProposedChangeAction::Create => None,
-            relux_core::ProposedChangeAction::Replace => match baseline {
+        // 2. A `replace`/`rename` requires a baseline hash (no force in v1); a
+        // `create` has no prior file, so it needs none.
+        let baseline = if action.requires_baseline() {
+            match baseline {
                 Some(b) => Some(b),
                 None => {
                     let reason =
@@ -2654,7 +2654,9 @@ impl KernelState {
                         reason,
                     });
                 }
-            },
+            }
+        } else {
+            None
         };
 
         // 3. The run's adapter must have a controlled workspace root.
@@ -2686,8 +2688,15 @@ impl KernelState {
             &rel_path,
             action,
             baseline.as_deref(),
+            dest_path.as_deref(),
             &content,
         );
+        // The path reported as applied is where the file now lives: the destination
+        // for a rename, otherwise the change's own path.
+        let reported_path = match (action.has_destination(), &dest_path) {
+            (true, Some(dest)) => dest.clone(),
+            _ => rel_path.clone(),
+        };
         match outcome {
             Ok(written_bytes) => {
                 let applied_at = self.clock.tick();
@@ -2698,14 +2707,21 @@ impl KernelState {
                         change.refused_reason = None;
                     }
                 }
+                let human = if action.has_destination() {
+                    format!("renamed {rel_path} to {reported_path} ({written_bytes} bytes)")
+                } else {
+                    format!("applied proposed change to {reported_path} ({written_bytes} bytes)")
+                };
                 self.push_run_event(
                     run_id,
                     "proposed_change_applied",
                     "kernel",
-                    &format!("applied proposed change to {rel_path} ({written_bytes} bytes)"),
+                    &human,
                     serde_json::json!({
                         "index": index,
+                        "action": action.as_str(),
                         "path": rel_path,
+                        "dest_path": dest_path,
                         "bytes": written_bytes,
                     }),
                 );
@@ -2717,12 +2733,18 @@ impl KernelState {
                     Some(run_id.as_str()),
                     task_namespace.as_ref(),
                     AuditResult::Success,
-                    serde_json::json!({ "index": index, "path": rel_path, "bytes": written_bytes }),
+                    serde_json::json!({
+                        "index": index,
+                        "action": action.as_str(),
+                        "path": rel_path,
+                        "dest_path": dest_path,
+                        "bytes": written_bytes,
+                    }),
                 );
                 Ok(AppliedProposedChange {
                     run_id: run_id.clone(),
                     index,
-                    path: rel_path,
+                    path: reported_path,
                     bytes: written_bytes,
                     applied_at,
                 })
@@ -2854,6 +2876,7 @@ impl KernelState {
             Option<String>,
             String,
             String,
+            Option<String>,
         );
         let snapshot: Vec<ChangeSnapshot> = {
             let run = self
@@ -2875,6 +2898,7 @@ impl KernelState {
                     change.baseline_sha256.clone(),
                     change.path.clone(),
                     change.new_content.clone(),
+                    change.dest_path.clone(),
                 ));
             }
             out
@@ -2885,8 +2909,8 @@ impl KernelState {
         // we audit the refusal but do NOT stamp a refusal reason on the changes.
         let not_approved: Vec<usize> = snapshot
             .iter()
-            .filter(|(_, status, _, _, _, _)| *status != ProposedChangeStatus::Approved)
-            .map(|(i, _, _, _, _, _)| *i)
+            .filter(|(_, status, _, _, _, _, _)| *status != ProposedChangeStatus::Approved)
+            .map(|(i, _, _, _, _, _, _)| *i)
             .collect();
         if !not_approved.is_empty() {
             let reason = format!(
@@ -2909,18 +2933,18 @@ impl KernelState {
             });
         }
 
-        // 2. Every selected `replace` must carry a baseline hash (no force in v1).
-        // A `create` has no prior file, so it needs none.
+        // 2. Every selected `replace`/`rename` must carry a baseline hash (no force
+        // in v1). A `create` has no prior file, so it needs none.
         let no_baseline: Vec<usize> = snapshot
             .iter()
-            .filter(|(_, _, action, baseline, _, _)| {
-                *action == relux_core::ProposedChangeAction::Replace && baseline.is_none()
+            .filter(|(_, _, action, baseline, _, _, _)| {
+                action.requires_baseline() && baseline.is_none()
             })
-            .map(|(i, _, _, _, _, _)| *i)
+            .map(|(i, _, _, _, _, _, _)| *i)
             .collect();
         if !no_baseline.is_empty() {
             let reason = format!(
-                "every replace in a transactional apply must carry a baseline hash \
+                "every replace or rename in a transactional apply must carry a baseline hash \
                  (no force in v1); missing on: {no_baseline:?}"
             );
             self.refuse_proposed_change_set(run_id, indices, &agent_id, task_namespace.as_ref(), &reason);
@@ -2957,9 +2981,10 @@ impl KernelState {
         // targets, baselines/absence), then write them all transactionally.
         let changes: Vec<PlannedChange> = snapshot
             .iter()
-            .map(|(_, _, action, baseline, path, content)| PlannedChange {
+            .map(|(_, _, action, baseline, path, content, dest)| PlannedChange {
                 action: *action,
                 path: path.clone(),
+                dest: dest.clone(),
                 baseline: baseline.clone(),
                 content: content.clone(),
             })
@@ -2968,7 +2993,7 @@ impl KernelState {
             Ok(applied_files) => {
                 let applied_at = self.clock.tick();
                 let mut applied = Vec::with_capacity(applied_files.len());
-                for ((index, _, _, _, _, _), (rel_path, written_bytes)) in
+                for ((index, _, _, _, _, _, _), (rel_path, written_bytes)) in
                     snapshot.iter().zip(applied_files.iter())
                 {
                     if let Some(run) = self.runs.get_mut(run_id) {
@@ -4575,12 +4600,15 @@ struct ApplySetFailure {
 }
 
 /// One proposed change handed to the pure workspace writer: the filesystem
-/// `action` (replace/create), the declared relative `path`, the optional
-/// `baseline` (Some for a replace, None for a create), and the new `content`.
+/// `action` (replace/create/rename), the declared relative `path` (the source for
+/// a rename), the optional `dest` (the destination for a rename; `None` otherwise),
+/// the optional `baseline` (Some for a replace/rename, None for a create), and the
+/// new `content` (empty for a rename, which moves the file intact).
 #[derive(Debug)]
 struct PlannedChange {
     action: relux_core::ProposedChangeAction,
     path: String,
+    dest: Option<String>,
     baseline: Option<String>,
     content: String,
 }
@@ -4593,17 +4621,30 @@ enum RollbackPlan {
     RestoreOriginal(Vec<u8>),
     /// The file did not exist before (a create); delete it on rollback.
     DeleteCreated,
+    /// The file was moved (a rename); move it back from the destination to the
+    /// source. The source/destination paths live on the [`PlannedWrite`].
+    RestoreRename,
 }
 
 /// One fully-validated change ready to write in a transactional apply, plus the
 /// information the write phase needs to roll the file back if a later write in the
-/// same transaction fails.
+/// same transaction fails. For a rename, `safe_rel`/`target` are the *source* and
+/// `dest_safe_rel`/`dest_target` are the *destination* the file moves to.
 #[derive(Debug)]
 struct PlannedWrite {
     action: relux_core::ProposedChangeAction,
     safe_rel: String,
     target: std::path::PathBuf,
+    /// The destination path of a rename (`None` for replace/create).
+    dest_safe_rel: Option<String>,
+    /// The destination target of a rename (`None` for replace/create).
+    dest_target: Option<std::path::PathBuf>,
     content: String,
+    /// The path reported as applied (the destination for a rename, else `safe_rel`).
+    report_rel: String,
+    /// The bytes reported as written (the moved file size for a rename, else the
+    /// new content length).
+    report_bytes: u64,
     rollback: RollbackPlan,
 }
 
@@ -4642,6 +4683,7 @@ fn apply_change_to_workspace(
     rel_path: &str,
     action: relux_core::ProposedChangeAction,
     baseline: Option<&str>,
+    dest: Option<&str>,
     content: &str,
 ) -> Result<u64, ApplyFailure> {
     let refuse = |reason: String| ApplyFailure {
@@ -4652,9 +4694,10 @@ fn apply_change_to_workspace(
         conflict: true,
         reason,
     };
+    let lift = |TargetRefusal { conflict: c, reason }| ApplyFailure { conflict: c, reason };
 
-    let (root_canon, safe_rel, target) = resolve_apply_target(workspace_root, rel_path)
-        .map_err(|TargetRefusal { conflict: c, reason }| ApplyFailure { conflict: c, reason })?;
+    let (root_canon, safe_rel, target) =
+        resolve_apply_target(workspace_root, rel_path).map_err(lift)?;
 
     match action {
         relux_core::ProposedChangeAction::Replace => {
@@ -4688,6 +4731,38 @@ fn apply_change_to_workspace(
             create_new_file_atomic(&target, &safe_rel, content, "0")
                 .map_err(|TargetRefusal { conflict: c, reason }| ApplyFailure { conflict: c, reason })?;
             Ok(content.len() as u64)
+        }
+        relux_core::ProposedChangeAction::Rename => {
+            let baseline = baseline.ok_or_else(|| {
+                refuse("internal: a rename reached the writer without a baseline".to_string())
+            })?;
+            let dest_rel = dest.ok_or_else(|| {
+                refuse("internal: a rename reached the writer without a destination".to_string())
+            })?;
+            // Source must be an existing regular file matching the baseline.
+            let original = verify_replace_baseline(&target, &safe_rel, baseline).map_err(lift)?;
+            // Destination must resolve safely inside the root and not yet exist.
+            let (_, dest_safe_rel, dest_target) =
+                resolve_apply_target(workspace_root, dest_rel).map_err(lift)?;
+            if dest_safe_rel == safe_rel || dest_target == target {
+                return Err(refuse(format!(
+                    "rename source and destination are the same path: {safe_rel}"
+                )));
+            }
+            if std::fs::symlink_metadata(&dest_target).is_ok() {
+                return Err(conflict(format!(
+                    "rename destination {dest_safe_rel} already exists; a rename never overwrites an existing path"
+                )));
+            }
+            ensure_parent_dirs(&root_canon, &dest_safe_rel).map_err(lift)?;
+            // Move the file. Source and destination are both inside the canonical
+            // root (same filesystem), so the rename is atomic.
+            if let Err(e) = std::fs::rename(&target, &dest_target) {
+                return Err(refuse(format!(
+                    "could not move {safe_rel} to {dest_safe_rel}: {e}"
+                )));
+            }
+            Ok(original.len() as u64)
         }
     }
 }
@@ -4952,13 +5027,20 @@ fn apply_change_set_to_workspace(
         let (_, safe_rel, target) =
             resolve_apply_target(workspace_root, &change.path).map_err(lift)?;
 
-        // No two changes in the set may target the same file (by safe rel or by
-        // resolved path), so apply order can never be ambiguous.
+        // Every path a change occupies (the source/target, and a rename's
+        // destination) must be distinct across the whole set — by safe rel and by
+        // resolved path — so no two changes touch the same file in the same
+        // transaction and apply order is never ambiguous.
         if !seen_rel.insert(safe_rel.clone()) || !seen_target.insert(target.clone()) {
             return Err(refuse(format!(
-                "duplicate target path in the change set: {safe_rel}"
+                "conflicting target path in the change set: {safe_rel}"
             )));
         }
+
+        let mut dest_safe_rel: Option<String> = None;
+        let mut dest_target: Option<std::path::PathBuf> = None;
+        let mut report_rel = safe_rel.clone();
+        let mut report_bytes = change.content.len() as u64;
 
         let rollback = match change.action {
             relux_core::ProposedChangeAction::Replace => {
@@ -4980,13 +5062,57 @@ fn apply_change_set_to_workspace(
                 }
                 RollbackPlan::DeleteCreated
             }
+            relux_core::ProposedChangeAction::Rename => {
+                let baseline = change.baseline.as_deref().ok_or_else(|| {
+                    refuse(format!(
+                        "internal: rename {safe_rel} reached the set writer without a baseline"
+                    ))
+                })?;
+                let dest_rel = change.dest.as_deref().ok_or_else(|| {
+                    refuse(format!(
+                        "internal: rename {safe_rel} reached the set writer without a destination"
+                    ))
+                })?;
+                // Source must be an existing regular file matching the baseline.
+                let original =
+                    verify_replace_baseline(&target, &safe_rel, baseline).map_err(lift)?;
+                // Destination must resolve safely inside the root and not yet exist.
+                let (_, d_safe_rel, d_target) =
+                    resolve_apply_target(workspace_root, dest_rel).map_err(lift)?;
+                if d_safe_rel == safe_rel || d_target == target {
+                    return Err(refuse(format!(
+                        "rename source and destination are the same path: {safe_rel}"
+                    )));
+                }
+                if std::fs::symlink_metadata(&d_target).is_ok() {
+                    return Err(conflict(format!(
+                        "rename destination {d_safe_rel} already exists; a rename never overwrites an existing path"
+                    )));
+                }
+                // The destination is a second occupied path: it must also be unique
+                // across the set (no other change may target or move onto it).
+                if !seen_rel.insert(d_safe_rel.clone()) || !seen_target.insert(d_target.clone()) {
+                    return Err(refuse(format!(
+                        "conflicting target path in the change set: {d_safe_rel}"
+                    )));
+                }
+                report_rel = d_safe_rel.clone();
+                report_bytes = original.len() as u64;
+                dest_safe_rel = Some(d_safe_rel);
+                dest_target = Some(d_target);
+                RollbackPlan::RestoreRename
+            }
         };
 
         planned.push(PlannedWrite {
             action: change.action,
             safe_rel,
             target,
+            dest_safe_rel,
+            dest_target,
             content: change.content.clone(),
+            report_rel,
+            report_bytes,
             rollback,
         });
     }
@@ -5025,13 +5151,36 @@ fn apply_change_set_to_workspace(
                     })
                     .map_err(|TargetRefusal { reason, .. }| reason)
             }
+            relux_core::ProposedChangeAction::Rename => {
+                // Source was verified in phase 1; create the destination's parent
+                // dirs (if any) and move the file. A missing dest field here is an
+                // internal invariant break (phase 1 sets it for every rename).
+                match (p.dest_safe_rel.as_deref(), p.dest_target.as_ref()) {
+                    (Some(dest_safe_rel), Some(dest_target)) => {
+                        ensure_parent_dirs(&root_canon, dest_safe_rel)
+                            .map_err(|TargetRefusal { reason, .. }| reason)
+                            .and_then(|()| {
+                                std::fs::rename(&p.target, dest_target).map_err(|e| {
+                                    format!(
+                                        "could not move {} to {dest_safe_rel}: {e}",
+                                        p.safe_rel
+                                    )
+                                })
+                            })
+                    }
+                    _ => Err(format!(
+                        "internal: rename {} reached the set writer without a destination",
+                        p.safe_rel
+                    )),
+                }
+            }
         };
         if let Err(cause) = write_res {
             let rolled = rollback_writes(&written);
             return Err(refuse(rollback_message(&cause, &written, rolled)));
         }
         written.push(p);
-        applied.push((p.safe_rel.clone(), p.content.len() as u64));
+        applied.push((p.report_rel.clone(), p.report_bytes));
     }
     Ok(applied)
 }
@@ -5064,6 +5213,17 @@ fn rollback_writes(written: &[&PlannedWrite]) -> bool {
             RollbackPlan::DeleteCreated => {
                 if std::fs::remove_file(&p.target).is_err() {
                     all_ok = false;
+                }
+            }
+            RollbackPlan::RestoreRename => {
+                // The file was moved source -> dest; move it back dest -> source.
+                match &p.dest_target {
+                    Some(dest_target) => {
+                        if std::fs::rename(dest_target, &p.target).is_err() {
+                            all_ok = false;
+                        }
+                    }
+                    None => all_ok = false,
                 }
             }
         }
@@ -7055,6 +7215,7 @@ mod tests {
         let change = relux_core::ProposedChange {
             path: path.to_string(),
             action: relux_core::ProposedChangeAction::Replace,
+            dest_path: None,
             new_content: new_content.to_string(),
             baseline_sha256: baseline,
             new_sha256: relux_core::sha256_hex(new_content.as_bytes()),
@@ -7079,6 +7240,7 @@ mod tests {
             "out.txt",
             relux_core::ProposedChangeAction::Replace,
             Some(&baseline),
+            None,
             "new content",
         )
         .expect("apply ok");
@@ -7096,6 +7258,7 @@ mod tests {
             "out.txt",
             relux_core::ProposedChangeAction::Replace,
             Some(&baseline),
+            None,
             "new content",
         )
         .unwrap_err();
@@ -7113,6 +7276,7 @@ mod tests {
             "absent.txt",
             relux_core::ProposedChangeAction::Replace,
             Some(&baseline),
+            None,
             "x",
         )
         .unwrap_err();
@@ -7129,6 +7293,7 @@ mod tests {
             "../escape.txt",
             relux_core::ProposedChangeAction::Replace,
             Some("x"),
+            None,
             "y",
         )
         .unwrap_err();
@@ -7144,6 +7309,7 @@ mod tests {
             dir.path().to_str().unwrap(),
             "src/new/mod.rs",
             relux_core::ProposedChangeAction::Create,
+            None,
             None,
             "pub fn hi() {}\n",
         )
@@ -7171,6 +7337,7 @@ mod tests {
             "exists.txt",
             relux_core::ProposedChangeAction::Create,
             None,
+            None,
             "new content",
         )
         .unwrap_err();
@@ -7192,11 +7359,211 @@ mod tests {
             ".git/hooks/pre-commit",
             relux_core::ProposedChangeAction::Create,
             None,
+            None,
             "#!/bin/sh\n",
         )
         .unwrap_err();
         assert!(!err.conflict);
         assert!(err.reason.contains("unsafe") || err.reason.contains("excluded"));
+    }
+
+    // ── rename/move (master plan §15 diff/apply model) ─────────────────────
+
+    #[test]
+    fn rename_to_workspace_moves_file_when_baseline_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("old.txt"), "keep me").unwrap();
+        let baseline = relux_core::sha256_hex(b"keep me");
+        let n = apply_change_to_workspace(
+            dir.path().to_str().unwrap(),
+            "old.txt",
+            relux_core::ProposedChangeAction::Rename,
+            Some(&baseline),
+            Some("new.txt"),
+            "", // a rename carries no new content
+        )
+        .expect("rename ok");
+        // The reported bytes are the moved file's size.
+        assert_eq!(n, "keep me".len() as u64);
+        // The source is gone; the destination has the original content intact.
+        assert!(!dir.path().join("old.txt").exists(), "source must be moved away");
+        assert_eq!(std::fs::read_to_string(dir.path().join("new.txt")).unwrap(), "keep me");
+    }
+
+    #[test]
+    fn rename_to_workspace_makes_dest_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("old.txt"), "x").unwrap();
+        let baseline = relux_core::sha256_hex(b"x");
+        apply_change_to_workspace(
+            dir.path().to_str().unwrap(),
+            "old.txt",
+            relux_core::ProposedChangeAction::Rename,
+            Some(&baseline),
+            Some("moved/into/here.txt"),
+            "",
+        )
+        .expect("rename ok");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("moved").join("into").join("here.txt")).unwrap(),
+            "x"
+        );
+    }
+
+    #[test]
+    fn rename_to_workspace_refuses_when_dest_exists_as_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("old.txt"), "src").unwrap();
+        std::fs::write(dir.path().join("taken.txt"), "DO NOT TOUCH").unwrap();
+        let baseline = relux_core::sha256_hex(b"src");
+        let err = apply_change_to_workspace(
+            dir.path().to_str().unwrap(),
+            "old.txt",
+            relux_core::ProposedChangeAction::Rename,
+            Some(&baseline),
+            Some("taken.txt"),
+            "",
+        )
+        .unwrap_err();
+        // An existing destination is a conflict; nothing is moved.
+        assert!(err.conflict, "existing destination is a conflict");
+        assert_eq!(std::fs::read_to_string(dir.path().join("old.txt")).unwrap(), "src");
+        assert_eq!(std::fs::read_to_string(dir.path().join("taken.txt")).unwrap(), "DO NOT TOUCH");
+    }
+
+    #[test]
+    fn rename_to_workspace_refuses_on_baseline_conflict_and_leaves_source() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("old.txt"), "CHANGED ON DISK").unwrap();
+        let baseline = relux_core::sha256_hex(b"what the agent saw");
+        let err = apply_change_to_workspace(
+            dir.path().to_str().unwrap(),
+            "old.txt",
+            relux_core::ProposedChangeAction::Rename,
+            Some(&baseline),
+            Some("new.txt"),
+            "",
+        )
+        .unwrap_err();
+        assert!(err.conflict, "source baseline mismatch is a conflict");
+        // The source is untouched and the destination was never created.
+        assert_eq!(std::fs::read_to_string(dir.path().join("old.txt")).unwrap(), "CHANGED ON DISK");
+        assert!(!dir.path().join("new.txt").exists());
+    }
+
+    #[test]
+    fn rename_to_workspace_refuses_missing_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let baseline = relux_core::sha256_hex(b"x");
+        let err = apply_change_to_workspace(
+            dir.path().to_str().unwrap(),
+            "absent.txt",
+            relux_core::ProposedChangeAction::Rename,
+            Some(&baseline),
+            Some("new.txt"),
+            "",
+        )
+        .unwrap_err();
+        // A rename needs an existing source file (a missing one is a conflict).
+        assert!(err.conflict);
+    }
+
+    #[test]
+    fn rename_to_workspace_refuses_unsafe_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("old.txt"), "x").unwrap();
+        let baseline = relux_core::sha256_hex(b"x");
+        // A `..` destination escapes the root: a structural refusal, source intact.
+        let err = apply_change_to_workspace(
+            dir.path().to_str().unwrap(),
+            "old.txt",
+            relux_core::ProposedChangeAction::Rename,
+            Some(&baseline),
+            Some("../escape.txt"),
+            "",
+        )
+        .unwrap_err();
+        assert!(!err.conflict);
+        assert!(err.reason.contains("unsafe") || err.reason.contains("escape"));
+        assert_eq!(std::fs::read_to_string(dir.path().join("old.txt")).unwrap(), "x");
+    }
+
+    #[test]
+    fn rename_to_workspace_refuses_same_source_and_dest() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+        let baseline = relux_core::sha256_hex(b"x");
+        let err = apply_change_to_workspace(
+            dir.path().to_str().unwrap(),
+            "a.txt",
+            relux_core::ProposedChangeAction::Rename,
+            Some(&baseline),
+            Some("a.txt"),
+            "",
+        )
+        .unwrap_err();
+        assert!(!err.conflict);
+        assert!(err.reason.contains("same path"));
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "x");
+    }
+
+    /// Build a kernel + run carrying a single `rename` proposed change moving
+    /// `path` -> `dest`, with the source `baseline`, under a controlled `workdir`.
+    fn kernel_with_rename_change(
+        workdir: Option<&str>,
+        baseline: Option<String>,
+        path: &str,
+        dest: &str,
+    ) -> (KernelState, RunId) {
+        let (mut k, run_id) = kernel_with_proposed_change(workdir, baseline, path, "x");
+        let change = &mut k.runs.get_mut(&run_id).unwrap().proposed_changes[0];
+        change.action = relux_core::ProposedChangeAction::Rename;
+        change.dest_path = Some(dest.to_string());
+        change.new_content = String::new();
+        change.bytes = 0;
+        change.new_sha256 = relux_core::sha256_hex(b"");
+        (k, run_id)
+    }
+
+    #[test]
+    fn review_then_apply_rename_moves_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("old.rs"), "fn old() {}\n").unwrap();
+        let baseline = relux_core::sha256_hex(b"fn old() {}\n");
+        let (mut k, run_id) = kernel_with_rename_change(
+            Some(dir.path().to_str().unwrap()),
+            Some(baseline),
+            "old.rs",
+            "new.rs",
+        );
+        // Apply before approval is refused honestly.
+        let err = k.apply_proposed_change(&run_id, 0).unwrap_err();
+        assert!(matches!(err, KernelError::ProposedChangeNotApproved { .. }));
+        k.review_proposed_change(&run_id, 0, true, None).unwrap();
+        let applied = k.apply_proposed_change(&run_id, 0).expect("rename apply ok");
+        // The applied path is the destination (where the file now lives).
+        assert_eq!(applied.path, "new.rs");
+        assert!(!dir.path().join("old.rs").exists());
+        assert_eq!(std::fs::read_to_string(dir.path().join("new.rs")).unwrap(), "fn old() {}\n");
+        let change = &k.run(&run_id).unwrap().proposed_changes[0];
+        assert_eq!(change.status, relux_core::ProposedChangeStatus::Applied);
+        assert!(change.applied_at.is_some());
+    }
+
+    #[test]
+    fn apply_rename_refuses_without_a_baseline_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("old.rs"), "x").unwrap();
+        let (mut k, run_id) =
+            kernel_with_rename_change(Some(dir.path().to_str().unwrap()), None, "old.rs", "new.rs");
+        k.review_proposed_change(&run_id, 0, true, None).unwrap();
+        let err = k.apply_proposed_change(&run_id, 0).unwrap_err();
+        assert!(matches!(err, KernelError::ProposedChangeNotApplicable { .. }));
+        // The source was never moved.
+        assert!(dir.path().join("old.rs").exists());
+        assert!(!dir.path().join("new.rs").exists());
+        let change = &k.run(&run_id).unwrap().proposed_changes[0];
+        assert!(change.refused_reason.as_deref().unwrap().contains("baseline"));
     }
 
     /// Build a kernel + run carrying a single `create` proposed change with no
@@ -7408,6 +7775,7 @@ mod tests {
             .map(|(path, baseline, new_content)| relux_core::ProposedChange {
                 path: path.to_string(),
                 action: relux_core::ProposedChangeAction::Replace,
+                dest_path: None,
                 new_content: new_content.to_string(),
                 baseline_sha256: baseline.clone(),
                 new_sha256: relux_core::sha256_hex(new_content.as_bytes()),
@@ -7530,7 +7898,7 @@ mod tests {
         let err = k.apply_proposed_change_set(&run_id, &[0, 1]).unwrap_err();
         match err {
             KernelError::ProposedChangeSetNotApplicable { reason, .. } => {
-                assert!(reason.contains("duplicate"), "reason: {reason}");
+                assert!(reason.contains("conflicting"), "reason: {reason}");
             }
             other => panic!("expected NotApplicable, got {other:?}"),
         }
@@ -7627,12 +7995,14 @@ mod tests {
         std::fs::write(dir.path().join("nested").join("b.txt"), "old-b").unwrap();
         let changes = vec![
             PlannedChange {
+                dest: None,
                 action: relux_core::ProposedChangeAction::Replace,
                 path: "a.txt".to_string(),
                 baseline: Some(relux_core::sha256_hex(b"old-a")),
                 content: "new-a".to_string(),
             },
             PlannedChange {
+                dest: None,
                 action: relux_core::ProposedChangeAction::Replace,
                 path: "nested/b.txt".to_string(),
                 baseline: Some(relux_core::sha256_hex(b"old-b")),
@@ -7655,12 +8025,14 @@ mod tests {
         std::fs::write(dir.path().join("existing.txt"), "old").unwrap();
         let changes = vec![
             PlannedChange {
+                dest: None,
                 action: relux_core::ProposedChangeAction::Replace,
                 path: "existing.txt".to_string(),
                 baseline: Some(relux_core::sha256_hex(b"old")),
                 content: "rewritten".to_string(),
             },
             PlannedChange {
+                dest: None,
                 action: relux_core::ProposedChangeAction::Create,
                 path: "fresh/added.rs".to_string(),
                 baseline: None,
@@ -7686,12 +8058,14 @@ mod tests {
         std::fs::write(dir.path().join("collide.txt"), "I EXIST").unwrap();
         let changes = vec![
             PlannedChange {
+                dest: None,
                 action: relux_core::ProposedChangeAction::Replace,
                 path: "a.txt".to_string(),
                 baseline: Some(relux_core::sha256_hex(b"old-a")),
                 content: "new-a".to_string(),
             },
             PlannedChange {
+                dest: None,
                 action: relux_core::ProposedChangeAction::Create,
                 path: "collide.txt".to_string(),
                 baseline: None,
@@ -7717,12 +8091,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let changes = vec![
             PlannedChange {
+                dest: None,
                 action: relux_core::ProposedChangeAction::Create,
                 path: "sub".to_string(),
                 baseline: None,
                 content: "i am a file".to_string(),
             },
             PlannedChange {
+                dest: None,
                 action: relux_core::ProposedChangeAction::Create,
                 path: "sub/inner.txt".to_string(),
                 baseline: None,
@@ -7735,6 +8111,214 @@ mod tests {
         // The created file `sub` was rolled back (deleted) — no net change at all.
         assert!(!dir.path().join("sub").exists(), "rolled-back create must be gone");
         assert!(err.reason.contains("rolled back") || err.reason.contains("no files were written"));
+    }
+
+    #[test]
+    fn change_set_mixes_rename_replace_and_create_atomically() {
+        // One transaction: move `old.txt` -> `moved.txt`, rewrite `keep.txt`, and
+        // create `fresh.txt`. All three land together.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("old.txt"), "move me").unwrap();
+        std::fs::write(dir.path().join("keep.txt"), "old-keep").unwrap();
+        let changes = vec![
+            PlannedChange {
+                action: relux_core::ProposedChangeAction::Rename,
+                path: "old.txt".to_string(),
+                dest: Some("moved.txt".to_string()),
+                baseline: Some(relux_core::sha256_hex(b"move me")),
+                content: String::new(),
+            },
+            PlannedChange {
+                action: relux_core::ProposedChangeAction::Replace,
+                path: "keep.txt".to_string(),
+                dest: None,
+                baseline: Some(relux_core::sha256_hex(b"old-keep")),
+                content: "new-keep".to_string(),
+            },
+            PlannedChange {
+                action: relux_core::ProposedChangeAction::Create,
+                path: "fresh.txt".to_string(),
+                dest: None,
+                baseline: None,
+                content: "created".to_string(),
+            },
+        ];
+        let applied =
+            apply_change_set_to_workspace(dir.path().to_str().unwrap(), &changes).expect("ok");
+        assert_eq!(applied.len(), 3);
+        // The rename reports the destination path and the moved file's size.
+        assert_eq!(applied[0], ("moved.txt".to_string(), "move me".len() as u64));
+        assert!(!dir.path().join("old.txt").exists());
+        assert_eq!(std::fs::read_to_string(dir.path().join("moved.txt")).unwrap(), "move me");
+        assert_eq!(std::fs::read_to_string(dir.path().join("keep.txt")).unwrap(), "new-keep");
+        assert_eq!(std::fs::read_to_string(dir.path().join("fresh.txt")).unwrap(), "created");
+    }
+
+    #[test]
+    fn change_set_rename_dest_conflict_leaves_everything_untouched() {
+        // A good replace + a rename whose destination ALREADY exists must refuse the
+        // whole transaction: nothing is written or moved.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "old-a").unwrap();
+        std::fs::write(dir.path().join("src.txt"), "move me").unwrap();
+        std::fs::write(dir.path().join("taken.txt"), "I EXIST").unwrap();
+        let changes = vec![
+            PlannedChange {
+                action: relux_core::ProposedChangeAction::Replace,
+                path: "a.txt".to_string(),
+                dest: None,
+                baseline: Some(relux_core::sha256_hex(b"old-a")),
+                content: "new-a".to_string(),
+            },
+            PlannedChange {
+                action: relux_core::ProposedChangeAction::Rename,
+                path: "src.txt".to_string(),
+                dest: Some("taken.txt".to_string()),
+                baseline: Some(relux_core::sha256_hex(b"move me")),
+                content: String::new(),
+            },
+        ];
+        let err =
+            apply_change_set_to_workspace(dir.path().to_str().unwrap(), &changes).unwrap_err();
+        assert!(err.conflict, "a rename onto an existing path is a conflict");
+        // NOTHING was written or moved.
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "old-a");
+        assert_eq!(std::fs::read_to_string(dir.path().join("src.txt")).unwrap(), "move me");
+        assert_eq!(std::fs::read_to_string(dir.path().join("taken.txt")).unwrap(), "I EXIST");
+    }
+
+    #[test]
+    fn change_set_refuses_a_rename_baseline_conflict_and_leaves_everything() {
+        // The rename's source changed on disk since the proposal: the whole set is
+        // refused before any write, so the good replace is never applied either.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "old-a").unwrap();
+        std::fs::write(dir.path().join("src.txt"), "DIFFERENT NOW").unwrap();
+        let changes = vec![
+            PlannedChange {
+                action: relux_core::ProposedChangeAction::Replace,
+                path: "a.txt".to_string(),
+                dest: None,
+                baseline: Some(relux_core::sha256_hex(b"old-a")),
+                content: "new-a".to_string(),
+            },
+            PlannedChange {
+                action: relux_core::ProposedChangeAction::Rename,
+                path: "src.txt".to_string(),
+                dest: Some("moved.txt".to_string()),
+                baseline: Some(relux_core::sha256_hex(b"what the agent saw")),
+                content: String::new(),
+            },
+        ];
+        let err =
+            apply_change_set_to_workspace(dir.path().to_str().unwrap(), &changes).unwrap_err();
+        assert!(err.conflict, "rename source baseline mismatch is a conflict");
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "old-a");
+        assert_eq!(std::fs::read_to_string(dir.path().join("src.txt")).unwrap(), "DIFFERENT NOW");
+        assert!(!dir.path().join("moved.txt").exists());
+    }
+
+    #[test]
+    fn change_set_refuses_overlapping_rename_and_create_targets() {
+        // Two changes occupy the SAME destination path (a create AND a rename both
+        // target `dest.txt`): the set is refused as a conflicting target, untouched.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("src.txt"), "move me").unwrap();
+        let changes = vec![
+            PlannedChange {
+                action: relux_core::ProposedChangeAction::Create,
+                path: "dest.txt".to_string(),
+                dest: None,
+                baseline: None,
+                content: "created".to_string(),
+            },
+            PlannedChange {
+                action: relux_core::ProposedChangeAction::Rename,
+                path: "src.txt".to_string(),
+                dest: Some("dest.txt".to_string()),
+                baseline: Some(relux_core::sha256_hex(b"move me")),
+                content: String::new(),
+            },
+        ];
+        let err =
+            apply_change_set_to_workspace(dir.path().to_str().unwrap(), &changes).unwrap_err();
+        assert!(!err.conflict, "an overlapping target is a structural refusal");
+        assert!(err.reason.contains("conflicting target path"), "reason: {}", err.reason);
+        // Nothing written or moved.
+        assert!(!dir.path().join("dest.txt").exists());
+        assert_eq!(std::fs::read_to_string(dir.path().join("src.txt")).unwrap(), "move me");
+    }
+
+    #[test]
+    fn change_set_refuses_renaming_a_file_another_change_also_targets() {
+        // One change renames `shared.txt` away; another replaces it. They occupy the
+        // same source path, so the set is refused before any write.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("shared.txt"), "shared").unwrap();
+        let changes = vec![
+            PlannedChange {
+                action: relux_core::ProposedChangeAction::Rename,
+                path: "shared.txt".to_string(),
+                dest: Some("moved.txt".to_string()),
+                baseline: Some(relux_core::sha256_hex(b"shared")),
+                content: String::new(),
+            },
+            PlannedChange {
+                action: relux_core::ProposedChangeAction::Replace,
+                path: "shared.txt".to_string(),
+                dest: None,
+                baseline: Some(relux_core::sha256_hex(b"shared")),
+                content: "rewritten".to_string(),
+            },
+        ];
+        let err =
+            apply_change_set_to_workspace(dir.path().to_str().unwrap(), &changes).unwrap_err();
+        assert!(!err.conflict);
+        assert!(err.reason.contains("conflicting target path"), "reason: {}", err.reason);
+        assert!(!dir.path().join("moved.txt").exists());
+        assert_eq!(std::fs::read_to_string(dir.path().join("shared.txt")).unwrap(), "shared");
+    }
+
+    #[test]
+    fn change_set_rolls_back_a_rename_on_a_later_write_failure() {
+        // A rename succeeds in phase 2, then a later create fails (its parent is a
+        // file). The completed rename must be rolled back: the file moves back to its
+        // source and the destination is gone, leaving no net change.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("src.txt"), "move me").unwrap();
+        let changes = vec![
+            PlannedChange {
+                action: relux_core::ProposedChangeAction::Rename,
+                path: "src.txt".to_string(),
+                dest: Some("moved.txt".to_string()),
+                baseline: Some(relux_core::sha256_hex(b"move me")),
+                content: String::new(),
+            },
+            // `blocker` is created as a FILE; then a create under `blocker/inner.txt`
+            // fails because its parent is not a directory — forcing a rollback.
+            PlannedChange {
+                action: relux_core::ProposedChangeAction::Create,
+                path: "blocker".to_string(),
+                dest: None,
+                baseline: None,
+                content: "i am a file".to_string(),
+            },
+            PlannedChange {
+                action: relux_core::ProposedChangeAction::Create,
+                path: "blocker/inner.txt".to_string(),
+                dest: None,
+                baseline: None,
+                content: "never written".to_string(),
+            },
+        ];
+        let err =
+            apply_change_set_to_workspace(dir.path().to_str().unwrap(), &changes).unwrap_err();
+        assert!(!err.conflict, "a phase-2 parent failure is a structural refusal");
+        // The rename was rolled back: the file is back at its source, no destination.
+        assert_eq!(std::fs::read_to_string(dir.path().join("src.txt")).unwrap(), "move me");
+        assert!(!dir.path().join("moved.txt").exists(), "rolled-back rename dest must be gone");
+        assert!(!dir.path().join("blocker").exists(), "rolled-back create must be gone");
+        assert!(err.reason.contains("rolled back"));
     }
 
     #[test]
@@ -7810,6 +8394,43 @@ mod tests {
             "brand new doc\n"
         );
         assert_eq!(std::fs::read_to_string(work.path().join("keep.txt")).unwrap(), "new-keep");
+    }
+
+    #[test]
+    fn cli_run_captures_a_rename_and_apply_moves_the_file_end_to_end() {
+        // The rename slice end-to-end: a fake CLI emits an envelope with ONE
+        // `action:"rename"` (source path + a `to` destination + the source
+        // baseline). The kernel captures it, the operator approves it, and apply
+        // moves the file inside the controlled workspace root.
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("old_name.rs"), "fn thing() {}\n").unwrap();
+        let base = relux_core::sha256_hex(b"fn thing() {}\n");
+        let cli_dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            r#"{{"type":"result","is_error":false,"result":"renamed it","proposed_changes":[{{"path":"old_name.rs","action":"rename","to":"src/new_name.rs","baseline_sha256":"{base}"}}]}}"#
+        );
+        let fake = write_fake_json_cli(cli_dir.path(), "fake-claude-rename", &body);
+        let mut k = adapter_kernel();
+        enable_claude_with_workdir(&mut k, &fake, work.path().to_str().unwrap());
+        let (_agent, task) = cli_task(&mut k);
+        let run_id = k.execute_assigned_run(&task).expect("adapter run ok");
+
+        // Captured as a rename with its destination; the file has not moved yet.
+        let changes = &k.run(&run_id).unwrap().proposed_changes;
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].action, relux_core::ProposedChangeAction::Rename);
+        assert_eq!(changes[0].dest_path.as_deref(), Some("src/new_name.rs"));
+        assert!(work.path().join("old_name.rs").exists());
+
+        // Approve + apply: the file moves (and its parent dir is created).
+        k.review_proposed_change(&run_id, 0, true, None).unwrap();
+        let applied = k.apply_proposed_change(&run_id, 0).expect("rename apply ok");
+        assert_eq!(applied.path, "src/new_name.rs");
+        assert!(!work.path().join("old_name.rs").exists());
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("src").join("new_name.rs")).unwrap(),
+            "fn thing() {}\n"
+        );
     }
 
     #[test]

@@ -142,6 +142,7 @@ mod tests {
         run.proposed_changes = vec![ProposedChange {
             path: "src/main.rs".into(),
             action: crate::proposed_change::ProposedChangeAction::Replace,
+            dest_path: None,
             new_content: "fn main() {}\n".into(),
             baseline_sha256: Some(crate::proposed_change::sha256_hex(b"old")),
             new_sha256: crate::proposed_change::sha256_hex(b"fn main() {}\n"),

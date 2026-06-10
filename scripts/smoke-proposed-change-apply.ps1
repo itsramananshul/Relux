@@ -74,7 +74,22 @@ $tests = @(
     'change_set_mixes_create_and_replace_atomically',
     'change_set_create_conflict_leaves_everything_untouched',
     'change_set_rolls_back_a_created_file_on_a_later_write_failure',
-    'cli_run_captures_one_create_and_one_replace_and_set_apply_writes_both_end_to_end'
+    'cli_run_captures_one_create_and_one_replace_and_set_apply_writes_both_end_to_end',
+    # Rename/move action — moves an existing baseline file to a new destination
+    # within the same transaction safety model (RELUX_MASTER_PLAN §15): the source
+    # must match its baseline, the destination must not exist, and a mixed
+    # rename+replace+create set applies/rolls back atomically. Includes a fake-CLI
+    # envelope with ONE rename.
+    'rename_to_workspace_moves_file_when_baseline_matches',
+    'rename_to_workspace_refuses_when_dest_exists_as_conflict',
+    'rename_to_workspace_refuses_on_baseline_conflict_and_leaves_source',
+    'review_then_apply_rename_moves_the_file',
+    'apply_rename_refuses_without_a_baseline_hash',
+    'change_set_mixes_rename_replace_and_create_atomically',
+    'change_set_rename_dest_conflict_leaves_everything_untouched',
+    'change_set_refuses_overlapping_rename_and_create_targets',
+    'change_set_rolls_back_a_rename_on_a_later_write_failure',
+    'cli_run_captures_a_rename_and_apply_moves_the_file_end_to_end'
 )
 foreach ($t in $tests) {
     $out = & cargo test -p relux-kernel --lib $t 2>$null | Out-String

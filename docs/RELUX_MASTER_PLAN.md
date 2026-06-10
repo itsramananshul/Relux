@@ -732,9 +732,11 @@ Fields:
   adapter declared none. Never fabricated.
 - proposed_changes — reviewable, applyable **proposed file changes** the adapter
   declared in its structured result envelope (`proposed_changes: [...]`): each a
-  bounded, path-sanitized, text-only **full-content replacement** of one file
-  (`path` / `new_content` / `baseline_sha256?` / `new_sha256` / `bytes` / `source`)
-  with a review `status` (proposed → approved → applied, or rejected). Unlike
+  bounded, path-sanitized, text-only change to one file — a full-content
+  `replace`, a new-file `create`, or a `rename`/move to a `dest_path`
+  (`path` / `action` / `dest_path?` / `new_content` / `baseline_sha256?` /
+  `new_sha256` / `bytes` / `source`) with a review `status` (proposed → approved →
+  applied, or rejected). Unlike
   `artifacts` (read-only references), these carry content and ARE the first real
   Relux diff/apply model: the operator reviews (approve / reject) and, once
   approved, explicitly applies into the run's controlled workspace root with a
@@ -2630,19 +2632,26 @@ remain, in rough priority for the next slices:
    captures proposed changes with the safe review/apply flow. Structurally, the
    Prime chat response wire (`PrimeTurn`) carries no `proposed_changes`/`artifacts`
    field, so a proposed change can never reach the chat surface. **Apply now
-   supports two actions** (`action: "replace"` — the default and historical
-   behavior — or `action: "create"`; a missing action defaults to `replace` for
-   backward compatibility): a `replace` is a full-content replacement over an
-   existing baseline file (a missing target is a conflict), while a `create` adds a
-   **new file** that must NOT already exist (an existing path is a conflict — never
-   overwritten), carries **no baseline**, and creates any missing parent
-   directories (each a sanitized, non-excluded, in-root component, with no symlink
-   crossing) before placing the file atomically (an O_EXCL reservation + temp +
-   rename, so a racing creator never clobbers). Both actions share the same
-   approval gate, path/exclusion checks, workspace-root confinement, transactional
-   set-apply (validate-all-then-write-all, with creates rolled back by deletion on a
-   mid-apply fault), and honest 409/422 refusals. What is still **not** done: file
-   rename/delete (only replace + create are modeled); arbitrary patch/diff parsing
+   supports three actions** (`action: "replace"` — the default and historical
+   behavior — `action: "create"`, or `action: "rename"`/`"move"`; a missing action
+   defaults to `replace` for backward compatibility): a `replace` is a full-content
+   replacement over an existing baseline file (a missing target is a conflict); a
+   `create` adds a **new file** that must NOT already exist (an existing path is a
+   conflict — never overwritten), carries **no baseline**, and creates any missing
+   parent directories (each a sanitized, non-excluded, in-root component, with no
+   symlink crossing) before placing the file atomically (an O_EXCL reservation +
+   temp + rename, so a racing creator never clobbers); and a `rename` **moves** an
+   existing baseline file from `path` to a new `dest_path` (both sanitized + root-
+   confined), preserving its content (so it carries **no new content**) — it
+   verifies the **source still matches its baseline** (a mismatch is a conflict),
+   refuses if the **destination already exists** (a conflict) or equals the source,
+   creates any missing destination parent dirs, then moves the file. All three
+   actions share the same approval gate, path/exclusion checks, workspace-root
+   confinement, transactional set-apply (validate-all-then-write-all, with creates
+   rolled back by deletion and renames moved back to their source on a mid-apply
+   fault; a rename occupies BOTH its source and destination so no two changes may
+   overlap a path), and honest 409/422 refusals. What is still **not** done: file
+   delete (replace + create + rename are modeled); arbitrary patch/diff parsing
    (deliberately not built — replacement is safer); live event streaming (the page
    polls/refreshes a synchronous run rather than tailing it); and resuming a
    *partial* CLI run (retry is a new attempt). Execution-environment runtimes are
