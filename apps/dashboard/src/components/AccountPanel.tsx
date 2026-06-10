@@ -10,6 +10,7 @@ import {
   describeIdlePolicy,
   describeAbsolutePolicy,
   reauthCallout,
+  type ReauthCallout,
 } from "../account";
 
 // The signed-in operator's Account modal (RELUX_MASTER_PLAN "Local operator
@@ -19,6 +20,57 @@ import {
 // kernel verifies the current password, stores a fresh Argon2id hash, and
 // invalidates every OTHER session — so this tab stays signed in while any other
 // browser/device is booted. "Forgot password" still points at `reset-admin`.
+
+// The re-authentication affordance in the Account modal (RELUX_MASTER_PLAN
+// "Local operator login v1"). Always present when auth is enforced — signing
+// out then back in is the one reliable way to clear the hard absolute ceiling —
+// and EMPHASISED (primary button + an alert banner) only when `callout` says
+// that ceiling is close; unadorned (ghost button, no banner) otherwise. It
+// hides entirely under the dev bypass. Pure/presentational so the promoted vs
+// unadorned markup can be server-rendered with fixture metadata in tests, not
+// just exercised through a live fetch.
+export function AccountReauth({
+  authDisabled,
+  callout,
+  reauthErr,
+  signingOut,
+  onReauth,
+}: {
+  authDisabled: boolean;
+  callout: ReauthCallout | null;
+  reauthErr: string | null;
+  signingOut: boolean;
+  onReauth: () => void;
+}) {
+  if (authDisabled) return null;
+  return (
+    <div className="account-reauth" style={{ padding: "0 16px 12px" }}>
+      {callout && (
+        <div className="banner err" role="alert" style={{ marginBottom: 10 }}>
+          {callout.message}. Only a fresh sign-in extends it — sign out and back in to keep
+          working.
+        </div>
+      )}
+      {reauthErr && (
+        <div className="banner err" role="alert">
+          {reauthErr}
+        </div>
+      )}
+      <button
+        className={"btn" + (callout ? "" : " ghost") + " sm"}
+        style={{ width: "100%" }}
+        disabled={signingOut}
+        onClick={onReauth}
+        title="Sign out now; the sign-in screen appears so you can start a fresh session"
+      >
+        {signingOut ? "Signing out…" : "Sign out and sign back in"}
+      </button>
+      <p className="muted" style={{ fontSize: 11, margin: "6px 0 0" }}>
+        Ends this session and shows the sign-in screen. Other sessions are unaffected.
+      </p>
+    </div>
+  );
+}
 
 export function AccountPanel({ who, onClose }: { who: string; onClose: () => void }) {
   const { changePassword, logout } = useAuth();
@@ -214,33 +266,13 @@ export function AccountPanel({ who, onClose }: { who: string; onClose: () => voi
         {/* Re-authentication path. Always present (signing out then back in is the
             one reliable way to clear the hard absolute ceiling), and emphasised —
             primary button + an alert banner — only when that ceiling is close. */}
-        {!meta?.auth_disabled && (
-          <div className="account-reauth" style={{ padding: "0 16px 12px" }}>
-            {callout && (
-              <div className="banner err" role="alert" style={{ marginBottom: 10 }}>
-                {callout.message}. Only a fresh sign-in extends it — sign out and back in to keep
-                working.
-              </div>
-            )}
-            {reauthErr && (
-              <div className="banner err" role="alert">
-                {reauthErr}
-              </div>
-            )}
-            <button
-              className={"btn" + (callout ? "" : " ghost") + " sm"}
-              style={{ width: "100%" }}
-              disabled={signingOut}
-              onClick={() => void reauth()}
-              title="Sign out now; the sign-in screen appears so you can start a fresh session"
-            >
-              {signingOut ? "Signing out…" : "Sign out and sign back in"}
-            </button>
-            <p className="muted" style={{ fontSize: 11, margin: "6px 0 0" }}>
-              Ends this session and shows the sign-in screen. Other sessions are unaffected.
-            </p>
-          </div>
-        )}
+        <AccountReauth
+          authDisabled={!!meta?.auth_disabled}
+          callout={callout}
+          reauthErr={reauthErr}
+          signingOut={signingOut}
+          onReauth={() => void reauth()}
+        />
 
         {done ? (
           <div style={{ padding: "4px 16px 16px" }}>

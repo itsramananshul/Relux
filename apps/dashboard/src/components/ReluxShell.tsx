@@ -3,7 +3,7 @@ import { NavLink, useLocation } from "react-router-dom";
 import { useAuth } from "../auth";
 import { AccountPanel } from "./AccountPanel";
 import { session, type SessionMetaResponse } from "../api";
-import { sessionWarning } from "../account";
+import { sessionWarning, type SessionWarning } from "../account";
 
 // The standalone Relux product shell (RELUX_MASTER_PLAN section 11 Dashboard,
 // section 21 Final Product Feeling). This is what relux-kernel serves at /dashboard:
@@ -43,6 +43,36 @@ const TITLES: Record<string, { title: string; sub: string }> = {
   "/approvals": { title: "Approvals", sub: "Manage pending approvals and agent permissions" },
   "/health": { title: "Health", sub: "Relux kernel health and readiness" },
 };
+
+// The passive, low-noise session-expiry chip the topbar surfaces when a window
+// is close (RELUX_MASTER_PLAN "Local operator login v1"). Pure/presentational:
+// it renders whatever `sessionWarning` already decided (the absolute "hard"
+// variant carries an extra class) and renders NOTHING when that decision is
+// null — so the chip's markup can be server-rendered with fixture metadata in
+// tests, not just exercised through a live fetch. Clicking it opens Account.
+export function SessionWarnChip({
+  warn,
+  onOpen,
+}: {
+  warn: SessionWarning | null;
+  onOpen: () => void;
+}) {
+  if (!warn) return null;
+  return (
+    <button
+      className={"session-warn-chip" + (warn.kind === "absolute" ? " hard" : "")}
+      title={
+        warn.kind === "absolute"
+          ? "This session reaches its hard 7-day limit soon. Sign out and back in to continue — open Account for details."
+          : "This session will sign out for inactivity soon. Any action keeps it alive — open Account for details."
+      }
+      onClick={onOpen}
+    >
+      <span className="dot" aria-hidden="true" />
+      {warn.message}
+    </button>
+  );
+}
 
 function Group({ label, items }: { label: string; items: NavEntry[] }) {
   return (
@@ -157,20 +187,7 @@ export function ReluxShell({ children }: { children: ReactNode }) {
             <span className="sub">{meta.sub}</span>
           </div>
           <div className="spacer" style={{ flex: 1 }} />
-          {warn && (
-            <button
-              className={"session-warn-chip" + (warn.kind === "absolute" ? " hard" : "")}
-              title={
-                warn.kind === "absolute"
-                  ? "This session reaches its hard 7-day limit soon. Sign out and back in to continue — open Account for details."
-                  : "This session will sign out for inactivity soon. Any action keeps it alive — open Account for details."
-              }
-              onClick={() => setAccountOpen(true)}
-            >
-              <span className="dot" aria-hidden="true" />
-              {warn.message}
-            </button>
-          )}
+          <SessionWarnChip warn={warn} onOpen={() => setAccountOpen(true)} />
           <NavLink to="/prime" title="Talk to Prime">
             <button className="btn sm">Ask Prime →</button>
           </NavLink>
