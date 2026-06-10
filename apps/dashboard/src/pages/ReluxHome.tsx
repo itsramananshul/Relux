@@ -1,6 +1,15 @@
 import { Link } from "react-router-dom";
-import { reluxPlugins, type ReluxPlugin, type ReluxState } from "../api";
+import {
+  reluxPlugins,
+  reluxAi,
+  reluxAdapters,
+  type ReluxPlugin,
+  type ReluxState,
+  type ReluxAiStatus,
+  type ReluxAdapterStatus,
+} from "../api";
 import { useAsync } from "../components/common";
+import { primeBrainStep } from "../onboarding";
 
 // Relux Home (RELUX_MASTER_PLAN section 11 Dashboard, section 2 North Star): the first
 // screen of the standalone Relux product. It is backed ONLY by the local
@@ -54,20 +63,9 @@ function getFirstRunChecklist(s: ReluxState | null): ChecklistItem[] {
       description: s.pending_approvals > 0 ? `You have ${s.pending_approvals} pending approval(s) requiring your decision.` : "No pending approvals at the moment.",
       linkTo: "/approvals"
     },
-    {
-      id: "coding-adapter",
-      label: "Set up a coding adapter (Claude / Codex)",
-      status: "link",
-      description: "Install + log in to the Claude or Codex CLI, then enable its adapter on the Crew page so Prime can run real assigned tasks.",
-      linkTo: "/crew"
-    },
-    {
-      id: "ai-provider",
-      label: "Configure Prime's AI provider (optional)",
-      status: "link",
-      description: "Add an OpenRouter API key from Health → Prime AI settings for natural chat. Claude/Codex adapters use their own local CLI login.",
-      linkTo: "/health"
-    },
+    // The "connect Prime to a brain" step is derived live from the control plane
+    // (AI status + adapters) and inserted by the component via primeBrainStep, so
+    // it reflects real readiness and the exact next step — not a static link.
     {
       id: "installed-plugins",
       label: "Plugins installed",
@@ -90,8 +88,20 @@ function getFirstRunChecklist(s: ReluxState | null): ChecklistItem[] {
 export function ReluxHome() {
   const state = useAsync<ReluxState>(() => reluxPlugins.state(), []);
   const plugins = useAsync<ReluxPlugin[]>(() => reluxPlugins.list(), []);
+  const ai = useAsync<ReluxAiStatus>(() => reluxAi.status(), []);
+  const adapters = useAsync<ReluxAdapterStatus[]>(() => reluxAdapters.list(), []);
 
-  const checklist = getFirstRunChecklist(state.data);
+  // Compose the checklist with the LIVE brain step inserted right after
+  // "Prime is available", so the very first thing a new user sees is whether
+  // Prime is connected to a real brain and exactly how to connect one.
+  const checklist = (() => {
+    const items = getFirstRunChecklist(state.data);
+    if (!state.data) return items; // still loading the control plane
+    const brain: ChecklistItem = { ...primeBrainStep(ai.data, adapters.data) };
+    const primeIdx = items.findIndex((i) => i.id === "prime-available");
+    const at = primeIdx >= 0 ? primeIdx + 1 : 0;
+    return [...items.slice(0, at), brain, ...items.slice(at)];
+  })();
 
   return (
     <div className="grid">
@@ -105,6 +115,8 @@ export function ReluxHome() {
             onClick={() => {
               state.reload();
               plugins.reload();
+              ai.reload();
+              adapters.reload();
             }}
             disabled={state.loading}
           >

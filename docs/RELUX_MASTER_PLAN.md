@@ -2138,10 +2138,15 @@ boot the bundle, pick a Prime brain (Local / Claude CLI / Codex CLI / OpenRouter
 from Health, chat with Prime, and create/assign/run tasks. The honest gaps that
 remain, in rough priority for the next slices:
 
-1. **First-run onboarding.** Home has a static first-run checklist, but there is
-   no guided wizard that detects the Claude/Codex CLI, walks the user through
-   picking a brain, and lands them on a first chat/task. New users still have to
-   discover that Health → *Prime Brain / AI Runtime* is where setup happens.
+1. **First-run onboarding.** *(Largely addressed post-v0.1.1.)* Home's first-run
+   checklist now derives a **live "connect Prime to a brain" step** from the
+   control plane (`/v1/relux/ai/status` + `/v1/relux/adapters`): it detects whether
+   the Claude/Codex CLI is on PATH, reports whether the selected brain is actually
+   usable, and gives the exact next step — always routed to Health → *Prime Brain /
+   AI Runtime*, never the legacy Crew path. The pure derivation lives in
+   `apps/dashboard/src/onboarding.ts` with unit coverage in
+   `apps/dashboard/test/onboarding.test.ts`. A fuller modal walkthrough (a single
+   guided flow that ends on a first chat/task) is still optional polish.
 2. **Plugin install UX.** Install-from-GitHub/zip works and is honest about
    metadata-only wrappers, but the dashboard could surface a clearer "configure a
    runtime" call-to-action and avoid any "ready"-looking label for a
