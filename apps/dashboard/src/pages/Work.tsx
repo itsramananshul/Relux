@@ -639,14 +639,32 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
         <div className="xtr-bar-meta">
           <h4 style={{ margin: 0 }}>Run Detail</h4>
           {run && <span className={`badge ${runStatusTone(run.status)}`}>{run.status}</span>}
-          {inFlight && (
-            <span className="muted" style={{ fontSize: 11 }}>
-              {/* Honest in-flight state: the stall signal reports real elapsed
-                  silence (no new event/phase for a while); otherwise the normal
-                  live indicator. Never a fabricated progress bar. */}
-              {stalledNote ? `live · ${stalledNote}` : "live · refreshing…"}
-            </span>
-          )}
+          {inFlight &&
+            (stalledNote ? (
+              /* Honest in-flight state: the stall signal reports real elapsed
+                 silence (no new event/phase for a while). Same chip language as
+                 the legacy RunTranscript header (◌ + the honest "no activity"
+                 label, `badge in_progress`) so the two surfaces read identically
+                 — never a fabricated progress bar (relix-dashboard-design §8 / §11). */
+              <span
+                className="badge in_progress"
+                style={{ fontSize: 9, fontWeight: 600 }}
+                title="real elapsed silence — no new event/phase has arrived for a while (not a guaranteed stall, just no observed activity)"
+              >
+                ◌ {stalledNote}
+              </span>
+            ) : (
+              /* Live indicator, matching RunTranscript's `● live` chip (`badge
+                 done` tone): the panel live-tails the transcript and re-polls the
+                 run record while it is in flight. */
+              <span
+                className="badge done"
+                style={{ fontSize: 9, fontWeight: 600 }}
+                title="this run is in flight — the panel live-tails the transcript and re-polls the run record"
+              >
+                ● live
+              </span>
+            ))}
         </div>
         <div className="xtr-bar-actions">
           <button className="btn ghost sm" title="Copy a shareable link to this run" onClick={() => void copyLink()}>
