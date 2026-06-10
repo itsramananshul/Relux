@@ -9,6 +9,33 @@ once a stable release is cut.
 
 ### Added
 
+- **One shared parallel orchestration executor across the sync API, CLI, and async
+  job.** The synchronous `POST /v1/relux/prime/orchestrations/:id/run` and the
+  `prime orchestration run --concurrency N` CLI now perform the **same true bounded
+  OS-parallel execution** the non-blocking job path already had — independent briefs
+  ready in a round run as **real concurrent OS adapter processes**, not one-at-a-time
+  under the lock (master plan §10.4 — "multiple tasks can run in parallel"). There is
+  now **one execution implementation**, not two: the kernel's `run_orchestration`
+  (used by the CLI and the blocking API handler) and the dashboard's background job
+  worker both drive the same primitives — `prepare_orchestration_round` (schedule the
+  ready set, start runs, resolve local-echo/pre-spawn-blocked briefs inline, return
+  enabled-CLI spawn plans), the shared `run_briefs_in_parallel` (one OS thread per
+  brief), and `finalize_prepared_brief` (merge each result via the shared
+  `record_brief_outcome`). The prior sequential single-lock round loop
+  (`run_one_orchestration_round`) is **gone**, so the two paths can no longer diverge.
+  Safety is unchanged on every path: dependency gating, the at-most-once-per-round
+  rule, permission + adapter-runtime gating before any spawn, secret redaction, the
+  run transcript, audit, retry, failure/panic isolation between siblings, and **no
+  auto-run of downloaded plugin code** (only an explicitly enabled, operator-configured
+  local binary spawns). The job path keeps releasing the kernel lock around the spawn
+  window and persisting between rounds for responsive polling; the synchronous API/CLI
+  own the kernel for the whole batch (the API on the blocking pool so the async reactor
+  is never parked), so two concurrent runs can never double-execute a brief. The
+  synchronous `/run` and CLI **block until the whole batch is done** and return the
+  final result; `run-async` still returns a job id immediately and is polled for live
+  progress. Proven by a deterministic **rendezvous** test driving `run_orchestration`
+  directly: two independent slow fake adapters each complete only if the other is
+  running at the same instant (impossible if executed sequentially), finishing in ~1s.
 - **True bounded OS-parallel execution for independent ready briefs.** Briefs
   that are ready in the same round now run as **real concurrent OS processes**, not
   one-at-a-time under the kernel lock (master plan §10.4 — "multiple tasks can run
@@ -34,10 +61,10 @@ once a stable release is cut.
   only if the other is running at the same instant — they finish in ~1s where a
   sequential round would spin ~30s — plus tests for safe merge, failure isolation
   (one brief fails, the sibling completes), and dependency preservation across the
-  prepare/finalize split. *Remaining caveat:* the synchronous `POST …/run` and the
-  `prime orchestration run` CLI still execute briefs inline under the lock (fine for
-  the blocking paths); the parallel execution path is the non-blocking job path
-  (`run-async`), which the dashboard uses.
+  prepare/finalize split. *(Originally landed on the non-blocking job path only; the
+  synchronous `POST …/run` and `prime orchestration run` CLI were brought onto the
+  same shared parallel executor in the follow-up entry above — they are no longer
+  single-lock sequential.)*
 - **Non-blocking orchestration jobs + live, pollable progress.** Running an
   orchestration no longer blocks on one long request (master plan "Orchestration
   (First Multi-Agent Slice)" — the previously-deferred non-blocking job model).

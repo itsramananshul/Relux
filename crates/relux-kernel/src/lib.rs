@@ -48,8 +48,8 @@ pub use plugin_install::{
 pub use prime::{classify_intent, decide};
 pub use runtime::{invoke_http_loopback, RuntimeClientError};
 pub use state::{
-    BundledRefresh, BundledRefreshSummary, FinishedBrief, KernelCounters, KernelSnapshot,
-    KernelState, PreparedBrief, RoundPrep,
+    run_briefs_in_parallel, BundledRefresh, BundledRefreshSummary, FinishedBrief, KernelCounters,
+    KernelSnapshot, KernelState, PreparedBrief, RoundPrep,
 };
 pub use store::SqliteStore;
 

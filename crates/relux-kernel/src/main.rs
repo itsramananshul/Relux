@@ -296,7 +296,7 @@ fn run_prime_orchestration(args: &[String]) -> Result<(), KernelError> {
         Some((sub, rest)) if sub == "show" => run_orchestration_show(rest),
         Some((sub, rest)) if sub == "run" => run_orchestration_run(rest),
         _ => Err(KernelError::Storage(
-            "usage: relux-kernel prime orchestration <list|show <id>|run <id> [--max N]>"
+            "usage: relux-kernel prime orchestration <list|show <id>|run <id> [--max N] [--concurrency N]>"
                 .to_string(),
         )),
     }
@@ -374,6 +374,14 @@ fn run_orchestration_show(args: &[String]) -> Result<(), KernelError> {
     })
 }
 
+/// Run a multi-agent orchestration batch to completion from the CLI.
+///
+/// `--concurrency N` (default 2, clamp 1..=4) is the round size: the independent
+/// briefs ready in one round run as real concurrent OS adapter processes via the
+/// shared [`relux_kernel::KernelState::run_orchestration`] engine — the same true
+/// parallelism the dashboard's background job path uses. This command blocks until
+/// the whole batch finishes and then prints the result; it owns the store
+/// exclusively for the run (load -> run -> save), so there is no interleaving.
 fn run_orchestration_run(args: &[String]) -> Result<(), KernelError> {
     let mut id: Option<String> = None;
     let mut max: usize = 25;

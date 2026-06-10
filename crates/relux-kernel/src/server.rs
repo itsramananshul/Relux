@@ -40,7 +40,7 @@ use relux_core::{
 };
 use relux_kernel::{
     install_from_dir, install_from_github, install_from_zip, remove_plugin, AiConfig, AiMode,
-    AiOutcome, AiStatus, FinishedBrief, KernelError, KernelState, PreparedBrief, SqliteStore,
+    AiOutcome, AiStatus, KernelError, KernelState, SqliteStore,
 };
 
 /// The default loopback bind address; override with `RELUX_HTTP_ADDR`.
@@ -1369,9 +1369,19 @@ struct RunOrchestrationReq {
     concurrency: Option<usize>,
 }
 
-/// Run a governed multi-agent batch for one orchestration. Persists even on
-/// partial failure so blocked/failed step records survive (like the run/retry
-/// path), then returns the per-agent batch result.
+/// Run a governed multi-agent batch for one orchestration **synchronously**: this
+/// blocks until every round is done, then returns the final per-agent batch result.
+/// (Callers that want to poll mid-run use the non-blocking `run-async` endpoint,
+/// which returns a job id immediately.)
+///
+/// The work runs through the shared [`KernelState::run_orchestration`] engine, so
+/// the independent briefs ready in one round execute as real concurrent OS adapter
+/// processes (bounded by `concurrency`, default 2, clamp 1..=4) — the same true
+/// parallelism the job path has. It is driven on a blocking worker so the async
+/// reactor is never parked for the (possibly multi-second) batch, and the kernel
+/// lock is held for the whole batch so two concurrent runs of the same orchestration
+/// can never double-execute a brief. Persists even on partial failure so
+/// blocked/failed step records survive (like the run/retry path).
 async fn run_orchestration_batch(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
@@ -1381,8 +1391,14 @@ async fn run_orchestration_batch(
     let req = body.map(|b| b.0).unwrap_or_default();
     let max = req.max.unwrap_or(25);
     let concurrency = req.concurrency.unwrap_or(2);
-    let result =
-        locked_save_persisting(&state, |kernel| kernel.run_orchestration(&oid, max, concurrency))?;
+    // The whole batch (lock + OS-parallel adapter spawns + joins) is blocking, so run
+    // it off the reactor on the blocking pool rather than parking an async worker.
+    let state = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        locked_save_persisting(&state, |kernel| kernel.run_orchestration(&oid, max, concurrency))
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("orchestration run was interrupted: {e}")))??;
     Ok(Json(result))
 }
 
@@ -1716,8 +1732,8 @@ impl JobAggregate {
 /// 1. **Prepare (locked, persists).** [`KernelState::prepare_orchestration_round`]
 ///    marks dependency blocks, picks the ready set, starts each brief's run, and
 ///    resolves local-echo / pre-spawn-blocked briefs inline. Enabled CLI briefs come
-///    back as [`PreparedBrief`]s with their step already stamped (run id, start,
-///    round), so a poll right now sees them as in-flight.
+///    back as [`relux_kernel::PreparedBrief`]s with their step already stamped (run
+///    id, start, round), so a poll right now sees them as in-flight.
 /// 2. **Spawn (NO lock).** [`run_briefs_in_parallel`] runs every prepared brief's
 ///    adapter process on its own OS thread concurrently — the real parallelism. The
 ///    lock is free, so polls and other requests stay responsive while the CLIs run.
@@ -1762,8 +1778,9 @@ fn run_parallel_round(
         });
     }
 
-    // Phase 2: run the prepared adapter processes in parallel with the lock RELEASED.
-    let finished = run_briefs_in_parallel(prepared);
+    // Phase 2: run the prepared adapter processes in parallel with the lock RELEASED,
+    // through the SAME shared spawn primitive the synchronous kernel driver uses.
+    let finished = relux_kernel::run_briefs_in_parallel(prepared);
 
     // Phase 3: merge every finished brief back under the lock, then finalize.
     let snap = locked_save_persisting(state, move |kernel| {
@@ -1776,26 +1793,6 @@ fn run_parallel_round(
         Ok((result, snap))
     })?;
     Ok(snap)
-}
-
-/// Run every prepared brief's adapter process concurrently on its own OS thread,
-/// joining all before returning. The set is already bounded to the concurrency cap
-/// (≤ 4) by the round scheduler, so this spawns at most that many threads. A single
-/// brief is run inline (no thread). A brief whose thread panics is dropped from the
-/// result — its step stays pending (it was stamped, not finalized) and re-runs next
-/// round — so one brief can never take the others down.
-fn run_briefs_in_parallel(prepared: Vec<PreparedBrief>) -> Vec<FinishedBrief> {
-    if prepared.len() <= 1 {
-        return prepared.into_iter().map(|p| p.run()).collect();
-    }
-    let handles: Vec<_> = prepared
-        .into_iter()
-        .map(|p| std::thread::spawn(move || p.run()))
-        .collect();
-    handles
-        .into_iter()
-        .filter_map(|h| h.join().ok())
-        .collect()
 }
 
 /// Drive one orchestration job to completion on a background thread.

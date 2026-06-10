@@ -1416,13 +1416,20 @@ impl KernelState {
     /// one brief and moves it to a terminal outcome, so the pending set strictly
     /// shrinks.
     ///
-    /// Concurrency note: this synchronous entry point still runs each brief inline
-    /// under the single-owner lock (it is used by the blocking `/run` API and the
-    /// `task orchestration run` CLI, where holding the lock for the batch is fine).
-    /// True bounded OS-parallel execution lives on the non-blocking job path, which
-    /// drives the same scheduler via [`prepare_orchestration_round`] +
-    /// [`finalize_prepared_brief`] with the lock released for the spawn window, so up
-    /// to `concurrency` briefs' adapter processes run on real OS threads at once.
+    /// Concurrency note: this synchronous entry point now performs **true bounded
+    /// OS-parallel execution** — the independent briefs ready in one round run as
+    /// real concurrent adapter processes (up to `concurrency` at once), exactly like
+    /// the non-blocking job path. Both paths drive the SAME scheduler/executor
+    /// primitives — [`prepare_orchestration_round`] (schedule + start + inline
+    /// resolve), [`run_briefs_in_parallel`] (off-lock OS-thread spawn), and
+    /// [`finalize_prepared_brief`] (merge each result) — so there is one execution
+    /// semantics, not two. The difference is only the surrounding harness: this
+    /// synchronous driver owns the kernel exclusively (a one-shot CLI process, the
+    /// blocking `/run` API handler under its lock, or a test), so there is no lock to
+    /// release between phases and no per-round persistence; the HTTP server wraps the
+    /// same three phases with lock-release + persist-between-rounds so a concurrent
+    /// poll stays responsive. It is used by the blocking `POST .../run` API and the
+    /// `prime orchestration run` CLI, which therefore get real parallelism too.
     pub fn run_orchestration(
         &mut self,
         id: &OrchestrationId,
@@ -1433,16 +1440,33 @@ impl KernelState {
         let concurrency = concurrency.clamp(1, 4);
         let mut result = self.new_orchestration_batch_result(id, concurrency)?;
 
-        // Drive the rounds to completion. Each round is one call to
-        // [`run_one_orchestration_round`], which the non-blocking background job
-        // also calls one-at-a-time (persisting between rounds) so the same
-        // dependency-aware, round-numbered scheduling is the single source of truth
-        // for both the synchronous and the job path.
+        // Drive the rounds to completion through the shared prepare -> spawn-parallel
+        // -> finalize engine (the same primitives the background job path drives one
+        // round at a time). Each round:
+        //   1. prepare (schedule the ready set within the `max` budget, start each
+        //      brief's run, resolve local-echo / pre-spawn-blocked briefs inline, and
+        //      return the enabled-CLI briefs as spawn plans),
+        //   2. run those prepared adapter processes on real OS threads concurrently,
+        //      bounded by the round's concurrency cap,
+        //   3. finalize each finished brief back into the durable record.
+        // The kernel is owned exclusively here, so the phases run back-to-back with no
+        // lock to release. A failure or panic in one brief's thread never corrupts a
+        // sibling: each owns its own run/task records and is merged independently.
         let mut round_no: u32 = 0;
         loop {
             let next_round = round_no + 1;
-            if !self.run_one_orchestration_round(id, max, concurrency, next_round, &mut result)? {
+            let prep =
+                self.prepare_orchestration_round(id, max, concurrency, next_round, &mut result)?;
+            // An empty prep means the `max` budget is spent or no brief is ready — the
+            // batch is complete. (Termination is structural: every non-empty round
+            // moves >=1 brief to a terminal outcome, so the pending set strictly
+            // shrinks.)
+            if !prep.ran() {
                 break;
+            }
+            let finished = run_briefs_in_parallel(prep.prepared);
+            for f in finished {
+                self.finalize_prepared_brief(id, f, &mut result);
             }
             round_no = next_round;
         }
@@ -1484,93 +1508,10 @@ impl KernelState {
         })
     }
 
-    /// Execute at most ONE dependency-aware round, mutating `result` and the
-    /// durable step records, stamping each brief run this round with the absolute
-    /// `round_no`. Returns `true` when a round ran (≥1 brief attempted), `false`
-    /// when the `max` budget is spent or no brief is ready (the batch is complete).
-    ///
-    /// It deliberately does NOT finalize the orchestration status/summary or
-    /// persist anything: the caller drives the rounds. The synchronous
-    /// [`run_orchestration`] calls it in a tight loop; the non-blocking job calls
-    /// it one round at a time, releasing the kernel lock and saving the record
-    /// between rounds so a mid-batch poll sees real, already-recorded progress.
-    /// Passing the absolute `round_no` keeps the per-brief `round` correct across a
-    /// job that spans many separately-locked calls.
-    pub fn run_one_orchestration_round(
-        &mut self,
-        id: &OrchestrationId,
-        max: usize,
-        concurrency: usize,
-        round_no: u32,
-        result: &mut OrchestrationBatchResult,
-    ) -> Result<bool, KernelError> {
-        let max = max.clamp(1, 25);
-        let concurrency = concurrency.clamp(1, 4);
-
-        // Budget guard: never attempt more than `max` briefs in one call, so a
-        // single run can never spin the whole fleet without an explicit ask.
-        if result.ran as usize >= max {
-            return Ok(false);
-        }
-
-        // Honestly mark any brief whose dependency failed/blocked as `Blocked`
-        // before choosing this round's work, so a failed upstream never silently
-        // strands its dependents as "pending".
-        result.dependency_blocked += self.propagate_dependency_blocks(id);
-
-        // A brief is ready when it is still pending and every dependency has
-        // `Completed`. Collected in index order so the lowest-index ready brief
-        // (which, post-propagation, always exists while anything is pending)
-        // runs first.
-        let ready: Vec<(usize, TaskId, AgentId)> = self
-            .orchestrations
-            .get(id)
-            .map(|o| {
-                o.steps
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, s)| {
-                        s.outcome == StepOutcome::Pending
-                            && s.depends_on.iter().all(|&j| {
-                                o.steps
-                                    .get(j)
-                                    .map(|d| d.outcome == StepOutcome::Completed)
-                                    .unwrap_or(true)
-                            })
-                    })
-                    .map(|(i, s)| (i, s.task_id.clone(), s.agent_id.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if ready.is_empty() {
-            return Ok(false);
-        }
-
-        let budget_left = max - result.ran as usize;
-        let take = concurrency.min(budget_left);
-        for (idx, task_id, agent_id) in ready.into_iter().take(take) {
-            result.ran += 1;
-            let started_at = self.clock.tick();
-            let exec = self.execute_assigned_run(&task_id);
-            let finished_at = self.clock.tick();
-            self.record_brief_outcome(
-                id,
-                idx,
-                round_no,
-                agent_id.as_str(),
-                &task_id,
-                exec,
-                started_at,
-                finished_at,
-                result,
-            );
-        }
-        Ok(true)
-    }
-
     /// Merge one brief's execution result into the batch tallies and its durable
-    /// step record. Shared by the sequential round loop and the parallel
-    /// finalize path so both interpret an `execute`/`finalize` outcome identically:
+    /// step record. Shared by the inline-resolved briefs in
+    /// [`prepare_orchestration_round`] and the off-lock briefs merged in
+    /// [`finalize_prepared_brief`] so both interpret an `execute`/`finalize` outcome identically:
     /// `Ok` is completed; a runtime/permission/binary error is `Blocked` (needs a
     /// human); any other error is `Failed` (retryable). The latest run for the task
     /// is the attempt just made, so the step's `run_id` points at it.
@@ -3909,6 +3850,31 @@ impl RoundPrep {
     pub fn ran(&self) -> bool {
         self.ran_inline > 0 || !self.prepared.is_empty()
     }
+}
+
+/// Run every prepared brief's adapter process concurrently on its own OS thread,
+/// joining all before returning. The set is already bounded to the concurrency cap
+/// (<= 4) by the round scheduler, so this spawns at most that many threads. A single
+/// brief is run inline (no thread). A brief whose thread panics is dropped from the
+/// result — its step stays pending (it was stamped, not finalized) and re-runs next
+/// round — so one brief can never take the others down.
+///
+/// This is the ONE off-lock spawn primitive shared by both orchestration drivers:
+/// the synchronous in-kernel driver ([`KernelState::run_orchestration`], used by the
+/// blocking `/run` API and the `prime orchestration run` CLI) calls it directly
+/// between its prepare and finalize phases; the HTTP server's non-blocking job
+/// driver calls it with the kernel lock released. Both therefore get identical true
+/// bounded OS-parallel adapter execution. Results come back in the input order (the
+/// joins block in order), so the caller's finalize sequence stays deterministic.
+pub fn run_briefs_in_parallel(prepared: Vec<PreparedBrief>) -> Vec<FinishedBrief> {
+    if prepared.len() <= 1 {
+        return prepared.into_iter().map(|p| p.run()).collect();
+    }
+    let handles: Vec<_> = prepared
+        .into_iter()
+        .map(|p| std::thread::spawn(move || p.run()))
+        .collect();
+    handles.into_iter().filter_map(|h| h.join().ok()).collect()
 }
 
 /// Render a concise, already-redacted run summary from an adapter outcome. Uses
@@ -6406,6 +6372,69 @@ mod tests {
             assert!(step.finished_at.is_some());
         }
         assert_eq!(stored.status, OrchestrationStatus::Completed);
+    }
+
+    #[test]
+    fn run_orchestration_runs_independent_briefs_truly_in_parallel() {
+        // The synchronous engine `run_orchestration` — the one the blocking `/run`
+        // API and the `prime orchestration run` CLI both call — must itself run
+        // independent ready briefs as REAL concurrent OS processes, not sequentially.
+        //
+        // Proof is the same rendezvous barrier the job-path test uses: each fake
+        // adapter completes only if a sibling was running at the same time (it claims
+        // a slot, then waits for a second slot to appear before exiting 0; run
+        // sequentially the first would wait for an arrival that never comes and time
+        // out to a non-zero exit). So two completions is a deterministic proof that
+        // `run_orchestration` overlapped the two adapter processes in one round. Run
+        // sequentially this same setup would leave a failed/blocked brief.
+        let dir = tempfile::tempdir().unwrap();
+        let marks = dir.path().join("marks");
+        let cli = write_rendezvous_cli(dir.path(), "rendezvous", &marks);
+
+        let (mut k, ctx) = orchestration_kernel();
+        install_bundled(&mut k, claude_adapter_manifest());
+        let claude = PluginId::new("relux-adapter-claude-cli");
+        k.create_agent(
+            "research-agent",
+            "Research Agent",
+            "investigates",
+            &claude,
+            &ctx.namespace,
+            None,
+            vec![],
+        )
+        .unwrap();
+        enable_adapter_with(&mut k, &claude, &cli);
+
+        let record = k
+            .prime_orchestrate(&ctx, "research the rust options and research the go options")
+            .unwrap();
+        let id = record.id.clone();
+        assert!(
+            record.steps.iter().all(|s| s.depends_on.is_empty()),
+            "both briefs are independent"
+        );
+
+        // The single synchronous entry point both the API and the CLI use. cap 2 =>
+        // both briefs ready in round 1 run their adapter processes concurrently.
+        let batch = k.run_orchestration(&id, 25, 2).unwrap();
+
+        assert_eq!(batch.ran, 2);
+        assert_eq!(
+            batch.completed, 2,
+            "both rendezvous briefs completed => run_orchestration overlapped them"
+        );
+        assert_eq!(batch.failed, 0);
+        assert_eq!(batch.blocked, 0);
+        assert_eq!(batch.rounds, 1, "both fit one round at cap 2");
+        assert_eq!(batch.status, OrchestrationStatus::Completed);
+        let stored = k.orchestration(&id).unwrap();
+        for step in &stored.steps {
+            assert_eq!(step.outcome, StepOutcome::Completed);
+            assert_eq!(step.round, Some(1), "both ran in the same round");
+            assert!(step.run_id.is_some());
+            assert!(step.finished_at.is_some());
+        }
     }
 
     #[test]
