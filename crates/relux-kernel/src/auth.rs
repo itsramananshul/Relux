@@ -47,6 +47,38 @@ pub const SESSION_TTL_SECS: i64 = 12 * 60 * 60;
 /// a loopback operator console, not an internet service.
 pub const MIN_PASSWORD_LEN: usize = 8;
 
+/// Why an authenticated password change was refused. The HTTP layer maps each
+/// variant to an honest status code; **no variant ever carries the plaintext
+/// password or the stored hash**, so a logged/serialized error can never leak a
+/// secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChangePasswordError {
+    /// No admin account exists yet (first-run setup has not happened).
+    NoAdmin,
+    /// The supplied current password did not match the stored credential.
+    WrongCurrent,
+    /// The proposed new password is shorter than [`MIN_PASSWORD_LEN`].
+    TooShort,
+    /// Persisting the new credential failed (I/O or encode). The message is a
+    /// safe, secret-free description of the storage failure.
+    Storage(String),
+}
+
+impl std::fmt::Display for ChangePasswordError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoAdmin => write!(f, "no admin configured — run setup first"),
+            Self::WrongCurrent => write!(f, "current password is incorrect"),
+            Self::TooShort => {
+                write!(f, "new password too short (min {MIN_PASSWORD_LEN} chars)")
+            }
+            Self::Storage(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+impl std::error::Error for ChangePasswordError {}
+
 fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -102,6 +134,36 @@ impl AdminStore {
         let rec = write_admin_record(&self.path, username, password)?;
         if let Ok(mut c) = self.cached.write() {
             *c = Some(rec);
+        }
+        Ok(())
+    }
+
+    /// Change the stored password for the (single) admin: verify `current`
+    /// against the stored hash, then rewrite the record with a freshly
+    /// Argon2id-hashed `new` password via the SAME atomic write as setup/reset.
+    /// The username is preserved. Neither password is ever logged or returned.
+    fn change_password(&self, current: &str, new: &str) -> Result<(), ChangePasswordError> {
+        let rec = self
+            .cached
+            .read()
+            .ok()
+            .and_then(|c| c.clone())
+            .ok_or(ChangePasswordError::NoAdmin)?;
+        // Verify the current password before doing anything else. A corrupt stored
+        // hash and a wrong password both read as WrongCurrent (no detail leaks).
+        let parsed =
+            PasswordHash::new(&rec.hash).map_err(|_| ChangePasswordError::WrongCurrent)?;
+        Argon2::default()
+            .verify_password(current.as_bytes(), &parsed)
+            .map_err(|_| ChangePasswordError::WrongCurrent)?;
+        // Only after identity is proven do we validate the proposed new password.
+        if new.len() < MIN_PASSWORD_LEN {
+            return Err(ChangePasswordError::TooShort);
+        }
+        let updated = write_admin_record(&self.path, &rec.username, new)
+            .map_err(ChangePasswordError::Storage)?;
+        if let Ok(mut c) = self.cached.write() {
+            *c = Some(updated);
         }
         Ok(())
     }
@@ -254,6 +316,15 @@ impl SessionStore {
             m.remove(sid);
         }
     }
+
+    /// Drop every session EXCEPT `keep` (the caller's own session). Used after a
+    /// password change so any OTHER live session is invalidated immediately while
+    /// the operator who just changed their password stays signed in.
+    fn retain_only(&self, keep: &str) {
+        if let Ok(mut m) = self.inner.write() {
+            m.retain(|sid, _| sid == keep);
+        }
+    }
 }
 
 // ── Combined handle stored on AppState ──────────────────────────
@@ -313,6 +384,30 @@ impl DashboardAuth {
     /// Verify a login. Returns the canonical username on success.
     pub fn verify_login(&self, username: &str, password: &str) -> Option<String> {
         self.admin.verify(username.trim(), password)
+    }
+
+    /// Change the admin password for an already-authenticated operator.
+    ///
+    /// `current_sid` is the caller's OWN session id. The flow:
+    /// 1. Verify `current` against the stored Argon2id hash (wrong → error).
+    /// 2. Validate the new password length.
+    /// 3. Atomically rewrite the on-disk credential with a fresh Argon2id hash.
+    /// 4. Invalidate every OTHER live session, preserving only `current_sid`.
+    ///
+    /// Step 4 means a password change boots any other browser/device that still
+    /// holds a session, but does NOT log the operator out of the tab they just
+    /// used. Neither password is ever logged or returned. Recovery when the
+    /// current password is unknown stays the local `reset-admin` CLI
+    /// ([`reset_admin_credential`]).
+    pub fn change_password(
+        &self,
+        current_sid: &str,
+        current: &str,
+        new: &str,
+    ) -> Result<(), ChangePasswordError> {
+        self.admin.change_password(current, new)?;
+        self.sessions.retain_only(current_sid);
+        Ok(())
     }
 
     /// Mint a new session for `username` and return its opaque id.
@@ -521,6 +616,88 @@ mod tests {
         let raw = std::fs::read_to_string(&admin).unwrap();
         assert!(raw.contains("$argon2id$"), "got: {raw}");
         assert!(!raw.contains("secretpass1"));
+    }
+
+    #[test]
+    fn change_password_wrong_current_is_rejected_and_old_still_works() {
+        let (auth, _tmp) = auth();
+        auth.create_admin("ops", "oldpassword").unwrap();
+        let sid = auth.create_session("ops");
+        // A wrong current password is refused with WrongCurrent...
+        assert_eq!(
+            auth.change_password(&sid, "not-the-current", "brandnewpass"),
+            Err(ChangePasswordError::WrongCurrent)
+        );
+        // ...and nothing changed: the original password still verifies.
+        assert_eq!(auth.verify_login("ops", "oldpassword").as_deref(), Some("ops"));
+        assert!(auth.verify_login("ops", "brandnewpass").is_none());
+    }
+
+    #[test]
+    fn change_password_too_short_new_is_rejected() {
+        let (auth, _tmp) = auth();
+        auth.create_admin("ops", "oldpassword").unwrap();
+        let sid = auth.create_session("ops");
+        // Correct current password, but the new one is below MIN_PASSWORD_LEN.
+        assert_eq!(
+            auth.change_password(&sid, "oldpassword", "short"),
+            Err(ChangePasswordError::TooShort)
+        );
+        // The old password is untouched.
+        assert_eq!(auth.verify_login("ops", "oldpassword").as_deref(), Some("ops"));
+    }
+
+    #[test]
+    fn change_password_success_swaps_hash_and_old_password_stops_working() {
+        let tmp = tempfile::tempdir().unwrap();
+        let admin = tmp.path().join("dashboard-admin.json");
+        let auth = DashboardAuth::from_admin_path(&admin);
+        auth.create_admin("ops", "oldpassword").unwrap();
+        let before = std::fs::read_to_string(&admin).unwrap();
+        let sid = auth.create_session("ops");
+        auth.change_password(&sid, "oldpassword", "newpassword1").unwrap();
+        // The new password works; the old one no longer does.
+        assert_eq!(auth.verify_login("ops", "newpassword1").as_deref(), Some("ops"));
+        assert!(auth.verify_login("ops", "oldpassword").is_none());
+        // The stored hash actually changed and remains an Argon2id PHC string with
+        // neither plaintext written to disk.
+        let after = std::fs::read_to_string(&admin).unwrap();
+        assert_ne!(before, after, "the stored hash must be rewritten");
+        assert!(after.contains("$argon2id$"), "got: {after}");
+        assert!(!after.contains("newpassword1"));
+        assert!(!after.contains("oldpassword"));
+        // A FRESH handle (simulating a serve restart) honors only the new password.
+        let reopened = DashboardAuth::from_admin_path(&admin);
+        assert_eq!(reopened.verify_login("ops", "newpassword1").as_deref(), Some("ops"));
+        assert!(reopened.verify_login("ops", "oldpassword").is_none());
+    }
+
+    #[test]
+    fn change_password_invalidates_other_sessions_but_keeps_current() {
+        let (auth, _tmp) = auth();
+        auth.create_admin("ops", "oldpassword").unwrap();
+        let current = auth.create_session("ops");
+        let other = auth.create_session("ops");
+        // Both sessions are valid before the change.
+        assert!(auth.validate_session(&current).is_some());
+        assert!(auth.validate_session(&other).is_some());
+        auth.change_password(&current, "oldpassword", "newpassword1").unwrap();
+        // The caller's own session survives; every other session is dropped.
+        assert_eq!(auth.validate_session(&current).as_deref(), Some("ops"));
+        assert!(
+            auth.validate_session(&other).is_none(),
+            "other live sessions must be invalidated by a password change"
+        );
+    }
+
+    #[test]
+    fn change_password_no_admin_is_rejected() {
+        let (auth, _tmp) = auth();
+        // No setup yet → no credential to change.
+        assert_eq!(
+            auth.change_password("anything", "x", "newpassword1"),
+            Err(ChangePasswordError::NoAdmin)
+        );
     }
 
     #[test]

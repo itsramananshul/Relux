@@ -1,6 +1,7 @@
-import { type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { NavLink, useLocation } from "react-router-dom";
 import { useAuth } from "../auth";
+import { AccountPanel } from "./AccountPanel";
 
 // The standalone Relux product shell (RELUX_MASTER_PLAN section 11 Dashboard,
 // section 21 Final Product Feeling). This is what relux-kernel serves at /dashboard:
@@ -66,6 +67,7 @@ export function ReluxShell({ children }: { children: ReactNode }) {
   const meta = TITLES[loc.pathname] ?? { title: "Relux", sub: "" };
   const { status, logout } = useAuth();
   const who = status?.username ?? "admin";
+  const [accountOpen, setAccountOpen] = useState(false);
 
   return (
     <div className="app">
@@ -93,9 +95,14 @@ export function ReluxShell({ children }: { children: ReactNode }) {
           <NavLink to="/prime" title="Talk to Prime">
             <button className="btn sm">Ask Prime →</button>
           </NavLink>
-          <span className="muted" style={{ fontSize: 12, margin: "0 4px 0 12px" }} title="Signed-in operator">
+          <button
+            className="btn ghost sm"
+            style={{ margin: "0 4px 0 12px" }}
+            title="Account — change your password"
+            onClick={() => setAccountOpen(true)}
+          >
             {who}
-          </span>
+          </button>
           <button
             className="btn ghost sm"
             title="Sign out of the Relux dashboard"
@@ -106,6 +113,7 @@ export function ReluxShell({ children }: { children: ReactNode }) {
         </header>
         <div className="workspace">{children}</div>
       </div>
+      {accountOpen && <AccountPanel who={who} onClose={() => setAccountOpen(false)} />}
     </div>
   );
 }

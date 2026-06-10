@@ -22,6 +22,10 @@ interface AuthContextValue {
   refresh: () => Promise<void>;
   login: (username: string, password: string) => Promise<void>;
   setup: (username: string, password: string) => Promise<void>;
+  // Authenticated password change. Throws an ApiError on failure (wrong current
+  // password, too-short new password, …) so the form can show the real reason.
+  // The caller's own session is preserved; other sessions are invalidated.
+  changePassword: (currentPassword: string, newPassword: string) => Promise<void>;
   logout: () => Promise<void>;
 }
 
@@ -87,6 +91,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [refresh],
   );
 
+  const changePassword = useCallback(
+    async (currentPassword: string, newPassword: string) => {
+      // Hits the protected /v1/auth/change-password route; the cookie rides
+      // automatically. A 401 here is a wrong CURRENT password (a legitimate form
+      // error), not a lapsed session — api.ts treats /v1/auth/* as auth paths and
+      // does not fire the session-expired signal for it.
+      await api.post("/v1/auth/change-password", {
+        current_password: currentPassword,
+        new_password: newPassword,
+      });
+    },
+    [],
+  );
+
   const logout = useCallback(async () => {
     try {
       await api.post("/v1/auth/logout");
@@ -97,7 +115,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   return (
     <AuthContext.Provider
-      value={{ loading, status, bridgeDown, bridgeError, sessionExpired, refresh, login, setup, logout }}
+      value={{ loading, status, bridgeDown, bridgeError, sessionExpired, refresh, login, setup, changePassword, logout }}
     >
       {children}
     </AuthContext.Provider>

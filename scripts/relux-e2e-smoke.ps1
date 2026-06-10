@@ -371,6 +371,42 @@ try {
             Assert 'auth setup creates admin + session' ($setup.Status -eq 200) ("status " + $setup.Status)
             $me = Invoke-Api 'GET' '/v1/auth/me' $null
             Assert 'auth me returns the session user' (($me.Status -eq 200) -and ($me.Body -match 'e2e-admin')) ("status " + $me.Status)
+
+            # -- Authenticated password change ---------------------------------
+            # A SECOND signed-in session (its own cookie jar) proves the documented
+            # invalidation: a change keeps the caller's own session but boots every
+            # other live session.
+            $otherHandler = New-Object System.Net.Http.HttpClientHandler
+            $otherHandler.CookieContainer = New-Object System.Net.CookieContainer
+            $otherHandler.UseCookies = $true
+            $other = New-Object System.Net.Http.HttpClient($otherHandler)
+            $other.Timeout = [TimeSpan]::FromSeconds(20)
+            $otherLogin = $other.PostAsync("$base/v1/auth/login", (New-Object System.Net.Http.StringContent((@{ username = 'e2e-admin'; password = 'e2e-pass-123' } | ConvertTo-Json -Compress), [System.Text.Encoding]::UTF8, 'application/json'))).GetAwaiter().GetResult()
+            $otherStateBefore = $other.GetAsync("$base/v1/relux/state").GetAwaiter().GetResult()
+            Assert 'second session is live before change' (([int]$otherLogin.StatusCode -eq 200) -and ([int]$otherStateBefore.StatusCode -eq 200)) ("login=" + [int]$otherLogin.StatusCode + " state=" + [int]$otherStateBefore.StatusCode)
+
+            # Wrong current password is refused (401) and changes nothing.
+            $cpWrong = Invoke-Api 'POST' '/v1/auth/change-password' (@{ current_password = 'not-the-password'; new_password = 'e2e-pass-456' } | ConvertTo-Json -Compress)
+            Assert 'change-password rejects wrong current' ($cpWrong.Status -eq 401) ("status " + $cpWrong.Status)
+            # Too-short new password is refused (400).
+            $cpShort = Invoke-Api 'POST' '/v1/auth/change-password' (@{ current_password = 'e2e-pass-123'; new_password = 'short' } | ConvertTo-Json -Compress)
+            Assert 'change-password rejects too-short new' ($cpShort.Status -eq 400) ("status " + $cpShort.Status)
+            # Successful change (200) — never echoes the password/hash.
+            $cpOk = Invoke-Api 'POST' '/v1/auth/change-password' (@{ current_password = 'e2e-pass-123'; new_password = 'e2e-pass-456' } | ConvertTo-Json -Compress)
+            $cpClean = ($cpOk.Status -eq 200) -and (-not ($cpOk.Body -match 'e2e-pass-456')) -and (-not ($cpOk.Body -match 'argon2'))
+            Assert 'change-password succeeds without leaking the secret' $cpClean ("status " + $cpOk.Status)
+            # The caller's own session SURVIVES the change.
+            Assert 'current session survives the change' ((Invoke-Api 'GET' '/v1/relux/state' $null).Status -eq 200) '200'
+            # Every OTHER session is invalidated (now 401).
+            $otherStateAfter = $other.GetAsync("$base/v1/relux/state").GetAwaiter().GetResult()
+            Assert 'other session invalidated by the change' ([int]$otherStateAfter.StatusCode -eq 401) ("status " + [int]$otherStateAfter.StatusCode)
+            $other.Dispose()
+            # The old password no longer logs in; the new one does.
+            $loginOld = Invoke-Api 'POST' '/v1/auth/login' (@{ username = 'e2e-admin'; password = 'e2e-pass-123' } | ConvertTo-Json -Compress)
+            Assert 'old password no longer works' ($loginOld.Status -eq 401) ("status " + $loginOld.Status)
+            $loginNew = Invoke-Api 'POST' '/v1/auth/login' (@{ username = 'e2e-admin'; password = 'e2e-pass-456' } | ConvertTo-Json -Compress)
+            Assert 'new password works' ($loginNew.Status -eq 200) ("status " + $loginNew.Status)
+
             $dash = Invoke-Api 'GET' '/dashboard' $null
             if ($dash.Status -eq 200) {
                 Pass 'GET /dashboard' '200'

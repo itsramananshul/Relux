@@ -2594,10 +2594,20 @@ The API never returns the key. The dashboard shows the current AI provider/mode.
   serve auth middleware protects every `/v1/relux/*` route behind a valid session;
   the dashboard `fetch` rides the cookie automatically (no token paste). Public by
   design: the static dashboard (so the setup/login screen always renders — never a
-  blank page), the `/v1/auth/*` endpoints (`status`/`setup`/`login`/`logout`/`me`),
-  and `/v1/relux/health` (liveness probe). Sessions are in-memory (a single-process
+  blank page), the public auth endpoints (`/v1/auth/status`/`setup`/`login`/
+  `logout`/`me`), and `/v1/relux/health` (liveness probe). `POST
+  /v1/auth/change-password` is the one auth endpoint that is **protected** (it
+  requires a session, so it sits behind the same guard as `/v1/relux/*`). Sessions are in-memory (a single-process
   kernel): a restart drops them and re-prompts login while the admin credential
-  stays durable. Password recovery is the **local** `relux-kernel reset-admin`
+  stays durable. A signed-in operator can **change the password in-product** via
+  `POST /v1/auth/change-password` (`{ current_password, new_password }`, behind the
+  session guard; surfaced by the dashboard's **Account** control): it verifies the
+  current password, enforces the same 8-char minimum, and rewrites the credential
+  with a fresh Argon2id hash through the same atomic write as setup — never logging
+  or returning the plaintext/hash. A successful change **preserves the caller's own
+  session and invalidates every OTHER live session** (a change boots other
+  browsers/devices but not the current tab). Password recovery when the current
+  password is *unknown* stays the **local** `relux-kernel reset-admin`
   CLI (filesystem-only, no network/unauthenticated reset; restart `serve` to drop
   live sessions). A dev/test-only escape hatch `RELUX_AUTH_DISABLED` leaves the API
   open (OFF by default, flagged loudly by `serve` and `doctor`). The CLI

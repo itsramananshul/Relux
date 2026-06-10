@@ -9,6 +9,30 @@ once a stable release is cut.
 
 ### Added
 
+- **In-product password change for the local operator login.** The signed-in
+  operator can now change the local admin password from the dashboard — no CLI for
+  the normal case. The Relux shell's signed-in name is an **Account** control that
+  opens a change-password dialog (current password + new password + confirm, with
+  friendly validation and an explicit success state); **Forgot password** still
+  points at the local `reset-admin` CLI. New protected endpoint
+  `POST /v1/auth/change-password` (`{ "current_password", "new_password" }`,
+  behind the session guard): it verifies the current password against the stored
+  Argon2id hash, enforces the same 8-char minimum as setup, and writes a fresh
+  Argon2id hash with the **same atomic write** as first-run setup/reset — the
+  plaintext and the hash are **never logged or returned**. **Session policy on
+  change (documented):** the caller's own session is preserved while **every other
+  live session is invalidated**, so changing the password boots any other
+  browser/device but does not sign the operator out of the tab they just used.
+  Recovery when the current password is unknown remains the local `reset-admin`
+  CLI. Tests pin the semantics: wrong current password is refused and changes
+  nothing, a too-short new password is refused, a success swaps the on-disk hash
+  (old password stops working, new one works after a simulated restart), other
+  sessions are invalidated while the current survives, and the endpoint requires a
+  session (the dev/test `RELUX_AUTH_DISABLED` bypass refuses the change rather than
+  rewrite an ignored credential). A new dashboard unit test pins the form's
+  client-side validation, and `relux-e2e-smoke.ps1` drives the live flow end to end
+  (two cookie jars prove the invalidation; old-fails/new-works login round-trip).
+  See `docs/RELUX_MASTER_PLAN.md` → *Local operator login v1*.
 - **Local operator login for the standalone Relux dashboard/API (auth v1).** The
   `relux-kernel serve` surface is no longer unauthenticated: it now requires a
   simple local username/password sign-in, replacing the dashboard token weirdness

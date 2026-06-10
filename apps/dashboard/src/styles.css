@@ -478,6 +478,18 @@ a > .stat-card:hover { border-color: var(--text-faint); }
   border: 1px solid var(--border); border-radius: 4px; padding: 0 5px; margin-right: 3px; color: var(--text-dim);
 }
 
+/* ── Account modal — change-password dialog over the palette scrim. One flat
+   bordered B&W surface, matching the command palette (design §2/§12). */
+.account-modal {
+  width: 100%; max-width: 420px; background: var(--bg-raised); border: 1px solid var(--border);
+  border-radius: var(--radius); overflow: hidden; display: flex; flex-direction: column;
+  max-height: 86vh;
+}
+.account-head {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+  padding: 14px 16px 8px;
+}
+
 /* Crew roster-at-a-glance strip — leadership/active/pending/runnable tiers.
    Wraps to fewer columns on narrow viewports; never overflows. */
 .roster-strip { display: flex; flex-wrap: wrap; gap: 14px 28px; align-items: flex-start; }

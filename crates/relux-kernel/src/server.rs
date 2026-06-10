@@ -165,6 +165,7 @@ async fn serve() -> Result<(), KernelError> {
     println!("   POST   /v1/auth/login                      {{ \"username\":\"...\", \"password\":\"...\" }}");
     println!("   POST   /v1/auth/logout");
     println!("   GET    /v1/auth/me                         (current session user)");
+    println!("   POST   /v1/auth/change-password            {{ \"current_password\":\"...\", \"new_password\":\"...\" }} (requires session)");
     println!("   GET    /v1/relux/health                    (public liveness; no session required)");
     println!("   GET    /v1/relux/state");
     println!("   GET    /v1/relux/ai/status");
@@ -357,6 +358,9 @@ fn public_router() -> Router<AppState> {
 /// without running the guard.
 fn protected_router() -> Router<AppState> {
     Router::new()
+        // Authenticated password change (a valid session is required, hence it is
+        // a protected route). Public /v1/auth/* covers setup/login/logout/me.
+        .route("/v1/auth/change-password", post(auth_change_password))
         // The /v1/relux control-plane API the dashboard calls on the same origin.
         .route("/v1/relux/state", get(get_state))
         .route("/v1/relux/ai/status", get(get_ai_status))
@@ -613,6 +617,60 @@ async fn auth_logout(State(state): State<AppState>, headers: header::HeaderMap) 
         serde_json::json!({ "ok": true }),
         relux_kernel::clear_session_cookie(),
     )
+}
+
+/// An authenticated password change: the operator's CURRENT password plus the
+/// new one. Both fields are write-only — never logged or echoed back.
+#[derive(Debug, Deserialize)]
+struct ChangePasswordReq {
+    current_password: String,
+    new_password: String,
+}
+
+/// `POST /v1/auth/change-password` — protected (a valid session is required, so
+/// it lives behind `require_session`). Verifies the current password, stores a
+/// fresh Argon2id hash atomically, and invalidates every OTHER live session
+/// while preserving the caller's own. This is the normal in-product change path;
+/// recovery when the current password is unknown stays the local `reset-admin`
+/// CLI. Neither password is ever logged or returned.
+async fn auth_change_password(
+    State(state): State<AppState>,
+    headers: header::HeaderMap,
+    Json(req): Json<ChangePasswordReq>,
+) -> Response {
+    // The dev/test bypass admits requests without a real session, so there is no
+    // caller session to anchor the change to — refuse clearly rather than rewrite
+    // a credential the bypass ignores anyway.
+    if state.auth_disabled {
+        return auth_err(
+            StatusCode::BAD_REQUEST,
+            "password change is unavailable while RELUX_AUTH_DISABLED is set",
+        );
+    }
+    // The middleware already admitted a valid session; resolve the raw cookie so
+    // we know WHICH session to preserve when the others are invalidated.
+    let Some(sid) = relux_kernel::session_cookie_from_headers(&headers) else {
+        return auth_err(StatusCode::UNAUTHORIZED, "not logged in");
+    };
+    match state
+        .dashboard_auth
+        .change_password(&sid, &req.current_password, &req.new_password)
+    {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
+        Err(e) => {
+            // Map each refusal to an honest status; the Display text never carries
+            // a secret (see ChangePasswordError).
+            let status = match e {
+                relux_kernel::ChangePasswordError::WrongCurrent => StatusCode::UNAUTHORIZED,
+                relux_kernel::ChangePasswordError::TooShort => StatusCode::BAD_REQUEST,
+                relux_kernel::ChangePasswordError::NoAdmin => StatusCode::CONFLICT,
+                relux_kernel::ChangePasswordError::Storage(_) => {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            };
+            auth_err(status, &e.to_string())
+        }
+    }
 }
 
 /// `GET /v1/auth/me` — the logged-in username, or 401.
@@ -4974,5 +5032,115 @@ mod tests {
         let (_, _, body) = call(&state, "GET", "/v1/auth/status", None, None).await;
         assert!(body.contains("\"auth_disabled\":true"), "got: {body}");
         assert!(body.contains("\"authenticated\":true"), "got: {body}");
+        // The change-password route refuses while the bypass is on (it would
+        // rewrite a credential the bypass ignores). 400, not a silent success.
+        let (cp, _, _) = call(
+            &state,
+            "POST",
+            "/v1/auth/change-password",
+            None,
+            Some(r#"{"current_password":"x","new_password":"newpassword1"}"#),
+        )
+        .await;
+        assert_eq!(cp, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn change_password_requires_a_session() {
+        let (state, _dir) = auth_state(false);
+        // Configure the admin via setup, but present NO session cookie.
+        let (_, _, _) = call(
+            &state,
+            "POST",
+            "/v1/auth/setup",
+            None,
+            Some(r#"{"username":"ops","password":"hunter2pass"}"#),
+        )
+        .await;
+        // The route is protected: without a session it is 401, never a change.
+        let (no_sess, _, _) = call(
+            &state,
+            "POST",
+            "/v1/auth/change-password",
+            None,
+            Some(r#"{"current_password":"hunter2pass","new_password":"newpassword1"}"#),
+        )
+        .await;
+        assert_eq!(no_sess, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn change_password_over_http_swaps_creds_and_old_login_fails() {
+        let (state, _dir) = auth_state(false);
+        // Setup mints a session cookie we ride for the authenticated change.
+        let (_, set_cookie, _) = call(
+            &state,
+            "POST",
+            "/v1/auth/setup",
+            None,
+            Some(r#"{"username":"ops","password":"hunter2pass"}"#),
+        )
+        .await;
+        let cookie = session_pair(&set_cookie.expect("setup sets a cookie"));
+
+        // Wrong current password → 401, nothing changed, and the secret is not
+        // echoed back in the error body.
+        let (wrong, _, wbody) = call(
+            &state,
+            "POST",
+            "/v1/auth/change-password",
+            Some(&cookie),
+            Some(r#"{"current_password":"nope","new_password":"newpassword1"}"#),
+        )
+        .await;
+        assert_eq!(wrong, StatusCode::UNAUTHORIZED);
+        assert!(!wbody.contains("newpassword1"), "must not echo the new password");
+
+        // Too-short new password → 400.
+        let (short, _, _) = call(
+            &state,
+            "POST",
+            "/v1/auth/change-password",
+            Some(&cookie),
+            Some(r#"{"current_password":"hunter2pass","new_password":"short"}"#),
+        )
+        .await;
+        assert_eq!(short, StatusCode::BAD_REQUEST);
+
+        // A correct change → 200; the current session still works afterward.
+        let (ok, _, obody) = call(
+            &state,
+            "POST",
+            "/v1/auth/change-password",
+            Some(&cookie),
+            Some(r#"{"current_password":"hunter2pass","new_password":"newpassword1"}"#),
+        )
+        .await;
+        assert_eq!(ok, StatusCode::OK);
+        assert!(!obody.contains("newpassword1") && !obody.contains("argon2"), "got: {obody}");
+        let (still_ok, _, _) =
+            call(&state, "GET", "/v1/relux/state", Some(&cookie), None).await;
+        assert_eq!(still_ok, StatusCode::OK);
+
+        // The old password no longer logs in; the new one does.
+        let (old, _, _) = call(
+            &state,
+            "POST",
+            "/v1/auth/login",
+            None,
+            Some(r#"{"username":"ops","password":"hunter2pass"}"#),
+        )
+        .await;
+        assert_eq!(old, StatusCode::UNAUTHORIZED);
+        let (new, new_cookie, _) = call(
+            &state,
+            "POST",
+            "/v1/auth/login",
+            None,
+            Some(r#"{"username":"ops","password":"newpassword1"}"#),
+        )
+        .await;
+        assert_eq!(new, StatusCode::OK);
+        assert!(new_cookie.is_some(), "new password must mint a session");
     }
 }
