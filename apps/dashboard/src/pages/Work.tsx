@@ -20,6 +20,9 @@ import {
   proposedChangeStatusTone,
   canReviewProposedChange,
   canApplyProposedChange,
+  reviewableProposedChangeIndices,
+  applyEligibleProposedChangeIndices,
+  showBatchProposedChangeControls,
 } from "../runview";
 
 // Relux Work page: standalone surface for tasks and runs.
@@ -473,6 +476,13 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
   // Per-change busy flag (by index), so one button shows a pending state without
   // freezing the whole panel.
   const [pcBusy, setPcBusy] = useState<number | null>(null);
+  // Busy flag for a batch (multi-file) operation, so the batch toolbar shows a
+  // pending state without colliding with the per-change buttons.
+  const [batchBusy, setBatchBusy] = useState(false);
+  // Indices for the batch toolbar: still-reviewable changes (Approve all) and
+  // apply-eligible changes (Apply all approved). The backend re-validates both.
+  const reviewableIndices = reviewableProposedChangeIndices(proposedChanges);
+  const applyEligibleIndices = applyEligibleProposedChangeIndices(proposedChanges);
 
   async function reviewChange(index: number, decision: "approve" | "reject") {
     setPcBusy(index);
@@ -498,6 +508,39 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
       reloadRun();
     } finally {
       setPcBusy(null);
+    }
+  }
+
+  // Approve every still-reviewable change. Approval touches no files, so doing it
+  // sequentially is safe; the real all-or-nothing guarantee is on the apply below.
+  async function approveAll(indices: number[]) {
+    setBatchBusy(true);
+    try {
+      for (const i of indices) {
+        await reluxWork.reviewProposedChange(runId, i, "approve");
+      }
+    } catch (e) {
+      alert(e instanceof Error ? e.message : "Approve all failed");
+    } finally {
+      setBatchBusy(false);
+      reloadRun();
+    }
+  }
+
+  // Apply every approved change as ONE transaction. The backend writes all or
+  // none — a single refusal (conflict / unsafe / duplicate / missing baseline)
+  // leaves every file untouched and reports the honest reason here.
+  async function applyAll(indices: number[]) {
+    setBatchBusy(true);
+    try {
+      const res = await reluxWork.applyProposedChangeSet(runId, indices);
+      reloadRun();
+      alert(`Applied ${res.applied.length} file(s) as one transaction.`);
+    } catch (e) {
+      alert(e instanceof Error ? e.message : "Apply all failed (no files were changed)");
+      reloadRun();
+    } finally {
+      setBatchBusy(false);
     }
   }
 
@@ -655,6 +698,40 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
               enable Apply; applying writes into the run's controlled workspace
               root after a baseline-conflict check. Refusals are shown honestly. */}
           <h5 style={{ marginTop: 16, marginBottom: 8 }}>Proposed Changes</h5>
+          {/* Batch (multi-file) controls: only shown when a run has more than one
+              proposed change (a single change uses the per-change flow below).
+              "Apply all approved" writes every approved change as ONE all-or-
+              nothing transaction — the backend writes all or none. */}
+          {showBatchProposedChangeControls(proposedChanges) && (
+            <div className="row" style={{ alignItems: "center", gap: 8, marginBottom: 8 }}>
+              <span className="muted" style={{ fontSize: 11 }}>
+                {proposedChanges.length} changes
+              </span>
+              <div className="spacer" style={{ flex: 1 }} />
+              {reviewableIndices.length > 0 && (
+                <button
+                  className="btn ghost sm"
+                  disabled={batchBusy || pcBusy !== null}
+                  title="Approve every change still awaiting review"
+                  onClick={() => void approveAll(reviewableIndices)}
+                >
+                  {batchBusy ? "…" : `Approve all (${reviewableIndices.length})`}
+                </button>
+              )}
+              <button
+                className="btn sm"
+                disabled={batchBusy || pcBusy !== null || applyEligibleIndices.length === 0}
+                title={
+                  applyEligibleIndices.length > 0
+                    ? "Apply every approved change as one all-or-nothing transaction"
+                    : "Approve changes first — apply needs an approved change with a baseline hash"
+                }
+                onClick={() => void applyAll(applyEligibleIndices)}
+              >
+                {batchBusy ? "Applying…" : `Apply all approved (${applyEligibleIndices.length})`}
+              </button>
+            </div>
+          )}
           {proposedChanges.length > 0 ? (
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
               {proposedChanges.map((c, i) => (

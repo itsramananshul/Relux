@@ -1762,6 +1762,16 @@ export interface ReluxApplyResult {
   applied_at: string;
 }
 
+// The result of a successful transactional (multi-file) proposed-change apply
+// (master plan §15). Either every selected change was applied or none were, so
+// `applied` lists exactly the files written and `applied_at` is the one shared
+// stamp recorded for the whole transaction.
+export interface ReluxApplySetResult {
+  run_id: string;
+  applied: ReluxApplyResult[];
+  applied_at: string;
+}
+
 export interface ReluxRun {
   id: string;
   task_id: string;
@@ -1887,6 +1897,18 @@ export const reluxWork = {
   applyProposedChange: (runId: string, index: number) =>
     api.post<ReluxApplyResult>(
       `/v1/relux/runs/${encodeURIComponent(runId)}/proposed-changes/${index}/apply`,
+    ),
+
+  // Apply a SET of APPROVED proposed changes for one run as a single
+  // all-or-nothing transaction (master plan §15). The backend validates every
+  // selected change together first (approved, baseline still matching, safe
+  // distinct path, existing target) and writes ALL or NONE. Throws an ApiError on
+  // an honest refusal (409 baseline conflict; 422 not-approved / no-baseline /
+  // no-workspace / unsafe or duplicate target) so the UI can show the real reason.
+  applyProposedChangeSet: (runId: string, indices: number[]) =>
+    api.post<ReluxApplySetResult>(
+      `/v1/relux/runs/${encodeURIComponent(runId)}/proposed-changes/apply`,
+      { indices },
     ),
 };
 

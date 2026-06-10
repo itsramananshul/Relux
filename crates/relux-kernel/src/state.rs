@@ -2758,6 +2758,282 @@ impl KernelState {
         );
     }
 
+    /// Apply a **set** of approved proposed changes for one run as a single
+    /// all-or-nothing transaction (master plan section 15 diff/apply model, safety
+    /// bar section 17.5). This extends the single-change [`Self::apply_proposed_change`]
+    /// with the same strict bar applied to every selected change — but validated
+    /// *together first*, so the transaction either writes ALL the files or writes
+    /// NONE of them and leaves every status honest.
+    ///
+    /// The selection is the explicit `indices` of the changes to apply (one run,
+    /// so they all share one adapter and therefore one controlled workspace root).
+    /// The whole transaction is refused — nothing written — unless EVERY selected
+    /// change:
+    ///
+    /// 1. resolves to a distinct, existing change (no duplicate or unknown index);
+    /// 2. is in `Approved` state (approval is still required, per change);
+    /// 3. carries a `baseline_sha256` (v1 refuses without one — no force);
+    /// 4. has a safe relative target path AND a path distinct from every other
+    ///    selected change (no two changes may target the same file);
+    /// 5. resolves inside the run's configured workspace root with no `..`/symlink
+    ///    escape, to an existing regular file within the apply cap whose current
+    ///    SHA-256 still equals the declared baseline (else a **conflict**).
+    ///
+    /// Only after all of that passes are the files written (temp file + rename per
+    /// file). If a write fails mid-apply, the already-written files are rolled back
+    /// to the originals captured during validation and an honest failure is
+    /// returned — strict up-front validation is preferred precisely so this
+    /// rollback path is essentially never reached. On success every applied change
+    /// flips to `Applied` (with a shared `applied_at` stamp), one
+    /// `proposed_change_set_applied` transcript event + a `proposed_change:apply_set`
+    /// audit are recorded, and the per-file results are returned. On any refusal no
+    /// file is modified, the honest reason is recorded on each selected change, and
+    /// a failed audit is written.
+    pub fn apply_proposed_change_set(
+        &mut self,
+        run_id: &RunId,
+        indices: &[usize],
+    ) -> Result<AppliedProposedChangeSet, KernelError> {
+        use relux_core::ProposedChangeStatus;
+        let (agent_id, task_id, adapter_plugin) = {
+            let run = self
+                .runs
+                .get(run_id)
+                .ok_or_else(|| KernelError::UnknownRun(run_id.to_string()))?;
+            (
+                run.agent_id.clone(),
+                run.task_id.clone(),
+                run.adapter_plugin.clone(),
+            )
+        };
+        let task_namespace = self.tasks.get(&task_id).map(|t| t.namespace_id.clone());
+
+        // 0. The selection must be non-empty with no duplicate indices.
+        if indices.is_empty() {
+            return Err(KernelError::ProposedChangeSetNotApplicable {
+                run: run_id.to_string(),
+                reason: "no proposed changes were selected to apply".to_string(),
+            });
+        }
+        let mut seen_idx = std::collections::HashSet::new();
+        for &i in indices {
+            if !seen_idx.insert(i) {
+                return Err(KernelError::ProposedChangeSetNotApplicable {
+                    run: run_id.to_string(),
+                    reason: format!("change index {i} is listed more than once in the selection"),
+                });
+            }
+        }
+
+        // Snapshot the fields we need for every selected change. An unknown index
+        // fails the whole transaction (nothing is written).
+        let snapshot: Vec<(usize, ProposedChangeStatus, Option<String>, String, String)> = {
+            let run = self
+                .runs
+                .get(run_id)
+                .ok_or_else(|| KernelError::UnknownRun(run_id.to_string()))?;
+            let mut out = Vec::with_capacity(indices.len());
+            for &i in indices {
+                let change = run.proposed_changes.get(i).ok_or_else(|| {
+                    KernelError::UnknownProposedChange {
+                        run: run_id.to_string(),
+                        index: i,
+                    }
+                })?;
+                out.push((
+                    i,
+                    change.status,
+                    change.baseline_sha256.clone(),
+                    change.path.clone(),
+                    change.new_content.clone(),
+                ));
+            }
+            out
+        };
+
+        // 1. Every selected change must be Approved. A not-approved change is an
+        // operator precondition (resolve by approving), so — like single apply —
+        // we audit the refusal but do NOT stamp a refusal reason on the changes.
+        let not_approved: Vec<usize> = snapshot
+            .iter()
+            .filter(|(_, status, _, _, _)| *status != ProposedChangeStatus::Approved)
+            .map(|(i, _, _, _, _)| *i)
+            .collect();
+        if !not_approved.is_empty() {
+            let reason = format!(
+                "every selected change must be approved before a transactional apply; \
+                 not approved: {not_approved:?}"
+            );
+            self.record_audit(
+                "agent",
+                agent_id.as_str(),
+                "proposed_change:apply_set",
+                Some("run"),
+                Some(run_id.as_str()),
+                task_namespace.as_ref(),
+                AuditResult::Failed,
+                serde_json::json!({ "indices": indices, "reason": reason }),
+            );
+            return Err(KernelError::ProposedChangeSetNotApplicable {
+                run: run_id.to_string(),
+                reason,
+            });
+        }
+
+        // 2. Every selected change must carry a baseline hash (no force in v1).
+        let no_baseline: Vec<usize> = snapshot
+            .iter()
+            .filter(|(_, _, baseline, _, _)| baseline.is_none())
+            .map(|(i, _, _, _, _)| *i)
+            .collect();
+        if !no_baseline.is_empty() {
+            let reason = format!(
+                "every change in a transactional apply must carry a baseline hash \
+                 (no force in v1); missing on: {no_baseline:?}"
+            );
+            self.refuse_proposed_change_set(run_id, indices, &agent_id, task_namespace.as_ref(), &reason);
+            return Err(KernelError::ProposedChangeSetNotApplicable {
+                run: run_id.to_string(),
+                reason,
+            });
+        }
+
+        // 3. The run's adapter must have one controlled workspace root (a run has a
+        // single adapter, so the whole set shares one root by construction).
+        let workspace_root = self
+            .adapter_runtime_configs
+            .get(&adapter_plugin)
+            .and_then(|c| c.working_dir.clone())
+            .filter(|w| !w.trim().is_empty());
+        let workspace_root = match workspace_root {
+            Some(w) => w,
+            None => {
+                let reason = format!(
+                    "no controlled workspace root is configured for this run's adapter ({}); \
+                     set its working_dir before applying",
+                    adapter_plugin.as_str()
+                );
+                self.refuse_proposed_change_set(run_id, indices, &agent_id, task_namespace.as_ref(), &reason);
+                return Err(KernelError::ProposedChangeSetNotApplicable {
+                    run: run_id.to_string(),
+                    reason,
+                });
+            }
+        };
+
+        // 4-5. Validate every change against the workspace (paths, no duplicate
+        // targets, baselines), then write them all transactionally.
+        let changes: Vec<(String, String, String)> = snapshot
+            .iter()
+            .map(|(_, _, baseline, path, content)| {
+                (
+                    path.clone(),
+                    baseline.clone().expect("baseline checked present above"),
+                    content.clone(),
+                )
+            })
+            .collect();
+        match apply_change_set_to_workspace(&workspace_root, &changes) {
+            Ok(applied_files) => {
+                let applied_at = self.clock.tick();
+                let mut applied = Vec::with_capacity(applied_files.len());
+                for ((index, _, _, _, _), (rel_path, written_bytes)) in
+                    snapshot.iter().zip(applied_files.iter())
+                {
+                    if let Some(run) = self.runs.get_mut(run_id) {
+                        if let Some(change) = run.proposed_changes.get_mut(*index) {
+                            change.status = ProposedChangeStatus::Applied;
+                            change.applied_at = Some(applied_at.clone());
+                            change.refused_reason = None;
+                        }
+                    }
+                    applied.push(AppliedProposedChange {
+                        run_id: run_id.clone(),
+                        index: *index,
+                        path: rel_path.clone(),
+                        bytes: *written_bytes,
+                        applied_at: applied_at.clone(),
+                    });
+                }
+                let paths: Vec<&str> = applied.iter().map(|a| a.path.as_str()).collect();
+                self.push_run_event(
+                    run_id,
+                    "proposed_change_set_applied",
+                    "kernel",
+                    &format!(
+                        "applied {} proposed change(s) as one transaction",
+                        applied.len()
+                    ),
+                    serde_json::json!({
+                        "indices": indices,
+                        "paths": paths,
+                        "count": applied.len(),
+                    }),
+                );
+                self.record_audit(
+                    "agent",
+                    agent_id.as_str(),
+                    "proposed_change:apply_set",
+                    Some("run"),
+                    Some(run_id.as_str()),
+                    task_namespace.as_ref(),
+                    AuditResult::Success,
+                    serde_json::json!({ "indices": indices, "count": applied.len(), "paths": paths }),
+                );
+                Ok(AppliedProposedChangeSet {
+                    run_id: run_id.clone(),
+                    applied,
+                    applied_at,
+                })
+            }
+            Err(ApplySetFailure { conflict, reason }) => {
+                self.refuse_proposed_change_set(run_id, indices, &agent_id, task_namespace.as_ref(), &reason);
+                if conflict {
+                    Err(KernelError::ProposedChangeSetConflict {
+                        run: run_id.to_string(),
+                        reason,
+                    })
+                } else {
+                    Err(KernelError::ProposedChangeSetNotApplicable {
+                        run: run_id.to_string(),
+                        reason,
+                    })
+                }
+            }
+        }
+    }
+
+    /// Record an honest refusal reason on every selected change in a refused
+    /// transactional apply + one failed audit. The changes keep their `Approved`
+    /// status (the operator can fix the workspace and retry), but each carries the
+    /// reason the transaction was refused so the dashboard can show why.
+    fn refuse_proposed_change_set(
+        &mut self,
+        run_id: &RunId,
+        indices: &[usize],
+        agent_id: &AgentId,
+        namespace: Option<&NamespaceId>,
+        reason: &str,
+    ) {
+        if let Some(run) = self.runs.get_mut(run_id) {
+            for &i in indices {
+                if let Some(change) = run.proposed_changes.get_mut(i) {
+                    change.set_refused_reason(reason);
+                }
+            }
+        }
+        self.record_audit(
+            "agent",
+            agent_id.as_str(),
+            "proposed_change:apply_set",
+            Some("run"),
+            Some(run_id.as_str()),
+            namespace,
+            AuditResult::Failed,
+            serde_json::json!({ "indices": indices, "reason": reason }),
+        );
+    }
+
     /// Retry a failed run as a **fresh** run on the same task
     /// (`docs/RELUX_MASTER_PLAN.md` section 10.2 `prime.retry_run`). This is an
     /// honest re-attempt, not a resume of a partial CLI run (resuming a partial
@@ -4234,6 +4510,19 @@ pub struct AppliedProposedChange {
     pub applied_at: String,
 }
 
+/// The result of a successful **transactional** proposed-change apply (master
+/// plan section 15). Either every selected change was applied or none were, so
+/// `applied` lists exactly the changes that were written and `applied_at` is the
+/// single shared stamp recorded for the transaction.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AppliedProposedChangeSet {
+    pub run_id: RunId,
+    /// One entry per applied change, in selection order.
+    pub applied: Vec<AppliedProposedChange>,
+    /// The logical-clock stamp recorded once for the whole transaction.
+    pub applied_at: String,
+}
+
 /// An honest apply refusal. `conflict` distinguishes a baseline/content conflict
 /// (the workspace moved out from under the change) from a structural refusal
 /// (unsafe path, missing/irregular target) so the API can map it to the right
@@ -4242,6 +4531,27 @@ pub struct AppliedProposedChange {
 struct ApplyFailure {
     conflict: bool,
     reason: String,
+}
+
+/// An honest refusal of a **transactional** change-set apply. Like
+/// [`ApplyFailure`], `conflict` marks a baseline/target conflict (the workspace
+/// moved) vs a structural refusal (unsafe path, duplicate target, write failure),
+/// so the API maps it to a 409 vs 422.
+#[derive(Debug)]
+struct ApplySetFailure {
+    conflict: bool,
+    reason: String,
+}
+
+/// One fully-validated change ready to write in a transactional apply, plus the
+/// original on-disk bytes captured during validation so the write phase can roll
+/// the file back if a later write in the same transaction fails.
+#[derive(Debug)]
+struct PlannedWrite {
+    safe_rel: String,
+    target: std::path::PathBuf,
+    content: String,
+    original: Vec<u8>,
 }
 
 /// The maximum size of an existing target file we will read to verify its
@@ -4369,6 +4679,206 @@ fn apply_change_to_workspace(
 /// First 8 chars of a hash, for a legible conflict message.
 fn short_hash(h: &str) -> &str {
     &h[..h.len().min(8)]
+}
+
+/// Validate a **set** of proposed changes against `workspace_root` and write them
+/// all transactionally (master plan section 15 / safety bar section 17.5). PURE
+/// of kernel state — it only touches the filesystem. `changes` is a slice of
+/// `(rel_path, baseline_sha256, new_content)`.
+///
+/// All-or-nothing in two phases:
+///
+/// 1. **Validate all** (no writes): each path must sanitize to a safe relative
+///    path, resolve inside the canonical root with no `..`/symlink escape, be a
+///    distinct target (no two changes may write the same file), and point at an
+///    existing regular file (within the apply cap) whose current SHA-256 still
+///    equals its declared baseline. The original bytes are captured here so a
+///    later write failure can roll back. ANY failure returns before a single byte
+///    is written.
+/// 2. **Write all** (temp file + rename per file): on the first write error the
+///    already-written files are restored from their captured originals and an
+///    honest failure is returned. Because phase 1 is strict, this rollback path is
+///    essentially unreachable except for a genuine mid-apply I/O fault.
+///
+/// On success returns one `(safe_rel, bytes_written)` per change, in input order.
+fn apply_change_set_to_workspace(
+    workspace_root: &str,
+    changes: &[(String, String, String)],
+) -> Result<Vec<(String, u64)>, ApplySetFailure> {
+    let refuse = |reason: String| ApplySetFailure {
+        conflict: false,
+        reason,
+    };
+    let conflict = |reason: String| ApplySetFailure {
+        conflict: true,
+        reason,
+    };
+
+    if changes.is_empty() {
+        return Err(refuse("no changes to apply".to_string()));
+    }
+
+    let root = std::path::Path::new(workspace_root);
+    let root_canon = std::fs::canonicalize(root)
+        .map_err(|e| refuse(format!("workspace root {workspace_root} is not accessible: {e}")))?;
+    if !root_canon.is_dir() {
+        return Err(refuse(format!(
+            "workspace root {workspace_root} is not a directory"
+        )));
+    }
+
+    // ── Phase 1: validate every change; capture originals. No writes. ──────────
+    let mut planned: Vec<PlannedWrite> = Vec::with_capacity(changes.len());
+    let mut seen_rel: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_target: std::collections::HashSet<std::path::PathBuf> =
+        std::collections::HashSet::new();
+    for (rel_path, baseline, content) in changes {
+        let safe_rel = relux_core::proposed_change::sanitize_change_path(rel_path)
+            .ok_or_else(|| refuse(format!("unsafe or excluded target path: {rel_path}")))?;
+
+        // Resolve <root>/<rel>, refusing any escape or symlinked component.
+        let mut target = root_canon.clone();
+        for comp in safe_rel.split('/') {
+            target.push(comp);
+        }
+        if !target.starts_with(&root_canon) {
+            return Err(refuse(format!(
+                "resolved path escapes the workspace root: {safe_rel}"
+            )));
+        }
+        let mut cur = root_canon.clone();
+        for comp in safe_rel.split('/') {
+            cur.push(comp);
+            match std::fs::symlink_metadata(&cur) {
+                Ok(md) if md.file_type().is_symlink() => {
+                    return Err(refuse(format!("path crosses a symlink: {comp}")));
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+
+        // No two changes in the set may target the same file (by safe rel or by
+        // resolved path), so apply order can never be ambiguous.
+        if !seen_rel.insert(safe_rel.clone()) || !seen_target.insert(target.clone()) {
+            return Err(refuse(format!(
+                "duplicate target path in the change set: {safe_rel}"
+            )));
+        }
+
+        // The target must already exist as a regular file (v1 applies over an
+        // existing baseline; it does not create new files).
+        let md = match std::fs::symlink_metadata(&target) {
+            Ok(md) => md,
+            Err(_) => {
+                return Err(conflict(format!(
+                    "target {safe_rel} does not exist; v1 applies over an existing baseline file only"
+                )));
+            }
+        };
+        if !md.file_type().is_file() {
+            return Err(refuse(format!("target {safe_rel} is not a regular file")));
+        }
+        if md.len() > APPLY_TARGET_MAX_BYTES {
+            return Err(refuse(format!(
+                "target {safe_rel} is larger than the {APPLY_TARGET_MAX_BYTES}-byte apply cap"
+            )));
+        }
+
+        let current = std::fs::read(&target)
+            .map_err(|e| refuse(format!("could not read target {safe_rel}: {e}")))?;
+        let current_hash = relux_core::sha256_hex(&current);
+        if &current_hash != baseline {
+            return Err(conflict(format!(
+                "baseline mismatch for {safe_rel}: the file changed since the proposal \
+                 (expected {}, found {})",
+                short_hash(baseline),
+                short_hash(&current_hash)
+            )));
+        }
+
+        planned.push(PlannedWrite {
+            safe_rel,
+            target,
+            content: content.clone(),
+            original: current,
+        });
+    }
+
+    // ── Phase 2: write every change (temp + rename), rolling back on failure. ──
+    let mut written: Vec<&PlannedWrite> = Vec::with_capacity(planned.len());
+    let mut applied: Vec<(String, u64)> = Vec::with_capacity(planned.len());
+    for (i, p) in planned.iter().enumerate() {
+        let parent = match p.target.parent() {
+            Some(parent) => parent,
+            None => {
+                let rolled = rollback_writes(&written);
+                return Err(refuse(rollback_message(
+                    &format!("target {} has no parent directory", p.safe_rel),
+                    &written,
+                    rolled,
+                )));
+            }
+        };
+        let tmp = parent.join(format!(".relux-apply-{}-{}.tmp", std::process::id(), i));
+        let write_res = std::fs::write(&tmp, p.content.as_bytes())
+            .and_then(|()| std::fs::rename(&tmp, &p.target));
+        if let Err(e) = write_res {
+            let _ = std::fs::remove_file(&tmp);
+            let rolled = rollback_writes(&written);
+            return Err(refuse(rollback_message(
+                &format!("could not write {}: {e}", p.safe_rel),
+                &written,
+                rolled,
+            )));
+        }
+        written.push(p);
+        applied.push((p.safe_rel.clone(), p.content.len() as u64));
+    }
+    Ok(applied)
+}
+
+/// Restore each already-written file in a failed transaction to its captured
+/// original bytes (temp + rename). Returns `true` when every restore succeeded.
+fn rollback_writes(written: &[&PlannedWrite]) -> bool {
+    let mut all_ok = true;
+    for (i, p) in written.iter().enumerate() {
+        let parent = match p.target.parent() {
+            Some(parent) => parent,
+            None => {
+                all_ok = false;
+                continue;
+            }
+        };
+        let tmp = parent.join(format!(".relux-rollback-{}-{}.tmp", std::process::id(), i));
+        if std::fs::write(&tmp, &p.original)
+            .and_then(|()| std::fs::rename(&tmp, &p.target))
+            .is_err()
+        {
+            let _ = std::fs::remove_file(&tmp);
+            all_ok = false;
+        }
+    }
+    all_ok
+}
+
+/// Build an honest failure message for a mid-apply write error, stating whether
+/// the rollback fully restored the prior writes (so the operator knows whether
+/// the workspace is back to its pre-apply state or may have been left modified).
+fn rollback_message(cause: &str, written: &[&PlannedWrite], rolled_back_ok: bool) -> String {
+    if written.is_empty() {
+        format!("{cause}; no files were written")
+    } else if rolled_back_ok {
+        format!(
+            "{cause}; rolled back {} already-written file(s) to leave no net change",
+            written.len()
+        )
+    } else {
+        format!(
+            "{cause}; ROLLBACK INCOMPLETE — {} file(s) were written and could not all be restored",
+            written.len()
+        )
+    }
 }
 
 /// Project a `Task` into the compact `TaskBrief` Prime speaks about.
@@ -6531,6 +7041,301 @@ mod tests {
         k.review_proposed_change(&run_id, 0, true, None).unwrap();
         k.apply_proposed_change(&run_id, 0).expect("apply ok");
         assert_eq!(std::fs::read_to_string(work.path().join("greeting.txt")).unwrap(), "goodbye");
+    }
+
+    /// Build a kernel + a completed run carrying SEVERAL proposed changes, with
+    /// the claude adapter pointed at `workdir`. Each change starts in `Proposed`.
+    /// `changes` is `(path, baseline, new_content)`.
+    fn kernel_with_proposed_changes(
+        workdir: Option<&str>,
+        changes: &[(&str, Option<String>, &str)],
+    ) -> (KernelState, RunId) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = write_fake_cli(dir.path(), "fake-claude", "ok");
+        std::mem::forget(dir);
+        let mut k = adapter_kernel();
+        k.configure_adapter_runtime(
+            &PluginId::new("relux-adapter-claude-cli"),
+            Some(true),
+            Some(fake.to_string_lossy().to_string()),
+            Some(30),
+            Some(8192),
+            workdir.map(|w| w.to_string()),
+        )
+        .unwrap();
+        let (_agent, task) = cli_task(&mut k);
+        let run_id = k.start_run(&task).unwrap();
+        let proposed: Vec<relux_core::ProposedChange> = changes
+            .iter()
+            .map(|(path, baseline, new_content)| relux_core::ProposedChange {
+                path: path.to_string(),
+                new_content: new_content.to_string(),
+                baseline_sha256: baseline.clone(),
+                new_sha256: relux_core::sha256_hex(new_content.as_bytes()),
+                bytes: new_content.len() as u64,
+                source: "claude-cli".to_string(),
+                status: relux_core::ProposedChangeStatus::Proposed,
+                review_note: None,
+                refused_reason: None,
+                applied_at: None,
+            })
+            .collect();
+        k.runs.get_mut(&run_id).unwrap().proposed_changes = proposed;
+        (k, run_id)
+    }
+
+    #[test]
+    fn change_set_applies_multiple_files_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "old-a").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "old-b").unwrap();
+        let (mut k, run_id) = kernel_with_proposed_changes(
+            Some(dir.path().to_str().unwrap()),
+            &[
+                ("a.txt", Some(relux_core::sha256_hex(b"old-a")), "new-a"),
+                ("b.txt", Some(relux_core::sha256_hex(b"old-b")), "new-b"),
+            ],
+        );
+        // A set apply before approval is refused with NOTHING written.
+        let err = k.apply_proposed_change_set(&run_id, &[0, 1]).unwrap_err();
+        assert!(matches!(err, KernelError::ProposedChangeSetNotApplicable { .. }));
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "old-a");
+        assert_eq!(std::fs::read_to_string(dir.path().join("b.txt")).unwrap(), "old-b");
+
+        // Approve both, then apply as one transaction.
+        k.review_proposed_change(&run_id, 0, true, None).unwrap();
+        k.review_proposed_change(&run_id, 1, true, None).unwrap();
+        let applied = k.apply_proposed_change_set(&run_id, &[0, 1]).expect("apply set ok");
+        assert_eq!(applied.applied.len(), 2);
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "new-a");
+        assert_eq!(std::fs::read_to_string(dir.path().join("b.txt")).unwrap(), "new-b");
+        // Both changes flipped to Applied with the SAME shared stamp.
+        let run = k.run(&run_id).unwrap();
+        assert!(run
+            .proposed_changes
+            .iter()
+            .all(|c| c.status == relux_core::ProposedChangeStatus::Applied));
+        assert_eq!(
+            run.proposed_changes[0].applied_at,
+            run.proposed_changes[1].applied_at
+        );
+        // One transcript event + one success audit for the transaction.
+        assert!(k
+            .run_events(&run_id)
+            .into_iter()
+            .any(|e| e.kind == "proposed_change_set_applied"));
+        assert!(k
+            .audit_log()
+            .iter()
+            .any(|e| e.action == "proposed_change:apply_set" && e.result == AuditResult::Success));
+    }
+
+    #[test]
+    fn change_set_partial_conflict_leaves_all_files_untouched() {
+        // One change has a stale baseline (the file moved under it). The whole
+        // transaction must refuse with NEITHER file modified.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "old-a").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "DIVERGED").unwrap();
+        let (mut k, run_id) = kernel_with_proposed_changes(
+            Some(dir.path().to_str().unwrap()),
+            &[
+                ("a.txt", Some(relux_core::sha256_hex(b"old-a")), "new-a"),
+                ("b.txt", Some(relux_core::sha256_hex(b"old-b")), "new-b"),
+            ],
+        );
+        k.review_proposed_change(&run_id, 0, true, None).unwrap();
+        k.review_proposed_change(&run_id, 1, true, None).unwrap();
+        let err = k.apply_proposed_change_set(&run_id, &[0, 1]).unwrap_err();
+        assert!(matches!(err, KernelError::ProposedChangeSetConflict { .. }));
+        // NOTHING was written — not even the change with the good baseline.
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "old-a");
+        assert_eq!(std::fs::read_to_string(dir.path().join("b.txt")).unwrap(), "DIVERGED");
+        // Both changes stay Approved (not Applied) and each carries the reason.
+        let run = k.run(&run_id).unwrap();
+        assert!(run
+            .proposed_changes
+            .iter()
+            .all(|c| c.status == relux_core::ProposedChangeStatus::Approved));
+        assert!(run
+            .proposed_changes
+            .iter()
+            .all(|c| c.refused_reason.as_deref().unwrap_or_default().contains("baseline")));
+        // A failed audit was recorded; no success.
+        assert!(k
+            .audit_log()
+            .iter()
+            .any(|e| e.action == "proposed_change:apply_set" && e.result == AuditResult::Failed));
+        assert!(!k
+            .audit_log()
+            .iter()
+            .any(|e| e.action == "proposed_change:apply_set" && e.result == AuditResult::Success));
+    }
+
+    #[test]
+    fn change_set_refuses_duplicate_target_paths() {
+        // Two changes targeting the same file (one via backslashes) is ambiguous;
+        // the transaction refuses and writes nothing.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("dup.txt"), "old").unwrap();
+        let baseline = relux_core::sha256_hex(b"old");
+        let (mut k, run_id) = kernel_with_proposed_changes(
+            Some(dir.path().to_str().unwrap()),
+            &[
+                ("dup.txt", Some(baseline.clone()), "first"),
+                ("dup.txt", Some(baseline), "second"),
+            ],
+        );
+        k.review_proposed_change(&run_id, 0, true, None).unwrap();
+        k.review_proposed_change(&run_id, 1, true, None).unwrap();
+        let err = k.apply_proposed_change_set(&run_id, &[0, 1]).unwrap_err();
+        match err {
+            KernelError::ProposedChangeSetNotApplicable { reason, .. } => {
+                assert!(reason.contains("duplicate"), "reason: {reason}");
+            }
+            other => panic!("expected NotApplicable, got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(dir.path().join("dup.txt")).unwrap(), "old");
+    }
+
+    #[test]
+    fn change_set_refuses_unsafe_path_in_the_set() {
+        // Validation re-checks paths at apply time; an unsafe path anywhere in the
+        // set refuses the whole transaction (a safe sibling is not written).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ok.txt"), "old").unwrap();
+        let baseline = relux_core::sha256_hex(b"old");
+        let (mut k, run_id) = kernel_with_proposed_changes(
+            Some(dir.path().to_str().unwrap()),
+            &[("ok.txt", Some(baseline), "new")],
+        );
+        k.review_proposed_change(&run_id, 0, true, None).unwrap();
+        // Tamper the stored path to an escaping one (as if storage were corrupted)
+        // to prove the apply-time re-validation gate.
+        k.runs.get_mut(&run_id).unwrap().proposed_changes[0].path = "../escape.txt".to_string();
+        let err = k.apply_proposed_change_set(&run_id, &[0]).unwrap_err();
+        assert!(matches!(err, KernelError::ProposedChangeSetNotApplicable { .. }));
+    }
+
+    #[test]
+    fn change_set_refuses_without_a_baseline_anywhere() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "old-a").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "old-b").unwrap();
+        let (mut k, run_id) = kernel_with_proposed_changes(
+            Some(dir.path().to_str().unwrap()),
+            &[
+                ("a.txt", Some(relux_core::sha256_hex(b"old-a")), "new-a"),
+                ("b.txt", None, "new-b"), // no baseline → refuses whole set
+            ],
+        );
+        k.review_proposed_change(&run_id, 0, true, None).unwrap();
+        k.review_proposed_change(&run_id, 1, true, None).unwrap();
+        let err = k.apply_proposed_change_set(&run_id, &[0, 1]).unwrap_err();
+        assert!(matches!(err, KernelError::ProposedChangeSetNotApplicable { .. }));
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "old-a");
+    }
+
+    #[test]
+    fn change_set_refuses_empty_and_duplicate_index_selections() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "old-a").unwrap();
+        let (mut k, run_id) = kernel_with_proposed_changes(
+            Some(dir.path().to_str().unwrap()),
+            &[("a.txt", Some(relux_core::sha256_hex(b"old-a")), "new-a")],
+        );
+        k.review_proposed_change(&run_id, 0, true, None).unwrap();
+        // Empty selection.
+        assert!(matches!(
+            k.apply_proposed_change_set(&run_id, &[]).unwrap_err(),
+            KernelError::ProposedChangeSetNotApplicable { .. }
+        ));
+        // Duplicate index in the selection.
+        assert!(matches!(
+            k.apply_proposed_change_set(&run_id, &[0, 0]).unwrap_err(),
+            KernelError::ProposedChangeSetNotApplicable { .. }
+        ));
+        // Unknown index.
+        assert!(matches!(
+            k.apply_proposed_change_set(&run_id, &[0, 9]).unwrap_err(),
+            KernelError::UnknownProposedChange { .. }
+        ));
+        // The file was never touched by any of the refusals.
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "old-a");
+    }
+
+    #[test]
+    fn change_set_refuses_without_a_workspace_root() {
+        let (mut k, run_id) = kernel_with_proposed_changes(
+            None, // no working_dir configured
+            &[("a.txt", Some(relux_core::sha256_hex(b"old-a")), "new-a")],
+        );
+        k.review_proposed_change(&run_id, 0, true, None).unwrap();
+        let err = k.apply_proposed_change_set(&run_id, &[0]).unwrap_err();
+        assert!(matches!(err, KernelError::ProposedChangeSetNotApplicable { .. }));
+        assert!(k.run(&run_id).unwrap().proposed_changes[0]
+            .refused_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("workspace"));
+    }
+
+    #[test]
+    fn apply_set_to_workspace_writes_all_when_baselines_match() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("nested")).unwrap();
+        std::fs::write(dir.path().join("a.txt"), "old-a").unwrap();
+        std::fs::write(dir.path().join("nested").join("b.txt"), "old-b").unwrap();
+        let changes = vec![
+            ("a.txt".to_string(), relux_core::sha256_hex(b"old-a"), "new-a".to_string()),
+            (
+                "nested/b.txt".to_string(),
+                relux_core::sha256_hex(b"old-b"),
+                "new-b".to_string(),
+            ),
+        ];
+        let applied =
+            apply_change_set_to_workspace(dir.path().to_str().unwrap(), &changes).expect("ok");
+        assert_eq!(applied.len(), 2);
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "new-a");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("nested").join("b.txt")).unwrap(),
+            "new-b"
+        );
+    }
+
+    #[test]
+    fn cli_run_captures_two_proposed_changes_and_set_apply_writes_both_end_to_end() {
+        // The transactional slice end-to-end: a fake CLI emits an envelope with TWO
+        // proposed_changes (each a full-content replacement + correct baseline);
+        // the kernel captures both, the operator approves both, and ONE set apply
+        // rewrites both files in the controlled workspace root.
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("one.txt"), "hello").unwrap();
+        std::fs::write(work.path().join("two.txt"), "world").unwrap();
+        let base_one = relux_core::sha256_hex(b"hello");
+        let base_two = relux_core::sha256_hex(b"world");
+        let cli_dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            r#"{{"type":"result","is_error":false,"result":"rewrote both","proposed_changes":[{{"path":"one.txt","content":"HELLO","baseline_sha256":"{base_one}"}},{{"path":"two.txt","content":"WORLD","baseline_sha256":"{base_two}"}}]}}"#
+        );
+        let fake = write_fake_json_cli(cli_dir.path(), "fake-claude-set", &body);
+        let mut k = adapter_kernel();
+        enable_claude_with_workdir(&mut k, &fake, work.path().to_str().unwrap());
+        let (_agent, task) = cli_task(&mut k);
+        let run_id = k.execute_assigned_run(&task).expect("adapter run ok");
+
+        // Both captured, still Proposed; files untouched until apply.
+        assert_eq!(k.run(&run_id).unwrap().proposed_changes.len(), 2);
+        assert_eq!(std::fs::read_to_string(work.path().join("one.txt")).unwrap(), "hello");
+
+        // Approve both, apply as one transaction.
+        k.review_proposed_change(&run_id, 0, true, None).unwrap();
+        k.review_proposed_change(&run_id, 1, true, None).unwrap();
+        let applied = k.apply_proposed_change_set(&run_id, &[0, 1]).expect("set apply ok");
+        assert_eq!(applied.applied.len(), 2);
+        assert_eq!(std::fs::read_to_string(work.path().join("one.txt")).unwrap(), "HELLO");
+        assert_eq!(std::fs::read_to_string(work.path().join("two.txt")).unwrap(), "WORLD");
     }
 
     #[test]

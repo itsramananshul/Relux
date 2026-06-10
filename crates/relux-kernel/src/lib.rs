@@ -48,7 +48,8 @@ pub use plugin_install::{
 pub use prime::{classify_intent, decide};
 pub use runtime::{invoke_http_loopback, RuntimeClientError};
 pub use state::{
-    run_briefs_in_parallel, AppliedProposedChange, BundledRefresh, BundledRefreshSummary,
+    run_briefs_in_parallel, AppliedProposedChange, AppliedProposedChangeSet, BundledRefresh,
+    BundledRefreshSummary,
     FinishedBrief, KernelCounters, KernelSnapshot, KernelState, PreparedBrief, RoundPrep,
 };
 pub use store::SqliteStore;
@@ -108,6 +109,10 @@ pub enum KernelError {
         index: usize,
         reason: String,
     },
+    #[error("the proposed-change set on run {run} cannot be applied: {reason}")]
+    ProposedChangeSetNotApplicable { run: String, reason: String },
+    #[error("the proposed-change set on run {run} conflicts with the workspace: {reason}")]
+    ProposedChangeSetConflict { run: String, reason: String },
     #[error("unknown approval: {0}")]
     UnknownApproval(String),
     #[error("unknown orchestration: {0}")]

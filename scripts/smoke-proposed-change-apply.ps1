@@ -55,7 +55,13 @@ $tests = @(
     'review_then_apply_writes_the_file',
     'apply_to_workspace_refuses_on_baseline_conflict_and_leaves_file',
     'apply_refuses_without_a_baseline_hash',
-    'apply_refuses_without_a_workspace_root'
+    'apply_refuses_without_a_workspace_root',
+    # Transactional (multi-file) apply — the "two proposed changes -> apply set to
+    # a temp workspace, all-or-nothing" slice (RELUX_MASTER_PLAN §15).
+    'cli_run_captures_two_proposed_changes_and_set_apply_writes_both_end_to_end',
+    'change_set_applies_multiple_files_atomically',
+    'change_set_partial_conflict_leaves_all_files_untouched',
+    'change_set_refuses_duplicate_target_paths'
 )
 foreach ($t in $tests) {
     $out = & cargo test -p relux-kernel --lib $t 2>$null | Out-String
@@ -123,6 +129,21 @@ try {
                 try { $null = Invoke-WebRequest -UseBasicParsing -Method POST -Uri "$base/v1/relux/runs/run_nope/proposed-changes/0/review" -Body '{"decision":"maybe"}' -ContentType 'application/json' -TimeoutSec 5 }
                 catch { $status3 = [int]$_.Exception.Response.StatusCode }
                 Assert 'review with bad decision -> 400' ($status3 -eq 400) "got $status3"
+
+                # The transactional (multi-file) apply route exists and refuses
+                # honestly: a VALID body on an unknown run reaches the kernel and
+                # returns its "unknown run" 400 (a 2xx would be a fabricated apply;
+                # a missing route would 404). Proves the new set route is wired.
+                $status4 = 0
+                try { $null = Invoke-WebRequest -UseBasicParsing -Method POST -Uri "$base/v1/relux/runs/run_nope/proposed-changes/apply" -Body '{"indices":[0,1]}' -ContentType 'application/json' -TimeoutSec 5 }
+                catch { $status4 = [int]$_.Exception.Response.StatusCode }
+                Assert 'set-apply on unknown run refuses honestly (400)' ($status4 -eq 400) "got $status4"
+
+                # An empty selection is rejected up front (400) — never a no-op 2xx.
+                $status5 = 0
+                try { $null = Invoke-WebRequest -UseBasicParsing -Method POST -Uri "$base/v1/relux/runs/run_nope/proposed-changes/apply" -Body '{"indices":[]}' -ContentType 'application/json' -TimeoutSec 5 }
+                catch { $status5 = [int]$_.Exception.Response.StatusCode }
+                Assert 'set-apply with empty selection -> 400' ($status5 -eq 400) "got $status5"
             }
         }
     }

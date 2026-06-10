@@ -9,6 +9,57 @@ once a stable release is cut.
 
 ### Added
 
+- **First safe multi-file transactional apply for a run's proposed changes
+  (master plan §15 / §9.6).** Extends the single-file apply below with an
+  **all-or-nothing transaction** over a *set* of a run's proposed changes: every
+  selected change is validated **together first**, and the files are written only
+  if **all** checks pass — otherwise **no file is modified** and every status stays
+  honest. The single-change review/apply path is unchanged (and, per the doc, "if
+  only one, the existing flow remains fine"). (1) **Kernel** —
+  `apply_proposed_change_set(run_id, indices)` requires the selection to be
+  non-empty with no duplicate/unknown indices, then requires **every** selected
+  change to be `Approved`, to carry a **baseline hash** (no force), to have a
+  **safe relative path distinct from every other** change in the set (no two
+  changes may target the same file), and to resolve inside the run's single
+  configured **`working_dir`** (one run → one adapter → one root) with **no
+  `..`/symlink escape** to an **existing regular file** whose current SHA-256 still
+  **equals the baseline**. Only then does the pure
+  `apply_change_set_to_workspace` write each file **atomically** (a temp file then
+  a rename); if a write fails mid-apply it **rolls the already-written files back**
+  to the originals captured during validation and reports an honest failure
+  (strict up-front validation is preferred precisely so this path is essentially
+  unreachable). On success every change flips to `Applied` with one shared
+  `applied_at` stamp, a `proposed_change_set_applied` transcript event and a
+  `proposed_change:apply_set` **success** audit land; on any refusal each selected
+  change records the honest reason and a **failed** audit lands. (2) **API** —
+  `POST /v1/relux/runs/:id/proposed-changes/apply` with `{ "indices": [..] }`; a
+  workspace baseline conflict is a `409`, any other inapplicable set (not approved
+  / no baseline / no workspace / unsafe or duplicate target / unknown index) is a
+  `422`, and an empty/absent selection is a `400` — never a fabricated `2xx`.
+  (3) **Dashboard** — Run Detail shows a batch toolbar **only when a run has more
+  than one proposed change**: **Approve all** (approves every still-reviewable
+  change) and **Apply all approved (N)** (applies every approved+baselined change
+  as one transaction, surfacing the honest all-or-nothing refusal reason).
+  (4) **Tests** — kernel: multi-file atomic apply (shared stamp, one transcript
+  event + success audit), **partial conflict leaves ALL files untouched** (both
+  stay `Approved`, failed audit, no success), **duplicate target** refused,
+  apply-time **unsafe-path** re-validation, missing-baseline-anywhere refused,
+  empty/duplicate/unknown index selections refused, no-workspace refused, the pure
+  set writer, and a **fake-CLI-envelope end-to-end with TWO proposed changes** that
+  captures both, approves both, and applies both into a temp workspace; API
+  status-mapping (409 vs 422); dashboard `reviewableProposedChangeIndices` /
+  `applyEligibleProposedChangeIndices` / `showBatchProposedChangeControls`; and the
+  PowerShell smoke (`scripts/smoke-proposed-change-apply.ps1`) extended with the
+  transactional kernel tests + the new set-apply route refusing honestly.
+  **Caveats / still not done:** the transaction is over **one run's** changes (a
+  run has a single adapter, so one workspace root — cross-run/cross-root apply is
+  out of scope); each change is still a **single-file full-content replacement over
+  an existing baseline file** (no new-file create, rename, or delete — a missing
+  target is a conflict); approval is still per-change (the UI "Approve all" loops
+  the existing review endpoint — approval touches no files, so the transactional
+  guarantee is specifically on the **writes**); and rollback is best-effort on a
+  genuine mid-apply I/O fault — when it cannot fully restore, the failure message
+  says so explicitly rather than overclaiming a clean revert.
 - **Prime conversational brain handles a `proposed_changes` envelope honestly —
   no silent drop, no hidden work (master plan §15 + the AI "Conversational
   Shaping / Actionful Safety" section).** The Prime chat/brain path is

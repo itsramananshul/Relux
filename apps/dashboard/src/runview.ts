@@ -244,6 +244,40 @@ export function canApplyProposedChange(change: ReluxProposedChange): boolean {
   return change.status === "approved" && typeof change.baseline_sha256 === "string";
 }
 
+// The indices of the changes that are still reviewable (status "proposed"), in
+// list order. Drives the batch "Approve all" affordance.
+export function reviewableProposedChangeIndices(
+  changes: ReluxProposedChange[],
+): number[] {
+  const out: number[] = [];
+  changes.forEach((c, i) => {
+    if (canReviewProposedChange(c)) out.push(i);
+  });
+  return out;
+}
+
+// The indices of the changes eligible for a transactional apply (approved + a
+// baseline hash), in list order. This is exactly the selection the dashboard
+// sends to the multi-file apply endpoint; the backend re-validates everything.
+export function applyEligibleProposedChangeIndices(
+  changes: ReluxProposedChange[],
+): number[] {
+  const out: number[] = [];
+  changes.forEach((c, i) => {
+    if (canApplyProposedChange(c)) out.push(i);
+  });
+  return out;
+}
+
+// Whether to offer the batch (multi-file) review/apply toolbar: only when a run
+// has MORE THAN ONE proposed change. With a single change the existing per-change
+// flow is sufficient (master plan §15: "If only one, existing flow remains fine").
+export function showBatchProposedChangeControls(
+  changes: ReluxProposedChange[],
+): boolean {
+  return changes.length > 1;
+}
+
 // The honest reason that apply/diff/accept-reject review is unavailable on a
 // Relux run with NO captured artifact references. A Relux run record carries a
 // transcript, output excerpt, metrics, and (when the adapter declared them)

@@ -20,6 +20,9 @@ import {
   proposedChangeStatusTone,
   canReviewProposedChange,
   canApplyProposedChange,
+  reviewableProposedChangeIndices,
+  applyEligibleProposedChangeIndices,
+  showBatchProposedChangeControls,
 } from "../src/runview.ts";
 
 // The Work page's run-depth view must read HONESTLY: it only formats/classifies
@@ -187,6 +190,24 @@ test("canReview/canApply gate on status and a baseline hash", () => {
   assert.equal(canApplyProposedChange(mk("approved", "abc")), true);
   assert.equal(canApplyProposedChange(mk("approved")), false); // no baseline → not applyable
   assert.equal(canApplyProposedChange(mk("proposed", "abc")), false);
+});
+
+test("batch helpers select reviewable/apply-eligible indices and gate the toolbar", () => {
+  const mk = (status: string, baseline?: string) =>
+    ({ path: "f", new_content: "x", new_sha256: "h", bytes: 1, source: "x", status, baseline_sha256: baseline }) as any;
+  const changes = [
+    mk("proposed"),            // 0: reviewable, not apply-eligible
+    mk("approved", "abc"),     // 1: apply-eligible
+    mk("approved"),            // 2: approved but NO baseline → not apply-eligible
+    mk("applied", "abc"),      // 3: terminal — neither
+    mk("rejected"),            // 4: terminal — neither
+  ];
+  assert.deepEqual(reviewableProposedChangeIndices(changes), [0]);
+  assert.deepEqual(applyEligibleProposedChangeIndices(changes), [1]);
+  // The batch toolbar shows only when there is MORE THAN ONE change.
+  assert.equal(showBatchProposedChangeControls(changes), true);
+  assert.equal(showBatchProposedChangeControls([mk("approved", "abc")]), false);
+  assert.equal(showBatchProposedChangeControls([]), false);
 });
 
 test("runArtifacts returns only well-formed references and normalizes unknown types", () => {

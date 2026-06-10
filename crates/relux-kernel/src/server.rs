@@ -336,6 +336,10 @@ fn router(state: AppState) -> Router {
             "/v1/relux/runs/:id/proposed-changes/:index/apply",
             post(apply_proposed_change),
         )
+        .route(
+            "/v1/relux/runs/:id/proposed-changes/apply",
+            post(apply_proposed_change_set),
+        )
         .route("/v1/relux/audit", get(list_audit_events))
         .route("/v1/relux/health", get(get_health))
         .route("/v1/relux/tasks/:id/start", post(start_task))
@@ -1103,6 +1107,44 @@ async fn apply_proposed_change(
     let run_id = relux_core::RunId::new(id);
     let applied =
         locked_save_persisting(&state, |kernel| kernel.apply_proposed_change(&run_id, index))?;
+    Ok(Json(applied))
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplyProposedChangeSetReq {
+    /// The explicit indices of the (already approved) proposed changes to apply as
+    /// one transaction. Must be non-empty.
+    indices: Vec<usize>,
+}
+
+/// POST `/v1/relux/runs/:id/proposed-changes/apply` — apply a SET of approved
+/// proposed changes for one run as a single all-or-nothing transaction (master
+/// plan section 15 apply, safety bar section 17.5). Every selected change is
+/// validated together first (approved, baseline present + still matching, safe
+/// distinct path, existing target); only if ALL pass are the files written (each
+/// via a temp file then a rename, with rollback on a mid-apply write fault).
+/// Refuses honestly with no
+/// file modified — a baseline conflict with the workspace maps to a `409`, any
+/// other inapplicable set (a change not approved, a missing baseline, no workspace
+/// root, an unsafe or duplicate target, an unknown index) maps to a `422`, and a
+/// request with no indices maps to a `400`.
+async fn apply_proposed_change_set(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    body: Option<Json<ApplyProposedChangeSetReq>>,
+) -> Result<Json<relux_kernel::AppliedProposedChangeSet>, ApiError> {
+    let req = body.map(|b| b.0).ok_or_else(|| {
+        ApiError::bad_request("a JSON body with { \"indices\": [..] } is required")
+    })?;
+    if req.indices.is_empty() {
+        return Err(ApiError::bad_request(
+            "at least one proposed-change index is required",
+        ));
+    }
+    let run_id = relux_core::RunId::new(id);
+    let applied = locked_save_persisting(&state, |kernel| {
+        kernel.apply_proposed_change_set(&run_id, &req.indices)
+    })?;
     Ok(Json(applied))
 }
 
@@ -3274,6 +3316,10 @@ fn status_for(err: &KernelError) -> StatusCode {
         KernelError::ProposedChangeNotApproved { .. }
         | KernelError::ProposedChangeConflict { .. } => StatusCode::CONFLICT,
         KernelError::ProposedChangeNotApplicable { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+        // The transactional (multi-file) apply maps the same way: a baseline
+        // conflict is a resolvable 409; any other refusal is unprocessable (422).
+        KernelError::ProposedChangeSetConflict { .. } => StatusCode::CONFLICT,
+        KernelError::ProposedChangeSetNotApplicable { .. } => StatusCode::UNPROCESSABLE_ENTITY,
         KernelError::AdapterBinaryMissing { .. } => StatusCode::UNPROCESSABLE_ENTITY,
         KernelError::AdapterExecutionFailed { .. } => StatusCode::BAD_GATEWAY,
         KernelError::AdapterNotConfigurable { .. } | KernelError::InvalidAdapterConfig { .. } => {
@@ -3717,6 +3763,22 @@ mod tests {
                 message: "timeout".into()
             }),
             StatusCode::BAD_GATEWAY
+        );
+        // Transactional (multi-file) apply: a workspace conflict is a 409; any
+        // other refusal of the set is a 422 — mirroring the single-change apply.
+        assert_eq!(
+            status_for(&KernelError::ProposedChangeSetConflict {
+                run: "r".into(),
+                reason: "baseline mismatch".into()
+            }),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            status_for(&KernelError::ProposedChangeSetNotApplicable {
+                run: "r".into(),
+                reason: "duplicate target".into()
+            }),
+            StatusCode::UNPROCESSABLE_ENTITY
         );
     }
 
