@@ -33,7 +33,18 @@ tokio = { workspace = true }
 # reqwest (rustls-tls, json) so no new HTTP/TLS stack enters the tree; the
 # deterministic Prime path never touches it.
 reqwest = { workspace = true }
+# Local operator login (first-run admin password + session cookies). Argon2id is
+# the password KDF (workspace-pinned, already in the tree via relix-runtime /
+# relix-web-bridge); `rand` mints session ids and `hex` encodes them. No new
+# heavy dependency enters the workspace - these are all reused workspace pins.
+argon2 = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 # Temp directories for the SqliteStore round-trip tests.
 tempfile = { workspace = true }
+# Drive the `serve` router end to end in tests (oneshot) so the auth middleware
+# and the /v1/auth/* handlers are exercised over a real Request, not just unit
+# methods. Reuses the workspace-pinned tower already in the tree via axum.
+tower = { workspace = true }

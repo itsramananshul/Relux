@@ -305,7 +305,13 @@ try {
         $serveErr = Join-Path $TempRoot 'serve.err.log'
         $serveProc = Start-Process -FilePath $ReleaseExe -ArgumentList 'serve' -PassThru -WindowStyle Hidden -RedirectStandardOutput $serveOut -RedirectStandardError $serveErr
 
-        $client = New-Object System.Net.Http.HttpClient
+        # A CookieContainer captures the relux_session cookie minted by
+        # /v1/auth/setup and re-sends it on every later request - exactly what the
+        # browser dashboard does. Local operator login now guards /v1/relux/*.
+        $handler = New-Object System.Net.Http.HttpClientHandler
+        $handler.CookieContainer = New-Object System.Net.CookieContainer
+        $handler.UseCookies = $true
+        $client = New-Object System.Net.Http.HttpClient($handler)
         # Generous timeout: execute-assigned is synchronous, and a REAL Claude/Codex
         # adapter run (opt-in) blocks this call until the CLI finishes. Fast calls
         # still return immediately, so a high ceiling is harmless.
@@ -331,18 +337,40 @@ try {
             }
         }
 
-        # Wait (bounded) for the server to answer.
+        # Wait (bounded) for the server to answer. Probe the PUBLIC health route
+        # (no session required) so readiness does not depend on login.
         $deadline = (Get-Date).AddSeconds(25)
         $ready = $false
         while ((Get-Date) -lt $deadline) {
             if ($serveProc.HasExited) { break }
-            $h = Invoke-Api 'GET' '/v1/relux/state' $null
+            $h = Invoke-Api 'GET' '/v1/relux/health' $null
             if ($h.Status -eq 200) { $ready = $true; break }
             Start-Sleep -Milliseconds 400
         }
-        Assert 'serve becomes ready' $ready ("$base/v1/relux/state")
+        Assert 'serve becomes ready' $ready ("$base/v1/relux/health")
 
         if ($ready) {
+            # -- Local operator login -----------------------------------------
+            # NEGATIVE control: a protected route with NO session must be 401
+            # (proves auth is genuinely enforced, not wide open). Use a fresh
+            # cookieless client so the main client's jar stays empty until setup.
+            $bare = New-Object System.Net.Http.HttpClient
+            $bare.Timeout = [TimeSpan]::FromSeconds(20)
+            try {
+                $noAuth = $bare.GetAsync("$base/v1/relux/state").GetAwaiter().GetResult()
+                Assert 'protected route 401 without session' ([int]$noAuth.StatusCode -eq 401) ("status " + [int]$noAuth.StatusCode)
+            } catch {
+                Fail 'protected route 401 without session' $_.Exception.Message
+            } finally {
+                $bare.Dispose()
+            }
+            # First-run setup mints the relux_session cookie into the main client's
+            # jar, so every subsequent /v1/relux/* call authenticates automatically.
+            $setupBody = @{ username = 'e2e-admin'; password = 'e2e-pass-123' } | ConvertTo-Json -Compress
+            $setup = Invoke-Api 'POST' '/v1/auth/setup' $setupBody
+            Assert 'auth setup creates admin + session' ($setup.Status -eq 200) ("status " + $setup.Status)
+            $me = Invoke-Api 'GET' '/v1/auth/me' $null
+            Assert 'auth me returns the session user' (($me.Status -eq 200) -and ($me.Body -match 'e2e-admin')) ("status " + $me.Status)
             $dash = Invoke-Api 'GET' '/dashboard' $null
             if ($dash.Status -eq 200) {
                 Pass 'GET /dashboard' '200'

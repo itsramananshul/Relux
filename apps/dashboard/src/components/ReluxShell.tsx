@@ -1,13 +1,17 @@
 import { type ReactNode } from "react";
 import { NavLink, useLocation } from "react-router-dom";
+import { useAuth } from "../auth";
 
 // The standalone Relux product shell (RELUX_MASTER_PLAN section 11 Dashboard,
 // section 21 Final Product Feeling). This is what relux-kernel serves at /dashboard:
 // a Relux-branded surface whose routes are backed ONLY by the local /v1/relux
 // control plane (state, prime, work, crew, plugins, approvals, health) - no Relix
-// web bridge, no login, no 401. The old bridge-backed Relix pages are not part of
-// this shell and do not appear in its navigation; they remain reachable at their
-// legacy paths only for continuity (see App.tsx LegacyDashboard).
+// web bridge. Access is gated by the local operator login (RELUX_MASTER_PLAN
+// "Local operator login v1"): the kernel protects /v1/relux/* behind the
+// relux_session cookie, and the shell shows who is signed in plus a sign-out
+// control. The old bridge-backed Relix pages are not part of this shell and do
+// not appear in its navigation; they remain reachable at their legacy paths only
+// for continuity (see App.tsx LegacyDashboard).
 
 interface NavEntry {
   to: string;
@@ -60,6 +64,8 @@ function Group({ label, items }: { label: string; items: NavEntry[] }) {
 export function ReluxShell({ children }: { children: ReactNode }) {
   const loc = useLocation();
   const meta = TITLES[loc.pathname] ?? { title: "Relux", sub: "" };
+  const { status, logout } = useAuth();
+  const who = status?.username ?? "admin";
 
   return (
     <div className="app">
@@ -72,8 +78,8 @@ export function ReluxShell({ children }: { children: ReactNode }) {
         <Group label="Control plane" items={RELUX_NAV} />
         <div className="sidebar-foot">
           <div className="muted" style={{ fontSize: 11, padding: "0 12px", lineHeight: 1.5 }}>
-            Served by <span className="mono">relux-kernel</span>. The local control
-            plane needs no login.
+            Served by <span className="mono">relux-kernel</span>. Signed in as{" "}
+            <span className="mono">{who}</span>.
           </div>
         </div>
       </aside>
@@ -87,6 +93,16 @@ export function ReluxShell({ children }: { children: ReactNode }) {
           <NavLink to="/prime" title="Talk to Prime">
             <button className="btn sm">Ask Prime →</button>
           </NavLink>
+          <span className="muted" style={{ fontSize: 12, margin: "0 4px 0 12px" }} title="Signed-in operator">
+            {who}
+          </span>
+          <button
+            className="btn ghost sm"
+            title="Sign out of the Relux dashboard"
+            onClick={() => void logout()}
+          >
+            Sign out
+          </button>
         </header>
         <div className="workspace">{children}</div>
       </div>

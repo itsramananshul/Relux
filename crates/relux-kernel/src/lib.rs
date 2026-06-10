@@ -18,6 +18,7 @@
 
 pub mod adapter;
 pub mod ai;
+pub mod auth;
 pub mod builtin;
 pub mod clock;
 pub mod event;
@@ -36,6 +37,11 @@ pub use adapter::{
 pub use ai::{
     clear_stored_config, compose_chat_prompt, is_actionful, read_stored_config, shape_reply,
     write_stored_config, AiConfig, AiMode, AiOutcome, AiStatus, PrimeBrain, StoredAiConfig,
+};
+pub use auth::{
+    admin_path_for_db, clear_session_cookie, read_admin_username, reset_admin_credential,
+    session_cookie_from_headers, set_session_cookie, DashboardAuth, MIN_PASSWORD_LEN,
+    SESSION_COOKIE,
 };
 pub use builtin::{is_builtin_tool, is_internal_plugin, BUILTIN_TOOLS, INTERNAL_PLUGIN_IDS};
 pub use clock::Clock;

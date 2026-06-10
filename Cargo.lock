@@ -4003,7 +4003,10 @@ dependencies = [
 name = "relux-kernel"
 version = "0.1.4"
 dependencies = [
+ "argon2",
  "axum",
+ "hex",
+ "rand 0.8.6",
  "relux-core",
  "reqwest",
  "rusqlite",
@@ -4012,6 +4015,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tower",
  "zip",
 ]
 

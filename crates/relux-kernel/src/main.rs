@@ -40,6 +40,9 @@ fn main() -> ExitCode {
     //   relux-kernel serve                   -> run the local /v1/relux HTTP API
     //   relux-kernel health|doctor          -> check local health, return zero on PASS
     //   relux-kernel reset-local             -> wipe + reinit the local dev DB
+    //   relux-kernel reset-admin [user] [pw] -> local operator password recovery
+    //                                           (rewrites dashboard-admin.json;
+    //                                           generates a password if omitted)
     //   relux-kernel plugins                 -> list installed plugins
     //   relux-kernel plugin install-dir <p>  -> install a plugin from a folder
     //   relux-kernel plugin install-zip <p>  -> install a plugin from a .zip
@@ -88,6 +91,7 @@ fn main() -> ExitCode {
             }
         }
         Some((cmd, _)) if cmd == "reset-local" => run_reset_local(),
+        Some((cmd, rest)) if cmd == "reset-admin" => run_reset_admin(rest),
         Some((cmd, _)) if cmd == "plugins" => run_plugins_list(),
         Some((cmd, rest)) if cmd == "plugin" => run_plugin_subcommand(rest),
         Some((cmd, _)) if cmd == "tools" => run_tools_list(),
@@ -547,6 +551,25 @@ fn run_health() -> ExitCode {
         }
     }
 
+    // Local operator login status. A configured admin means the dashboard/API
+    // require sign-in; no admin yet means the first dashboard load shows the
+    // one-time setup form. Neither is a failure — this is informational so the
+    // operator knows what to expect (and the dev/test bypass is flagged loudly).
+    if auth_disabled_env() {
+        warnings.push(
+            "WARN: RELUX_AUTH_DISABLED is set — `serve` will leave the dashboard/API OPEN (dev/test only)."
+                .to_string(),
+        );
+        if exit_code == ExitCode::SUCCESS {
+            exit_code = ExitCode::from(1);
+        }
+    } else {
+        match relux_kernel::read_admin_username(&admin_path()) {
+            Some(user) => println!("PASS: Local login: admin '{user}' configured (dashboard requires sign-in)."),
+            None => println!("INFO: Local login: no admin yet — first dashboard load shows the setup form."),
+        }
+    }
+
     // AI status: resolve from the dashboard-written secrets file (when present)
     // with environment fallback, so a key configured from the dashboard is
     // honored here too.
@@ -637,6 +660,31 @@ fn ai_config_path() -> PathBuf {
         Some(parent) if !parent.as_os_str().is_empty() => parent.join("ai-config.json"),
         _ => PathBuf::from("dev-data/relux/ai-config.json"),
     }
+}
+
+/// The dashboard admin credential file: `dashboard-admin.json` next to the local
+/// dev database (`dev-data/relux/dashboard-admin.json` by default, gitignored).
+/// `RELUX_ADMIN_FILE` overrides it. Holds the Argon2id password hash for local
+/// operator login — never plaintext, never returned by the API. See
+/// `docs/RELUX_MASTER_PLAN.md` "Local operator login v1".
+fn admin_path() -> PathBuf {
+    match std::env::var("RELUX_ADMIN_FILE") {
+        Ok(p) if !p.trim().is_empty() => PathBuf::from(p),
+        _ => relux_kernel::admin_path_for_db(&db_path()),
+    }
+}
+
+/// Whether the dev/test auth bypass (`RELUX_AUTH_DISABLED`) is requested. Mirrors
+/// the same parse the `serve` middleware uses so `doctor` reports it honestly.
+fn auth_disabled_env() -> bool {
+    matches!(
+        std::env::var("RELUX_AUTH_DISABLED")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 /// The durable root for staged plugin uploads: an `uploads/` folder next to the
@@ -816,6 +864,69 @@ fn run_reset_local() -> Result<(), KernelError> {
     println!("   reinitialized with plugins, the workspace namespace, and the Prime agent.");
 
     Ok(())
+}
+
+/// **Local operator password recovery.** Rewrite the dashboard admin credential
+/// with a fresh Argon2id hash, using the SAME storage as first-run setup
+/// (`docs/RELUX_MASTER_PLAN.md` "Local operator login v1").
+///
+/// Usage: `relux-kernel reset-admin [username] [password]`.
+/// - If `username` is omitted, the existing admin username is kept (or `admin`
+///   when no admin exists yet).
+/// - If `password` is omitted, a strong random password is generated and PRINTED
+///   once (the only time it is ever shown). The existing secret is never read or
+///   printed.
+///
+/// This is a local CLI/filesystem operation only — there is NO network or
+/// unauthenticated reset path. It does not weaken session auth or touch any other
+/// state. In-memory sessions are not invalidated here; **restart
+/// `relux-kernel serve`** to drop live sessions (a restart also reloads this new
+/// credential).
+fn run_reset_admin(args: &[String]) -> Result<(), KernelError> {
+    let path = admin_path();
+
+    // Resolve the username: explicit arg > existing admin username > "admin".
+    let username = match args.first() {
+        Some(u) if !u.trim().is_empty() => u.trim().to_string(),
+        _ => relux_kernel::read_admin_username(&path).unwrap_or_else(|| "admin".to_string()),
+    };
+
+    // Resolve the password: explicit arg > a freshly generated strong one.
+    let (password, generated) = match args.get(1) {
+        Some(p) if !p.trim().is_empty() => (p.clone(), false),
+        _ => (generate_password(), true),
+    };
+
+    relux_kernel::reset_admin_credential(&path, &username, &password)
+        .map_err(|e| KernelError::Storage(format!("reset-admin failed: {e}")))?;
+
+    println!("reset-admin: local operator credential rewritten.");
+    println!("   file:     {}", path.display());
+    println!("   username: {username}");
+    if generated {
+        println!("   password: {password}");
+        println!("   ^ this generated password is shown ONCE. Save it now.");
+    } else {
+        println!("   password: (set from the value you provided)");
+    }
+    println!();
+    println!("Restart `relux-kernel serve` to drop any live sessions and load this");
+    println!("credential, then sign in to the dashboard with the new password.");
+    Ok(())
+}
+
+/// Generate a strong, copy-pasteable random password (no ambiguous characters).
+/// Used by `reset-admin` when the operator does not supply one.
+fn generate_password() -> String {
+    use rand::RngCore;
+    // Avoid 0/O/1/l/I to keep the printed password unambiguous to retype.
+    const ALPHABET: &[u8] = b"abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let mut bytes = [0u8; 20];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    bytes
+        .iter()
+        .map(|b| ALPHABET[(*b as usize) % ALPHABET.len()] as char)
+        .collect()
 }
 
 /// Build the path for a SQLite sidecar by appending `suffix` to the db filename.

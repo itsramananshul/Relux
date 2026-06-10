@@ -1806,8 +1806,9 @@ What remains intentionally local-first (out of scope for this RC):
   share the folder/zip directly.
 - Windows x64 only (the script builds and labels a `windows-x64` bundle). No
   cross-OS bundles are produced here.
-- The standalone API binds loopback and is unauthenticated by design - it is not
-  a multi-user or production surface.
+- The standalone API binds loopback and is now gated by a single-admin local
+  operator login (post-v0.1.4); it is still not a multi-user or production
+  surface (one admin, in-memory sessions, http loopback with no transport TLS).
 - GitHub Actions stay disabled; releases are cut by hand with this script.
 
 ### Release history (local Windows bundles)
@@ -1862,7 +1863,8 @@ stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
   does not survive a restart for **by-job-id** polls (the by-orchestration-id poll
   stays restart-honest); live-tail is incremental polling, not a server-push event
   stream; retry/resume is a fresh attempt or a continued batch, not a partial-CLI-run
-  resume; and the standalone API remains loopback-only and unauthenticated by design.
+  resume; and the standalone API remains loopback-only (now gated by the
+  single-admin local operator login added after v0.1.4).
 - **v0.1.3** (2026-06-10) — first build on top of v0.1.2 that turns Prime from a
   single local task runner into a governed **multi-agent orchestrator**.
   **Multi-agent orchestration:** Prime decomposes a goal into role-typed briefs
@@ -2581,8 +2583,31 @@ The API never returns the key. The dashboard shows the current AI provider/mode.
   **not** stream events live or resume a *partial* CLI run; a retry is a new
   attempt, not a resume. Execution-environment runtimes remain not implemented
   yet.
-- The standalone API is local-only and unauthenticated by design; it binds
-  loopback. It is not a multi-user or production surface.
+- **Local operator login v1.** The standalone dashboard/API now require a local
+  sign-in (post-v0.1.4 auth slice). On first launch the dashboard shows a one-time
+  **setup** form that creates a single local admin (username + **Argon2id** PHC
+  password hash, stored at `dev-data/relux/dashboard-admin.json` next to the DB,
+  gitignored, OS-restricted, **never** plaintext and never returned by the API).
+  After setup, login mints an **HTTP-only** `relux_session` cookie
+  (`SameSite=Lax`, `Path=/`, 12h expiry; **no** `Secure` because the console runs
+  over loopback `http://` — a TLS-terminating reverse proxy can re-add it). The
+  serve auth middleware protects every `/v1/relux/*` route behind a valid session;
+  the dashboard `fetch` rides the cookie automatically (no token paste). Public by
+  design: the static dashboard (so the setup/login screen always renders — never a
+  blank page), the `/v1/auth/*` endpoints (`status`/`setup`/`login`/`logout`/`me`),
+  and `/v1/relux/health` (liveness probe). Sessions are in-memory (a single-process
+  kernel): a restart drops them and re-prompts login while the admin credential
+  stays durable. Password recovery is the **local** `relux-kernel reset-admin`
+  CLI (filesystem-only, no network/unauthenticated reset; restart `serve` to drop
+  live sessions). A dev/test-only escape hatch `RELUX_AUTH_DISABLED` leaves the API
+  open (OFF by default, flagged loudly by `serve` and `doctor`). The CLI
+  (`prime`, `task run-assigned`, `tools`, autonomy, …) talks to the durable store
+  directly and is unaffected by HTTP auth.
+- The standalone API is local-first and binds **loopback only**; it is now gated
+  by the single-admin local operator login above (not the earlier
+  "unauthenticated by design"). It remains a single-operator local console, not a
+  multi-tenant or internet production surface: one admin account, in-memory
+  sessions, and a loopback bind with no transport TLS (http).
 
 ### Status after v0.1.1 — next unfinished pieces
 

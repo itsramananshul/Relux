@@ -9,6 +9,40 @@ once a stable release is cut.
 
 ### Added
 
+- **Local operator login for the standalone Relux dashboard/API (auth v1).** The
+  `relux-kernel serve` surface is no longer unauthenticated: it now requires a
+  simple local username/password sign-in, replacing the dashboard token weirdness
+  with a browser session cookie. On first launch the dashboard shows a one-time
+  **setup** form that creates a single local admin; the password is stored only as
+  an **Argon2id** PHC hash at `dev-data/relux/dashboard-admin.json` (next to the
+  DB, gitignored, OS-restricted, never plaintext, never returned by the API). A
+  successful setup/login mints an **HTTP-only** `relux_session` cookie
+  (`SameSite=Lax`, `Path=/`, 12-hour expiry; **no** `Secure` because the console
+  runs over loopback `http://` — documented honestly, a TLS-terminating proxy can
+  re-add it). New public endpoints `GET /v1/auth/status`, `POST /v1/auth/setup`,
+  `POST /v1/auth/login`, `POST /v1/auth/logout`, `GET /v1/auth/me`; a middleware
+  protects every other `/v1/relux/*` route behind a valid session, while the
+  static dashboard (so the login screen always renders) and `/v1/relux/health`
+  (liveness) stay public. The dashboard gates the whole shell on the session and
+  adds a **Sign out** control showing the signed-in operator. Sessions are
+  in-memory (single-process): a `serve` restart drops them and re-prompts login
+  while the admin credential stays durable. **Password recovery** is the local
+  `relux-kernel reset-admin [username] [password]` CLI (filesystem-only, no
+  network/unauthenticated reset; generates + prints a strong password once when
+  omitted; restart `serve` to drop live sessions). The CLI (`prime`,
+  `task run-assigned`, `tools`, autonomy, …) talks to the durable store directly
+  and is unaffected. A dev/test-only escape hatch `RELUX_AUTH_DISABLED` leaves the
+  API open (OFF by default; flagged loudly by `serve` and `doctor`). Tests pin the
+  doc semantics: password is stored as Argon2id (never plaintext), setup is
+  first-run only, login rejects a wrong password, a protected route is 401 without
+  a session and 200 with one, logout re-locks, health stays public, and the bypass
+  opens the API only when explicitly set. The `relux-e2e-smoke.ps1` serve checks
+  now log in (cookie jar) and assert the no-session negative control. This
+  **partially closes** the long-standing "standalone API is loopback-only and
+  unauthenticated by design" caveat — the loopback bind stays, but the surface is
+  now gated by a single-admin local login (still a single-operator local console,
+  not a multi-tenant/internet production surface). See `docs/RELUX_MASTER_PLAN.md`
+  → *Local operator login v1*.
 - **Relux local release v0.1.4 (Windows bundle).** The `relux-kernel` /
   `relux-core` crates move from `0.1.3` to `0.1.4` for the first build on top of
   v0.1.3 that makes the orchestrator's **run results reviewable and applyable** and

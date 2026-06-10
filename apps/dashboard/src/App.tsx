@@ -57,14 +57,28 @@ function ReluxNotFound() {
 
 export function App() {
   const loc = useLocation();
+  const { loading, status } = useAuth();
 
-  // Legacy bridge-backed pages keep their exact paths behind the auth gate.
+  // Local operator login (RELUX_MASTER_PLAN "Local operator login v1"). The
+  // standalone Relux surfaces now require a session too: the kernel protects
+  // /v1/relux/* behind the relux_session cookie. The static SPA still loads;
+  // it renders the setup/login screen here (never a blank page) until a
+  // session exists. When auth is disabled (dev/test) the kernel reports
+  // authenticated:true, so this gate is transparent.
+  if (loading) {
+    return <div className="center-spinner">Loading Relux…</div>;
+  }
+  if (!status?.authenticated) {
+    return <Login />;
+  }
+
+  // Legacy bridge-backed pages keep their exact paths behind the same gate.
   if (isLegacyPath(loc.pathname)) {
     return <LegacyDashboard />;
   }
 
-  // The Relux-local surfaces are the default product, OUTSIDE the bridge auth
-  // gate. A catch-all renders an in-shell "not found" so no path is ever blank.
+  // The Relux-local surfaces are the default product. A catch-all renders an
+  // in-shell "not found" so no path is ever blank.
   return (
     <ReluxShell>
       <Routes>

@@ -1,0 +1,551 @@
+//! Local operator login — first-run admin setup, Argon2id password storage, and
+//! HTTP-only session cookies for the standalone `relux-kernel serve` dashboard.
+//!
+//! Until now the standalone Relux API bound loopback and was unauthenticated by
+//! design (`docs/RELUX_MASTER_PLAN.md` §22). That is fine for a single trusted
+//! operator on their own machine, but the dashboard token-paste flow was awkward
+//! and any other local process/user could probe the open port. This module adds
+//! a simple username/password login on top, mirroring the proven legacy bridge
+//! design (`crates/relix-web-bridge/src/dashboard_auth.rs`) but self-contained in
+//! the kernel:
+//!
+//! - First run: an admin account is created (username + Argon2id PHC hash),
+//!   persisted next to the local DB as `dashboard-admin.json`.
+//! - Login verifies the password and mints an in-memory session.
+//! - A successful setup/login sets an **HTTP-only** `relux_session` cookie; the
+//!   serve auth middleware admits any request carrying a valid session cookie, so
+//!   every dashboard `fetch` authenticates automatically — no token paste.
+//!
+//! Sessions live in memory (a single-process kernel); they reset on restart,
+//! which simply re-prompts the operator to log in. The admin credential is
+//! durable on disk. There is no network/unauthenticated reset path — recovery is
+//! the local `relux-kernel reset-admin` CLI ([`reset_admin_credential`]).
+//!
+//! **Honest scope:** this is a local-first single-admin console guard, not an
+//! internet auth system. The cookie omits `Secure` because the operator console
+//! runs over loopback `http://`; a reverse proxy terminating TLS can re-add it.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+
+use argon2::password_hash::rand_core::OsRng;
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::Argon2;
+use axum::http::header;
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
+
+/// Name of the HTTP-only session cookie the dashboard rides on.
+pub const SESSION_COOKIE: &str = "relux_session";
+
+/// Session lifetime in seconds. A logged-in operator stays authenticated for
+/// this long without re-entering their password (12 hours).
+pub const SESSION_TTL_SECS: i64 = 12 * 60 * 60;
+
+/// Minimum password length accepted at setup. Deliberately modest — this guards
+/// a loopback operator console, not an internet service.
+pub const MIN_PASSWORD_LEN: usize = 8;
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+// ── Admin credential (durable) ──────────────────────────────────
+
+/// The single dashboard admin account, persisted as JSON next to the local DB.
+/// `hash` is an Argon2id PHC string — never the plaintext password.
+#[derive(Clone, Serialize, Deserialize)]
+struct AdminRecord {
+    username: String,
+    hash: String,
+    #[serde(default)]
+    created_at: i64,
+}
+
+/// File-backed admin credential store with an in-memory cache.
+#[derive(Clone)]
+struct AdminStore {
+    path: Arc<PathBuf>,
+    /// Cached record; `None` until first-run setup completes.
+    cached: Arc<RwLock<Option<AdminRecord>>>,
+}
+
+impl AdminStore {
+    fn load(path: &Path) -> Self {
+        let cached = std::fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<AdminRecord>(&b).ok());
+        Self {
+            path: Arc::new(path.to_path_buf()),
+            cached: Arc::new(RwLock::new(cached)),
+        }
+    }
+
+    fn exists(&self) -> bool {
+        self.cached.read().map(|c| c.is_some()).unwrap_or(false)
+    }
+
+    fn username(&self) -> Option<String> {
+        self.cached
+            .read()
+            .ok()
+            .and_then(|c| c.as_ref().map(|r| r.username.clone()))
+    }
+
+    /// Create the admin account (first run only). Hashes `password` with
+    /// Argon2id and persists the record at restrictive permissions.
+    fn create(&self, username: &str, password: &str) -> Result<(), String> {
+        let rec = write_admin_record(&self.path, username, password)?;
+        if let Ok(mut c) = self.cached.write() {
+            *c = Some(rec);
+        }
+        Ok(())
+    }
+
+    /// Verify a login. Returns the canonical username on success. A constant-ish
+    /// Argon2 verify runs only after the username matches; a wrong password and
+    /// an unknown username both return `None`.
+    fn verify(&self, username: &str, password: &str) -> Option<String> {
+        let rec = self.cached.read().ok()?.clone()?;
+        if rec.username != username {
+            return None;
+        }
+        let parsed = PasswordHash::new(&rec.hash).ok()?;
+        Argon2::default()
+            .verify_password(password.as_bytes(), &parsed)
+            .ok()
+            .map(|_| rec.username)
+    }
+}
+
+/// Where the dashboard admin credential lives, given the local DB path:
+/// `dashboard-admin.json` in the SAME directory. Used by both the running serve
+/// process and the `reset-admin` CLI so they always agree on the file.
+pub fn admin_path_for_db(db_path: &Path) -> PathBuf {
+    db_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.join("dashboard-admin.json"))
+        .unwrap_or_else(|| PathBuf::from("dashboard-admin.json"))
+}
+
+/// Hash `password` (Argon2id) + atomically write the admin record at `path`,
+/// restricting it to the current user. Shared by first-run setup and the reset
+/// path so the on-disk format is identical.
+fn write_admin_record(path: &Path, username: &str, password: &str) -> Result<AdminRecord, String> {
+    let salt = SaltString::generate(&mut OsRng);
+    let hash = Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|e| format!("hash: {e}"))?
+        .to_string();
+    let rec = AdminRecord {
+        username: username.to_string(),
+        hash,
+        created_at: now_secs(),
+    };
+    let body = serde_json::to_vec_pretty(&rec).map_err(|e| format!("encode: {e}"))?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+        }
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, &body).map_err(|e| format!("write: {e}"))?;
+    let _ = restrict_to_current_user(&tmp);
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename: {e}"))?;
+    let _ = restrict_to_current_user(path);
+    Ok(rec)
+}
+
+/// The current admin username at `admin_path`, or `None` if no admin exists yet.
+/// Never returns the password hash — callers that reset reuse the existing
+/// username without ever seeing the secret.
+pub fn read_admin_username(admin_path: &Path) -> Option<String> {
+    let bytes = std::fs::read(admin_path).ok()?;
+    serde_json::from_slice::<AdminRecord>(&bytes)
+        .ok()
+        .map(|r| r.username)
+}
+
+/// **Local operator recovery only.** Overwrite the dashboard admin credential at
+/// `admin_path` with a new username + a freshly Argon2id-hashed password, using
+/// the SAME storage format as first-run setup.
+///
+/// There is deliberately NO network path to this — it is a CLI / filesystem
+/// operation an operator runs locally (it requires write access to the admin
+/// file). It does NOT print or read the existing password/hash, does NOT weaken
+/// session auth, and does NOT touch any other state. Existing in-memory sessions
+/// are not invalidated here; restart `relux-kernel serve` to drop them (a
+/// restart also reloads this new credential).
+pub fn reset_admin_credential(
+    admin_path: &Path,
+    username: &str,
+    password: &str,
+) -> Result<(), String> {
+    let username = username.trim();
+    if username.is_empty() {
+        return Err("username required".to_string());
+    }
+    if password.len() < MIN_PASSWORD_LEN {
+        return Err(format!("password too short (min {MIN_PASSWORD_LEN} chars)"));
+    }
+    write_admin_record(admin_path, username, password).map(|_| ())
+}
+
+// ── Sessions (in-memory) ────────────────────────────────────────
+
+struct Session {
+    username: String,
+    expires_at: i64,
+}
+
+/// In-memory session table, keyed by a random opaque session id.
+#[derive(Clone)]
+struct SessionStore {
+    inner: Arc<RwLock<HashMap<String, Session>>>,
+}
+
+impl SessionStore {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    fn create(&self, username: &str) -> String {
+        let mut buf = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut buf);
+        let sid = hex::encode(buf);
+        if let Ok(mut m) = self.inner.write() {
+            m.insert(
+                sid.clone(),
+                Session {
+                    username: username.to_string(),
+                    expires_at: now_secs() + SESSION_TTL_SECS,
+                },
+            );
+        }
+        sid
+    }
+
+    /// Return the session's username if it exists and has not expired. Prunes
+    /// the entry when expired.
+    fn validate(&self, sid: &str) -> Option<String> {
+        let now = now_secs();
+        if let Ok(m) = self.inner.read() {
+            match m.get(sid) {
+                Some(s) if s.expires_at > now => return Some(s.username.clone()),
+                Some(_) => {} // expired → fall through to prune
+                None => return None,
+            }
+        }
+        if let Ok(mut m) = self.inner.write() {
+            m.remove(sid);
+        }
+        None
+    }
+
+    fn remove(&self, sid: &str) {
+        if let Ok(mut m) = self.inner.write() {
+            m.remove(sid);
+        }
+    }
+}
+
+// ── Combined handle stored on AppState ──────────────────────────
+
+/// Dashboard auth state: the durable admin credential + the in-memory session
+/// table. Cloned cheaply (Arc inside).
+#[derive(Clone)]
+pub struct DashboardAuth {
+    admin: AdminStore,
+    sessions: SessionStore,
+}
+
+impl DashboardAuth {
+    /// Build from the local DB path: the admin record lives in the same
+    /// directory (`dashboard-admin.json`) so it sits with the operator's other
+    /// Relux state.
+    pub fn from_db_path(db_path: &Path) -> Self {
+        let admin_path = admin_path_for_db(db_path);
+        Self::from_admin_path(&admin_path)
+    }
+
+    /// Build directly from an explicit admin-file path (used by tests and any
+    /// caller that resolves the file itself).
+    pub fn from_admin_path(admin_path: &Path) -> Self {
+        Self {
+            admin: AdminStore::load(admin_path),
+            sessions: SessionStore::new(),
+        }
+    }
+
+    /// Whether the first-run admin account has been configured.
+    pub fn admin_exists(&self) -> bool {
+        self.admin.exists()
+    }
+
+    /// The configured admin username, if any.
+    pub fn admin_username(&self) -> Option<String> {
+        self.admin.username()
+    }
+
+    /// Create the first-run admin account. Errors if one already exists, the
+    /// username is empty, or the password is too short.
+    pub fn create_admin(&self, username: &str, password: &str) -> Result<(), String> {
+        if self.admin.exists() {
+            return Err("admin already configured".to_string());
+        }
+        let username = username.trim();
+        if username.is_empty() {
+            return Err("username required".to_string());
+        }
+        if password.len() < MIN_PASSWORD_LEN {
+            return Err(format!("password too short (min {MIN_PASSWORD_LEN} chars)"));
+        }
+        self.admin.create(username, password)
+    }
+
+    /// Verify a login. Returns the canonical username on success.
+    pub fn verify_login(&self, username: &str, password: &str) -> Option<String> {
+        self.admin.verify(username.trim(), password)
+    }
+
+    /// Mint a new session for `username` and return its opaque id.
+    pub fn create_session(&self, username: &str) -> String {
+        self.sessions.create(username)
+    }
+
+    /// Validate a raw session-cookie value. Used by the serve auth middleware to
+    /// admit a logged-in dashboard request. Returns the username.
+    pub fn validate_session(&self, sid: &str) -> Option<String> {
+        self.sessions.validate(sid)
+    }
+
+    /// Drop a session (logout).
+    pub fn remove_session(&self, sid: &str) {
+        self.sessions.remove(sid)
+    }
+}
+
+// ── Cookie helpers ──────────────────────────────────────────────
+
+/// Pull the `relux_session` value out of a request's `Cookie` header.
+pub fn session_cookie_from_headers(headers: &header::HeaderMap) -> Option<String> {
+    let raw = headers.get(header::COOKIE)?.to_str().ok()?;
+    for pair in raw.split(';') {
+        let pair = pair.trim();
+        if let Some(v) = pair.strip_prefix(&format!("{SESSION_COOKIE}=")) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Build the `Set-Cookie` value that establishes a logged-in session.
+///
+/// `HttpOnly` so page JS cannot read it; `SameSite=Lax` so a cross-site form
+/// POST cannot ride it while a normal top-level navigation still carries it;
+/// `Path=/` for the whole app; `Max-Age` matching the session TTL. No `Secure`
+/// because the operator console runs over loopback `http://` — a reverse proxy
+/// terminating TLS can re-add it.
+pub fn set_session_cookie(sid: &str) -> String {
+    format!("{SESSION_COOKIE}={sid}; HttpOnly; SameSite=Lax; Path=/; Max-Age={SESSION_TTL_SECS}")
+}
+
+/// Build the `Set-Cookie` value that clears the session on logout.
+pub fn clear_session_cookie() -> String {
+    format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0")
+}
+
+// ── Best-effort OS file hardening ───────────────────────────────
+
+/// Restrict `path` to the current user. On POSIX this is `chmod 0600`; on
+/// Windows it strips inheritance and grants only the current user via `icacls`.
+/// Best-effort: a failure is returned (callers ignore it — a writable secret
+/// file is still better than none) and never blocks setup.
+fn restrict_to_current_user(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(path, perms)
+            .map_err(|e| format!("chmod {}: {e}", path.display()))
+    }
+    #[cfg(windows)]
+    {
+        let user = std::env::var("USERNAME").unwrap_or_default();
+        if user.is_empty() {
+            return Err("USERNAME not set; cannot scope ACL".to_string());
+        }
+        let status = std::process::Command::new("icacls")
+            .arg(path)
+            .arg("/inheritance:r")
+            .arg("/grant:r")
+            .arg(format!("{user}:(F)"))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_err(|e| format!("spawn icacls: {e}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("icacls exited with {status}"))
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn auth() -> (DashboardAuth, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let admin = tmp.path().join("dashboard-admin.json");
+        (DashboardAuth::from_admin_path(&admin), tmp)
+    }
+
+    #[test]
+    fn admin_setup_then_verify_roundtrips() {
+        let (auth, _tmp) = auth();
+        assert!(!auth.admin_exists());
+        auth.create_admin("ops", "hunter2pass").unwrap();
+        assert!(auth.admin_exists());
+        assert_eq!(auth.admin_username().as_deref(), Some("ops"));
+        assert_eq!(auth.verify_login("ops", "hunter2pass").as_deref(), Some("ops"));
+        assert!(auth.verify_login("ops", "wrong").is_none());
+        assert!(auth.verify_login("other", "hunter2pass").is_none());
+    }
+
+    #[test]
+    fn setup_is_first_run_only_and_validates() {
+        let (auth, _tmp) = auth();
+        // Empty username + short password are refused.
+        assert!(auth.create_admin("  ", "longenough").is_err());
+        assert!(auth.create_admin("ops", "short").is_err());
+        // A valid setup succeeds once...
+        auth.create_admin("ops", "validpassword").unwrap();
+        // ...and a second setup is refused (use login / reset instead).
+        assert!(auth.create_admin("ops", "anotherpassword").is_err());
+    }
+
+    #[test]
+    fn admin_record_persists_across_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let admin = tmp.path().join("dashboard-admin.json");
+        let a1 = DashboardAuth::from_admin_path(&admin);
+        a1.create_admin("ops", "hunter2pass").unwrap();
+        // A fresh handle on the same path reads the persisted admin.
+        let a2 = DashboardAuth::from_admin_path(&admin);
+        assert!(a2.admin_exists());
+        assert_eq!(a2.verify_login("ops", "hunter2pass").as_deref(), Some("ops"));
+    }
+
+    #[test]
+    fn session_create_validate_remove() {
+        let (auth, _tmp) = auth();
+        let sid = auth.create_session("ops");
+        assert_eq!(auth.validate_session(&sid).as_deref(), Some("ops"));
+        auth.remove_session(&sid);
+        assert!(auth.validate_session(&sid).is_none());
+        // Unknown session id is rejected.
+        assert!(auth.validate_session("deadbeef").is_none());
+    }
+
+    #[test]
+    fn stored_hash_is_argon2id_phc_not_plaintext() {
+        let (auth, tmp) = auth();
+        auth.create_admin("ops", "hunter2pass").unwrap();
+        let raw = std::fs::read_to_string(tmp.path().join("dashboard-admin.json")).unwrap();
+        assert!(raw.contains("$argon2id$"), "got: {raw}");
+        assert!(
+            !raw.contains("hunter2pass"),
+            "password must never be stored in plaintext"
+        );
+    }
+
+    #[test]
+    fn admin_path_is_next_to_the_db() {
+        let p = admin_path_for_db(Path::new("/x/y/local.db"));
+        assert!(p.ends_with("dashboard-admin.json"));
+        assert_eq!(p.parent().unwrap(), Path::new("/x/y"));
+        // A bare filename (no parent) still resolves to a sane relative path.
+        let p2 = admin_path_for_db(Path::new("local.db"));
+        assert!(p2.ends_with("dashboard-admin.json"));
+    }
+
+    #[test]
+    fn reset_changes_password_old_fails_new_works() {
+        let tmp = tempfile::tempdir().unwrap();
+        let admin = tmp.path().join("dashboard-admin.json");
+        let a1 = DashboardAuth::from_admin_path(&admin);
+        a1.create_admin("ops", "oldpassword").unwrap();
+        assert_eq!(a1.verify_login("ops", "oldpassword").as_deref(), Some("ops"));
+        // Reset keeps the username (read from disk) but sets a new password.
+        let user = read_admin_username(&admin).unwrap();
+        assert_eq!(user, "ops");
+        reset_admin_credential(&admin, &user, "newpassword1").unwrap();
+        // A FRESH handle (simulating a serve restart) honors ONLY the new
+        // password — the old one is gone.
+        let a2 = DashboardAuth::from_admin_path(&admin);
+        assert_eq!(a2.verify_login("ops", "newpassword1").as_deref(), Some("ops"));
+        assert!(
+            a2.verify_login("ops", "oldpassword").is_none(),
+            "old password must stop working after reset"
+        );
+    }
+
+    #[test]
+    fn reset_creates_when_absent_and_validates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let admin = tmp.path().join("dashboard-admin.json");
+        // No admin yet → reset CREATES it with the given username.
+        assert!(read_admin_username(&admin).is_none());
+        reset_admin_credential(&admin, "newadmin", "secretpass1").unwrap();
+        assert_eq!(read_admin_username(&admin).as_deref(), Some("newadmin"));
+        // Empty username / short password are refused, never stored as plaintext.
+        assert!(reset_admin_credential(&admin, "  ", "longenough").is_err());
+        assert!(reset_admin_credential(&admin, "ops", "short").is_err());
+        let raw = std::fs::read_to_string(&admin).unwrap();
+        assert!(raw.contains("$argon2id$"), "got: {raw}");
+        assert!(!raw.contains("secretpass1"));
+    }
+
+    #[test]
+    fn cookie_value_parses_from_header() {
+        let mut headers = header::HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            header::HeaderValue::from_static("foo=bar; relux_session=abc123; baz=1"),
+        );
+        assert_eq!(session_cookie_from_headers(&headers).as_deref(), Some("abc123"));
+        // No cookie header → None (an unauthenticated caller is rejected).
+        let empty = header::HeaderMap::new();
+        assert!(session_cookie_from_headers(&empty).is_none());
+    }
+
+    #[test]
+    fn set_cookie_is_httponly_lax_and_clear_expires_it() {
+        let set = set_session_cookie("abc123");
+        assert!(set.contains("relux_session=abc123"));
+        assert!(set.contains("HttpOnly"));
+        assert!(set.contains("SameSite=Lax"));
+        assert!(set.contains("Path=/"));
+        // No Secure attribute (loopback http) — documented honestly.
+        assert!(!set.contains("Secure"));
+        let clear = clear_session_cookie();
+        assert!(clear.contains("Max-Age=0"));
+    }
+}

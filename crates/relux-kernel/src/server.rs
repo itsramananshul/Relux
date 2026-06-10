@@ -64,6 +64,14 @@ struct AppState {
     /// The dashboard-written AI provider secrets file (gitignored). Resolved live
     /// per request so a key set from the dashboard takes effect without a restart.
     ai_config_path: PathBuf,
+    /// Local operator login: the durable Argon2id admin credential + in-memory
+    /// session table. The auth middleware admits a request carrying a valid
+    /// `relux_session` cookie; `/v1/auth/*` mint/clear it. See [`crate`] auth.
+    dashboard_auth: relux_kernel::DashboardAuth,
+    /// Dev/test-only escape hatch: when `RELUX_AUTH_DISABLED` is truthy the auth
+    /// middleware passes every request through (a loud warning is printed at
+    /// startup). OFF by default — production/normal use always enforces login.
+    auth_disabled: bool,
     lock: Arc<Mutex<()>>,
     /// In-process registry of non-blocking orchestration jobs. Lives only for the
     /// life of the server process: a restart honestly loses in-flight job records
@@ -99,6 +107,8 @@ async fn serve() -> Result<(), KernelError> {
         uploads_root: crate::uploads_root(),
         dashboard_dir: crate::dashboard::resolve_dist_dir(),
         ai_config_path: crate::ai_config_path(),
+        dashboard_auth: relux_kernel::DashboardAuth::from_admin_path(&crate::admin_path()),
+        auth_disabled: auth_disabled_from_env(),
         lock: Arc::new(Mutex::new(())),
         jobs: JobRegistry::default(),
     };
@@ -125,6 +135,21 @@ async fn serve() -> Result<(), KernelError> {
     println!("   Relux dashboard: http://{bound}/dashboard");
     println!("   Relux API:       http://{bound}/v1/relux/state");
     println!();
+    // Honest login status so the operator knows what the first dashboard load
+    // will show: a first-run setup form, or the sign-in form.
+    if state.auth_disabled {
+        println!("   !! AUTH DISABLED (RELUX_AUTH_DISABLED set): the dashboard/API are OPEN.");
+        println!("      This is a dev/test escape hatch ONLY. Unset it for normal use.");
+    } else if state.dashboard_auth.admin_exists() {
+        let who = state
+            .dashboard_auth
+            .admin_username()
+            .unwrap_or_else(|| "admin".to_string());
+        println!("   login:  sign in as '{who}' on the dashboard (session cookie, no token paste).");
+    } else {
+        println!("   login:  first run — open the dashboard to set your admin username + password.");
+    }
+    println!();
     if dashboard_missing {
         println!(
             "   note: the dashboard bundle is not built; /dashboard will return a build notice."
@@ -135,6 +160,12 @@ async fn serve() -> Result<(), KernelError> {
     println!("   db      {}", crate::db_path().display());
     println!("   plugins {}", crate::plugins_root().display());
     println!("   GET    /dashboard                          (standalone Relux shell)");
+    println!("   GET    /v1/auth/status                     (public: needs_setup / authenticated)");
+    println!("   POST   /v1/auth/setup                      {{ \"username\":\"...\", \"password\":\"...\" }} (first run only)");
+    println!("   POST   /v1/auth/login                      {{ \"username\":\"...\", \"password\":\"...\" }}");
+    println!("   POST   /v1/auth/logout");
+    println!("   GET    /v1/auth/me                         (current session user)");
+    println!("   GET    /v1/relux/health                    (public liveness; no session required)");
     println!("   GET    /v1/relux/state");
     println!("   GET    /v1/relux/ai/status");
     println!("   PUT    /v1/relux/ai/config                 {{ \"provider\":\"openrouter\", \"api_key\":\"...\", \"model\"?, \"disabled\"? }}");
@@ -275,14 +306,57 @@ fn bind_addr() -> Result<SocketAddr, KernelError> {
         .map_err(|e| KernelError::Storage(format!("invalid RELUX_HTTP_ADDR {raw:?}: {e}")))
 }
 
-/// Assemble the `/v1/relux` router with the shared state.
+/// Assemble the full router with the shared state.
+///
+/// Two layers of routes:
+///
+/// - **Public** (no session required): the static dashboard shell (so the SPA can
+///   always load and render the setup/login screen — never a blank page), the
+///   `/v1/auth/*` login endpoints, and the `/v1/relux/health` liveness probe.
+/// - **Protected** (`require_session`): every other `/v1/relux/*` control-plane
+///   route. A request without a valid `relux_session` cookie gets an honest 401
+///   (`needs_setup` is included so the dashboard can route to the right screen).
+///
+/// The dev/test escape hatch `RELUX_AUTH_DISABLED` short-circuits the middleware
+/// (a loud startup warning is printed); it is OFF by default.
 fn router(state: AppState) -> Router {
+    let protected = protected_router().route_layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        require_session,
+    ));
+    public_router()
+        .merge(protected)
+        // Bound the request body so a large zip upload is refused cleanly.
+        .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
+        .with_state(state)
+}
+
+/// Routes that never require a session: the static dashboard, the auth
+/// endpoints, and the health probe.
+fn public_router() -> Router<AppState> {
     Router::new()
         // Standalone Relux dashboard shell, served by the kernel itself.
         .route("/", get(root_redirect))
         .route("/dashboard", get(dashboard_index))
         .route("/dashboard/", get(dashboard_index))
         .route("/dashboard/*path", get(dashboard_path))
+        // Local operator login (mints/clears the relux_session cookie). These are
+        // intentionally public so an unauthenticated browser can reach the
+        // setup/login forms; `me`/`logout` self-gate on the cookie.
+        .route("/v1/auth/status", get(auth_status))
+        .route("/v1/auth/setup", post(auth_setup))
+        .route("/v1/auth/login", post(auth_login))
+        .route("/v1/auth/logout", post(auth_logout))
+        .route("/v1/auth/me", get(auth_me))
+        // Liveness: no session required (a probe must work before login).
+        .route("/v1/relux/health", get(get_health))
+}
+
+/// Every control-plane route that requires a valid session. The auth middleware
+/// is attached by [`router`] via `route_layer`, so an unmatched path 404s
+/// without running the guard.
+fn protected_router() -> Router<AppState> {
+    Router::new()
         // The /v1/relux control-plane API the dashboard calls on the same origin.
         .route("/v1/relux/state", get(get_state))
         .route("/v1/relux/ai/status", get(get_ai_status))
@@ -341,7 +415,6 @@ fn router(state: AppState) -> Router {
             post(apply_proposed_change_set),
         )
         .route("/v1/relux/audit", get(list_audit_events))
-        .route("/v1/relux/health", get(get_health))
         .route("/v1/relux/tasks/:id/start", post(start_task))
         .route("/v1/relux/tasks/:id/execute-assigned", post(execute_assigned_task))
         .route("/v1/relux/tasks/:id/assign", post(assign_task_to_agent))
@@ -377,9 +450,182 @@ fn router(state: AppState) -> Router {
         .route("/v1/relux/approvals/:id/decide", post(decide_approval))
         .route("/v1/relux/permissions", get(list_permissions))
         .route("/v1/relux/agents/:id/permissions", post(grant_agent_permission))
-        // Bound the request body so a large zip upload is refused cleanly.
-        .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
-        .with_state(state)
+}
+
+/// Whether the dev/test auth bypass is requested via `RELUX_AUTH_DISABLED`.
+/// Truthy values: `1`, `true`, `yes`, `on` (case-insensitive). Anything else —
+/// including unset — keeps auth ENFORCED.
+fn auth_disabled_from_env() -> bool {
+    matches!(
+        std::env::var("RELUX_AUTH_DISABLED")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Auth guard for the protected `/v1/relux/*` routes. Admits a request that
+/// carries a valid `relux_session` cookie; otherwise returns an honest 401 with
+/// `needs_setup` so the dashboard can route to the setup vs login screen. The
+/// dev/test bypass (`auth_disabled`) passes everything through.
+async fn require_session(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if state.auth_disabled {
+        return next.run(req).await;
+    }
+    let authed = relux_kernel::session_cookie_from_headers(req.headers())
+        .and_then(|sid| state.dashboard_auth.validate_session(&sid))
+        .is_some();
+    if authed {
+        return next.run(req).await;
+    }
+    let needs_setup = !state.dashboard_auth.admin_exists();
+    let error = if needs_setup {
+        "setup required — create the local admin account first"
+    } else {
+        "authentication required — sign in to the Relux dashboard"
+    };
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({ "error": error, "needs_setup": needs_setup })),
+    )
+        .into_response()
+}
+
+// --- Local operator login handlers -----------------------------------------
+
+/// A username/password pair for setup/login. The password is never logged or
+/// echoed back.
+#[derive(Debug, Deserialize)]
+struct Credentials {
+    username: String,
+    password: String,
+}
+
+/// Read the `relux_session` cookie from a header map and resolve it to a logged-
+/// in username (or `None`).
+fn session_user(state: &AppState, headers: &header::HeaderMap) -> Option<String> {
+    relux_kernel::session_cookie_from_headers(headers)
+        .and_then(|sid| state.dashboard_auth.validate_session(&sid))
+}
+
+/// Attach a `Set-Cookie` header to a JSON 200 response.
+fn ok_with_cookie<T: Serialize>(body: T, cookie: String) -> Response {
+    let mut resp = (StatusCode::OK, Json(body)).into_response();
+    if let Ok(hv) = header::HeaderValue::from_str(&cookie) {
+        resp.headers_mut().append(header::SET_COOKIE, hv);
+    }
+    resp
+}
+
+fn auth_err(status: StatusCode, error: &str) -> Response {
+    (status, Json(serde_json::json!({ "error": error }))).into_response()
+}
+
+/// `GET /v1/auth/status` — public. Tells the dashboard whether to show the
+/// first-run setup form, the login form, or the app. When auth is disabled
+/// (dev/test) it reports `authenticated: true` so the SPA renders the app.
+async fn auth_status(State(state): State<AppState>, headers: header::HeaderMap) -> Response {
+    if state.auth_disabled {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "needs_setup": false,
+                "authenticated": true,
+                "username": "dev",
+                "auth_disabled": true,
+            })),
+        )
+            .into_response();
+    }
+    let username = session_user(&state, &headers);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "needs_setup": !state.dashboard_auth.admin_exists(),
+            "authenticated": username.is_some(),
+            "username": username,
+        })),
+    )
+        .into_response()
+}
+
+/// `POST /v1/auth/setup` — first-run only. Creates the admin account and logs
+/// in. Refuses (409) once an admin already exists (use login instead).
+async fn auth_setup(State(state): State<AppState>, Json(creds): Json<Credentials>) -> Response {
+    if state.dashboard_auth.admin_exists() {
+        return auth_err(
+            StatusCode::CONFLICT,
+            "admin already configured — log in instead",
+        );
+    }
+    match state
+        .dashboard_auth
+        .create_admin(creds.username.trim(), &creds.password)
+    {
+        Ok(()) => {
+            let username = creds.username.trim().to_string();
+            let sid = state.dashboard_auth.create_session(&username);
+            ok_with_cookie(
+                serde_json::json!({ "username": username }),
+                relux_kernel::set_session_cookie(&sid),
+            )
+        }
+        // create_admin validates username/password and returns a clear message.
+        Err(e) => auth_err(StatusCode::BAD_REQUEST, &e),
+    }
+}
+
+/// `POST /v1/auth/login` — verify the admin password and mint a session.
+async fn auth_login(State(state): State<AppState>, Json(creds): Json<Credentials>) -> Response {
+    if !state.dashboard_auth.admin_exists() {
+        return auth_err(
+            StatusCode::CONFLICT,
+            "no admin configured — run setup first",
+        );
+    }
+    match state
+        .dashboard_auth
+        .verify_login(creds.username.trim(), &creds.password)
+    {
+        Some(username) => {
+            let sid = state.dashboard_auth.create_session(&username);
+            ok_with_cookie(
+                serde_json::json!({ "username": username }),
+                relux_kernel::set_session_cookie(&sid),
+            )
+        }
+        None => auth_err(StatusCode::UNAUTHORIZED, "invalid username or password"),
+    }
+}
+
+/// `POST /v1/auth/logout` — drop the session and clear the cookie.
+async fn auth_logout(State(state): State<AppState>, headers: header::HeaderMap) -> Response {
+    if let Some(sid) = relux_kernel::session_cookie_from_headers(&headers) {
+        state.dashboard_auth.remove_session(&sid);
+    }
+    ok_with_cookie(
+        serde_json::json!({ "ok": true }),
+        relux_kernel::clear_session_cookie(),
+    )
+}
+
+/// `GET /v1/auth/me` — the logged-in username, or 401.
+async fn auth_me(State(state): State<AppState>, headers: header::HeaderMap) -> Response {
+    if state.auth_disabled {
+        return (StatusCode::OK, Json(serde_json::json!({ "username": "dev" }))).into_response();
+    }
+    match session_user(&state, &headers) {
+        Some(username) => {
+            (StatusCode::OK, Json(serde_json::json!({ "username": username }))).into_response()
+        }
+        None => auth_err(StatusCode::UNAUTHORIZED, "not logged in"),
+    }
 }
 
 // --- Static dashboard serving ----------------------------------------------
@@ -4133,6 +4379,10 @@ mod tests {
             uploads_root: dir.path().join("uploads"),
             dashboard_dir: None,
             ai_config_path: dir.path().join("ai.json"),
+            dashboard_auth: relux_kernel::DashboardAuth::from_admin_path(
+                &dir.path().join("dashboard-admin.json"),
+            ),
+            auth_disabled: false,
             lock: Arc::new(Mutex::new(())),
             jobs: JobRegistry::default(),
         };
@@ -4293,6 +4543,10 @@ mod tests {
             uploads_root: dir.path().join("uploads"),
             dashboard_dir: None,
             ai_config_path: dir.path().join("ai.json"),
+            dashboard_auth: relux_kernel::DashboardAuth::from_admin_path(
+                &dir.path().join("dashboard-admin.json"),
+            ),
+            auth_disabled: false,
             lock: Arc::new(Mutex::new(())),
             jobs: JobRegistry::default(),
         }
@@ -4541,5 +4795,184 @@ mod tests {
             wire.get("artifacts").is_none(),
             "the Prime chat turn wire must not carry artifacts"
         );
+    }
+
+    // --- Local operator login (HTTP) ---------------------------------------
+
+    use tower::ServiceExt; // for `oneshot`
+
+    /// Build a real AppState over a throwaway temp store, plus the temp dir to
+    /// keep it alive for the test's lifetime. `auth_disabled` toggles the bypass.
+    fn auth_state(auth_disabled: bool) -> (AppState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("local.db");
+        // Bootstrap the store so protected handlers have a real kernel to read.
+        let mut store = SqliteStore::open(&db_path).expect("open store");
+        let mut kernel = store.load().expect("load");
+        crate::ensure_bootstrapped(&mut kernel).expect("bootstrap");
+        store.save(&kernel).expect("save");
+        let state = AppState {
+            db_path,
+            plugins_root: dir.path().join("plugins"),
+            uploads_root: dir.path().join("uploads"),
+            dashboard_dir: None,
+            ai_config_path: dir.path().join("ai.json"),
+            dashboard_auth: relux_kernel::DashboardAuth::from_admin_path(
+                &dir.path().join("dashboard-admin.json"),
+            ),
+            auth_disabled,
+            lock: Arc::new(Mutex::new(())),
+            jobs: JobRegistry::default(),
+        };
+        (state, dir)
+    }
+
+    /// Issue one request against a freshly-built router and return
+    /// (status, set-cookie value if any, body string).
+    async fn call(
+        state: &AppState,
+        method: &str,
+        path: &str,
+        cookie: Option<&str>,
+        json_body: Option<&str>,
+    ) -> (StatusCode, Option<String>, String) {
+        let mut builder = axum::http::Request::builder().method(method).uri(path);
+        if let Some(c) = cookie {
+            builder = builder.header(header::COOKIE, c);
+        }
+        let body = match json_body {
+            Some(b) => {
+                builder = builder.header(header::CONTENT_TYPE, "application/json");
+                axum::body::Body::from(b.to_string())
+            }
+            None => axum::body::Body::empty(),
+        };
+        let req = builder.body(body).unwrap();
+        let resp = router(state.clone()).oneshot(req).await.unwrap();
+        let status = resp.status();
+        let set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, set_cookie, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// Extract the `relux_session=...` pair from a Set-Cookie header so a later
+    /// request can present it (mirrors a browser cookie jar).
+    fn session_pair(set_cookie: &str) -> String {
+        set_cookie
+            .split(';')
+            .next()
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn health_is_public_but_state_requires_a_session() {
+        let (state, _dir) = auth_state(false);
+        // Liveness probe works with no session (a probe must run before login).
+        let (health, _, _) = call(&state, "GET", "/v1/relux/health", None, None).await;
+        assert_eq!(health, StatusCode::OK);
+        // A protected control-plane route is 401 without a session, and reports
+        // needs_setup so the dashboard routes to the setup screen.
+        let (state_status, _, body) =
+            call(&state, "GET", "/v1/relux/state", None, None).await;
+        assert_eq!(state_status, StatusCode::UNAUTHORIZED);
+        assert!(body.contains("\"needs_setup\":true"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn setup_then_session_unlocks_then_logout_relocks() {
+        let (state, _dir) = auth_state(false);
+        // status before setup → needs_setup.
+        let (_, _, status_body) = call(&state, "GET", "/v1/auth/status", None, None).await;
+        assert!(status_body.contains("\"needs_setup\":true"), "got: {status_body}");
+
+        // First-run setup mints a session cookie.
+        let (s, set_cookie, _) = call(
+            &state,
+            "POST",
+            "/v1/auth/setup",
+            None,
+            Some(r#"{"username":"ops","password":"hunter2pass"}"#),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let cookie = session_pair(&set_cookie.expect("setup sets a cookie"));
+        assert!(cookie.starts_with("relux_session="), "got: {cookie}");
+
+        // The same protected route now succeeds WITH the session cookie.
+        let (ok, _, _) = call(&state, "GET", "/v1/relux/state", Some(&cookie), None).await;
+        assert_eq!(ok, StatusCode::OK);
+
+        // A second setup is refused — setup is first-run only.
+        let (dup, _, _) = call(
+            &state,
+            "POST",
+            "/v1/auth/setup",
+            None,
+            Some(r#"{"username":"ops","password":"hunter2pass"}"#),
+        )
+        .await;
+        assert_eq!(dup, StatusCode::CONFLICT);
+
+        // Logout drops the session; the protected route 401s again.
+        let (lo, _, _) = call(&state, "POST", "/v1/auth/logout", Some(&cookie), None).await;
+        assert_eq!(lo, StatusCode::OK);
+        let (relocked, _, _) =
+            call(&state, "GET", "/v1/relux/state", Some(&cookie), None).await;
+        assert_eq!(relocked, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn login_rejects_wrong_password_and_accepts_the_right_one() {
+        let (state, _dir) = auth_state(false);
+        // Configure the admin via setup first.
+        let (_, _, _) = call(
+            &state,
+            "POST",
+            "/v1/auth/setup",
+            None,
+            Some(r#"{"username":"ops","password":"hunter2pass"}"#),
+        )
+        .await;
+        // Wrong password → 401, no cookie.
+        let (bad, bad_cookie, _) = call(
+            &state,
+            "POST",
+            "/v1/auth/login",
+            None,
+            Some(r#"{"username":"ops","password":"nope"}"#),
+        )
+        .await;
+        assert_eq!(bad, StatusCode::UNAUTHORIZED);
+        assert!(bad_cookie.is_none(), "a failed login must not set a session");
+        // Right password → 200 + a fresh session that unlocks the API.
+        let (good, good_cookie, _) = call(
+            &state,
+            "POST",
+            "/v1/auth/login",
+            None,
+            Some(r#"{"username":"ops","password":"hunter2pass"}"#),
+        )
+        .await;
+        assert_eq!(good, StatusCode::OK);
+        let cookie = session_pair(&good_cookie.expect("login sets a cookie"));
+        let (ok, _, _) = call(&state, "GET", "/v1/relux/tools", Some(&cookie), None).await;
+        assert_eq!(ok, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_disabled_bypass_opens_the_api_for_dev_test() {
+        let (state, _dir) = auth_state(true);
+        // No session, yet a protected route succeeds because the bypass is on.
+        let (ok, _, _) = call(&state, "GET", "/v1/relux/state", None, None).await;
+        assert_eq!(ok, StatusCode::OK);
+        // status advertises the disabled state so the SPA renders the app.
+        let (_, _, body) = call(&state, "GET", "/v1/auth/status", None, None).await;
+        assert!(body.contains("\"auth_disabled\":true"), "got: {body}");
+        assert!(body.contains("\"authenticated\":true"), "got: {body}");
     }
 }
