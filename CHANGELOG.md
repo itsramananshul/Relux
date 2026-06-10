@@ -9,6 +9,22 @@ once a stable release is cut.
 
 ### Added
 
+- **Compact-resilient Relux Work Run Detail header (relix-dashboard-design §8 /
+  §11).** The `RunDetailPanel` header on the **Work** page laid its title +
+  `status` badge + `live · No activity for Xs` cue and its **Copy link / Retry /
+  Close** controls on a single non-wrapping `.row` with a `flex:1` spacer. That
+  panel is a full-width `.card` (not a `.context-panel`, so the
+  `.context-panel .row { flex-wrap: wrap }` rule never applied), so in a narrow
+  card a long stalled cue squeezed the three action buttons — shrinking them and
+  wrapping their labels (`Copy`/`link`). The header now reuses the same
+  `.xtr-bar` / `.xtr-bar-meta` / `.xtr-bar-actions` split the legacy
+  `<RunTranscript>` header adopted: the meta group (title, status, live/stalled
+  cue) takes the flexible track and wraps **within itself**, while the action
+  buttons stay together as one `flex:0 0 auto` unit and wrap as a block under the
+  meta when the card is narrow — no squeeze, no label-wrap, and **no state is
+  hidden**. Pure-markup/CSS reuse (no new CSS, no behavior change beyond layout);
+  the existing transcript helpers stay unit-tested and the dashboard bundle was
+  rebuilt.
 - **Honest stalled / no-activity signal on the legacy Run transcript too
   (relix-dashboard-design §8 / §11).** The Relux Work Run Detail already showed a
   `No activity for Xs` cue when an in-flight run went quiet; the **legacy bridge**

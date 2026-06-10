@@ -629,27 +629,36 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
 
   return (
     <div style={{ paddingBottom: 16 }}>
-      <div className="row" style={{ alignItems: "center", marginBottom: 12 }}>
-        <h4 style={{ margin: 0 }}>Run Detail</h4>
-        {run && <span className={`badge ${runStatusTone(run.status)}`} style={{ marginLeft: 8 }}>{run.status}</span>}
-        {inFlight && (
-          <span className="muted" style={{ fontSize: 11, marginLeft: 8 }}>
-            {/* Honest in-flight state: the stall signal reports real elapsed
-                silence (no new event/phase for a while); otherwise the normal
-                live indicator. Never a fabricated progress bar. */}
-            {stalledNote ? `live · ${stalledNote}` : "live · refreshing…"}
-          </span>
-        )}
-        <div className="spacer" style={{ flex: 1 }} />
-        <button className="btn ghost sm" style={{ marginRight: 8 }} title="Copy a shareable link to this run" onClick={() => void copyLink()}>
-          Copy link
-        </button>
-        {run && canRetryRun(run) && (
-          <button className="btn sm" style={{ marginRight: 8 }} onClick={() => void retry()} disabled={retrying}>
-            {retrying ? "Retrying…" : "Retry"}
+      {/* Title + status/live-stalled cues group on the left; the Copy-link /
+          Retry / Close controls stay together on the right. Two groups (the
+          shared `.xtr-bar` split, not a flex-1 spacer) so a long stalled cue
+          wraps within the meta group and the action buttons wrap as one unit in
+          a narrow card — they never get squeezed or label-wrapped. Matches the
+          legacy RunTranscript header (relix-dashboard-design §8 / §11). */}
+      <div className="xtr-bar" style={{ marginBottom: 12 }}>
+        <div className="xtr-bar-meta">
+          <h4 style={{ margin: 0 }}>Run Detail</h4>
+          {run && <span className={`badge ${runStatusTone(run.status)}`}>{run.status}</span>}
+          {inFlight && (
+            <span className="muted" style={{ fontSize: 11 }}>
+              {/* Honest in-flight state: the stall signal reports real elapsed
+                  silence (no new event/phase for a while); otherwise the normal
+                  live indicator. Never a fabricated progress bar. */}
+              {stalledNote ? `live · ${stalledNote}` : "live · refreshing…"}
+            </span>
+          )}
+        </div>
+        <div className="xtr-bar-actions">
+          <button className="btn ghost sm" title="Copy a shareable link to this run" onClick={() => void copyLink()}>
+            Copy link
           </button>
-        )}
-        <button className="btn ghost sm" onClick={onClose}>Close</button>
+          {run && canRetryRun(run) && (
+            <button className="btn sm" onClick={() => void retry()} disabled={retrying}>
+              {retrying ? "Retrying…" : "Retry"}
+            </button>
+          )}
+          <button className="btn ghost sm" onClick={onClose}>Close</button>
+        </div>
       </div>
       {shareNote && (
         <div className="muted mono" style={{ fontSize: 11, marginBottom: 8, wordBreak: "break-all" }}>{shareNote}</div>
