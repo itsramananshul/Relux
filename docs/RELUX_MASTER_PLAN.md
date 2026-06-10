@@ -2627,7 +2627,20 @@ The API never returns the key. The dashboard shows the current AI provider/mode.
   Account panel closing) — never a busy poll, which would be pointless since the
   read does not slide the session; a single per-minute timer counts down locally
   between fetches, and the chip stays hidden under `RELUX_AUTH_DISABLED` or for an
-  older kernel that omits the deadlines. Public by
+  older kernel that omits the deadlines. Because the hard absolute ceiling cannot
+  be slid by anything the operator does in the console, the **Account** control
+  pairs the readout with a clear **re-authentication path**: a *"Sign out and sign
+  back in"* button that ends the current session (via the existing
+  `POST /v1/auth/logout`) so the normal sign-in screen reappears and a fresh login
+  mints a new session — the only thing that resets the 7-day cap. It **never**
+  auto-submits credentials (the operator still types their password on the login
+  screen) and never weakens auth. The button is always present in Account, and is
+  **emphasised** — promoted to the primary action with an alert banner — exactly
+  when the absolute ceiling is inside its warning window (the same ≤30 min the red
+  chip uses); when the ceiling is comfortably far off it stays a quiet secondary
+  control. Signing out this way leaves other sessions untouched, and the
+  password-change form is unchanged (a failed sign-out keeps the session intact and
+  surfaces the reason, with the topbar **Sign out** control as the fallback). Public by
   design: the static dashboard (so the setup/login screen always renders — never a
   blank page), the public auth endpoints (`/v1/auth/status`/`setup`/`login`/
   `logout`/`me`), and `/v1/relux/health` (liveness probe). `POST

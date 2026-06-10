@@ -505,6 +505,9 @@ a > .stat-card:hover { border-color: var(--text-faint); }
   display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
   padding: 14px 16px 8px;
 }
+/* Re-auth block — the "sign out and sign back in" path that clears the hard
+   absolute ceiling. A hairline separates it from the session readout above. */
+.account-reauth { border-top: 1px solid var(--border-soft); margin-top: 4px; padding-top: 12px; }
 
 /* Crew roster-at-a-glance strip — leadership/active/pending/runnable tiers.
    Wraps to fewer columns on narrow viewports; never overflows. */

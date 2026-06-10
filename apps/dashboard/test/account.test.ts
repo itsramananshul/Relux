@@ -9,6 +9,7 @@ import {
   describeIdlePolicy,
   describeAbsolutePolicy,
   sessionWarning,
+  reauthCallout,
   ABSOLUTE_WARN_SECS,
   IDLE_WARN_SECS,
   type SessionMeta,
@@ -165,4 +166,48 @@ test("sessionWarning stays silent under the dev bypass and for an older kernel",
   assert.equal(sessionWarning(bypass, 0), null);
   // An older kernel sends only { username } — hide the chip, don't invent it.
   assert.equal(sessionWarning({ username: "ops" }, 0), null);
+});
+
+// ── Re-authentication callout (Account control) ──────────────────────────
+// The Account panel always offers a "Sign out and sign back in" button; this
+// helper decides only when to EMPHASISE it (RELUX_MASTER_PLAN "Local operator
+// login v1"). It fires solely on the non-sliding absolute ceiling within the
+// same warning window the chip uses — a fresh sign-in is the only thing that
+// extends it — and stays silent for idle, the dev bypass, and an older kernel.
+
+test("reauthCallout emphasises within the absolute warning window", () => {
+  const m: SessionMeta = { username: "ops", absolute_expires_in_secs: 20 * 60 };
+  const c = reauthCallout(m, 0);
+  assert.equal(c?.secsLeft, 20 * 60);
+  assert.match(c?.message ?? "", /re-sign-in required in/i);
+  // Right at the threshold edge it still fires; just past it stays quiet.
+  assert.ok(reauthCallout({ username: "ops", absolute_expires_in_secs: ABSOLUTE_WARN_SECS }, 0));
+  assert.equal(reauthCallout({ username: "ops", absolute_expires_in_secs: ABSOLUTE_WARN_SECS + 1 }, 0), null);
+});
+
+test("reauthCallout stays quiet when the ceiling is comfortably far off", () => {
+  // META has 7d absolute remaining — the button renders unadorned, no banner.
+  assert.equal(reauthCallout(META, 0), null);
+});
+
+test("reauthCallout ignores idle expiry (only a fresh sign-in clears absolute)", () => {
+  // Idle about to bite but the absolute ceiling is a week out → no re-auth banner.
+  const m: SessionMeta = {
+    username: "ops",
+    idle_expires_in_secs: 2 * 60,
+    absolute_expires_in_secs: 7 * 86400,
+  };
+  assert.equal(reauthCallout(m, 0), null);
+});
+
+test("reauthCallout honours local elapsed time", () => {
+  const m: SessionMeta = { username: "ops", absolute_expires_in_secs: 32 * 60 };
+  assert.equal(reauthCallout(m, 0), null); // 32m out — outside the window
+  assert.equal(reauthCallout(m, 3 * 60)?.secsLeft, 29 * 60); // 29m left — now warns
+});
+
+test("reauthCallout stays silent under the dev bypass and for an older kernel", () => {
+  const bypass: SessionMeta = { username: "ops", auth_disabled: true, absolute_expires_in_secs: 60 };
+  assert.equal(reauthCallout(bypass, 0), null);
+  assert.equal(reauthCallout({ username: "ops" }, 0), null);
 });

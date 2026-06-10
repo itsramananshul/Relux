@@ -9,6 +9,7 @@ import {
   absoluteRemaining,
   describeIdlePolicy,
   describeAbsolutePolicy,
+  reauthCallout,
 } from "../account";
 
 // The signed-in operator's Account modal (RELUX_MASTER_PLAN "Local operator
@@ -20,13 +21,18 @@ import {
 // browser/device is booted. "Forgot password" still points at `reset-admin`.
 
 export function AccountPanel({ who, onClose }: { who: string; onClose: () => void }) {
-  const { changePassword } = useAuth();
+  const { changePassword, logout } = useAuth();
   const [current, setCurrent] = useState("");
   const [next, setNext] = useState("");
   const [confirm, setConfirm] = useState("");
   const [err, setErr] = useState<string | null>(null);
   const [done, setDone] = useState(false);
   const [busy, setBusy] = useState(false);
+  // Re-authentication: signing out, then back in, is the one reliable way to
+  // clear the hard absolute ceiling. It never auto-submits credentials — it just
+  // ends this session so the normal sign-in screen appears.
+  const [signingOut, setSigningOut] = useState(false);
+  const [reauthErr, setReauthErr] = useState<string | null>(null);
   const firstFieldRef = useRef<HTMLInputElement>(null);
 
   // Safe session-expiry metadata (GET /v1/auth/me — idle/absolute deadlines, no
@@ -86,6 +92,8 @@ export function AccountPanel({ who, onClose }: { who: string; onClose: () => voi
   const absLeft = meta ? absoluteRemaining(meta, elapsedSecs) : null;
   const idlePolicy = meta ? describeIdlePolicy(meta) : null;
   const absPolicy = meta ? describeAbsolutePolicy(meta) : null;
+  // Emphasise the re-auth path only when the hard ceiling is actually close.
+  const callout = meta ? reauthCallout(meta, elapsedSecs) : null;
 
   async function submit(e: FormEvent) {
     e.preventDefault();
@@ -107,6 +115,26 @@ export function AccountPanel({ who, onClose }: { who: string; onClose: () => voi
       setErr(e instanceof Error ? e.message : "Could not change the password.");
     } finally {
       setBusy(false);
+    }
+  }
+
+  // Sign out so the operator can sign back in with a fresh session — the only
+  // thing that clears the hard absolute ceiling. We never auto-submit
+  // credentials: on success the app re-renders to the sign-in screen (and this
+  // modal unmounts), so the operator types their password themselves. A failure
+  // (e.g. the kernel is briefly unreachable) leaves the session intact and
+  // surfaces the reason; the topbar Sign out control is the fallback.
+  async function reauth() {
+    setReauthErr(null);
+    setSigningOut(true);
+    try {
+      await logout();
+      // Success unmounts this modal as <App> swaps in <Login>; nothing more to do.
+    } catch (e) {
+      setReauthErr(
+        e instanceof Error ? e.message : "Could not sign out. Try the Sign out control in the topbar.",
+      );
+      setSigningOut(false);
     }
   }
 
@@ -180,6 +208,37 @@ export function AccountPanel({ who, onClose }: { who: string; onClose: () => voi
                 )}
               </ul>
             )}
+          </div>
+        )}
+
+        {/* Re-authentication path. Always present (signing out then back in is the
+            one reliable way to clear the hard absolute ceiling), and emphasised —
+            primary button + an alert banner — only when that ceiling is close. */}
+        {!meta?.auth_disabled && (
+          <div className="account-reauth" style={{ padding: "0 16px 12px" }}>
+            {callout && (
+              <div className="banner err" role="alert" style={{ marginBottom: 10 }}>
+                {callout.message}. Only a fresh sign-in extends it — sign out and back in to keep
+                working.
+              </div>
+            )}
+            {reauthErr && (
+              <div className="banner err" role="alert">
+                {reauthErr}
+              </div>
+            )}
+            <button
+              className={"btn" + (callout ? "" : " ghost") + " sm"}
+              style={{ width: "100%" }}
+              disabled={signingOut}
+              onClick={() => void reauth()}
+              title="Sign out now; the sign-in screen appears so you can start a fresh session"
+            >
+              {signingOut ? "Signing out…" : "Sign out and sign back in"}
+            </button>
+            <p className="muted" style={{ fontSize: 11, margin: "6px 0 0" }}>
+              Ends this session and shows the sign-in screen. Other sessions are unaffected.
+            </p>
           </div>
         )}
 

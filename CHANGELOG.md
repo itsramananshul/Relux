@@ -9,6 +9,22 @@ once a stable release is cut.
 
 ### Added
 
+- **One-click re-authentication from the Account panel.** The **Account** control
+  now offers a *"Sign out and sign back in"* button — the one reliable way to clear
+  the hard **absolute** 7-day ceiling, which no in-console action can extend. It
+  ends the current session via the existing `POST /v1/auth/logout` so the normal
+  sign-in screen reappears; the operator then logs in themselves, minting a fresh
+  session that resets the cap. It **never** auto-submits credentials and never
+  weakens auth. The button is always present, and is **emphasised** — promoted to
+  the primary action with an alert banner — exactly when the absolute ceiling is
+  inside its warning window (the same ≤30 min the red expiry chip uses, so the chip
+  → Account → re-auth path is coherent); otherwise it stays a quiet secondary
+  control. Signing out this way leaves other sessions untouched, and the
+  password-change form is unchanged (a failed sign-out keeps the session intact and
+  surfaces why, with the topbar **Sign out** control as the fallback). Tests pin the
+  decision helper (`reauthCallout` — fires only on the absolute window, ignores
+  idle, honours elapsed time, silent under the dev bypass / older kernel). Backend
+  untouched. See `docs/RELUX_MASTER_PLAN.md` → *Local operator login v1*.
 - **Passive session-expiry warning in the Relux shell.** The dashboard topbar now
   shows a quiet chip when the signed-in session is close to ending — amber for the
   rolling **idle** window (*"Signs out for inactivity in 8m"*, ≤10 min left) and

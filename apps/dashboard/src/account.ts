@@ -173,3 +173,33 @@ export function sessionWarning(meta: SessionMeta, elapsedSecs = 0): SessionWarni
   candidates.sort((a, b) => a.secsLeft - b.secsLeft || (a.kind === "absolute" ? -1 : 1));
   return candidates[0];
 }
+
+// ── Re-authentication callout (Account control) ────────────────────────────
+// The Account panel always offers a "Sign out and sign back in" affordance — the
+// one reliable way to clear the hard absolute ceiling, which no in-console action
+// can extend (RELUX_MASTER_PLAN "Local operator login v1"). This pure helper
+// decides only whether to EMPHASISE that path with an urgent banner: it fires
+// when the non-sliding absolute deadline is inside its warning window (the same
+// ABSOLUTE_WARN_SECS the shell chip uses), because that is precisely when a fresh
+// sign-in is the only thing that helps. Idle expiry is deliberately excluded —
+// any ordinary action slides it forward, so it needs no special re-auth prompt.
+// Returns null (the common case: the button still renders, just unadorned) under
+// the dev bypass, for an older kernel without deadlines, or whenever the ceiling
+// is comfortably far off. The button itself is rendered regardless of this; the
+// callout is purely the "now it matters" emphasis.
+export interface ReauthCallout {
+  // Seconds left on the absolute ceiling when evaluated (clamped ≥0).
+  secsLeft: number;
+  // A short line for the emphasised banner (already includes the countdown).
+  message: string;
+}
+
+export function reauthCallout(meta: SessionMeta, elapsedSecs = 0): ReauthCallout | null {
+  if (meta.auth_disabled) return null;
+  const absLeft = absoluteRemaining(meta, elapsedSecs);
+  if (absLeft == null || absLeft > ABSOLUTE_WARN_SECS) return null;
+  return {
+    secsLeft: absLeft,
+    message: `Re-sign-in required in ${formatDuration(absLeft)}`,
+  };
+}
