@@ -36,7 +36,13 @@
 #                        safe settings, runs ONE manual tick, and verifies the
 #                        task honestly moved Queued -> Completed with a run.
 #   7. HTTP serve (opt)- starts `relux-kernel serve` on a free loopback port and
-#                        hits /dashboard, /v1/relux/state, /v1/relux/prime/autonomy,
+#                        exercises local operator login end to end: setup/login,
+#                        /v1/auth/me, an authenticated password change (with the
+#                        documented other-session invalidation), and the Account
+#                        re-auth/session-reset flow (sign out invalidates the old
+#                        session server-side; the next login mints a fresh session
+#                        whose absolute 7-day ceiling is reset). Then hits
+#                        /dashboard, /v1/relux/state, /v1/relux/prime/autonomy,
 #                        and /v1/relux/tools; stops the server at the end. The
 #                        loopback test (step 4) rides on this same server because
 #                        granting Prime a new tool permission is an API operation.
@@ -406,6 +412,75 @@ try {
             Assert 'old password no longer works' ($loginOld.Status -eq 401) ("status " + $loginOld.Status)
             $loginNew = Invoke-Api 'POST' '/v1/auth/login' (@{ username = 'e2e-admin'; password = 'e2e-pass-456' } | ConvertTo-Json -Compress)
             Assert 'new password works' ($loginNew.Status -eq 200) ("status " + $loginNew.Status)
+
+            # -- Re-auth / session reset (chip -> Account -> sign out -> login) --
+            # Proves the Account "Sign out and sign back in" path (the only way to
+            # clear the hard ABSOLUTE 7-day ceiling): a logout invalidates the old
+            # session server-side, and the next login mints a FRESH session whose
+            # absolute window is reset (>= the first session's, and ~the full cap),
+            # while the old cookie stays dead. Uses its OWN cookie jars so the main
+            # client's surviving session is untouched. Deadlines come straight from
+            # the non-sliding GET /v1/auth/me the Account control already reads.
+            $uri = [Uri]$base
+            # Session S1: a fresh login on a dedicated jar.
+            $raHandler = New-Object System.Net.Http.HttpClientHandler
+            $raHandler.CookieContainer = New-Object System.Net.CookieContainer
+            $raHandler.UseCookies = $true
+            $ra = New-Object System.Net.Http.HttpClient($raHandler)
+            $ra.Timeout = [TimeSpan]::FromSeconds(20)
+            $raLogin = $ra.PostAsync("$base/v1/auth/login", (New-Object System.Net.Http.StringContent((@{ username = 'e2e-admin'; password = 'e2e-pass-456' } | ConvertTo-Json -Compress), [System.Text.Encoding]::UTF8, 'application/json'))).GetAwaiter().GetResult()
+            $sid1 = $raHandler.CookieContainer.GetCookies($uri)['relux_session'].Value
+            $me1 = $ra.GetAsync("$base/v1/auth/me").GetAwaiter().GetResult()
+            $me1Body = $me1.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+            $me1Json = $null; try { $me1Json = $me1Body | ConvertFrom-Json } catch {}
+            $absAt1 = if ($me1Json) { [int64]$me1Json.absolute_expires_at } else { 0 }
+            $absLeft1 = if ($me1Json) { [int64]$me1Json.absolute_expires_in_secs } else { 0 }
+            $absMax = if ($me1Json) { [int64]$me1Json.absolute_max_secs } else { 0 }
+            # S1 opens a full absolute window (~the configured cap, a few secs slack).
+            $s1Fresh = ([int]$raLogin.StatusCode -eq 200) -and $sid1 -and ($absMax -gt 0) -and ([math]::Abs($absLeft1 - $absMax) -le 10)
+            Assert 'reauth: first session opens a full absolute window' $s1Fresh ("login=" + [int]$raLogin.StatusCode + " abs_left=$absLeft1 of $absMax")
+
+            # Account "Sign out": logout drops S1 (clears this jar's cookie too).
+            $raLogout = $ra.PostAsync("$base/v1/auth/logout", (New-Object System.Net.Http.StringContent('{}', [System.Text.Encoding]::UTF8, 'application/json'))).GetAwaiter().GetResult()
+            Assert 'reauth: sign out returns 200' ([int]$raLogout.StatusCode -eq 200) ("status " + [int]$raLogout.StatusCode)
+
+            # The OLD cookie is dead server-side: replay the raw sid on a no-jar
+            # client (UseCookies=false) and confirm both the protected API and the
+            # status read reject it (true invalidation, not just a cleared browser).
+            $rawHandler = New-Object System.Net.Http.HttpClientHandler
+            $rawHandler.UseCookies = $false
+            $rawc = New-Object System.Net.Http.HttpClient($rawHandler)
+            $rawc.Timeout = [TimeSpan]::FromSeconds(20)
+            function Get-WithCookie([System.Net.Http.HttpClient]$c, [string]$path, [string]$sid) {
+                $req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, "$base$path")
+                [void]$req.Headers.TryAddWithoutValidation('Cookie', "relux_session=$sid")
+                return $c.SendAsync($req).GetAwaiter().GetResult()
+            }
+            $deadState = Get-WithCookie $rawc '/v1/relux/state' $sid1
+            $deadMe = Get-WithCookie $rawc '/v1/auth/me' $sid1
+            $oldDead = ([int]$deadState.StatusCode -eq 401) -and ([int]$deadMe.StatusCode -eq 401)
+            Assert 'reauth: old session invalid after sign out' $oldDead ("state=" + [int]$deadState.StatusCode + " me=" + [int]$deadMe.StatusCode)
+
+            # Re-login mints a DISTINCT session S2 with a reset absolute window.
+            $ra2Handler = New-Object System.Net.Http.HttpClientHandler
+            $ra2Handler.CookieContainer = New-Object System.Net.CookieContainer
+            $ra2Handler.UseCookies = $true
+            $ra2 = New-Object System.Net.Http.HttpClient($ra2Handler)
+            $ra2.Timeout = [TimeSpan]::FromSeconds(20)
+            $ra2Login = $ra2.PostAsync("$base/v1/auth/login", (New-Object System.Net.Http.StringContent((@{ username = 'e2e-admin'; password = 'e2e-pass-456' } | ConvertTo-Json -Compress), [System.Text.Encoding]::UTF8, 'application/json'))).GetAwaiter().GetResult()
+            $sid2 = $ra2Handler.CookieContainer.GetCookies($uri)['relux_session'].Value
+            $me2 = $ra2.GetAsync("$base/v1/auth/me").GetAwaiter().GetResult()
+            $me2Body = $me2.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+            $me2Json = $null; try { $me2Json = $me2Body | ConvertFrom-Json } catch {}
+            $absAt2 = if ($me2Json) { [int64]$me2Json.absolute_expires_at } else { -1 }
+            $absLeft2 = if ($me2Json) { [int64]$me2Json.absolute_expires_in_secs } else { 0 }
+            # New opaque id, ceiling pushed forward (never backward), full window again.
+            $s2Reset = ([int]$ra2Login.StatusCode -eq 200) -and $sid2 -and ($sid2 -ne $sid1) -and ($absAt2 -ge $absAt1) -and ([math]::Abs($absLeft2 - $absMax) -le 10)
+            Assert 'reauth: re-login resets the absolute window (new session)' $s2Reset ("new_sid=$($sid2 -ne $sid1) abs_at2>=abs_at1=$($absAt2 -ge $absAt1) abs_left=$absLeft2")
+            # The old S1 cookie is STILL dead after the re-auth (it was not revived).
+            $stillDead = Get-WithCookie $rawc '/v1/relux/state' $sid1
+            Assert 'reauth: old session stays dead after re-login' ([int]$stillDead.StatusCode -eq 401) ("status " + [int]$stillDead.StatusCode)
+            $ra.Dispose(); $ra2.Dispose(); $rawc.Dispose()
 
             $dash = Invoke-Api 'GET' '/dashboard' $null
             if ($dash.Status -eq 200) {

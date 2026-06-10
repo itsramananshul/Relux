@@ -5352,6 +5352,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reauth_logout_then_login_resets_the_absolute_window_and_kills_the_old_session() {
+        // End-to-end proof of the Account "Sign out and sign back in" path (the one
+        // way to clear the hard absolute ceiling): a logout invalidates the old
+        // session server-side, and the subsequent login mints a FRESH session whose
+        // absolute window is reset (>= the first session's, and ~the full cap), while
+        // the old cookie stays dead. Mirrors the live-kernel e2e smoke deterministically.
+        let (state, _dir) = auth_state(false);
+        // First-run setup mints session S1.
+        let (s, set1, _) = call(
+            &state,
+            "POST",
+            "/v1/auth/setup",
+            None,
+            Some(r#"{"username":"ops","password":"hunter2pass"}"#),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let s1 = session_pair(&set1.expect("setup sets a cookie"));
+
+        // S1's absolute window is fresh (~the full cap) and admits the API.
+        let (ok1, _, me1) = call(&state, "GET", "/v1/auth/me", Some(&s1), None).await;
+        assert_eq!(ok1, StatusCode::OK);
+        let v1: serde_json::Value = serde_json::from_str(&me1).expect("me1 json");
+        let abs_at_1 = v1["absolute_expires_at"].as_i64().expect("abs_at_1");
+        let abs_left_1 = v1["absolute_expires_in_secs"].as_i64().expect("abs_left_1");
+        assert!(
+            (abs_left_1 - relux_kernel::SESSION_ABSOLUTE_MAX_SECS).abs() <= 3,
+            "S1 should open a full absolute window; got {abs_left_1}"
+        );
+        let (gate1, _, _) = call(&state, "GET", "/v1/relux/state", Some(&s1), None).await;
+        assert_eq!(gate1, StatusCode::OK);
+
+        // Account "Sign out": logout drops S1.
+        let (lo, _, _) = call(&state, "POST", "/v1/auth/logout", Some(&s1), None).await;
+        assert_eq!(lo, StatusCode::OK);
+        // The OLD cookie is now dead — both the protected API and the status read
+        // reject it (server-side invalidation, not just a cleared browser jar).
+        let (gate_dead, _, _) = call(&state, "GET", "/v1/relux/state", Some(&s1), None).await;
+        assert_eq!(gate_dead, StatusCode::UNAUTHORIZED);
+        let (me_dead, _, _) = call(&state, "GET", "/v1/auth/me", Some(&s1), None).await;
+        assert_eq!(me_dead, StatusCode::UNAUTHORIZED);
+
+        // Re-login mints a DISTINCT session S2.
+        let (li, set2, _) = call(
+            &state,
+            "POST",
+            "/v1/auth/login",
+            None,
+            Some(r#"{"username":"ops","password":"hunter2pass"}"#),
+        )
+        .await;
+        assert_eq!(li, StatusCode::OK);
+        let s2 = session_pair(&set2.expect("login sets a cookie"));
+        assert_ne!(s2, s1, "re-login must mint a new opaque session id, not reuse the old one");
+
+        // S2's absolute window is reset: at least as far out as S1's (never inheriting
+        // a shrunk remainder) and ~the full cap again.
+        let (ok2, _, me2) = call(&state, "GET", "/v1/auth/me", Some(&s2), None).await;
+        assert_eq!(ok2, StatusCode::OK);
+        let v2: serde_json::Value = serde_json::from_str(&me2).expect("me2 json");
+        let abs_at_2 = v2["absolute_expires_at"].as_i64().expect("abs_at_2");
+        let abs_left_2 = v2["absolute_expires_in_secs"].as_i64().expect("abs_left_2");
+        assert!(
+            abs_at_2 >= abs_at_1,
+            "the re-auth must push the absolute ceiling forward (or equal), never backward: {abs_at_2} < {abs_at_1}"
+        );
+        assert!(
+            (abs_left_2 - relux_kernel::SESSION_ABSOLUTE_MAX_SECS).abs() <= 3,
+            "S2 should re-open a full absolute window; got {abs_left_2}"
+        );
+        // S2 admits the API; the old S1 cookie is STILL dead (re-auth did not revive it).
+        let (gate2, _, _) = call(&state, "GET", "/v1/relux/state", Some(&s2), None).await;
+        assert_eq!(gate2, StatusCode::OK);
+        let (still_dead, _, _) = call(&state, "GET", "/v1/relux/state", Some(&s1), None).await;
+        assert_eq!(still_dead, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn auth_me_reports_dev_identity_under_the_bypass() {
         let (state, _dir) = auth_state(true);
         let (ok, _, body) = call(&state, "GET", "/v1/auth/me", None, None).await;

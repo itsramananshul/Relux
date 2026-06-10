@@ -9,6 +9,20 @@ once a stable release is cut.
 
 ### Added
 
+- **End-to-end proof of the re-auth / session-reset flow.** Two complementary
+  checks pin the Account *"Sign out and sign back in"* path — the only way to clear
+  the hard **absolute** 7-day ceiling. A deterministic in-process HTTP test
+  (`reauth_logout_then_login_resets_the_absolute_window_and_kills_the_old_session`)
+  drives setup → `/v1/auth/me` → logout → re-login and asserts the old session is
+  invalidated server-side (both `/v1/relux/*` and `/v1/auth/me` reject the old
+  cookie) while the new session mints a **distinct** id and a **reset** absolute
+  window (ceiling pushed forward, ~the full cap again). The standalone e2e smoke
+  (`scripts/relux-e2e-smoke.ps1`) mirrors the same flow against the real release
+  binary over HTTP, replaying the raw old cookie on a no-jar client to prove true
+  server-side invalidation rather than a merely-cleared browser jar. No production
+  constant is mutated for the proof; the reset is shown **relative to the first
+  session** plus old-cookie invalidation. Backend untouched. See
+  `docs/RELUX_MASTER_PLAN.md` → *Local operator login v1*.
 - **One-click re-authentication from the Account panel.** The **Account** control
   now offers a *"Sign out and sign back in"* button — the one reliable way to clear
   the hard **absolute** 7-day ceiling, which no in-console action can extend. It
