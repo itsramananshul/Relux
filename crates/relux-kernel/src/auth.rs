@@ -39,9 +39,20 @@ use serde::{Deserialize, Serialize};
 /// Name of the HTTP-only session cookie the dashboard rides on.
 pub const SESSION_COOKIE: &str = "relux_session";
 
-/// Session lifetime in seconds. A logged-in operator stays authenticated for
-/// this long without re-entering their password (12 hours).
+/// Idle timeout in seconds. A logged-in operator stays authenticated for this
+/// long **of inactivity** before having to sign in again (12 hours — the same
+/// window the fixed-lifetime v1 used). Each authenticated control-plane request
+/// slides the session's idle deadline forward by this much (see
+/// [`DashboardAuth::refresh_session`]), so an actively-used console never expires
+/// out from under the operator.
 pub const SESSION_TTL_SECS: i64 = 12 * 60 * 60;
+
+/// Absolute maximum session lifetime in seconds, measured from when the session
+/// was first minted (7 days). The sliding idle window can renew a session
+/// repeatedly, but **never past this cap** — after a week a session is forced to
+/// re-authenticate regardless of activity. This bounds how long a single stolen
+/// or forgotten cookie stays useful even under continuous traffic.
+pub const SESSION_ABSOLUTE_MAX_SECS: i64 = 7 * 24 * 60 * 60;
 
 /// Minimum password length accepted at setup. Deliberately modest — this guards
 /// a loopback operator console, not an internet service.
@@ -262,7 +273,12 @@ pub fn reset_admin_credential(
 
 struct Session {
     username: String,
+    /// Idle deadline: the session is valid until this instant unless an
+    /// authenticated request slides it forward. Always `<= absolute_deadline`.
     expires_at: i64,
+    /// Hard ceiling set at creation (`created_at + SESSION_ABSOLUTE_MAX_SECS`).
+    /// `expires_at` is never slid past this, so the session cannot outlive it.
+    absolute_deadline: i64,
 }
 
 /// In-memory session table, keyed by a random opaque session id.
@@ -282,31 +298,69 @@ impl SessionStore {
         let mut buf = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut buf);
         let sid = hex::encode(buf);
+        let now = now_secs();
         if let Ok(mut m) = self.inner.write() {
             m.insert(
                 sid.clone(),
                 Session {
                     username: username.to_string(),
-                    expires_at: now_secs() + SESSION_TTL_SECS,
+                    expires_at: now + SESSION_TTL_SECS,
+                    absolute_deadline: now + SESSION_ABSOLUTE_MAX_SECS,
                 },
             );
         }
         sid
     }
 
+    /// Whether a session is still live: within BOTH the idle window
+    /// (`expires_at`) and the absolute lifetime (`absolute_deadline`). The
+    /// invariant `expires_at <= absolute_deadline` makes the second check
+    /// redundant in practice, but it is kept explicit so a hand-constructed or
+    /// future-edited session can never slip past the hard ceiling.
+    fn is_live(s: &Session, now: i64) -> bool {
+        s.expires_at > now && s.absolute_deadline > now
+    }
+
     /// Return the session's username if it exists and has not expired. Prunes
-    /// the entry when expired.
+    /// the entry when expired. **Non-mutating on the deadline** — used by status
+    /// reads (`/v1/auth/status`, `/v1/auth/me`) so polling never slides the idle
+    /// window; only real control-plane activity refreshes it (see [`Self::refresh`]).
     fn validate(&self, sid: &str) -> Option<String> {
         let now = now_secs();
         if let Ok(m) = self.inner.read() {
             match m.get(sid) {
-                Some(s) if s.expires_at > now => return Some(s.username.clone()),
+                Some(s) if Self::is_live(s, now) => return Some(s.username.clone()),
                 Some(_) => {} // expired → fall through to prune
                 None => return None,
             }
         }
         if let Ok(mut m) = self.inner.write() {
             m.remove(sid);
+        }
+        None
+    }
+
+    /// Slide a live session's idle deadline forward and report the cookie
+    /// `Max-Age` (seconds) the caller should re-emit. The new idle deadline is
+    /// `now + SESSION_TTL_SECS`, **capped at `absolute_deadline`** so the session
+    /// can never be renewed past its hard ceiling. Returns `None` (and prunes the
+    /// entry) when the session is missing or already past either deadline — in
+    /// that case no cookie should be sent. The session id itself is unchanged
+    /// (the window slides; the opaque id is not rotated).
+    fn refresh(&self, sid: &str) -> Option<i64> {
+        let now = now_secs();
+        if let Ok(mut m) = self.inner.write() {
+            match m.get_mut(sid) {
+                Some(s) if Self::is_live(s, now) => {
+                    let new_exp = (now + SESSION_TTL_SECS).min(s.absolute_deadline);
+                    s.expires_at = new_exp;
+                    return Some(new_exp - now);
+                }
+                Some(_) => {
+                    m.remove(sid);
+                }
+                None => {}
+            }
         }
         None
     }
@@ -324,6 +378,32 @@ impl SessionStore {
         if let Ok(mut m) = self.inner.write() {
             m.retain(|sid, _| sid == keep);
         }
+    }
+
+    /// Test seam: insert a session with explicit deadlines so the sliding/absolute
+    /// behavior can be exercised without sleeping for real-time hours.
+    #[cfg(test)]
+    fn insert_raw(&self, sid: &str, username: &str, expires_at: i64, absolute_deadline: i64) {
+        if let Ok(mut m) = self.inner.write() {
+            m.insert(
+                sid.to_string(),
+                Session {
+                    username: username.to_string(),
+                    expires_at,
+                    absolute_deadline,
+                },
+            );
+        }
+    }
+
+    /// Test seam: read back a session's `(expires_at, absolute_deadline)`.
+    #[cfg(test)]
+    fn peek(&self, sid: &str) -> Option<(i64, i64)> {
+        self.inner
+            .read()
+            .ok()?
+            .get(sid)
+            .map(|s| (s.expires_at, s.absolute_deadline))
     }
 }
 
@@ -415,10 +495,21 @@ impl DashboardAuth {
         self.sessions.create(username)
     }
 
-    /// Validate a raw session-cookie value. Used by the serve auth middleware to
-    /// admit a logged-in dashboard request. Returns the username.
+    /// Validate a raw session-cookie value **without** sliding its idle window.
+    /// Used by the serve auth middleware to decide admission and by the public
+    /// status endpoints to report login state. Returns the username.
     pub fn validate_session(&self, sid: &str) -> Option<String> {
         self.sessions.validate(sid)
+    }
+
+    /// Slide a live session forward by the idle timeout and return the cookie
+    /// `Max-Age` (seconds) to re-emit, capped at the session's absolute
+    /// lifetime. Returns `None` when the session is missing/expired, in which
+    /// case the caller must NOT set a refreshed cookie. The serve auth middleware
+    /// calls this on a successful protected response so an actively-used console
+    /// keeps a rolling session up to [`SESSION_ABSOLUTE_MAX_SECS`].
+    pub fn refresh_session(&self, sid: &str) -> Option<i64> {
+        self.sessions.refresh(sid)
     }
 
     /// Drop a session (logout).
@@ -451,8 +542,24 @@ pub fn session_cookie_from_headers(headers: &header::HeaderMap) -> Option<String
 /// `Path=/` for the whole app; `Max-Age` matching the session TTL. No `Secure`
 /// because the operator console runs over loopback `http://` — a reverse proxy
 /// terminating TLS can re-add it.
+///
+/// Used at login/setup to establish a fresh full-length idle window. The sliding
+/// refresh on subsequent requests uses [`set_session_cookie_with_max_age`] so the
+/// browser's cookie expiry tracks the server session as the window slides (and
+/// shrinks near the absolute deadline).
 pub fn set_session_cookie(sid: &str) -> String {
-    format!("{SESSION_COOKIE}={sid}; HttpOnly; SameSite=Lax; Path=/; Max-Age={SESSION_TTL_SECS}")
+    set_session_cookie_with_max_age(sid, SESSION_TTL_SECS)
+}
+
+/// Same cookie as [`set_session_cookie`] but with an explicit `Max-Age`. The
+/// serve auth middleware emits this on a successful protected request, passing
+/// the remaining seconds reported by [`DashboardAuth::refresh_session`], so the
+/// browser keeps the cookie exactly as long as the server keeps the session.
+/// A non-positive `max_age` is clamped to `0`, which expires the cookie
+/// immediately rather than emitting a negative attribute.
+pub fn set_session_cookie_with_max_age(sid: &str, max_age: i64) -> String {
+    let max_age = max_age.max(0);
+    format!("{SESSION_COOKIE}={sid}; HttpOnly; SameSite=Lax; Path=/; Max-Age={max_age}")
 }
 
 /// Build the `Set-Cookie` value that clears the session on logout.
@@ -557,6 +664,114 @@ mod tests {
         assert!(auth.validate_session(&sid).is_none());
         // Unknown session id is rejected.
         assert!(auth.validate_session("deadbeef").is_none());
+    }
+
+    #[test]
+    fn refresh_slides_the_idle_deadline_forward() {
+        let (auth, _tmp) = auth();
+        let now = now_secs();
+        // A session that is live but about to time out (10s of idle left), with a
+        // far-off absolute ceiling.
+        auth.sessions
+            .insert_raw("sid", "ops", now + 10, now + SESSION_ABSOLUTE_MAX_SECS);
+        let max_age = auth.refresh_session("sid").expect("a live session refreshes");
+        // The returned Max-Age is the full idle window (the cap is far away).
+        assert!(
+            (max_age - SESSION_TTL_SECS).abs() <= 2,
+            "expected ~{SESSION_TTL_SECS}, got {max_age}"
+        );
+        // The stored idle deadline jumped forward to ~now + idle.
+        let (expires_at, _abs) = auth.sessions.peek("sid").unwrap();
+        assert!(
+            expires_at >= now + SESSION_TTL_SECS - 2,
+            "idle deadline must slide forward; got {expires_at}"
+        );
+        // Still a valid session after the slide.
+        assert_eq!(auth.validate_session("sid").as_deref(), Some("ops"));
+    }
+
+    #[test]
+    fn refresh_is_capped_by_the_absolute_deadline() {
+        let (auth, _tmp) = auth();
+        let now = now_secs();
+        // Live session, but the absolute ceiling is only 100s away — closer than a
+        // full idle window. The slide must clamp to the ceiling, not overshoot it.
+        let abs = now + 100;
+        auth.sessions.insert_raw("sid", "ops", now + 10, abs);
+        let max_age = auth.refresh_session("sid").expect("still live");
+        assert!(
+            max_age <= 100 && max_age > 90,
+            "refresh must clamp Max-Age to the absolute ceiling; got {max_age}"
+        );
+        let (expires_at, _abs) = auth.sessions.peek("sid").unwrap();
+        assert!(
+            expires_at <= abs,
+            "idle deadline must never exceed the absolute ceiling ({expires_at} > {abs})"
+        );
+    }
+
+    #[test]
+    fn refresh_rejects_an_idle_timed_out_session_and_prunes_it() {
+        let (auth, _tmp) = auth();
+        let now = now_secs();
+        // Idle deadline already in the past (absolute ceiling still ahead).
+        auth.sessions
+            .insert_raw("sid", "ops", now - 1, now + SESSION_ABSOLUTE_MAX_SECS);
+        assert!(
+            auth.refresh_session("sid").is_none(),
+            "an idle-expired session must not refresh"
+        );
+        // The dead entry was pruned and no longer validates.
+        assert!(auth.sessions.peek("sid").is_none());
+        assert!(auth.validate_session("sid").is_none());
+    }
+
+    #[test]
+    fn refresh_rejects_a_session_past_its_absolute_deadline() {
+        let (auth, _tmp) = auth();
+        let now = now_secs();
+        // Idle window would look open (1000s left) but the absolute ceiling has
+        // already passed — the hard cap wins and the session is dead.
+        auth.sessions.insert_raw("sid", "ops", now + 1000, now - 1);
+        assert!(
+            auth.refresh_session("sid").is_none(),
+            "the absolute ceiling must force expiry even with idle time left"
+        );
+        assert!(auth.validate_session("sid").is_none());
+    }
+
+    #[test]
+    fn validate_does_not_slide_the_idle_window() {
+        let (auth, _tmp) = auth();
+        let now = now_secs();
+        let before = now + 30;
+        auth.sessions
+            .insert_raw("sid", "ops", before, now + SESSION_ABSOLUTE_MAX_SECS);
+        // A plain validate (status poll) admits the session but leaves the idle
+        // deadline untouched — only refresh slides it.
+        assert_eq!(auth.validate_session("sid").as_deref(), Some("ops"));
+        let (after, _abs) = auth.sessions.peek("sid").unwrap();
+        assert_eq!(after, before, "validate must not move the idle deadline");
+    }
+
+    #[test]
+    fn refreshed_session_never_outlives_the_absolute_cap() {
+        let (auth, _tmp) = auth();
+        let now = now_secs();
+        // Real session minted now; its ceiling is now + absolute max.
+        let sid = auth.create_session("ops");
+        let (_e, abs) = auth.sessions.peek(&sid).unwrap();
+        assert!(
+            (abs - (now + SESSION_ABSOLUTE_MAX_SECS)).abs() <= 2,
+            "absolute deadline is set at creation"
+        );
+        // Repeated refreshes keep sliding the idle window but the ceiling is fixed.
+        for _ in 0..5 {
+            auth.refresh_session(&sid).expect("live");
+            let (expires_at, abs2) = auth.sessions.peek(&sid).unwrap();
+            assert_eq!(abs2, abs, "the absolute ceiling is immutable across refreshes");
+            assert!(expires_at <= abs2, "idle deadline stays under the ceiling");
+        }
     }
 
     #[test]
@@ -724,5 +939,21 @@ mod tests {
         assert!(!set.contains("Secure"));
         let clear = clear_session_cookie();
         assert!(clear.contains("Max-Age=0"));
+    }
+
+    #[test]
+    fn set_cookie_with_max_age_carries_that_window_and_clamps_negatives() {
+        // An explicit positive Max-Age is echoed verbatim (used by the sliding
+        // refresh to track the remaining server-side lifetime).
+        let c = set_session_cookie_with_max_age("abc123", 3600);
+        assert!(c.contains("relux_session=abc123"));
+        assert!(c.contains("HttpOnly") && c.contains("SameSite=Lax") && c.contains("Path=/"));
+        assert!(c.contains("Max-Age=3600"), "got: {c}");
+        assert!(!c.contains("Secure"));
+        // The login/setup helper still emits the full idle window.
+        assert!(set_session_cookie("abc123").contains(&format!("Max-Age={SESSION_TTL_SECS}")));
+        // A non-positive Max-Age is clamped to 0 (never a negative attribute).
+        let neg = set_session_cookie_with_max_age("abc123", -5);
+        assert!(neg.contains("Max-Age=0"), "got: {neg}");
     }
 }

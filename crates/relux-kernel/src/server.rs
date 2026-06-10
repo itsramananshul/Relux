@@ -474,6 +474,15 @@ fn auth_disabled_from_env() -> bool {
 /// carries a valid `relux_session` cookie; otherwise returns an honest 401 with
 /// `needs_setup` so the dashboard can route to the setup vs login screen. The
 /// dev/test bypass (`auth_disabled`) passes everything through.
+///
+/// **Sliding session:** on a *successful* protected response the guard slides the
+/// session's idle deadline forward and re-emits the `relux_session` cookie with a
+/// fresh `Max-Age` (capped at the absolute lifetime — see
+/// [`relux_kernel::DashboardAuth::refresh_session`]). So an actively-used console
+/// stays signed in indefinitely up to the absolute cap, while an idle one still
+/// times out. The refreshed cookie is attached **only** when the request was
+/// authenticated AND the handler returned a success status — a 401 from this
+/// guard, or a 4xx/5xx from the handler, never carries a session cookie.
 async fn require_session(
     State(state): State<AppState>,
     req: axum::extract::Request,
@@ -482,23 +491,42 @@ async fn require_session(
     if state.auth_disabled {
         return next.run(req).await;
     }
-    let authed = relux_kernel::session_cookie_from_headers(req.headers())
-        .and_then(|sid| state.dashboard_auth.validate_session(&sid))
+    // Decide admission with a NON-sliding validate (so a single request slides the
+    // window at most once, on success, below — not here).
+    let sid = relux_kernel::session_cookie_from_headers(req.headers());
+    let authed = sid
+        .as_deref()
+        .and_then(|s| state.dashboard_auth.validate_session(s))
         .is_some();
-    if authed {
-        return next.run(req).await;
+    if !authed {
+        let needs_setup = !state.dashboard_auth.admin_exists();
+        let error = if needs_setup {
+            "setup required — create the local admin account first"
+        } else {
+            "authentication required — sign in to the Relux dashboard"
+        };
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": error, "needs_setup": needs_setup })),
+        )
+            .into_response();
     }
-    let needs_setup = !state.dashboard_auth.admin_exists();
-    let error = if needs_setup {
-        "setup required — create the local admin account first"
-    } else {
-        "authentication required — sign in to the Relux dashboard"
-    };
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(serde_json::json!({ "error": error, "needs_setup": needs_setup })),
-    )
-        .into_response()
+    let mut resp = next.run(req).await;
+    // Only a successful protected response refreshes the rolling session. This
+    // keeps `Set-Cookie` off failed-handler responses and slides the server-side
+    // idle window in lock-step with the cookie the browser keeps.
+    if resp.status().is_success() {
+        if let Some(sid) = sid {
+            if let Some(max_age) = state.dashboard_auth.refresh_session(&sid) {
+                if let Ok(hv) = header::HeaderValue::from_str(
+                    &relux_kernel::set_session_cookie_with_max_age(&sid, max_age),
+                ) {
+                    resp.headers_mut().append(header::SET_COOKIE, hv);
+                }
+            }
+        }
+    }
+    resp
 }
 
 // --- Local operator login handlers -----------------------------------------
@@ -5142,5 +5170,65 @@ mod tests {
         .await;
         assert_eq!(new, StatusCode::OK);
         assert!(new_cookie.is_some(), "new password must mint a session");
+    }
+
+    #[tokio::test]
+    async fn successful_protected_request_refreshes_the_session_cookie() {
+        let (state, _dir) = auth_state(false);
+        // Setup mints the first session cookie.
+        let (_, set_cookie, _) = call(
+            &state,
+            "POST",
+            "/v1/auth/setup",
+            None,
+            Some(r#"{"username":"ops","password":"hunter2pass"}"#),
+        )
+        .await;
+        let cookie = session_pair(&set_cookie.expect("setup sets a cookie"));
+
+        // A successful protected request re-emits the cookie (rolling session).
+        let (ok, refreshed, _) =
+            call(&state, "GET", "/v1/relux/state", Some(&cookie), None).await;
+        assert_eq!(ok, StatusCode::OK);
+        let refreshed = refreshed.expect("a successful protected request refreshes the cookie");
+        // Same opaque session id (the window slides; the id is not rotated)...
+        assert_eq!(session_pair(&refreshed), cookie, "the session id must be stable");
+        // ...still HttpOnly with a positive idle Max-Age.
+        assert!(refreshed.contains("HttpOnly"), "got: {refreshed}");
+        assert!(
+            refreshed.contains(&format!("Max-Age={}", relux_kernel::SESSION_TTL_SECS)),
+            "the refreshed cookie carries the full idle window; got: {refreshed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_or_expired_protected_request_sets_no_cookie() {
+        let (state, _dir) = auth_state(false);
+        // Configure the admin so the 401 path is "needs login", not "needs setup".
+        let (_, _, _) = call(
+            &state,
+            "POST",
+            "/v1/auth/setup",
+            None,
+            Some(r#"{"username":"ops","password":"hunter2pass"}"#),
+        )
+        .await;
+        // No cookie → 401 and crucially NO Set-Cookie (a failed auth never mints
+        // or refreshes a session).
+        let (no_sess, no_cookie, _) =
+            call(&state, "GET", "/v1/relux/state", None, None).await;
+        assert_eq!(no_sess, StatusCode::UNAUTHORIZED);
+        assert!(no_cookie.is_none(), "a rejected request must not set a cookie");
+        // A bogus/expired session id → 401, still no Set-Cookie.
+        let (bad, bad_cookie, _) = call(
+            &state,
+            "GET",
+            "/v1/relux/state",
+            Some("relux_session=deadbeef"),
+            None,
+        )
+        .await;
+        assert_eq!(bad, StatusCode::UNAUTHORIZED);
+        assert!(bad_cookie.is_none(), "an invalid session must not set a cookie");
     }
 }

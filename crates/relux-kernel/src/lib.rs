@@ -40,8 +40,9 @@ pub use ai::{
 };
 pub use auth::{
     admin_path_for_db, clear_session_cookie, read_admin_username, reset_admin_credential,
-    session_cookie_from_headers, set_session_cookie, ChangePasswordError, DashboardAuth,
-    MIN_PASSWORD_LEN, SESSION_COOKIE,
+    session_cookie_from_headers, set_session_cookie, set_session_cookie_with_max_age,
+    ChangePasswordError, DashboardAuth, MIN_PASSWORD_LEN, SESSION_ABSOLUTE_MAX_SECS,
+    SESSION_COOKIE, SESSION_TTL_SECS,
 };
 pub use builtin::{is_builtin_tool, is_internal_plugin, BUILTIN_TOOLS, INTERNAL_PLUGIN_IDS};
 pub use clock::Clock;

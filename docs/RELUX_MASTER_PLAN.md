@@ -2589,10 +2589,22 @@ The API never returns the key. The dashboard shows the current AI provider/mode.
   password hash, stored at `dev-data/relux/dashboard-admin.json` next to the DB,
   gitignored, OS-restricted, **never** plaintext and never returned by the API).
   After setup, login mints an **HTTP-only** `relux_session` cookie
-  (`SameSite=Lax`, `Path=/`, 12h expiry; **no** `Secure` because the console runs
+  (`SameSite=Lax`, `Path=/`; **no** `Secure` because the console runs
   over loopback `http://` — a TLS-terminating reverse proxy can re-add it). The
   serve auth middleware protects every `/v1/relux/*` route behind a valid session;
-  the dashboard `fetch` rides the cookie automatically (no token paste). Public by
+  the dashboard `fetch` rides the cookie automatically (no token paste).
+  Sessions are **sliding/rolling**: the 12h window is an **idle timeout**, not a
+  fixed lifetime. On every *successful* protected request the middleware slides
+  the session's idle deadline forward by 12h and re-emits the cookie with a fresh
+  `Max-Age`, so an actively-used console never expires out from under the
+  operator, while one left idle for 12h still times out. A **hard absolute
+  ceiling of 7 days** (`SESSION_ABSOLUTE_MAX_SECS`) caps the rolling renewal: a
+  session can never be slid past 7 days from when it was minted, so a continuously
+  active (or stolen) cookie is forced to re-authenticate after a week. The refresh
+  is attached **only** on an authenticated request that returns a success status —
+  a 401 from the guard, or a 4xx/5xx from the handler, never carries a session
+  cookie. Status polls (`/v1/auth/status`, `/v1/auth/me`) validate **without**
+  sliding, so background polling alone does not keep a session alive. Public by
   design: the static dashboard (so the setup/login screen always renders — never a
   blank page), the public auth endpoints (`/v1/auth/status`/`setup`/`login`/
   `logout`/`me`), and `/v1/relux/health` (liveness probe). `POST
