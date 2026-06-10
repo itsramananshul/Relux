@@ -339,7 +339,12 @@ export function OrchestrationPanel() {
   );
 }
 
-function OrchestrationRow({
+// Exported for the render/DOM verification (`test/render-interrupted.test.mjs`):
+// it server-renders this row with a reconstructed-interrupted job fixture and
+// asserts the visible interrupted callout + Continue button actually appear, so a
+// regression that hides them (or a stale shipped bundle) is caught — not just the
+// pure helpers in `orchestration.ts`.
+export function OrchestrationRow({
   o,
   job,
   onRun,

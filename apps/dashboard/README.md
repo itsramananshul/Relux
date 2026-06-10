@@ -76,6 +76,38 @@ npm run build    # -> crates/relix-web-bridge/dashboard-dist/
 Then rebuild/boot the bridge as usual. Re-run `npm run build` and commit
 the regenerated `dashboard-dist/` whenever the UI changes.
 
+## Tests
+
+```sh
+cd apps/dashboard
+npm test         # node:test — pure helpers + a render/DOM verification
+```
+
+Most tests are framework-free assertions over the pure derivations in
+`src/*.ts` (run with `node --test --experimental-strip-types`). One harness,
+`test/render-interrupted.test.mjs`, additionally proves the **interrupted
+orchestration UX actually renders** (RELUX_MASTER_PLAN Sec 15) — the failure a
+user hits after a server restart, which a pure-function test cannot catch. It
+adds **no new dependencies** and needs **no browser**:
+
+- **Render path.** It transpiles the real `OrchestrationRow` with the esbuild
+  already vendored by Vite, then server-renders it through `react-dom/server`
+  + react-router's `StaticRouter` (both already present). It asserts a
+  reconstructed-`interrupted` job renders the "Run interrupted — no live worker"
+  callout, the durable progress, and a **Continue** button — and that a planned
+  plan or a live running job does **not** show that callout. So a regression
+  that hides the callout, drops Continue, or shows it for the wrong state fails
+  here.
+- **Shipped-bundle path.** It reads the committed bundle the kernel actually
+  serves (`crates/relix-web-bridge/dashboard-dist`) and asserts the `index.html`
+  asset wiring is intact and the JS bundle still carries the callout copy — so a
+  **blank/broken dashboard** (broken asset refs) or a **stale dist** (source
+  changed, bundle not rebuilt) is caught in the artifact that ships.
+
+The render path catches **source** regressions; the shipped-bundle path catches
+a **stale committed bundle** — complementary to the dist-parity gate below
+(which rebuilds and diffs the whole bundle).
+
 ## Mesh policy
 
 The dashboard's board / inbox / crew / runs pages call the coordinator's

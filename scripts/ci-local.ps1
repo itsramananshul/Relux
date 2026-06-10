@@ -53,6 +53,26 @@ $Steps = @(
         Script = { & (Join-Path $RepoRoot 'scripts/check-dashboard-dist.ps1') }
     },
     @{
+        # Dashboard unit + render/DOM tests (node:test). Fast (~0.2s) and
+        # browser-free: the pure derivations in src/*.ts PLUS
+        # test/render-interrupted.test.mjs, which server-renders the real
+        # OrchestrationRow (esbuild already vendored by Vite) to prove the
+        # interrupted callout + Continue button actually render, and asserts the
+        # committed bundle still carries that copy. Runs right after dist parity,
+        # which guarantees node_modules is installed (non-destructive).
+        Name   = 'dashboard tests (npm test: pure helpers + render/DOM verification)'
+        Script = {
+            $npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
+            if (-not $npm) { $npm = Get-Command npm -ErrorAction SilentlyContinue }
+            Push-Location (Join-Path $RepoRoot 'apps/dashboard')
+            try {
+                if ($npm) { & $npm.Source test }
+                else { Write-Host 'npm not found — dashboard tests skipped'; cmd /c exit 2 }
+            }
+            finally { Pop-Location }
+        }
+    },
+    @{
         # Serial build/test (CARGO_BUILD_JOBS=1 + --test-threads=1)
         # avoids the Windows target-dir flake where parallel rustc
         # invocations race antivirus file locks and fail the link step
@@ -102,5 +122,5 @@ if ($null -ne $Failed) {
     Write-Host "CI-LOCAL: FAIL  (first failing gate: $Failed)" -ForegroundColor Red
     exit 1
 }
-Write-Host 'CI-LOCAL: PASS  (fmt + clippy + serial test + deny + first-release live smoke all green)' -ForegroundColor Green
+Write-Host 'CI-LOCAL: PASS  (fmt + clippy + dashboard tests + serial test + deny + first-release live smoke all green)' -ForegroundColor Green
 exit 0
