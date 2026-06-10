@@ -2034,6 +2034,7 @@ impl KernelState {
             usage: None,
             cost: None,
             retried_from: None,
+            artifacts: Vec::new(),
         };
         self.runs.insert(run_id.clone(), run);
 
@@ -2454,6 +2455,20 @@ impl KernelState {
             if cost.is_some() {
                 run.cost = cost;
             }
+        }
+    }
+
+    /// Persist the read-only artifact references an adapter declared in its
+    /// structured result envelope onto the durable run record (master plan
+    /// section 9.6 / section 15). Best-effort: an unknown run id or an empty set
+    /// is a no-op (we never write an empty `artifacts` and never fabricate one).
+    /// These are *references* only - capturing them does NOT enable apply.
+    fn set_run_artifacts(&mut self, run_id: &RunId, artifacts: Vec<relux_core::RunArtifact>) {
+        if artifacts.is_empty() {
+            return;
+        }
+        if let Some(run) = self.runs.get_mut(run_id) {
+            run.artifacts = artifacts;
         }
     }
 
@@ -3498,6 +3513,7 @@ impl KernelState {
                         "is_error": parsed.is_error,
                         "cost_usd": parsed.cost_usd,
                         "num_turns": parsed.num_turns,
+                        "artifacts": parsed.artifacts.len(),
                     }),
                 );
 
@@ -3516,6 +3532,9 @@ impl KernelState {
                         parsed.usage.clone(),
                         parsed.cost_usd,
                     );
+                    // An errored envelope may still reference artifacts it
+                    // produced before failing - capture them read-only.
+                    self.set_run_artifacts(&run_id, parsed.artifacts.clone());
                     self.fail_cli_run(&run_id, task_id, namespace.as_ref(), adapter, &reason);
                     return Err(KernelError::AdapterExecutionFailed {
                         plugin: adapter.to_string(),
@@ -3530,6 +3549,7 @@ impl KernelState {
                     parsed.usage.clone(),
                     parsed.cost_usd,
                 );
+                self.set_run_artifacts(&run_id, parsed.artifacts.clone());
                 self.complete_task(task_id)?;
                 let agent = self
                     .runs
@@ -5778,6 +5798,59 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .contains("SUMMARY_TEXT_OK"));
+    }
+
+    #[test]
+    fn cli_run_captures_and_persists_artifact_references() {
+        // A CLI whose JSON envelope declares `artifacts` has those references
+        // captured read-only onto the durable run record, sanitized, and they
+        // survive a snapshot round-trip (a dashboard refresh). The adapter_output
+        // event also records the count.
+        let dir = tempfile::tempdir().unwrap();
+        let body = r#"{"type":"result","is_error":false,"result":"edited two files","artifacts":[{"name":"main.rs","type":"file","path":"src/main.rs","summary":"added a fn"},{"type":"diff","path":"/etc/passwd"}]}"#;
+        let fake = write_fake_json_cli(dir.path(), "fake-claude-arts", body);
+        let mut k = adapter_kernel();
+        enable_claude_with(&mut k, &fake);
+        let (_agent, task) = cli_task(&mut k);
+        let run_id = k.execute_assigned_run(&task).expect("adapter run ok");
+
+        let run = k.run(&run_id).unwrap();
+        assert_eq!(run.status, RunStatus::Completed);
+        assert_eq!(run.artifacts.len(), 2);
+        assert_eq!(run.artifacts[0].name, "main.rs");
+        assert_eq!(run.artifacts[0].kind, relux_core::ArtifactKind::File);
+        assert_eq!(run.artifacts[0].path.as_deref(), Some("src/main.rs"));
+        assert_eq!(run.artifacts[0].source, "claude-cli");
+        // The absolute path is dropped, but the reference is still captured.
+        assert_eq!(run.artifacts[1].path, None);
+
+        // The adapter_output event records the artifact count honestly.
+        let out_event = k
+            .run_events(&run_id)
+            .into_iter()
+            .find(|e| e.kind == "adapter_output")
+            .expect("adapter_output event");
+        assert_eq!(out_event.payload.get("artifacts").and_then(|v| v.as_u64()), Some(2));
+
+        // Survives a snapshot round-trip (durable across a refresh / restart).
+        let restored = KernelState::from_snapshot(k.snapshot());
+        let restored_run = restored.run(&run_id).unwrap();
+        assert_eq!(restored_run.artifacts.len(), 2);
+        assert_eq!(restored_run.artifacts[0].path.as_deref(), Some("src/main.rs"));
+    }
+
+    #[test]
+    fn cli_run_without_artifacts_records_none() {
+        // The honest empty state: an envelope with no `artifacts` yields an empty
+        // set (never a fabricated one).
+        let dir = tempfile::tempdir().unwrap();
+        let body = r#"{"type":"result","is_error":false,"result":"no files changed"}"#;
+        let fake = write_fake_json_cli(dir.path(), "fake-claude-noart", body);
+        let mut k = adapter_kernel();
+        enable_claude_with(&mut k, &fake);
+        let (_agent, task) = cli_task(&mut k);
+        let run_id = k.execute_assigned_run(&task).expect("adapter run ok");
+        assert!(k.run(&run_id).unwrap().artifacts.is_empty());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentId;
+use crate::artifact::RunArtifact;
 use crate::plugin::PluginId;
 use crate::task::TaskId;
 
@@ -76,4 +77,67 @@ pub struct Run {
     /// partial CLI run (master plan section 10.2 `prime.retry_run`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retried_from: Option<RunId>,
+    /// Read-only **artifact references** the adapter declared in its structured
+    /// result envelope (master plan section 9.6 / section 15). Each is a bounded,
+    /// redacted, path-sanitized reference (name/type/summary/source) — NOT a
+    /// workspace diff or an apply plan. Empty when the adapter declared none (or
+    /// emitted no structured envelope). Capturing these never enables apply: the
+    /// Relux run model still has no diff/apply, so the dashboard lists them
+    /// read-only and keeps apply unavailable. Never fabricated.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<RunArtifact>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::artifact::{ArtifactKind, RunArtifact};
+
+    fn sample_run() -> Run {
+        Run {
+            id: RunId::new("run_0001"),
+            task_id: TaskId::new("task_0001"),
+            agent_id: AgentId::new("agent_0001"),
+            adapter_plugin: PluginId::new("relux-adapter-claude-cli"),
+            status: RunStatus::Completed,
+            started_at: Some("t0".into()),
+            ended_at: Some("t1".into()),
+            summary: Some("done".into()),
+            error: None,
+            duration_ms: Some(10),
+            usage: None,
+            cost: None,
+            retried_from: None,
+            artifacts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn empty_artifacts_are_omitted_from_the_wire() {
+        let json = serde_json::to_value(sample_run()).unwrap();
+        assert!(json.get("artifacts").is_none(), "empty artifacts must be omitted");
+    }
+
+    #[test]
+    fn artifacts_round_trip_with_type_field_for_the_api() {
+        let mut run = sample_run();
+        run.artifacts = vec![RunArtifact {
+            name: "main.rs".into(),
+            kind: ArtifactKind::File,
+            summary: Some("edited".into()),
+            source: "claude-cli".into(),
+            path: Some("src/main.rs".into()),
+            bytes: Some(42),
+            truncated: false,
+        }];
+        let json = serde_json::to_value(&run).unwrap();
+        // The API flattens `Run`, so the wire carries `artifacts[].type`.
+        let arts = json.get("artifacts").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(arts.len(), 1);
+        assert_eq!(arts[0].get("type").and_then(|v| v.as_str()), Some("file"));
+        assert_eq!(arts[0].get("name").and_then(|v| v.as_str()), Some("main.rs"));
+        // Round-trips back to the same value.
+        let back: Run = serde_json::from_value(json).unwrap();
+        assert_eq!(back.artifacts, run.artifacts);
+    }
 }

@@ -6,7 +6,7 @@
 // reused without a DOM. Nothing here invents data: every helper only formats or
 // classifies what the API already recorded.
 
-import type { ReluxRun, ReluxRunDetail, ReluxRunEvent } from "./api";
+import type { ReluxRun, ReluxRunArtifact, ReluxRunDetail, ReluxRunEvent } from "./api";
 
 // The badge tone for a run status. Unknown/!terminal statuses fall back to the
 // neutral "backlog" tone rather than guessing success.
@@ -100,26 +100,96 @@ export function toolCallSummary(events: ReluxRunEvent[] | undefined | null): str
   return parts.join(" · ");
 }
 
-// The honest reason that explains why this surface offers no artifact/diff/apply
-// or accept/reject review affordance. A Relux run record carries a transcript,
-// output excerpt, and metrics — but NO workspace artifact set, diff plan, or
-// review verdict (those fields do not exist on the run). Diff/apply/review live on
-// the legacy Runs surface, which is backed by a separate run store whose ids are
-// NOT Relux run ids — so we must never link this run there or fake the controls.
-// Future-proof: if a run record ever gains a real `artifacts` field, this flips to
-// available rather than silently lying.
+// The set of known artifact-kind strings the backend emits; anything else is
+// normalized to "other" so a future/unknown type still renders honestly.
+const KNOWN_ARTIFACT_TYPES = new Set([
+  "file",
+  "diff",
+  "patch",
+  "log",
+  "url",
+  "note",
+  "other",
+]);
+
+// The read-only artifact references a run captured from its adapter result
+// envelope (master plan §9.6 / §15). Defensive: only accepts well-formed entries
+// (object with a string `name` + `type`), so a malformed payload renders nothing
+// rather than throwing. These are references — name/type/summary/source — NOT a
+// diff or an apply plan; the UI lists them read-only.
+export function runArtifacts(
+  run: ReluxRun | ReluxRunDetail | null | undefined,
+): ReluxRunArtifact[] {
+  const raw = (run as unknown as { artifacts?: unknown } | null | undefined)?.artifacts;
+  if (!Array.isArray(raw)) return [];
+  const out: ReluxRunArtifact[] = [];
+  for (const a of raw) {
+    if (!a || typeof a !== "object") continue;
+    const rec = a as Record<string, unknown>;
+    if (typeof rec.name !== "string" || typeof rec.source !== "string") continue;
+    const type =
+      typeof rec.type === "string" && KNOWN_ARTIFACT_TYPES.has(rec.type)
+        ? (rec.type as string)
+        : "other";
+    out.push({
+      name: rec.name,
+      type,
+      source: rec.source,
+      summary: typeof rec.summary === "string" ? rec.summary : undefined,
+      path: typeof rec.path === "string" ? rec.path : undefined,
+      bytes: typeof rec.bytes === "number" ? rec.bytes : undefined,
+      truncated: rec.truncated === true ? true : undefined,
+    });
+  }
+  return out;
+}
+
+// A short, human label for an artifact kind.
+export function artifactTypeLabel(type: string): string {
+  const map: Record<string, string> = {
+    file: "File",
+    diff: "Diff",
+    patch: "Patch",
+    log: "Log",
+    url: "URL",
+    note: "Note",
+    other: "Other",
+  };
+  return map[type] ?? "Other";
+}
+
+// The honest reason that apply/diff/accept-reject review is unavailable on a
+// Relux run with NO captured artifact references. A Relux run record carries a
+// transcript, output excerpt, metrics, and (when the adapter declared them)
+// read-only artifact references — but NO workspace diff plan or review verdict.
+// Diff/apply/review live on the legacy Runs surface, backed by a separate run
+// store whose ids are NOT Relux run ids — so we never link this run there or fake
+// the controls.
 export const REVIEW_APPLY_UNAVAILABLE_REASON =
-  "Relux runs are read-only execution records — a transcript, output excerpt, and metrics. " +
-  "Workspace artifacts, diff/apply, and accept/reject review are not part of the Relux run model; " +
+  "This Relux run is a read-only execution record — a transcript, output excerpt, and metrics, " +
+  "with no artifact references. Diff/apply and accept/reject review are not part of the Relux run model; " +
   "those affordances live on the legacy Runs surface, which uses a separate run store (its run ids are not Relux run ids).";
 
+// The honest reason that apply is STILL unavailable even when a run DID capture
+// artifact references: those references are read-only (name/type/summary/source),
+// not a diff or an apply plan. A safe diff/apply model for Relux runs does not
+// exist yet, so we list the references but never offer apply (and never fake it).
+export const APPLY_PENDING_DIFF_MODEL_REASON =
+  "These are read-only artifact references captured from the adapter's result envelope. " +
+  "Diff preview, apply, and accept/reject review require a Relux diff/apply model that does not exist yet — " +
+  "apply is unavailable until then. (The legacy Runs surface has apply, but its run ids are not Relux run ids.)";
+
+// Whether to offer artifact/diff/apply + accept/reject review for THIS run. Apply
+// is ALWAYS unavailable today: the Relux run model has no diff/apply, so even a
+// run that captured artifact references cannot be applied honestly. The reason
+// adapts so the UI explains the right thing (references-are-read-only vs.
+// no-data-at-all) rather than hiding it or wiring dead controls. Never returns
+// available: true until a real diff/apply model exists.
 export function reviewApplyAvailability(
   run: ReluxRunDetail,
 ): { available: boolean; reason: string } {
-  // Only claim the capability if the record actually carries an artifact set.
-  const artifacts = (run as unknown as { artifacts?: unknown }).artifacts;
-  if (Array.isArray(artifacts) && artifacts.length > 0) {
-    return { available: true, reason: "" };
+  if (runArtifacts(run).length > 0) {
+    return { available: false, reason: APPLY_PENDING_DIFF_MODEL_REASON };
   }
   return { available: false, reason: REVIEW_APPLY_UNAVAILABLE_REASON };
 }

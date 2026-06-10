@@ -3173,6 +3173,65 @@ mod tests {
         assert!(msg.contains("20000"), "got: {msg}");
     }
 
+    fn run_with(artifacts: Vec<relux_core::RunArtifact>) -> relux_core::Run {
+        relux_core::Run {
+            id: relux_core::RunId::new("run_0001"),
+            task_id: relux_core::TaskId::new("task_0001"),
+            agent_id: relux_core::AgentId::new("agent_0001"),
+            adapter_plugin: PluginId::new("relux-adapter-claude-cli"),
+            status: relux_core::RunStatus::Completed,
+            started_at: Some("t0".into()),
+            ended_at: Some("t1".into()),
+            summary: Some("done".into()),
+            error: None,
+            duration_ms: Some(10),
+            usage: None,
+            cost: None,
+            retried_from: None,
+            artifacts,
+        }
+    }
+
+    fn record_of(run: relux_core::Run) -> RunRecord {
+        RunRecord {
+            run,
+            task_title: Some("a task".into()),
+            phase: Some("run_completed".into()),
+            output_excerpt: None,
+            failure_reason: None,
+            retryable: false,
+        }
+    }
+
+    #[test]
+    fn run_record_flattens_artifacts_onto_the_detail_response() {
+        // GET /v1/relux/runs/:id returns a flattened RunRecord; an artifact-bearing
+        // run must surface `artifacts[].type` on the wire for the dashboard.
+        let run = run_with(vec![relux_core::RunArtifact {
+            name: "main.rs".into(),
+            kind: relux_core::ArtifactKind::File,
+            summary: Some("edited".into()),
+            source: "claude-cli".into(),
+            path: Some("src/main.rs".into()),
+            bytes: Some(42),
+            truncated: false,
+        }]);
+        let json = serde_json::to_value(record_of(run)).unwrap();
+        let arts = json.get("artifacts").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(arts.len(), 1);
+        assert_eq!(arts[0].get("type").and_then(|v| v.as_str()), Some("file"));
+        assert_eq!(arts[0].get("name").and_then(|v| v.as_str()), Some("main.rs"));
+        assert_eq!(arts[0].get("source").and_then(|v| v.as_str()), Some("claude-cli"));
+    }
+
+    #[test]
+    fn run_record_omits_artifacts_when_there_are_none() {
+        // The honest empty state: no `artifacts` key, so the dashboard renders the
+        // empty state rather than an empty (or fabricated) list.
+        let json = serde_json::to_value(record_of(run_with(Vec::new()))).unwrap();
+        assert!(json.get("artifacts").is_none());
+    }
+
     #[test]
     fn bind_failure_message_suggests_distinct_alt_port() {
         // When the busy port already equals the suggested alternative, suggest another.

@@ -724,6 +724,12 @@ Fields:
 - cost
 - summary
 - error
+- artifacts — read-only artifact **references** the adapter declared in its
+  structured result envelope (`artifacts: [...]`): each a bounded, redacted,
+  path-sanitized reference (name / type / summary / source, optional relative
+  path + size). These are references, **not** a workspace diff or an apply plan,
+  and capturing them does not enable apply (see section 15). Empty when the
+  adapter declared none. Never fabricated.
 
 ### 9.7 Run Event
 
@@ -2564,17 +2570,29 @@ remain, in rough priority for the next slices:
    survives a refresh. Run Detail also ports the run-depth **tool calls** field
    (§11.3) — derived honestly from the durable transcript (`toolCallSummary`
    counts real `tool_call` / `tool_call_denied` / `tool_call_failed` events, never
-   inferred) — and surfaces an **honest review/apply state**: the legacy `/runs`
-   artifact preview/diff, apply plan, and accept/reject review are **not part of
-   the Relux run model** (a relux-kernel run record carries no artifact set, diff
-   plan, or review verdict), so the panel states that (`reviewApplyAvailability`)
-   instead of hiding it or wiring dead controls — and deliberately does **not** call
+   inferred). **First real Relux run artifact model (read-only capture):** when an
+   adapter's structured result envelope declares `artifacts: [...]`, the kernel
+   now captures those as bounded, redacted, **path-sanitized references**
+   (`relux_core::capture_run_artifacts` → `Run.artifacts`, persisted on the
+   durable run record so a refresh shows them) and `GET /v1/relux/runs/:id`
+   flattens them onto the detail; the Work Run Detail lists them read-only
+   (name / type / summary / source, `runArtifacts`/`artifactTypeLabel`) with an
+   honest empty state. Safety: the count and every field are capped, secrets are
+   redacted, and an unsafe declared path (absolute / drive / UNC / `..`) is dropped
+   — the kernel never reads the underlying file. This is **capture only**: it is
+   NOT the legacy `/runs` workspace changed-file set (with a baseline hash + apply
+   plan) — the two share no ids or store. Apply stays **unavailable**: even a run
+   that captured references cannot be applied, because the Relux run model still
+   has **no diff/apply or review verdict**, so the panel says so honestly
+   (`reviewApplyAvailability` always returns `available:false`; the reason adapts —
+   references-are-read-only vs. no-data-at-all) and deliberately does **not** call
    the legacy `/v1/runs/:id/{artifacts,diff,apply,review}` endpoints, because those
-   ids belong to the separate `brief_runs` ledger. What is still **not** done: live
-   event streaming (the page polls/refreshes a synchronous run rather than tailing
-   it) and resuming a *partial* CLI run (retry is a new attempt); artifact/diff/apply
-   and review remain legacy-`/runs`-only until the Relux run model records workspace
-   artifacts. Execution-environment runtimes are not implemented.
+   ids belong to the separate `brief_runs` ledger. What is still **not** done: a
+   Relux diff/apply model and accept/reject review (the next slice — the captured
+   references define the contract for it); live event streaming (the page
+   polls/refreshes a synchronous run rather than tailing it); and resuming a
+   *partial* CLI run (retry is a new attempt). Execution-environment runtimes are
+   not implemented.
 4. **Multi-agent autonomy.** *(First slice addressed post-v0.1.2; depth slice
    added after.)* See "Orchestration (First Multi-Agent Slice)" below. Prime can
    decompose a multi-step goal into role-typed **briefs assigned to different

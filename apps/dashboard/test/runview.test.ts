@@ -11,6 +11,9 @@ import {
   toolCallSummary,
   reviewApplyAvailability,
   REVIEW_APPLY_UNAVAILABLE_REASON,
+  APPLY_PENDING_DIFF_MODEL_REASON,
+  runArtifacts,
+  artifactTypeLabel,
 } from "../src/runview.ts";
 
 // The Work page's run-depth view must read HONESTLY: it only formats/classifies
@@ -88,23 +91,66 @@ test("toolCallSummary counts only real tool events, and is null when there are n
   );
 });
 
-test("reviewApplyAvailability is honestly unavailable for a plain Relux run", () => {
+test("reviewApplyAvailability is honestly unavailable for a Relux run with no artifacts", () => {
   const base = { id: "r", task_id: "t", agent_id: "a", adapter_plugin: "p", status: "completed" } as any;
   const verdict = reviewApplyAvailability(base);
   assert.equal(verdict.available, false);
   assert.equal(verdict.reason, REVIEW_APPLY_UNAVAILABLE_REASON);
   // The reason must name where the capability actually lives and why ids don't cross.
-  assert.match(verdict.reason, /read-only execution records/);
+  assert.match(verdict.reason, /read-only execution record/);
   assert.match(verdict.reason, /legacy Runs surface/);
   assert.match(verdict.reason, /not Relux run ids/);
 });
 
-test("reviewApplyAvailability flips to available only when a real artifact set is present", () => {
+test("reviewApplyAvailability stays unavailable even WITH artifacts (no diff/apply model yet)", () => {
+  // Capturing read-only references must NEVER enable apply — there is no Relux
+  // diff/apply model. The reason adapts to explain the references are read-only.
   const withArtifacts = {
     id: "r", task_id: "t", agent_id: "a", adapter_plugin: "p", status: "completed",
-    artifacts: [{ rel_path: "src/main.rs" }],
+    artifacts: [{ name: "main.rs", type: "file", source: "claude-cli" }],
   } as any;
-  assert.equal(reviewApplyAvailability(withArtifacts).available, true);
-  // An empty artifact array is not a capability — stay honest.
-  assert.equal(reviewApplyAvailability({ ...withArtifacts, artifacts: [] }).available, false);
+  const verdict = reviewApplyAvailability(withArtifacts);
+  assert.equal(verdict.available, false);
+  assert.equal(verdict.reason, APPLY_PENDING_DIFF_MODEL_REASON);
+  assert.match(verdict.reason, /read-only artifact references/);
+  assert.match(verdict.reason, /apply is unavailable until then/);
+  // An empty artifact array falls back to the no-data reason.
+  assert.equal(
+    reviewApplyAvailability({ ...withArtifacts, artifacts: [] }).reason,
+    REVIEW_APPLY_UNAVAILABLE_REASON,
+  );
+});
+
+test("runArtifacts returns only well-formed references and normalizes unknown types", () => {
+  const run = {
+    id: "r", task_id: "t", agent_id: "a", adapter_plugin: "p", status: "completed",
+    artifacts: [
+      { name: "main.rs", type: "file", source: "claude-cli", path: "src/main.rs", bytes: 42 },
+      { name: "weird", type: "made-up", source: "claude-cli" }, // unknown → "other"
+      { type: "file", source: "x" },           // no name → dropped
+      { name: "no-source", type: "file" },      // no source → dropped
+      "not-an-object",                          // wrong shape → dropped
+      null,                                     // null → dropped
+    ],
+  } as any;
+  const arts = runArtifacts(run);
+  assert.equal(arts.length, 2);
+  assert.equal(arts[0].name, "main.rs");
+  assert.equal(arts[0].path, "src/main.rs");
+  assert.equal(arts[0].bytes, 42);
+  assert.equal(arts[1].type, "other"); // unknown normalized
+});
+
+test("runArtifacts is empty for a run with no artifacts or a bad shape", () => {
+  assert.deepEqual(runArtifacts(undefined), []);
+  assert.deepEqual(runArtifacts(null), []);
+  assert.deepEqual(runArtifacts({ id: "r" } as any), []);
+  assert.deepEqual(runArtifacts({ artifacts: "nope" } as any), []);
+});
+
+test("artifactTypeLabel maps known kinds and falls back to Other", () => {
+  assert.equal(artifactTypeLabel("file"), "File");
+  assert.equal(artifactTypeLabel("diff"), "Diff");
+  assert.equal(artifactTypeLabel("url"), "URL");
+  assert.equal(artifactTypeLabel("mystery"), "Other");
 });

@@ -7,6 +7,7 @@
 pub mod adapter;
 pub mod adapter_result;
 pub mod agent;
+pub mod artifact;
 pub mod approval;
 pub mod audit;
 pub mod namespace;
@@ -28,6 +29,7 @@ pub use adapter::{
 };
 pub use adapter_result::{parse_adapter_result, AdapterResultSummary};
 pub use agent::{Agent, AgentId};
+pub use artifact::{capture_run_artifacts, ArtifactKind, RunArtifact, MAX_ARTIFACTS};
 pub use approval::{Approval, ApprovalId, ApprovalStatus};
 pub use audit::{AuditEvent, AuditResult};
 pub use namespace::{Namespace, NamespaceId};

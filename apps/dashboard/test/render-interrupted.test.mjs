@@ -220,6 +220,18 @@ test("the shipped JS bundle carries the Run Detail review/apply parity affordanc
   // bundle is stale relative to the source that owns these affordances.
   assert.match(bundle, /tool call/);
   assert.match(bundle, /Review/);
-  assert.match(bundle, /read-only execution records/);
+  assert.match(bundle, /read-only execution record/);
   assert.match(bundle, /legacy Runs surface/);
+});
+
+test("the shipped JS bundle carries the read-only Run artifacts surface (no stale dist)", () => {
+  const assetsDir = join(distDir, "assets");
+  const jsFiles = readdirSync(assetsDir).filter((f) => f.endsWith(".js"));
+  const bundle = jsFiles.map((f) => readFileSync(join(assetsDir, f), "utf8")).join("\n");
+  // Run Detail now lists read-only artifact references the adapter declared, with
+  // an honest empty state and an apply-still-unavailable reason (no diff/apply
+  // model yet). These literals survive minification; absence ⇒ stale dist.
+  assert.match(bundle, /No artifacts declared for this run\./);
+  assert.match(bundle, /read-only artifact references/);
+  assert.match(bundle, /apply is unavailable until then/);
 });

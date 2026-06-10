@@ -16,6 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::artifact::{capture_run_artifacts, RunArtifact};
 use crate::AdapterKind;
 
 /// The outcome of interpreting an adapter's captured stdout.
@@ -40,6 +41,11 @@ pub struct AdapterResultSummary {
     pub usage: Option<serde_json::Value>,
     /// The envelope's self-reported duration in milliseconds, when present.
     pub duration_ms: Option<u64>,
+    /// Read-only artifact references the envelope declared (`artifacts: [...]`).
+    /// Bounded, redacted, path-sanitized references — never the file contents, a
+    /// diff, or an apply plan (master plan section 9.6 / section 15). Empty when
+    /// the envelope declared none.
+    pub artifacts: Vec<RunArtifact>,
 }
 
 impl AdapterResultSummary {
@@ -53,7 +59,19 @@ impl AdapterResultSummary {
             num_turns: None,
             usage: None,
             duration_ms: None,
+            artifacts: Vec::new(),
         }
+    }
+}
+
+/// A short, stable adapter-source label for an [`AdapterKind`], used to tag
+/// captured artifact references ("from claude-cli").
+fn adapter_source_label(kind: AdapterKind) -> &'static str {
+    match kind {
+        AdapterKind::LocalPrime => "local-prime",
+        AdapterKind::ClaudeCli => "claude-cli",
+        AdapterKind::CodexCli => "codex-cli",
+        AdapterKind::Command => "command",
     }
 }
 
@@ -61,7 +79,7 @@ impl AdapterResultSummary {
 /// summary when it is a recognized JSON result envelope, otherwise fall back to
 /// the plain text. `kind` is advisory only - the parser detects the envelope by
 /// shape, so it stays correct even if a CLI changes its flags.
-pub fn parse_adapter_result(stdout: &str, _kind: AdapterKind) -> AdapterResultSummary {
+pub fn parse_adapter_result(stdout: &str, kind: AdapterKind) -> AdapterResultSummary {
     let trimmed = stdout.trim();
     // Only attempt JSON parsing when the text actually looks like a single JSON
     // object. This avoids mis-parsing prose that merely contains braces.
@@ -102,6 +120,10 @@ pub fn parse_adapter_result(stdout: &str, _kind: AdapterKind) -> AdapterResultSu
     let num_turns = obj.get("num_turns").and_then(|v| v.as_u64());
     let usage = obj.get("usage").cloned();
     let duration_ms = obj.get("duration_ms").and_then(|v| v.as_u64());
+    // Capture any declared artifact references read-only (bounded, redacted,
+    // path-sanitized). Only from a recognized envelope - an arbitrary JSON blob
+    // never reaches here. Never reads the filesystem.
+    let artifacts = capture_run_artifacts(obj.get("artifacts"), adapter_source_label(kind));
 
     AdapterResultSummary {
         structured: true,
@@ -111,6 +133,7 @@ pub fn parse_adapter_result(stdout: &str, _kind: AdapterKind) -> AdapterResultSu
         num_turns,
         usage,
         duration_ms,
+        artifacts,
     }
 }
 
@@ -178,6 +201,40 @@ mod tests {
         let s = parse_adapter_result(stdout, AdapterKind::Command);
         assert!(!s.structured);
         assert_eq!(s.text, stdout);
+    }
+
+    #[test]
+    fn envelope_captures_artifact_references() {
+        let stdout = r#"{
+            "type": "result",
+            "result": "Edited two files.",
+            "artifacts": [
+                { "name": "main.rs", "type": "file", "path": "src/main.rs", "summary": "added a fn" },
+                { "type": "diff", "path": "/abs/should/drop" }
+            ]
+        }"#;
+        let s = parse_adapter_result(stdout, AdapterKind::ClaudeCli);
+        assert!(s.structured);
+        assert_eq!(s.artifacts.len(), 2);
+        assert_eq!(s.artifacts[0].name, "main.rs");
+        assert_eq!(s.artifacts[0].source, "claude-cli");
+        assert_eq!(s.artifacts[0].path.as_deref(), Some("src/main.rs"));
+        // The absolute path is dropped, but the reference is still captured.
+        assert_eq!(s.artifacts[1].path, None);
+    }
+
+    #[test]
+    fn plain_text_has_no_artifacts() {
+        let s = parse_adapter_result("just prose", AdapterKind::CodexCli);
+        assert!(s.artifacts.is_empty());
+    }
+
+    #[test]
+    fn envelope_without_artifacts_is_empty_not_fabricated() {
+        let stdout = r#"{"type":"result","result":"ok"}"#;
+        let s = parse_adapter_result(stdout, AdapterKind::ClaudeCli);
+        assert!(s.structured);
+        assert!(s.artifacts.is_empty());
     }
 
     #[test]

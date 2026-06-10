@@ -9,6 +9,39 @@ once a stable release is cut.
 
 ### Added
 
+- **First real Relux run artifact model — read-only reference capture (master
+  plan §9.6 / §15).** A Relux run can now record the **artifact references** an
+  adapter declares in its structured result envelope, closing the gap where the
+  run model carried no artifacts so review/apply could not be honestly built.
+  This slice is deliberately **capture-only, never apply.** (1) **Parser** —
+  `relux_core::capture_run_artifacts` reads an envelope's `artifacts: [...]`
+  (objects or bare-string names) into bounded `RunArtifact` references
+  (`name` / `type` ∈ file·diff·patch·log·url·note·other / `summary` / `source` +
+  optional sanitized relative `path` + `bytes`); `parse_adapter_result` captures
+  them only from a recognized envelope (an arbitrary JSON blob never qualifies)
+  and tags each with the adapter source label. **Safety:** count capped
+  (`MAX_ARTIFACTS = 64`) and every field capped, secrets redacted, and an unsafe
+  declared path (absolute / Windows drive / UNC / `..` traversal) is **dropped**
+  while the reference is still kept — the kernel **never reads the underlying
+  file**. (2) **Persistence** — `Run.artifacts` is set on the durable run record
+  on both completion and an `is_error` envelope failure, survives a snapshot
+  round-trip (a dashboard refresh / restart), and the `adapter_output` transcript
+  event records the captured count. (3) **API** — `GET /v1/relux/runs/:id`
+  flattens `artifacts` onto the detail when present, omits the key entirely when
+  empty (an honest empty state). (4) **Dashboard** — Run Detail gains a read-only
+  **Artifacts** table (name / type / summary / source, with the sanitized path and
+  size) plus an empty state; **apply stays unavailable** — `reviewApplyAvailability`
+  now always returns `available:false` (capturing references does **not** enable
+  apply; there is still no Relux diff/apply or review verdict), with the reason
+  adapting between references-are-read-only and no-data-at-all. (5) **Tests** —
+  parser (capture, unknown-type→other, traversal/absolute/UNC drop, count + field
+  caps, secret redaction, bare-string, non-array), kernel persistence + snapshot
+  round-trip driven by a **fake CLI emitting a structured envelope with artifact
+  refs** (the integration smoke), API `RunRecord` flatten + empty-state omission,
+  the dashboard `runArtifacts`/`reviewApplyAvailability`/`artifactTypeLabel`
+  helpers, and a stale-dist bundle guard for the new copy. **Next slice:** the
+  captured references define the contract for a real Relux diff/apply + review
+  model; this slice does not build it (and never fakes it).
 - **Relux local release v0.1.3 (Windows bundle).** The `relux-kernel` /
   `relux-core` crates move from `0.1.2` to `0.1.3` for the first build that turns
   Prime from a single local task runner into a governed **multi-agent

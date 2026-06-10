@@ -13,6 +13,8 @@ import {
   eventPayloadPreview,
   toolCallSummary,
   reviewApplyAvailability,
+  runArtifacts,
+  artifactTypeLabel,
 } from "../runview";
 
 // Relux Work page: standalone surface for tasks and runs.
@@ -456,6 +458,10 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
   // THIS run. Relux run records carry none of that data, so we surface the reason
   // instead of hiding it or wiring dead buttons.
   const reviewApply = run ? reviewApplyAvailability(run) : null;
+  // Read-only artifact references the adapter declared in its result envelope
+  // (§9.6 / §15). These are references (name/type/summary/source), NOT a diff or
+  // an apply plan — we list them but apply stays unavailable (see reviewApply).
+  const artifacts = run ? runArtifacts(run) : [];
 
   return (
     <div style={{ paddingBottom: 16 }}>
@@ -563,10 +569,53 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
           ) : (
             <div className="empty sm">No events found for this run.</div>
           )}
-          {/* Artifact/diff/apply and accept/reject review are legacy-Runs-only
-              affordances. Relux run records carry none of that data, so we state
-              that honestly rather than hiding it or rendering dead controls. If a
-              run ever grows a real artifact set, reviewApplyAvailability flips. */}
+          {/* Read-only artifact references the adapter declared in its result
+              envelope. References only (name/type/summary/source) — no diff, no
+              apply. Rendered when present; otherwise an honest empty state. */}
+          <h5 style={{ marginTop: 16, marginBottom: 8 }}>Artifacts</h5>
+          {artifacts.length > 0 ? (
+            <div className="table-scroll" style={{ maxHeight: 240 }}>
+              <table className="table sm">
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Type</th>
+                    <th>Summary</th>
+                    <th>Source</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {artifacts.map((a, i) => (
+                    <tr key={`${a.name}-${i}`}>
+                      <td className="mono" style={{ fontSize: 11 }}>
+                        {a.name}
+                        {a.path && a.path !== a.name && (
+                          <div className="muted" style={{ fontSize: 10 }}>{a.path}</div>
+                        )}
+                      </td>
+                      <td>
+                        {artifactTypeLabel(a.type)}
+                        {typeof a.bytes === "number" && (
+                          <div className="muted" style={{ fontSize: 10 }}>{a.bytes} B</div>
+                        )}
+                      </td>
+                      <td className="muted" style={{ fontSize: 11 }}>
+                        {a.summary ?? "—"}
+                        {a.truncated && <span title="truncated"> …</span>}
+                      </td>
+                      <td className="muted" style={{ fontSize: 11 }}>{a.source}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <div className="empty sm">No artifacts declared for this run.</div>
+          )}
+          {/* Apply/diff and accept/reject review are NOT part of the Relux run
+              model (no diff/apply exists yet). Even when artifact references are
+              captured above, apply stays unavailable — we state why honestly
+              rather than hiding it or wiring dead controls. */}
           <h5 style={{ marginTop: 16, marginBottom: 8 }}>Review &amp; Apply</h5>
           {reviewApply && !reviewApply.available && (
             <div className="banner" style={{ fontSize: 11, lineHeight: 1.5 }}>

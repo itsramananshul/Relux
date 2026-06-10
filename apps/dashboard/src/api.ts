@@ -1699,6 +1699,29 @@ export interface ReluxAgent {
   created_at: string;
 }
 
+// One read-only artifact reference captured from an adapter's structured result
+// envelope (master plan §9.6 / §15). This is a REFERENCE the adapter declared —
+// name/type/summary/source (+ optional sanitized relative path + size) — NOT a
+// workspace diff or an apply plan. Relux records it read-only and never reads the
+// underlying file; capturing references does NOT enable apply (the Relux run
+// model still has no diff/apply). Distinct from the legacy `RunArtifact`.
+export interface ReluxRunArtifact {
+  name: string;
+  // "file" | "diff" | "patch" | "log" | "url" | "note" | "other" — unknown kinds
+  // degrade to "other" on the backend.
+  type: string;
+  summary?: string;
+  // The adapter that produced the reference, e.g. "claude-cli".
+  source: string;
+  // A sanitized, relative path. Absent when none was declared or the declared
+  // path was unsafe (absolute / drive / UNC / `..`) and was dropped.
+  path?: string;
+  // Reported size in bytes, display-only.
+  bytes?: number;
+  // True when a captured field was truncated to its cap.
+  truncated?: boolean;
+}
+
 export interface ReluxRun {
   id: string;
   task_id: string;
@@ -1719,6 +1742,8 @@ export interface ReluxRun {
   cost?: number;
   // When this run was created by retrying an earlier run, that run's id.
   retried_from?: string;
+  // Read-only artifact references the adapter declared. Absent/empty when none.
+  artifacts?: ReluxRunArtifact[];
 }
 
 // One Relux run-transcript event from `/v1/relux/runs/:id/events`. This is the
