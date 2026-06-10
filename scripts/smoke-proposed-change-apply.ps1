@@ -89,7 +89,25 @@ $tests = @(
     'change_set_rename_dest_conflict_leaves_everything_untouched',
     'change_set_refuses_overlapping_rename_and_create_targets',
     'change_set_rolls_back_a_rename_on_a_later_write_failure',
-    'cli_run_captures_a_rename_and_apply_moves_the_file_end_to_end'
+    'cli_run_captures_a_rename_and_apply_moves_the_file_end_to_end',
+    # Delete action — removes an existing baseline file within the same transaction
+    # safety model (RELUX_MASTER_PLAN §15): the target must be a regular file
+    # matching its baseline (no dirs/symlinks, no force), a delete cannot overlap
+    # another change's path, and a mixed delete+replace+create set applies / rolls
+    # back atomically (a rolled-back delete is recreated from its captured bytes).
+    # Includes a fake-CLI envelope with ONE delete.
+    'delete_from_workspace_removes_file_when_baseline_matches',
+    'delete_from_workspace_refuses_on_baseline_conflict_and_leaves_file',
+    'delete_from_workspace_refuses_missing_target',
+    'delete_from_workspace_refuses_a_directory',
+    'review_then_apply_delete_removes_the_file',
+    'apply_delete_refuses_without_a_baseline_hash',
+    'apply_delete_on_a_changed_file_refuses_as_conflict_and_leaves_it',
+    'change_set_mixes_delete_replace_and_create_atomically',
+    'change_set_refuses_delete_and_replace_of_the_same_path',
+    'change_set_refuses_a_delete_baseline_conflict_and_leaves_everything',
+    'change_set_rolls_back_a_delete_on_a_later_write_failure',
+    'cli_run_captures_a_delete_and_apply_removes_the_file_end_to_end'
 )
 foreach ($t in $tests) {
     $out = & cargo test -p relux-kernel --lib $t 2>$null | Out-String

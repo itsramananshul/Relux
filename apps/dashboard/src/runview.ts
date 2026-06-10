@@ -170,7 +170,7 @@ const KNOWN_CHANGE_STATUSES = new Set(["proposed", "approved", "rejected", "appl
 
 // The set of known proposed-change actions; anything else (or absent) normalizes
 // to "replace" so older records and unknown future actions still render honestly.
-const KNOWN_CHANGE_ACTIONS = new Set(["replace", "create", "rename"]);
+const KNOWN_CHANGE_ACTIONS = new Set(["replace", "create", "rename", "delete"]);
 
 // The reviewable proposed file changes a run captured from its adapter result
 // envelope (master plan §15 / §9.6). Defensive: only accepts well-formed entries
@@ -220,10 +220,11 @@ export function runProposedChanges(
 }
 
 // A short, human label for a proposed-change action ("replace" / "create" /
-// "rename"). Anything unrecognized reads as "Replace" (the default parser value).
+// "rename" / "delete"). Anything unrecognized reads as "Replace" (the default).
 export function proposedChangeActionLabel(action: string | undefined): string {
   if (action === "create") return "Create";
   if (action === "rename") return "Rename";
+  if (action === "delete") return "Delete";
   return "Replace";
 }
 
@@ -237,6 +238,12 @@ export function isCreateProposedChange(change: ReluxProposedChange): boolean {
 // and, like a replace, needs the source baseline to apply.
 export function isRenameProposedChange(change: ReluxProposedChange): boolean {
   return change.action === "rename";
+}
+
+// Whether this change removes a file (a delete). A delete carries no new content
+// and, like a replace, needs the source baseline to apply.
+export function isDeleteProposedChange(change: ReluxProposedChange): boolean {
+  return change.action === "delete";
 }
 
 // A "source → destination" label for a rename, or just the path for a
@@ -277,9 +284,9 @@ export function canReviewProposedChange(change: ReluxProposedChange): boolean {
 }
 
 // Whether an operator can apply this change from the UI: it must be `approved`,
-// and a `replace` or `rename` additionally needs a baseline hash (apply refuses
-// without one in v1). A `create` needs no baseline (there is no prior file). The
-// backend re-checks everything; this just avoids offering a dead button.
+// and a `replace`, `rename`, or `delete` additionally needs a baseline hash (apply
+// refuses without one in v1). A `create` needs no baseline (there is no prior
+// file). The backend re-checks everything; this just avoids offering a dead button.
 export function canApplyProposedChange(change: ReluxProposedChange): boolean {
   if (change.status !== "approved") return false;
   if (isCreateProposedChange(change)) return true;

@@ -21,6 +21,7 @@ import {
   proposedChangeActionLabel,
   isCreateProposedChange,
   isRenameProposedChange,
+  isDeleteProposedChange,
   proposedChangePathLabel,
   canReviewProposedChange,
   canApplyProposedChange,
@@ -755,7 +756,12 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
                       {proposedChangeStatusLabel(c.status)}
                     </span>
                     <span className="muted" style={{ fontSize: 10 }}>
-                      {isRenameProposedChange(c) ? "move" : `${c.bytes} B`} · {c.source}
+                      {isRenameProposedChange(c)
+                        ? "move"
+                        : isDeleteProposedChange(c)
+                          ? "delete"
+                          : `${c.bytes} B`}{" "}
+                      · {c.source}
                     </span>
                     <div className="spacer" style={{ flex: 1 }} />
                     {canReviewProposedChange(c) && (
@@ -786,7 +792,9 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
                               ? "Create the new file in the run's workspace root"
                               : isRenameProposedChange(c)
                                 ? "Move the file to its destination in the run's workspace root"
-                                : "Write the new content into the run's workspace root"
+                                : isDeleteProposedChange(c)
+                                  ? "Delete the file from the run's workspace root"
+                                  : "Write the new content into the run's workspace root"
                             : "Apply needs a baseline hash (none was recorded)"
                         }
                         onClick={() => void applyChange(i)}
@@ -804,6 +812,17 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
                       <div className="muted" style={{ fontSize: 10, marginTop: 4 }}>
                         Move — applied only if {c.dest_path ?? "the destination"} does not already
                         exist and the source still matches its baseline.
+                      </div>
+                      {!c.baseline_sha256 && (
+                        <div className="muted" style={{ fontSize: 10, marginTop: 4 }}>
+                          No baseline hash — apply is refused (no force in v1).
+                        </div>
+                      )}
+                    </>
+                  ) : isDeleteProposedChange(c) ? (
+                    <>
+                      <div className="muted" style={{ fontSize: 10, marginTop: 4 }}>
+                        Delete — the file is removed only if it still matches its baseline.
                       </div>
                       {!c.baseline_sha256 && (
                         <div className="muted" style={{ fontSize: 10, marginTop: 4 }}>
@@ -834,10 +853,15 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
                     </div>
                   )}
                   {/* Read-only preview of the full proposed content. A rename moves
-                      the file intact, so it has no new content to preview. */}
+                      the file intact and a delete removes it, so neither has new
+                      content to preview. */}
                   {isRenameProposedChange(c) ? (
                     <div className="muted" style={{ fontSize: 10, marginTop: 6 }}>
                       No content change — the file is moved intact.
+                    </div>
+                  ) : isDeleteProposedChange(c) ? (
+                    <div className="muted" style={{ fontSize: 10, marginTop: 6 }}>
+                      No content — the file is removed.
                     </div>
                   ) : (
                     <details style={{ marginTop: 6 }}>

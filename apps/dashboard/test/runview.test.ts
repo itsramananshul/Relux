@@ -21,6 +21,7 @@ import {
   proposedChangeActionLabel,
   isCreateProposedChange,
   isRenameProposedChange,
+  isDeleteProposedChange,
   proposedChangePathLabel,
   canReviewProposedChange,
   canApplyProposedChange,
@@ -177,25 +178,29 @@ test("runProposedChanges parses the action field and normalizes unknown/absent t
     proposed_changes: [
       { path: "new.txt", action: "create", new_content: "hi", new_sha256: "h", bytes: 2, source: "x", status: "proposed" },
       { path: "old.txt", action: "replace", new_content: "yo", new_sha256: "h", bytes: 2, source: "x", status: "proposed", baseline_sha256: "b" },
-      { path: "weird.txt", action: "delete", new_content: "z", new_sha256: "h", bytes: 1, source: "x", status: "proposed" }, // unknown → replace
+      { path: "weird.txt", action: "purge", new_content: "z", new_sha256: "h", bytes: 1, source: "x", status: "proposed" }, // unknown → replace
       { path: "legacy.txt", new_content: "q", new_sha256: "h", bytes: 1, source: "x", status: "proposed" }, // absent → replace
       { path: "old.rs", action: "rename", dest_path: "new.rs", new_content: "", new_sha256: "h", bytes: 0, source: "x", status: "proposed", baseline_sha256: "b" },
+      { path: "dead.rs", action: "delete", new_content: "", new_sha256: "h", bytes: 0, source: "x", status: "proposed", baseline_sha256: "b" },
     ],
   } as any;
   const cs = runProposedChanges(run);
-  assert.equal(cs.length, 5);
+  assert.equal(cs.length, 6);
   assert.equal(cs[0].action, "create");
   assert.equal(cs[1].action, "replace");
   assert.equal(cs[2].action, "replace"); // unknown normalized
   assert.equal(cs[3].action, "replace"); // absent normalized
   assert.equal(cs[4].action, "rename");
   assert.equal(cs[4].dest_path, "new.rs"); // destination is carried through
+  assert.equal(cs[5].action, "delete");
+  assert.equal(cs[5].dest_path, undefined); // a delete has no destination
 });
 
-test("proposedChangeActionLabel and isCreate/isRename classify the action honestly", () => {
+test("proposedChangeActionLabel and isCreate/isRename/isDelete classify the action honestly", () => {
   assert.equal(proposedChangeActionLabel("create"), "Create");
   assert.equal(proposedChangeActionLabel("replace"), "Replace");
   assert.equal(proposedChangeActionLabel("rename"), "Rename");
+  assert.equal(proposedChangeActionLabel("delete"), "Delete");
   assert.equal(proposedChangeActionLabel(undefined), "Replace");
   assert.equal(proposedChangeActionLabel("zzz"), "Replace");
   assert.equal(isCreateProposedChange({ action: "create" } as any), true);
@@ -203,6 +208,9 @@ test("proposedChangeActionLabel and isCreate/isRename classify the action honest
   assert.equal(isCreateProposedChange({} as any), false); // missing → replace
   assert.equal(isRenameProposedChange({ action: "rename" } as any), true);
   assert.equal(isRenameProposedChange({ action: "replace" } as any), false);
+  assert.equal(isDeleteProposedChange({ action: "delete" } as any), true);
+  assert.equal(isDeleteProposedChange({ action: "replace" } as any), false);
+  assert.equal(isDeleteProposedChange({ action: "rename" } as any), false);
 });
 
 test("proposedChangePathLabel shows source → destination only for a rename", () => {
@@ -223,6 +231,11 @@ test("proposedChangePathLabel shows source → destination only for a rename", (
     proposedChangePathLabel({ action: "create", path: "new.rs" } as any),
     "new.rs",
   );
+  // A delete shows just its path (no destination).
+  assert.equal(
+    proposedChangePathLabel({ action: "delete", path: "dead.rs" } as any),
+    "dead.rs",
+  );
 });
 
 test("canApply gates a rename on approval AND a source baseline (like a replace)", () => {
@@ -231,6 +244,14 @@ test("canApply gates a rename on approval AND a source baseline (like a replace)
   assert.equal(canApplyProposedChange(mkRename("approved", "abc")), true);
   assert.equal(canApplyProposedChange(mkRename("approved")), false); // no baseline → not applyable
   assert.equal(canApplyProposedChange(mkRename("proposed", "abc")), false);
+});
+
+test("canApply gates a delete on approval AND a source baseline (like a replace)", () => {
+  const mkDelete = (status: string, baseline?: string) =>
+    ({ path: "dead", action: "delete", new_content: "", new_sha256: "h", bytes: 0, source: "x", status, baseline_sha256: baseline }) as any;
+  assert.equal(canApplyProposedChange(mkDelete("approved", "abc")), true);
+  assert.equal(canApplyProposedChange(mkDelete("approved")), false); // no baseline → not applyable
+  assert.equal(canApplyProposedChange(mkDelete("proposed", "abc")), false);
 });
 
 test("runProposedChanges is empty for a run with none or a bad shape", () => {

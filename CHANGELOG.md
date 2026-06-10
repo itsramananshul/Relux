@@ -9,6 +9,53 @@ once a stable release is cut.
 
 ### Added
 
+- **Safe `delete`/remove action for proposed changes (master plan §15 / §9.6).**
+  Extends the proposed-change model with a fourth action that removes an existing
+  file: a change now carries `action: "replace"` (default), `"create"`, `"rename"`,
+  or `"delete"` (alias `"remove"`). A delete names a `path` and the **baseline
+  hash** of the file it expects to remove; it carries **no new content** and **no
+  destination**. **Backward compatible** — `action` stays a `#[serde(default)]`
+  field, so older envelopes and persisted records (replace/create/rename) are
+  unchanged. (1) **Core** — a `Delete` variant on `ProposedChangeAction`
+  (`requires_baseline()` now includes it; `has_destination()` does not); capture
+  records the source baseline like a replace, drops any declared content/destination
+  (a delete only removes the `path`), and an unsafe/excluded `path` still drops the
+  whole change. (2) **Kernel apply (the safety bar)** — a delete requires the same
+  explicit **approval**, the same strict **safe relative / excluded-path** gate, and
+  the same **workspace-root confinement** (resolve inside the canonical
+  `working_dir`, no `..`/symlink escape) as a replace; it **refuses without a
+  baseline** (no force in v1), verifies the target is an **existing regular file**
+  (never a **directory or symlink** — both are refused) that **still matches its
+  baseline** (a mismatch is an honest **conflict**, the file left untouched), and
+  then removes it (`std::fs::remove_file`). The **transactional set apply** treats a
+  delete's `path` as an occupied target — **distinct across the whole set** (a set
+  that wants `replace` + `delete`, or `rename` onto, the same path is refused as a
+  conflicting target) — validates all changes **together first** (no writes), and a
+  mid-apply fault rolls back: replaces restored, creates deleted, renames moved
+  back, and **deletes recreated** from their captured bytes (content restored as far
+  as practical — file metadata such as permissions/timestamps is **not** preserved
+  across the round-trip; the failure message is honest about an incomplete
+  rollback). (3) **API** — unchanged routes; a delete's applied result reports its
+  `path` and the **removed file's size**, a baseline conflict maps to the existing
+  `409`, structural refusals (unsafe/overlapping path, directory/symlink target, no
+  baseline) to `422`. (4) **Dashboard** — Run Detail shows the **Delete** action, a
+  "delete" marker instead of a byte count, a delete-specific helper note, and **no
+  content preview** (the file is removed). (5) **Tests** — core: delete capture with
+  a baseline + no content/destination, the `remove` alias, delete on the wire,
+  baseline-optional capture, drop on an unsafe/excluded path; kernel: delete removes
+  a file / refuses a baseline-mismatch, missing-target, directory, or (Unix)
+  symlink, end-to-end review→apply delete, a **mixed delete+replace+create set**
+  applied atomically, a delete-baseline-conflict set leaving everything untouched, a
+  **delete+replace same-path** refusal, a genuine **phase-2 rollback that recreates a
+  deleted file**, and a **fake-CLI envelope with one delete** captured, approved, and
+  applied into a temp workspace; dashboard `runview` delete parsing/label/`isDelete`
+  + delete apply-eligibility; and the PowerShell smoke
+  (`scripts/smoke-proposed-change-apply.ps1`) extended with the twelve new delete
+  kernel tests. **Caveats / still not done:** arbitrary patch/diff parsing is
+  deliberately not built (replacement is safer); a delete restores only **content**
+  on rollback, not file metadata; and the transaction is still over **one run's**
+  changes (one adapter → one workspace root). With delete modeled, the four core
+  filesystem actions (replace/create/rename/delete) are now complete.
 - **Safe `rename`/move action for proposed changes (master plan §15 / §9.6).**
   Extends the proposed-change model with a third action that relocates an existing
   file: a change now carries `action: "replace"` (default), `"create"`, or

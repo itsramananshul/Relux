@@ -2707,10 +2707,16 @@ impl KernelState {
                         change.refused_reason = None;
                     }
                 }
-                let human = if action.has_destination() {
-                    format!("renamed {rel_path} to {reported_path} ({written_bytes} bytes)")
-                } else {
-                    format!("applied proposed change to {reported_path} ({written_bytes} bytes)")
+                let human = match action {
+                    relux_core::ProposedChangeAction::Rename => {
+                        format!("renamed {rel_path} to {reported_path} ({written_bytes} bytes)")
+                    }
+                    relux_core::ProposedChangeAction::Delete => {
+                        format!("deleted {rel_path} ({written_bytes} bytes)")
+                    }
+                    _ => {
+                        format!("applied proposed change to {reported_path} ({written_bytes} bytes)")
+                    }
                 };
                 self.push_run_event(
                     run_id,
@@ -4600,10 +4606,11 @@ struct ApplySetFailure {
 }
 
 /// One proposed change handed to the pure workspace writer: the filesystem
-/// `action` (replace/create/rename), the declared relative `path` (the source for
-/// a rename), the optional `dest` (the destination for a rename; `None` otherwise),
-/// the optional `baseline` (Some for a replace/rename, None for a create), and the
-/// new `content` (empty for a rename, which moves the file intact).
+/// `action` (replace/create/rename/delete), the declared relative `path` (the
+/// source for a rename, the target for a delete), the optional `dest` (the
+/// destination for a rename; `None` otherwise), the optional `baseline` (Some for a
+/// replace/rename/delete, None for a create), and the new `content` (empty for a
+/// rename, which moves the file intact, and for a delete, which removes it).
 #[derive(Debug)]
 struct PlannedChange {
     action: relux_core::ProposedChangeAction,
@@ -4624,6 +4631,10 @@ enum RollbackPlan {
     /// The file was moved (a rename); move it back from the destination to the
     /// source. The source/destination paths live on the [`PlannedWrite`].
     RestoreRename,
+    /// The file was removed (a delete); recreate it at its original path with these
+    /// captured bytes. Content is restored as far as practical; file metadata
+    /// (permissions, timestamps) is NOT preserved across the round-trip.
+    RestoreDeleted(Vec<u8>),
 }
 
 /// One fully-validated change ready to write in a transactional apply, plus the
@@ -4678,6 +4689,13 @@ const APPLY_TARGET_MAX_BYTES: u64 = 4 * 1024 * 1024;
 ///   walk above — so `create_dir_all` cannot be redirected outside the root);
 /// - the file is placed atomically with an O_EXCL reservation (so a racing creator
 ///   loses) followed by a temp-file + rename (crash-atomic content).
+///
+/// For a **delete** (`baseline` = Some):
+/// - the target must already exist as a regular file (never a directory or symlink)
+///   whose current SHA-256 equals the declared `baseline` (else a conflict — the
+///   file is left untouched);
+/// - the file is removed (`std::fs::remove_file`); the reported size is the bytes
+///   that were removed.
 fn apply_change_to_workspace(
     workspace_root: &str,
     rel_path: &str,
@@ -4762,6 +4780,19 @@ fn apply_change_to_workspace(
                     "could not move {safe_rel} to {dest_safe_rel}: {e}"
                 )));
             }
+            Ok(original.len() as u64)
+        }
+        relux_core::ProposedChangeAction::Delete => {
+            let baseline = baseline.ok_or_else(|| {
+                refuse("internal: a delete reached the writer without a baseline".to_string())
+            })?;
+            // Target must be an existing regular file matching the baseline (a
+            // directory/symlink/missing target is refused by this check).
+            let original = verify_replace_baseline(&target, &safe_rel, baseline).map_err(lift)?;
+            if let Err(e) = std::fs::remove_file(&target) {
+                return Err(refuse(format!("could not delete {safe_rel}: {e}")));
+            }
+            // Report the size of the file that was removed.
             Ok(original.len() as u64)
         }
     }
@@ -4971,24 +5002,28 @@ fn short_hash(h: &str) -> &str {
 /// Validate a **set** of proposed changes against `workspace_root` and write them
 /// all transactionally (master plan section 15 / safety bar section 17.5). PURE
 /// of kernel state — it only touches the filesystem. Each [`PlannedChange`] is a
-/// replace (over an existing baseline file) or a create (a new file).
+/// replace (over an existing baseline file), a create (a new file), a rename (move
+/// an existing baseline file), or a delete (remove an existing baseline file).
 ///
 /// All-or-nothing in two phases:
 ///
 /// 1. **Validate all** (no writes): each path must sanitize to a safe relative
 ///    path, resolve inside the canonical root with no `..`/symlink escape, and be a
-///    distinct target (no two changes may write the same file). A **replace** must
-///    point at an existing regular file (within the apply cap) whose current
-///    SHA-256 still equals its declared baseline; its original bytes are captured
-///    so a later write failure can restore them. A **create** must point at a path
-///    that does NOT yet exist (else a conflict); its rollback is a delete. ANY
-///    failure returns before a single byte is written.
+///    distinct target (no two changes may write the same file; a rename occupies
+///    BOTH its source and destination). A **replace** or **delete** must point at an
+///    existing regular file (within the apply cap) whose current SHA-256 still
+///    equals its declared baseline; its original bytes are captured so a later write
+///    failure can restore them. A **create** must point at a path that does NOT yet
+///    exist (else a conflict); its rollback is a delete. A **rename** verifies its
+///    source like a replace and that its destination does not yet exist. ANY failure
+///    returns before a single byte is written.
 /// 2. **Write all** (replace: temp + rename; create: O_EXCL reservation + temp +
-///    rename, with parent dirs created): on the first write error the
-///    already-written files are rolled back — replaces restored to their captured
-///    originals, creates deleted — and an honest failure is returned. Because
-///    phase 1 is strict, this rollback path is essentially unreachable except for a
-///    genuine mid-apply I/O fault.
+///    rename, with parent dirs created; rename: move; delete: remove): on the first
+///    write error the already-written files are rolled back — replaces restored to
+///    their captured originals, creates deleted, renames moved back, deletes
+///    recreated from their captured bytes — and an honest failure is returned.
+///    Because phase 1 is strict, this rollback path is essentially unreachable
+///    except for a genuine mid-apply I/O fault.
 ///
 /// On success returns one `(safe_rel, bytes_written)` per change, in input order.
 fn apply_change_set_to_workspace(
@@ -5102,6 +5137,19 @@ fn apply_change_set_to_workspace(
                 dest_target = Some(d_target);
                 RollbackPlan::RestoreRename
             }
+            relux_core::ProposedChangeAction::Delete => {
+                let baseline = change.baseline.as_deref().ok_or_else(|| {
+                    refuse(format!(
+                        "internal: delete {safe_rel} reached the set writer without a baseline"
+                    ))
+                })?;
+                // Target must be an existing regular file matching the baseline; its
+                // original bytes are captured so a later write failure can restore it.
+                let original =
+                    verify_replace_baseline(&target, &safe_rel, baseline).map_err(lift)?;
+                report_bytes = original.len() as u64;
+                RollbackPlan::RestoreDeleted(original)
+            }
         };
 
         planned.push(PlannedWrite {
@@ -5174,6 +5222,12 @@ fn apply_change_set_to_workspace(
                     )),
                 }
             }
+            relux_core::ProposedChangeAction::Delete => {
+                // The target was verified in phase 1; remove it now. Its original
+                // bytes are held on the rollback plan to restore on a later failure.
+                std::fs::remove_file(&p.target)
+                    .map_err(|e| format!("could not delete {}: {e}", p.safe_rel))
+            }
         };
         if let Err(cause) = write_res {
             let rolled = rollback_writes(&written);
@@ -5187,7 +5241,9 @@ fn apply_change_set_to_workspace(
 
 /// Roll each already-written file in a failed transaction back to its pre-apply
 /// state — a replace is restored to its captured original bytes (temp + rename); a
-/// create is deleted. Returns `true` when every rollback succeeded.
+/// create is deleted; a rename is moved back to its source; a delete is recreated
+/// from its captured bytes (content only — metadata is not preserved). Returns
+/// `true` when every rollback succeeded.
 fn rollback_writes(written: &[&PlannedWrite]) -> bool {
     let mut all_ok = true;
     for (i, p) in written.iter().enumerate() {
@@ -5224,6 +5280,27 @@ fn rollback_writes(written: &[&PlannedWrite]) -> bool {
                         }
                     }
                     None => all_ok = false,
+                }
+            }
+            RollbackPlan::RestoreDeleted(original) => {
+                // The file was removed; recreate it at its source path with the
+                // captured bytes (content restored as far as practical — metadata is
+                // not preserved). The parent directory was never removed by a delete.
+                let parent = match p.target.parent() {
+                    Some(parent) => parent,
+                    None => {
+                        all_ok = false;
+                        continue;
+                    }
+                };
+                let tmp =
+                    parent.join(format!(".relux-rollback-{}-{}.tmp", std::process::id(), i));
+                if std::fs::write(&tmp, original)
+                    .and_then(|()| std::fs::rename(&tmp, &p.target))
+                    .is_err()
+                {
+                    let _ = std::fs::remove_file(&tmp);
+                    all_ok = false;
                 }
             }
         }
@@ -7507,6 +7584,107 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "x");
     }
 
+    // ── delete (master plan §15 diff/apply model) ──────────────────────────
+
+    #[test]
+    fn delete_from_workspace_removes_file_when_baseline_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("gone.txt"), "remove me").unwrap();
+        let baseline = relux_core::sha256_hex(b"remove me");
+        let n = apply_change_to_workspace(
+            dir.path().to_str().unwrap(),
+            "gone.txt",
+            relux_core::ProposedChangeAction::Delete,
+            Some(&baseline),
+            None,
+            "", // a delete carries no new content
+        )
+        .expect("delete ok");
+        // The reported bytes are the removed file's size; the file is gone.
+        assert_eq!(n, "remove me".len() as u64);
+        assert!(!dir.path().join("gone.txt").exists(), "target must be removed");
+    }
+
+    #[test]
+    fn delete_from_workspace_refuses_on_baseline_conflict_and_leaves_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("keep.txt"), "CHANGED ON DISK").unwrap();
+        let baseline = relux_core::sha256_hex(b"what the agent saw");
+        let err = apply_change_to_workspace(
+            dir.path().to_str().unwrap(),
+            "keep.txt",
+            relux_core::ProposedChangeAction::Delete,
+            Some(&baseline),
+            None,
+            "",
+        )
+        .unwrap_err();
+        assert!(err.conflict, "baseline mismatch is a conflict");
+        // The file is untouched (a delete never removes a file that moved on us).
+        assert_eq!(std::fs::read_to_string(dir.path().join("keep.txt")).unwrap(), "CHANGED ON DISK");
+    }
+
+    #[test]
+    fn delete_from_workspace_refuses_missing_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let baseline = relux_core::sha256_hex(b"x");
+        let err = apply_change_to_workspace(
+            dir.path().to_str().unwrap(),
+            "absent.txt",
+            relux_core::ProposedChangeAction::Delete,
+            Some(&baseline),
+            None,
+            "",
+        )
+        .unwrap_err();
+        // A delete needs an existing target file (a missing one is a conflict).
+        assert!(err.conflict);
+    }
+
+    #[test]
+    fn delete_from_workspace_refuses_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("adir")).unwrap();
+        let baseline = relux_core::sha256_hex(b"x");
+        let err = apply_change_to_workspace(
+            dir.path().to_str().unwrap(),
+            "adir",
+            relux_core::ProposedChangeAction::Delete,
+            Some(&baseline),
+            None,
+            "",
+        )
+        .unwrap_err();
+        // A directory is not a regular file: a structural refusal, dir left intact.
+        assert!(!err.conflict);
+        assert!(err.reason.contains("not a regular file"));
+        assert!(dir.path().join("adir").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_from_workspace_refuses_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("real.txt"), "real").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real.txt"), dir.path().join("link.txt"))
+            .unwrap();
+        let baseline = relux_core::sha256_hex(b"real");
+        let err = apply_change_to_workspace(
+            dir.path().to_str().unwrap(),
+            "link.txt",
+            relux_core::ProposedChangeAction::Delete,
+            Some(&baseline),
+            None,
+            "",
+        )
+        .unwrap_err();
+        // A symlink is rejected at path resolution (it never reaches the unlink), so
+        // the link and its target both survive.
+        assert!(!err.conflict);
+        assert!(dir.path().join("link.txt").exists());
+        assert_eq!(std::fs::read_to_string(dir.path().join("real.txt")).unwrap(), "real");
+    }
+
     /// Build a kernel + run carrying a single `rename` proposed change moving
     /// `path` -> `dest`, with the source `baseline`, under a controlled `workdir`.
     fn kernel_with_rename_change(
@@ -7564,6 +7742,76 @@ mod tests {
         assert!(!dir.path().join("new.rs").exists());
         let change = &k.run(&run_id).unwrap().proposed_changes[0];
         assert!(change.refused_reason.as_deref().unwrap().contains("baseline"));
+    }
+
+    /// Build a kernel + run carrying a single `delete` proposed change removing
+    /// `path`, with the source `baseline`, under a controlled `workdir`.
+    fn kernel_with_delete_change(
+        workdir: Option<&str>,
+        baseline: Option<String>,
+        path: &str,
+    ) -> (KernelState, RunId) {
+        let (mut k, run_id) = kernel_with_proposed_change(workdir, baseline, path, "x");
+        let change = &mut k.runs.get_mut(&run_id).unwrap().proposed_changes[0];
+        change.action = relux_core::ProposedChangeAction::Delete;
+        change.dest_path = None;
+        change.new_content = String::new();
+        change.bytes = 0;
+        change.new_sha256 = relux_core::sha256_hex(b"");
+        (k, run_id)
+    }
+
+    #[test]
+    fn review_then_apply_delete_removes_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("dead.rs"), "fn dead() {}\n").unwrap();
+        let baseline = relux_core::sha256_hex(b"fn dead() {}\n");
+        let (mut k, run_id) =
+            kernel_with_delete_change(Some(dir.path().to_str().unwrap()), Some(baseline), "dead.rs");
+        // Apply before approval is refused honestly.
+        let err = k.apply_proposed_change(&run_id, 0).unwrap_err();
+        assert!(matches!(err, KernelError::ProposedChangeNotApproved { .. }));
+        k.review_proposed_change(&run_id, 0, true, None).unwrap();
+        let applied = k.apply_proposed_change(&run_id, 0).expect("delete apply ok");
+        // The applied path is the removed file; its size is reported.
+        assert_eq!(applied.path, "dead.rs");
+        assert_eq!(applied.bytes, "fn dead() {}\n".len() as u64);
+        assert!(!dir.path().join("dead.rs").exists());
+        let change = &k.run(&run_id).unwrap().proposed_changes[0];
+        assert_eq!(change.status, relux_core::ProposedChangeStatus::Applied);
+        assert!(change.applied_at.is_some());
+    }
+
+    #[test]
+    fn apply_delete_refuses_without_a_baseline_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("dead.rs"), "x").unwrap();
+        let (mut k, run_id) =
+            kernel_with_delete_change(Some(dir.path().to_str().unwrap()), None, "dead.rs");
+        k.review_proposed_change(&run_id, 0, true, None).unwrap();
+        let err = k.apply_proposed_change(&run_id, 0).unwrap_err();
+        assert!(matches!(err, KernelError::ProposedChangeNotApplicable { .. }));
+        // The file was never removed (no force in v1).
+        assert!(dir.path().join("dead.rs").exists());
+        let change = &k.run(&run_id).unwrap().proposed_changes[0];
+        assert!(change.refused_reason.as_deref().unwrap().contains("baseline"));
+    }
+
+    #[test]
+    fn apply_delete_on_a_changed_file_refuses_as_conflict_and_leaves_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("dead.rs"), "MOVED ON US").unwrap();
+        let stale = relux_core::sha256_hex(b"what the agent saw");
+        let (mut k, run_id) =
+            kernel_with_delete_change(Some(dir.path().to_str().unwrap()), Some(stale), "dead.rs");
+        k.review_proposed_change(&run_id, 0, true, None).unwrap();
+        let err = k.apply_proposed_change(&run_id, 0).unwrap_err();
+        assert!(matches!(err, KernelError::ProposedChangeConflict { .. }));
+        // The file is untouched and the change keeps an honest reason.
+        assert_eq!(std::fs::read_to_string(dir.path().join("dead.rs")).unwrap(), "MOVED ON US");
+        let change = &k.run(&run_id).unwrap().proposed_changes[0];
+        assert_eq!(change.status, relux_core::ProposedChangeStatus::Approved);
+        assert!(change.refused_reason.as_deref().unwrap().contains("baseline mismatch"));
     }
 
     /// Build a kernel + run carrying a single `create` proposed change with no
@@ -8322,6 +8570,147 @@ mod tests {
     }
 
     #[test]
+    fn change_set_mixes_delete_replace_and_create_atomically() {
+        // One transaction: delete `drop.txt`, rewrite `keep.txt`, create `fresh.txt`.
+        // All three land together.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("drop.txt"), "delete me").unwrap();
+        std::fs::write(dir.path().join("keep.txt"), "old-keep").unwrap();
+        let changes = vec![
+            PlannedChange {
+                action: relux_core::ProposedChangeAction::Delete,
+                path: "drop.txt".to_string(),
+                dest: None,
+                baseline: Some(relux_core::sha256_hex(b"delete me")),
+                content: String::new(),
+            },
+            PlannedChange {
+                action: relux_core::ProposedChangeAction::Replace,
+                path: "keep.txt".to_string(),
+                dest: None,
+                baseline: Some(relux_core::sha256_hex(b"old-keep")),
+                content: "new-keep".to_string(),
+            },
+            PlannedChange {
+                action: relux_core::ProposedChangeAction::Create,
+                path: "fresh.txt".to_string(),
+                dest: None,
+                baseline: None,
+                content: "created".to_string(),
+            },
+        ];
+        let applied =
+            apply_change_set_to_workspace(dir.path().to_str().unwrap(), &changes).expect("ok");
+        assert_eq!(applied.len(), 3);
+        // The delete reports its own path and the removed file's size.
+        assert_eq!(applied[0], ("drop.txt".to_string(), "delete me".len() as u64));
+        assert!(!dir.path().join("drop.txt").exists());
+        assert_eq!(std::fs::read_to_string(dir.path().join("keep.txt")).unwrap(), "new-keep");
+        assert_eq!(std::fs::read_to_string(dir.path().join("fresh.txt")).unwrap(), "created");
+    }
+
+    #[test]
+    fn change_set_refuses_delete_and_replace_of_the_same_path() {
+        // One change deletes `shared.txt`; another replaces it. They occupy the same
+        // path, so the set is refused before any write — nothing is removed or
+        // rewritten. (A set that wants replace + delete the same path is refused.)
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("shared.txt"), "shared").unwrap();
+        let changes = vec![
+            PlannedChange {
+                action: relux_core::ProposedChangeAction::Delete,
+                path: "shared.txt".to_string(),
+                dest: None,
+                baseline: Some(relux_core::sha256_hex(b"shared")),
+                content: String::new(),
+            },
+            PlannedChange {
+                action: relux_core::ProposedChangeAction::Replace,
+                path: "shared.txt".to_string(),
+                dest: None,
+                baseline: Some(relux_core::sha256_hex(b"shared")),
+                content: "rewritten".to_string(),
+            },
+        ];
+        let err =
+            apply_change_set_to_workspace(dir.path().to_str().unwrap(), &changes).unwrap_err();
+        assert!(!err.conflict, "an overlapping target is a structural refusal");
+        assert!(err.reason.contains("conflicting target path"), "reason: {}", err.reason);
+        assert_eq!(std::fs::read_to_string(dir.path().join("shared.txt")).unwrap(), "shared");
+    }
+
+    #[test]
+    fn change_set_refuses_a_delete_baseline_conflict_and_leaves_everything() {
+        // The delete's target changed on disk since the proposal: the whole set is
+        // refused before any write, so the good replace is never applied either.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "old-a").unwrap();
+        std::fs::write(dir.path().join("drop.txt"), "DIFFERENT NOW").unwrap();
+        let changes = vec![
+            PlannedChange {
+                action: relux_core::ProposedChangeAction::Replace,
+                path: "a.txt".to_string(),
+                dest: None,
+                baseline: Some(relux_core::sha256_hex(b"old-a")),
+                content: "new-a".to_string(),
+            },
+            PlannedChange {
+                action: relux_core::ProposedChangeAction::Delete,
+                path: "drop.txt".to_string(),
+                dest: None,
+                baseline: Some(relux_core::sha256_hex(b"what the agent saw")),
+                content: String::new(),
+            },
+        ];
+        let err =
+            apply_change_set_to_workspace(dir.path().to_str().unwrap(), &changes).unwrap_err();
+        assert!(err.conflict, "delete baseline mismatch is a conflict");
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "old-a");
+        assert_eq!(std::fs::read_to_string(dir.path().join("drop.txt")).unwrap(), "DIFFERENT NOW");
+    }
+
+    #[test]
+    fn change_set_rolls_back_a_delete_on_a_later_write_failure() {
+        // A delete succeeds in phase 2, then a later create fails (its parent is a
+        // file). The completed delete must be rolled back: the file is recreated from
+        // its captured bytes, leaving no net change.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("drop.txt"), "bring me back").unwrap();
+        let changes = vec![
+            PlannedChange {
+                action: relux_core::ProposedChangeAction::Delete,
+                path: "drop.txt".to_string(),
+                dest: None,
+                baseline: Some(relux_core::sha256_hex(b"bring me back")),
+                content: String::new(),
+            },
+            // `blocker` is created as a FILE; then a create under `blocker/inner.txt`
+            // fails because its parent is not a directory — forcing a rollback.
+            PlannedChange {
+                action: relux_core::ProposedChangeAction::Create,
+                path: "blocker".to_string(),
+                dest: None,
+                baseline: None,
+                content: "i am a file".to_string(),
+            },
+            PlannedChange {
+                action: relux_core::ProposedChangeAction::Create,
+                path: "blocker/inner.txt".to_string(),
+                dest: None,
+                baseline: None,
+                content: "never written".to_string(),
+            },
+        ];
+        let err =
+            apply_change_set_to_workspace(dir.path().to_str().unwrap(), &changes).unwrap_err();
+        assert!(!err.conflict, "a phase-2 parent failure is a structural refusal");
+        // The delete was rolled back: the file is restored to its original content.
+        assert_eq!(std::fs::read_to_string(dir.path().join("drop.txt")).unwrap(), "bring me back");
+        assert!(!dir.path().join("blocker").exists(), "rolled-back create must be gone");
+        assert!(err.reason.contains("rolled back"));
+    }
+
+    #[test]
     fn cli_run_captures_two_proposed_changes_and_set_apply_writes_both_end_to_end() {
         // The transactional slice end-to-end: a fake CLI emits an envelope with TWO
         // proposed_changes (each a full-content replacement + correct baseline);
@@ -8431,6 +8820,41 @@ mod tests {
             std::fs::read_to_string(work.path().join("src").join("new_name.rs")).unwrap(),
             "fn thing() {}\n"
         );
+    }
+
+    #[test]
+    fn cli_run_captures_a_delete_and_apply_removes_the_file_end_to_end() {
+        // The delete slice end-to-end: a fake CLI emits an envelope with ONE
+        // `action:"delete"` (target path + the source baseline). The kernel captures
+        // it, the operator approves it, and apply removes the file inside the
+        // controlled workspace root.
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("obsolete.rs"), "fn old() {}\n").unwrap();
+        let base = relux_core::sha256_hex(b"fn old() {}\n");
+        let cli_dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            r#"{{"type":"result","is_error":false,"result":"removed it","proposed_changes":[{{"path":"obsolete.rs","action":"delete","baseline_sha256":"{base}"}}]}}"#
+        );
+        let fake = write_fake_json_cli(cli_dir.path(), "fake-claude-delete", &body);
+        let mut k = adapter_kernel();
+        enable_claude_with_workdir(&mut k, &fake, work.path().to_str().unwrap());
+        let (_agent, task) = cli_task(&mut k);
+        let run_id = k.execute_assigned_run(&task).expect("adapter run ok");
+
+        // Captured as a delete with the source baseline; the file is still present.
+        let changes = &k.run(&run_id).unwrap().proposed_changes;
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].action, relux_core::ProposedChangeAction::Delete);
+        assert_eq!(changes[0].dest_path, None);
+        assert_eq!(changes[0].new_content, "");
+        assert!(work.path().join("obsolete.rs").exists());
+
+        // Approve + apply: the file is removed.
+        k.review_proposed_change(&run_id, 0, true, None).unwrap();
+        let applied = k.apply_proposed_change(&run_id, 0).expect("delete apply ok");
+        assert_eq!(applied.path, "obsolete.rs");
+        assert_eq!(applied.bytes, "fn old() {}\n".len() as u64);
+        assert!(!work.path().join("obsolete.rs").exists());
     }
 
     #[test]

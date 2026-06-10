@@ -733,7 +733,7 @@ Fields:
 - proposed_changes — reviewable, applyable **proposed file changes** the adapter
   declared in its structured result envelope (`proposed_changes: [...]`): each a
   bounded, path-sanitized, text-only change to one file — a full-content
-  `replace`, a new-file `create`, or a `rename`/move to a `dest_path`
+  `replace`, a new-file `create`, a `rename`/move to a `dest_path`, or a `delete`
   (`path` / `action` / `dest_path?` / `new_content` / `baseline_sha256?` /
   `new_sha256` / `bytes` / `source`) with a review `status` (proposed → approved →
   applied, or rejected). Unlike
@@ -2632,26 +2632,32 @@ remain, in rough priority for the next slices:
    captures proposed changes with the safe review/apply flow. Structurally, the
    Prime chat response wire (`PrimeTurn`) carries no `proposed_changes`/`artifacts`
    field, so a proposed change can never reach the chat surface. **Apply now
-   supports three actions** (`action: "replace"` — the default and historical
-   behavior — `action: "create"`, or `action: "rename"`/`"move"`; a missing action
-   defaults to `replace` for backward compatibility): a `replace` is a full-content
+   supports four actions** (`action: "replace"` — the default and historical
+   behavior — `action: "create"`, `action: "rename"`/`"move"`, or
+   `action: "delete"`/`"remove"`; a missing action defaults to `replace` for
+   backward compatibility): a `replace` is a full-content
    replacement over an existing baseline file (a missing target is a conflict); a
    `create` adds a **new file** that must NOT already exist (an existing path is a
    conflict — never overwritten), carries **no baseline**, and creates any missing
    parent directories (each a sanitized, non-excluded, in-root component, with no
    symlink crossing) before placing the file atomically (an O_EXCL reservation +
-   temp + rename, so a racing creator never clobbers); and a `rename` **moves** an
+   temp + rename, so a racing creator never clobbers); a `rename` **moves** an
    existing baseline file from `path` to a new `dest_path` (both sanitized + root-
    confined), preserving its content (so it carries **no new content**) — it
    verifies the **source still matches its baseline** (a mismatch is a conflict),
    refuses if the **destination already exists** (a conflict) or equals the source,
-   creates any missing destination parent dirs, then moves the file. All three
+   creates any missing destination parent dirs, then moves the file; and a `delete`
+   **removes** an existing baseline file at `path` (carrying **no content** and **no
+   destination**) — it verifies the target is an **existing regular file** (never a
+   directory or symlink) that **still matches its baseline** (a mismatch is a
+   conflict), then removes it. All four
    actions share the same approval gate, path/exclusion checks, workspace-root
    confinement, transactional set-apply (validate-all-then-write-all, with creates
-   rolled back by deletion and renames moved back to their source on a mid-apply
-   fault; a rename occupies BOTH its source and destination so no two changes may
-   overlap a path), and honest 409/422 refusals. What is still **not** done: file
-   delete (replace + create + rename are modeled); arbitrary patch/diff parsing
+   rolled back by deletion, renames moved back to their source, and deletes
+   recreated from their captured bytes on a mid-apply fault; a rename occupies BOTH
+   its source and destination, and a delete occupies its target, so no two changes
+   may overlap a path), and honest 409/422 refusals. What is still **not** done:
+   arbitrary patch/diff parsing
    (deliberately not built — replacement is safer); live event streaming (the page
    polls/refreshes a synchronous run rather than tailing it); and resuming a
    *partial* CLI run (retry is a new attempt). Execution-environment runtimes are
