@@ -281,7 +281,9 @@ An **Adapter** plugin decides how an assigned task runs. The bundled
 adds bundled adapters that drive a **local coding-agent CLI** you already have
 installed:
 
-- `relux-adapter-claude-cli` &rarr; runs `claude -p --permission-mode default`
+- `relux-adapter-claude-cli` &rarr; runs `claude -p --permission-mode default
+  --output-format json` (the JSON envelope is parsed into an honest summary + cost/
+  usage; it is not a bypass/danger flag)
 - `relux-adapter-codex-cli` &rarr; runs `codex exec`
 - any other Adapter plugin can be driven as a **generic command** by configuring
   an explicit binary.
@@ -346,6 +348,52 @@ Enable/Disable control and the clear note that *Relux will run this local CLI wh
 an assigned task starts*. On the **Work** page, the "Run (Assigned)" action now
 dispatches through the assigned agent's adapter, and the run detail shows the
 adapter's (redacted) output or the honest failure reason.
+
+### Adapter run depth (what a run records, where to see it, retry)
+
+Every adapter run is recorded so you can understand and recover it after the fact
+&mdash; nothing shown is fabricated; it all comes from the durable transcript.
+
+What a run records:
+
+- A **lifecycle transcript**: `run_started` &rarr; `adapter_spawn` &rarr;
+  `adapter_output` &rarr; `run_completed` / `run_failed`, each a durable, redacted,
+  capped event.
+- A **real measured `duration_ms`** (the actual wall time of the subprocess) and an
+  honest status with a clear **failure reason** when it fails.
+- The adapter's **(redacted, capped) stdout/stderr** on the `adapter_output` event,
+  plus a bounded **output excerpt** on the run header. Secrets are scrubbed and big
+  logs are capped &mdash; no secrets and no unbounded logs are ever stored.
+- **Structured metrics when the CLI reports them.** The Claude adapter runs with
+  `--output-format json`; Relux parses that result envelope into a human summary
+  plus `usage` and `cost`, and treats an envelope `is_error` as a failure *even on
+  a clean exit*. Codex and generic commands surface their plain text honestly (no
+  invented metrics).
+
+Where to see it:
+
+- **Dashboard &rarr; Work &rarr; Recent Runs &rarr; Inspect.** The Run Detail panel
+  shows the adapter, status, current/last phase, real duration, cost/usage (when
+  present), the output excerpt, the failure reason, and the full transcript. A panel
+  left open during a long run polls and refreshes the *real* recorded state (there
+  is no fake/streamed progress yet).
+- **API:** `GET /v1/relux/runs`, `GET /v1/relux/runs/:id` (carries the derived
+  `phase` / `duration_ms` / `output_excerpt` / `failure_reason` / `retryable` /
+  `cost` / `usage`), and `GET /v1/relux/runs/:id/events`.
+
+Retry a failed run:
+
+- A failed run is **retryable** as a *fresh* run on the **same task** &mdash; this is
+  a new attempt, not a resume of a partial CLI run. It re-runs through the same safe
+  gating (enabled runtime, binary on PATH, permission check) and records its lineage
+  (`retried_from`).
+- **Dashboard:** the Run Detail panel shows a **Retry** button on a failed run.
+- **API:** `POST /v1/relux/runs/:id/retry` &rarr; `{ "run_id": "..." }`.
+- **CLI:** `relux-kernel task retry-run <run_id>`.
+
+Caveats: execution is synchronous (no live event streaming yet, so the UI
+polls/refreshes); only the Claude adapter emits structured metrics today; a retry
+is a new attempt rather than a resume.
 
 ### Bundled plugins refresh idempotently (no reset needed)
 

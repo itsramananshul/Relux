@@ -83,6 +83,8 @@ pub enum KernelError {
     UnknownRun(String),
     #[error("no active run found for task: {0}")]
     NoActiveRun(String),
+    #[error("run {run} is not retryable (status {status}); only failed runs can be retried")]
+    RunNotRetryable { run: String, status: String },
     #[error("unknown approval: {0}")]
     UnknownApproval(String),
     #[error("task {0} has no assigned agent")]

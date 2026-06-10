@@ -1,7 +1,16 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import { useLocation } from "react-router-dom";
-import { reluxWork, reluxAudit, type ReluxTask, type ReluxRun, type ReluxAgent, type ReluxTaskDetail, type ReluxRunDetail, type ReluxAuditEntry, type RunEvent } from "../api";
+import { reluxWork, reluxAudit, type ReluxTask, type ReluxRun, type ReluxAgent, type ReluxTaskDetail, type ReluxRunDetail, type ReluxAuditEntry, type ReluxRunEvent } from "../api";
 import { useAsync } from "../components/common";
+import {
+  runStatusTone,
+  formatRunDuration,
+  canRetryRun,
+  runMetricsLine,
+  phaseLabel,
+  isRunInFlight,
+  eventPayloadPreview,
+} from "../runview";
 
 // Relux Work page: standalone surface for tasks and runs.
 // BACKED BY: /v1/relux/tasks, /v1/relux/runs.
@@ -127,7 +136,14 @@ export function Work() {
                   <TaskDetailPanel taskId={selectedTaskId} onClose={() => setSelectedTaskId(null)} />
                 )}
                 {selectedRunId && (
-                  <RunDetailPanel runId={selectedRunId} onClose={() => setSelectedRunId(null)} />
+                  <RunDetailPanel
+                    runId={selectedRunId}
+                    onClose={() => setSelectedRunId(null)}
+                    onRetried={(newRunId) => {
+                      handleReload();
+                      setSelectedRunId(newRunId);
+                    }}
+                  />
                 )}
               </div>
             )}
@@ -150,13 +166,20 @@ export function Work() {
                     <tbody>
                       {[...runs].reverse().map(run => (
                         <tr key={run.id}>
-                          <td className="mono" style={{ fontSize: 11 }}>{run.id}</td>
+                          <td className="mono" style={{ fontSize: 11 }}>
+                            {run.id}
+                            {run.retried_from && (
+                              <span className="muted" style={{ fontSize: 9, display: "block" }}>
+                                retry of {run.retried_from}
+                              </span>
+                            )}
+                          </td>
                           <td className="mono" style={{ fontSize: 11 }}>{run.task_id}</td>
                           <td className="mono" style={{ fontSize: 11 }}>
                             {agents?.find(a => a.id === run.agent_id)?.name || run.agent_id}
                           </td>
                           <td>
-                            <span className={`badge ${run.status === "completed" ? "done" : run.status === "running" ? "running" : "backlog"}`}>
+                            <span className={`badge ${runStatusTone(run.status)}`}>
                               {run.status}
                             </span>
                           </td>
@@ -338,27 +361,62 @@ function TaskDetailPanel({ taskId, onClose }: { taskId: string; onClose: () => v
   );
 }
 
-function RunDetailPanel({ runId, onClose }: { runId: string; onClose: () => void }) {
-  const { data: run, loading: loadingRun, error: errorRun } = useAsync<ReluxRunDetail>(
+function RunDetailPanel({ runId, onClose, onRetried }: { runId: string; onClose: () => void; onRetried: (newRunId: string) => void }) {
+  const { data: run, loading: loadingRun, error: errorRun, reload: reloadRun } = useAsync<ReluxRunDetail>(
     () => reluxWork.getRun(runId),
     [runId],
   );
-  const { data: events, loading: loadingEvents, error: errorEvents } = useAsync<RunEvent[]>(
+  const { data: events, loading: loadingEvents, error: errorEvents, reload: reloadEvents } = useAsync<ReluxRunEvent[]>(
     () => reluxWork.getRunEvents(runId),
     [runId],
   );
+  const [retrying, setRetrying] = useState(false);
 
-  const error = errorRun || errorEvents;
-  const loading = loadingRun || loadingEvents;
+  // Light polling while the run is still in flight. Execution is synchronous, so
+  // a run is usually already terminal when this panel opens; this only keeps a
+  // panel left open during a long CLI run fresh. No fake progress: we just
+  // re-fetch the real recorded run + transcript.
+  const inFlight = isRunInFlight(run?.status);
+  useEffect(() => {
+    if (!inFlight) return;
+    const t = setInterval(() => {
+      reloadRun();
+      reloadEvents();
+    }, 1500);
+    return () => clearInterval(t);
+  }, [inFlight, reloadRun, reloadEvents]);
+
+  async function retry() {
+    setRetrying(true);
+    try {
+      const res = await reluxWork.retryRun(runId);
+      onRetried(res.run_id);
+    } catch (e) {
+      alert(e instanceof Error ? e.message : "Retry failed");
+    } finally {
+      setRetrying(false);
+    }
+  }
+
+  const error = errorRun;
+  const duration = run ? formatRunDuration(run.duration_ms) : null;
+  const metrics = run ? runMetricsLine(run) : null;
 
   return (
     <div style={{ paddingBottom: 16 }}>
       <div className="row" style={{ alignItems: "center", marginBottom: 12 }}>
         <h4 style={{ margin: 0 }}>Run Detail</h4>
+        {run && <span className={`badge ${runStatusTone(run.status)}`} style={{ marginLeft: 8 }}>{run.status}</span>}
+        {inFlight && <span className="muted" style={{ fontSize: 11, marginLeft: 8 }}>live · refreshing…</span>}
         <div className="spacer" style={{ flex: 1 }} />
+        {run && canRetryRun(run) && (
+          <button className="btn sm" style={{ marginRight: 8 }} onClick={() => void retry()} disabled={retrying}>
+            {retrying ? "Retrying…" : "Retry"}
+          </button>
+        )}
         <button className="btn ghost sm" onClick={onClose}>Close</button>
       </div>
-      {loading ? (
+      {loadingRun && !run ? (
         <div className="loading">Loading run details...</div>
       ) : error ? (
         <div className="banner err" style={{ fontSize: 12 }}>
@@ -367,16 +425,29 @@ function RunDetailPanel({ runId, onClose }: { runId: string; onClose: () => void
       ) : run ? (
         <div className="grid" style={{ gap: 8, fontSize: 12 }}>
           <div className="kv"><span>ID:</span><span className="mono">{run.id}</span></div>
+          {run.task_title && <div className="kv"><span>Task:</span><span>{run.task_title}</span></div>}
           <div className="kv"><span>Task ID:</span><span className="mono">{run.task_id}</span></div>
           <div className="kv"><span>Agent ID:</span><span className="mono">{run.agent_id}</span></div>
-          <div className="kv"><span>Adapter Plugin:</span><span>{run.adapter_plugin}</span></div>
-          <div className="kv"><span>Status:</span><span>{run.status}</span></div>
-          <div className="kv"><span>Started At:</span><span>{run.started_at ? new Date(run.started_at).toLocaleString() : "N/A"}</span></div>
-          <div className="kv"><span>Ended At:</span><span>{run.ended_at ? new Date(run.ended_at).toLocaleString() : "N/A"}</span></div>
+          <div className="kv"><span>Adapter:</span><span className="mono">{run.adapter_plugin}</span></div>
+          <div className="kv"><span>Phase:</span><span>{phaseLabel(run.phase, run.status)}</span></div>
+          <div className="kv"><span>Duration:</span><span>{duration ?? "—"}</span></div>
+          {metrics && <div className="kv"><span>Metrics:</span><span>{metrics}</span></div>}
+          {run.retried_from && <div className="kv"><span>Retry of:</span><span className="mono">{run.retried_from}</span></div>}
+          {/* Logical-sequence timestamps (ordering, not wall-clock). Real timing is "Duration" above. */}
+          <div className="kv"><span>Sequence:</span><span className="mono">{run.started_at ?? "—"} → {run.ended_at ?? "(in progress)"}</span></div>
+          {run.failure_reason && (
+            <div className="kv stretch"><span>Failure reason:</span>
+              <pre className="code" style={{ whiteSpace: "pre-wrap", color: "var(--err, #b00)" }}>{run.failure_reason}</pre>
+            </div>
+          )}
           {run.summary && <div className="kv stretch"><span>Summary:</span><pre className="code" style={{ whiteSpace: "pre-wrap" }}>{run.summary}</pre></div>}
-          {run.error && <div className="kv stretch"><span>Error:</span><pre className="code" style={{ whiteSpace: "pre-wrap" }}>{run.error}</pre></div>}
-          <h5 style={{ marginTop: 16, marginBottom: 8 }}>Events</h5>
-          {loadingEvents ? (
+          {run.output_excerpt && (
+            <div className="kv stretch"><span>Output excerpt:</span>
+              <pre className="code" style={{ whiteSpace: "pre-wrap", maxHeight: 240, overflow: "auto" }}>{run.output_excerpt}</pre>
+            </div>
+          )}
+          <h5 style={{ marginTop: 16, marginBottom: 8 }}>Transcript</h5>
+          {loadingEvents && !events ? (
             <div className="loading">Loading events...</div>
           ) : errorEvents ? (
             <div className="banner err" style={{ fontSize: 12 }}>
@@ -387,28 +458,31 @@ function RunDetailPanel({ runId, onClose }: { runId: string; onClose: () => void
               <table className="table sm">
                 <thead>
                   <tr>
-                    <th>Time</th>
-                    <th>Kind</th>
+                    <th>Seq</th>
+                    <th>Phase</th>
                     <th>Source</th>
                     <th>Message</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {events.map((event, index) => (
-                    <tr key={index}>
-                      <td>{event.ts ? new Date(event.ts * 1000).toLocaleTimeString() : "N/A"}</td>
-                      <td>{event.kind}</td>
-                      <td>{event.source}</td>
-                      <td className="muted" style={{ fontSize: 11 }}>
-                        {event.message}
-                        {event.payload_json && (
-                          <pre className="code" style={{ whiteSpace: "pre-wrap", marginTop: 4 }}>
-                            {JSON.stringify(JSON.parse(event.payload_json), null, 2)}
-                          </pre>
-                        )}
-                      </td>
-                    </tr>
-                  ))}
+                  {events.map((event) => {
+                    const preview = eventPayloadPreview(event.payload);
+                    return (
+                      <tr key={event.id}>
+                        <td className="mono" style={{ fontSize: 10 }}>{event.ts}</td>
+                        <td>{phaseLabel(event.kind, undefined)}</td>
+                        <td>{event.source}</td>
+                        <td className="muted" style={{ fontSize: 11 }}>
+                          {event.message}
+                          {preview && (
+                            <pre className="code" style={{ whiteSpace: "pre-wrap", marginTop: 4 }}>
+                              {preview}
+                            </pre>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>

@@ -67,15 +67,24 @@ pub struct AdapterRunOutcome {
     pub stderr: String,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+    /// Real measured wall-clock duration of the subprocess, in milliseconds. This
+    /// is honest process timing (the adapter layer already reads a monotonic
+    /// `Instant` for the timeout); it never feeds the kernel's deterministic
+    /// logical clock and only exists for real CLI runs.
+    pub duration_ms: u64,
 }
 
 /// Build the argv (after the program name) for a given adapter kind. The prompt
 /// is delivered on stdin (see [`AdapterCommandSpec::stdin`]), NOT as an argument,
 /// so these are just the mode/permission flags. Pure and unit-tested.
 ///
-/// - Claude: `-p --permission-mode default` (print/non-interactive, safe
-///   non-bypass permission mode; prompt read from stdin).
-/// - Codex: `exec` (the non-interactive subcommand; prompt read from stdin).
+/// - Claude: `-p --permission-mode default --output-format json` (print/
+///   non-interactive, safe non-bypass permission mode, structured result
+///   envelope; prompt read from stdin). The JSON envelope lets the kernel parse
+///   an honest summary + cost/usage (master plan section 9.6) while still storing
+///   the raw, redacted output. It is NOT a bypass/danger flag.
+/// - Codex: `exec` (the non-interactive subcommand; prompt read from stdin). Left
+///   as plain text - its JSONL event stream is a separate, larger parsing job.
 /// - Command: no extra args (the operator's binary reads the prompt from stdin).
 /// - LocalPrime: never spawned (returns an empty argv defensively).
 pub fn build_adapter_args(kind: &AdapterKind) -> Vec<String> {
@@ -84,6 +93,8 @@ pub fn build_adapter_args(kind: &AdapterKind) -> Vec<String> {
             "-p".to_string(),
             "--permission-mode".to_string(),
             CLAUDE_PERMISSION_MODE.to_string(),
+            "--output-format".to_string(),
+            "json".to_string(),
         ],
         AdapterKind::CodexCli => vec!["exec".to_string()],
         AdapterKind::Command | AdapterKind::LocalPrime => Vec::new(),
@@ -266,6 +277,8 @@ pub fn run_adapter_command(spec: &AdapterCommandSpec) -> std::io::Result<Adapter
         }
     };
 
+    let duration_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+
     let (stdout_bytes, stdout_truncated) = out_handle.join().unwrap_or_default();
     let (stderr_bytes, stderr_truncated) = err_handle.join().unwrap_or_default();
 
@@ -281,6 +294,7 @@ pub fn run_adapter_command(spec: &AdapterCommandSpec) -> std::io::Result<Adapter
         stderr: redact_secrets(&String::from_utf8_lossy(&stderr_bytes)),
         stdout_truncated,
         stderr_truncated,
+        duration_ms,
     })
 }
 
@@ -331,9 +345,15 @@ mod tests {
                 "-p".to_string(),
                 "--permission-mode".to_string(),
                 "default".to_string(),
+                "--output-format".to_string(),
+                "json".to_string(),
             ]
         );
-        // Never a bypass/danger flag, and the prompt is never an argv element.
+        // The structured-output flag is present, the safe permission mode is kept,
+        // and there is never a bypass/danger flag; the prompt is never an argv
+        // element.
+        assert!(args.windows(2).any(|w| w == ["--output-format", "json"]));
+        assert!(args.iter().any(|a| a == "default"));
         assert!(!args.iter().any(|a| a.contains("dangerously")));
         assert!(!args.iter().any(|a| a == "bypassPermissions"));
     }

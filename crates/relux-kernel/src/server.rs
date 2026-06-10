@@ -248,6 +248,7 @@ fn router(state: AppState) -> Router {
         .route("/v1/relux/runs", get(list_runs))
         .route("/v1/relux/runs/:id", get(get_run))
         .route("/v1/relux/runs/:id/events", get(get_run_events))
+        .route("/v1/relux/runs/:id/retry", post(retry_run))
         .route("/v1/relux/audit", get(list_audit_events))
         .route("/v1/relux/health", get(get_health))
         .route("/v1/relux/tasks/:id/start", post(start_task))
@@ -646,12 +647,7 @@ async fn get_run(
             .run(&run_id)
             .ok_or_else(|| KernelError::UnknownRun(run_id.to_string()))?
             .clone();
-
-        let task_title = kernel
-            .task(&run.task_id)
-            .map(|t| t.title.clone());
-
-        Ok(RunRecord { run, task_title })
+        Ok(build_run_record(kernel, run))
     })?;
     Ok(Json(record))
 }
@@ -939,8 +935,29 @@ async fn execute_assigned_task(
     // Dispatch on the assigned agent's adapter: local Prime echoes; an enabled
     // CLI adapter (Claude/Codex/generic) spawns its local binary; anything else
     // fails honestly. The run/transcript is persisted either way.
-    let run_id = locked_save(&state, |kernel| kernel.execute_assigned_run(&task_id))?;
+    // Persist even on failure so a failed CLI run + its transcript survive for the
+    // dashboard (and stay retryable), matching the CLI path.
+    let run_id = locked_save_persisting(&state, |kernel| kernel.execute_assigned_run(&task_id))?;
     Ok(Json(ExecuteAssignedTaskResponse { run_id }))
+}
+
+#[derive(Debug, Serialize)]
+struct RetryRunResponse {
+    /// The id of the fresh run created by the retry (linked to the same task via
+    /// the new run's `retried_from`).
+    run_id: relux_core::RunId,
+}
+
+/// Retry a failed run as a fresh run on the same task (master plan section 10.2
+/// `prime.retry_run`). This is a re-attempt, not a resume of a partial CLI run.
+async fn retry_run(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<RetryRunResponse>, ApiError> {
+    let run_id = relux_core::RunId::new(id);
+    // Persist even if the retry's fresh run fails, so the new attempt is durable.
+    let new_run_id = locked_save_persisting(&state, |kernel| kernel.retry_run(&run_id))?;
+    Ok(Json(RetryRunResponse { run_id: new_run_id }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1668,6 +1685,27 @@ where
     Ok(out)
 }
 
+/// Like [`locked_save`] but persists the kernel **even when `f` returns an
+/// error**, then surfaces the error to the caller. Used for adapter execution and
+/// retry. A CLI run that fails has already recorded a failed run, its transcript,
+/// and an audit entry in kernel state; that record must survive so the dashboard
+/// can show what happened and offer a retry, instead of being rolled back. The
+/// CLI path already saves before propagating; this keeps the HTTP path consistent.
+fn locked_save_persisting<F, T>(state: &AppState, f: F) -> Result<T, ApiError>
+where
+    F: FnOnce(&mut KernelState) -> Result<T, KernelError>,
+{
+    let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut store = SqliteStore::open(&state.db_path)?;
+    let mut kernel = store.load()?;
+    crate::ensure_bootstrapped(&mut kernel)?;
+    let result = f(&mut kernel);
+    // Persist whatever the kernel recorded, success or honest failure, before
+    // propagating the outcome.
+    store.save(&kernel)?;
+    Ok(result?)
+}
+
 /// Lock, open the store, load + bootstrap, run `f`. Read-only: no save.
 fn locked_read<F, T>(state: &AppState, f: F) -> Result<T, ApiError>
 where
@@ -1836,13 +1874,67 @@ struct TaskRecord {
     assignee_name: Option<String>,
 }
 
-/// One run, flattened for the dashboard table.
+/// One run, flattened for the dashboard table, with derived run-depth fields so
+/// the Work page can show adapter/status/phase/duration/output excerpt + a clear
+/// failure reason and retry affordance without re-deriving from the transcript
+/// (master plan section 11.3 Active Runs).
 #[derive(Debug, Serialize)]
 struct RunRecord {
     #[serde(flatten)]
     run: relux_core::Run,
     #[serde(skip_serializing_if = "Option::is_none")]
     task_title: Option<String>,
+    /// The latest transcript event kind, i.e. the current/last phase
+    /// (`run_started`, `adapter_spawn`, `adapter_output`, `run_completed`,
+    /// `run_failed`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<String>,
+    /// A bounded, already-redacted excerpt of the adapter's last output, for the
+    /// run header. Pulled from the recorded transcript - never re-run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_excerpt: Option<String>,
+    /// The honest failure reason for a failed run (the run's recorded error).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_reason: Option<String>,
+    /// Whether the dashboard should offer a Retry action: a failed run whose task
+    /// still exists and is still assigned.
+    retryable: bool,
+}
+
+/// The maximum number of characters of adapter output surfaced in a run header
+/// excerpt. The full (capped, redacted) output stays available on the transcript.
+const RUN_OUTPUT_EXCERPT_CHARS: usize = 2000;
+
+/// Build a [`RunRecord`] with the derived run-depth fields, reading only the
+/// already-persisted run + transcript (no re-execution).
+fn build_run_record(kernel: &KernelState, run: relux_core::Run) -> RunRecord {
+    let task = kernel.task(&run.task_id);
+    let task_title = task.map(|t| t.title.clone());
+    let events = kernel.run_events(&run.id);
+    let phase = events.last().map(|e| e.kind.clone());
+    // The latest adapter_output event's stdout is the freshest real output.
+    let output_excerpt = events
+        .iter()
+        .rev()
+        .find(|e| e.kind == "adapter_output")
+        .and_then(|e| e.payload.get("stdout"))
+        .and_then(|v| v.as_str())
+        .map(|s| {
+            let trimmed = s.trim();
+            trimmed.chars().take(RUN_OUTPUT_EXCERPT_CHARS).collect::<String>()
+        })
+        .filter(|s| !s.is_empty());
+    let failure_reason = run.error.clone();
+    let retryable = run.status == relux_core::RunStatus::Failed
+        && task.map(|t| t.assigned_agent.is_some()).unwrap_or(false);
+    RunRecord {
+        run,
+        task_title,
+        phase,
+        output_excerpt,
+        failure_reason,
+        retryable,
+    }
 }
 
 /// Build a [`TaskRecord`] from a `Task` and its assigned `Agent` (if any).
@@ -2009,6 +2101,8 @@ fn status_for(err: &KernelError) -> StatusCode {
             StatusCode::NOT_FOUND
         }
         KernelError::AdapterRuntimeDisabled { .. } => StatusCode::CONFLICT,
+        // Retrying a run that is not in a failed state is a resolvable conflict.
+        KernelError::RunNotRetryable { .. } => StatusCode::CONFLICT,
         KernelError::AdapterBinaryMissing { .. } => StatusCode::UNPROCESSABLE_ENTITY,
         KernelError::AdapterExecutionFailed { .. } => StatusCode::BAD_GATEWAY,
         KernelError::AdapterNotConfigurable { .. } | KernelError::InvalidAdapterConfig { .. } => {

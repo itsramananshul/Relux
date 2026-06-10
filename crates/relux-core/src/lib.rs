@@ -5,6 +5,7 @@
 //! No runtime, no storage, no dashboard - pure types + validation.
 
 pub mod adapter;
+pub mod adapter_result;
 pub mod agent;
 pub mod approval;
 pub mod audit;
@@ -24,6 +25,7 @@ pub use adapter::{
     CODEX_CLI_ADAPTER_ID, DEFAULT_ADAPTER_MAX_OUTPUT_BYTES, DEFAULT_ADAPTER_TIMEOUT_SECONDS,
     LOCAL_PRIME_ADAPTER_ID,
 };
+pub use adapter_result::{parse_adapter_result, AdapterResultSummary};
 pub use agent::{Agent, AgentId};
 pub use approval::{Approval, ApprovalId, ApprovalStatus};
 pub use audit::{AuditEvent, AuditResult};

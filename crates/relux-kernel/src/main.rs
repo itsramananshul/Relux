@@ -106,8 +106,12 @@ fn run_task_subcommand(args: &[String]) -> Result<(), KernelError> {
             let task_id_str = first_arg(rest, "task run-assigned <task_id>")?;
             run_assigned_task(&task_id_str)
         }
+        Some((sub, rest)) if sub == "retry-run" => {
+            let run_id_str = first_arg(rest, "task retry-run <run_id>")?;
+            retry_run_cli(&run_id_str)
+        }
         _ => Err(KernelError::Storage(
-            "usage: relux-kernel task <run-assigned> <task_id>".to_string(),
+            "usage: relux-kernel task <run-assigned <task_id> | retry-run <run_id>>".to_string(),
         )),
     }
 }
@@ -245,6 +249,23 @@ fn run_assigned_task(task_id_str: &str) -> Result<(), KernelError> {
     let run_id = result?;
 
     println!("Successfully executed task {} as assigned agent. New run: {}", task_id, run_id);
+    Ok(())
+}
+
+/// Retry a failed run as a fresh run on the same task (master plan section 10.2
+/// `prime.retry_run`). Persists the new run either way so its transcript survives.
+fn retry_run_cli(run_id_str: &str) -> Result<(), KernelError> {
+    let run_id = relux_core::RunId::new(run_id_str);
+    let path = db_path();
+    let mut store = SqliteStore::open(&path)?;
+    let mut kernel = store.load()?;
+    ensure_bootstrapped(&mut kernel)?;
+
+    let result = kernel.retry_run(&run_id);
+    store.save(&kernel)?;
+    let new_run_id = result?;
+
+    println!("Retried run {run_id} as a fresh run on the same task. New run: {new_run_id}");
     Ok(())
 }
 

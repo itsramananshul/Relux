@@ -1498,6 +1498,30 @@ export interface ReluxRun {
   ended_at?: string;
   summary?: string;
   error?: string;
+  // Real measured wall-clock duration of the adapter subprocess (ms). Only
+  // present for CLI adapter runs; absent for the deterministic local echo path.
+  duration_ms?: number;
+  // Token/usage data, only when the adapter emitted a structured result
+  // envelope we could parse. Never synthesized.
+  usage?: Record<string, unknown>;
+  // Reported cost in USD, only when the adapter result envelope carried it.
+  cost?: number;
+  // When this run was created by retrying an earlier run, that run's id.
+  retried_from?: string;
+}
+
+// One Relux run-transcript event from `/v1/relux/runs/:id/events`. This is the
+// kernel's own shape (distinct from the legacy bridge `RunEvent`): `ts` is a
+// logical-clock ISO string (ordering, not wall time) and `payload` is a parsed
+// JSON object, not a string.
+export interface ReluxRunEvent {
+  id: string;
+  run_id: string;
+  ts: string;
+  kind: string;
+  source: string;
+  message: string;
+  payload?: Record<string, unknown> | null;
 }
 
 export interface ReluxAuditEntry {
@@ -1517,7 +1541,16 @@ export interface ReluxTaskDetail extends ReluxTask {
 }
 
 export interface ReluxRunDetail extends ReluxRun {
-  // Potentially more fields for a detailed view, e.g., full transcript, tool calls
+  // The parent task's title, for the run header.
+  task_title?: string;
+  // The latest transcript event kind, i.e. the current/last phase.
+  phase?: string;
+  // A bounded, already-redacted excerpt of the adapter's last output.
+  output_excerpt?: string;
+  // The honest failure reason for a failed run.
+  failure_reason?: string;
+  // Whether the dashboard should offer a Retry action.
+  retryable?: boolean;
 }
 
 export const reluxWork = {
@@ -1529,8 +1562,9 @@ export const reluxWork = {
   listRuns: () => api.get<ReluxRun[]>("/v1/relux/runs"),
   // Get a specific run by id.
   getRun: (id: string) => api.get<ReluxRunDetail>(`/v1/relux/runs/${encodeURIComponent(id)}`),
-  // Get events for a specific run.
-  getRunEvents: (id: string) => api.get<RunEvent[]>(`/v1/relux/runs/${encodeURIComponent(id)}/events`),
+  // Get the durable, capped, redacted transcript for a specific run.
+  getRunEvents: (id: string) =>
+    api.get<ReluxRunEvent[]>(`/v1/relux/runs/${encodeURIComponent(id)}/events`),
   // All agents, sorted by id.
   listAgents: () => api.get<ReluxAgent[]>("/v1/relux/agents"),
   // Create a new task and assign it to Prime.
@@ -1547,6 +1581,11 @@ export const reluxWork = {
   // Execute a running task locally as its assigned agent.
   executeAssignedTask: (id: string) =>
     api.post<{ run_id: string }>(`/v1/relux/tasks/${encodeURIComponent(id)}/execute-assigned`),
+
+  // Retry a failed run as a fresh run on the same task (master plan section 10.2
+  // prime.retry_run). Returns the new run's id.
+  retryRun: (id: string) =>
+    api.post<{ run_id: string }>(`/v1/relux/runs/${encodeURIComponent(id)}/retry`),
 };
 
 export const reluxAudit = {

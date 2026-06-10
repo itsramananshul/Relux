@@ -2176,10 +2176,19 @@ The API never returns the key. The dashboard shows the current AI provider/mode.
   (Claude CLI, Codex CLI, or a generic command), but only when the operator
   explicitly enables that adapter (disabled by default) and the binary is on PATH.
   Relux runs the CLI non-interactively with a safe, non-bypass permission mode and
-  never passes `--dangerously-skip-permissions`. It does not parse the CLI's output
-  into structured tool calls, stream events live, or resume a partial CLI run; the
-  run records the CLI's (redacted, capped) output and an honest pass/fail.
-  Execution-environment runtimes remain not implemented yet.
+  never passes `--dangerously-skip-permissions`. Each run records a durable,
+  redacted, capped transcript (`run_started` → `adapter_spawn` → `adapter_output`
+  → `run_completed`/`run_failed`), a **real measured** wall-clock `duration_ms`,
+  and an honest pass/fail with a clear failure reason. When the CLI emits a
+  structured result envelope (the Claude adapter requests `--output-format json`),
+  Relux parses it into an honest text summary plus `usage`/`cost`, treats an
+  envelope-reported `is_error` as a failure even on exit 0, and still stores the
+  raw output; otherwise it surfaces the plain text honestly (Codex stays plain
+  text). A **failed run is retryable** as a fresh run on the same task
+  (`prime.retry_run`), with attempt lineage recorded (`retried_from`). It does
+  **not** stream events live or resume a *partial* CLI run; a retry is a new
+  attempt, not a resume. Execution-environment runtimes remain not implemented
+  yet.
 - The standalone API is local-only and unauthenticated by design; it binds
   loopback. It is not a multi-user or production surface.
 
@@ -2210,9 +2219,21 @@ remain, in rough priority for the next slices:
    by default** with a toggle for the rest. The pure derivations live in
    `apps/dashboard/src/plugins.ts` with unit coverage in
    `apps/dashboard/test/plugins.test.ts`.
-3. **Adapter run depth.** Adapter Runtime v1 records a single pass/fail with the
-   CLI's captured output; it does not yet stream events live, parse structured
-   tool calls, or resume a partial CLI run. Execution-environment runtimes are
+3. **Adapter run depth.** *(Addressed post-v0.1.1.)* A CLI adapter run is now
+   observable, understandable, and recoverable: the Work page's Run Detail shows
+   the adapter, status, current/last **phase**, a **real measured duration**, a
+   redacted **output excerpt**, a clear **failure reason**, and (when the CLI
+   reported them) **cost/usage** — all read from the durable transcript, never
+   fabricated. The Claude adapter requests a JSON result envelope that the kernel
+   parses into an honest summary + metrics (`relux_core::parse_adapter_result`),
+   and an envelope `is_error` is treated as a failure even on a clean exit; Codex
+   and generic commands degrade honestly to plain text. A **failed run is
+   retryable** from the UI/API/CLI as a fresh run on the same task
+   (`prime.retry_run` → `POST /v1/relux/runs/:id/retry`), with lineage recorded
+   (`retried_from`); the HTTP path persists a failed run so its transcript
+   survives a refresh. What is still **not** done: live event streaming (the page
+   polls/refreshes a synchronous run rather than tailing it) and resuming a
+   *partial* CLI run (retry is a new attempt). Execution-environment runtimes are
    not implemented.
 4. **Multi-agent autonomy.** Prime's autonomy loop runs one safe governed tick at
    a time; coordinated multi-Operative execution is later.

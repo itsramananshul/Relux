@@ -1315,6 +1315,10 @@ impl KernelState {
             ended_at: None,
             summary: None,
             error: None,
+            duration_ms: None,
+            usage: None,
+            cost: None,
+            retried_from: None,
         };
         self.runs.insert(run_id.clone(), run);
 
@@ -1712,6 +1716,113 @@ impl KernelState {
             serde_json::Value::Null,
         );
         Ok(())
+    }
+
+    /// Record the real measured metrics for a finished adapter run: wall-clock
+    /// duration (always), and token usage + cost (only when the adapter emitted a
+    /// structured result envelope we could parse). Master plan section 9.6.
+    ///
+    /// Best-effort: an unknown run id is a no-op (the caller already failed
+    /// honestly). Never invents usage/cost it was not handed.
+    fn set_run_metrics(
+        &mut self,
+        run_id: &RunId,
+        duration_ms: u64,
+        usage: Option<serde_json::Value>,
+        cost: Option<f64>,
+    ) {
+        if let Some(run) = self.runs.get_mut(run_id) {
+            run.duration_ms = Some(duration_ms);
+            if usage.is_some() {
+                run.usage = usage;
+            }
+            if cost.is_some() {
+                run.cost = cost;
+            }
+        }
+    }
+
+    /// Retry a failed run as a **fresh** run on the same task
+    /// (`docs/RELUX_MASTER_PLAN.md` section 10.2 `prime.retry_run`). This is an
+    /// honest re-attempt, not a resume of a partial CLI run (resuming a partial
+    /// run is explicitly out of scope for Adapter Runtime v1): the task is
+    /// re-queued and dispatched through its assigned agent's adapter again, with
+    /// the same safety gating (enabled runtime, binary on PATH, permission check)
+    /// as the first attempt. The new run records its lineage via `retried_from`.
+    ///
+    /// Refuses honestly when the run is not in a retryable (`Failed`) state, when
+    /// the task no longer exists, or when it has no assigned agent.
+    pub fn retry_run(&mut self, run_id: &RunId) -> Result<RunId, KernelError> {
+        let (task_id, status) = {
+            let run = self
+                .runs
+                .get(run_id)
+                .ok_or_else(|| KernelError::UnknownRun(run_id.to_string()))?;
+            (run.task_id.clone(), run.status.clone())
+        };
+        if status != RunStatus::Failed {
+            return Err(KernelError::RunNotRetryable {
+                run: run_id.to_string(),
+                status: format!("{status:?}"),
+            });
+        }
+        let task = self
+            .tasks
+            .get(&task_id)
+            .ok_or_else(|| KernelError::UnknownTask(task_id.to_string()))?;
+        let namespace = task.namespace_id.clone();
+        if task.assigned_agent.is_none() {
+            return Err(KernelError::TaskNotAssigned(task_id.to_string()));
+        }
+
+        // Re-queue the task so a fresh run can start, then dispatch it through the
+        // same assigned-adapter path used by the original attempt. We capture the
+        // outcome rather than `?`-propagating it so the retry's lineage is stamped
+        // even when this attempt also fails (an honest, recorded re-attempt).
+        if let Some(task) = self.tasks.get_mut(&task_id) {
+            task.status = TaskStatus::Queued;
+            task.updated_at = self.clock.tick();
+        }
+        let result = self.execute_assigned_run(&task_id);
+
+        // The fresh run is the highest-numbered run (ids are monotonic and
+        // zero-padded, so lexicographic max == newest). It exists whether the
+        // attempt succeeded or failed honestly.
+        let new_run_id = self
+            .runs
+            .values()
+            .max_by_key(|r| r.id.0.clone())
+            .map(|r| r.id.clone())
+            .filter(|id| id != run_id);
+
+        if let Some(new_run_id) = new_run_id.clone() {
+            if let Some(run) = self.runs.get_mut(&new_run_id) {
+                run.retried_from = Some(run_id.clone());
+            }
+            self.push_run_event(
+                &new_run_id,
+                "run_retried_from",
+                "kernel",
+                &format!("retry of failed run {run_id}"),
+                serde_json::json!({ "retried_from": run_id.as_str() }),
+            );
+            self.record_audit(
+                "user",
+                "founder",
+                "run:retry",
+                Some("run"),
+                Some(new_run_id.as_str()),
+                Some(&namespace),
+                if result.is_ok() {
+                    AuditResult::Success
+                } else {
+                    AuditResult::Failed
+                },
+                serde_json::json!({ "retried_from": run_id.as_str(), "task": task_id.as_str() }),
+            );
+        }
+
+        result
     }
 
     /// Mark a task completed (`docs/RELUX_MASTER_PLAN.md` section 9.5).
@@ -2553,7 +2664,11 @@ impl KernelState {
         // 4. Run the process (the one place the kernel touches a real CLI).
         match crate::adapter::run_adapter_command(&spec) {
             Ok(outcome) if outcome.success => {
-                let summary = render_adapter_summary(&binary, &outcome);
+                // Parse a structured result envelope when the CLI emitted one
+                // (Claude `--output-format json`); otherwise surface plain text.
+                // Never fabricate a tool call or success.
+                let parsed = relux_core::parse_adapter_result(&outcome.stdout, config.kind);
+                let summary = render_adapter_summary(&binary, &outcome, &parsed);
                 self.push_run_event(
                     &run_id,
                     "adapter_output",
@@ -2565,9 +2680,43 @@ impl KernelState {
                         "stderr": outcome.stderr,
                         "stdout_truncated": outcome.stdout_truncated,
                         "stderr_truncated": outcome.stderr_truncated,
+                        "duration_ms": outcome.duration_ms,
+                        "structured": parsed.structured,
+                        "is_error": parsed.is_error,
+                        "cost_usd": parsed.cost_usd,
+                        "num_turns": parsed.num_turns,
                     }),
                 );
+
+                // An exit code of 0 is not always success: a structured envelope
+                // can report `is_error: true` (e.g. a rate limit). Honour that so
+                // we never record a fabricated success.
+                if parsed.is_error == Some(true) {
+                    let reason = format!(
+                        "adapter '{}' reported an error: {}",
+                        binary,
+                        first_line(&parsed.text)
+                    );
+                    self.set_run_metrics(
+                        &run_id,
+                        outcome.duration_ms,
+                        parsed.usage.clone(),
+                        parsed.cost_usd,
+                    );
+                    self.fail_cli_run(&run_id, task_id, namespace.as_ref(), adapter, &reason);
+                    return Err(KernelError::AdapterExecutionFailed {
+                        plugin: adapter.to_string(),
+                        message: reason,
+                    });
+                }
+
                 self.complete_run(&run_id, &summary)?;
+                self.set_run_metrics(
+                    &run_id,
+                    outcome.duration_ms,
+                    parsed.usage.clone(),
+                    parsed.cost_usd,
+                );
                 self.complete_task(task_id)?;
                 let agent = self
                     .runs
@@ -2612,8 +2761,10 @@ impl KernelState {
                         "timed_out": outcome.timed_out,
                         "stdout": outcome.stdout,
                         "stderr": outcome.stderr,
+                        "duration_ms": outcome.duration_ms,
                     }),
                 );
+                self.set_run_metrics(&run_id, outcome.duration_ms, None, None);
                 self.fail_cli_run(&run_id, task_id, namespace.as_ref(), adapter, &reason);
                 Err(KernelError::AdapterExecutionFailed {
                     plugin: adapter.to_string(),
@@ -2804,20 +2955,37 @@ fn created_by_actor(created_by: &str) -> (&str, &str) {
     }
 }
 
-/// Render a concise, already-redacted run summary from an adapter outcome. The
-/// stdout snippet is bounded so a long transcript never bloats the summary.
-fn render_adapter_summary(binary: &str, outcome: &crate::adapter::AdapterRunOutcome) -> String {
+/// Render a concise, already-redacted run summary from an adapter outcome. Uses
+/// the parsed result text (the envelope's `result` when the CLI emitted one, else
+/// the raw stdout) so the summary is the human-meaningful line, not a wall of
+/// JSON. The snippet is bounded so a long transcript never bloats the summary.
+fn render_adapter_summary(
+    binary: &str,
+    outcome: &crate::adapter::AdapterRunOutcome,
+    parsed: &relux_core::AdapterResultSummary,
+) -> String {
     let mut s = format!("adapter '{binary}' completed (exit 0)");
-    let stdout = outcome.stdout.trim();
-    if !stdout.is_empty() {
-        let snippet: String = stdout.chars().take(280).collect();
+    let text = parsed.text.trim();
+    if !text.is_empty() {
+        let snippet: String = text.chars().take(280).collect();
         s.push_str(": ");
         s.push_str(&snippet);
-        if outcome.stdout_truncated || stdout.chars().count() > 280 {
+        if outcome.stdout_truncated || text.chars().count() > 280 {
             s.push_str(" …");
         }
     }
     s
+}
+
+/// The first non-empty line of a block of text, bounded, for one-line summaries.
+fn first_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .chars()
+        .take(200)
+        .collect()
 }
 
 /// Project a `Task` into the compact `TaskBrief` Prime speaks about.
@@ -4564,6 +4732,158 @@ mod tests {
         let completed = k.execute_assigned_run(&task).expect("echo path ok");
         assert_eq!(completed, run);
         assert_eq!(k.task(&task).unwrap().status, TaskStatus::Completed);
+    }
+
+    /// Write a fake CLI that prints a fixed body verbatim (no shell escaping of
+    /// the body's quotes), used to emit a JSON result envelope.
+    fn write_fake_json_cli(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            let path = dir.join(format!("{name}.cmd"));
+            // `echo` prints the rest of the line literally (quotes included). The
+            // JSON we emit contains no cmd metacharacters (>, <, |, &, ^).
+            std::fs::write(&path, format!("@echo off\r\necho {body}\r\n")).unwrap();
+            path
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.join(name);
+            // Single-quote the body so its double quotes survive to stdout.
+            std::fs::write(&path, format!("#!/bin/sh\necho '{body}'\n")).unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+            path
+        }
+    }
+
+    /// Write a fake CLI that exits non-zero (a deterministic failure).
+    fn write_failing_cli(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            let path = dir.join(format!("{name}.cmd"));
+            std::fs::write(&path, "@echo off\r\necho boom 1>&2\r\nexit /b 3\r\n").unwrap();
+            path
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.join(name);
+            std::fs::write(&path, "#!/bin/sh\necho boom 1>&2\nexit 3\n").unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+            path
+        }
+    }
+
+    fn enable_claude_with(k: &mut KernelState, binary: &std::path::Path) {
+        k.configure_adapter_runtime(
+            &PluginId::new("relux-adapter-claude-cli"),
+            Some(true),
+            Some(binary.to_string_lossy().to_string()),
+            Some(30),
+            Some(8192),
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cli_run_parses_structured_envelope_and_records_metrics() {
+        // A CLI that emits a Claude-style JSON result envelope is parsed into an
+        // honest text summary + cost/usage; the raw output is still on the
+        // transcript and a real duration is recorded.
+        let dir = tempfile::tempdir().unwrap();
+        let body = r#"{"type":"result","is_error":false,"result":"SUMMARY_TEXT_OK","total_cost_usd":0.0125,"num_turns":3,"usage":{"output_tokens":210}}"#;
+        let fake = write_fake_json_cli(dir.path(), "fake-claude-json", body);
+        let mut k = adapter_kernel();
+        enable_claude_with(&mut k, &fake);
+        let (_agent, task) = cli_task(&mut k);
+        let run_id = k.execute_assigned_run(&task).expect("adapter run ok");
+
+        let run = k.run(&run_id).unwrap();
+        assert_eq!(run.status, RunStatus::Completed);
+        // Summary is the envelope's `result`, not a wall of JSON.
+        assert!(run.summary.as_deref().unwrap_or_default().contains("SUMMARY_TEXT_OK"));
+        // Real metrics are recorded (cost parsed; duration measured).
+        assert_eq!(run.cost, Some(0.0125));
+        assert!(run.duration_ms.is_some());
+        assert!(run.usage.is_some());
+        // The adapter_output event is tagged structured and carries the raw stdout.
+        let out_event = k
+            .run_events(&run_id)
+            .into_iter()
+            .find(|e| e.kind == "adapter_output")
+            .expect("adapter_output event");
+        assert_eq!(out_event.payload.get("structured").and_then(|v| v.as_bool()), Some(true));
+        assert!(out_event
+            .payload
+            .get("stdout")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .contains("SUMMARY_TEXT_OK"));
+    }
+
+    #[test]
+    fn cli_run_envelope_error_on_clean_exit_is_an_honest_failure() {
+        // Exit 0 but `is_error: true` must NOT be recorded as success.
+        let dir = tempfile::tempdir().unwrap();
+        let body = r#"{"type":"result","is_error":true,"result":"rate limited"}"#;
+        let fake = write_fake_json_cli(dir.path(), "fake-claude-err", body);
+        let mut k = adapter_kernel();
+        enable_claude_with(&mut k, &fake);
+        let (_agent, task) = cli_task(&mut k);
+        let err = k.execute_assigned_run(&task).unwrap_err();
+        assert!(matches!(err, KernelError::AdapterExecutionFailed { .. }));
+        assert_eq!(k.task(&task).unwrap().status, TaskStatus::Failed);
+        let run = k.runs().into_iter().next_back().unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert!(run.error.as_deref().unwrap_or_default().contains("reported an error"));
+    }
+
+    #[test]
+    fn retry_run_creates_a_fresh_linked_run() {
+        // A failed run can be retried; the retry is a brand-new run on the same
+        // task, with lineage recorded. (Same failing binary -> the retry also
+        // fails, which is fine: we are asserting the retry mechanics + lineage.)
+        let dir = tempfile::tempdir().unwrap();
+        let fake = write_failing_cli(dir.path(), "fake-fail");
+        let mut k = adapter_kernel();
+        enable_claude_with(&mut k, &fake);
+        let (_agent, task) = cli_task(&mut k);
+        let first = k.execute_assigned_run(&task).unwrap_err();
+        assert!(matches!(first, KernelError::AdapterExecutionFailed { .. }));
+        let first_run = k.runs().into_iter().next_back().unwrap().id.clone();
+        assert_eq!(k.run(&first_run).unwrap().status, RunStatus::Failed);
+
+        // Retry -> a fresh run, linked back to the first, on the same task.
+        let second_run = k.retry_run(&first_run).unwrap_err(); // same binary still fails
+        assert!(matches!(second_run, KernelError::AdapterExecutionFailed { .. }));
+        // The new run exists, differs from the first, and carries lineage.
+        let newest = k.runs().into_iter().next_back().unwrap();
+        assert_ne!(newest.id, first_run);
+        assert_eq!(newest.retried_from.as_ref(), Some(&first_run));
+        assert_eq!(newest.task_id, task);
+        assert!(k
+            .audit_log()
+            .iter()
+            .any(|e| e.action == "run:retry"));
+    }
+
+    #[test]
+    fn retry_run_refuses_a_run_that_did_not_fail() {
+        // Only failed runs are retryable.
+        let dir = tempfile::tempdir().unwrap();
+        let fake = write_fake_cli(dir.path(), "fake-ok", "OK");
+        let mut k = adapter_kernel();
+        enable_claude_with(&mut k, &fake);
+        let (_agent, task) = cli_task(&mut k);
+        let run_id = k.execute_assigned_run(&task).expect("ok run");
+        assert_eq!(k.run(&run_id).unwrap().status, RunStatus::Completed);
+        let err = k.retry_run(&run_id).unwrap_err();
+        assert!(matches!(err, KernelError::RunNotRetryable { .. }));
     }
 
     #[test]
