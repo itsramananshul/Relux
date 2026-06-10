@@ -3,10 +3,11 @@ import { NavLink, useLocation } from "react-router-dom";
 
 // The standalone Relux product shell (RELUX_MASTER_PLAN section 11 Dashboard,
 // section 21 Final Product Feeling). This is what relux-kernel serves at /dashboard:
-// a Relux-branded surface whose default routes are backed ONLY by the local
-// /v1/relux control plane (state, prime, plugins) - no Relix web bridge, no
-// login, no 401. The legacy bridge-backed pages stay reachable from the "Bridge
-// (legacy)" group, but they are no longer the first thing the user sees.
+// a Relux-branded surface whose routes are backed ONLY by the local /v1/relux
+// control plane (state, prime, work, crew, plugins, approvals, health) - no Relix
+// web bridge, no login, no 401. The old bridge-backed Relix pages are not part of
+// this shell and do not appear in its navigation; they remain reachable at their
+// legacy paths only for continuity (see App.tsx LegacyDashboard).
 
 interface NavEntry {
   to: string;
@@ -15,7 +16,7 @@ interface NavEntry {
 }
 
 // Relux-local destinations: each is served by the kernel itself and needs no
-// bridge or login.
+// bridge or login. This is the entire standalone product navigation.
 const RELUX_NAV: NavEntry[] = [
   { to: "/", label: "Home", icon: "◈" },
   { to: "/prime", label: "Prime", icon: "✦" },
@@ -24,16 +25,6 @@ const RELUX_NAV: NavEntry[] = [
   { to: "/plugins", label: "Plugins", icon: "#" },
   { to: "/approvals", label: "Approvals", icon: "✔" },
   { to: "/health", label: "Health", icon: "♥" },
-];
-
-// Legacy bridge-backed surfaces (the old Relix dashboard). Kept reachable for
-// continuity; they require the web bridge + a login and degrade honestly when
-// it is absent.
-const LEGACY_NAV: NavEntry[] = [
-  { to: "/briefs", label: "Board", icon: "▤" },
-  { to: "/runs", label: "Active Runs", icon: "◐" },
-  { to: "/agents", label: "Crew", icon: "◍" },
-  { to: "/approvals", label: "Approvals", icon: "✔" },
 ];
 
 const TITLES: Record<string, { title: string; sub: string }> = {
@@ -79,7 +70,6 @@ export function ReluxShell({ children }: { children: ReactNode }) {
           <div className="env">local</div>
         </div>
         <Group label="Control plane" items={RELUX_NAV} />
-        <Group label="Bridge (legacy)" items={LEGACY_NAV} />
         <div className="sidebar-foot">
           <div className="muted" style={{ fontSize: 11, padding: "0 12px", lineHeight: 1.5 }}>
             Served by <span className="mono">relux-kernel</span>. The local control

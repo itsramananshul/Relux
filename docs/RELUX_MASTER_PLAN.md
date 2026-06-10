@@ -1653,6 +1653,15 @@ backed only by the local `/v1/relux` API:
 - **Plugins** - install/remove plugins through the durable lifecycle
   (`/v1/relux/plugins/*`).
 - **Approvals** - manage pending approvals and agent permissions (`/v1/relux/approvals`, `/v1/relux/permissions`).
+- **Health** - local readiness/diagnostics surface: state counts, plugin/tool/
+  adapter status, Prime autonomy status, AI mode, and the package/check command
+  hints (`/v1/relux/health`, `/v1/relux/tools`, `/v1/relux/adapters`,
+  `/v1/relux/prime/autonomy`). It depends only on the local control plane, never
+  the old bridge.
+
+These seven surfaces are the entire standalone navigation. The old bridge-backed
+Relix pages are not part of this shell and do not appear in its nav; they remain
+reachable only at their legacy paths (labelled legacy when visited directly).
 
 The dashboard bundle is the committed Vite build at
 `crates/relix-web-bridge/dashboard-dist`; `relux-kernel` serves it directly
@@ -2045,10 +2054,15 @@ The API never returns the key. The dashboard shows the current AI provider/mode.
 
 ### MVP limitations (honest)
 
-- The Relux-local shell covers Home, Prime, Work, Plugins, and Approvals. The legacy
-  bridge-backed pages (Board, Active Runs, Crew) are still in the
-  bundle and reachable from the "Bridge (legacy)" nav, but they require the old
-  Relix web bridge + a login and degrade honestly when it is absent.
+- The standalone Relux shell covers Home, Prime, Work, Crew, Plugins, Approvals,
+  and Health — all backed only by the local `/v1/relux` control plane (no Relix
+  web bridge, no login). These are the entire primary navigation. The old
+  bridge-backed Relix pages (Command Center/Overview, Mandates, the Briefs board,
+  Active Runs, the legacy Agents/Crew console, Chat, Settings, etc.) still exist in
+  the bundle at their original paths for continuity, but they are NOT part of the
+  standalone Relux shell and do not appear in its navigation. Visiting one directly
+  shows the legacy Relix bridge console (clearly labelled legacy), which requires
+  the old Relix web bridge + a login and degrades honestly when it is absent.
 - Prime has an optional LLM-backed path for conversational replies, but its
   core planning remains deterministic. Multi-agent autonomous execution is later.
 - Tool invocation executes built-in deterministic handlers (echo, status) plus

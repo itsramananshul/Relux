@@ -142,7 +142,7 @@ export function Layout({ children }: { children: ReactNode }) {
         <div className="brand">
           <div className="logo">R</div>
           <div className="name">Relix</div>
-          <div className="env">bridge</div>
+          <div className="env">legacy</div>
         </div>
         <Group label="Workspace" items={PRIMARY} counts={counts} />
         <Group label="Organization" items={ORG} counts={counts} />
@@ -192,7 +192,19 @@ export function Layout({ children }: { children: ReactNode }) {
             <button className="btn sm">Ask Prime →</button>
           </Link>
         </header>
-        <div className="workspace">{children}</div>
+        <div className="workspace">
+          <div
+            className="banner"
+            style={{ fontSize: 12, marginBottom: 12, display: "flex", alignItems: "center", gap: 8 }}
+          >
+            <span>
+              Legacy Relix bridge console — not the standalone Relux shell. It
+              requires the Relix web bridge and a login.
+            </span>
+            <Link to="/" className="link">Back to Relux →</Link>
+          </div>
+          {children}
+        </div>
       </div>
       <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
     </div>
