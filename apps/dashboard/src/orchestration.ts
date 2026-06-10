@@ -290,10 +290,19 @@ export function jobPhaseLabel(job: ReluxOrchestrationJob | null | undefined): st
   switch (job.state) {
     case "queued":
       return "Queued";
-    case "running":
-      return job.current_round > 0
-        ? `Running — round ${job.current_round}`
-        : "Running — starting";
+    case "running": {
+      const base =
+        job.current_round > 0
+          ? `Running — round ${job.current_round}`
+          : "Running — starting";
+      // Surface the real OS-parallelism: how many briefs are in flight together
+      // right now, and the round cap. Only when more than one runs at once, so a
+      // single-brief round stays quiet.
+      const inflight = job.steps.filter((s) => s.outcome === "running").length;
+      return inflight > 1
+        ? `${base} · ${inflight} briefs in parallel (cap ${job.concurrency})`
+        : base;
+    }
     case "completed":
       return "Completed";
     case "failed":

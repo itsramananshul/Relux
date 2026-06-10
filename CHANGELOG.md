@@ -9,6 +9,35 @@ once a stable release is cut.
 
 ### Added
 
+- **True bounded OS-parallel execution for independent ready briefs.** Briefs
+  that are ready in the same round now run as **real concurrent OS processes**, not
+  one-at-a-time under the kernel lock (master plan §10.4 — "multiple tasks can run
+  in parallel"). The CLI execution path is split into three phases around the
+  single-owner lock: **prepare** (locked, persists) resolves the ready set, starts
+  each brief's run, runs local-echo briefs inline, and hands enabled-CLI briefs back
+  as fully-resolved spawn plans with their step already stamped (run id / start /
+  round) so a poll sees them in flight; **spawn** runs every prepared brief's adapter
+  process on its own OS thread **with the lock released**, so up to the concurrency
+  cap (default 2, clamp 1..=4) run at once; **finalize** (locked, persists) merges
+  each result back independently. Every safety property is preserved — permissions
+  and adapter-runtime gating (a disabled/unconfigured runtime or missing binary is
+  still blocked before any spawn), secret redaction, the run transcript, audit, and
+  retry semantics all happen under the lock; **no downloaded plugin code is ever
+  auto-run** (only an explicitly enabled, operator-configured local binary spawns).
+  Each brief runs **at most once per round**; a failure — or even a panic — in one
+  brief's thread never corrupts a sibling (each owns its own run/task records and
+  merges separately). Dependencies still gate future rounds (a dependent is never
+  even prepared while its dependency is pending). The non-blocking job now reports
+  **multiple in-flight briefs** when several run together, and the dashboard surfaces
+  the real parallelism ("round N · K briefs in parallel (cap C)"). Proven by a
+  deterministic **rendezvous** test: two independent slow fake adapters each complete
+  only if the other is running at the same instant — they finish in ~1s where a
+  sequential round would spin ~30s — plus tests for safe merge, failure isolation
+  (one brief fails, the sibling completes), and dependency preservation across the
+  prepare/finalize split. *Remaining caveat:* the synchronous `POST …/run` and the
+  `prime orchestration run` CLI still execute briefs inline under the lock (fine for
+  the blocking paths); the parallel execution path is the non-blocking job path
+  (`run-async`), which the dashboard uses.
 - **Non-blocking orchestration jobs + live, pollable progress.** Running an
   orchestration no longer blocks on one long request (master plan "Orchestration
   (First Multi-Agent Slice)" — the previously-deferred non-blocking job model).
@@ -62,9 +91,10 @@ once a stable release is cut.
   brief in **one round** (27s billed run), and a dependent chain ran a real Claude
   research brief in round 1 that **gated** a downstream implementation brief into
   round 2 (34s billed run) — fully traced goal → brief → agent → run.
-  *Honest limits:* briefs **within** a round still execute sequentially through the
-  kernel's single-owner lock (the cap bounds round size + pins the contract; no
-  OS-parallel CLI spawns yet), and an HTTP run is synchronous so the dashboard shows
+  *Honest limits (when shipped; now superseded for the job path — see "True bounded
+  OS-parallel execution" above):* briefs **within** a round executed sequentially
+  through the kernel's single-owner lock (the cap bounded round size + pinned the
+  contract; no OS-parallel CLI spawns yet), and an HTTP run is synchronous so the dashboard shows
   recorded round/timing/dependency state **after** the batch returns rather than a
   live mid-run feed (no fabricated in-flight progress). Backend tests pin
   dependency ordering, the concurrency cap (independent briefs share a round; cap 1

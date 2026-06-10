@@ -1905,10 +1905,21 @@ How it works:
   brief to a terminal outcome, so the pending set strictly shrinks), and never
   loops, recurses, or auto-runs downloaded plugin code (section 8.2). Re-running
   only picks up still-pending briefs.
-- **Honest concurrency note:** `concurrency` bounds the *round size* and pins the
-  scheduler contract; briefs within a round currently execute **sequentially**
-  through the kernel's single-owner lock (no OS-parallel CLI spawns yet). Real
-  OS-parallel execution within a round is a later slice.
+- **Concurrency:** `concurrency` bounds the *round size*. On the **non-blocking job
+  path** (`run-async`, what the dashboard uses), the independent ready briefs of a
+  round run as **true OS-parallel adapter processes** — up to the cap at once. The
+  CLI path is split into three phases around the single-owner lock: **prepare**
+  (locked) resolves the ready set, starts each run, runs local-echo briefs inline,
+  and produces spawn plans for enabled-CLI briefs (stamping run id / start / round so
+  a poll sees them in flight); **spawn** runs each plan's process on its own OS
+  thread **with the lock released**; **finalize** (locked) merges each result back
+  independently. All governance stays under the lock (permission + runtime gating
+  before any spawn, redaction, transcript, audit, retry) and **no downloaded plugin
+  code is ever auto-run** (only an explicitly enabled, operator-configured local
+  binary spawns). Each brief runs **at most once per round**, a failure/panic in one
+  brief never corrupts a sibling, and dependencies still gate future rounds.
+  *Caveat:* the **synchronous** `POST …/run` and `prime orchestration run` CLI still
+  execute briefs inline under the lock (acceptable for the blocking paths).
 
 This is distinct from the background autonomy loop above, which stays deterministic
 (echo-only) and never spawns a paid CLI. Orchestration is operator-triggered.
@@ -2389,13 +2400,17 @@ remain, in rough priority for the next slices:
    implementation), and the run loop **gates on them** — running only ready briefs,
    honestly blocking a brief whose dependency failed, and grouping independent
    ready briefs into **rounds bounded by a concurrency cap** (default 2, clamp
-   1..=4), with per-brief start/finish/round recorded for progress. What is still
-   **not** done: **OS-parallel** execution *within* a round (briefs in a round
-   still run sequentially through the kernel's single-owner lock — the cap bounds
-   the round size and pins the contract, but does not yet spawn CLIs concurrently);
-   **live mid-run progress streaming** (an HTTP run is synchronous; the dashboard
-   renders the recorded round/timing/dependency state after the batch returns, not
-   a live feed); automatic agent hiring during planning (Prime falls back to itself
+   1..=4), with per-brief start/finish/round recorded for progress. On the
+   **non-blocking job path** (`run-async`), a round's independent ready briefs now
+   run as **true OS-parallel adapter processes** — the CLI path is split into
+   prepare (locked) / spawn (lock released, one OS thread per brief) / finalize
+   (locked) phases, so up to the cap run at once while every governance check, the
+   transcript, audit, and retry stay under the lock and no downloaded plugin code is
+   auto-run. What is still **not** done: OS-parallel execution on the **synchronous**
+   `POST …/run` + `prime orchestration run` CLI (those still run briefs inline under
+   the lock — acceptable for the blocking paths); **live mid-run progress streaming**
+   on the synchronous path (the job path does poll real in-flight briefs); automatic
+   agent hiring during planning (Prime falls back to itself
    and suggests a hire); and a background timer that drives orchestrations (running
    is operator-triggered from the UI/CLI/API; the background autonomy timer stays
    deterministic and never spawns a paid CLI).

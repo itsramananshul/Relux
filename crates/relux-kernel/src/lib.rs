@@ -47,7 +47,10 @@ pub use plugin_install::{
 };
 pub use prime::{classify_intent, decide};
 pub use runtime::{invoke_http_loopback, RuntimeClientError};
-pub use state::{BundledRefresh, BundledRefreshSummary, KernelCounters, KernelSnapshot, KernelState};
+pub use state::{
+    BundledRefresh, BundledRefreshSummary, FinishedBrief, KernelCounters, KernelSnapshot,
+    KernelState, PreparedBrief, RoundPrep,
+};
 pub use store::SqliteStore;
 
 use relux_core::ManifestError;

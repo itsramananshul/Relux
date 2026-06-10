@@ -40,7 +40,7 @@ use relux_core::{
 };
 use relux_kernel::{
     install_from_dir, install_from_github, install_from_zip, remove_plugin, AiConfig, AiMode,
-    AiOutcome, AiStatus, KernelError, KernelState, SqliteStore,
+    AiOutcome, AiStatus, FinishedBrief, KernelError, KernelState, PreparedBrief, SqliteStore,
 };
 
 /// The default loopback bind address; override with `RELUX_HTTP_ADDR`.
@@ -1590,8 +1590,9 @@ fn now_millis() -> u64 {
 
 /// The task ids of up to `n` briefs that are ready to run right now (pending with
 /// every dependency completed), in index order. Mirrors the kernel scheduler's
-/// readiness rule on the durable record so the job can mark in-flight briefs
-/// honestly before a round runs.
+/// readiness rule (now owned by [`KernelState::prepare_orchestration_round`]); kept
+/// as a test oracle that pins the same readiness semantics on the durable record.
+#[cfg(test)]
 fn ready_task_ids(orch: &Orchestration, n: usize) -> Vec<String> {
     orch.steps
         .iter()
@@ -1708,11 +1709,100 @@ impl JobAggregate {
     }
 }
 
+/// Run ONE dependency-aware round with true bounded OS-parallel adapter execution.
+///
+/// Three phases around the single-owner kernel lock:
+///
+/// 1. **Prepare (locked, persists).** [`KernelState::prepare_orchestration_round`]
+///    marks dependency blocks, picks the ready set, starts each brief's run, and
+///    resolves local-echo / pre-spawn-blocked briefs inline. Enabled CLI briefs come
+///    back as [`PreparedBrief`]s with their step already stamped (run id, start,
+///    round), so a poll right now sees them as in-flight.
+/// 2. **Spawn (NO lock).** [`run_briefs_in_parallel`] runs every prepared brief's
+///    adapter process on its own OS thread concurrently — the real parallelism. The
+///    lock is free, so polls and other requests stay responsive while the CLIs run.
+/// 3. **Finalize (locked, persists).** Each finished brief is merged back via
+///    [`KernelState::finalize_prepared_brief`]; the batch is then finalized.
+///
+/// A failure (or even a panic) in one brief's thread never corrupts another: each
+/// brief owns its own run/task records and is merged independently. Returns the
+/// per-round batch result (`rounds == 1`) plus the post-round record snapshot.
+fn run_parallel_round(
+    state: &AppState,
+    oid: &OrchestrationId,
+    job_id: &str,
+    budget: usize,
+    concurrency: usize,
+    round_no: u32,
+) -> Result<(OrchestrationBatchResult, Option<Orchestration>), ApiError> {
+    // Phase 1: prepare under the lock. Persists the started runs + stamped steps so
+    // a mid-round poll of the durable record sees real in-flight work.
+    let (mut result, prepared) = locked_save_persisting(state, |kernel| {
+        let mut result = kernel.new_orchestration_batch_result(oid, concurrency)?;
+        let prep =
+            kernel.prepare_orchestration_round(oid, budget, concurrency, round_no, &mut result)?;
+        Ok((result, prep.prepared))
+    })?;
+
+    // Surface the genuinely-in-flight briefs to the job poll (real concurrency now,
+    // not a pseudo-label): they have a Running run and an OS process about to spawn.
+    if !prepared.is_empty() {
+        let inflight: Vec<String> = prepared.iter().map(|p| p.task_id().to_string()).collect();
+        let snap = locked_read(state, |k| Ok(k.orchestration(oid).cloned()))
+            .ok()
+            .flatten();
+        state.jobs.update(job_id, |j| {
+            if let Some(o) = snap.as_ref() {
+                j.steps = job_steps(o, &inflight);
+            }
+            j.last_event = Some(format!(
+                "round {round_no}: {} brief(s) running in parallel (cap {concurrency})",
+                inflight.len()
+            ));
+        });
+    }
+
+    // Phase 2: run the prepared adapter processes in parallel with the lock RELEASED.
+    let finished = run_briefs_in_parallel(prepared);
+
+    // Phase 3: merge every finished brief back under the lock, then finalize.
+    let snap = locked_save_persisting(state, move |kernel| {
+        for f in finished {
+            kernel.finalize_prepared_brief(oid, f, &mut result);
+        }
+        result.rounds = 1;
+        kernel.finalize_orchestration_batch(oid, &mut result)?;
+        let snap = kernel.orchestration(oid).cloned();
+        Ok((result, snap))
+    })?;
+    Ok(snap)
+}
+
+/// Run every prepared brief's adapter process concurrently on its own OS thread,
+/// joining all before returning. The set is already bounded to the concurrency cap
+/// (≤ 4) by the round scheduler, so this spawns at most that many threads. A single
+/// brief is run inline (no thread). A brief whose thread panics is dropped from the
+/// result — its step stays pending (it was stamped, not finalized) and re-runs next
+/// round — so one brief can never take the others down.
+fn run_briefs_in_parallel(prepared: Vec<PreparedBrief>) -> Vec<FinishedBrief> {
+    if prepared.len() <= 1 {
+        return prepared.into_iter().map(|p| p.run()).collect();
+    }
+    let handles: Vec<_> = prepared
+        .into_iter()
+        .map(|p| std::thread::spawn(move || p.run()))
+        .collect();
+    handles
+        .into_iter()
+        .filter_map(|h| h.join().ok())
+        .collect()
+}
+
 /// Drive one orchestration job to completion on a background thread.
 ///
-/// Each iteration runs ONE governed round (a per-call budget equal to the round
-/// size) through the existing, tested `run_orchestration`, releasing the kernel
-/// lock and persisting the record between rounds so progress is recorded
+/// Each iteration runs ONE governed round with true bounded OS-parallel adapter
+/// execution ([`run_parallel_round`]), releasing the kernel lock during the spawn
+/// window and persisting the record between rounds so progress is recorded
 /// incrementally. It stops when the per-job `max` budget is spent, a round runs no
 /// brief, or the orchestration is no longer `running`.
 fn drive_orchestration_job(
@@ -1729,38 +1819,23 @@ fn drive_orchestration_job(
         j.last_event = Some("running".to_string());
     });
 
-    // The per-round budget: at most `concurrency` briefs per kernel call, so the
-    // lock is released after every round-sized slice of work.
+    // The per-round budget: at most `concurrency` briefs per round, run as real
+    // OS-parallel adapter processes (see [`run_parallel_round`]). The kernel lock is
+    // released for the whole spawn/await window, so several briefs run at once and a
+    // mid-round poll sees them all in flight.
     let per_call = concurrency.clamp(1, 4);
     let mut total_ran = 0usize;
     let mut agg = JobAggregate::default();
+    let mut round_no = 0u32;
 
     loop {
         if total_ran >= user_max {
             break;
         }
 
-        // Mark the briefs about to run this round as `running` for a mid-batch
-        // poll. Read-only; tolerant of a vanished record (next step handles it).
-        if let Ok(Some(orch)) = locked_read(&state, |k| Ok(k.orchestration(&oid).cloned())) {
-            let ready = ready_task_ids(&orch, per_call);
-            if !ready.is_empty() {
-                jobs.update(&job_id, |j| {
-                    j.steps = job_steps(&orch, &ready);
-                    j.last_event =
-                        Some(format!("round {}: {} brief(s) starting", j.current_round + 1, ready.len()));
-                });
-            }
-        }
-
+        round_no += 1;
         let budget = per_call.min(user_max - total_ran).max(1);
-        let outcome = locked_save_persisting(&state, |kernel| {
-            let r = kernel.run_orchestration(&oid, budget, concurrency)?;
-            let snap = kernel.orchestration(&oid).cloned();
-            Ok((r, snap))
-        });
-
-        match outcome {
+        match run_parallel_round(&state, &oid, &job_id, budget, concurrency, round_no) {
             Ok((result, snap)) => {
                 total_ran += result.ran as usize;
                 let ran_this = result.ran;

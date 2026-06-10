@@ -1416,10 +1416,13 @@ impl KernelState {
     /// one brief and moves it to a terminal outcome, so the pending set strictly
     /// shrinks.
     ///
-    /// Honest concurrency note: `concurrency` bounds the *round size* and pins the
-    /// scheduler contract; briefs within a round execute sequentially through the
-    /// kernel's single-owner lock (no OS-parallel CLI spawns yet) - real parallel
-    /// execution is a later slice.
+    /// Concurrency note: this synchronous entry point still runs each brief inline
+    /// under the single-owner lock (it is used by the blocking `/run` API and the
+    /// `task orchestration run` CLI, where holding the lock for the batch is fine).
+    /// True bounded OS-parallel execution lives on the non-blocking job path, which
+    /// drives the same scheduler via [`prepare_orchestration_round`] +
+    /// [`finalize_prepared_brief`] with the lock released for the spawn window, so up
+    /// to `concurrency` briefs' adapter processes run on real OS threads at once.
     pub fn run_orchestration(
         &mut self,
         id: &OrchestrationId,
@@ -1550,64 +1553,286 @@ impl KernelState {
             let started_at = self.clock.tick();
             let exec = self.execute_assigned_run(&task_id);
             let finished_at = self.clock.tick();
-            // The latest run for this task is the attempt we just made (run ids
-            // are zero-padded, so id order == creation order).
-            let run_id = self
-                .runs
-                .values()
-                .filter(|r| r.task_id == task_id)
-                .max_by(|a, b| a.id.0.cmp(&b.id.0))
-                .map(|r| r.id.clone());
-            let (outcome, note) = match exec {
-                Ok(_) => {
-                    result.completed += 1;
-                    (StepOutcome::Completed, None)
+            self.record_brief_outcome(
+                id,
+                idx,
+                round_no,
+                agent_id.as_str(),
+                &task_id,
+                exec,
+                started_at,
+                finished_at,
+                result,
+            );
+        }
+        Ok(true)
+    }
+
+    /// Merge one brief's execution result into the batch tallies and its durable
+    /// step record. Shared by the sequential round loop and the parallel
+    /// finalize path so both interpret an `execute`/`finalize` outcome identically:
+    /// `Ok` is completed; a runtime/permission/binary error is `Blocked` (needs a
+    /// human); any other error is `Failed` (retryable). The latest run for the task
+    /// is the attempt just made, so the step's `run_id` points at it.
+    #[allow(clippy::too_many_arguments)]
+    fn record_brief_outcome(
+        &mut self,
+        id: &OrchestrationId,
+        idx: usize,
+        round_no: u32,
+        agent_label: &str,
+        task_id: &TaskId,
+        exec: Result<RunId, KernelError>,
+        started_at: String,
+        finished_at: String,
+        result: &mut OrchestrationBatchResult,
+    ) {
+        // The latest run for this task is the attempt we just made (run ids are
+        // zero-padded, so id order == creation order).
+        let run_id = self
+            .runs
+            .values()
+            .filter(|r| r.task_id == *task_id)
+            .max_by(|a, b| a.id.0.cmp(&b.id.0))
+            .map(|r| r.id.clone());
+        let (outcome, note) = match exec {
+            Ok(_) => {
+                result.completed += 1;
+                (StepOutcome::Completed, None)
+            }
+            Err(e) => {
+                // Distinguish "needs a human" (blocked) from a genuine run
+                // failure (retryable). A disabled/unconfigured CLI runtime, a
+                // missing binary, an invalid config, or a missing permission
+                // all mean the brief cannot run until someone acts.
+                let blocked = matches!(
+                    e,
+                    KernelError::AdapterRuntimeDisabled { .. }
+                        | KernelError::AdapterRuntimeNotConfigured { .. }
+                        | KernelError::InvalidAdapterConfig { .. }
+                        | KernelError::AdapterBinaryMissing { .. }
+                        | KernelError::PermissionDenied { .. }
+                );
+                if blocked {
+                    result.blocked += 1;
+                } else {
+                    result.failed += 1;
                 }
-                Err(e) => {
-                    // Distinguish "needs a human" (blocked) from a genuine run
-                    // failure (retryable). A disabled/unconfigured CLI runtime, a
-                    // missing binary, an invalid config, or a missing permission
-                    // all mean the brief cannot run until someone acts.
-                    let blocked = matches!(
-                        e,
-                        KernelError::AdapterRuntimeDisabled { .. }
-                            | KernelError::AdapterRuntimeNotConfigured { .. }
-                            | KernelError::InvalidAdapterConfig { .. }
-                            | KernelError::AdapterBinaryMissing { .. }
-                            | KernelError::PermissionDenied { .. }
-                    );
+                let reason = e.to_string();
+                result.skipped_reasons.push(format!("{task_id}: {reason}"));
+                (
                     if blocked {
-                        result.blocked += 1;
+                        StepOutcome::Blocked
                     } else {
-                        result.failed += 1;
-                    }
-                    let reason = e.to_string();
-                    result.skipped_reasons.push(format!("{task_id}: {reason}"));
-                    (
-                        if blocked {
-                            StepOutcome::Blocked
-                        } else {
-                            StepOutcome::Failed
-                        },
-                        Some(reason),
-                    )
+                        StepOutcome::Failed
+                    },
+                    Some(reason),
+                )
+            }
+        };
+        result
+            .per_agent
+            .push(format!("round {round_no} {agent_label}: {task_id} {}", outcome.label()));
+        if let Some(o) = self.orchestrations.get_mut(id) {
+            if let Some(step) = o.steps.get_mut(idx) {
+                step.outcome = outcome;
+                step.run_id = run_id;
+                step.note = note;
+                step.started_at = Some(started_at);
+                step.finished_at = Some(finished_at);
+                step.round = Some(round_no);
+            }
+        }
+    }
+
+    /// Prepare ONE dependency-aware round for OS-parallel execution, under the
+    /// kernel lock. Mirrors [`run_one_orchestration_round`]'s scheduling exactly —
+    /// propagate dependency blocks, collect the ready set in index order, take up to
+    /// `concurrency` within the `max` budget — but instead of spawning each brief's
+    /// CLI inline it:
+    ///
+    /// - runs local-echo briefs inline (deterministic, no blocking I/O) and records
+    ///   their outcome immediately;
+    /// - records inline any brief that blocks/fails before a spawn (disabled
+    ///   runtime, missing binary, permission denied, no active run);
+    /// - for an enabled CLI brief, prepares the spawn ([`prepare_cli_run`]), stamps
+    ///   the step's `run_id`/`started_at`/`round` so a mid-flight poll sees it, and
+    ///   returns it as a [`PreparedBrief`] to run off-lock.
+    ///
+    /// The caller releases the lock, runs every [`PreparedBrief`] in parallel, then
+    /// calls [`finalize_prepared_brief`] for each under the lock. `result.ran` is
+    /// incremented here for every attempted brief (inline or prepared), so the
+    /// budget is honoured across the split. Returns the [`RoundPrep`]; an empty,
+    /// non-`ran` result means no brief was ready (the batch is complete).
+    pub fn prepare_orchestration_round(
+        &mut self,
+        id: &OrchestrationId,
+        max: usize,
+        concurrency: usize,
+        round_no: u32,
+        result: &mut OrchestrationBatchResult,
+    ) -> Result<RoundPrep, KernelError> {
+        let max = max.clamp(1, 25);
+        let concurrency = concurrency.clamp(1, 4);
+        let mut prep = RoundPrep {
+            ran_inline: 0,
+            prepared: Vec::new(),
+        };
+
+        if result.ran as usize >= max {
+            return Ok(prep);
+        }
+
+        result.dependency_blocked += self.propagate_dependency_blocks(id);
+
+        let ready: Vec<(usize, TaskId, AgentId)> = self
+            .orchestrations
+            .get(id)
+            .map(|o| {
+                o.steps
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| {
+                        s.outcome == StepOutcome::Pending
+                            && s.depends_on.iter().all(|&j| {
+                                o.steps
+                                    .get(j)
+                                    .map(|d| d.outcome == StepOutcome::Completed)
+                                    .unwrap_or(true)
+                            })
+                    })
+                    .map(|(i, s)| (i, s.task_id.clone(), s.agent_id.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if ready.is_empty() {
+            return Ok(prep);
+        }
+
+        let budget_left = max - result.ran as usize;
+        let take = concurrency.min(budget_left);
+        for (idx, task_id, agent_id) in ready.into_iter().take(take) {
+            result.ran += 1;
+            let started_at = self.clock.tick();
+
+            // Resolve the adapter kind for this brief's assigned agent. A brief that
+            // cannot even be looked up is recorded as a failure inline (never spawned).
+            let adapter = self
+                .agents
+                .get(&agent_id)
+                .map(|a| a.adapter_plugin.clone());
+            let kind = adapter.as_ref().map(|a| recognize_adapter_kind(a.as_str()));
+
+            // Start the run if the task is still Created/Queued, exactly like
+            // execute_assigned_run. A start failure (e.g. permission) is recorded
+            // inline as a block/fail.
+            let needs_start = self
+                .tasks
+                .get(&task_id)
+                .map(|t| matches!(t.status, TaskStatus::Created | TaskStatus::Queued))
+                .unwrap_or(false);
+            if needs_start {
+                if let Err(e) = self.start_run(&task_id) {
+                    let finished_at = self.clock.tick();
+                    self.record_brief_outcome(
+                        id, idx, round_no, agent_id.as_str(), &task_id, Err(e), started_at,
+                        finished_at, result,
+                    );
+                    prep.ran_inline += 1;
+                    continue;
                 }
-            };
-            result
-                .per_agent
-                .push(format!("round {round_no} {agent_id}: {task_id} {}", outcome.label()));
-            if let Some(o) = self.orchestrations.get_mut(id) {
-                if let Some(step) = o.steps.get_mut(idx) {
-                    step.outcome = outcome;
-                    step.run_id = run_id;
-                    step.note = note;
-                    step.started_at = Some(started_at);
-                    step.finished_at = Some(finished_at);
-                    step.round = Some(round_no);
+            }
+
+            match (adapter, kind) {
+                // Local Prime echo: deterministic, no blocking I/O — run under the
+                // lock and record immediately.
+                (Some(_), Some(Some(AdapterKind::LocalPrime))) => {
+                    let exec = self.execute_local_run(&task_id);
+                    let finished_at = self.clock.tick();
+                    self.record_brief_outcome(
+                        id, idx, round_no, agent_id.as_str(), &task_id, exec, started_at,
+                        finished_at, result,
+                    );
+                    prep.ran_inline += 1;
+                }
+                // An enabled CLI adapter: prepare the spawn, then run it off-lock.
+                (Some(adapter_id), _) => match self.prepare_cli_run(&task_id, &adapter_id) {
+                    Ok(plan) => {
+                        // Make the in-flight brief visible to a mid-round poll: the
+                        // run exists and is Running; stamp the durable step now.
+                        let run_id = plan.run_id.clone();
+                        if let Some(o) = self.orchestrations.get_mut(id) {
+                            if let Some(step) = o.steps.get_mut(idx) {
+                                step.run_id = Some(run_id);
+                                step.started_at = Some(started_at.clone());
+                                step.round = Some(round_no);
+                            }
+                        }
+                        prep.prepared.push(PreparedBrief {
+                            step_index: idx,
+                            round_no,
+                            agent_label: agent_id.as_str().to_string(),
+                            started_at,
+                            plan,
+                        });
+                    }
+                    Err(e) => {
+                        let finished_at = self.clock.tick();
+                        self.record_brief_outcome(
+                            id, idx, round_no, agent_id.as_str(), &task_id, Err(e), started_at,
+                            finished_at, result,
+                        );
+                        prep.ran_inline += 1;
+                    }
+                },
+                // No adapter / unknown agent: an honest failure, recorded inline.
+                (None, _) => {
+                    let exec = self.execute_assigned_run(&task_id);
+                    let finished_at = self.clock.tick();
+                    self.record_brief_outcome(
+                        id, idx, round_no, agent_id.as_str(), &task_id, exec, started_at,
+                        finished_at, result,
+                    );
+                    prep.ran_inline += 1;
                 }
             }
         }
-        Ok(true)
+        Ok(prep)
+    }
+
+    /// Finalize one [`FinishedBrief`] (its adapter process ran off-lock) back into
+    /// the orchestration record under the kernel lock: parse + record the output,
+    /// complete/fail the run + task, then merge the outcome and tallies via
+    /// [`record_brief_outcome`]. The step's `started_at`/`round` were already stamped
+    /// at prepare time; this sets the terminal `outcome`, `finished_at`, and note.
+    pub fn finalize_prepared_brief(
+        &mut self,
+        id: &OrchestrationId,
+        finished: FinishedBrief,
+        result: &mut OrchestrationBatchResult,
+    ) {
+        let FinishedBrief {
+            step_index,
+            round_no,
+            agent_label,
+            started_at,
+            plan,
+            outcome,
+        } = finished;
+        let task_id = plan.task_id.clone();
+        let exec = self.finalize_cli_run(plan, outcome);
+        let finished_at = self.clock.tick();
+        self.record_brief_outcome(
+            id,
+            step_index,
+            round_no,
+            &agent_label,
+            &task_id,
+            exec,
+            started_at,
+            finished_at,
+            result,
+        );
     }
 
     /// Finalize a batch: recompute the orchestration's status/pending/waiting from
@@ -3135,11 +3360,39 @@ impl KernelState {
     /// Execute the assigned task by spawning the adapter's local CLI. Gated on an
     /// enabled runtime + a binary on PATH; every outcome is recorded on the run
     /// transcript and audit log. On failure the run and task are marked failed.
+    ///
+    /// This is the sequential, single-lock path: it prepares the spawn, runs the
+    /// process inline, and finalizes the result in one call. The parallel
+    /// orchestration driver uses the same two halves ([`prepare_cli_run`] +
+    /// [`finalize_cli_run`]) but spawns the process OUTSIDE the kernel lock so
+    /// several briefs' CLIs run on real OS threads at once.
     fn execute_cli_run(
         &mut self,
         task_id: &TaskId,
         adapter: &PluginId,
     ) -> Result<RunId, KernelError> {
+        let plan = self.prepare_cli_run(task_id, adapter)?;
+        // The one place the kernel touches a real CLI. In the sequential path this
+        // runs inline; the parallel path calls the same function on a worker thread
+        // with the kernel lock released (see [`PreparedBrief::run`]).
+        let outcome = crate::adapter::run_adapter_command(&plan.spec);
+        self.finalize_cli_run(plan, outcome)
+    }
+
+    /// Prepare a CLI adapter spawn under the kernel lock: require an enabled
+    /// runtime, resolve the binary on PATH, compose the prompt, build the redaction-
+    /// ready [`AdapterCommandSpec`], and record the `adapter_spawn` transcript
+    /// event. Returns a [`CliExecPlan`] whose `spec` carries no `&self`, so the
+    /// actual blocking process spawn can happen with the lock released. Every early
+    /// exit (disabled/unconfigured runtime, missing binary, invalid config) marks
+    /// the run + task failed and returns the same honest error as before — never a
+    /// fabricated success, and never an auto-run of downloaded plugin code (only an
+    /// explicitly enabled, operator-configured local binary is ever spawned).
+    fn prepare_cli_run(
+        &mut self,
+        task_id: &TaskId,
+        adapter: &PluginId,
+    ) -> Result<CliExecPlan, KernelError> {
         let run_id = self
             .runs
             .values()
@@ -3245,13 +3498,48 @@ impl KernelState {
             }),
         );
 
-        // 4. Run the process (the one place the kernel touches a real CLI).
-        match crate::adapter::run_adapter_command(&spec) {
+        Ok(CliExecPlan {
+            run_id,
+            task_id: task_id.clone(),
+            adapter: adapter.clone(),
+            kind: config.kind,
+            binary,
+            namespace,
+            timeout_seconds: config.timeout_seconds,
+            spec,
+        })
+    }
+
+    /// Finalize a CLI adapter run under the kernel lock from the process `outcome`
+    /// produced by [`crate::adapter::run_adapter_command`] (run inline in the
+    /// sequential path, or on a worker thread in the parallel path). Parses any
+    /// structured envelope, records the (already-redacted) output on the transcript,
+    /// completes or fails the run + task, writes metrics + audit, and returns the
+    /// run id on success. Behaviour is identical to the old inline body — only the
+    /// process spawn was lifted out so it can run without the lock.
+    fn finalize_cli_run(
+        &mut self,
+        plan: CliExecPlan,
+        outcome: std::io::Result<crate::adapter::AdapterRunOutcome>,
+    ) -> Result<RunId, KernelError> {
+        let CliExecPlan {
+            run_id,
+            task_id,
+            adapter,
+            kind: config_kind,
+            binary,
+            namespace,
+            timeout_seconds,
+            spec: _,
+        } = plan;
+        let task_id = &task_id;
+        let adapter = &adapter;
+        match outcome {
             Ok(outcome) if outcome.success => {
                 // Parse a structured result envelope when the CLI emitted one
                 // (Claude `--output-format json`); otherwise surface plain text.
                 // Never fabricate a tool call or success.
-                let parsed = relux_core::parse_adapter_result(&outcome.stdout, config.kind);
+                let parsed = relux_core::parse_adapter_result(&outcome.stdout, config_kind);
                 let summary = render_adapter_summary(&binary, &outcome, &parsed);
                 self.push_run_event(
                     &run_id,
@@ -3323,7 +3611,7 @@ impl KernelState {
                 let reason = if outcome.timed_out {
                     format!(
                         "adapter '{}' timed out after {}s",
-                        binary, config.timeout_seconds
+                        binary, timeout_seconds
                     )
                 } else {
                     format!(
@@ -3536,6 +3824,90 @@ fn created_by_actor(created_by: &str) -> (&str, &str) {
         ("user", created_by)
     } else {
         ("agent", created_by)
+    }
+}
+
+/// A fully-resolved CLI adapter invocation, produced by `prepare_cli_run` under
+/// the kernel lock and consumed by `finalize_cli_run`. Everything the spawn needs
+/// is captured here so the blocking `run_adapter_command` call can run with the
+/// lock released. Plain data (no `&self`), so it is `Send` and crosses to a worker
+/// thread for true OS-parallel execution.
+struct CliExecPlan {
+    run_id: RunId,
+    task_id: TaskId,
+    adapter: PluginId,
+    kind: AdapterKind,
+    binary: String,
+    namespace: Option<NamespaceId>,
+    timeout_seconds: u64,
+    spec: crate::adapter::AdapterCommandSpec,
+}
+
+/// One ready brief whose adapter spawn has been prepared under the kernel lock but
+/// not yet run. The orchestration driver collects up to the concurrency cap of
+/// these, releases the lock, runs them on real OS threads via [`Self::run`], then
+/// merges the results back under the lock. `Send` (only plain data), so it moves
+/// freely across threads.
+pub struct PreparedBrief {
+    step_index: usize,
+    round_no: u32,
+    agent_label: String,
+    started_at: String,
+    plan: CliExecPlan,
+}
+
+impl PreparedBrief {
+    /// The task this prepared brief will run (for the in-flight poll view).
+    pub fn task_id(&self) -> &TaskId {
+        &self.plan.task_id
+    }
+
+    /// Run the prepared adapter process. NO kernel access — pure blocking I/O on
+    /// the already-resolved, redaction-ready spec, safe to call on a worker thread
+    /// while the kernel lock is released. The returned [`FinishedBrief`] is merged
+    /// back into the orchestration record under the lock by
+    /// [`KernelState::finalize_prepared_brief`].
+    pub fn run(self) -> FinishedBrief {
+        let outcome = crate::adapter::run_adapter_command(&self.plan.spec);
+        FinishedBrief {
+            step_index: self.step_index,
+            round_no: self.round_no,
+            agent_label: self.agent_label,
+            started_at: self.started_at,
+            plan: self.plan,
+            outcome,
+        }
+    }
+}
+
+/// A prepared brief whose adapter process has finished running (off-lock). Carries
+/// the raw process outcome plus the identifiers needed to finalize it back under
+/// the kernel lock. `Send` (the outcome is plain data + an `io::Error`).
+pub struct FinishedBrief {
+    step_index: usize,
+    round_no: u32,
+    agent_label: String,
+    started_at: String,
+    plan: CliExecPlan,
+    outcome: std::io::Result<crate::adapter::AdapterRunOutcome>,
+}
+
+/// The outcome of preparing one dependency-aware round under the lock: how many
+/// briefs were resolved inline (local-echo briefs and briefs blocked/failed before
+/// any spawn) and the CLI briefs still to run off-lock. A round "ran" when
+/// `ran_inline + prepared.len() > 0`; an empty result means nothing was ready.
+pub struct RoundPrep {
+    /// Briefs fully resolved under the lock this round (local echo, or a runtime/
+    /// binary block recorded before any process spawn).
+    pub ran_inline: u32,
+    /// CLI briefs prepared for off-lock parallel execution.
+    pub prepared: Vec<PreparedBrief>,
+}
+
+impl RoundPrep {
+    /// True when at least one brief was attempted this round (inline or prepared).
+    pub fn ran(&self) -> bool {
+        self.ran_inline > 0 || !self.prepared.is_empty()
     }
 }
 
@@ -5817,6 +6189,362 @@ mod tests {
             !k.runs().iter().any(|r| r.task_id == impl_task),
             "no run was spawned for the dependency-blocked brief"
         );
+    }
+
+    /// A generic (Command-kind) adapter manifest with an arbitrary id, used to put
+    /// a second independent brief on a *different* binary than the Claude adapter.
+    fn command_adapter_manifest(id: &str) -> PluginManifest {
+        PluginManifest {
+            id: PluginId::new(id),
+            name: "Command Adapter".to_string(),
+            version: "0.1.0".to_string(),
+            kind: PluginKind::Adapter,
+            description: "generic command adapter".to_string(),
+            author: "test".to_string(),
+            trust_level: TrustLevel::Official,
+            capabilities: PluginCapability {
+                tools: vec![],
+                permissions: vec![Permission::new(format!("adapter:{id}:run")).unwrap()],
+            },
+            health: PluginHealth::Unknown,
+        }
+    }
+
+    fn enable_adapter_with(k: &mut KernelState, plugin: &PluginId, binary: &std::path::Path) {
+        k.configure_adapter_runtime(
+            plugin,
+            Some(true),
+            Some(binary.to_string_lossy().to_string()),
+            Some(60),
+            Some(8192),
+            None,
+        )
+        .unwrap();
+    }
+
+    /// Write a fake adapter that proves it ran *concurrently* with a sibling: it
+    /// atomically claims a numbered slot directory under `mark_dir` (via `mkdir`,
+    /// which is atomic, so two racing processes claim *distinct* slots), then waits
+    /// until at least two slots exist before exiting 0. If two of these run in
+    /// parallel both reach the barrier and succeed; if they ran sequentially the
+    /// first would wait for a second arrival that never comes and time out (exit 1).
+    /// So two successes is a deterministic proof of overlapping in-flight execution
+    /// — no timing guess, and no shared-file write contention (each owns its slot).
+    fn write_rendezvous_cli(
+        scripts_dir: &std::path::Path,
+        name: &str,
+        mark_dir: &std::path::Path,
+    ) -> std::path::PathBuf {
+        std::fs::create_dir_all(mark_dir).unwrap();
+        #[cfg(windows)]
+        {
+            let path = scripts_dir.join(format!("{name}.cmd"));
+            let md = mark_dir.to_string_lossy().replace('/', "\\");
+            // `ping -n 2` sleeps ~1s per try without needing `timeout` (which fails
+            // when stdin is redirected, as the kernel does). ~30s ceiling.
+            let body = format!(
+                "@echo off\r\n\
+                 set \"MD={md}\"\r\n\
+                 set n=0\r\n\
+                 :claim\r\n\
+                 mkdir \"%MD%\\p%n%\" 2>nul && goto claimed\r\n\
+                 set /a n+=1\r\n\
+                 if %n% GEQ 50 exit /b 2\r\n\
+                 goto claim\r\n\
+                 :claimed\r\n\
+                 set /a tries=0\r\n\
+                 :loop\r\n\
+                 set count=0\r\n\
+                 for /d %%D in (\"%MD%\\p*\") do set /a count+=1\r\n\
+                 if %count% GEQ 2 goto done\r\n\
+                 set /a tries+=1\r\n\
+                 if %tries% GEQ 30 exit /b 1\r\n\
+                 ping -n 2 127.0.0.1 >nul\r\n\
+                 goto loop\r\n\
+                 :done\r\n\
+                 echo RENDEZVOUS_OK\r\n\
+                 exit /b 0\r\n"
+            );
+            std::fs::write(&path, body).unwrap();
+            path
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = scripts_dir.join(name);
+            let md = mark_dir.to_string_lossy().to_string();
+            let body = format!(
+                "#!/bin/sh\n\
+                 MD='{md}'\n\
+                 n=0\n\
+                 while ! mkdir \"$MD/p$n\" 2>/dev/null; do\n\
+                   n=$((n+1))\n\
+                   [ \"$n\" -ge 50 ] && exit 2\n\
+                 done\n\
+                 tries=0\n\
+                 while :; do\n\
+                   count=$(ls -d \"$MD\"/p* 2>/dev/null | wc -l)\n\
+                   [ \"$count\" -ge 2 ] && break\n\
+                   tries=$((tries+1))\n\
+                   [ \"$tries\" -ge 100 ] && exit 1\n\
+                   sleep 0.1\n\
+                 done\n\
+                 echo RENDEZVOUS_OK\n\
+                 exit 0\n"
+            );
+            std::fs::write(&path, body).unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+            path
+        }
+    }
+
+    /// Drive ONE round through the real kernel split — prepare under the lock, run
+    /// the prepared briefs on parallel OS threads (exactly as the server's
+    /// `run_briefs_in_parallel` does), then finalize each back — and finalize the
+    /// batch. Returns the round's result.
+    fn run_one_parallel_round(
+        k: &mut KernelState,
+        id: &OrchestrationId,
+        max: usize,
+        concurrency: usize,
+        round_no: u32,
+    ) -> (OrchestrationBatchResult, usize) {
+        let mut result = k.new_orchestration_batch_result(id, concurrency).unwrap();
+        let prep = k
+            .prepare_orchestration_round(id, max, concurrency, round_no, &mut result)
+            .unwrap();
+        let prepared_count = prep.prepared.len();
+        let handles: Vec<_> = prep
+            .prepared
+            .into_iter()
+            .map(|p| std::thread::spawn(move || p.run()))
+            .collect();
+        let finished: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        for f in finished {
+            k.finalize_prepared_brief(id, f, &mut result);
+        }
+        result.rounds = 1;
+        k.finalize_orchestration_batch(id, &mut result).unwrap();
+        (result, prepared_count)
+    }
+
+    #[test]
+    fn parallel_round_runs_two_independent_briefs_concurrently() {
+        // Two independent research briefs on an enabled Claude CLI adapter whose
+        // binary is a rendezvous barrier: each completes only if the other was
+        // running at the same time. Both completing is a deterministic proof of
+        // true OS-parallel adapter execution (not pseudo-concurrency).
+        let dir = tempfile::tempdir().unwrap();
+        let marks = dir.path().join("marks");
+        let cli = write_rendezvous_cli(dir.path(), "rendezvous", &marks);
+
+        let (mut k, ctx) = orchestration_kernel();
+        install_bundled(&mut k, claude_adapter_manifest());
+        let claude = PluginId::new("relux-adapter-claude-cli");
+        k.create_agent(
+            "research-agent",
+            "Research Agent",
+            "investigates",
+            &claude,
+            &ctx.namespace,
+            None,
+            vec![],
+        )
+        .unwrap();
+        enable_adapter_with(&mut k, &claude, &cli);
+
+        let record = k
+            .prime_orchestrate(&ctx, "research the rust options and research the go options")
+            .unwrap();
+        let id = record.id.clone();
+        assert!(
+            record.steps.iter().all(|s| s.depends_on.is_empty()),
+            "both briefs are independent"
+        );
+        assert!(
+            record.steps.iter().all(|s| s.agent_id.as_str() == "research-agent"),
+            "both briefs run on the CLI adapter"
+        );
+
+        // Prepare returns BOTH briefs for off-lock parallel execution.
+        let mut probe = k.new_orchestration_batch_result(&id, 2).unwrap();
+        let prep = k
+            .prepare_orchestration_round(&id, 2, 2, 1, &mut probe)
+            .unwrap();
+        assert_eq!(prep.prepared.len(), 2, "both CLI briefs prepared to spawn in parallel");
+        assert_eq!(prep.ran_inline, 0, "nothing resolved inline; both go off-lock");
+        // The in-flight briefs are visible mid-round: their runs started and the
+        // durable steps are stamped while the outcome is still pending.
+        let mid = k.orchestration(&id).unwrap();
+        assert!(mid.steps.iter().all(|s| s.outcome == StepOutcome::Pending));
+        assert!(mid.steps.iter().all(|s| s.run_id.is_some()), "runs started under the lock");
+        assert_eq!(k.runs().iter().filter(|r| r.status == RunStatus::Running).count(), 2);
+
+        // Run the two prepared briefs in parallel and finalize.
+        let handles: Vec<_> = prep
+            .prepared
+            .into_iter()
+            .map(|p| std::thread::spawn(move || p.run()))
+            .collect();
+        let finished: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        for f in finished {
+            k.finalize_prepared_brief(&id, f, &mut probe);
+        }
+        probe.rounds = 1;
+        k.finalize_orchestration_batch(&id, &mut probe).unwrap();
+
+        assert_eq!(probe.completed, 2, "both rendezvous briefs completed => they ran together");
+        assert_eq!(probe.failed, 0);
+        assert_eq!(probe.blocked, 0);
+        let stored = k.orchestration(&id).unwrap();
+        for step in &stored.steps {
+            assert_eq!(step.outcome, StepOutcome::Completed);
+            assert_eq!(step.round, Some(1), "both ran in the same round");
+            assert!(step.run_id.is_some());
+            assert!(step.finished_at.is_some());
+        }
+        assert_eq!(stored.status, OrchestrationStatus::Completed);
+    }
+
+    #[test]
+    fn parallel_round_isolates_a_failure_and_merges_safely() {
+        // Two independent briefs in one parallel round on DIFFERENT binaries: one OK
+        // (Claude adapter), one failing (a generic command adapter). The failure of
+        // one must not corrupt the other — the OK brief completes, the failing one
+        // fails, and the merge tallies both honestly.
+        let dir = tempfile::tempdir().unwrap();
+        let ok = write_fake_cli(dir.path(), "ok-cli", "RESEARCH_OK");
+        let bad = write_failing_cli(dir.path(), "bad-cli");
+
+        let (mut k, ctx) = orchestration_kernel();
+        install_bundled(&mut k, claude_adapter_manifest());
+        let command = PluginId::new("relux-adapter-command-test");
+        install_bundled(&mut k, command_adapter_manifest(command.as_str()));
+        let claude = PluginId::new("relux-adapter-claude-cli");
+        k.create_agent(
+            "research-agent",
+            "Research Agent",
+            "investigates",
+            &claude,
+            &ctx.namespace,
+            None,
+            vec![],
+        )
+        .unwrap();
+        k.create_agent(
+            "ops-agent",
+            "Ops Agent",
+            "ships releases",
+            &command,
+            &ctx.namespace,
+            None,
+            vec![],
+        )
+        .unwrap();
+        enable_adapter_with(&mut k, &claude, &ok);
+        enable_adapter_with(&mut k, &command, &bad);
+
+        // research (no prereq) + operations (no prereq) => two independent briefs.
+        let record = k
+            .prime_orchestrate(&ctx, "research the options and deploy the release")
+            .unwrap();
+        let id = record.id.clone();
+        assert_eq!(record.steps[0].agent_id.as_str(), "research-agent");
+        assert_eq!(record.steps[1].agent_id.as_str(), "ops-agent");
+        assert!(record.steps.iter().all(|s| s.depends_on.is_empty()));
+
+        let (result, prepared) = run_one_parallel_round(&mut k, &id, 2, 2, 1);
+        assert_eq!(prepared, 2, "both briefs ran together off-lock");
+        assert_eq!(result.completed, 1);
+        assert_eq!(result.failed, 1);
+        assert_eq!(result.status, OrchestrationStatus::NeedsAttention);
+
+        let stored = k.orchestration(&id).unwrap();
+        let research = &stored.steps[0];
+        let ops = &stored.steps[1];
+        assert_eq!(research.outcome, StepOutcome::Completed, "OK brief unaffected by the sibling failure");
+        assert!(research.run_id.is_some());
+        assert_eq!(ops.outcome, StepOutcome::Failed, "failing brief recorded honestly");
+        assert!(ops.note.is_some());
+        // The two briefs have distinct runs/tasks — no cross-contamination.
+        assert_ne!(research.task_id, ops.task_id);
+        assert_ne!(research.run_id, ops.run_id);
+        // The completed brief's task really completed; the failed brief's task failed.
+        assert_eq!(k.task(&research.task_id).unwrap().status, TaskStatus::Completed);
+        assert_eq!(k.task(&ops.task_id).unwrap().status, TaskStatus::Failed);
+    }
+
+    #[test]
+    fn parallel_prepare_preserves_dependencies_across_rounds() {
+        // A dependent brief must not be prepared while its dependency is pending: the
+        // first parallel round prepares only the independent research brief; the
+        // dependent implementation brief runs only in a later round, after research
+        // has completed. Dependency gating survives the prepare/finalize split.
+        let dir = tempfile::tempdir().unwrap();
+        let ok = write_fake_cli(dir.path(), "ok-cli", "OK");
+
+        let (mut k, ctx) = orchestration_kernel();
+        install_bundled(&mut k, claude_adapter_manifest());
+        let claude = PluginId::new("relux-adapter-claude-cli");
+        k.create_agent(
+            "research-agent",
+            "Research Agent",
+            "investigates",
+            &claude,
+            &ctx.namespace,
+            None,
+            vec![],
+        )
+        .unwrap();
+        enable_adapter_with(&mut k, &claude, &ok);
+
+        let record = k
+            .prime_orchestrate(&ctx, "research the options and implement the prototype")
+            .unwrap();
+        let id = record.id.clone();
+        assert_eq!(record.steps[1].depends_on, vec![0], "impl waits on research");
+        let impl_task = record.steps[1].task_id.clone();
+
+        // Round 1: only the independent research brief is ready, so only it is
+        // prepared/run. The dependent implementation brief is NOT touched.
+        let mut probe = k.new_orchestration_batch_result(&id, 2).unwrap();
+        let prep = k
+            .prepare_orchestration_round(&id, 2, 2, 1, &mut probe)
+            .unwrap();
+        assert_eq!(prep.prepared.len(), 1, "only research is ready in round 1");
+        assert_eq!(prep.prepared[0].task_id(), &record.steps[0].task_id);
+        assert!(
+            !k.runs().iter().any(|r| r.task_id == impl_task),
+            "the dependent brief never started a run while its dep was pending"
+        );
+
+        // Finish round 1, then run the whole batch to completion in order.
+        let handles: Vec<_> = prep
+            .prepared
+            .into_iter()
+            .map(|p| std::thread::spawn(move || p.run()))
+            .collect();
+        let finished: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        for f in finished {
+            k.finalize_prepared_brief(&id, f, &mut probe);
+        }
+        probe.rounds = 1;
+        k.finalize_orchestration_batch(&id, &mut probe).unwrap();
+
+        // Round 2: research is complete, so implementation becomes ready and runs.
+        // (It is assigned to the local-prime code-agent, so it resolves inline under
+        // the lock rather than as an off-lock spawn — what matters is that it only
+        // runs now, never in round 1 while its dependency was pending.)
+        let (r2, _prepared2) = run_one_parallel_round(&mut k, &id, 2, 2, 2);
+        assert_eq!(r2.ran, 1, "only implementation ran in round 2");
+        assert_eq!(r2.completed, 1);
+
+        let stored = k.orchestration(&id).unwrap();
+        assert_eq!(stored.steps[0].round, Some(1), "research ran first");
+        assert_eq!(stored.steps[1].round, Some(2), "implementation ran after");
+        assert_eq!(stored.status, OrchestrationStatus::Completed);
     }
 
     #[test]
