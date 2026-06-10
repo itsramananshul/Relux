@@ -37,7 +37,12 @@ import {
 test("runStatusTone maps known statuses and falls back neutrally", () => {
   assert.equal(runStatusTone("completed"), "done");
   assert.equal(runStatusTone("running"), "running");
-  assert.equal(runStatusTone("failed"), "backlog");
+  // `failed` carries the shared error-red chip tone (`.badge.blocked`) so a
+  // failed run is never rendered in the neutral tone (relix-dashboard-design
+  // §12: status vocabulary includes "error"; "No silent failures").
+  assert.equal(runStatusTone("failed"), "blocked");
+  // `cancelled` is a terminal non-error and stays neutral.
+  assert.equal(runStatusTone("cancelled"), "backlog");
   assert.equal(runStatusTone(undefined), "backlog");
 });
 

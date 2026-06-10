@@ -9,6 +9,22 @@ once a stable release is cut.
 
 ### Added
 
+- **Failed-run status badge carries the error tone (relix-dashboard-design
+  §12).** `runStatusTone` mapped a `failed` run to the neutral `backlog` chip —
+  the same muted-grey tone used for unknown / pre-terminal statuses — so a failed
+  run's **status badge** (on the Run Detail header and the Work run list) read as
+  unemphasized as a `completed` one, even though the **failure-reason** text right
+  below it renders in red (`var(--err)`). The design system's status vocabulary
+  explicitly includes an **error** tone ("blocked, live/running, done/healthy,
+  error" as restrained badges) and mandates "No silent failures: every failed run
+  is visible." `failed` now maps to the existing shared error-red chip
+  (`.badge.blocked` — the same muted `var(--err)` chip the transcript uses for
+  "permission denied"), so the status badge reads consistently with the red
+  failure reason and is never rendered in the neutral tone. `cancelled` is a
+  terminal **non-error** and stays neutral; `completed` / `running` / pre-terminal
+  tones are unchanged. Pure tone-mapping reuse of an existing chip (no new CSS, no
+  behavior change); the `runStatusTone` semantics are pinned by a unit test and
+  the dashboard bundle was rebuilt.
 - **Compact-resilient Relux Work Run Detail header (relix-dashboard-design §8 /
   §11).** The `RunDetailPanel` header on the **Work** page laid its title +
   `status` badge + `live · No activity for Xs` cue and its **Copy link / Retry /

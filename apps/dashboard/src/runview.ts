@@ -14,11 +14,19 @@ import type {
   ReluxRunEvent,
 } from "./api";
 
-// The badge tone for a run status. Unknown/!terminal statuses fall back to the
-// neutral "backlog" tone rather than guessing success.
-export function runStatusTone(status: string | undefined): "done" | "running" | "backlog" {
+// The badge tone for a run status. `failed` maps to the shared error-red chip
+// tone (`.badge.blocked` — the same muted `var(--err)` chip the transcript uses
+// for "permission denied"), so a failed run's status badge carries the "error"
+// meaning from the design-system status vocabulary (relix-dashboard-design §12:
+// "blocked, live/running, done/healthy, error" rendered as restrained badges;
+// "No silent failures: every failed run is visible") and reads consistently with
+// the red failure-reason text beneath it — never the neutral tone. `cancelled`
+// is a terminal non-error, so it stays neutral. Unknown/pre-terminal statuses
+// (pending, waiting_for_approval, …) fall back to "backlog" rather than guessing.
+export function runStatusTone(status: string | undefined): "done" | "running" | "backlog" | "blocked" {
   if (status === "completed") return "done";
   if (status === "running") return "running";
+  if (status === "failed") return "blocked";
   return "backlog";
 }
 
