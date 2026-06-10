@@ -2130,3 +2130,25 @@ The API never returns the key. The dashboard shows the current AI provider/mode.
   Execution-environment runtimes remain not implemented yet.
 - The standalone API is local-only and unauthenticated by design; it binds
   loopback. It is not a multi-user or production surface.
+
+### Status after v0.1.1 — next unfinished pieces
+
+As of **v0.1.1** the local loop is usable end-to-end without developer knowledge:
+boot the bundle, pick a Prime brain (Local / Claude CLI / Codex CLI / OpenRouter)
+from Health, chat with Prime, and create/assign/run tasks. The honest gaps that
+remain, in rough priority for the next slices:
+
+1. **First-run onboarding.** Home has a static first-run checklist, but there is
+   no guided wizard that detects the Claude/Codex CLI, walks the user through
+   picking a brain, and lands them on a first chat/task. New users still have to
+   discover that Health → *Prime Brain / AI Runtime* is where setup happens.
+2. **Plugin install UX.** Install-from-GitHub/zip works and is honest about
+   metadata-only wrappers, but the dashboard could surface a clearer "configure a
+   runtime" call-to-action and avoid any "ready"-looking label for a
+   metadata-only plugin.
+3. **Adapter run depth.** Adapter Runtime v1 records a single pass/fail with the
+   CLI's captured output; it does not yet stream events live, parse structured
+   tool calls, or resume a partial CLI run. Execution-environment runtimes are
+   not implemented.
+4. **Multi-agent autonomy.** Prime's autonomy loop runs one safe governed tick at
+   a time; coordinated multi-Operative execution is later.

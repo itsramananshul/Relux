@@ -26,6 +26,35 @@ with one command - no web bridge, no login:
 cargo run -p relux-kernel -- serve
 ```
 
+#### Run the packaged release (v0.1.1, no build needed)
+
+Prefer a prebuilt Windows bundle over building from source? Grab the latest
+[**Relux local release**](https://github.com/itsramananshul/Relux/releases) zip
+(`relux-local-0.1.1-windows-x64.zip`), extract it, and launch it - no Rust, no npm:
+
+```powershell
+# inside the extracted relux-local-0.1.1-windows-x64 folder
+powershell -NoProfile -ExecutionPolicy Bypass -File .\Start-Relux.ps1
+# override the port if 19891 is taken:  .\Start-Relux.ps1 -Port 20000
+```
+
+Then, in your browser:
+
+1. Open **http://127.0.0.1:19891/dashboard** (the launcher prints this URL).
+2. Go to **Health → Prime Brain / AI Runtime** and click **"Use Claude CLI for
+   Prime"**. If `claude` is not yet on your PATH the panel shows the exact install
+   + sign-in step (`npm i -g @anthropic-ai/claude-code`, then run `claude` once to
+   log in); install it, click **Refresh**, then **"Use Claude CLI for Prime"**
+   again. No JSON or env-var editing is required for normal Claude setup.
+3. Open **Prime** and chat - e.g. `create a task to summarize the README`. A
+   greeting stays a greeting; an action creates real, kernel-grounded work. Each
+   reply shows its source (`via Claude CLI` / `deterministic`).
+4. Open **Work** to see the created task, assign it to an agent on **Crew**, and
+   run it with **Run assigned**.
+
+The bundle stores its data under `.\data\local.db` next to `Start-Relux.ps1`, so
+it is fully self-contained and portable.
+
 **Product path (first release):** real work runs through a coding-agent **adapter**
 - the **Claude CLI** or the **Codex CLI** - driven by **Prime** and its tools. Set
 up an adapter from the dashboard (Crew → Adapters) and, optionally, give Prime a
