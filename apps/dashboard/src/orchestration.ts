@@ -277,10 +277,17 @@ export function jobIsActive(job: ReluxOrchestrationJob | null | undefined): bool
   return job != null && (job.state === "queued" || job.state === "running");
 }
 
-// True once a job has stopped working (completed, failed, or canceled); the UI
-// then stops polling, refreshes the durable record, and re-enables Run/Continue.
+// True once a job has stopped working (completed, failed, canceled, or
+// interrupted); the UI then stops polling, refreshes the durable record, and
+// re-enables Run/Continue. "interrupted" is the restart-honest reconstructed state
+// (no live worker, pending briefs remain) — terminal for that job, resumable.
 export function jobIsTerminal(state: ReluxJobState | undefined): boolean {
-  return state === "completed" || state === "failed" || state === "canceled";
+  return (
+    state === "completed" ||
+    state === "failed" ||
+    state === "canceled" ||
+    state === "interrupted"
+  );
 }
 
 // True while a job is active and a cancel has already been requested: the worker
@@ -329,6 +336,9 @@ export function jobPhaseLabel(job: ReluxOrchestrationJob | null | undefined): st
       return "Failed";
     case "canceled":
       return "Canceled";
+    case "interrupted":
+      // Reconstructed from the durable record after a restart (no live worker).
+      return "Interrupted — run was lost to a server restart";
     default:
       return "";
   }

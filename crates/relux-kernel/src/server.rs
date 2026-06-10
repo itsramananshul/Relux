@@ -1483,6 +1483,14 @@ enum JobState {
     /// was already in flight, then stopped before the next one. Remaining briefs
     /// are left in their durable (pending) state for a human to resume or retire.
     Canceled,
+    /// Reconstructed from the durable record because no in-process job exists: the
+    /// job registry is in-memory, so a server restart loses live jobs. A prior
+    /// worker ran at least one brief but is gone, and briefs remain pending. This
+    /// is terminal for *this* job (the worker is not coming back); the pending
+    /// briefs can be resumed with a fresh run. Never minted by a live worker —
+    /// only by [`reconstruct_job_from_record`] when the durable record proves a run
+    /// happened but no worker is driving it now.
+    Interrupted,
 }
 
 impl JobState {
@@ -1494,6 +1502,7 @@ impl JobState {
             JobState::Completed => "completed",
             JobState::Failed => "failed",
             JobState::Canceled => "canceled",
+            JobState::Interrupted => "interrupted",
         }
     }
 }
@@ -1675,7 +1684,12 @@ impl JobRegistry {
                     CancelOutcome::Requested(job.clone())
                 }
                 JobState::Canceled => CancelOutcome::AlreadyCanceled(job.clone()),
-                JobState::Completed | JobState::Failed => CancelOutcome::AlreadyTerminal(job.clone()),
+                // `Interrupted` is never stored in the registry (it is reconstructed
+                // on read), so this arm is unreachable in practice; treat it as
+                // terminal for exhaustiveness and honesty.
+                JobState::Completed | JobState::Failed | JobState::Interrupted => {
+                    CancelOutcome::AlreadyTerminal(job.clone())
+                }
             },
         }
     }
@@ -1757,6 +1771,89 @@ fn job_steps(orch: &Orchestration, running: &[String]) -> Vec<JobStepStatus> {
             }
         })
         .collect()
+}
+
+/// Reconstruct a job-like status from the durable orchestration record alone, for
+/// when no in-process job exists for the orchestration. The [`JobRegistry`] is
+/// in-memory, so a server restart loses every live job; without this a poll by
+/// orchestration id would 404 even though the durable record still proves real
+/// progress. Reconstruction never fabricates anything — every field is derived
+/// from what the kernel already persisted (per-brief outcomes, run ids, rounds).
+///
+/// Returns `None` when the orchestration never ran a single brief (no run id on
+/// any step): no job has ever existed for it, so the honest answer is still "no
+/// job started" and the dashboard falls back to the planned record. Otherwise the
+/// state is honest about what the record proves: `completed` when every brief is
+/// terminal (no pending left), else `interrupted` — a prior worker ran but is gone
+/// (finished, canceled, or lost to a restart) and the pending briefs can be
+/// resumed with a fresh run.
+fn reconstruct_job_from_record(orch: &Orchestration) -> Option<OrchestrationJob> {
+    let ran = orch.steps.iter().filter(|s| s.run_id.is_some()).count() as u32;
+    if ran == 0 {
+        // Nothing ever ran: no job has existed, so do not invent one.
+        return None;
+    }
+    let completed = orch
+        .steps
+        .iter()
+        .filter(|s| s.outcome == StepOutcome::Completed)
+        .count() as u32;
+    let failed = orch
+        .steps
+        .iter()
+        .filter(|s| s.outcome == StepOutcome::Failed)
+        .count() as u32;
+    let blocked = orch
+        .steps
+        .iter()
+        .filter(|s| s.outcome == StepOutcome::Blocked)
+        .count() as u32;
+    let pending = orch
+        .steps
+        .iter()
+        .filter(|s| s.outcome == StepOutcome::Pending)
+        .count();
+    let current_round = orch.steps.iter().filter_map(|s| s.round).max().unwrap_or(0);
+    let state = if pending == 0 {
+        JobState::Completed
+    } else {
+        JobState::Interrupted
+    };
+    let last_event = Some(match state {
+        JobState::Completed => format!(
+            "reconstructed from the durable record: all {} brief(s) reached a terminal outcome \
+             ({completed} completed, {failed} failed, {blocked} blocked)",
+            orch.steps.len()
+        ),
+        _ => format!(
+            "no live worker for this orchestration (the previous run finished, was canceled, or \
+             was lost to a server restart). {completed} brief(s) completed durably; {pending} \
+             pending — start a new run to resume"
+        ),
+    });
+    Some(OrchestrationJob {
+        // A clearly-synthetic, non-process-local id so a client can tell this came
+        // from the durable record rather than a live worker.
+        id: format!("durable:{}", orch.id.as_str()),
+        orchestration_id: orch.id.to_string(),
+        state,
+        // Runtime params (`max`/`concurrency`/wall-clock) are not part of the
+        // durable record; report honest best-effort values rather than fake ones.
+        max: orch.steps.len(),
+        concurrency: 1,
+        current_round,
+        ran,
+        completed,
+        failed,
+        blocked,
+        started_at_ms: None,
+        completed_at_ms: None,
+        last_event,
+        error: None,
+        cancel_requested: false,
+        steps: job_steps(orch, &[]),
+        result: None,
+    })
 }
 
 /// Accumulates per-round [`OrchestrationBatchResult`]s into one job-level result.
@@ -2075,29 +2172,55 @@ async fn start_orchestration_job(
 }
 
 /// GET `/v1/relux/orchestration-jobs/:job_id` — poll one job's live status. 404
-/// when the id is unknown (never started, or lost to a restart).
+/// when the id is unknown. Job ids are **process-local**: the job registry is
+/// in-memory, so a server restart loses them and a raw id can no longer be mapped
+/// to its orchestration. The message points the caller at the restart-honest,
+/// durable poll-by-orchestration-id endpoint instead of leaving a bare 404.
 async fn get_orchestration_job(
     State(state): State<AppState>,
     AxumPath(job_id): AxumPath<String>,
 ) -> Result<Json<OrchestrationJob>, ApiError> {
     state.jobs.get(&job_id).map(Json).ok_or_else(|| ApiError {
         status: StatusCode::NOT_FOUND,
-        message: format!("no orchestration job {job_id} (it may have been lost to a server restart)"),
+        message: format!(
+            "no orchestration job {job_id}. Job ids are process-local (the job registry is \
+             in-memory) and are not retained across a server restart; poll \
+             GET /v1/relux/prime/orchestrations/:id/job by orchestration id for durable, \
+             restart-honest status."
+        ),
     })
 }
 
 /// GET `/v1/relux/prime/orchestrations/:id/job` — the latest job for an
 /// orchestration, so the dashboard can poll by orchestration id without tracking
-/// the job id. 404 when none has been started (the dashboard then shows the
-/// durable record's recorded progress instead).
+/// the job id. A live in-process job wins (it carries real wall-clock + live
+/// in-flight state). When none exists — including after a server restart, since
+/// the registry is in-memory — the status is **reconstructed from the durable
+/// orchestration record** so a poll stays honest instead of misleadingly 404-ing:
+/// `completed` when every brief is terminal, `interrupted` when a prior run left
+/// briefs pending and no worker is driving it now. The orchestration must exist
+/// (404 otherwise); one that never ran a brief reports "no job started" (404) so
+/// the dashboard falls back to the planned record.
 async fn get_latest_orchestration_job(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<OrchestrationJob>, ApiError> {
-    state.jobs.latest_for(&id).map(Json).ok_or_else(|| ApiError {
-        status: StatusCode::NOT_FOUND,
-        message: format!("no orchestration job has been started for {id}"),
-    })
+    if let Some(job) = state.jobs.latest_for(&id) {
+        return Ok(Json(job));
+    }
+    let oid = OrchestrationId::new(id.clone());
+    let orch = locked_read(&state, |k| Ok(k.orchestration(&oid).cloned()))?.ok_or_else(|| {
+        ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: format!("no orchestration {id}"),
+        }
+    })?;
+    reconstruct_job_from_record(&orch)
+        .map(Json)
+        .ok_or_else(|| ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: format!("no orchestration job has been started for {id}"),
+        })
 }
 
 /// POST `/v1/relux/orchestration-jobs/:job_id/cancel` — request cancellation of an
@@ -3813,5 +3936,98 @@ mod tests {
             after2.steps.iter().all(|s| s.outcome == StepOutcome::Completed),
             "the orchestration is fully completed after resume"
         );
+    }
+
+    // --- Restart honesty: reconstruct job status from the durable record -------
+
+    /// A fresh [`AppState`] over the SAME on-disk store, with a brand-new (empty)
+    /// in-memory [`JobRegistry`] — the exact shape a server restart produces: the
+    /// durable orchestration record survives, every live job is gone.
+    fn restarted_state_over(dir: &tempfile::TempDir) -> AppState {
+        AppState {
+            db_path: dir.path().join("local.db"),
+            plugins_root: dir.path().join("plugins"),
+            uploads_root: dir.path().join("uploads"),
+            dashboard_dir: None,
+            ai_config_path: dir.path().join("ai.json"),
+            lock: Arc::new(Mutex::new(())),
+            jobs: JobRegistry::default(),
+        }
+    }
+
+    #[test]
+    fn reconstruct_returns_none_when_no_brief_ever_ran() {
+        // A planned orchestration that never ran a brief has no job history, so
+        // reconstruction invents nothing — the poll still honestly 404s and the
+        // dashboard falls back to the planned record.
+        let (state, _dir, oid) = app_state_with_prime_orchestration();
+        let orch = locked_read(&state, |k| Ok(k.orchestration(&oid).cloned()))
+            .unwrap()
+            .unwrap();
+        assert!(
+            reconstruct_job_from_record(&orch).is_none(),
+            "no run id on any step => no reconstructed job"
+        );
+    }
+
+    #[test]
+    fn reconstruct_reports_interrupted_after_partial_run_across_restart() {
+        // Restart-honesty invariant (RELUX_MASTER_PLAN Sec 15). A job budgeted to one
+        // brief leaves the orchestration partially done; after a "restart" (fresh
+        // registry over the same store) the live job is gone, but a poll by
+        // orchestration id reconstructs an honest `interrupted` status from the
+        // durable record — never a misleading "never existed" 404.
+        let (state, dir, oid) = app_state_with_prime_orchestration();
+        let job1 = state.jobs.start(oid.as_str(), 1, 2).unwrap();
+        drive_orchestration_job(state.clone(), job1.id.clone(), oid.clone(), 1, 2);
+
+        // Simulate the restart: a new state with an empty registry over the same db.
+        let restarted = restarted_state_over(&dir);
+        assert!(
+            restarted.jobs.latest_for(oid.as_str()).is_none(),
+            "the in-memory job is gone after a restart"
+        );
+
+        let orch = locked_read(&restarted, |k| Ok(k.orchestration(&oid).cloned()))
+            .unwrap()
+            .unwrap();
+        let rebuilt = reconstruct_job_from_record(&orch).expect("a prior run => a reconstructed job");
+        assert_eq!(rebuilt.state, JobState::Interrupted, "pending briefs remain");
+        assert_eq!(rebuilt.ran, 1, "exactly one brief had run before the restart");
+        assert_eq!(rebuilt.completed, 1, "that brief completed durably");
+        assert!(rebuilt.current_round >= 1, "a round was recorded");
+        assert!(
+            rebuilt.steps.iter().any(|s| s.outcome == "pending"),
+            "the reconstructed view shows the still-pending briefs to resume"
+        );
+        assert!(
+            rebuilt.id.starts_with("durable:"),
+            "the reconstructed id is clearly synthetic, not a live job id"
+        );
+        assert!(
+            rebuilt.last_event.as_deref().unwrap_or("").contains("pending"),
+            "the message honestly explains the pending work to resume"
+        );
+    }
+
+    #[test]
+    fn reconstruct_reports_completed_when_all_briefs_terminal_across_restart() {
+        // The positive control: a fully-run orchestration reconstructs as `completed`
+        // (not `interrupted`) after a restart, since no brief is left pending.
+        let (state, dir, oid) = app_state_with_prime_orchestration();
+        let job = state.jobs.start(oid.as_str(), 25, 2).unwrap();
+        drive_orchestration_job(state.clone(), job.id.clone(), oid.clone(), 25, 2);
+
+        let restarted = restarted_state_over(&dir);
+        let orch = locked_read(&restarted, |k| Ok(k.orchestration(&oid).cloned()))
+            .unwrap()
+            .unwrap();
+        let rebuilt = reconstruct_job_from_record(&orch).expect("a run happened");
+        assert_eq!(rebuilt.state, JobState::Completed, "no brief left pending");
+        assert!(
+            rebuilt.steps.iter().all(|s| s.outcome != "pending"),
+            "every brief reached a terminal outcome"
+        );
+        assert!(rebuilt.ran >= 1, "at least one brief ran");
     }
 }

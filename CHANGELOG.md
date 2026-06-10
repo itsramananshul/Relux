@@ -35,8 +35,11 @@ once a stable release is cut.
   enabled, operator-configured local binary spawns). Proven by deterministic
   rendezvous tests (two slow fake adapters that finish only if running at the same
   instant) and against the **real Claude CLI**. *Known caveats:* the in-memory job
-  registry does not survive a server restart (a mid-job poll 404s and the dashboard
-  falls back to the durable orchestration record); the concurrency cap is 1..=4 and
+  registry does not survive a server restart, but a poll **by orchestration id**
+  (`GET …/orchestrations/:id/job`) stays restart-honest by reconstructing a job
+  status from the durable record (`completed`/`interrupted`) — only the raw
+  **by-job-id** poll 404s, since process-local job ids cannot be mapped back to an
+  orchestration after a restart; the concurrency cap is 1..=4 and
   the per-call round budget is 1..=25; dependency inference is conservative
   role-co-occurrence (not a full task graph); planning does not auto-create agents;
   no background timer drives orchestrations (operator-triggered only); and a retry

@@ -1517,12 +1517,17 @@ export interface ReluxOrchestrationBatchResult {
 // "canceled" is reached when a cancel was requested and honored: the worker
 // finished any in-flight round, then stopped before the next one (see the cancel
 // endpoint). It is terminal, like completed/failed.
+// "interrupted" is reported only by the poll-by-orchestration-id endpoint when no
+// live job exists but the durable record proves a prior run happened (e.g. the
+// server restarted mid-job — the in-memory registry is lost, the record is not).
+// It is terminal for that job; its pending briefs can be resumed with a fresh run.
 export type ReluxJobState =
   | "queued"
   | "running"
   | "completed"
   | "failed"
-  | "canceled";
+  | "canceled"
+  | "interrupted";
 
 // One brief's status as the job last observed it. `outcome` is the durable step
 // outcome, except briefs the worker is about to run this round are reported as
@@ -1536,9 +1541,11 @@ export interface ReluxJobStepStatus {
   note?: string | null;
 }
 
-// A pollable, in-memory record of one non-blocking orchestration run. Lost on a
-// server restart (the durable orchestration record keeps the real per-brief
-// progress); a poll for a lost job returns 404.
+// A pollable record of one non-blocking orchestration run. Live jobs are held
+// in-memory and lost on a server restart; the poll-by-orchestration-id endpoint
+// then RECONSTRUCTS a restart-honest status from the durable record (state
+// "completed" or "interrupted", id prefixed "durable:"). Only the raw
+// poll-by-job-id endpoint 404s for a lost job (job ids are process-local).
 export interface ReluxOrchestrationJob {
   id: string;
   orchestration_id: string;
@@ -1597,13 +1604,16 @@ export const reluxOrchestration = {
       `/v1/relux/prime/orchestrations/${encodeURIComponent(id)}/run-async`,
       opts ?? {},
     ),
-  // The latest job for an orchestration (poll target). 404 when none has been
-  // started — the caller then shows the durable record's recorded progress.
+  // The latest job for an orchestration (poll target). A live job wins; with none
+  // (e.g. after a server restart) it reconstructs a restart-honest status from the
+  // durable record ("completed"/"interrupted"). 404 only when the orchestration
+  // never ran a brief — the caller then shows the planned record's progress.
   latestJob: (id: string) =>
     api.get<ReluxOrchestrationJob>(
       `/v1/relux/prime/orchestrations/${encodeURIComponent(id)}/job`,
     ),
-  // Poll one job by id. 404 when unknown (never started, or lost to a restart).
+  // Poll one job by its (process-local) id. 404 when unknown — never started, or
+  // lost to a server restart; poll by orchestration id for restart-honest status.
   job: (jobId: string) =>
     api.get<ReluxOrchestrationJob>(
       `/v1/relux/orchestration-jobs/${encodeURIComponent(jobId)}`,

@@ -299,13 +299,22 @@ test("jobIsActive is true only while queued or running", () => {
   assert.equal(jobIsActive(undefined), false);
 });
 
-test("jobIsTerminal is true for completed, failed, or canceled", () => {
+test("jobIsTerminal is true for completed, failed, canceled, or interrupted", () => {
   assert.equal(jobIsTerminal("completed"), true);
   assert.equal(jobIsTerminal("failed"), true);
   assert.equal(jobIsTerminal("canceled"), true);
+  // A restart-reconstructed job is terminal too (no live worker), so the UI stops
+  // polling and falls back to the durable record.
+  assert.equal(jobIsTerminal("interrupted"), true);
   assert.equal(jobIsTerminal("running"), false);
   assert.equal(jobIsTerminal("queued"), false);
   assert.equal(jobIsTerminal(undefined), false);
+});
+
+test("interrupted is not active and never cancelable (no live worker)", () => {
+  assert.equal(jobIsActive(job("interrupted")), false);
+  assert.equal(jobCanCancel(job("interrupted")), false);
+  assert.equal(jobIsCanceling(job("interrupted", { cancel_requested: true })), false);
 });
 
 test("jobCanCancel only while active and no cancel pending", () => {
@@ -346,6 +355,10 @@ test("jobPhaseLabel reflects the real lifecycle, not a spinner", () => {
   assert.equal(jobPhaseLabel(job("running", { current_round: 2 })), "Running — round 2");
   assert.equal(jobPhaseLabel(job("completed")), "Completed");
   assert.equal(jobPhaseLabel(job("failed")), "Failed");
+  assert.equal(
+    jobPhaseLabel(job("interrupted")),
+    "Interrupted — run was lost to a server restart",
+  );
   assert.equal(jobPhaseLabel(null), "");
 });
 

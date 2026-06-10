@@ -2037,9 +2037,19 @@ dependency-aware ready/waiting/blocked state **as the batch progresses**, not on
 after it returns. The blocking `/run` endpoint stays for the CLI/tests. Two honesty
 contracts hold: (1) the briefs about to run this round are reported as `running`
 from the durable readiness rule — nothing fabricates in-flight progress; (2) the
-job registry is **in-memory only**, so a server restart mid-job loses the job
-record (a poll then 404s and the dashboard falls back to the durable record, which
-still carries whatever rounds actually completed). The worker never spins: each
+job registry is **in-memory only**, so a server restart mid-job loses the live job
+record — but a poll **by orchestration id** (`GET …/orchestrations/:id/job`) stays
+**restart-honest** by *reconstructing* a job-like status from the durable record
+when no live job exists: `completed` when every brief is terminal, else
+`interrupted` (a prior worker ran but is gone; pending briefs remain and can be
+resumed with a fresh run), with a clearly-synthetic `durable:<id>` id and a message
+explaining the pending work. Reconstruction fabricates nothing — every field comes
+from what the kernel already persisted (per-brief outcomes, run ids, rounds); an
+orchestration that never ran a brief still honestly 404s ("no job started") so the
+dashboard shows its planned record. Only the raw **by-job-id** endpoint
+(`GET …/orchestration-jobs/:job_id`) 404s for a lost job, because process-local job
+ids cannot be mapped to an orchestration after a restart — its 404 message points
+the caller at the durable by-orchestration-id poll. The worker never spins: each
 round moves ≥1 brief to a terminal outcome and it stops as soon as a round runs no
 brief, the per-job budget is spent, or the orchestration is no longer `running`.
 Duplicate starts are rejected (409, one active job per orchestration) and the fleet
@@ -2094,6 +2104,28 @@ same orchestration and asserts it is accepted (not a 409), runs **only** the pre
 `pending` downstream briefs (`job.ran` equals the pending count — the completed round-1
 briefs are never re-run), preserves each completed brief's original run id and round,
 gives each resumed brief a brand-new run id, and drives the record to fully `completed`.
+
+**Job status is restart-honest.** Because the registry is in-memory, a server
+restart loses every live job — but the durable record outlives it, so a poll **by
+orchestration id** (`GET …/orchestrations/:id/job`) reconstructs an honest job-like
+status when no live job exists: `completed` when every brief is terminal, else
+`interrupted` (a prior run left briefs pending and no worker is driving it now),
+with a synthetic `durable:<id>` id and a `ran` count that matches the record.
+Reconstruction (`reconstruct_job_from_record`) fabricates nothing and returns
+`None` (an honest 404) for an orchestration that never ran a brief, so the dashboard
+falls back to the planned record. The raw **by-job-id** poll still 404s for a lost
+job (process-local ids can't be remapped after a restart) with a message pointing at
+the durable poll. Unit tests
+(`reconstruct_returns_none_when_no_brief_ever_ran`,
+`reconstruct_reports_interrupted_after_partial_run_across_restart`,
+`reconstruct_reports_completed_when_all_briefs_terminal_across_restart`) pin the
+reconstruction over a fresh registry on the same store, and a dedicated **restart**
+smoke (`scripts/smoke-orchestration-restart.ps1`) proves it end-to-end against a
+kernel that is genuinely stopped and restarted: a `max=1` job leaves briefs pending,
+restart #1 reconstructs `interrupted` (and the lost job id 404s), a fresh job
+resumes to `completed`, and restart #2 reconstructs `completed`. The dashboard treats
+`interrupted` as terminal (`jobIsTerminal`) with an honest phase label, so it stops
+polling, shows the durable progress, and re-enables Continue to resume.
 
 ### Tool Invocation Surface (First Honest Version)
 
