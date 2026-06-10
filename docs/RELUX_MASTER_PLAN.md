@@ -2079,6 +2079,22 @@ then asserts the terminal `canceled` state with **both** in-flight briefs record
 `completed` honestly and the downstream implementation + documentation briefs left
 `pending`.
 
+**Resume-after-cancel is genuine, not a promise.** The "left `pending` for a human to
+resume with a fresh run" claim above is now proven. Because the duplicate-job guard
+only rejects a `queued`/`running` job for the same orchestration (a terminal
+`canceled` job no longer counts) and a round only schedules `pending` briefs whose
+dependencies are `completed`, starting a fresh job on a partially-done orchestration
+resumes it exactly where the cancel stopped — already-completed briefs are skipped, not
+re-run. This needs no special resume code; it falls out of the durable record being the
+single source of truth. A deterministic unit test
+(`a_second_job_resumes_only_pending_briefs_and_preserves_completed_runs`) and a
+dedicated **live resume-after-cancel** smoke (`scripts/smoke-orchestration-resume.ps1`)
+pin it: the smoke runs the multi-brief cancel scenario, then starts a fresh job on the
+same orchestration and asserts it is accepted (not a 409), runs **only** the previously
+`pending` downstream briefs (`job.ran` equals the pending count — the completed round-1
+briefs are never re-run), preserves each completed brief's original run id and round,
+gives each resumed brief a brand-new run id, and drives the record to fully `completed`.
+
 ### Tool Invocation Surface (First Honest Version)
 
 Installed ToolSet plugins are now visible, callable capabilities through the

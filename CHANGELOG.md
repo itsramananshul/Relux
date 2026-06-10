@@ -129,6 +129,28 @@ once a stable release is cut.
   observes `cancel_requested` while still `running`, then asserts terminal `canceled`
   with **both** in-flight briefs recorded `completed` honestly and the downstream
   implementation + documentation briefs left `pending`.
+- **Resume-after-cancel for orchestration jobs (proven).** The other half of the
+  cancel contract (master plan §15): a partially-done orchestration left behind by a
+  canceled job is genuinely **resumable** — a fresh job picks up exactly where the
+  canceled one stopped and never re-runs completed work. No production change was
+  needed; the behavior falls out of the existing design (the duplicate-job guard only
+  blocks `queued`/`running` jobs, so a terminal `canceled` job no longer counts, and a
+  round only schedules `pending` briefs whose dependencies are `completed`). It is now
+  **pinned**: a deterministic unit test
+  (`a_second_job_resumes_only_pending_briefs_and_preserves_completed_runs`) budgets a
+  first job to one brief, then starts a second job and asserts it ran *only* the
+  still-pending briefs (`ran == pending count`), that each completed brief kept its
+  **original** run id and round byte-for-byte, that each resumed brief earned a
+  **new** run id, and that the orchestration ends fully `completed`. A dedicated
+  **live resume-after-cancel** HTTP smoke (`scripts/smoke-orchestration-resume.ps1`)
+  proves it end-to-end against real spawned processes: it runs the multi-brief cancel
+  scenario (two slow CLI briefs caught `running` together, canceled mid-round, both
+  recorded `completed`, downstream left `pending`), snapshots each brief's run id and
+  round, then starts a **fresh** job on the same orchestration and asserts it is
+  accepted (not a 409 duplicate), runs **only** the two pending downstream briefs
+  (`job.ran == 2`), preserves the round-1 briefs' original run ids/rounds, gives the
+  downstream briefs brand-new run ids distinct from the round-1 ones, and drives the
+  record to fully `completed`.
 - **Non-blocking orchestration jobs + live, pollable progress.** Running an
   orchestration no longer blocks on one long request (master plan "Orchestration
   (First Multi-Agent Slice)" — the previously-deferred non-blocking job model).

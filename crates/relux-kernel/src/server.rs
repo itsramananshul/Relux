@@ -3720,4 +3720,98 @@ mod tests {
             "without cancel the briefs actually run"
         );
     }
+
+    #[test]
+    fn a_second_job_resumes_only_pending_briefs_and_preserves_completed_runs() {
+        // Resume-after-cancel invariant (RELUX_MASTER_PLAN Sec 15). When a job leaves
+        // an orchestration partially done — some briefs completed, the rest pending —
+        // a fresh job must run ONLY the still-pending briefs. It must never re-run an
+        // already-completed brief: each completed brief keeps the exact run id and
+        // round it earned in the first job, while the resumed briefs earn brand-new
+        // run ids of their own.
+        let (state, _dir, oid) = app_state_with_prime_orchestration();
+
+        // First job, budgeted to exactly ONE brief. The round runs one ready brief,
+        // then the per-job budget is spent and the worker stops — leaving the rest
+        // pending, the same partial shape a mid-flight cancel leaves behind.
+        let job1 = state.jobs.start(oid.as_str(), 1, 2).unwrap();
+        drive_orchestration_job(state.clone(), job1.id.clone(), oid.clone(), 1, 2);
+        let done1 = state.jobs.get(&job1.id).expect("job1 survives");
+        assert_eq!(done1.ran, 1, "first job ran exactly one brief (budget=1)");
+
+        let after1 = locked_read(&state, |k| Ok(k.orchestration(&oid).cloned()))
+            .unwrap()
+            .unwrap();
+        let completed1: Vec<_> = after1
+            .steps
+            .iter()
+            .filter(|s| s.outcome == StepOutcome::Completed)
+            .collect();
+        let pending1: Vec<_> = after1
+            .steps
+            .iter()
+            .filter(|s| s.outcome == StepOutcome::Pending)
+            .collect();
+        assert_eq!(completed1.len(), 1, "exactly one brief completed");
+        assert!(!pending1.is_empty(), "downstream briefs still pending to resume");
+        // Snapshot the completed brief's earned identity so we can prove the resume
+        // never touches it.
+        let done_task = completed1[0].task_id.clone();
+        let done_run = completed1[0].run_id.clone().expect("completed brief has a run id");
+        let done_round = completed1[0].round;
+        assert!(done_round.is_some(), "completed brief recorded its round");
+        let pending_tasks: Vec<_> = pending1.iter().map(|s| s.task_id.clone()).collect();
+
+        // Fresh, non-blocking job on the SAME orchestration. The first job is terminal
+        // (Completed), so this is accepted rather than rejected as a duplicate.
+        let job2 = state
+            .jobs
+            .start(oid.as_str(), 25, 2)
+            .expect("a fresh job resumes the partially-done orchestration");
+        assert_ne!(job2.id, job1.id);
+        drive_orchestration_job(state.clone(), job2.id.clone(), oid.clone(), 25, 2);
+        let done2 = state.jobs.get(&job2.id).expect("job2 survives");
+        assert_eq!(done2.state, JobState::Completed, "resumed job completes");
+        assert_eq!(
+            done2.ran as usize,
+            pending_tasks.len(),
+            "the resumed job ran ONLY the previously-pending briefs, never re-running the completed one"
+        );
+
+        let after2 = locked_read(&state, |k| Ok(k.orchestration(&oid).cloned()))
+            .unwrap()
+            .unwrap();
+        // The already-completed brief is byte-for-byte untouched: same run id, same round.
+        let done_after = after2
+            .steps
+            .iter()
+            .find(|s| s.task_id == done_task)
+            .expect("completed brief still present");
+        assert_eq!(done_after.outcome, StepOutcome::Completed);
+        assert_eq!(
+            done_after.run_id, Some(done_run.clone()),
+            "the completed brief kept its original run id (was not re-run)"
+        );
+        assert_eq!(
+            done_after.round, done_round,
+            "the completed brief kept its original round"
+        );
+        // Every resumed brief now completed, each with a brand-new run id distinct from
+        // the first job's.
+        for tid in &pending_tasks {
+            let s = after2
+                .steps
+                .iter()
+                .find(|s| &s.task_id == tid)
+                .expect("resumed brief present");
+            assert_eq!(s.outcome, StepOutcome::Completed, "resumed brief completed");
+            let rid = s.run_id.clone().expect("resumed brief earned a run id");
+            assert_ne!(rid, done_run, "resumed brief earned a NEW run id");
+            assert!(s.round.is_some(), "resumed brief recorded its round");
+        }
+        assert!(
+            after2.steps.iter().all(|s| s.outcome == StepOutcome::Completed),
+            "the orchestration is fully completed after resume"
+        );
+    }
 }
