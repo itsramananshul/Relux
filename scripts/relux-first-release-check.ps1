@@ -77,6 +77,15 @@ $launcherCheck = Join-Path $PSScriptRoot "check-launcher-preflight.ps1"
 [void](Invoke-NativeStep -Name "bundle launcher preflight" -Exe "powershell" `
     -Arguments @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $launcherCheck))
 
+# The kernel `serve` bind-failure message (Rust) and the launcher preflight
+# message (PowerShell) are two independent surfaces for the same port-busy
+# guidance (RELUX_MASTER_PLAN Sec 22). This static cross-source check pins their
+# wording parity so they cannot drift - both name "already in use", point at
+# /dashboard, and show `Start-Relux.ps1 -Port`, and neither promises auto-pick.
+$portGuidanceCheck = Join-Path $PSScriptRoot "check-port-guidance.ps1"
+[void](Invoke-NativeStep -Name "port guidance contract" -Exe "powershell" `
+    -Arguments @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $portGuidanceCheck))
+
 if (Test-Path -LiteralPath $ReleaseExe) {
     Invoke-NativeStep -Name "release doctor" -Exe $ReleaseExe -Arguments @("doctor")
 } elseif ($Cargo) {

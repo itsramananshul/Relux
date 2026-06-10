@@ -1678,7 +1678,12 @@ Configuration:
   `http://127.0.0.1:19891/dashboard` to check for a running instance, and gives
   the exact command to pick another port (`RELUX_HTTP_ADDR` for a source
   checkout, `Start-Relux.ps1 -Port <port>` for the bundle) - never a bare OS
-  error.
+  error and never an auto-picked port. The bundle launcher's preflight repeats
+  this same guidance. Because the two surfaces are written in Rust and
+  PowerShell respectively, `scripts\check-port-guidance.ps1` (run by the release
+  gate) reads both and asserts they stay in lockstep - both name the conflict
+  "already in use", point at `/dashboard`, and show `Start-Relux.ps1 -Port`,
+  and neither promises to auto-pick a port - so the wording cannot drift.
 - `RELUX_DASHBOARD_DIST` - override the dashboard bundle directory.
 
 Local first-release checks:
