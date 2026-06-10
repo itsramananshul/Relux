@@ -1,6 +1,6 @@
 ﻿# Relux Master Plan
 
-Version: 0.1.0
+Version: 0.1.1
 Status: Canonical planning document
 Product name: Relux
 Repository: `D:\DATA\WORK\OpenPrem\Apps\Relix-Revised`
@@ -1767,6 +1767,29 @@ What remains intentionally local-first (out of scope for this RC):
 - The standalone API binds loopback and is unauthenticated by design - it is not
   a multi-user or production surface.
 - GitHub Actions stay disabled; releases are cut by hand with this script.
+
+### Release history (local Windows bundles)
+
+Relux ships as hand-cut, local-first Windows bundles (no installer, no hosted
+download). The version is the `relux-kernel` / `relux-core` crate version and is
+stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
+`VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
+
+- **v0.1.1** (2026-06-10) — first build that makes **Prime brain selection** a
+  first-class dashboard surface. Health → *Prime Brain / AI Runtime* lets the
+  operator pick who answers Prime's conversational turns — Local (deterministic),
+  Claude CLI, Codex CLI, or OpenRouter — with one-click *"Use Claude/Codex for
+  Prime"* that enables the adapter and selects the brain together. Live adapter
+  status (on-PATH / enabled / ready) and the exact install/sign-in next step are
+  shown inline, so no JSON editing or CLI flags are needed for normal Claude/Codex
+  setup. The dev/test `echo` tool is no longer surfaced as a product path (it
+  stays as internal smoke plumbing only). The blank/legacy-route bug stays fixed:
+  the Relux shell owns every path with an in-shell not-found.
+- **v0.1.0** (2026-05-23) — first standalone Relux bundle: `relux-kernel serve`
+  control plane, the seven-surface dashboard (Home, Prime, Work, Crew, Plugins,
+  Approvals, Health), Plugin Runtime v1 (HTTP loopback), Adapter Runtime v1
+  (Claude/Codex/generic CLI, disabled by default), the safe Prime autonomy loop,
+  and the deterministic tool floor (`echo` / `status`).
 
 ### Prime Autonomy Loop (First Local Version)
 

@@ -9,6 +9,19 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.1 (Windows bundle).** The `relux-kernel` /
+  `relux-core` crates move from `0.1.0` to `0.1.1` for the first build that makes
+  **Prime brain selection** a first-class dashboard surface. Health → *Prime
+  Brain / AI Runtime* lets the operator choose who answers Prime's conversational
+  turns — Local (deterministic), Claude CLI, Codex CLI, or OpenRouter — with a
+  one-click *"Use Claude/Codex for Prime"* that enables the adapter and selects
+  the brain together, plus live adapter status and the exact install/sign-in next
+  step. No JSON editing or CLI flags are needed for normal Claude setup. The
+  dev/test `echo` tool is no longer presented as a product path (internal smoke
+  plumbing only), and the blank/legacy-route fix is retained. This version line is
+  the `relux-kernel` crate version (separate from the Relix workspace version
+  above); build the bundle with `scripts\relux-package-local.ps1 -FullE2E`. See
+  `docs/RELUX_MASTER_PLAN.md` → *Release history*.
 - **Release readiness CLI.** `relix release readiness` now prints the
   local first-release gate, current binary version, expected tag, git
   HEAD, clean/dirty state, and local/origin tag presence; it can run the
