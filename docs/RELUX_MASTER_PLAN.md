@@ -730,6 +730,16 @@ Fields:
   path + size). These are references, **not** a workspace diff or an apply plan,
   and capturing them does not enable apply (see section 15). Empty when the
   adapter declared none. Never fabricated.
+- proposed_changes — reviewable, applyable **proposed file changes** the adapter
+  declared in its structured result envelope (`proposed_changes: [...]`): each a
+  bounded, path-sanitized, text-only **full-content replacement** of one file
+  (`path` / `new_content` / `baseline_sha256?` / `new_sha256` / `bytes` / `source`)
+  with a review `status` (proposed → approved → applied, or rejected). Unlike
+  `artifacts` (read-only references), these carry content and ARE the first real
+  Relux diff/apply model: the operator reviews (approve / reject) and, once
+  approved, explicitly applies into the run's controlled workspace root with a
+  baseline-conflict check (see section 15). Empty when the adapter declared none.
+  Never fabricated; apply is never automatic.
 
 ### 9.7 Run Event
 
@@ -2579,20 +2589,37 @@ remain, in rough priority for the next slices:
    (name / type / summary / source, `runArtifacts`/`artifactTypeLabel`) with an
    honest empty state. Safety: the count and every field are capped, secrets are
    redacted, and an unsafe declared path (absolute / drive / UNC / `..`) is dropped
-   — the kernel never reads the underlying file. This is **capture only**: it is
-   NOT the legacy `/runs` workspace changed-file set (with a baseline hash + apply
-   plan) — the two share no ids or store. Apply stays **unavailable**: even a run
-   that captured references cannot be applied, because the Relux run model still
-   has **no diff/apply or review verdict**, so the panel says so honestly
-   (`reviewApplyAvailability` always returns `available:false`; the reason adapts —
-   references-are-read-only vs. no-data-at-all) and deliberately does **not** call
-   the legacy `/v1/runs/:id/{artifacts,diff,apply,review}` endpoints, because those
-   ids belong to the separate `brief_runs` ledger. What is still **not** done: a
-   Relux diff/apply model and accept/reject review (the next slice — the captured
-   references define the contract for it); live event streaming (the page
-   polls/refreshes a synchronous run rather than tailing it); and resuming a
-   *partial* CLI run (retry is a new attempt). Execution-environment runtimes are
-   not implemented.
+   — the kernel never reads the underlying file. The references are **capture only** and
+   NOT the legacy `/runs` workspace changed-file set — the two share no ids or
+   store. **First real Relux diff/apply model (reviewed proposed changes):** an
+   adapter envelope may ALSO declare `proposed_changes: [...]` — reviewable,
+   applyable **full-content file replacements** (each `path` / `new_content` /
+   `baseline_sha256` / computed `new_sha256` / `bytes` / `source` / `status`),
+   captured by `relux_core::capture_proposed_changes` → `Run.proposed_changes`
+   (persisted; survives a snapshot round-trip) and flattened onto
+   `GET /v1/relux/runs/:id`. The operator **reviews** each
+   (`POST …/proposed-changes/:index/review` → approve / reject) and, once approved,
+   **explicitly applies** it (`POST …/proposed-changes/:index/apply`) into the run's
+   **controlled workspace root** (the adapter's `working_dir`). **Nothing is ever
+   auto-applied.** Apply (the one place the kernel writes an agent-proposed file)
+   refuses honestly and never fabricates success: it requires `Approved` state,
+   **refuses without a baseline hash** (no force in v1), requires a configured
+   workspace root, resolves the target **inside** that root with no `..`/symlink
+   escape, refuses excluded (vcs/build/secret) paths, requires an **existing
+   regular file whose current SHA-256 equals the baseline** (a mismatch is an
+   honest **conflict**, the file untouched), and writes **atomically**. Capture is
+   bounded (`MAX_PROPOSED_CHANGES = 32`, `MAX_CONTENT_BYTES = 256 KiB`, text-only,
+   path-sanitized). The Work Run Detail surfaces a **Proposed Changes** section
+   (per-change status, content preview, approve / reject / apply, honest refused
+   reasons / conflicts), and `reviewApplyAvailability` now returns
+   `available:true` when a run proposed changes (apply is real for them); a run
+   with only read-only references keeps the honest "no diff/apply" reason. What is
+   still **not** done: multi-file/transactional apply, file create/rename/delete
+   (v1 is single-file full-content replacement over an existing baseline — a
+   missing target is a conflict); arbitrary patch/diff parsing (deliberately not
+   built — replacement is safer); live event streaming (the page polls/refreshes a
+   synchronous run rather than tailing it); and resuming a *partial* CLI run (retry
+   is a new attempt). Execution-environment runtimes are not implemented.
 4. **Multi-agent autonomy.** *(First slice addressed post-v0.1.2; depth slice
    added after.)* See "Orchestration (First Multi-Agent Slice)" below. Prime can
    decompose a multi-step goal into role-typed **briefs assigned to different

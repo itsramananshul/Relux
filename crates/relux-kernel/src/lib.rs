@@ -48,8 +48,8 @@ pub use plugin_install::{
 pub use prime::{classify_intent, decide};
 pub use runtime::{invoke_http_loopback, RuntimeClientError};
 pub use state::{
-    run_briefs_in_parallel, BundledRefresh, BundledRefreshSummary, FinishedBrief, KernelCounters,
-    KernelSnapshot, KernelState, PreparedBrief, RoundPrep,
+    run_briefs_in_parallel, AppliedProposedChange, BundledRefresh, BundledRefreshSummary,
+    FinishedBrief, KernelCounters, KernelSnapshot, KernelState, PreparedBrief, RoundPrep,
 };
 pub use store::SqliteStore;
 
@@ -88,6 +88,26 @@ pub enum KernelError {
     NoActiveRun(String),
     #[error("run {run} is not retryable (status {status}); only failed runs can be retried")]
     RunNotRetryable { run: String, status: String },
+    #[error("run {run} has no proposed change at index {index}")]
+    UnknownProposedChange { run: String, index: usize },
+    #[error("proposed change {index} on run {run} is not approved (status {status}); approve it before applying")]
+    ProposedChangeNotApproved {
+        run: String,
+        index: usize,
+        status: String,
+    },
+    #[error("proposed change {index} on run {run} cannot be applied: {reason}")]
+    ProposedChangeNotApplicable {
+        run: String,
+        index: usize,
+        reason: String,
+    },
+    #[error("proposed change {index} on run {run} conflicts with the workspace: {reason}")]
+    ProposedChangeConflict {
+        run: String,
+        index: usize,
+        reason: String,
+    },
     #[error("unknown approval: {0}")]
     UnknownApproval(String),
     #[error("unknown orchestration: {0}")]

@@ -2035,6 +2035,7 @@ impl KernelState {
             cost: None,
             retried_from: None,
             artifacts: Vec::new(),
+            proposed_changes: Vec::new(),
         };
         self.runs.insert(run_id.clone(), run);
 
@@ -2470,6 +2471,291 @@ impl KernelState {
         if let Some(run) = self.runs.get_mut(run_id) {
             run.artifacts = artifacts;
         }
+    }
+
+    /// Persist the reviewable **proposed file changes** an adapter declared in its
+    /// structured result envelope onto the durable run record (master plan section
+    /// 15 / section 9.6). Best-effort: an unknown run id or an empty set is a no-op
+    /// (we never write an empty `proposed_changes` and never fabricate one). These
+    /// carry content and can be reviewed/applied, but capturing them NEVER applies
+    /// them — apply requires an explicit operator approval + apply action.
+    fn set_run_proposed_changes(
+        &mut self,
+        run_id: &RunId,
+        changes: Vec<relux_core::ProposedChange>,
+    ) {
+        if changes.is_empty() {
+            return;
+        }
+        if let Some(run) = self.runs.get_mut(run_id) {
+            run.proposed_changes = changes;
+        }
+    }
+
+    /// Record an operator's accept/reject of one proposed change (master plan
+    /// section 15 review verdict). `approve = true` moves a `Proposed` change to
+    /// `Approved` (eligible for an explicit apply); `false` moves it to `Rejected`
+    /// (never applied). An already-`Applied` change cannot be re-reviewed. Returns
+    /// the new status. Audited; never applies anything.
+    pub fn review_proposed_change(
+        &mut self,
+        run_id: &RunId,
+        index: usize,
+        approve: bool,
+        note: Option<&str>,
+    ) -> Result<relux_core::ProposedChangeStatus, KernelError> {
+        use relux_core::ProposedChangeStatus;
+        let (agent_id, task_id) = {
+            let run = self
+                .runs
+                .get(run_id)
+                .ok_or_else(|| KernelError::UnknownRun(run_id.to_string()))?;
+            (run.agent_id.clone(), run.task_id.clone())
+        };
+        let task_namespace = self.tasks.get(&task_id).map(|t| t.namespace_id.clone());
+        let new_status = {
+            let run = self
+                .runs
+                .get_mut(run_id)
+                .ok_or_else(|| KernelError::UnknownRun(run_id.to_string()))?;
+            let change = run.proposed_changes.get_mut(index).ok_or_else(|| {
+                KernelError::UnknownProposedChange {
+                    run: run_id.to_string(),
+                    index,
+                }
+            })?;
+            if change.status == ProposedChangeStatus::Applied {
+                return Err(KernelError::ProposedChangeNotApplicable {
+                    run: run_id.to_string(),
+                    index,
+                    reason: "the change is already applied and cannot be re-reviewed".to_string(),
+                });
+            }
+            change.status = if approve {
+                ProposedChangeStatus::Approved
+            } else {
+                ProposedChangeStatus::Rejected
+            };
+            if let Some(n) = note {
+                change.set_review_note(n);
+            }
+            // A fresh decision clears a stale refusal reason from a prior attempt.
+            change.refused_reason = None;
+            change.status
+        };
+        self.record_audit(
+            "agent",
+            agent_id.as_str(),
+            if approve {
+                "proposed_change:approve"
+            } else {
+                "proposed_change:reject"
+            },
+            Some("run"),
+            Some(run_id.as_str()),
+            task_namespace.as_ref(),
+            AuditResult::Success,
+            serde_json::json!({ "index": index, "status": new_status.as_str() }),
+        );
+        Ok(new_status)
+    }
+
+    /// Apply one **approved** proposed change into the run's controlled workspace
+    /// root (master plan section 15 apply, safety bar section 17.5). This is the
+    /// one place the Relux kernel writes a file an agent proposed, so the bar is
+    /// strict and every refusal is honest (no fabricated success):
+    ///
+    /// 1. the change must be in `Approved` state (approval required);
+    /// 2. it must carry a `baseline_sha256` (v1 refuses without one — no force);
+    /// 3. the run's adapter must have a configured `working_dir` (the controlled
+    ///    workspace root); otherwise there is nowhere safe to write;
+    /// 4. the target resolves inside that root with no symlink/`..` escape and is
+    ///    not an excluded (vcs/build/secret) path;
+    /// 5. the target must already exist as a regular file whose current SHA-256
+    ///    equals the declared baseline (a mismatch is a **conflict** — refused, the
+    ///    file untouched);
+    /// 6. only then is the new content written atomically (temp file + rename).
+    ///
+    /// On success the change flips to `Applied` (with an `applied_at` stamp), a
+    /// transcript event + audit are recorded, and the applied path/bytes are
+    /// returned. A refusal records the honest reason on the change and audits a
+    /// failure; the file is never partially written.
+    pub fn apply_proposed_change(
+        &mut self,
+        run_id: &RunId,
+        index: usize,
+    ) -> Result<AppliedProposedChange, KernelError> {
+        use relux_core::ProposedChangeStatus;
+        let (agent_id, task_id, adapter_plugin) = {
+            let run = self
+                .runs
+                .get(run_id)
+                .ok_or_else(|| KernelError::UnknownRun(run_id.to_string()))?;
+            (
+                run.agent_id.clone(),
+                run.task_id.clone(),
+                run.adapter_plugin.clone(),
+            )
+        };
+        let task_namespace = self.tasks.get(&task_id).map(|t| t.namespace_id.clone());
+
+        // Snapshot the change fields we need (status/baseline/path/content) so the
+        // borrow of `self.runs` is released before we read other kernel state.
+        let (status, baseline, rel_path, content) = {
+            let run = self
+                .runs
+                .get(run_id)
+                .ok_or_else(|| KernelError::UnknownRun(run_id.to_string()))?;
+            let change = run.proposed_changes.get(index).ok_or_else(|| {
+                KernelError::UnknownProposedChange {
+                    run: run_id.to_string(),
+                    index,
+                }
+            })?;
+            (
+                change.status,
+                change.baseline_sha256.clone(),
+                change.path.clone(),
+                change.new_content.clone(),
+            )
+        };
+
+        // 1. Approval is required.
+        if status != ProposedChangeStatus::Approved {
+            return Err(KernelError::ProposedChangeNotApproved {
+                run: run_id.to_string(),
+                index,
+                status: status.as_str().to_string(),
+            });
+        }
+
+        // A closure to record an honest refusal on the change + audit, then build
+        // the typed error. Keeps every early-exit path consistent.
+        // 2. A baseline hash is required (no force in v1).
+        let baseline = match baseline {
+            Some(b) => b,
+            None => {
+                let reason =
+                    "no baseline hash recorded; refusing to apply without one (no force in v1)"
+                        .to_string();
+                self.refuse_proposed_change(run_id, index, &agent_id, task_namespace.as_ref(), &reason);
+                return Err(KernelError::ProposedChangeNotApplicable {
+                    run: run_id.to_string(),
+                    index,
+                    reason,
+                });
+            }
+        };
+
+        // 3. The run's adapter must have a controlled workspace root.
+        let workspace_root = self
+            .adapter_runtime_configs
+            .get(&adapter_plugin)
+            .and_then(|c| c.working_dir.clone())
+            .filter(|w| !w.trim().is_empty());
+        let workspace_root = match workspace_root {
+            Some(w) => w,
+            None => {
+                let reason = format!(
+                    "no controlled workspace root is configured for this run's adapter ({}); \
+                     set its working_dir before applying",
+                    adapter_plugin.as_str()
+                );
+                self.refuse_proposed_change(run_id, index, &agent_id, task_namespace.as_ref(), &reason);
+                return Err(KernelError::ProposedChangeNotApplicable {
+                    run: run_id.to_string(),
+                    index,
+                    reason,
+                });
+            }
+        };
+
+        // 4-6. Resolve, conflict-check, and write under the controlled root.
+        let outcome = apply_change_to_workspace(&workspace_root, &rel_path, &baseline, &content);
+        match outcome {
+            Ok(written_bytes) => {
+                let applied_at = self.clock.tick();
+                if let Some(run) = self.runs.get_mut(run_id) {
+                    if let Some(change) = run.proposed_changes.get_mut(index) {
+                        change.status = ProposedChangeStatus::Applied;
+                        change.applied_at = Some(applied_at.clone());
+                        change.refused_reason = None;
+                    }
+                }
+                self.push_run_event(
+                    run_id,
+                    "proposed_change_applied",
+                    "kernel",
+                    &format!("applied proposed change to {rel_path} ({written_bytes} bytes)"),
+                    serde_json::json!({
+                        "index": index,
+                        "path": rel_path,
+                        "bytes": written_bytes,
+                    }),
+                );
+                self.record_audit(
+                    "agent",
+                    agent_id.as_str(),
+                    "proposed_change:apply",
+                    Some("run"),
+                    Some(run_id.as_str()),
+                    task_namespace.as_ref(),
+                    AuditResult::Success,
+                    serde_json::json!({ "index": index, "path": rel_path, "bytes": written_bytes }),
+                );
+                Ok(AppliedProposedChange {
+                    run_id: run_id.clone(),
+                    index,
+                    path: rel_path,
+                    bytes: written_bytes,
+                    applied_at,
+                })
+            }
+            Err(ApplyFailure { conflict, reason }) => {
+                self.refuse_proposed_change(run_id, index, &agent_id, task_namespace.as_ref(), &reason);
+                if conflict {
+                    Err(KernelError::ProposedChangeConflict {
+                        run: run_id.to_string(),
+                        index,
+                        reason,
+                    })
+                } else {
+                    Err(KernelError::ProposedChangeNotApplicable {
+                        run: run_id.to_string(),
+                        index,
+                        reason,
+                    })
+                }
+            }
+        }
+    }
+
+    /// Record an honest refusal reason on a proposed change + a failed audit. The
+    /// change keeps its `Approved` status (the operator may fix the workspace and
+    /// retry) but carries the reason so the dashboard shows why apply was refused.
+    fn refuse_proposed_change(
+        &mut self,
+        run_id: &RunId,
+        index: usize,
+        agent_id: &AgentId,
+        namespace: Option<&NamespaceId>,
+        reason: &str,
+    ) {
+        if let Some(run) = self.runs.get_mut(run_id) {
+            if let Some(change) = run.proposed_changes.get_mut(index) {
+                change.set_refused_reason(reason);
+            }
+        }
+        self.record_audit(
+            "agent",
+            agent_id.as_str(),
+            "proposed_change:apply",
+            Some("run"),
+            Some(run_id.as_str()),
+            namespace,
+            AuditResult::Failed,
+            serde_json::json!({ "index": index, "reason": reason }),
+        );
     }
 
     /// Retry a failed run as a **fresh** run on the same task
@@ -3514,6 +3800,7 @@ impl KernelState {
                         "cost_usd": parsed.cost_usd,
                         "num_turns": parsed.num_turns,
                         "artifacts": parsed.artifacts.len(),
+                        "proposed_changes": parsed.proposed_changes.len(),
                     }),
                 );
 
@@ -3533,8 +3820,11 @@ impl KernelState {
                         parsed.cost_usd,
                     );
                     // An errored envelope may still reference artifacts it
-                    // produced before failing - capture them read-only.
+                    // produced before failing - capture them read-only, plus any
+                    // proposed changes (captured for review; apply still requires
+                    // an explicit approval + action and is never automatic).
                     self.set_run_artifacts(&run_id, parsed.artifacts.clone());
+                    self.set_run_proposed_changes(&run_id, parsed.proposed_changes.clone());
                     self.fail_cli_run(&run_id, task_id, namespace.as_ref(), adapter, &reason);
                     return Err(KernelError::AdapterExecutionFailed {
                         plugin: adapter.to_string(),
@@ -3550,6 +3840,7 @@ impl KernelState {
                     parsed.cost_usd,
                 );
                 self.set_run_artifacts(&run_id, parsed.artifacts.clone());
+                self.set_run_proposed_changes(&run_id, parsed.proposed_changes.clone());
                 self.complete_task(task_id)?;
                 let agent = self
                     .runs
@@ -3928,6 +4219,156 @@ fn first_line(text: &str) -> String {
         .chars()
         .take(200)
         .collect()
+}
+
+/// The result of a successful proposed-change apply, returned to the API layer.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AppliedProposedChange {
+    pub run_id: RunId,
+    pub index: usize,
+    /// The safe relative path that was written.
+    pub path: String,
+    /// The number of bytes written.
+    pub bytes: u64,
+    /// The logical-clock stamp recorded at apply time.
+    pub applied_at: String,
+}
+
+/// An honest apply refusal. `conflict` distinguishes a baseline/content conflict
+/// (the workspace moved out from under the change) from a structural refusal
+/// (unsafe path, missing/irregular target) so the API can map it to the right
+/// status.
+#[derive(Debug)]
+struct ApplyFailure {
+    conflict: bool,
+    reason: String,
+}
+
+/// The maximum size of an existing target file we will read to verify its
+/// baseline hash. A file larger than this is refused rather than slurped into
+/// memory — the proposed-change model is for ordinary text source files.
+const APPLY_TARGET_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Resolve, conflict-check, and write one proposed change under `workspace_root`.
+/// PURE of kernel state — it only touches the filesystem, so it can be reasoned
+/// about (and tested) on its own. Every refusal is an [`ApplyFailure`] with an
+/// honest reason; on success it returns the number of bytes written.
+///
+/// Safety (master plan section 17.5):
+/// - the workspace root must exist and canonicalize (a controlled directory);
+/// - the target must resolve *inside* that root with no `..` escape and no
+///   symlink in any existing component (so a symlinked path can't redirect the
+///   write outside the root);
+/// - the target must already exist as a regular file whose current SHA-256 equals
+///   the declared `baseline` (else a conflict — the file is left untouched);
+/// - the write is atomic (temp file in the same directory + rename), so a crash
+///   mid-write never leaves a half-written file.
+fn apply_change_to_workspace(
+    workspace_root: &str,
+    rel_path: &str,
+    baseline: &str,
+    content: &str,
+) -> Result<u64, ApplyFailure> {
+    let refuse = |reason: String| ApplyFailure {
+        conflict: false,
+        reason,
+    };
+    let conflict = |reason: String| ApplyFailure {
+        conflict: true,
+        reason,
+    };
+
+    // The path was already sanitized at capture (relative, no `..`, not
+    // excluded); re-validate defensively in case storage was tampered with.
+    let safe_rel = relux_core::proposed_change::sanitize_change_path(rel_path)
+        .ok_or_else(|| refuse(format!("unsafe or excluded target path: {rel_path}")))?;
+
+    let root = std::path::Path::new(workspace_root);
+    let root_canon = std::fs::canonicalize(root).map_err(|e| {
+        refuse(format!(
+            "workspace root {workspace_root} is not accessible: {e}"
+        ))
+    })?;
+    if !root_canon.is_dir() {
+        return Err(refuse(format!(
+            "workspace root {workspace_root} is not a directory"
+        )));
+    }
+
+    // Resolve <root>/<rel>, refusing any escape or symlinked component.
+    let mut target = root_canon.clone();
+    for comp in safe_rel.split('/') {
+        target.push(comp);
+    }
+    if !target.starts_with(&root_canon) {
+        return Err(refuse("resolved path escapes the workspace root".to_string()));
+    }
+    let mut cur = root_canon.clone();
+    for comp in safe_rel.split('/') {
+        cur.push(comp);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(md) if md.file_type().is_symlink() => {
+                return Err(refuse(format!("path crosses a symlink: {comp}")));
+            }
+            Ok(_) => {}
+            // The first non-existent component ends the check. For v1 the target
+            // must already exist (baseline is its hash), so a missing target is
+            // caught below as a conflict.
+            Err(_) => break,
+        }
+    }
+
+    // The target must already exist as a regular file (v1 applies over an
+    // existing baseline; it does not create new files).
+    let md = match std::fs::symlink_metadata(&target) {
+        Ok(md) => md,
+        Err(_) => {
+            return Err(conflict(format!(
+                "target {safe_rel} does not exist; v1 applies over an existing baseline file only"
+            )));
+        }
+    };
+    if !md.file_type().is_file() {
+        return Err(refuse(format!(
+            "target {safe_rel} is not a regular file"
+        )));
+    }
+    if md.len() > APPLY_TARGET_MAX_BYTES {
+        return Err(refuse(format!(
+            "target {safe_rel} is larger than the {APPLY_TARGET_MAX_BYTES}-byte apply cap"
+        )));
+    }
+
+    // Verify the baseline still matches the on-disk content.
+    let current = std::fs::read(&target)
+        .map_err(|e| refuse(format!("could not read target {safe_rel}: {e}")))?;
+    let current_hash = relux_core::sha256_hex(&current);
+    if current_hash != baseline {
+        return Err(conflict(format!(
+            "baseline mismatch for {safe_rel}: the file changed since the proposal \
+             (expected {}, found {})",
+            short_hash(baseline),
+            short_hash(&current_hash)
+        )));
+    }
+
+    // Atomic write: temp file in the same directory, then rename over the target.
+    let parent = target
+        .parent()
+        .ok_or_else(|| refuse("target has no parent directory".to_string()))?;
+    let tmp = parent.join(format!(".relux-apply-{}.tmp", std::process::id()));
+    std::fs::write(&tmp, content.as_bytes())
+        .map_err(|e| refuse(format!("could not stage the new content: {e}")))?;
+    if let Err(e) = std::fs::rename(&tmp, &target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(refuse(format!("could not write {safe_rel}: {e}")));
+    }
+    Ok(content.len() as u64)
+}
+
+/// First 8 chars of a hash, for a legible conflict message.
+fn short_hash(h: &str) -> &str {
+    &h[..h.len().min(8)]
 }
 
 /// Project a `Task` into the compact `TaskBrief` Prime speaks about.
@@ -5851,6 +6292,245 @@ mod tests {
         let (_agent, task) = cli_task(&mut k);
         let run_id = k.execute_assigned_run(&task).expect("adapter run ok");
         assert!(k.run(&run_id).unwrap().artifacts.is_empty());
+    }
+
+    // ── Proposed-change review/apply (master plan §15 diff/apply model) ─────
+
+    /// Enable the claude adapter with a controlled workspace root (working_dir).
+    fn enable_claude_with_workdir(k: &mut KernelState, binary: &std::path::Path, workdir: &str) {
+        k.configure_adapter_runtime(
+            &PluginId::new("relux-adapter-claude-cli"),
+            Some(true),
+            Some(binary.to_string_lossy().to_string()),
+            Some(30),
+            Some(8192),
+            Some(workdir.to_string()),
+        )
+        .unwrap();
+    }
+
+    /// Build a kernel + a completed run carrying one proposed change, with the
+    /// claude adapter pointed at `workdir`. The change starts in `Proposed`.
+    fn kernel_with_proposed_change(
+        workdir: Option<&str>,
+        baseline: Option<String>,
+        path: &str,
+        new_content: &str,
+    ) -> (KernelState, RunId) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = write_fake_cli(dir.path(), "fake-claude", "ok");
+        // Leak the tempdir so the fake binary path stays valid for the test.
+        std::mem::forget(dir);
+        let mut k = adapter_kernel();
+        k.configure_adapter_runtime(
+            &PluginId::new("relux-adapter-claude-cli"),
+            Some(true),
+            Some(fake.to_string_lossy().to_string()),
+            Some(30),
+            Some(8192),
+            workdir.map(|w| w.to_string()),
+        )
+        .unwrap();
+        let (_agent, task) = cli_task(&mut k);
+        let run_id = k.start_run(&task).unwrap();
+        let change = relux_core::ProposedChange {
+            path: path.to_string(),
+            new_content: new_content.to_string(),
+            baseline_sha256: baseline,
+            new_sha256: relux_core::sha256_hex(new_content.as_bytes()),
+            bytes: new_content.len() as u64,
+            source: "claude-cli".to_string(),
+            status: relux_core::ProposedChangeStatus::Proposed,
+            review_note: None,
+            refused_reason: None,
+            applied_at: None,
+        };
+        k.runs.get_mut(&run_id).unwrap().proposed_changes = vec![change];
+        (k, run_id)
+    }
+
+    #[test]
+    fn apply_to_workspace_writes_when_baseline_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("out.txt"), "old").unwrap();
+        let baseline = relux_core::sha256_hex(b"old");
+        let n = apply_change_to_workspace(
+            dir.path().to_str().unwrap(),
+            "out.txt",
+            &baseline,
+            "new content",
+        )
+        .expect("apply ok");
+        assert_eq!(n, "new content".len() as u64);
+        assert_eq!(std::fs::read_to_string(dir.path().join("out.txt")).unwrap(), "new content");
+    }
+
+    #[test]
+    fn apply_to_workspace_refuses_on_baseline_conflict_and_leaves_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("out.txt"), "DIFFERENT").unwrap();
+        let baseline = relux_core::sha256_hex(b"old");
+        let err = apply_change_to_workspace(
+            dir.path().to_str().unwrap(),
+            "out.txt",
+            &baseline,
+            "new content",
+        )
+        .unwrap_err();
+        assert!(err.conflict, "baseline mismatch is a conflict");
+        // The file is untouched.
+        assert_eq!(std::fs::read_to_string(dir.path().join("out.txt")).unwrap(), "DIFFERENT");
+    }
+
+    #[test]
+    fn apply_to_workspace_refuses_missing_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let baseline = relux_core::sha256_hex(b"old");
+        let err = apply_change_to_workspace(dir.path().to_str().unwrap(), "absent.txt", &baseline, "x")
+            .unwrap_err();
+        // A missing target (v1 needs an existing baseline file) is a conflict.
+        assert!(err.conflict);
+    }
+
+    #[test]
+    fn apply_to_workspace_refuses_path_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        // `..` is rejected by the sanitizer before any filesystem access.
+        let err = apply_change_to_workspace(dir.path().to_str().unwrap(), "../escape.txt", "x", "y")
+            .unwrap_err();
+        assert!(!err.conflict);
+        assert!(err.reason.contains("unsafe") || err.reason.contains("escape"));
+    }
+
+    #[test]
+    fn review_then_apply_writes_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("out.txt"), "old").unwrap();
+        let baseline = relux_core::sha256_hex(b"old");
+        let (mut k, run_id) = kernel_with_proposed_change(
+            Some(dir.path().to_str().unwrap()),
+            Some(baseline),
+            "out.txt",
+            "applied!",
+        );
+        // Apply before approval is refused honestly.
+        let err = k.apply_proposed_change(&run_id, 0).unwrap_err();
+        assert!(matches!(err, KernelError::ProposedChangeNotApproved { .. }));
+        // Approve, then apply.
+        let status = k.review_proposed_change(&run_id, 0, true, Some("ok")).unwrap();
+        assert_eq!(status, relux_core::ProposedChangeStatus::Approved);
+        let applied = k.apply_proposed_change(&run_id, 0).expect("apply ok");
+        assert_eq!(applied.path, "out.txt");
+        assert_eq!(std::fs::read_to_string(dir.path().join("out.txt")).unwrap(), "applied!");
+        // The change is now Applied with a stamp, and a transcript event + audit landed.
+        let change = &k.run(&run_id).unwrap().proposed_changes[0];
+        assert_eq!(change.status, relux_core::ProposedChangeStatus::Applied);
+        assert!(change.applied_at.is_some());
+        assert!(k
+            .run_events(&run_id)
+            .into_iter()
+            .any(|e| e.kind == "proposed_change_applied"));
+        assert!(k
+            .audit_log()
+            .iter()
+            .any(|e| e.action == "proposed_change:apply" && e.result == AuditResult::Success));
+        // Re-applying an Applied change is refused (no double-write).
+        let err = k.apply_proposed_change(&run_id, 0).unwrap_err();
+        assert!(matches!(err, KernelError::ProposedChangeNotApproved { .. }));
+    }
+
+    #[test]
+    fn apply_refuses_without_a_baseline_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("out.txt"), "old").unwrap();
+        let (mut k, run_id) = kernel_with_proposed_change(
+            Some(dir.path().to_str().unwrap()),
+            None, // no baseline
+            "out.txt",
+            "x",
+        );
+        k.review_proposed_change(&run_id, 0, true, None).unwrap();
+        let err = k.apply_proposed_change(&run_id, 0).unwrap_err();
+        assert!(matches!(err, KernelError::ProposedChangeNotApplicable { .. }));
+        // The honest reason is recorded on the change for the dashboard.
+        assert!(k.run(&run_id).unwrap().proposed_changes[0]
+            .refused_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("baseline"));
+        // The file was never touched.
+        assert_eq!(std::fs::read_to_string(dir.path().join("out.txt")).unwrap(), "old");
+    }
+
+    #[test]
+    fn apply_refuses_without_a_workspace_root() {
+        let (mut k, run_id) = kernel_with_proposed_change(
+            None, // no working_dir configured
+            Some(relux_core::sha256_hex(b"old")),
+            "out.txt",
+            "x",
+        );
+        k.review_proposed_change(&run_id, 0, true, None).unwrap();
+        let err = k.apply_proposed_change(&run_id, 0).unwrap_err();
+        assert!(matches!(err, KernelError::ProposedChangeNotApplicable { .. }));
+        assert!(k.run(&run_id).unwrap().proposed_changes[0]
+            .refused_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("workspace"));
+    }
+
+    #[test]
+    fn rejected_change_cannot_be_applied_and_review_after_applied_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("out.txt"), "old").unwrap();
+        let (mut k, run_id) = kernel_with_proposed_change(
+            Some(dir.path().to_str().unwrap()),
+            Some(relux_core::sha256_hex(b"old")),
+            "out.txt",
+            "x",
+        );
+        let status = k.review_proposed_change(&run_id, 0, false, Some("no thanks")).unwrap();
+        assert_eq!(status, relux_core::ProposedChangeStatus::Rejected);
+        let err = k.apply_proposed_change(&run_id, 0).unwrap_err();
+        assert!(matches!(err, KernelError::ProposedChangeNotApproved { .. }));
+    }
+
+    #[test]
+    fn cli_run_captures_proposed_changes_and_apply_writes_end_to_end() {
+        // The full first-class slice: a fake CLI emits an envelope with a
+        // proposed_changes full-content replacement (+ a correct baseline hash);
+        // the kernel captures it onto the durable run, the operator approves, and
+        // apply writes the new content into the controlled workspace root.
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("greeting.txt"), "hello").unwrap();
+        let baseline = relux_core::sha256_hex(b"hello");
+        let cli_dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            r#"{{"type":"result","is_error":false,"result":"rewrote greeting","proposed_changes":[{{"path":"greeting.txt","content":"goodbye","baseline_sha256":"{baseline}"}}]}}"#
+        );
+        let fake = write_fake_json_cli(cli_dir.path(), "fake-claude-pc", &body);
+        let mut k = adapter_kernel();
+        enable_claude_with_workdir(&mut k, &fake, work.path().to_str().unwrap());
+        let (_agent, task) = cli_task(&mut k);
+        let run_id = k.execute_assigned_run(&task).expect("adapter run ok");
+
+        // Captured onto the run (still Proposed; capturing never applies).
+        let change = &k.run(&run_id).unwrap().proposed_changes[0];
+        assert_eq!(change.path, "greeting.txt");
+        assert_eq!(change.new_content, "goodbye");
+        assert_eq!(change.status, relux_core::ProposedChangeStatus::Proposed);
+        // The file is untouched until an explicit apply.
+        assert_eq!(std::fs::read_to_string(work.path().join("greeting.txt")).unwrap(), "hello");
+
+        // Survives a snapshot round-trip (a dashboard refresh).
+        let restored = KernelState::from_snapshot(k.snapshot());
+        assert_eq!(restored.run(&run_id).unwrap().proposed_changes.len(), 1);
+
+        // Approve + apply → the file is rewritten.
+        k.review_proposed_change(&run_id, 0, true, None).unwrap();
+        k.apply_proposed_change(&run_id, 0).expect("apply ok");
+        assert_eq!(std::fs::read_to_string(work.path().join("greeting.txt")).unwrap(), "goodbye");
     }
 
     #[test]

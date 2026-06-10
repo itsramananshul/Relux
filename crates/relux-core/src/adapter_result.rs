@@ -17,6 +17,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::artifact::{capture_run_artifacts, RunArtifact};
+use crate::proposed_change::{capture_proposed_changes, ProposedChange};
 use crate::AdapterKind;
 
 /// The outcome of interpreting an adapter's captured stdout.
@@ -46,6 +47,12 @@ pub struct AdapterResultSummary {
     /// diff, or an apply plan (master plan section 9.6 / section 15). Empty when
     /// the envelope declared none.
     pub artifacts: Vec<RunArtifact>,
+    /// Reviewable, applyable proposed file changes the envelope declared
+    /// (`proposed_changes: [...]`). Bounded, path-sanitized, text-only
+    /// full-content replacements with a baseline hash (master plan section 15 /
+    /// section 9.6). Empty when the envelope declared none. Distinct from
+    /// `artifacts` (read-only references): these carry content and can be applied.
+    pub proposed_changes: Vec<ProposedChange>,
 }
 
 impl AdapterResultSummary {
@@ -60,6 +67,7 @@ impl AdapterResultSummary {
             usage: None,
             duration_ms: None,
             artifacts: Vec::new(),
+            proposed_changes: Vec::new(),
         }
     }
 }
@@ -123,7 +131,11 @@ pub fn parse_adapter_result(stdout: &str, kind: AdapterKind) -> AdapterResultSum
     // Capture any declared artifact references read-only (bounded, redacted,
     // path-sanitized). Only from a recognized envelope - an arbitrary JSON blob
     // never reaches here. Never reads the filesystem.
-    let artifacts = capture_run_artifacts(obj.get("artifacts"), adapter_source_label(kind));
+    let source_label = adapter_source_label(kind);
+    let artifacts = capture_run_artifacts(obj.get("artifacts"), source_label);
+    // Capture any declared reviewable proposed file changes (full-content
+    // replacements with a baseline hash). Pure: never touches the filesystem.
+    let proposed_changes = capture_proposed_changes(obj.get("proposed_changes"), source_label);
 
     AdapterResultSummary {
         structured: true,
@@ -134,6 +146,7 @@ pub fn parse_adapter_result(stdout: &str, kind: AdapterKind) -> AdapterResultSum
         usage,
         duration_ms,
         artifacts,
+        proposed_changes,
     }
 }
 
@@ -227,6 +240,30 @@ mod tests {
     fn plain_text_has_no_artifacts() {
         let s = parse_adapter_result("just prose", AdapterKind::CodexCli);
         assert!(s.artifacts.is_empty());
+        assert!(s.proposed_changes.is_empty());
+    }
+
+    #[test]
+    fn envelope_captures_proposed_changes() {
+        let base = crate::proposed_change::sha256_hex(b"old\n");
+        let stdout = format!(
+            r#"{{
+                "type": "result",
+                "result": "Edited one file.",
+                "proposed_changes": [
+                    {{ "path": "src/lib.rs", "content": "new\n", "baseline_sha256": "{base}" }},
+                    {{ "path": "/abs/should/drop", "content": "x" }}
+                ]
+            }}"#
+        );
+        let s = parse_adapter_result(&stdout, AdapterKind::ClaudeCli);
+        assert!(s.structured);
+        // The unsafe absolute-path change is dropped; the safe one is captured.
+        assert_eq!(s.proposed_changes.len(), 1);
+        assert_eq!(s.proposed_changes[0].path, "src/lib.rs");
+        assert_eq!(s.proposed_changes[0].new_content, "new\n");
+        assert_eq!(s.proposed_changes[0].source, "claude-cli");
+        assert_eq!(s.proposed_changes[0].baseline_sha256.as_deref(), Some(base.as_str()));
     }
 
     #[test]

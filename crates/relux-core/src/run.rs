@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent::AgentId;
 use crate::artifact::RunArtifact;
 use crate::plugin::PluginId;
+use crate::proposed_change::ProposedChange;
 use crate::task::TaskId;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -86,6 +87,17 @@ pub struct Run {
     /// read-only and keeps apply unavailable. Never fabricated.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<RunArtifact>,
+    /// Reviewable, applyable **proposed file changes** the adapter declared in its
+    /// structured result envelope (`proposed_changes: [...]`, master plan section
+    /// 15 / section 9.6). Each is a bounded, path-sanitized, text-only
+    /// **full-content replacement** of one file with the agent's baseline hash —
+    /// the first real Relux diff/apply model. Unlike `artifacts` (read-only
+    /// references), these carry content and can be reviewed (approve/reject) and,
+    /// once approved, explicitly applied into the run's controlled workspace root
+    /// with a baseline-conflict check. Empty when the adapter declared none. Never
+    /// fabricated; apply never happens without an explicit operator action.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proposed_changes: Vec<ProposedChange>,
 }
 
 #[cfg(test)]
@@ -109,6 +121,7 @@ mod tests {
             cost: None,
             retried_from: None,
             artifacts: Vec::new(),
+            proposed_changes: Vec::new(),
         }
     }
 
@@ -116,6 +129,35 @@ mod tests {
     fn empty_artifacts_are_omitted_from_the_wire() {
         let json = serde_json::to_value(sample_run()).unwrap();
         assert!(json.get("artifacts").is_none(), "empty artifacts must be omitted");
+        assert!(
+            json.get("proposed_changes").is_none(),
+            "empty proposed_changes must be omitted"
+        );
+    }
+
+    #[test]
+    fn proposed_changes_round_trip_with_status_for_the_api() {
+        use crate::proposed_change::{ProposedChange, ProposedChangeStatus};
+        let mut run = sample_run();
+        run.proposed_changes = vec![ProposedChange {
+            path: "src/main.rs".into(),
+            new_content: "fn main() {}\n".into(),
+            baseline_sha256: Some(crate::proposed_change::sha256_hex(b"old")),
+            new_sha256: crate::proposed_change::sha256_hex(b"fn main() {}\n"),
+            bytes: 13,
+            source: "claude-cli".into(),
+            status: ProposedChangeStatus::Approved,
+            review_note: Some("looks good".into()),
+            refused_reason: None,
+            applied_at: None,
+        }];
+        let json = serde_json::to_value(&run).unwrap();
+        let cs = json.get("proposed_changes").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].get("status").and_then(|v| v.as_str()), Some("approved"));
+        assert_eq!(cs[0].get("path").and_then(|v| v.as_str()), Some("src/main.rs"));
+        let back: Run = serde_json::from_value(json).unwrap();
+        assert_eq!(back.proposed_changes, run.proposed_changes);
     }
 
     #[test]

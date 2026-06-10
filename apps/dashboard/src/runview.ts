@@ -6,7 +6,13 @@
 // reused without a DOM. Nothing here invents data: every helper only formats or
 // classifies what the API already recorded.
 
-import type { ReluxRun, ReluxRunArtifact, ReluxRunDetail, ReluxRunEvent } from "./api";
+import type {
+  ReluxProposedChange,
+  ReluxRun,
+  ReluxRunArtifact,
+  ReluxRunDetail,
+  ReluxRunEvent,
+} from "./api";
 
 // The badge tone for a run status. Unknown/!terminal statuses fall back to the
 // neutral "backlog" tone rather than guessing success.
@@ -158,6 +164,86 @@ export function artifactTypeLabel(type: string): string {
   return map[type] ?? "Other";
 }
 
+// The set of known proposed-change lifecycle states; anything else normalizes to
+// "proposed" so a future/unknown status still renders honestly.
+const KNOWN_CHANGE_STATUSES = new Set(["proposed", "approved", "rejected", "applied"]);
+
+// The reviewable proposed file changes a run captured from its adapter result
+// envelope (master plan §15 / §9.6). Defensive: only accepts well-formed entries
+// (object with string `path` + `new_content` + `status`), so a malformed payload
+// renders nothing rather than throwing. Unlike `runArtifacts`, these carry the
+// full proposed content and can be approved + applied.
+export function runProposedChanges(
+  run: ReluxRun | ReluxRunDetail | null | undefined,
+): ReluxProposedChange[] {
+  const raw = (run as unknown as { proposed_changes?: unknown } | null | undefined)
+    ?.proposed_changes;
+  if (!Array.isArray(raw)) return [];
+  const out: ReluxProposedChange[] = [];
+  for (const c of raw) {
+    if (!c || typeof c !== "object") continue;
+    const rec = c as Record<string, unknown>;
+    if (
+      typeof rec.path !== "string" ||
+      typeof rec.new_content !== "string" ||
+      typeof rec.source !== "string"
+    )
+      continue;
+    const status =
+      typeof rec.status === "string" && KNOWN_CHANGE_STATUSES.has(rec.status)
+        ? (rec.status as string)
+        : "proposed";
+    out.push({
+      path: rec.path,
+      new_content: rec.new_content,
+      new_sha256: typeof rec.new_sha256 === "string" ? rec.new_sha256 : "",
+      bytes: typeof rec.bytes === "number" ? rec.bytes : rec.new_content.length,
+      source: rec.source,
+      status,
+      baseline_sha256: typeof rec.baseline_sha256 === "string" ? rec.baseline_sha256 : undefined,
+      review_note: typeof rec.review_note === "string" ? rec.review_note : undefined,
+      refused_reason: typeof rec.refused_reason === "string" ? rec.refused_reason : undefined,
+      applied_at: typeof rec.applied_at === "string" ? rec.applied_at : undefined,
+    });
+  }
+  return out;
+}
+
+// A short, human label for a proposed-change status.
+export function proposedChangeStatusLabel(status: string): string {
+  const map: Record<string, string> = {
+    proposed: "Proposed",
+    approved: "Approved",
+    rejected: "Rejected",
+    applied: "Applied",
+  };
+  return map[status] ?? "Proposed";
+}
+
+// The badge tone for a proposed-change status. Applied/approved read as success;
+// rejected as neutral; proposed as the in-flight tone.
+export function proposedChangeStatusTone(
+  status: string,
+): "done" | "running" | "backlog" {
+  if (status === "applied" || status === "approved") return "done";
+  if (status === "proposed") return "running";
+  return "backlog";
+}
+
+// Whether an operator can review (approve/reject) this change: only while it is
+// still `proposed`. An applied change is terminal; a decided one can be re-decided
+// only by the backend rule (review after applied is refused there).
+export function canReviewProposedChange(change: ReluxProposedChange): boolean {
+  return change.status === "proposed";
+}
+
+// Whether an operator can apply this change from the UI: only an `approved`
+// change with a baseline hash is eligible (apply refuses without a baseline in
+// v1). The backend re-checks everything; this just avoids offering a dead button.
+export function canApplyProposedChange(change: ReluxProposedChange): boolean {
+  return change.status === "approved" && typeof change.baseline_sha256 === "string";
+}
+
 // The honest reason that apply/diff/accept-reject review is unavailable on a
 // Relux run with NO captured artifact references. A Relux run record carries a
 // transcript, output excerpt, metrics, and (when the adapter declared them)
@@ -179,15 +265,25 @@ export const APPLY_PENDING_DIFF_MODEL_REASON =
   "Diff preview, apply, and accept/reject review require a Relux diff/apply model that does not exist yet — " +
   "apply is unavailable until then. (The legacy Runs surface has apply, but its run ids are not Relux run ids.)";
 
-// Whether to offer artifact/diff/apply + accept/reject review for THIS run. Apply
-// is ALWAYS unavailable today: the Relux run model has no diff/apply, so even a
-// run that captured artifact references cannot be applied honestly. The reason
-// adapts so the UI explains the right thing (references-are-read-only vs.
-// no-data-at-all) rather than hiding it or wiring dead controls. Never returns
-// available: true until a real diff/apply model exists.
+// The reason apply IS available: this run captured reviewable proposed changes
+// (full-content replacements with a baseline hash), which ARE the Relux diff/apply
+// model. The Proposed Changes section drives the real review + apply controls.
+export const APPLY_AVAILABLE_REASON =
+  "This run proposed reviewable file changes. Approve a change to enable apply; applying writes the " +
+  "new content into the run's controlled workspace root only after a baseline-conflict check (apply is " +
+  "refused without a baseline hash or a configured workspace, and never overwrites a file that changed).";
+
+// Whether to offer the proposed-change review + apply controls for THIS run.
+// Apply is available ONLY when the run captured proposed changes — those carry
+// content + a baseline hash and ARE the Relux diff/apply model. A run that only
+// captured read-only artifact references (or nothing) still has no apply, so the
+// reason adapts honestly rather than hiding it or wiring dead controls.
 export function reviewApplyAvailability(
   run: ReluxRunDetail,
 ): { available: boolean; reason: string } {
+  if (runProposedChanges(run).length > 0) {
+    return { available: true, reason: APPLY_AVAILABLE_REASON };
+  }
   if (runArtifacts(run).length > 0) {
     return { available: false, reason: APPLY_PENDING_DIFF_MODEL_REASON };
   }

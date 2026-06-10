@@ -9,6 +9,55 @@ once a stable release is cut.
 
 ### Added
 
+- **First real Relux diff/apply model — reviewed, applyable proposed changes
+  (master plan §15 / §9.6).** Builds directly on the read-only artifact-reference
+  capture below: a run can now carry **proposed file changes** an adapter declares
+  in a dedicated `proposed_changes: [...]` envelope field, which the operator can
+  **review (approve / reject)** and — once approved — **explicitly apply** into the
+  run's controlled workspace root. The model is deliberately the smallest safe
+  one: a **single-file, full-content replacement** with a **baseline hash**, NOT
+  arbitrary patch/diff parsing (a replacement applies cleanly or refuses — no fuzzy
+  hunk matching). **Nothing is ever auto-applied.** (1) **Capture** —
+  `relux_core::capture_proposed_changes` (pure, never touches the filesystem) reads
+  each item into a bounded `ProposedChange` (`path` / `new_content` /
+  `baseline_sha256?` / computed `new_sha256` / `bytes` / `source` / `status`),
+  computing the content's SHA-256 with `sha256_hex`. **Safety:** count capped
+  (`MAX_PROPOSED_CHANGES = 32`), content capped (`MAX_CONTENT_BYTES = 256 KiB`) and
+  required to be text (no NUL); the `path` must be **relative + safe + not excluded**
+  (absolute / drive / UNC / `..` and vcs/build/secret paths are dropped, so a change
+  can never target `.git`, a build dir, or a `.env`/`*.pem`); a `baseline_sha256`
+  is validated as 64-hex or dropped to `None`. (2) **Apply** (the one place the
+  kernel writes an agent-proposed file) refuses honestly and never fabricates
+  success: it requires an explicit **`Approved`** state, **refuses without a
+  baseline hash** (no force in v1), requires the run's adapter to have a configured
+  **`working_dir`** (the controlled root), resolves the target **inside** that root
+  with **no `..`/symlink escape**, requires an **existing regular file** whose
+  current SHA-256 **equals the baseline** (a mismatch is an honest **conflict**, the
+  file left untouched), and then writes **atomically** (temp + rename). Every
+  outcome is audited and recorded on the run transcript; a refusal records the
+  honest reason on the change. (3) **API** — `GET /v1/relux/runs/:id` flattens
+  `proposed_changes` (with `status`) onto the detail; `POST …/proposed-changes/
+  :index/review` records approve/reject; `POST …/proposed-changes/:index/apply`
+  applies (409 not-approved / baseline-conflict, 422 no-baseline / no-workspace /
+  unsafe target — never a fabricated 2xx). (4) **Dashboard** — Run Detail gains a
+  **Proposed Changes** section: per-change path / status badge / size, a collapsible
+  **content preview**, **Approve / Reject** (while proposed) and **Apply** (once
+  approved, gated on a baseline hash) controls, and the honest refused-reason /
+  applied / no-baseline lines; `reviewApplyAvailability` now returns
+  `available:true` when a run proposed changes (apply is real for them) and adapts
+  the reason otherwise. (5) **Tests** — core capture + path/baseline/size/content
+  safety; the pure apply function (write-on-match, baseline-conflict-leaves-file,
+  missing-target, path-escape); kernel review→apply, approval-required,
+  no-baseline, no-workspace, reject, and a **fake-CLI-envelope end-to-end** that
+  captures a proposed change, survives a snapshot round-trip, then approves +
+  applies into a temp workspace; API `RunRecord` flatten; dashboard
+  `runProposedChanges` / status helpers / `canReview`·`canApply` gating /
+  availability; a stale-dist bundle guard for the new copy; and a PowerShell smoke
+  (`scripts/smoke-proposed-change-apply.ps1`) wrapping the e2e test + HTTP route
+  wiring. **Caveats / still not done:** apply is **single-file full-content only**
+  (no multi-file transaction, no rename/delete, no new-file create — a missing
+  target is a conflict in v1); the baseline must be a real SHA-256 the agent
+  computed from the file it edited; live event streaming is still poll-based.
 - **First real Relux run artifact model — read-only reference capture (master
   plan §9.6 / §15).** A Relux run can now record the **artifact references** an
   adapter declares in its structured result envelope, closing the gap where the

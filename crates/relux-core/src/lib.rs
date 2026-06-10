@@ -15,6 +15,7 @@ pub mod orchestration;
 pub mod permission;
 pub mod plugin;
 pub mod prime;
+pub mod proposed_change;
 pub mod redact;
 pub mod run;
 pub mod runtime;
@@ -46,6 +47,10 @@ pub use plugin::{
 pub use prime::{
     PrimeAction, PrimeAutonomyConfig, PrimeAutonomyTickResult, PrimeContext, PrimeDisposition,
     PrimeIntent, PrimePlan, PrimeTurn, StateSummary, TaskBrief,
+};
+pub use proposed_change::{
+    capture_proposed_changes, sha256_hex, ProposedChange, ProposedChangeStatus,
+    MAX_CONTENT_BYTES, MAX_PROPOSED_CHANGES,
 };
 pub use redact::redact_secrets;
 pub use run::{Run, RunId, RunStatus};

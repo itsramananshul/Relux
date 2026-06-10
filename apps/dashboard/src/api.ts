@@ -1722,6 +1722,46 @@ export interface ReluxRunArtifact {
   truncated?: boolean;
 }
 
+// One reviewable, applyable proposed file change captured from an adapter's
+// structured result envelope (master plan §15 / §9.6). Unlike a read-only
+// `ReluxRunArtifact`, this carries the full proposed `new_content` of one text
+// file plus the agent's `baseline_sha256`, and can be reviewed (approve/reject)
+// and — once approved — explicitly applied into the run's controlled workspace
+// root with a baseline-conflict check. Capturing it NEVER applies it.
+export interface ReluxProposedChange {
+  // Safe, relative, `/`-separated target path inside the run's workspace root.
+  path: string;
+  // The full proposed new content of the file (text).
+  new_content: string;
+  // SHA-256 (hex) of the content the agent based its edit on. Absent when the
+  // envelope declared none — apply refuses without it (no force in v1).
+  baseline_sha256?: string;
+  // SHA-256 (hex) of `new_content`, computed at capture (integrity/display).
+  new_sha256: string;
+  // Byte length of `new_content`.
+  bytes: number;
+  // The adapter that produced the change (e.g. "claude-cli").
+  source: string;
+  // Lifecycle: "proposed" | "approved" | "rejected" | "applied".
+  status: string;
+  // A bounded operator note recorded at review time.
+  review_note?: string;
+  // The honest reason the last apply attempt was refused (conflict / no baseline
+  // / no workspace root / unsafe target). Cleared on a successful apply.
+  refused_reason?: string;
+  // The logical-clock stamp recorded when the change was applied.
+  applied_at?: string;
+}
+
+// The result of a successful proposed-change apply.
+export interface ReluxApplyResult {
+  run_id: string;
+  index: number;
+  path: string;
+  bytes: number;
+  applied_at: string;
+}
+
 export interface ReluxRun {
   id: string;
   task_id: string;
@@ -1744,6 +1784,9 @@ export interface ReluxRun {
   retried_from?: string;
   // Read-only artifact references the adapter declared. Absent/empty when none.
   artifacts?: ReluxRunArtifact[];
+  // Reviewable proposed file changes the adapter declared (full-content
+  // replacements with a baseline hash). Absent/empty when none.
+  proposed_changes?: ReluxProposedChange[];
 }
 
 // One Relux run-transcript event from `/v1/relux/runs/:id/events`. This is the
@@ -1822,6 +1865,29 @@ export const reluxWork = {
   // prime.retry_run). Returns the new run's id.
   retryRun: (id: string) =>
     api.post<{ run_id: string }>(`/v1/relux/runs/${encodeURIComponent(id)}/retry`),
+
+  // Record an operator accept/reject of a proposed change (master plan §15).
+  // Returns the updated run detail so the panel can refresh in one round trip.
+  // Never applies anything — apply is a separate, explicit action.
+  reviewProposedChange: (
+    runId: string,
+    index: number,
+    decision: "approve" | "reject",
+    note?: string,
+  ) =>
+    api.post<ReluxRunDetail>(
+      `/v1/relux/runs/${encodeURIComponent(runId)}/proposed-changes/${index}/review`,
+      { decision, ...(note ? { note } : {}) },
+    ),
+
+  // Apply an APPROVED proposed change into the run's controlled workspace root
+  // (master plan §15). Throws an ApiError on an honest refusal (409 not-approved
+  // / baseline conflict; 422 no-baseline / no-workspace / unsafe target) so the
+  // UI can show the real reason. Never fabricates success.
+  applyProposedChange: (runId: string, index: number) =>
+    api.post<ReluxApplyResult>(
+      `/v1/relux/runs/${encodeURIComponent(runId)}/proposed-changes/${index}/apply`,
+    ),
 };
 
 export const reluxAudit = {

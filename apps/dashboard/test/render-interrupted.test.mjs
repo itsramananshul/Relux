@@ -235,3 +235,18 @@ test("the shipped JS bundle carries the read-only Run artifacts surface (no stal
   assert.match(bundle, /read-only artifact references/);
   assert.match(bundle, /apply is unavailable until then/);
 });
+
+test("the shipped JS bundle carries the proposed-change review/apply surface (no stale dist)", () => {
+  const assetsDir = join(distDir, "assets");
+  const jsFiles = readdirSync(assetsDir).filter((f) => f.endsWith(".js"));
+  const bundle = jsFiles.map((f) => readFileSync(join(assetsDir, f), "utf8")).join("\n");
+  // Run Detail gained the first real Relux diff/apply model: a Proposed Changes
+  // section with approve/apply controls, a content preview, an honest empty state,
+  // and the apply-available reason. These literals survive minification; their
+  // absence means the committed bundle is stale relative to the source.
+  assert.match(bundle, /Proposed Changes/);
+  assert.match(bundle, /No proposed changes for this run\./);
+  assert.match(bundle, /Preview new content/);
+  assert.match(bundle, /No baseline hash/);
+  assert.match(bundle, /controlled workspace root/);
+});

@@ -15,6 +15,11 @@ import {
   reviewApplyAvailability,
   runArtifacts,
   artifactTypeLabel,
+  runProposedChanges,
+  proposedChangeStatusLabel,
+  proposedChangeStatusTone,
+  canReviewProposedChange,
+  canApplyProposedChange,
 } from "../runview";
 
 // Relux Work page: standalone surface for tasks and runs.
@@ -462,6 +467,39 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
   // (§9.6 / §15). These are references (name/type/summary/source), NOT a diff or
   // an apply plan — we list them but apply stays unavailable (see reviewApply).
   const artifacts = run ? runArtifacts(run) : [];
+  // Reviewable proposed file changes (master plan §15 diff/apply model). These
+  // carry content + a baseline hash and drive the real approve/apply controls.
+  const proposedChanges = run ? runProposedChanges(run) : [];
+  // Per-change busy flag (by index), so one button shows a pending state without
+  // freezing the whole panel.
+  const [pcBusy, setPcBusy] = useState<number | null>(null);
+
+  async function reviewChange(index: number, decision: "approve" | "reject") {
+    setPcBusy(index);
+    try {
+      await reluxWork.reviewProposedChange(runId, index, decision);
+      reloadRun();
+    } catch (e) {
+      alert(e instanceof Error ? e.message : "Review failed");
+    } finally {
+      setPcBusy(null);
+    }
+  }
+
+  async function applyChange(index: number) {
+    setPcBusy(index);
+    try {
+      const res = await reluxWork.applyProposedChange(runId, index);
+      reloadRun();
+      alert(`Applied ${res.path} (${res.bytes} bytes).`);
+    } catch (e) {
+      // An honest refusal (conflict / no baseline / no workspace) surfaces here.
+      alert(e instanceof Error ? e.message : "Apply failed");
+      reloadRun();
+    } finally {
+      setPcBusy(null);
+    }
+  }
 
   return (
     <div style={{ paddingBottom: 16 }}>
@@ -612,12 +650,96 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
           ) : (
             <div className="empty sm">No artifacts declared for this run.</div>
           )}
-          {/* Apply/diff and accept/reject review are NOT part of the Relux run
-              model (no diff/apply exists yet). Even when artifact references are
-              captured above, apply stays unavailable — we state why honestly
+          {/* Reviewable proposed file changes (master plan §15 diff/apply model):
+              full-content replacements with a baseline hash. Approve a change to
+              enable Apply; applying writes into the run's controlled workspace
+              root after a baseline-conflict check. Refusals are shown honestly. */}
+          <h5 style={{ marginTop: 16, marginBottom: 8 }}>Proposed Changes</h5>
+          {proposedChanges.length > 0 ? (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {proposedChanges.map((c, i) => (
+                <div key={`${c.path}-${i}`} className="card" style={{ padding: 10 }}>
+                  <div className="row" style={{ alignItems: "center", gap: 8 }}>
+                    <span className="mono" style={{ fontSize: 12 }}>{c.path}</span>
+                    <span className={`badge ${proposedChangeStatusTone(c.status)}`}>
+                      {proposedChangeStatusLabel(c.status)}
+                    </span>
+                    <span className="muted" style={{ fontSize: 10 }}>{c.bytes} B · {c.source}</span>
+                    <div className="spacer" style={{ flex: 1 }} />
+                    {canReviewProposedChange(c) && (
+                      <>
+                        <button
+                          className="btn sm"
+                          disabled={pcBusy === i}
+                          onClick={() => void reviewChange(i, "approve")}
+                        >
+                          {pcBusy === i ? "…" : "Approve"}
+                        </button>
+                        <button
+                          className="btn ghost sm"
+                          disabled={pcBusy === i}
+                          onClick={() => void reviewChange(i, "reject")}
+                        >
+                          Reject
+                        </button>
+                      </>
+                    )}
+                    {c.status === "approved" && (
+                      <button
+                        className="btn sm"
+                        disabled={pcBusy === i || !canApplyProposedChange(c)}
+                        title={
+                          canApplyProposedChange(c)
+                            ? "Write the new content into the run's workspace root"
+                            : "Apply needs a baseline hash (none was recorded)"
+                        }
+                        onClick={() => void applyChange(i)}
+                      >
+                        {pcBusy === i ? "Applying…" : "Apply"}
+                      </button>
+                    )}
+                  </div>
+                  {!c.baseline_sha256 && (
+                    <div className="muted" style={{ fontSize: 10, marginTop: 4 }}>
+                      No baseline hash — apply is refused (no force in v1).
+                    </div>
+                  )}
+                  {c.refused_reason && (
+                    <div className="banner err" style={{ fontSize: 10, marginTop: 6 }}>
+                      Refused: {c.refused_reason}
+                    </div>
+                  )}
+                  {c.status === "applied" && c.applied_at && (
+                    <div className="muted" style={{ fontSize: 10, marginTop: 4 }}>
+                      Applied at {c.applied_at}.
+                    </div>
+                  )}
+                  {c.review_note && (
+                    <div className="muted" style={{ fontSize: 10, marginTop: 4 }}>
+                      Note: {c.review_note}
+                    </div>
+                  )}
+                  {/* Read-only preview of the full proposed content. */}
+                  <details style={{ marginTop: 6 }}>
+                    <summary style={{ cursor: "pointer", fontSize: 11 }}>Preview new content</summary>
+                    <pre
+                      className="mono"
+                      style={{ fontSize: 11, maxHeight: 240, overflow: "auto", whiteSpace: "pre-wrap", marginTop: 6 }}
+                    >
+                      {c.new_content}
+                    </pre>
+                  </details>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="empty sm">No proposed changes for this run.</div>
+          )}
+          {/* The honest availability line: apply is real when this run proposed
+              changes (above); otherwise it explains why apply is unavailable
               rather than hiding it or wiring dead controls. */}
           <h5 style={{ marginTop: 16, marginBottom: 8 }}>Review &amp; Apply</h5>
-          {reviewApply && !reviewApply.available && (
+          {reviewApply && (
             <div className="banner" style={{ fontSize: 11, lineHeight: 1.5 }}>
               {reviewApply.reason}
             </div>

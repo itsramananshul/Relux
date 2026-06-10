@@ -12,8 +12,14 @@ import {
   reviewApplyAvailability,
   REVIEW_APPLY_UNAVAILABLE_REASON,
   APPLY_PENDING_DIFF_MODEL_REASON,
+  APPLY_AVAILABLE_REASON,
   runArtifacts,
   artifactTypeLabel,
+  runProposedChanges,
+  proposedChangeStatusLabel,
+  proposedChangeStatusTone,
+  canReviewProposedChange,
+  canApplyProposedChange,
 } from "../src/runview.ts";
 
 // The Work page's run-depth view must read HONESTLY: it only formats/classifies
@@ -119,6 +125,68 @@ test("reviewApplyAvailability stays unavailable even WITH artifacts (no diff/app
     reviewApplyAvailability({ ...withArtifacts, artifacts: [] }).reason,
     REVIEW_APPLY_UNAVAILABLE_REASON,
   );
+});
+
+test("reviewApplyAvailability IS available when the run captured proposed changes", () => {
+  // Proposed changes ARE the Relux diff/apply model: apply is real for them, and
+  // takes precedence over the read-only-references reason.
+  const withChanges = {
+    id: "r", task_id: "t", agent_id: "a", adapter_plugin: "p", status: "completed",
+    artifacts: [{ name: "main.rs", type: "file", source: "claude-cli" }],
+    proposed_changes: [
+      { path: "src/main.rs", new_content: "x", new_sha256: "h", bytes: 1, source: "claude-cli", status: "proposed" },
+    ],
+  } as any;
+  const verdict = reviewApplyAvailability(withChanges);
+  assert.equal(verdict.available, true);
+  assert.equal(verdict.reason, APPLY_AVAILABLE_REASON);
+  assert.match(verdict.reason, /controlled workspace root/);
+});
+
+test("runProposedChanges returns only well-formed changes and normalizes status", () => {
+  const run = {
+    id: "r", task_id: "t", agent_id: "a", adapter_plugin: "p", status: "completed",
+    proposed_changes: [
+      { path: "a.txt", new_content: "hi", new_sha256: "h", bytes: 2, source: "claude-cli", status: "approved", baseline_sha256: "b" },
+      { path: "b.txt", new_content: "yo", new_sha256: "h", bytes: 2, source: "x", status: "made-up" }, // unknown → proposed
+      { new_content: "no path", source: "x", status: "proposed" }, // no path → dropped
+      { path: "c.txt", source: "x", status: "proposed" },          // no content → dropped
+      "nope",                                                       // wrong shape → dropped
+      null,
+    ],
+  } as any;
+  const cs = runProposedChanges(run);
+  assert.equal(cs.length, 2);
+  assert.equal(cs[0].path, "a.txt");
+  assert.equal(cs[0].status, "approved");
+  assert.equal(cs[0].baseline_sha256, "b");
+  assert.equal(cs[1].status, "proposed"); // unknown normalized
+});
+
+test("runProposedChanges is empty for a run with none or a bad shape", () => {
+  assert.deepEqual(runProposedChanges(undefined), []);
+  assert.deepEqual(runProposedChanges({ id: "r" } as any), []);
+  assert.deepEqual(runProposedChanges({ proposed_changes: "nope" } as any), []);
+});
+
+test("proposedChangeStatusLabel and tone map known states honestly", () => {
+  assert.equal(proposedChangeStatusLabel("applied"), "Applied");
+  assert.equal(proposedChangeStatusLabel("zzz"), "Proposed");
+  assert.equal(proposedChangeStatusTone("applied"), "done");
+  assert.equal(proposedChangeStatusTone("approved"), "done");
+  assert.equal(proposedChangeStatusTone("proposed"), "running");
+  assert.equal(proposedChangeStatusTone("rejected"), "backlog");
+});
+
+test("canReview/canApply gate on status and a baseline hash", () => {
+  const mk = (status: string, baseline?: string) =>
+    ({ path: "f", new_content: "x", new_sha256: "h", bytes: 1, source: "x", status, baseline_sha256: baseline }) as any;
+  assert.equal(canReviewProposedChange(mk("proposed")), true);
+  assert.equal(canReviewProposedChange(mk("approved")), false);
+  // Apply needs an approved change WITH a baseline hash.
+  assert.equal(canApplyProposedChange(mk("approved", "abc")), true);
+  assert.equal(canApplyProposedChange(mk("approved")), false); // no baseline → not applyable
+  assert.equal(canApplyProposedChange(mk("proposed", "abc")), false);
 });
 
 test("runArtifacts returns only well-formed references and normalizes unknown types", () => {

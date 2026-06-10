@@ -144,6 +144,8 @@ async fn serve() -> Result<(), KernelError> {
     println!("   GET    /v1/relux/runs");
     println!("   GET    /v1/relux/runs/:id");
     println!("   GET    /v1/relux/runs/:id/events");
+    println!("   POST   /v1/relux/runs/:id/proposed-changes/:index/review {{ \"decision\": \"approve|reject\" }}");
+    println!("   POST   /v1/relux/runs/:id/proposed-changes/:index/apply");
     println!("   GET    /v1/relux/audit");
     println!("   GET    /v1/relux/health");
     println!("   POST   /v1/relux/prime                     {{ \"message\": \"...\" }}");
@@ -326,6 +328,14 @@ fn router(state: AppState) -> Router {
         .route("/v1/relux/runs/:id", get(get_run))
         .route("/v1/relux/runs/:id/events", get(get_run_events))
         .route("/v1/relux/runs/:id/retry", post(retry_run))
+        .route(
+            "/v1/relux/runs/:id/proposed-changes/:index/review",
+            post(review_proposed_change),
+        )
+        .route(
+            "/v1/relux/runs/:id/proposed-changes/:index/apply",
+            post(apply_proposed_change),
+        )
         .route("/v1/relux/audit", get(list_audit_events))
         .route("/v1/relux/health", get(get_health))
         .route("/v1/relux/tasks/:id/start", post(start_task))
@@ -1035,6 +1045,65 @@ async fn retry_run(
     // Persist even if the retry's fresh run fails, so the new attempt is durable.
     let new_run_id = locked_save_persisting(&state, |kernel| kernel.retry_run(&run_id))?;
     Ok(Json(RetryRunResponse { run_id: new_run_id }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ReviewProposedChangeReq {
+    /// "approve" or "reject" — the operator's verdict on the proposed change.
+    decision: String,
+    /// An optional, bounded operator note recorded with the verdict.
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// POST `/v1/relux/runs/:id/proposed-changes/:index/review` — record an operator
+/// accept/reject of one proposed change (master plan section 15). Returns the
+/// updated run detail so the dashboard can refresh in one round trip. Never
+/// applies anything; apply is a separate, explicit action.
+async fn review_proposed_change(
+    State(state): State<AppState>,
+    AxumPath((id, index)): AxumPath<(String, usize)>,
+    body: Option<Json<ReviewProposedChangeReq>>,
+) -> Result<Json<RunRecord>, ApiError> {
+    let req = body.map(|b| b.0).ok_or_else(|| {
+        ApiError::bad_request("a JSON body with { \"decision\": \"approve|reject\" } is required")
+    })?;
+    let approve = match req.decision.trim().to_ascii_lowercase().as_str() {
+        "approve" | "approved" | "accept" | "accepted" => true,
+        "reject" | "rejected" => false,
+        other => {
+            return Err(ApiError::bad_request(format!(
+                "decision must be 'approve' or 'reject', got '{other}'"
+            )))
+        }
+    };
+    let run_id = relux_core::RunId::new(id);
+    let record = locked_save(&state, |kernel| {
+        kernel.review_proposed_change(&run_id, index, approve, req.note.as_deref())?;
+        let run = kernel
+            .run(&run_id)
+            .ok_or_else(|| KernelError::UnknownRun(run_id.to_string()))?
+            .clone();
+        Ok(build_run_record(kernel, run))
+    })?;
+    Ok(Json(record))
+}
+
+/// POST `/v1/relux/runs/:id/proposed-changes/:index/apply` — apply one APPROVED
+/// proposed change into the run's controlled workspace root (master plan section
+/// 15 apply, safety bar section 17.5). Refuses honestly (no fabricated success):
+/// 409 when the change is not approved or the baseline conflicts with the
+/// workspace; 422 when it cannot be applied (no baseline hash, no workspace root,
+/// unsafe/irregular target). Persists the recorded refusal reason even on a
+/// refusal so the dashboard can show why.
+async fn apply_proposed_change(
+    State(state): State<AppState>,
+    AxumPath((id, index)): AxumPath<(String, usize)>,
+) -> Result<Json<relux_kernel::AppliedProposedChange>, ApiError> {
+    let run_id = relux_core::RunId::new(id);
+    let applied =
+        locked_save_persisting(&state, |kernel| kernel.apply_proposed_change(&run_id, index))?;
+    Ok(Json(applied))
 }
 
 #[derive(Debug, Deserialize)]
@@ -3101,6 +3170,14 @@ fn status_for(err: &KernelError) -> StatusCode {
         KernelError::AdapterRuntimeDisabled { .. } => StatusCode::CONFLICT,
         // Retrying a run that is not in a failed state is a resolvable conflict.
         KernelError::RunNotRetryable { .. } => StatusCode::CONFLICT,
+        // Proposed-change apply outcomes, mapped honestly: an unknown change is a
+        // 404; a not-approved change or a baseline conflict is a resolvable
+        // conflict (409); a structurally inapplicable change (no baseline hash, no
+        // workspace root, unsafe/irregular target) is unprocessable (422).
+        KernelError::UnknownProposedChange { .. } => StatusCode::NOT_FOUND,
+        KernelError::ProposedChangeNotApproved { .. }
+        | KernelError::ProposedChangeConflict { .. } => StatusCode::CONFLICT,
+        KernelError::ProposedChangeNotApplicable { .. } => StatusCode::UNPROCESSABLE_ENTITY,
         KernelError::AdapterBinaryMissing { .. } => StatusCode::UNPROCESSABLE_ENTITY,
         KernelError::AdapterExecutionFailed { .. } => StatusCode::BAD_GATEWAY,
         KernelError::AdapterNotConfigurable { .. } | KernelError::InvalidAdapterConfig { .. } => {
@@ -3189,6 +3266,7 @@ mod tests {
             cost: None,
             retried_from: None,
             artifacts,
+            proposed_changes: Vec::new(),
         }
     }
 
@@ -3230,6 +3308,32 @@ mod tests {
         // empty state rather than an empty (or fabricated) list.
         let json = serde_json::to_value(record_of(run_with(Vec::new()))).unwrap();
         assert!(json.get("artifacts").is_none());
+        assert!(json.get("proposed_changes").is_none());
+    }
+
+    #[test]
+    fn run_record_flattens_proposed_changes_with_status_onto_the_detail() {
+        // GET /v1/relux/runs/:id flattens the run, so a proposed change surfaces
+        // with its path + lifecycle status for the dashboard's review/apply UI.
+        let mut run = run_with(Vec::new());
+        run.proposed_changes = vec![relux_core::ProposedChange {
+            path: "src/main.rs".into(),
+            new_content: "fn main() {}\n".into(),
+            baseline_sha256: Some(relux_core::sha256_hex(b"old")),
+            new_sha256: relux_core::sha256_hex(b"fn main() {}\n"),
+            bytes: 13,
+            source: "claude-cli".into(),
+            status: relux_core::ProposedChangeStatus::Approved,
+            review_note: None,
+            refused_reason: None,
+            applied_at: None,
+        }];
+        let json = serde_json::to_value(record_of(run)).unwrap();
+        let cs = json.get("proposed_changes").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].get("path").and_then(|v| v.as_str()), Some("src/main.rs"));
+        assert_eq!(cs[0].get("status").and_then(|v| v.as_str()), Some("approved"));
+        assert_eq!(cs[0].get("new_content").and_then(|v| v.as_str()), Some("fn main() {}\n"));
     }
 
     #[test]
