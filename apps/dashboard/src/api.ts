@@ -1445,6 +1445,9 @@ export interface ReluxPlannedStep {
   title: string;
   role: ReluxOrchestrationRole;
   agent_id: string | null;
+  // Indices (into the plan's steps) of the briefs this brief waits on. Empty for
+  // an independent step (the backward-compatible default).
+  depends_on?: number[];
 }
 
 export interface ReluxOrchestrationPlan {
@@ -1460,8 +1463,16 @@ export interface ReluxOrchestrationStep {
   role: ReluxOrchestrationRole;
   title: string;
   outcome: ReluxStepOutcome;
+  // Indices (into the orchestration's steps) of the briefs this brief waits on.
+  // The run loop only runs a brief once every dependency has completed.
+  depends_on?: number[];
   run_id?: string | null;
   note?: string | null;
+  // When this brief's most recent run started/finished, and which batch round it
+  // ran in (1-based). Absent until the brief has run.
+  started_at?: string | null;
+  finished_at?: string | null;
+  round?: number | null;
 }
 
 export interface ReluxOrchestration {
@@ -1484,6 +1495,13 @@ export interface ReluxOrchestrationBatchResult {
   failed: number;
   blocked: number;
   pending: number;
+  // Round-size cap used (1..=4), how many dependency-gated rounds ran, briefs
+  // still waiting on a dependency, and briefs blocked because an upstream brief
+  // failed. Optional for forward/backward compatibility with older servers.
+  concurrency?: number;
+  rounds?: number;
+  waiting?: number;
+  dependency_blocked?: number;
   skipped_reasons: string[];
   per_agent: string[];
   summary: string;
@@ -1505,11 +1523,13 @@ export const reluxOrchestration = {
   get: (id: string) =>
     api.get<ReluxOrchestration>(`/v1/relux/prime/orchestrations/${encodeURIComponent(id)}`),
   // Run a governed multi-agent batch for one orchestration. `max` caps how many
-  // briefs run this batch (kernel clamps to 1..=25); omit to run the whole plan.
-  run: (id: string, max?: number) =>
+  // briefs run this batch (kernel clamps to 1..=25); `concurrency` caps the
+  // round size (kernel clamps to 1..=4, defaults to 2). Omit both to run the
+  // whole plan two-at-a-time.
+  run: (id: string, opts?: { max?: number; concurrency?: number }) =>
     api.post<ReluxOrchestrationBatchResult>(
       `/v1/relux/prime/orchestrations/${encodeURIComponent(id)}/run`,
-      max === undefined ? {} : { max },
+      opts ?? {},
     ),
 };
 

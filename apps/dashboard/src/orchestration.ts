@@ -11,6 +11,7 @@
 import type {
   ReluxOrchestration,
   ReluxOrchestrationStatus,
+  ReluxOrchestrationStep,
   ReluxStepOutcome,
 } from "./api";
 
@@ -78,6 +79,132 @@ export function orchestrationProgress(o: ReluxOrchestration): OrchestrationProgr
 export function orchestrationProgressLabel(o: ReluxOrchestration): string {
   const p = orchestrationProgress(o);
   return `${p.completed}/${p.total} completed`;
+}
+
+// The live dependency-aware lifecycle of one brief, derived from its own outcome
+// plus its dependencies' outcomes. This is what the panel renders so an operator
+// can see, before and after a run, which briefs are runnable now ("ready"), which
+// are still gated ("waiting"), and which are done/failed/blocked. Mirrors the
+// kernel scheduler's own readiness rule (run only when every dependency
+// completed); it never invents state.
+export type StepLifecycle =
+  | "completed"
+  | "failed"
+  | "blocked"
+  | "ready"
+  | "waiting";
+
+export function stepLifecycle(
+  o: ReluxOrchestration,
+  index: number,
+): StepLifecycle {
+  const step = o.steps[index];
+  if (!step) return "waiting";
+  if (step.outcome === "completed") return "completed";
+  if (step.outcome === "failed") return "failed";
+  if (step.outcome === "blocked") return "blocked";
+  // Pending: classify by its dependencies. Treat an out-of-range index as
+  // satisfied (defensive) so a malformed record never hides a runnable brief.
+  const deps = step.depends_on ?? [];
+  const depStates = deps.map((j) => o.steps[j]?.outcome);
+  if (depStates.some((s) => s === "failed" || s === "blocked")) return "blocked";
+  if (depStates.every((s) => s === undefined || s === "completed")) return "ready";
+  return "waiting";
+}
+
+// Badge tone for a derived lifecycle state (reuses the shared B&W tones).
+export function stepLifecycleTone(
+  state: StepLifecycle,
+): "done" | "in_progress" | "blocked" | "backlog" {
+  switch (state) {
+    case "completed":
+      return "done";
+    case "ready":
+      return "in_progress";
+    case "failed":
+    case "blocked":
+      return "blocked";
+    default:
+      return "backlog"; // waiting
+  }
+}
+
+// A human label for a brief's dependencies, e.g. "waits on task_0003, task_0004"
+// — or null when the brief is independent. Resolves indices to task ids so the
+// row reads in product terms, not array offsets.
+export function stepDependencyLabel(
+  o: ReluxOrchestration,
+  step: ReluxOrchestrationStep,
+): string | null {
+  const deps = step.depends_on ?? [];
+  if (!deps.length) return null;
+  const ids = deps
+    .map((j) => o.steps[j]?.task_id)
+    .filter((id): id is string => typeof id === "string");
+  if (!ids.length) return null;
+  return `waits on ${ids.join(", ")}`;
+}
+
+// Dependency-aware tallies for the orchestration: how many briefs are runnable
+// now vs still gated, on top of the raw outcome counts. Computed from the step
+// set, so it always matches the record.
+export interface OrchestrationReadiness {
+  ready: number;
+  waiting: number;
+  blocked: number;
+  completed: number;
+  failed: number;
+}
+
+export function orchestrationReadiness(
+  o: ReluxOrchestration,
+): OrchestrationReadiness {
+  const r: OrchestrationReadiness = {
+    ready: 0,
+    waiting: 0,
+    blocked: 0,
+    completed: 0,
+    failed: 0,
+  };
+  o.steps.forEach((_, i) => {
+    switch (stepLifecycle(o, i)) {
+      case "ready":
+        r.ready += 1;
+        break;
+      case "waiting":
+        r.waiting += 1;
+        break;
+      case "blocked":
+        r.blocked += 1;
+        break;
+      case "completed":
+        r.completed += 1;
+        break;
+      case "failed":
+        r.failed += 1;
+        break;
+    }
+  });
+  return r;
+}
+
+// The distinct batch rounds an orchestration's briefs ran in, smallest first,
+// each with the briefs recorded for that round. Briefs that have not run yet
+// (no round) are omitted. Lets the panel show "round 1: …, round 2: …" honestly
+// after a batch — real recorded data, never a fabricated timeline.
+export function orchestrationRounds(
+  o: ReluxOrchestration,
+): { round: number; steps: ReluxOrchestrationStep[] }[] {
+  const byRound = new Map<number, ReluxOrchestrationStep[]>();
+  for (const s of o.steps) {
+    if (typeof s.round === "number") {
+      if (!byRound.has(s.round)) byRound.set(s.round, []);
+      byRound.get(s.round)!.push(s);
+    }
+  }
+  return [...byRound.keys()]
+    .sort((a, b) => a - b)
+    .map((round) => ({ round, steps: byRound.get(round)! }));
 }
 
 // True when an orchestration has briefs left to run (so the UI can offer a

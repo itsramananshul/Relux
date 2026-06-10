@@ -1349,8 +1349,15 @@ impl KernelState {
                 role: planned.role,
                 title: planned.title.clone(),
                 outcome: StepOutcome::Pending,
+                // The planner's inferred dependencies index into `plan.steps`, and
+                // briefs are committed in that same order, so the indices carry
+                // over unchanged.
+                depends_on: planned.depends_on.clone(),
                 run_id: None,
                 note: None,
+                started_at: None,
+                finished_at: None,
+                round: None,
             });
         }
 
@@ -1385,44 +1392,48 @@ impl KernelState {
         Ok(record)
     }
 
-    /// Run a governed multi-agent batch for one orchestration.
+    /// Run a governed, dependency-aware multi-agent batch for one orchestration.
     ///
-    /// Each pending brief is executed through ITS assigned agent's adapter via the
+    /// The scheduler works in **rounds**. Each round it marks any brief whose
+    /// dependency failed/blocked as `Blocked` (honestly, never run), collects the
+    /// briefs that are *ready* (still pending and every dependency `Completed`),
+    /// and runs up to `concurrency` of them (clamped 1..=4). It repeats until no
+    /// brief is ready or the per-call budget `max` (clamped 1..=25) is spent.
+    ///
+    /// Each ready brief is executed through ITS assigned agent's adapter via the
     /// same governed path as the Work page ([`execute_assigned_run`]): the local
     /// Prime adapter echoes deterministically; an **enabled** CLI adapter spawns
     /// its binary; a disabled/unconfigured runtime or a missing permission is
-    /// recorded as `blocked` (a human action is required), never faked. The batch
-    /// is bounded by `max` (clamped 1..=25), runs each brief at most once, records
-    /// per-agent outcomes, updates the durable record, and stops safely - it never
-    /// loops, recurses, or spawns uncontrolled work, and never auto-runs downloaded
-    /// plugin code (section 10.4, section 8.1, section 8.2).
+    /// recorded as `blocked`, never faked. The loop runs each brief at most once,
+    /// records per-brief start/finish/round, updates the durable record, and stops
+    /// safely - it never loops forever, recurses, or auto-runs downloaded plugin
+    /// code (section 10.4, section 8.1, section 8.2).
+    ///
+    /// Termination + no-deadlock are structural: dependencies only ever point at
+    /// earlier briefs (a DAG), so after the block-propagation the lowest-index
+    /// pending brief always has all dependencies `Completed` (it is ready) - the
+    /// ready set is empty only when no brief is pending. Every round runs at least
+    /// one brief and moves it to a terminal outcome, so the pending set strictly
+    /// shrinks.
+    ///
+    /// Honest concurrency note: `concurrency` bounds the *round size* and pins the
+    /// scheduler contract; briefs within a round execute sequentially through the
+    /// kernel's single-owner lock (no OS-parallel CLI spawns yet) - real parallel
+    /// execution is a later slice.
     pub fn run_orchestration(
         &mut self,
         id: &OrchestrationId,
         max: usize,
+        concurrency: usize,
     ) -> Result<OrchestrationBatchResult, KernelError> {
         let max = max.clamp(1, 25);
+        let concurrency = concurrency.clamp(1, 4);
         let namespace = self
             .orchestrations
             .get(id)
             .ok_or_else(|| KernelError::UnknownOrchestration(id.to_string()))?
             .namespace_id
             .clone();
-
-        // Snapshot the pending steps to run, bounded by `max`, detached from the
-        // record so we can mutate it as each brief finishes.
-        let pending: Vec<(usize, TaskId, AgentId)> = self
-            .orchestrations
-            .get(id)
-            .map(|o| {
-                o.steps
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, s)| s.outcome == StepOutcome::Pending)
-                    .map(|(i, s)| (i, s.task_id.clone(), s.agent_id.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
 
         let mut result = OrchestrationBatchResult {
             orchestration_id: id.clone(),
@@ -1431,6 +1442,10 @@ impl KernelState {
             failed: 0,
             blocked: 0,
             pending: 0,
+            concurrency: concurrency as u32,
+            rounds: 0,
+            waiting: 0,
+            dependency_blocked: 0,
             skipped_reasons: Vec::new(),
             per_agent: Vec::new(),
             summary: String::new(),
@@ -1438,66 +1453,122 @@ impl KernelState {
             status: OrchestrationStatus::Planned,
         };
 
-        for (idx, task_id, agent_id) in pending.into_iter().take(max) {
-            result.ran += 1;
-            let exec = self.execute_assigned_run(&task_id);
-            // The latest run for this task is the attempt we just made (run ids are
-            // zero-padded, so id order == creation order).
-            let run_id = self
-                .runs
-                .values()
-                .filter(|r| r.task_id == task_id)
-                .max_by(|a, b| a.id.0.cmp(&b.id.0))
-                .map(|r| r.id.clone());
-            let (outcome, note) = match exec {
-                Ok(_) => {
-                    result.completed += 1;
-                    (StepOutcome::Completed, None)
-                }
-                Err(e) => {
-                    // Distinguish "needs a human" (blocked) from a genuine run
-                    // failure (retryable). A disabled/unconfigured CLI runtime, a
-                    // missing binary, an invalid config, or a missing permission all
-                    // mean the brief cannot run until someone acts.
-                    let blocked = matches!(
-                        e,
-                        KernelError::AdapterRuntimeDisabled { .. }
-                            | KernelError::AdapterRuntimeNotConfigured { .. }
-                            | KernelError::InvalidAdapterConfig { .. }
-                            | KernelError::AdapterBinaryMissing { .. }
-                            | KernelError::PermissionDenied { .. }
-                    );
-                    if blocked {
-                        result.blocked += 1;
-                    } else {
-                        result.failed += 1;
+        let mut round_no: u32 = 0;
+        loop {
+            // Budget guard: never attempt more than `max` briefs in one call, so a
+            // single run can never spin the whole fleet without an explicit ask.
+            if result.ran as usize >= max {
+                break;
+            }
+
+            // Honestly mark any brief whose dependency failed/blocked as `Blocked`
+            // before choosing this round's work, so a failed upstream never silently
+            // strands its dependents as "pending".
+            result.dependency_blocked += self.propagate_dependency_blocks(id);
+
+            // A brief is ready when it is still pending and every dependency has
+            // `Completed`. Collected in index order so the lowest-index ready brief
+            // (which, post-propagation, always exists while anything is pending)
+            // runs first.
+            let ready: Vec<(usize, TaskId, AgentId)> = self
+                .orchestrations
+                .get(id)
+                .map(|o| {
+                    o.steps
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, s)| {
+                            s.outcome == StepOutcome::Pending
+                                && s.depends_on.iter().all(|&j| {
+                                    o.steps
+                                        .get(j)
+                                        .map(|d| d.outcome == StepOutcome::Completed)
+                                        .unwrap_or(true)
+                                })
+                        })
+                        .map(|(i, s)| (i, s.task_id.clone(), s.agent_id.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if ready.is_empty() {
+                break;
+            }
+
+            let budget_left = max - result.ran as usize;
+            let take = concurrency.min(budget_left);
+            round_no += 1;
+            for (idx, task_id, agent_id) in ready.into_iter().take(take) {
+                result.ran += 1;
+                let started_at = self.clock.tick();
+                let exec = self.execute_assigned_run(&task_id);
+                let finished_at = self.clock.tick();
+                // The latest run for this task is the attempt we just made (run ids
+                // are zero-padded, so id order == creation order).
+                let run_id = self
+                    .runs
+                    .values()
+                    .filter(|r| r.task_id == task_id)
+                    .max_by(|a, b| a.id.0.cmp(&b.id.0))
+                    .map(|r| r.id.clone());
+                let (outcome, note) = match exec {
+                    Ok(_) => {
+                        result.completed += 1;
+                        (StepOutcome::Completed, None)
                     }
-                    let reason = e.to_string();
-                    result.skipped_reasons.push(format!("{task_id}: {reason}"));
-                    (
+                    Err(e) => {
+                        // Distinguish "needs a human" (blocked) from a genuine run
+                        // failure (retryable). A disabled/unconfigured CLI runtime, a
+                        // missing binary, an invalid config, or a missing permission
+                        // all mean the brief cannot run until someone acts.
+                        let blocked = matches!(
+                            e,
+                            KernelError::AdapterRuntimeDisabled { .. }
+                                | KernelError::AdapterRuntimeNotConfigured { .. }
+                                | KernelError::InvalidAdapterConfig { .. }
+                                | KernelError::AdapterBinaryMissing { .. }
+                                | KernelError::PermissionDenied { .. }
+                        );
                         if blocked {
-                            StepOutcome::Blocked
+                            result.blocked += 1;
                         } else {
-                            StepOutcome::Failed
-                        },
-                        Some(reason),
-                    )
-                }
-            };
-            result
-                .per_agent
-                .push(format!("{agent_id}: {task_id} {}", outcome.label()));
-            if let Some(o) = self.orchestrations.get_mut(id) {
-                if let Some(step) = o.steps.get_mut(idx) {
-                    step.outcome = outcome;
-                    step.run_id = run_id;
-                    step.note = note;
+                            result.failed += 1;
+                        }
+                        let reason = e.to_string();
+                        result.skipped_reasons.push(format!("{task_id}: {reason}"));
+                        (
+                            if blocked {
+                                StepOutcome::Blocked
+                            } else {
+                                StepOutcome::Failed
+                            },
+                            Some(reason),
+                        )
+                    }
+                };
+                result
+                    .per_agent
+                    .push(format!("round {round_no} {agent_id}: {task_id} {}", outcome.label()));
+                if let Some(o) = self.orchestrations.get_mut(id) {
+                    if let Some(step) = o.steps.get_mut(idx) {
+                        step.outcome = outcome;
+                        step.run_id = run_id;
+                        step.note = note;
+                        step.started_at = Some(started_at);
+                        step.finished_at = Some(finished_at);
+                        step.round = Some(round_no);
+                    }
                 }
             }
         }
+        result.rounds = round_no;
 
-        // Recompute overall status and the pending count from the full step set.
-        let (status, pending_left) = {
+        // A brief whose dependency failed in the final round must be marked blocked
+        // too (the loop may have exited on the budget guard before re-propagating).
+        result.dependency_blocked += self.propagate_dependency_blocks(id);
+
+        // Recompute overall status, pending, and dependency-waiting from the full
+        // step set.
+        let (status, pending_left, waiting) = {
             let o = self
                 .orchestrations
                 .get(id)
@@ -1506,6 +1577,21 @@ impl KernelState {
                 .steps
                 .iter()
                 .filter(|s| s.outcome == StepOutcome::Pending)
+                .count();
+            // Pending briefs still gated by a dependency that has not completed
+            // (they will become runnable once their upstream finishes).
+            let waiting = o
+                .steps
+                .iter()
+                .filter(|s| {
+                    s.outcome == StepOutcome::Pending
+                        && s.depends_on.iter().any(|&j| {
+                            o.steps
+                                .get(j)
+                                .map(|d| d.outcome != StepOutcome::Completed)
+                                .unwrap_or(false)
+                        })
+                })
                 .count();
             let any_blocked = o.steps.iter().any(|s| s.outcome == StepOutcome::Blocked);
             let any_failed = o.steps.iter().any(|s| s.outcome == StepOutcome::Failed);
@@ -1516,23 +1602,41 @@ impl KernelState {
             } else {
                 OrchestrationStatus::Completed
             };
-            (status, pending_left)
+            (status, pending_left, waiting)
         };
         result.pending = pending_left as u32;
+        result.waiting = waiting as u32;
         result.status = status;
         result.summary = format!(
-            "{} brief(s) run: {} completed, {} failed, {} blocked; {} pending.",
-            result.ran, result.completed, result.failed, result.blocked, result.pending
+            "{} round(s), up to {} brief(s) at a time: {} ran ({} completed, {} failed, {} blocked); {} blocked by a failed dependency; {} waiting on a dependency; {} pending.",
+            result.rounds,
+            result.concurrency,
+            result.ran,
+            result.completed,
+            result.failed,
+            result.blocked,
+            result.dependency_blocked,
+            result.waiting,
+            result.pending
         );
         result.next_action = match status {
             OrchestrationStatus::Completed => "All briefs completed. Review the runs.".to_string(),
-            OrchestrationStatus::Running => format!(
-                "Run the orchestration again to continue {} remaining brief(s).",
-                result.pending
-            ),
+            OrchestrationStatus::Running => {
+                if result.waiting > 0 {
+                    format!(
+                        "{} brief(s) pending ({} waiting on a dependency that has not completed). Run the orchestration again to continue.",
+                        result.pending, result.waiting
+                    )
+                } else {
+                    format!(
+                        "Run the orchestration again to continue {} remaining brief(s).",
+                        result.pending
+                    )
+                }
+            }
             OrchestrationStatus::NeedsAttention => format!(
-                "{} brief(s) need attention. Blocked briefs need their adapter runtime enabled (or reassignment); failed briefs can be retried. Then run again.",
-                result.blocked + result.failed
+                "{} brief(s) need attention. Blocked briefs need their adapter runtime enabled, an upstream brief retried, or reassignment; failed briefs can be retried. Then run again.",
+                result.blocked + result.failed + result.dependency_blocked
             ),
             OrchestrationStatus::Planned => {
                 "Run the orchestration to start the briefs.".to_string()
@@ -1552,7 +1656,7 @@ impl KernelState {
             Some("orchestration"),
             Some(id.as_str()),
             Some(&namespace),
-            if result.failed > 0 || result.blocked > 0 {
+            if result.failed > 0 || result.blocked > 0 || result.dependency_blocked > 0 {
                 AuditResult::Failed
             } else {
                 AuditResult::Success
@@ -1562,10 +1666,75 @@ impl KernelState {
                 "completed": result.completed,
                 "failed": result.failed,
                 "blocked": result.blocked,
+                "dependency_blocked": result.dependency_blocked,
+                "rounds": result.rounds,
+                "concurrency": result.concurrency,
+                "waiting": result.waiting,
                 "pending": result.pending,
             }),
         );
         Ok(result)
+    }
+
+    /// Mark every still-pending brief whose dependency `Failed`/`Blocked` as
+    /// `Blocked` itself, with an honest note pointing at the upstream brief.
+    /// Iterates to a fixpoint so a block cascades down a chain in one pass.
+    /// Returns the number of briefs newly blocked. Safe to call repeatedly (an
+    /// already-terminal brief is never re-touched).
+    fn propagate_dependency_blocks(&mut self, id: &OrchestrationId) -> u32 {
+        let mut newly_blocked = 0u32;
+        loop {
+            let updates: Vec<(usize, String)> = match self.orchestrations.get(id) {
+                Some(o) => o
+                    .steps
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.outcome == StepOutcome::Pending)
+                    .filter_map(|(i, s)| {
+                        s.depends_on
+                            .iter()
+                            .find(|&&j| {
+                                o.steps
+                                    .get(j)
+                                    .map(|d| {
+                                        matches!(
+                                            d.outcome,
+                                            StepOutcome::Failed | StepOutcome::Blocked
+                                        )
+                                    })
+                                    .unwrap_or(false)
+                            })
+                            .map(|&j| {
+                                let dep = &o.steps[j];
+                                (
+                                    i,
+                                    format!(
+                                        "blocked: depends on {} which {}",
+                                        dep.task_id,
+                                        dep.outcome.label()
+                                    ),
+                                )
+                            })
+                    })
+                    .collect(),
+                None => return newly_blocked,
+            };
+            if updates.is_empty() {
+                break;
+            }
+            for (i, reason) in updates {
+                if let Some(o) = self.orchestrations.get_mut(id) {
+                    if let Some(step) = o.steps.get_mut(i) {
+                        if step.outcome == StepOutcome::Pending {
+                            step.outcome = StepOutcome::Blocked;
+                            step.note = Some(reason);
+                            newly_blocked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        newly_blocked
     }
 
     // --- Runs --------------------------------------------------------------
@@ -5377,7 +5546,7 @@ mod tests {
             .unwrap();
         let id = record.id.clone();
 
-        let batch = k.run_orchestration(&id, 25).unwrap();
+        let batch = k.run_orchestration(&id, 25, 2).unwrap();
 
         assert_eq!(batch.ran, 2);
         assert_eq!(batch.completed, 2);
@@ -5411,19 +5580,19 @@ mod tests {
         let id = record.id.clone();
 
         // A capped batch runs only one brief and leaves the rest pending.
-        let first = k.run_orchestration(&id, 1).unwrap();
+        let first = k.run_orchestration(&id, 1, 2).unwrap();
         assert_eq!(first.ran, 1);
         assert_eq!(first.pending, 1);
         assert_eq!(first.status, OrchestrationStatus::Running);
         assert!(first.next_action.contains("again"));
 
         // Running again continues the remaining brief and completes.
-        let second = k.run_orchestration(&id, 25).unwrap();
+        let second = k.run_orchestration(&id, 25, 2).unwrap();
         assert_eq!(second.ran, 1);
         assert_eq!(second.status, OrchestrationStatus::Completed);
 
         // Running once more does nothing - no runaway, no re-running completed work.
-        let third = k.run_orchestration(&id, 25).unwrap();
+        let third = k.run_orchestration(&id, 25, 2).unwrap();
         assert_eq!(third.ran, 0);
         assert_eq!(third.completed, 0);
         assert_eq!(third.status, OrchestrationStatus::Completed);
@@ -5455,7 +5624,7 @@ mod tests {
         // research -> research-agent (Claude, disabled); document -> Prime (local).
         assert_eq!(record.steps[0].agent_id.as_str(), "research-agent");
 
-        let batch = k.run_orchestration(&id, 25).unwrap();
+        let batch = k.run_orchestration(&id, 25, 2).unwrap();
         assert_eq!(batch.blocked, 1);
         assert_eq!(batch.completed, 1);
         assert_eq!(batch.status, OrchestrationStatus::NeedsAttention);
@@ -5469,6 +5638,120 @@ mod tests {
             .unwrap();
         assert_eq!(blocked_step.outcome, StepOutcome::Blocked);
         assert!(blocked_step.note.is_some(), "blocked brief carries a reason");
+    }
+
+    #[test]
+    fn run_orchestration_runs_dependencies_before_dependents() {
+        let (mut k, ctx) = orchestration_kernel();
+        // implementation depends on research, so research must run (and complete)
+        // in an earlier round than implementation.
+        let record = k
+            .prime_orchestrate(&ctx, "research the options and implement the prototype")
+            .unwrap();
+        let id = record.id.clone();
+        assert_eq!(record.steps[1].depends_on, vec![0], "impl waits on research");
+
+        let batch = k.run_orchestration(&id, 25, 2).unwrap();
+        assert_eq!(batch.ran, 2);
+        assert_eq!(batch.completed, 2);
+        assert_eq!(batch.rounds, 2, "the dependent cannot share a round with its dep");
+        assert_eq!(batch.status, OrchestrationStatus::Completed);
+
+        let stored = k.orchestration(&id).unwrap();
+        assert_eq!(stored.steps[0].round, Some(1), "research ran first");
+        assert_eq!(stored.steps[1].round, Some(2), "implementation ran after");
+    }
+
+    #[test]
+    fn run_orchestration_runs_independent_briefs_together_and_honors_the_cap() {
+        let (mut k, ctx) = orchestration_kernel();
+        // Two research clauses: same tier, no prerequisite between them, so they are
+        // independent and may share a round.
+        let record = k
+            .prime_orchestrate(&ctx, "research the rust options and research the go options")
+            .unwrap();
+        let id = record.id.clone();
+        assert!(
+            record.steps.iter().all(|s| s.depends_on.is_empty()),
+            "independent briefs have no dependencies (backward compatible)"
+        );
+
+        // concurrency 2 -> both run in a single round.
+        let batch = k.run_orchestration(&id, 25, 2).unwrap();
+        assert_eq!(batch.ran, 2);
+        assert_eq!(batch.completed, 2);
+        assert_eq!(batch.rounds, 1, "two independent briefs fit one round at cap 2");
+        let stored = k.orchestration(&id).unwrap();
+        assert_eq!(stored.steps[0].round, Some(1));
+        assert_eq!(stored.steps[1].round, Some(1));
+
+        // No brief runs twice: a second batch does nothing.
+        let again = k.run_orchestration(&id, 25, 2).unwrap();
+        assert_eq!(again.ran, 0);
+        assert_eq!(again.rounds, 0);
+    }
+
+    #[test]
+    fn run_orchestration_concurrency_cap_of_one_serializes_independent_briefs() {
+        let (mut k, ctx) = orchestration_kernel();
+        let record = k
+            .prime_orchestrate(&ctx, "research the rust options and research the go options")
+            .unwrap();
+        let id = record.id.clone();
+
+        // cap 1 (and the clamp: 0 -> 1) forces one brief per round.
+        let batch = k.run_orchestration(&id, 25, 1).unwrap();
+        assert_eq!(batch.concurrency, 1);
+        assert_eq!(batch.ran, 2);
+        assert_eq!(batch.rounds, 2, "cap 1 never runs two briefs in one round");
+    }
+
+    #[test]
+    fn run_orchestration_blocks_a_brief_whose_dependency_did_not_complete() {
+        let (mut k, ctx) = orchestration_kernel();
+        // Research runs on a disabled Claude CLI (blocked); implementation depends
+        // on research, so it must be honestly blocked, NOT run, NOT faked.
+        install_bundled(&mut k, claude_adapter_manifest());
+        let claude = PluginId::new("relux-adapter-claude-cli");
+        k.create_agent(
+            "research-agent",
+            "Research Agent",
+            "investigates",
+            &claude,
+            &ctx.namespace,
+            None,
+            vec![],
+        )
+        .unwrap();
+
+        let record = k
+            .prime_orchestrate(&ctx, "research the options and implement the prototype")
+            .unwrap();
+        let id = record.id.clone();
+        assert_eq!(record.steps[0].agent_id.as_str(), "research-agent");
+        assert_eq!(record.steps[1].depends_on, vec![0]);
+        let impl_task = record.steps[1].task_id.clone();
+
+        let batch = k.run_orchestration(&id, 25, 2).unwrap();
+        assert_eq!(batch.blocked, 1, "research blocked by its disabled runtime");
+        assert_eq!(batch.dependency_blocked, 1, "implementation blocked by research");
+        assert_eq!(batch.completed, 0);
+        assert_eq!(batch.ran, 1, "the dependent was never executed");
+        assert_eq!(batch.status, OrchestrationStatus::NeedsAttention);
+
+        let stored = k.orchestration(&id).unwrap();
+        assert_eq!(stored.steps[1].outcome, StepOutcome::Blocked);
+        assert!(stored.steps[1]
+            .note
+            .as_ref()
+            .unwrap()
+            .contains("depends on"));
+        assert!(stored.steps[1].run_id.is_none(), "a dep-blocked brief has no run");
+        // The implementation task never started a run.
+        assert!(
+            !k.runs().iter().any(|r| r.task_id == impl_task),
+            "no run was spawned for the dependency-blocked brief"
+        );
     }
 
     #[test]

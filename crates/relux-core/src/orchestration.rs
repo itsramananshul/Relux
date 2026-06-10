@@ -100,6 +100,11 @@ pub struct PlannedStep {
     /// The id of an existing agent that fits this role, or `None` when no
     /// specialist exists (the kernel falls back to Prime and records a note).
     pub agent_id: Option<String>,
+    /// Indices (into the plan's `steps`) of the briefs this brief waits on. Only
+    /// ever earlier indices, so the dependency graph is a DAG by construction.
+    /// Empty for an independent step (the backward-compatible default).
+    #[serde(default)]
+    pub depends_on: Vec<usize>,
 }
 
 /// The pure decomposition of a goal into role-typed briefs, grounded in the
@@ -169,12 +174,28 @@ pub struct OrchestrationStep {
     pub role: OrchestrationRole,
     pub title: String,
     pub outcome: StepOutcome,
+    /// Indices (into the orchestration's `steps`) of the briefs this brief waits
+    /// on. The run loop only runs a brief once every dependency has `Completed`,
+    /// and marks a brief `Blocked` when a dependency `Failed`/`Blocked`. Always
+    /// earlier indices (a DAG); empty for an independent brief.
+    #[serde(default)]
+    pub depends_on: Vec<usize>,
     /// The most recent run for this step, once one has started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<RunId>,
     /// A short, honest note about the last attempt (e.g. the failure reason).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// When this brief's most recent run started / finished (clock ticks), so the
+    /// dashboard can render real per-brief progress after a batch completes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    /// The batch round this brief most recently ran in (1-based), for the
+    /// "which briefs ran together" view. `None` until it has run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round: Option<u32>,
 }
 
 /// Overall lifecycle of an orchestration.
@@ -236,11 +257,27 @@ pub struct OrchestrationBatchResult {
     pub completed: u32,
     pub failed: u32,
     pub blocked: u32,
-    /// Briefs still pending after this batch (capped out, run again to continue).
+    /// Briefs still pending after this batch (capped out or waiting on a
+    /// dependency; run again to continue).
     pub pending: u32,
+    /// The round-size cap used this batch (clamped 1..=4): the most ready briefs
+    /// the scheduler grouped into a single round.
+    #[serde(default)]
+    pub concurrency: u32,
+    /// How many dependency-gated rounds the scheduler executed this batch.
+    #[serde(default)]
+    pub rounds: u32,
+    /// Pending briefs that could not start because a dependency has not completed
+    /// yet (a subset of `pending`); they become runnable once their upstream does.
+    #[serde(default)]
+    pub waiting: u32,
+    /// Briefs marked `Blocked` this batch because an upstream brief they depend on
+    /// failed or was blocked (distinct from a runtime/permission block).
+    #[serde(default)]
+    pub dependency_blocked: u32,
     /// Reasons individual briefs were skipped or could not run.
     pub skipped_reasons: Vec<String>,
-    /// Per-agent outcome lines, e.g. `"code-agent: task_0007 completed"`.
+    /// Per-agent outcome lines, e.g. `"round 1 code-agent: task_0007 completed"`.
     pub per_agent: Vec<String>,
     pub summary: String,
     pub next_action: String,
@@ -291,10 +328,51 @@ pub fn plan_orchestration(goal: &str, summary: &StateSummary) -> OrchestrationPl
             title: title_from_clause(&clause),
             role,
             agent_id,
+            depends_on: Vec::new(),
         });
     }
 
+    // Infer simple, obvious dependencies so the run loop can gate work in order:
+    // implementation waits on research, and testing/review/documentation wait on
+    // implementation, when those roles co-occur in the goal. Each dependency only
+    // ever points at an *earlier* step, so the graph is a DAG by construction (no
+    // cycles, no deadlock). A goal whose roles do not co-occur gets no
+    // dependencies and runs exactly as before (backward compatible).
+    let mut any_dependency = false;
+    for i in 0..steps.len() {
+        let prereqs = prerequisite_roles(steps[i].role);
+        if prereqs.is_empty() {
+            continue;
+        }
+        let deps: Vec<usize> = (0..i).filter(|&j| prereqs.contains(&steps[j].role)).collect();
+        if !deps.is_empty() {
+            any_dependency = true;
+        }
+        steps[i].depends_on = deps;
+    }
+    if any_dependency {
+        notes.push(
+            "Dependency order: implementation waits on research; testing, review, and \
+             documentation wait on implementation."
+                .to_string(),
+        );
+    }
+
     OrchestrationPlan { goal, steps, notes }
+}
+
+/// The roles a step of `role` must wait for when both appear in the same goal.
+/// This is the planner's whole dependency policy: implementation waits on
+/// research; testing, review, and documentation wait on implementation. Every
+/// other role (research, operations, general) imposes no inferred prerequisite
+/// and runs as soon as it is the next ready brief.
+fn prerequisite_roles(role: OrchestrationRole) -> &'static [OrchestrationRole] {
+    use OrchestrationRole::*;
+    match role {
+        Implementation => &[Research],
+        Testing | Review | Documentation => &[Implementation],
+        Research | Operations | General => &[],
+    }
 }
 
 /// Natural-language connectors that separate steps within a goal, longest first
@@ -457,6 +535,81 @@ mod tests {
     }
 
     #[test]
+    fn infers_research_then_implementation_then_checks_dependencies() {
+        let s = summary_with_agents(&["prime"]);
+        let plan = plan_orchestration(
+            "research the options, implement a prototype, test it, and document it",
+            &s,
+        );
+        let roles: Vec<OrchestrationRole> = plan.steps.iter().map(|s| s.role).collect();
+        assert_eq!(
+            roles,
+            vec![
+                OrchestrationRole::Research,
+                OrchestrationRole::Implementation,
+                OrchestrationRole::Testing,
+                OrchestrationRole::Documentation,
+            ]
+        );
+        // research is independent; implementation waits on research; test + docs
+        // wait on implementation.
+        assert_eq!(plan.steps[0].depends_on, Vec::<usize>::new());
+        assert_eq!(plan.steps[1].depends_on, vec![0]);
+        assert_eq!(plan.steps[2].depends_on, vec![1]);
+        assert_eq!(plan.steps[3].depends_on, vec![1]);
+        assert!(plan.notes.iter().any(|n| n.contains("Dependency order")));
+    }
+
+    #[test]
+    fn independent_steps_have_no_dependencies() {
+        // Two research clauses: same tier, no prerequisite between them, so both
+        // are independent and can run in one round.
+        let s = summary_with_agents(&["prime"]);
+        let plan = plan_orchestration(
+            "research the rust options and research the go options",
+            &s,
+        );
+        assert!(plan.is_multi_agent());
+        assert!(plan.steps.iter().all(|st| st.depends_on.is_empty()));
+        assert!(!plan.notes.iter().any(|n| n.contains("Dependency order")));
+    }
+
+    #[test]
+    fn inferred_dependencies_always_point_at_earlier_steps() {
+        // The DAG invariant the run loop relies on: no dependency index is >= its
+        // own step index, so the graph can never contain a cycle.
+        let s = summary_with_agents(&["prime"]);
+        let plan = plan_orchestration(
+            "research it, implement it, review it, test it, and document it",
+            &s,
+        );
+        for (i, step) in plan.steps.iter().enumerate() {
+            for &dep in &step.depends_on {
+                assert!(dep < i, "step {i} depends on a later/self step {dep}");
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_step_without_dependency_fields_deserializes_to_defaults() {
+        // A record written before this slice has no depends_on / timing / round
+        // fields; it must load with empty deps and no timing (backward compatible).
+        let json = r#"{
+            "task_id": "task_0001",
+            "agent_id": "code-agent",
+            "role": "implementation",
+            "title": "Build it",
+            "outcome": "pending"
+        }"#;
+        let step: OrchestrationStep = serde_json::from_str(json).unwrap();
+        assert!(step.depends_on.is_empty());
+        assert!(step.run_id.is_none());
+        assert!(step.started_at.is_none());
+        assert!(step.finished_at.is_none());
+        assert!(step.round.is_none());
+    }
+
+    #[test]
     fn single_step_goal_is_not_multi_agent() {
         let s = summary_with_agents(&["prime"]);
         let plan = plan_orchestration("summarize the README", &s);
@@ -520,8 +673,12 @@ mod tests {
                 role: OrchestrationRole::Implementation,
                 title: "Build it".to_string(),
                 outcome: StepOutcome::Pending,
+                depends_on: vec![],
                 run_id: None,
                 note: None,
+                started_at: None,
+                finished_at: None,
+                round: None,
             }],
             notes: vec![],
             created_at: "t0".to_string(),

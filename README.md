@@ -534,24 +534,38 @@ not just one local task at a time. Planning is deterministic and conservative: a
 goal that does not split into at least two briefs is treated as a single task (no
 storm). Creating an orchestration mints one brief per step and assigns each to a
 fitting agent (a specialist on your roster, or Prime as a safe fallback); it does
-**not** run anything until you start it.
+**not** run anything until you start it. When obvious roles co-occur the planner
+also infers **simple dependencies** — implementation waits on research, and
+testing/review/documentation wait on implementation — so dependent work runs in
+order. (Dependencies only ever point at earlier briefs, so the plan is always a
+DAG; a goal without co-occurring roles has no dependencies and runs as before.)
 
 ```powershell
 relux-kernel prime orchestrate "research the options, implement a prototype, and write the docs"
 relux-kernel prime orchestration list
 relux-kernel prime orchestration show <id>
-relux-kernel prime orchestration run <id> [--max N]
+relux-kernel prime orchestration run <id> [--max N] [--concurrency N]
 ```
 
 Running a brief goes through **its assigned agent's own adapter**: a local agent
 echoes deterministically, while an agent on an **enabled** Claude/Codex CLI adapter
-runs the real CLI. A brief whose adapter runtime is disabled (or that is missing a
-permission) is recorded as **blocked** — never faked — with the exact next step.
-The batch is bounded, runs each brief once, records per-agent outcomes, and stops
-safely. The Prime page has an **Orchestration** panel (goal → preview plan →
-create → run/continue, showing per-agent briefs and outcomes), and Home surfaces
-the newest unfinished orchestration with its next action. Every orchestration is a
-durable, auditable trace of **goal → brief → agent → run**.
+runs the real CLI. The run loop is a **dependency-gated, round-based scheduler**: it
+runs only **ready** briefs (every dependency completed), groups independent ready
+briefs into **rounds bounded by a concurrency cap** (`--concurrency`, default 2,
+max 4), and **honestly blocks** a brief whose dependency failed (never runs or fakes
+it). A brief whose adapter runtime is disabled (or that is missing a permission) is
+likewise recorded as **blocked** — never faked — with the exact next step. The
+batch is bounded (`--max`), runs each brief once, records each brief's
+start/finish + round, and stops safely. The Prime page has an **Orchestration**
+panel (goal → preview plan with dependencies → create → run/continue, showing the
+ready/waiting/blocked readiness, per-agent briefs, and the round each ran in), and
+Home surfaces the newest unfinished orchestration with its next action. Every
+orchestration is a durable, auditable trace of **goal → brief → agent → run**.
+
+*Honest limit:* briefs **within** a round currently execute sequentially through the
+kernel's single-owner lock (the cap bounds round size; OS-parallel CLI spawns are a
+later slice), and an HTTP run is synchronous so the dashboard shows recorded
+round/dependency state after the batch returns rather than a live mid-run feed.
 
 The background autonomy timer above is unchanged (deterministic, echo-only, never a
 paid CLI); orchestration runs are operator-triggered from the UI, CLI, or API.

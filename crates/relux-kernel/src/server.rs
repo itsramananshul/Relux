@@ -1339,6 +1339,10 @@ struct RunOrchestrationReq {
     /// 25 (the whole plan) when omitted.
     #[serde(default)]
     max: Option<usize>,
+    /// Round-size cap: the most ready briefs the scheduler runs together in one
+    /// round (clamped to 1..=4 by the kernel). Defaults to 2 when omitted.
+    #[serde(default)]
+    concurrency: Option<usize>,
 }
 
 /// Run a governed multi-agent batch for one orchestration. Persists even on
@@ -1350,8 +1354,11 @@ async fn run_orchestration_batch(
     body: Option<Json<RunOrchestrationReq>>,
 ) -> Result<Json<OrchestrationBatchResult>, ApiError> {
     let oid = OrchestrationId::new(id);
-    let max = body.and_then(|b| b.0.max).unwrap_or(25);
-    let result = locked_save_persisting(&state, |kernel| kernel.run_orchestration(&oid, max))?;
+    let req = body.map(|b| b.0).unwrap_or_default();
+    let max = req.max.unwrap_or(25);
+    let concurrency = req.concurrency.unwrap_or(2);
+    let result =
+        locked_save_persisting(&state, |kernel| kernel.run_orchestration(&oid, max, concurrency))?;
     Ok(Json(result))
 }
 

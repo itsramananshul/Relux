@@ -14,6 +14,10 @@ import {
   canRunOrchestration,
   orchestrationNextAction,
   groupStepsByAgent,
+  stepLifecycle,
+  stepLifecycleTone,
+  stepDependencyLabel,
+  orchestrationReadiness,
 } from "../orchestration";
 
 // Orchestration panel (master plan section 10.4 Delegation Rules, section 15
@@ -135,17 +139,28 @@ export function OrchestrationPanel() {
               <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>
                 Prime would create {plan.steps.length} briefs:
               </div>
-              {plan.steps.map((s, i) => (
-                <div key={i} className="row wrap" style={{ gap: 8, fontSize: 12, marginBottom: 4 }}>
-                  <span className="badge backlog" style={{ fontSize: 9 }}>
-                    {s.role}
-                  </span>
-                  <span>{s.title}</span>
-                  <span className="muted" style={{ marginLeft: "auto" }}>
-                    → {s.agent_id ?? "prime (no specialist; hire one for this role)"}
-                  </span>
-                </div>
-              ))}
+              {plan.steps.map((s, i) => {
+                const deps = s.depends_on ?? [];
+                return (
+                  <div key={i} className="row wrap" style={{ gap: 8, fontSize: 12, marginBottom: 4 }}>
+                    <span className="mono muted" style={{ fontSize: 10 }}>
+                      {i + 1}.
+                    </span>
+                    <span className="badge backlog" style={{ fontSize: 9 }}>
+                      {s.role}
+                    </span>
+                    <span>{s.title}</span>
+                    {deps.length > 0 && (
+                      <span className="muted" style={{ fontSize: 10 }}>
+                        waits on {deps.map((j) => `#${j + 1}`).join(", ")}
+                      </span>
+                    )}
+                    <span className="muted" style={{ marginLeft: "auto" }}>
+                      → {s.agent_id ?? "prime (no specialist; hire one for this role)"}
+                    </span>
+                  </div>
+                );
+              })}
               {plan.notes.map((n, i) => (
                 <div key={i} className="muted" style={{ fontSize: 11, marginTop: 4 }}>
                   note: {n}
@@ -173,6 +188,15 @@ export function OrchestrationPanel() {
       {lastBatch && (
         <div className="banner" style={{ fontSize: 12, marginTop: 10 }}>
           <strong>Last batch:</strong> {lastBatch.summary} <br />
+          <span className="muted" style={{ fontSize: 11 }}>
+            {lastBatch.rounds ?? 0} round(s), up to {lastBatch.concurrency ?? 2} brief(s) at a
+            time
+            {(lastBatch.waiting ?? 0) > 0 ? ` · ${lastBatch.waiting} waiting on a dependency` : ""}
+            {(lastBatch.dependency_blocked ?? 0) > 0
+              ? ` · ${lastBatch.dependency_blocked} blocked by a failed dependency`
+              : ""}
+          </span>
+          <br />
           {lastBatch.per_agent.map((line, i) => (
             <span key={i} className="mono" style={{ display: "block", fontSize: 11 }}>
               {line}
@@ -217,6 +241,17 @@ function OrchestrationRow({
 }) {
   const [open, setOpen] = useState(false);
   const groups = groupStepsByAgent(o);
+  const readiness = orchestrationReadiness(o);
+  // The dependency-aware shape of remaining work, shown so an operator sees what
+  // is runnable now vs still gated before pressing Run.
+  const readinessBits = [
+    readiness.ready > 0 ? `${readiness.ready} ready` : null,
+    readiness.waiting > 0 ? `${readiness.waiting} waiting on a dependency` : null,
+    readiness.blocked > 0 ? `${readiness.blocked} blocked` : null,
+  ].filter(Boolean);
+  // Index briefs by task id so a row can resolve its own position for the
+  // dependency-aware lifecycle (which reads the whole step set).
+  const indexOfStep = new Map(o.steps.map((s, i) => [s.task_id, i] as const));
   return (
     <div className="card" style={{ marginBottom: 8, padding: 10 }}>
       <div className="row wrap" style={{ gap: 8, alignItems: "center" }}>
@@ -235,6 +270,12 @@ function OrchestrationRow({
       <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>
         {orchestrationNextAction(o)}
       </div>
+
+      {readinessBits.length > 0 && (
+        <div className="muted" style={{ fontSize: 11, marginTop: 2 }}>
+          {readinessBits.join(" · ")}
+        </div>
+      )}
 
       <div className="row" style={{ gap: 8, marginTop: 8 }}>
         <button
@@ -266,34 +307,60 @@ function OrchestrationRow({
                   view agent
                 </Link>
               </div>
-              {g.steps.map((s) => (
-                <div
-                  key={s.task_id}
-                  className="row wrap"
-                  style={{ gap: 8, fontSize: 12, padding: "2px 0 2px 12px" }}
-                >
-                  <span className={"badge " + stepOutcomeTone(s.outcome)} style={{ fontSize: 9 }}>
-                    {s.outcome}
-                  </span>
-                  <span className="badge backlog" style={{ fontSize: 9 }}>
-                    {s.role}
-                  </span>
-                  <Link to="/work" className="mono" style={{ fontSize: 11 }}>
-                    {s.task_id}
-                  </Link>
-                  <span>{s.title}</span>
-                  {s.run_id && (
-                    <Link to="/work" className="mono muted" style={{ fontSize: 10 }}>
-                      {s.run_id}
-                    </Link>
-                  )}
-                  {s.note && (
-                    <span className="muted" style={{ fontSize: 11, width: "100%" }}>
-                      {s.note}
+              {g.steps.map((s) => {
+                const idx = indexOfStep.get(s.task_id) ?? -1;
+                const lifecycle = idx >= 0 ? stepLifecycle(o, idx) : "waiting";
+                const depLabel = stepDependencyLabel(o, s);
+                return (
+                  <div
+                    key={s.task_id}
+                    className="row wrap"
+                    style={{ gap: 8, fontSize: 12, padding: "2px 0 2px 12px" }}
+                  >
+                    <span className={"badge " + stepOutcomeTone(s.outcome)} style={{ fontSize: 9 }}>
+                      {s.outcome}
                     </span>
-                  )}
-                </div>
-              ))}
+                    {/* The derived lifecycle adds the dependency-aware state the raw
+                        outcome can't show: a pending brief is "ready" or "waiting". */}
+                    {s.outcome === "pending" && (
+                      <span
+                        className={"badge " + stepLifecycleTone(lifecycle)}
+                        style={{ fontSize: 9 }}
+                        title="dependency-aware state"
+                      >
+                        {lifecycle}
+                      </span>
+                    )}
+                    <span className="badge backlog" style={{ fontSize: 9 }}>
+                      {s.role}
+                    </span>
+                    <Link to="/work" className="mono" style={{ fontSize: 11 }}>
+                      {s.task_id}
+                    </Link>
+                    <span>{s.title}</span>
+                    {typeof s.round === "number" && (
+                      <span className="muted" style={{ fontSize: 10 }}>
+                        round {s.round}
+                      </span>
+                    )}
+                    {s.run_id && (
+                      <Link to="/work" className="mono muted" style={{ fontSize: 10 }}>
+                        {s.run_id}
+                      </Link>
+                    )}
+                    {depLabel && (
+                      <span className="muted" style={{ fontSize: 10 }}>
+                        {depLabel}
+                      </span>
+                    )}
+                    {s.note && (
+                      <span className="muted" style={{ fontSize: 11, width: "100%" }}>
+                        {s.note}
+                      </span>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           ))}
         </div>

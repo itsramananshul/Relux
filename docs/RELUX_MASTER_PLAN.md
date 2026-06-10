@@ -1881,15 +1881,34 @@ How it works:
   (`goal → steps[{task, agent, role, run, outcome}]`). It creates work but **does
   not run it** — nothing executes, and no paid CLI is spawned, without an explicit
   start.
-- **Running an orchestration** is a governed batch: each pending brief runs through
-  **its assigned agent's adapter** via the same path as the Work page
-  (`execute_assigned_run`) — local Prime echoes deterministically; an **enabled**
-  Claude/Codex CLI agent spawns the real CLI; a disabled/unconfigured runtime or a
-  missing permission is recorded as **blocked** (a human action is required), never
-  faked. The batch is bounded (`max`, clamped 1..=25), runs each brief at most
-  once, records per-agent outcomes + the next human action, updates the durable
-  record, and **stops safely** — it never loops, recurses, or auto-runs downloaded
-  plugin code (section 8.2). Re-running only picks up still-pending briefs.
+- **Planning infers simple dependencies.** When obvious roles co-occur in the goal
+  the planner records a brief's prerequisites (`depends_on`, indices into the
+  plan): **implementation waits on research**, and **testing/review/documentation
+  wait on implementation**. Dependencies only ever point at *earlier* briefs, so
+  the graph is a DAG by construction (no cycles, no deadlock). A goal whose roles
+  do not co-occur gets no dependencies and behaves exactly as before (backward
+  compatible).
+- **Running an orchestration** is a governed, **dependency-aware, round-based**
+  batch. Each round the scheduler (1) honestly marks any brief whose dependency
+  `failed`/`blocked` as **blocked** (with a note naming the upstream brief — never
+  run, never faked), (2) collects the **ready** briefs (still pending and every
+  dependency `completed`), and (3) runs up to **`concurrency`** of them (clamped
+  1..=4, default 2). It repeats until no brief is ready or the per-call budget
+  `max` (clamped 1..=25) is spent. Each ready brief runs through **its assigned
+  agent's adapter** via the same path as the Work page (`execute_assigned_run`) —
+  local Prime echoes deterministically; an **enabled** Claude/Codex CLI agent
+  spawns the real CLI; a disabled/unconfigured runtime or a missing permission is
+  recorded as **blocked**. Each brief records its **start/finish + round**; the
+  batch result reports rounds, the concurrency cap, briefs **waiting** on a
+  dependency, and briefs **blocked by a failed dependency**. It runs each brief at
+  most once, **stops safely** (termination is structural: every round moves ≥1
+  brief to a terminal outcome, so the pending set strictly shrinks), and never
+  loops, recurses, or auto-runs downloaded plugin code (section 8.2). Re-running
+  only picks up still-pending briefs.
+- **Honest concurrency note:** `concurrency` bounds the *round size* and pins the
+  scheduler contract; briefs within a round currently execute **sequentially**
+  through the kernel's single-owner lock (no OS-parallel CLI spawns yet). Real
+  OS-parallel execution within a round is a later slice.
 
 This is distinct from the background autonomy loop above, which stays deterministic
 (echo-only) and never spawns a paid CLI. Orchestration is operator-triggered.
@@ -1900,7 +1919,7 @@ CLI:
 relux-kernel prime orchestrate "research the options, implement a prototype, and write the docs"
 relux-kernel prime orchestration list
 relux-kernel prime orchestration show <id>
-relux-kernel prime orchestration run <id> [--max N]
+relux-kernel prime orchestration run <id> [--max N] [--concurrency N]
 ```
 
 API:
@@ -1910,14 +1929,26 @@ POST /v1/relux/prime/orchestrate/preview      # preview a plan, commit nothing
 POST /v1/relux/prime/orchestrations           # create (plan + assign) from { goal }
 GET  /v1/relux/prime/orchestrations           # list
 GET  /v1/relux/prime/orchestrations/:id       # one record + full step chain
-POST /v1/relux/prime/orchestrations/:id/run   # run a governed batch ({ max? })
+POST /v1/relux/prime/orchestrations/:id/run   # governed dependency-aware batch ({ max?, concurrency? })
 ```
 
 Dashboard: the Prime page has an **Orchestration** panel (goal → preview plan →
-create → run/continue, with per-agent briefs and outcomes); Home shows the
-newest unfinished orchestration with its progress and next action. Pure UI logic
-lives in `apps/dashboard/src/orchestration.ts` with unit coverage in
-`apps/dashboard/test/orchestration.test.ts`.
+create → run/continue, with per-agent briefs and outcomes). The preview shows each
+brief's inferred dependencies; each orchestration shows a dependency-aware
+readiness line (how many briefs are **ready** now vs **waiting** on a dependency vs
+**blocked**), per-brief derived lifecycle badges (ready/waiting on a pending
+brief), the **round** each brief ran in, and the last batch's rounds + concurrency
+cap. Home shows the newest unfinished orchestration with its progress and next
+action. Pure UI logic lives in `apps/dashboard/src/orchestration.ts` with unit
+coverage in `apps/dashboard/test/orchestration.test.ts`.
+
+Progress visibility is honest about the current architecture: an HTTP run is
+synchronous (the kernel is single-owner-locked for the batch), so the panel renders
+the **recorded** per-brief start/finish/round and the dependency-aware
+ready/waiting/blocked state **after** the batch returns (it refreshes on
+completion) rather than streaming a live mid-run feed. Live mid-run streaming needs
+a non-blocking job model (a later slice); nothing here fabricates in-flight
+progress.
 
 ### Tool Invocation Surface (First Honest Version)
 
@@ -2321,14 +2352,24 @@ remain, in rough priority for the next slices:
    polls/refreshes a synchronous run rather than tailing it) and resuming a
    *partial* CLI run (retry is a new attempt). Execution-environment runtimes are
    not implemented.
-4. **Multi-agent autonomy.** *(First slice addressed post-v0.1.2.)* See
-   "Orchestration (First Multi-Agent Slice)" below. Prime can now decompose a
-   multi-step goal into role-typed **briefs assigned to different agents** and run
-   them in a **governed multi-agent batch** through each agent's own adapter (local
-   Prime echoes; an enabled Claude/Codex CLI agent runs the real CLI), recording
-   per-agent outcomes and a durable goal → brief → agent → run trace. What is still
-   **not** done: parallel/concurrent brief execution (the batch runs briefs
-   sequentially), dependency ordering between briefs, automatic agent hiring during
-   planning (Prime falls back to itself and suggests a hire), and a background timer
-   that drives orchestrations (running is operator-triggered from the UI/CLI/API;
-   the background autonomy timer stays deterministic and never spawns a paid CLI).
+4. **Multi-agent autonomy.** *(First slice addressed post-v0.1.2; depth slice
+   added after.)* See "Orchestration (First Multi-Agent Slice)" below. Prime can
+   decompose a multi-step goal into role-typed **briefs assigned to different
+   agents** and run them in a **governed, dependency-aware, round-based batch**
+   through each agent's own adapter (local Prime echoes; an enabled Claude/Codex CLI
+   agent runs the real CLI), recording per-agent outcomes and a durable goal →
+   brief → agent → run trace. The planner now **infers simple dependencies**
+   (implementation waits on research; testing/review/documentation wait on
+   implementation), and the run loop **gates on them** — running only ready briefs,
+   honestly blocking a brief whose dependency failed, and grouping independent
+   ready briefs into **rounds bounded by a concurrency cap** (default 2, clamp
+   1..=4), with per-brief start/finish/round recorded for progress. What is still
+   **not** done: **OS-parallel** execution *within* a round (briefs in a round
+   still run sequentially through the kernel's single-owner lock — the cap bounds
+   the round size and pins the contract, but does not yet spawn CLIs concurrently);
+   **live mid-run progress streaming** (an HTTP run is synchronous; the dashboard
+   renders the recorded round/timing/dependency state after the batch returns, not
+   a live feed); automatic agent hiring during planning (Prime falls back to itself
+   and suggests a hire); and a background timer that drives orchestrations (running
+   is operator-triggered from the UI/CLI/API; the background autonomy timer stays
+   deterministic and never spawns a paid CLI).

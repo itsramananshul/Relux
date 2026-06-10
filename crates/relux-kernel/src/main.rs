@@ -337,14 +337,27 @@ fn run_orchestration_show(args: &[String]) -> Result<(), KernelError> {
             o.status.label(),
             o.goal
         );
-        for step in &o.steps {
+        for (i, step) in o.steps.iter().enumerate() {
+            let deps = if step.depends_on.is_empty() {
+                String::new()
+            } else {
+                let names: Vec<String> = step
+                    .depends_on
+                    .iter()
+                    .filter_map(|&j| o.steps.get(j).map(|d| d.task_id.to_string()))
+                    .collect();
+                format!(" depends-on [{}]", names.join(", "))
+            };
             out.push_str(&format!(
-                "    - {} \"{}\" -> {} ({}) [{}]{}\n",
+                "    {}. {} \"{}\" -> {} ({}) [{}]{}{}{}\n",
+                i,
                 step.task_id,
                 step.title,
                 step.agent_id,
                 step.role.label(),
                 step.outcome.label(),
+                deps,
+                step.round.map(|r| format!(" round {r}")).unwrap_or_default(),
                 step.run_id
                     .as_ref()
                     .map(|r| format!(" run {r}"))
@@ -364,6 +377,7 @@ fn run_orchestration_show(args: &[String]) -> Result<(), KernelError> {
 fn run_orchestration_run(args: &[String]) -> Result<(), KernelError> {
     let mut id: Option<String> = None;
     let mut max: usize = 25;
+    let mut concurrency: usize = 2;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -375,6 +389,15 @@ fn run_orchestration_run(args: &[String]) -> Result<(), KernelError> {
                 max = val
                     .parse()
                     .map_err(|_| KernelError::Storage(format!("Invalid --max: {val}")))?;
+            }
+            "--concurrency" => {
+                i += 1;
+                let val = args.get(i).ok_or_else(|| {
+                    KernelError::Storage("Missing value for --concurrency".to_string())
+                })?;
+                concurrency = val
+                    .parse()
+                    .map_err(|_| KernelError::Storage(format!("Invalid --concurrency: {val}")))?;
             }
             other => {
                 if id.is_none() {
@@ -388,7 +411,8 @@ fn run_orchestration_run(args: &[String]) -> Result<(), KernelError> {
     }
     let id = id.ok_or_else(|| {
         KernelError::Storage(
-            "usage: relux-kernel prime orchestration run <id> [--max N]".to_string(),
+            "usage: relux-kernel prime orchestration run <id> [--max N] [--concurrency N]"
+                .to_string(),
         )
     })?;
     let oid = OrchestrationId::new(id);
@@ -398,7 +422,7 @@ fn run_orchestration_run(args: &[String]) -> Result<(), KernelError> {
     let mut store = SqliteStore::open(&path)?;
     let mut kernel = store.load()?;
     ensure_bootstrapped(&mut kernel)?;
-    let result = kernel.run_orchestration(&oid, max);
+    let result = kernel.run_orchestration(&oid, max, concurrency);
     store.save(&kernel)?;
     let result = result?;
 

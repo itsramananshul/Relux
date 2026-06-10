@@ -9,6 +9,44 @@ once a stable release is cut.
 
 ### Added
 
+- **Orchestration depth: dependency-aware, round-based batch execution.** The
+  multi-agent batch is no longer a flat sequential loop (master plan §10.4
+  Delegation Rules — "multiple tasks can run in parallel"; "Orchestration (First
+  Multi-Agent Slice)"). The planner now **infers simple dependencies** when obvious
+  roles co-occur in the goal — **implementation waits on research**, and
+  **testing/review/documentation wait on implementation** — recorded as
+  `depends_on` indices that only ever point at earlier briefs (a DAG by
+  construction: no cycles, no deadlock). Goals without co-occurring roles get no
+  dependencies and behave exactly as before (backward compatible). The run loop is
+  a **dependency-gated, round-based scheduler**: each round it honestly marks any
+  brief whose dependency failed/blocked as **blocked** (with a note naming the
+  upstream brief — never run, never faked), collects the **ready** briefs (pending
+  with every dependency completed), and runs up to a **concurrency cap** of them
+  (`concurrency`, default 2, clamp 1..=4); it repeats until nothing is ready or the
+  per-call `max` budget (clamp 1..=25) is spent. Termination is structural (every
+  round moves ≥1 brief to a terminal outcome). Each brief records its
+  **start/finish + round**; the batch result reports rounds, the cap, briefs
+  **waiting** on a dependency, and briefs **blocked by a failed dependency**.
+  Surfaces: `POST …/orchestrations/:id/run` accepts `{ max?, concurrency? }`;
+  `prime orchestration run <id> [--max N] [--concurrency N]`; `prime orchestration
+  show` lists each brief's dependencies + round. The dashboard panel shows the
+  inferred dependencies in the preview, a per-orchestration **ready / waiting /
+  blocked** readiness line, per-brief derived lifecycle badges
+  (ready/waiting on a still-pending brief), the **round** each brief ran in, and the
+  last batch's rounds + concurrency. **Proven against the real Claude CLI:** a
+  mixed orchestration ran a real Claude research brief alongside a local-prime doc
+  brief in **one round** (27s billed run), and a dependent chain ran a real Claude
+  research brief in round 1 that **gated** a downstream implementation brief into
+  round 2 (34s billed run) — fully traced goal → brief → agent → run.
+  *Honest limits:* briefs **within** a round still execute sequentially through the
+  kernel's single-owner lock (the cap bounds round size + pins the contract; no
+  OS-parallel CLI spawns yet), and an HTTP run is synchronous so the dashboard shows
+  recorded round/timing/dependency state **after** the batch returns rather than a
+  live mid-run feed (no fabricated in-flight progress). Backend tests pin
+  dependency ordering, the concurrency cap (independent briefs share a round; cap 1
+  serializes), a failed/blocked dependency honestly blocking its dependent with no
+  run spawned, bounded no-runaway, and backward compatibility; frontend tests pin
+  the readiness/lifecycle/dependency/round derivations.
 - **Multi-agent orchestration (first slice): Prime as an orchestrator.** Prime can
   now decompose a multi-step goal into role-typed **briefs assigned to different
   agents** and run them in a **governed multi-agent batch**, instead of being a
@@ -40,9 +78,9 @@ once a stable release is cut.
   two-agent orchestration where Prime (local echo) handled the research brief and a
   Claude-CLI `code-agent` handled the implementation brief — a real 44s Claude run
   with reported token usage and cost, fully traced goal → brief → agent → run.
-  *Caveats:* briefs run sequentially (no parallelism), there is no inter-brief
-  dependency ordering, planning does not auto-create agents, and no background timer
-  drives orchestrations yet.
+  *Caveats (this first slice):* briefs ran sequentially with no dependency ordering
+  — both addressed by the dependency-aware round scheduler above; planning still
+  does not auto-create agents, and no background timer drives orchestrations yet.
 - **Relux local release v0.1.2 (Windows bundle).** The `relux-kernel` /
   `relux-core` crates move from `0.1.1` to `0.1.2` for the first build that closes
   the three honest post-v0.1.1 gaps. **First-run brain onboarding:** Home's
