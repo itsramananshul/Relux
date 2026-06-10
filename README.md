@@ -242,9 +242,37 @@ instead.
 - An ambiguous source (more than one real plugin folder inside) is still a hard
   error rather than a silent guess.
 
-The dashboard Plugins page shows a **metadata only** badge and explains that a
-wrapper manifest was generated and that a runtime/tools must be configured before
-it can run. `/v1/relux/plugins` exposes a `generated: true` flag for these records.
+On the dashboard, a generated wrapper is honest and actionable, not a dead-end
+with a confusing badge:
+
+- It is badged **Needs configuration** (never the green "enabled" a real plugin
+  shows) and labelled a **Metadata-only wrapper** in the Kind column.
+- Its next step is **Set up → add tool definitions**, *not* "configure a runtime".
+  A wrapper declares no tools, and `discover_tools` only surfaces manifest-declared
+  tools, so a loopback runtime alone would surface nothing. The Set up panel says
+  this plainly and hands you a ready-to-edit `relux-plugin.json` (copy or
+  download), keyed to the plugin id, plus the exact install directory and the
+  three-step path: add the manifest → re-install → point a loopback runtime at a
+  local server.
+- After any install, the panel shows a **result summary**: tools discovered
+  (count), a wrapper generated (nothing runnable yet), or an adapter installed —
+  with the exact next step.
+- The Tools list shows **only runnable tools by default**, with a "Show N
+  non-runnable" toggle; a metadata-only plugin therefore never produces a
+  ready-looking tool.
+
+`/v1/relux/plugins` exposes a `generated: true` flag and a `tool_count` for each
+record, and a read-only template endpoint backs the Set up affordance:
+
+```text
+GET /v1/relux/plugins/:id/manifest-template
+  # { plugin_id, filename, install_dir, generated, manifest_json }
+```
+
+The `manifest_json` is a complete, re-installable starter `relux-plugin.json`
+(ToolSet, one example tool, permission strings bound to this plugin id). It is
+guidance only — Relux stores nothing from it and still runs nothing until you add
+real tools and a runtime.
 
 ### Adapter Runtime v1 (local coding-agent CLIs)
 

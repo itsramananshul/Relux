@@ -1,14 +1,32 @@
 import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import {
   reluxPluginRuntime,
   reluxPlugins,
   reluxTools,
+  type ReluxManifestTemplate,
   type ReluxPlugin,
   type ReluxPluginRuntime,
   type ReluxToolDescriptor,
   type ReluxToolInvocationResult,
 } from "../api";
 import { useAsync } from "../components/common";
+import {
+  installResultSummary,
+  pluginKindLabel,
+  pluginNextStep,
+  pluginStatus,
+  visibleTools,
+  type StatusVariant,
+} from "../plugins";
+
+// Map a derived status variant to the shared badge palette (B&W + semantic
+// accent only): ready=green, needs-config=amber, disabled=faint.
+const BADGE_CLASS: Record<StatusVariant, string> = {
+  ok: "done",
+  warn: "in_progress",
+  muted: "backlog",
+};
 
 // Plugins page (RELUX_MASTER_PLAN section 11.6): the installed-plugin surface for
 // the local Relux control plane. It lists what is installed (id, kind, version,
@@ -57,7 +75,9 @@ export function Plugins() {
           <InstallPanel
             onClose={() => setOpen(false)}
             onInstalled={() => {
-              setOpen(false);
+              // Refresh the table so the new row appears, but KEEP the panel open
+              // so the install result summary (what was discovered / generated and
+              // the next step) stays visible until the operator dismisses it.
               reload();
             }}
           />
@@ -113,20 +133,36 @@ function ToolsSection() {
     [],
   );
   const tools = data ?? [];
+  // By default the list shows only runnable (ready) tools, so a metadata-only or
+  // unconfigured plugin never looks usable. A toggle reveals the rest with their
+  // honest non-runnable status; nothing is permanently hidden or faked.
+  const [showAll, setShowAll] = useState(false);
+  const { shown, hiddenCount } = visibleTools(tools, showAll);
 
   return (
     <div className="card">
       <div className="row" style={{ marginBottom: 8, alignItems: "center" }}>
         <h3 style={{ margin: 0 }}>Tools</h3>
         <div className="spacer" style={{ flex: 1 }} />
-        <button className="btn ghost sm" onClick={() => reload()} disabled={loading}>
+        {hiddenCount > 0 || showAll ? (
+          <button
+            className="btn ghost sm"
+            onClick={() => setShowAll((v) => !v)}
+            title="Reveal installed-but-not-runnable tools with their honest status"
+          >
+            {showAll
+              ? "Show runnable only"
+              : `Show ${hiddenCount} non-runnable`}
+          </button>
+        ) : null}
+        <button className="btn ghost sm" style={{ marginLeft: 8 }} onClick={() => reload()} disabled={loading}>
           {loading ? "Loading..." : "Refresh"}
         </button>
       </div>
       <p className="muted" style={{ marginTop: -2, marginBottom: 12, fontSize: 12 }}>
-        Callable capabilities from installed plugins. Only built-in deterministic
-        tools execute; an installed tool with no kernel runtime is shown as
-        installed but not implemented, not hidden or faked. Invocations are
+        Callable capabilities from installed plugins. By default only runnable
+        tools are listed; an installed tool with no kernel runtime is not hidden
+        permanently — reveal it above to see its honest status. Invocations are
         permission-checked and audited.
       </p>
 
@@ -139,6 +175,18 @@ function ToolsSection() {
         <div className="loading">Loading tools...</div>
       ) : tools.length === 0 ? (
         <div className="empty">No tools available from installed plugins.</div>
+      ) : shown.length === 0 ? (
+        <div className="empty">
+          No runnable tools yet. {hiddenCount} installed tool
+          {hiddenCount === 1 ? " is" : "s are"} not runnable.{" "}
+          <button
+            className="btn ghost sm"
+            style={{ marginLeft: 4 }}
+            onClick={() => setShowAll(true)}
+          >
+            Show {hiddenCount === 1 ? "it" : "them"}
+          </button>
+        </div>
       ) : (
         <div className="table-scroll">
           <table className="table">
@@ -151,7 +199,7 @@ function ToolsSection() {
               </tr>
             </thead>
             <tbody>
-              {tools.map((t) => (
+              {shown.map((t) => (
                 <ToolRow key={`${t.plugin_id}/${t.tool_name}`} tool={t} />
               ))}
             </tbody>
@@ -315,6 +363,11 @@ function PluginRow({ plugin, onChanged }: { plugin: ReluxPlugin; onChanged: () =
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [runtimeOpen, setRuntimeOpen] = useState(false);
+  const [manifestOpen, setManifestOpen] = useState(false);
+
+  const status = pluginStatus(plugin);
+  const next = pluginNextStep(plugin);
+  const isWrapper = next.kind === "add-manifest";
 
   async function remove() {
     setBusy(true);
@@ -341,12 +394,26 @@ function PluginRow({ plugin, onChanged }: { plugin: ReluxPlugin; onChanged: () =
               {plugin.description}
             </div>
           )}
-          {plugin.generated && (
-            <div className="muted" style={{ fontSize: 11, marginTop: 4, maxWidth: 380 }}>
-              ⚠ Installed as metadata: Relux generated a wrapper manifest because
-              the source had no <span className="mono">relux-plugin.json</span>. It
-              runs nothing until you configure a runtime (below) or add tool
-              definitions.
+          {isWrapper && (
+            // Actionable, not just a warning: state the dead-end honestly (a
+            // runtime alone runs nothing) and put the "Set up" next step inline.
+            <div
+              className="banner info banner-action"
+              style={{ fontSize: 11, marginTop: 6 }}
+            >
+              <span>
+                Installed as metadata only — Relux generated a wrapper because the
+                source had no <span className="mono">relux-plugin.json</span>. It
+                declares no tools, so a runtime alone runs nothing. Next: add tool
+                definitions.
+              </span>
+              <button
+                className="banner-cta"
+                onClick={() => setManifestOpen((v) => !v)}
+                aria-expanded={manifestOpen}
+              >
+                {manifestOpen ? "Hide setup" : "Set up"}
+              </button>
             </div>
           )}
           {err && (
@@ -355,7 +422,14 @@ function PluginRow({ plugin, onChanged }: { plugin: ReluxPlugin; onChanged: () =
             </div>
           )}
         </td>
-        <td className="muted" style={{ fontSize: 12 }}>{plugin.kind}</td>
+        <td className="muted" style={{ fontSize: 12 }}>
+          <div>{pluginKindLabel(plugin)}</div>
+          {next.kind === "configure-runtime" && (
+            <div className="mono muted" style={{ fontSize: 11 }}>
+              {plugin.tool_count ?? 0} tool{(plugin.tool_count ?? 0) === 1 ? "" : "s"}
+            </div>
+          )}
+        </td>
         <td className="mono" style={{ fontSize: 12 }}>v{plugin.version}</td>
         <td className="muted" style={{ fontSize: 12, maxWidth: 240 }}>
           <div>{plugin.source_kind}</div>
@@ -364,17 +438,12 @@ function PluginRow({ plugin, onChanged }: { plugin: ReluxPlugin; onChanged: () =
           </div>
         </td>
         <td>
-          <span className={"badge " + (plugin.enabled ? "done" : "backlog")}>
-            {plugin.enabled ? "enabled" : "disabled"}
+          <span className={"badge " + BADGE_CLASS[status.variant]} title={status.title}>
+            {status.label}
           </span>
           {plugin.protected && (
             <span className="badge" style={{ marginLeft: 6 }} title="Bundled fixture; cannot be removed">
               protected
-            </span>
-          )}
-          {plugin.generated && (
-            <span className="badge backlog" style={{ marginLeft: 6 }} title="Wrapper manifest generated; no runnable tools yet">
-              metadata only
             </span>
           )}
         </td>
@@ -385,14 +454,29 @@ function PluginRow({ plugin, onChanged }: { plugin: ReluxPlugin; onChanged: () =
             </span>
           ) : (
             <>
-              <button
-                className="btn ghost sm"
-                onClick={() => setRuntimeOpen((v) => !v)}
-                aria-expanded={runtimeOpen}
-                title="Configure an HTTP loopback runtime for this plugin"
-              >
-                {runtimeOpen ? "Close" : "Runtime"}
-              </button>
+              {isWrapper ? (
+                <button
+                  className="btn ghost sm"
+                  onClick={() => setManifestOpen((v) => !v)}
+                  aria-expanded={manifestOpen}
+                  title="Add tool definitions so this plugin can become runnable"
+                >
+                  {manifestOpen ? "Close" : "Set up"}
+                </button>
+              ) : next.kind === "configure-adapter" ? (
+                <Link className="btn ghost sm" to="/crew" title={next.detail}>
+                  Configure
+                </Link>
+              ) : (
+                <button
+                  className="btn ghost sm"
+                  onClick={() => setRuntimeOpen((v) => !v)}
+                  aria-expanded={runtimeOpen}
+                  title="Configure an HTTP loopback runtime for this plugin"
+                >
+                  {runtimeOpen ? "Close" : "Runtime"}
+                </button>
+              )}
               <button
                 className="btn ghost sm"
                 style={{ marginLeft: 6 }}
@@ -405,6 +489,13 @@ function PluginRow({ plugin, onChanged }: { plugin: ReluxPlugin; onChanged: () =
           )}
         </td>
       </tr>
+      {manifestOpen && !plugin.protected && (
+        <tr>
+          <td colSpan={6} style={{ background: "transparent" }}>
+            <ManifestPanel plugin={plugin} />
+          </td>
+        </tr>
+      )}
       {runtimeOpen && !plugin.protected && (
         <tr>
           <td colSpan={6} style={{ background: "transparent" }}>
@@ -413,6 +504,103 @@ function PluginRow({ plugin, onChanged }: { plugin: ReluxPlugin; onChanged: () =
         </tr>
       )}
     </>
+  );
+}
+
+// Manifest setup panel for a generated metadata-only wrapper (RELUX_MASTER_PLAN
+// "Status after v0.1.1" item 2). A wrapper declares NO tools, so a loopback
+// runtime alone surfaces nothing — the only way to make it runnable is to add
+// tool definitions. This panel is honest about that architecture limit and hands
+// the operator a ready-to-edit `relux-plugin.json` (copy or download) plus the
+// exact path where it goes. Relux never infers tools or runs downloaded code.
+function ManifestPanel({ plugin }: { plugin: ReluxPlugin }) {
+  const { data, loading, error } = useAsync<ReluxManifestTemplate>(
+    () => reluxPlugins.manifestTemplate(plugin.id),
+    [plugin.id],
+  );
+  const [copied, setCopied] = useState(false);
+
+  async function copy() {
+    if (!data) return;
+    try {
+      await navigator.clipboard.writeText(data.manifest_json);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      setCopied(false);
+    }
+  }
+
+  function download() {
+    if (!data) return;
+    const blob = new Blob([data.manifest_json], { type: "application/json" });
+    const href = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = href;
+    a.download = data.filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(href);
+  }
+
+  return (
+    <div className="card" style={{ margin: "6px 0", padding: 12 }}>
+      <div className="row" style={{ marginBottom: 8, alignItems: "center" }}>
+        <strong style={{ fontSize: 13 }}>Make this plugin runnable</strong>
+        <div className="spacer" style={{ flex: 1 }} />
+        <span className="badge in_progress">metadata only</span>
+      </div>
+      <p className="muted" style={{ marginTop: 0, marginBottom: 10, fontSize: 11 }}>
+        Relux installed this plugin as <strong>metadata only</strong> because the
+        source had no <span className="mono">relux-plugin.json</span>. Relux never
+        infers tools from downloaded code, and configuring a loopback runtime alone
+        will not surface anything — there are no tool definitions to run. To make it
+        runnable: (1) add the manifest below to the plugin folder as{" "}
+        <span className="mono">relux-plugin.json</span> and fill in the real tools,
+        (2) re-install it (Local folder), then (3) point a loopback runtime at your
+        local server.
+      </p>
+
+      {error ? (
+        <div className="banner err" style={{ fontSize: 12 }}>
+          Could not load a manifest template ({error}).
+        </div>
+      ) : loading || !data ? (
+        <div className="loading">Loading template...</div>
+      ) : (
+        <>
+          <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>
+            Install directory:{" "}
+            <span className="mono" style={{ wordBreak: "break-all" }}>
+              {data.install_dir}
+            </span>
+          </div>
+          <pre
+            className="mono"
+            style={{
+              fontSize: 12,
+              background: "var(--panel, #111)",
+              padding: 10,
+              borderRadius: 6,
+              overflowX: "auto",
+              margin: 0,
+              maxHeight: 280,
+            }}
+          >
+            {data.manifest_json}
+          </pre>
+          <div className="row wrap" style={{ gap: 8, marginTop: 10 }}>
+            <button className="btn ghost sm" onClick={() => void copy()}>
+              {copied ? "Copied" : "Copy manifest"}
+            </button>
+            <button className="btn ghost sm" onClick={download}>
+              Download {data.filename}
+            </button>
+          </div>
+        </>
+      )}
+    </div>
   );
 }
 
@@ -572,6 +760,9 @@ function InstallPanel({
   const [file, setFile] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
   const [banner, setBanner] = useState<{ kind: string; msg: string } | null>(null);
+  // The just-installed plugin. While set, the panel shows an honest result
+  // summary (tools discovered / wrapper generated / adapter) instead of the form.
+  const [result, setResult] = useState<ReluxPlugin | null>(null);
 
   async function submit() {
     setBusy(true);
@@ -588,12 +779,49 @@ function InstallPanel({
         if (!dir.trim()) throw new Error("Enter a local folder path.");
         installed = await reluxPlugins.installDir(dir.trim());
       }
-      setBanner({ kind: "ok", msg: `Installed ${installed.name || installed.id} v${installed.version}.` });
+      setResult(installed);
+      setBusy(false);
       onInstalled(installed);
     } catch (e) {
       setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Install failed" });
       setBusy(false);
     }
+  }
+
+  if (result) {
+    const summary = installResultSummary(result);
+    return (
+      <div className="card" style={{ marginBottom: 12, padding: 12 }}>
+        <div className={"banner " + (summary.tone === "ok" ? "ok" : "info")} style={{ fontSize: 13 }}>
+          <strong>{summary.headline}</strong>
+          <div style={{ marginTop: 4, fontSize: 12 }}>{summary.detail}</div>
+        </div>
+        <div className="muted" style={{ fontSize: 11, marginBottom: 10 }}>
+          {pluginKindLabel(result)} · {result.id} · v{result.version} · source{" "}
+          {result.source_kind}
+          {result.generated
+            ? " · 0 tools discovered"
+            : ` · ${result.tool_count ?? 0} tool${(result.tool_count ?? 0) === 1 ? "" : "s"} discovered`}
+        </div>
+        <div className="row wrap" style={{ gap: 8 }}>
+          <button
+            className="btn ghost"
+            onClick={() => {
+              setResult(null);
+              setBanner(null);
+              setUrl("");
+              setDir("");
+              setFile(null);
+            }}
+          >
+            Install another
+          </button>
+          <button className="btn" onClick={onClose}>
+            Done
+          </button>
+        </div>
+      </div>
+    );
   }
 
   return (

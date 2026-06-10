@@ -1956,6 +1956,58 @@ a tool call; an installed-but-unimplemented tool is reported as not runnable her
 **arbitrary downloaded plugin runtime execution remains intentionally not
 implemented.**
 
+### Plugin Install UX v1 (honest metadata-only wrappers)
+
+Installing a GitHub repo / folder / zip with no `relux-plugin.json` succeeds as a
+**generated metadata-only wrapper** (sanitized id, zero tools, zero permissions,
+`Unverified`, `generated: true`). The dashboard now makes that state honest and
+actionable instead of leaving the operator to wonder:
+
+- **No "ready"-looking label.** A wrapper is badged **Needs configuration** (amber),
+  never the green "enabled" a real plugin shows. Its row carries an inline banner
+  stating the dead-end plainly: it declares no tools, so a runtime alone runs
+  nothing.
+- **The honest next step is a manifest, not a runtime.** Because `discover_tools`
+  only surfaces manifest-declared tools, a wrapper with no tool definitions stays
+  empty even with an enabled loopback runtime (pinned by the kernel test
+  `enabling_a_runtime_on_a_wrapper_surfaces_no_tools`). So the wrapper's call to
+  action is **Set up → add tool definitions**, not "configure a runtime". The Set
+  up panel hands the operator a ready-to-edit `relux-plugin.json` (copy or
+  download), keyed to the plugin's id, plus the exact install directory, and the
+  three-step path: add the manifest → re-install (Local folder) → point a loopback
+  runtime at a local server. Relux still never infers tools from repo content and
+  never runs downloaded code.
+- **Plugin categories are distinct.** The Kind column distinguishes **Adapter**
+  (configured on the Crew page), **ToolSet** (with its declared tool count and a
+  loopback **Runtime** panel), **Metadata-only wrapper** (Set up → manifest), and
+  internal dev/test plugins (hidden by default, §echo). A real manifest-based
+  plugin is unaffected and keeps its normal Runtime flow.
+- **Install result summary.** After an install the panel stays open and reports
+  what happened — tools discovered (count), a wrapper generated (nothing runnable
+  yet), or an adapter installed — and the exact next step, instead of a bare
+  "Installed X".
+- **Runnable-only tools by default.** The Tools list shows only `ready` tools by
+  default so a metadata-only or unconfigured plugin never looks usable; a
+  "Show N non-runnable" toggle reveals the rest with their honest status. Nothing
+  is permanently hidden or faked.
+
+The pure UI derivations (status, kind label, next-step, install summary, tool
+visibility) live in `apps/dashboard/src/plugins.ts`, unit-tested in
+`apps/dashboard/test/plugins.test.ts`. The backend adds `tool_count` to each
+`/v1/relux/plugins` record and a read-only template endpoint:
+
+```text
+GET /v1/relux/plugins/:id/manifest-template
+  -> { plugin_id, filename, install_dir, generated, manifest_json }
+```
+
+The returned `manifest_json` is a complete, re-installable starter `relux-plugin.json`
+(ToolSet, one example tool, permission strings bound to this plugin id). It stores
+nothing and runs nothing — it is guidance the operator fills in. Covered by kernel
+tests `generated_wrapper_record_is_flagged_and_has_zero_tools`,
+`real_toolset_record_reports_its_tool_count`, and
+`manifest_template_is_valid_json_keyed_to_the_plugin`.
+
 ### Adapter Runtime v1 (local coding-agent CLIs)
 
 An Adapter plugin (§8.1) decides how an assigned task runs. The bundled
@@ -2147,10 +2199,17 @@ remain, in rough priority for the next slices:
    `apps/dashboard/src/onboarding.ts` with unit coverage in
    `apps/dashboard/test/onboarding.test.ts`. A fuller modal walkthrough (a single
    guided flow that ends on a first chat/task) is still optional polish.
-2. **Plugin install UX.** Install-from-GitHub/zip works and is honest about
-   metadata-only wrappers, but the dashboard could surface a clearer "configure a
-   runtime" call-to-action and avoid any "ready"-looking label for a
-   metadata-only plugin.
+2. **Plugin install UX.** *(Addressed post-v0.1.1.)* See "Plugin Install UX v1"
+   below. A generated metadata-only wrapper is now badged **Needs configuration**
+   (never "enabled"/"ready"); its honest next step is **add tool definitions** (a
+   `relux-plugin.json`), not "configure a runtime" — because a wrapper declares no
+   tools, a loopback runtime alone surfaces nothing. The Plugins page gives a
+   one-click **Set up** affordance with a copy/download manifest template, the
+   install flow shows a **result summary** (tools discovered vs wrapper generated
+   vs adapter, plus the next step), and the Tools list shows **only runnable tools
+   by default** with a toggle for the rest. The pure derivations live in
+   `apps/dashboard/src/plugins.ts` with unit coverage in
+   `apps/dashboard/test/plugins.test.ts`.
 3. **Adapter run depth.** Adapter Runtime v1 records a single pass/fail with the
    CLI's captured output; it does not yet stream events live, parse structured
    tool calls, or resume a partial CLI run. Execution-environment runtimes are

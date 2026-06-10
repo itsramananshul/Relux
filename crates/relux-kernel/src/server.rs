@@ -148,6 +148,7 @@ async fn serve() -> Result<(), KernelError> {
     println!("   GET    /v1/relux/plugins/:id/runtime      (HTTP loopback runtime status)");
     println!("   PUT    /v1/relux/plugins/:id/runtime      {{ \"base_url\":\"http://127.0.0.1:<port>\", \"enabled\"?, \"timeout_ms\"? }}");
     println!("   DELETE /v1/relux/plugins/:id/runtime      (clear runtime config)");
+    println!("   GET    /v1/relux/plugins/:id/manifest-template  (starter relux-plugin.json)");
     println!("   DELETE /v1/relux/plugins/:id");
     println!("   GET    /v1/relux/adapters                  (adapter plugins + CLI runtime status)");
     println!("   GET    /v1/relux/adapters/:id/runtime");
@@ -264,6 +265,10 @@ fn router(state: AppState) -> Router {
                 .put(set_plugin_runtime)
                 .patch(set_plugin_runtime)
                 .delete(delete_plugin_runtime),
+        )
+        .route(
+            "/v1/relux/plugins/:id/manifest-template",
+            get(plugin_manifest_template),
         )
         .route("/v1/relux/plugins/:id", delete(remove))
         // Adapter runtime controls (local coding-agent CLIs).
@@ -1463,6 +1468,92 @@ async fn delete_plugin_runtime(
     Ok(Json(runtime_response(&id, None)))
 }
 
+/// The starter `relux-plugin.json` a metadata-only wrapper needs to become a real
+/// ToolSet. Returned by the manifest-template endpoint so the dashboard can offer
+/// a copy/download affordance: a generated wrapper declares NO tools, so a loopback
+/// runtime alone never surfaces anything - the operator must add tool definitions.
+#[derive(Debug, Serialize)]
+struct ManifestTemplateResponse {
+    plugin_id: String,
+    /// The file name the operator should write into their plugin folder.
+    filename: String,
+    /// The absolute install directory of this plugin (where the file would live in
+    /// the local index) - shown so the operator knows exactly where it goes.
+    install_dir: String,
+    /// Whether this plugin is a generated metadata-only wrapper (the case the
+    /// template primarily serves).
+    generated: bool,
+    /// A complete, ready-to-edit `relux-plugin.json` with one example tool wired to
+    /// this plugin's id. Filling it in (and pointing a loopback runtime at a local
+    /// server) is what makes the plugin runnable. Relux never infers tools itself.
+    manifest_json: String,
+}
+
+/// GET `/v1/relux/plugins/:id/manifest-template` - a starter `relux-plugin.json`
+/// for an installed plugin (primarily a generated metadata-only wrapper). Honest
+/// next step: a wrapper has no tool definitions, so configuring a runtime alone
+/// surfaces nothing; the operator adds tools with this template, re-installs, then
+/// configures a loopback runtime. Read-only; touches no config and stores no secret.
+async fn plugin_manifest_template(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<ManifestTemplateResponse>, ApiError> {
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err(ApiError::bad_request("plugin id is required"));
+    }
+    let plugin_id = relux_core::PluginId::new(id.clone());
+    let resp = locked_read(&state, |kernel| {
+        let installed = kernel
+            .installed_plugin(&plugin_id)
+            .ok_or_else(|| KernelError::PluginNotInstalled(id.clone()))?;
+        let manifest = kernel.plugin(&plugin_id);
+        let name = manifest
+            .map(|m| m.name.clone())
+            .unwrap_or_else(|| id.clone());
+        let generated = manifest.map(relux_kernel::is_generated_manifest).unwrap_or(false);
+        // A starter ToolSet manifest keyed to THIS plugin's id, so the permission
+        // strings line up with the kernel's `tool:<id>:<verb>` convention. The
+        // operator edits the single example tool (or adds more) to describe what
+        // their local loopback server actually exposes.
+        let template = serde_json::json!({
+            "id": id,
+            "name": name,
+            "version": "0.1.0",
+            "kind": "ToolSet",
+            "description": "Describe what this ToolSet does. Each tool below is exposed by a loopback HTTP server you run locally; Relux never runs downloaded code itself.",
+            "author": "you",
+            "trust_level": "community",
+            "capabilities": {
+                "tools": [
+                    {
+                        "name": "example.run",
+                        "description": "Replace with a real tool your loopback server implements.",
+                        "risk": "low",
+                        "permission": format!("tool:{id}:run"),
+                        "approval": "never",
+                        "timeout_secs": 5
+                    }
+                ],
+                "permissions": [
+                    format!("tool:{id}:run")
+                ]
+            },
+            "health": "unknown"
+        });
+        let manifest_json = serde_json::to_string_pretty(&template)
+            .unwrap_or_else(|_| "{}".to_string());
+        Ok(ManifestTemplateResponse {
+            plugin_id: id.clone(),
+            filename: "relux-plugin.json".to_string(),
+            install_dir: installed.install_dir.clone(),
+            generated,
+            manifest_json,
+        })
+    })?;
+    Ok(Json(resp))
+}
+
 // --- Adapter runtime (local coding-agent CLIs) -----------------------------
 
 /// GET `/v1/relux/adapters` - every installed Adapter plugin with its honest
@@ -1810,6 +1901,10 @@ struct PluginRecord {
     /// `relux-plugin.json`. Such a plugin is installed as metadata only and runs
     /// nothing until the operator configures a runtime or adds tool definitions.
     generated: bool,
+    /// Count of tools the manifest declares. Zero for a generated wrapper (and any
+    /// non-ToolSet plugin), so the dashboard can be honest that "metadata only"
+    /// means there is nothing to make runnable until tool definitions are added.
+    tool_count: usize,
     trust_level: Option<String>,
     health: Option<String>,
 }
@@ -1832,6 +1927,7 @@ fn plugin_record(installed: &InstalledPlugin, manifest: Option<&PluginManifest>)
         protected: bundled,
         bundled,
         generated: manifest.map(relux_kernel::is_generated_manifest).unwrap_or(false),
+        tool_count: manifest.map(|m| m.capabilities.tools.len()).unwrap_or(0),
         trust_level: manifest.map(|m| format!("{:?}", m.trust_level)),
         health: manifest.map(|m| format!("{:?}", m.health)),
     }
@@ -2035,9 +2131,124 @@ mod tests {
             "install_dir",
             "protected",
             "bundled",
+            "generated",
+            "tool_count",
         ] {
             assert!(v.get(key).is_some(), "missing key {key}");
         }
+    }
+
+    /// A metadata-only wrapper, shaped exactly like `scaffold_manifest` produces:
+    /// authored by [`GENERATED_MANIFEST_AUTHOR`], zero tools, zero permissions.
+    fn generated_wrapper_manifest(id: &str) -> PluginManifest {
+        PluginManifest {
+            id: PluginId::new(id),
+            name: format!("{id} (metadata only)"),
+            version: "0.0.0".to_string(),
+            kind: PluginKind::ToolSet,
+            description: "Installed as metadata: no runnable tools yet.".to_string(),
+            author: relux_kernel::GENERATED_MANIFEST_AUTHOR.to_string(),
+            trust_level: TrustLevel::Unverified,
+            capabilities: PluginCapability {
+                tools: Vec::new(),
+                permissions: Vec::new(),
+            },
+            health: PluginHealth::Unknown,
+        }
+    }
+
+    #[test]
+    fn generated_wrapper_record_is_flagged_and_has_zero_tools() {
+        let mut kernel = KernelState::new();
+        let installed = kernel.install_plugin(
+            generated_wrapper_manifest("relux-plugin-my-cool-repo"),
+            PluginSourceKind::Github,
+            "https://github.com/owner/my-cool-repo".to_string(),
+            "/data/relux-plugin-my-cool-repo".to_string(),
+            true,
+        );
+        let record = record_for(&kernel, &installed);
+        assert!(record.generated, "wrapper must be flagged generated");
+        assert_eq!(record.tool_count, 0, "a wrapper declares no tools");
+        assert!(!record.protected, "a github install is removable");
+    }
+
+    #[test]
+    fn real_toolset_record_reports_its_tool_count() {
+        let mut kernel = KernelState::new();
+        let installed = kernel.install_plugin(
+            echo_manifest(),
+            PluginSourceKind::LocalDir,
+            "/src/echo".to_string(),
+            "/data/echo".to_string(),
+            true,
+        );
+        let record = record_for(&kernel, &installed);
+        assert!(!record.generated, "a real manifest is not generated");
+        assert_eq!(record.tool_count, 1, "echo declares one tool");
+    }
+
+    /// The honest dead-end: a generated wrapper has no tool definitions, so even an
+    /// enabled loopback runtime surfaces NOTHING. This pins why the dashboard must
+    /// route a metadata-only plugin to "add a manifest", not "configure a runtime".
+    #[test]
+    fn enabling_a_runtime_on_a_wrapper_surfaces_no_tools() {
+        let mut kernel = KernelState::new();
+        let id = PluginId::new("relux-plugin-empty");
+        kernel.install_plugin(
+            generated_wrapper_manifest("relux-plugin-empty"),
+            PluginSourceKind::Github,
+            "https://github.com/owner/empty".to_string(),
+            "/data/relux-plugin-empty".to_string(),
+            true,
+        );
+        kernel
+            .configure_tool_runtime(&id, "http://127.0.0.1:19999", true, None)
+            .expect("configure runtime");
+        let tools = kernel.discover_tools(None);
+        assert!(
+            !tools.iter().any(|t| t.plugin_id == "relux-plugin-empty"),
+            "a wrapper with no tool definitions yields no tools even with a runtime"
+        );
+    }
+
+    #[test]
+    fn manifest_template_is_valid_json_keyed_to_the_plugin() {
+        // Build the template inline the same way the handler does, then prove it is
+        // a re-installable manifest: valid JSON, ToolSet, with permission strings
+        // bound to THIS plugin id.
+        let id = "relux-plugin-my-cool-repo";
+        let template = serde_json::json!({
+            "id": id,
+            "name": "My Cool Repo",
+            "version": "0.1.0",
+            "kind": "ToolSet",
+            "description": "x",
+            "author": "you",
+            "trust_level": "community",
+            "capabilities": {
+                "tools": [{
+                    "name": "example.run",
+                    "description": "x",
+                    "risk": "low",
+                    "permission": format!("tool:{id}:run"),
+                    "approval": "never",
+                    "timeout_secs": 5
+                }],
+                "permissions": [format!("tool:{id}:run")]
+            },
+            "health": "unknown"
+        });
+        let json = serde_json::to_string_pretty(&template).unwrap();
+        // It round-trips into a real PluginManifest and validates like any other.
+        let parsed: PluginManifest = serde_json::from_str(&json).expect("template parses");
+        assert_eq!(parsed.id.as_str(), id);
+        assert_eq!(parsed.kind, PluginKind::ToolSet);
+        assert_eq!(parsed.capabilities.tools.len(), 1);
+        assert_eq!(
+            parsed.capabilities.tools[0].permission.as_str(),
+            "tool:relux-plugin-my-cool-repo:run"
+        );
     }
 
     #[test]

@@ -43,7 +43,7 @@ pub use event::RunEvent;
 pub use loader::{load_plugin_manifests, MANIFEST_FILENAME};
 pub use plugin_install::{
     install_from_dir, install_from_github, install_from_zip, is_generated_manifest, list_installed,
-    refresh_bundled_plugins, remove_plugin,
+    refresh_bundled_plugins, remove_plugin, GENERATED_MANIFEST_AUTHOR,
 };
 pub use prime::{classify_intent, decide};
 pub use runtime::{invoke_http_loopback, RuntimeClientError};

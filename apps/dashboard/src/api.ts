@@ -1288,6 +1288,9 @@ export interface ReluxPlugin {
   // relux-plugin.json. The plugin is installed as metadata only and runs nothing
   // until a runtime/tools are configured.
   generated?: boolean;
+  // Number of tools the manifest declares. Zero for a generated wrapper, so the
+  // UI can be honest that there is nothing to make runnable until tools are added.
+  tool_count?: number;
   trust_level?: string | null;
   health?: string | null;
 }
@@ -1579,7 +1582,23 @@ export const reluxPlugins = {
   // Remove an installed plugin by id. Bundled plugins are refused (HTTP 409).
   remove: (id: string) =>
     api.del<{ removed: string }>(`/v1/relux/plugins/${encodeURIComponent(id)}`),
+  // A starter relux-plugin.json for an installed plugin (primarily a generated
+  // metadata-only wrapper). The honest next step for a wrapper: it has no tool
+  // definitions, so a runtime alone surfaces nothing - the operator fills this in,
+  // re-installs, then points a loopback runtime at a local server.
+  manifestTemplate: (id: string) =>
+    api.get<ReluxManifestTemplate>(
+      `/v1/relux/plugins/${encodeURIComponent(id)}/manifest-template`,
+    ),
 };
+
+export interface ReluxManifestTemplate {
+  plugin_id: string;
+  filename: string;
+  install_dir: string;
+  generated: boolean;
+  manifest_json: string;
+}
 
 // -- Relux plugin tool runtime (HTTP loopback) ------------------------------
 // A ToolSet plugin becomes executable only when an operator points it at a
