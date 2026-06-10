@@ -2068,7 +2068,16 @@ through the **real** adapter path, not test-only internals), polls until that br
 is genuinely `running`, requests cancel, observes `cancel_requested` while the job is
 still `running` (the canceling phase), then asserts the terminal `canceled` state
 with the in-flight brief recorded `completed` honestly and every downstream brief
-left `pending`.
+left `pending`. A companion **multi-brief in-flight cancel** smoke
+(`scripts/smoke-orchestration-cancel-multi.ps1`) hardens the honesty contract for the
+case it really hinges on — a cancel that lands while **two** independent briefs are
+running together in the same round: it routes a research brief and an operations
+brief to two separate slow local CLI adapters (both spawned through the real adapter
+path), runs the job at `concurrency=2`, polls until a single snapshot shows **both**
+briefs `running`, requests cancel, observes `cancel_requested` while still `running`,
+then asserts the terminal `canceled` state with **both** in-flight briefs recorded
+`completed` honestly and the downstream implementation + documentation briefs left
+`pending`.
 
 ### Tool Invocation Surface (First Honest Version)
 

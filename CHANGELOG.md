@@ -120,7 +120,15 @@ once a stable release is cut.
   CLI adapter spawned through the **real** adapter path, polls until it is genuinely
   `running`, cancels, observes `cancel_requested` while still `running`, then asserts
   the terminal `canceled` state with the in-flight brief recorded `completed` and
-  every downstream brief left `pending`.
+  every downstream brief left `pending`. A companion **multi-brief in-flight cancel**
+  smoke (`scripts/smoke-orchestration-cancel-multi.ps1`) proves the same honesty
+  contract for the harder case — a cancel that arrives while **two** independent
+  briefs run together in one round: at `concurrency=2` it routes a research brief and
+  an operations brief to two separate slow local CLI adapters (both via the real
+  adapter path), polls until a single snapshot shows **both** `running`, cancels,
+  observes `cancel_requested` while still `running`, then asserts terminal `canceled`
+  with **both** in-flight briefs recorded `completed` honestly and the downstream
+  implementation + documentation briefs left `pending`.
 - **Non-blocking orchestration jobs + live, pollable progress.** Running an
   orchestration no longer blocks on one long request (master plan "Orchestration
   (First Multi-Agent Slice)" — the previously-deferred non-blocking job model).
