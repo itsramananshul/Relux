@@ -164,6 +164,7 @@ async fn serve() -> Result<(), KernelError> {
     println!("   POST   /v1/relux/prime/orchestrations/:id/run-async  (start a background job; returns job + status_url)");
     println!("   GET    /v1/relux/prime/orchestrations/:id/job         (latest job for this orchestration)");
     println!("   GET    /v1/relux/orchestration-jobs/:job_id           (poll one job's status)");
+    println!("   POST   /v1/relux/orchestration-jobs/:job_id/cancel    (request cancellation; stops before the next round)");
     println!("   GET    /v1/relux/adapters/:id/runtime");
     println!("   PUT    /v1/relux/adapters/:id/runtime     {{ \"enabled\":true, \"command\"?, \"timeout_seconds\"?, \"max_output_bytes\"? }}");
     println!("   DELETE /v1/relux/adapters/:id/runtime     (clear adapter runtime config)");
@@ -314,6 +315,10 @@ fn router(state: AppState) -> Router {
         .route(
             "/v1/relux/orchestration-jobs/:job_id",
             get(get_orchestration_job),
+        )
+        .route(
+            "/v1/relux/orchestration-jobs/:job_id/cancel",
+            post(cancel_orchestration_job),
         )
         .route("/v1/relux/tasks", get(list_tasks).post(create_task))
         .route("/v1/relux/tasks/:id", get(get_task))
@@ -1474,6 +1479,23 @@ enum JobState {
     /// The worker hit an error it could not turn into a per-brief block (e.g. the
     /// store failed); the message is in `error`.
     Failed,
+    /// Cancellation was requested and honored: the worker finished any round that
+    /// was already in flight, then stopped before the next one. Remaining briefs
+    /// are left in their durable (pending) state for a human to resume or retire.
+    Canceled,
+}
+
+impl JobState {
+    /// A short human label, matching the snake_case wire form.
+    fn label(&self) -> &'static str {
+        match self {
+            JobState::Queued => "queued",
+            JobState::Running => "running",
+            JobState::Completed => "completed",
+            JobState::Failed => "failed",
+            JobState::Canceled => "canceled",
+        }
+    }
 }
 
 /// One brief's status as the job last observed it. `outcome` is the durable step
@@ -1520,6 +1542,11 @@ struct OrchestrationJob {
     /// An honest error message when `state == Failed`.
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// Set true the moment a cancel is requested. While the job is still `running`
+    /// this means "canceling - finishing the in-flight round, then stopping"; the
+    /// worker flips the state to `Canceled` once that round completes. Always
+    /// serialized so the dashboard can show the pending-cancel state honestly.
+    cancel_requested: bool,
     /// The latest per-brief snapshot the worker recorded.
     steps: Vec<JobStepStatus>,
     /// The aggregate batch result, set once the worker finishes.
@@ -1596,6 +1623,7 @@ impl JobRegistry {
             completed_at_ms: None,
             last_event: Some("queued".to_string()),
             error: None,
+            cancel_requested: false,
             steps: Vec::new(),
             result: None,
         };
@@ -1628,6 +1656,50 @@ impl JobRegistry {
             .max_by(|a, b| a.id.cmp(&b.id))
             .cloned()
     }
+
+    /// Request cancellation of a job. This only sets a cooperative flag; the worker
+    /// owns the actual `Canceled` state transition (it stops before its next round,
+    /// after any in-flight round finishes), so the cancel path never races the
+    /// worker on the state field and never kills a brief mid-flight. Idempotent on
+    /// an already-canceling/canceled job; refuses a job that already finished.
+    fn request_cancel(&self, job_id: &str) -> CancelOutcome {
+        let mut store = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        match store.jobs.get_mut(job_id) {
+            None => CancelOutcome::Unknown,
+            Some(job) => match job.state {
+                JobState::Queued | JobState::Running => {
+                    job.cancel_requested = true;
+                    job.last_event = Some(
+                        "cancel requested - will stop after the in-flight round".to_string(),
+                    );
+                    CancelOutcome::Requested(job.clone())
+                }
+                JobState::Canceled => CancelOutcome::AlreadyCanceled(job.clone()),
+                JobState::Completed | JobState::Failed => CancelOutcome::AlreadyTerminal(job.clone()),
+            },
+        }
+    }
+
+    /// Whether a cancel has been requested for `job_id` (false if it was evicted).
+    /// The worker polls this between rounds to decide whether to stop.
+    fn is_cancel_requested(&self, job_id: &str) -> bool {
+        let store = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        store.jobs.get(job_id).map(|j| j.cancel_requested).unwrap_or(false)
+    }
+}
+
+/// The outcome of a cancellation request, so the HTTP handler can map it to an
+/// honest status code without re-locking the registry.
+#[derive(Debug)]
+enum CancelOutcome {
+    /// The job was active; the cancel flag is set (worker will stop next round).
+    Requested(OrchestrationJob),
+    /// The job was already canceling/canceled; nothing more to do (idempotent).
+    AlreadyCanceled(OrchestrationJob),
+    /// The job already finished (completed/failed); there is nothing to cancel.
+    AlreadyTerminal(OrchestrationJob),
+    /// No such job (never started, or lost to a restart).
+    Unknown,
 }
 
 /// Wall-clock now in unix millis (0 if the clock is before the epoch, which never
@@ -1860,8 +1932,20 @@ fn drive_orchestration_job(
     let mut total_ran = 0usize;
     let mut agg = JobAggregate::default();
     let mut round_no = 0u32;
+    // True once we stop *because* a cancel was requested (as opposed to finishing
+    // the plan or running out of ready briefs). Drives the final Canceled state.
+    let mut canceled = false;
 
     loop {
+        // Cooperative cancellation checkpoint. The kernel lock is free here and any
+        // prior round has fully finalized, so stopping now leaves remaining briefs
+        // in their honest durable state - we never kill a brief mid-flight. A cancel
+        // that arrives during a round is honored on the next loop iteration, after
+        // that round's in-flight briefs finish and persist.
+        if jobs.is_cancel_requested(&job_id) {
+            canceled = true;
+            break;
+        }
         if total_ran >= user_max {
             break;
         }
@@ -1907,14 +1991,24 @@ fn drive_orchestration_job(
     let final_snap = locked_read(&state, |k| Ok(k.orchestration(&oid).cloned()))
         .ok()
         .flatten();
+    let rounds_done = agg.rounds;
     let final_result = agg.into_result(&oid, concurrency);
     jobs.update(&job_id, |j| {
-        j.state = JobState::Completed;
+        j.state = if canceled { JobState::Canceled } else { JobState::Completed };
         j.completed_at_ms = Some(now_millis());
         if let Some(orch) = final_snap.as_ref() {
             j.steps = job_steps(orch, &[]);
         }
-        j.last_event = Some(final_result.summary.clone());
+        j.last_event = Some(if canceled {
+            format!(
+                "canceled after {rounds_done} round(s); any in-flight briefs finished and the \
+                 remaining briefs were left pending for a human to resume or retire"
+            )
+        } else {
+            final_result.summary.clone()
+        });
+        // The aggregate still reports exactly what really ran, so a canceled job is
+        // observable (it never claims more progress than the kernel recorded).
         j.result = Some(final_result);
     });
 }
@@ -2004,6 +2098,35 @@ async fn get_latest_orchestration_job(
         status: StatusCode::NOT_FOUND,
         message: format!("no orchestration job has been started for {id}"),
     })
+}
+
+/// POST `/v1/relux/orchestration-jobs/:job_id/cancel` — request cancellation of an
+/// active orchestration job. This is cooperative and honest: it does NOT kill an
+/// adapter process that is already running. The worker finishes the round that is
+/// in flight (so no brief is interrupted), then stops before the next round and
+/// marks the job `canceled`; remaining briefs stay pending for a human to resume.
+/// Returns the updated job (200). 404 when unknown; 409 when the job already
+/// finished (completed/failed) and so cannot be canceled.
+async fn cancel_orchestration_job(
+    State(state): State<AppState>,
+    AxumPath(job_id): AxumPath<String>,
+) -> Result<Json<OrchestrationJob>, ApiError> {
+    match state.jobs.request_cancel(&job_id) {
+        CancelOutcome::Requested(job) | CancelOutcome::AlreadyCanceled(job) => Ok(Json(job)),
+        CancelOutcome::AlreadyTerminal(job) => Err(ApiError {
+            status: StatusCode::CONFLICT,
+            message: format!(
+                "orchestration job {job_id} already finished ({}); nothing to cancel",
+                job.state.label()
+            ),
+        }),
+        CancelOutcome::Unknown => Err(ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: format!(
+                "no orchestration job {job_id} (it may have been lost to a server restart)"
+            ),
+        }),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -3455,5 +3578,146 @@ mod tests {
         assert_eq!(result.ran, 0);
         assert_eq!(result.rounds, 0);
         assert_eq!(result.status, OrchestrationStatus::Completed);
+    }
+
+    // --- Cancellation: registry state machine -----------------------------
+
+    #[test]
+    fn registry_request_cancel_sets_the_flag_on_an_active_job() {
+        let reg = JobRegistry::default();
+        let job = reg.start("orch_0001", 25, 2).unwrap();
+        assert!(!reg.is_cancel_requested(&job.id), "fresh job has no cancel");
+        match reg.request_cancel(&job.id) {
+            CancelOutcome::Requested(j) => assert!(j.cancel_requested),
+            other => panic!("expected Requested, got {other:?}"),
+        }
+        assert!(reg.is_cancel_requested(&job.id), "flag is now set");
+        // Still active (worker not running here), so a repeat request is accepted
+        // idempotently rather than erroring.
+        assert!(matches!(reg.request_cancel(&job.id), CancelOutcome::Requested(_)));
+    }
+
+    #[test]
+    fn registry_request_cancel_is_idempotent_once_canceled() {
+        let reg = JobRegistry::default();
+        let job = reg.start("orch_0001", 25, 2).unwrap();
+        reg.update(&job.id, |j| j.state = JobState::Canceled);
+        assert!(matches!(
+            reg.request_cancel(&job.id),
+            CancelOutcome::AlreadyCanceled(_)
+        ));
+    }
+
+    #[test]
+    fn registry_refuses_to_cancel_a_finished_job() {
+        let reg = JobRegistry::default();
+        let done = reg.start("orch_0001", 25, 2).unwrap();
+        reg.update(&done.id, |j| j.state = JobState::Completed);
+        assert!(matches!(
+            reg.request_cancel(&done.id),
+            CancelOutcome::AlreadyTerminal(_)
+        ));
+        let failed = reg.start("orch_0002", 25, 2).unwrap();
+        reg.update(&failed.id, |j| j.state = JobState::Failed);
+        assert!(matches!(
+            reg.request_cancel(&failed.id),
+            CancelOutcome::AlreadyTerminal(_)
+        ));
+    }
+
+    #[test]
+    fn registry_request_cancel_unknown_job_is_unknown() {
+        let reg = JobRegistry::default();
+        assert!(matches!(reg.request_cancel("nope"), CancelOutcome::Unknown));
+        assert!(!reg.is_cancel_requested("nope"));
+    }
+
+    #[test]
+    fn a_canceled_job_does_not_block_a_fresh_run() {
+        // Cancellation is resumable: a canceled job is terminal, so it no longer
+        // counts as the orchestration's active job and a new run can start.
+        let reg = JobRegistry::default();
+        let first = reg.start("orch_0001", 25, 2).unwrap();
+        reg.update(&first.id, |j| j.state = JobState::Canceled);
+        let second = reg.start("orch_0001", 25, 2).expect("a new job after cancel");
+        assert_ne!(second.id, first.id);
+    }
+
+    // --- Cancellation: cooperative worker behavior ------------------------
+
+    /// Build a real AppState backed by a temp SQLite store, seeded with a
+    /// multi-brief orchestration whose briefs all fall back to Prime (the local
+    /// echo adapter), so a round runs inline without spawning any CLI process.
+    fn app_state_with_prime_orchestration() -> (AppState, tempfile::TempDir, OrchestrationId) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("local.db");
+        let mut store = SqliteStore::open(&db_path).expect("open store");
+        let mut kernel = store.load().expect("load");
+        let ctx = crate::ensure_bootstrapped(&mut kernel).expect("bootstrap");
+        // Research + documentation: two clauses, both Prime fallback (no specialist).
+        let orch = kernel
+            .prime_orchestrate(&ctx, "research the rust options and document the findings")
+            .expect("plan orchestration");
+        assert!(orch.steps.len() >= 2, "needs a multi-brief plan");
+        store.save(&kernel).expect("save");
+        let oid = orch.id.clone();
+        let state = AppState {
+            db_path,
+            plugins_root: dir.path().join("plugins"),
+            uploads_root: dir.path().join("uploads"),
+            dashboard_dir: None,
+            ai_config_path: dir.path().join("ai.json"),
+            lock: Arc::new(Mutex::new(())),
+            jobs: JobRegistry::default(),
+        };
+        (state, dir, oid)
+    }
+
+    #[test]
+    fn worker_cancel_requested_up_front_runs_no_round_and_marks_canceled() {
+        let (state, _dir, oid) = app_state_with_prime_orchestration();
+        let job = state.jobs.start(oid.as_str(), 25, 2).unwrap();
+        // Request cancellation BEFORE the worker runs its first round.
+        assert!(matches!(
+            state.jobs.request_cancel(&job.id),
+            CancelOutcome::Requested(_)
+        ));
+
+        drive_orchestration_job(state.clone(), job.id.clone(), oid.clone(), 25, 2);
+
+        let done = state.jobs.get(&job.id).expect("job survives");
+        assert_eq!(done.state, JobState::Canceled, "honored the cancel");
+        assert_eq!(done.current_round, 0, "no round ran");
+        assert_eq!(done.ran, 0, "no brief ran");
+        assert!(done.completed_at_ms.is_some(), "job finished");
+        // The durable record proves nothing executed: every brief is still pending.
+        let orch = locked_read(&state, |k| Ok(k.orchestration(&oid).cloned()))
+            .unwrap()
+            .unwrap();
+        assert!(
+            orch.steps.iter().all(|s| s.outcome == StepOutcome::Pending),
+            "cancellation must not run any brief"
+        );
+    }
+
+    #[test]
+    fn worker_without_cancel_runs_the_briefs_and_completes() {
+        // Positive control: the SAME seeded orchestration runs to completion when no
+        // cancel is requested, proving the cancel test above is not vacuous.
+        let (state, _dir, oid) = app_state_with_prime_orchestration();
+        let job = state.jobs.start(oid.as_str(), 25, 2).unwrap();
+
+        drive_orchestration_job(state.clone(), job.id.clone(), oid.clone(), 25, 2);
+
+        let done = state.jobs.get(&job.id).expect("job survives");
+        assert_eq!(done.state, JobState::Completed, "ran to completion");
+        assert!(done.ran >= 1, "at least one brief ran");
+        let orch = locked_read(&state, |k| Ok(k.orchestration(&oid).cloned()))
+            .unwrap()
+            .unwrap();
+        assert!(
+            orch.steps.iter().any(|s| s.outcome != StepOutcome::Pending),
+            "without cancel the briefs actually run"
+        );
     }
 }

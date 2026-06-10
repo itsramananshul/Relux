@@ -1514,7 +1514,15 @@ export interface ReluxOrchestrationBatchResult {
 // The lifecycle of a background orchestration run. Distinct from the
 // orchestration's own status: a job is "completed" once its worker finished its
 // rounds, even if the orchestration itself ended "needs_attention".
-export type ReluxJobState = "queued" | "running" | "completed" | "failed";
+// "canceled" is reached when a cancel was requested and honored: the worker
+// finished any in-flight round, then stopped before the next one (see the cancel
+// endpoint). It is terminal, like completed/failed.
+export type ReluxJobState =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "canceled";
 
 // One brief's status as the job last observed it. `outcome` is the durable step
 // outcome, except briefs the worker is about to run this round are reported as
@@ -1546,6 +1554,10 @@ export interface ReluxOrchestrationJob {
   completed_at_ms?: number | null;
   last_event?: string | null;
   error?: string | null;
+  // True once a cancel has been requested. While the job is still "running" this
+  // means "canceling — finishing the in-flight round, then stopping"; the worker
+  // flips state to "canceled" once that round completes.
+  cancel_requested?: boolean;
   steps: ReluxJobStepStatus[];
   result?: ReluxOrchestrationBatchResult | null;
 }
@@ -1595,6 +1607,15 @@ export const reluxOrchestration = {
   job: (jobId: string) =>
     api.get<ReluxOrchestrationJob>(
       `/v1/relux/orchestration-jobs/${encodeURIComponent(jobId)}`,
+    ),
+  // Request cancellation of an active job. Cooperative and honest: it does NOT
+  // kill a running adapter process — the worker finishes the in-flight round,
+  // then stops before the next one and marks the job "canceled". Returns the
+  // updated job (200); 404 when unknown; 409 when the job already finished.
+  cancelJob: (jobId: string) =>
+    api.post<ReluxOrchestrationJob>(
+      `/v1/relux/orchestration-jobs/${encodeURIComponent(jobId)}/cancel`,
+      {},
     ),
 };
 

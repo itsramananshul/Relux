@@ -84,8 +84,33 @@ try {
   }
 
   $completedCount = ($rec.steps | Where-Object { $_.outcome -eq "completed" }).Count
+
+  # Cancel-path guards (deterministic, no race with the worker):
+  #  - cancelling an unknown job is a clean 404, and
+  #  - cancelling the now-finished job is a 409 (nothing to cancel) - never a
+  #    faked success.
+  Write-Host "== verifying cancel of an unknown job (expect 404) =="
+  $cancelUnknown404 = $false
+  try {
+    Invoke-RestMethod -Method Post -Uri "$base/v1/relux/orchestration-jobs/job_9999/cancel" `
+      -ContentType "application/json" -Body "{}" | Out-Null
+  } catch {
+    if ($_.Exception.Response.StatusCode.value__ -eq 404) { $cancelUnknown404 = $true }
+  }
+  Write-Host "   unknown-job cancel returned 404: $cancelUnknown404"
+
+  Write-Host "== verifying cancel of an already-finished job (expect 409) =="
+  $cancelFinished409 = $false
+  try {
+    Invoke-RestMethod -Method Post -Uri "$base/v1/relux/orchestration-jobs/$jobId/cancel" `
+      -ContentType "application/json" -Body "{}" | Out-Null
+  } catch {
+    if ($_.Exception.Response.StatusCode.value__ -eq 409) { $cancelFinished409 = $true }
+  }
+  Write-Host "   finished-job cancel returned 409: $cancelFinished409"
+
   Write-Host ""
-  Write-Host "SMOKE-RESULT job_state=$($final.state) record_status=$($rec.status) completed_briefs=$completedCount/$($rec.steps.Count) dup_guard_409=$dupRejected"
+  Write-Host "SMOKE-RESULT job_state=$($final.state) record_status=$($rec.status) completed_briefs=$completedCount/$($rec.steps.Count) dup_guard_409=$dupRejected cancel_unknown_404=$cancelUnknown404 cancel_finished_409=$cancelFinished409"
 }
 finally {
   Write-Host "== stopping kernel =="

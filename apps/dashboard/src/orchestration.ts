@@ -277,16 +277,36 @@ export function jobIsActive(job: ReluxOrchestrationJob | null | undefined): bool
   return job != null && (job.state === "queued" || job.state === "running");
 }
 
-// True once a job has stopped working (completed or failed); the UI then stops
-// polling, refreshes the durable record, and re-enables Run/Continue.
+// True once a job has stopped working (completed, failed, or canceled); the UI
+// then stops polling, refreshes the durable record, and re-enables Run/Continue.
 export function jobIsTerminal(state: ReluxJobState | undefined): boolean {
-  return state === "completed" || state === "failed";
+  return state === "completed" || state === "failed" || state === "canceled";
+}
+
+// True while a job is active and a cancel has already been requested: the worker
+// is finishing its in-flight round before stopping. The UI shows "Canceling…" and
+// disables a second Cancel.
+export function jobIsCanceling(job: ReluxOrchestrationJob | null | undefined): boolean {
+  return jobIsActive(job) && job?.cancel_requested === true;
+}
+
+// True when the UI should offer a Cancel control: the job is active and no cancel
+// is pending yet.
+export function jobCanCancel(job: ReluxOrchestrationJob | null | undefined): boolean {
+  return jobIsActive(job) && job?.cancel_requested !== true;
 }
 
 // A short human phase label for the job, used in place of a spinner. Reflects the
 // real lifecycle the worker reported, never a guessed step.
 export function jobPhaseLabel(job: ReluxOrchestrationJob | null | undefined): string {
   if (!job) return "";
+  // A pending cancel takes precedence over the running phase: the worker is
+  // finishing the in-flight round before it stops.
+  if (jobIsCanceling(job)) {
+    return job.current_round > 0
+      ? `Canceling — finishing round ${job.current_round}`
+      : "Canceling…";
+  }
   switch (job.state) {
     case "queued":
       return "Queued";
@@ -307,6 +327,8 @@ export function jobPhaseLabel(job: ReluxOrchestrationJob | null | undefined): st
       return "Completed";
     case "failed":
       return "Failed";
+    case "canceled":
+      return "Canceled";
     default:
       return "";
   }

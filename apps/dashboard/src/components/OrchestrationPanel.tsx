@@ -21,6 +21,8 @@ import {
   orchestrationReadiness,
   jobIsActive,
   jobIsTerminal,
+  jobIsCanceling,
+  jobCanCancel,
   jobPhaseLabel,
   jobProgressLabel,
   jobRunningStepIds,
@@ -154,6 +156,24 @@ export function OrchestrationPanel() {
     }
   }
 
+  // Request cancellation of the active job for orchestration `id`. Cooperative and
+  // honest: the worker finishes the in-flight round, then stops before the next
+  // one and marks the job canceled. The poll effect keeps running (the job is
+  // still active until the worker stops), so the live banner shows "Canceling…"
+  // and then "Canceled". We optimistically fold the updated job in so the button
+  // disables immediately.
+  async function cancel(id: string) {
+    const job = jobs[id];
+    if (!jobCanCancel(job)) return;
+    setError(null);
+    try {
+      const updated = await reluxOrchestration.cancelJob(job!.id);
+      if (mounted.current) setJobs((prev) => ({ ...prev, [id]: updated }));
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : "Failed to cancel orchestration run");
+    }
+  }
+
   const planIsMultiAgent = plan != null && plan.steps.length >= 2;
 
   return (
@@ -278,6 +298,7 @@ export function OrchestrationPanel() {
               o={o}
               job={jobs[o.id] ?? null}
               onRun={() => void run(o.id)}
+              onCancel={() => void cancel(o.id)}
             />
           ))
         )}
@@ -290,10 +311,12 @@ function OrchestrationRow({
   o,
   job,
   onRun,
+  onCancel,
 }: {
   o: ReluxOrchestration;
   job: ReluxOrchestrationJob | null;
   onRun: () => void;
+  onCancel: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const groups = groupStepsByAgent(o);
@@ -371,6 +394,23 @@ function OrchestrationRow({
         >
           {runButtonLabel(o, job)}
         </button>
+        {/* Cancel is offered only while a job is active. It is cooperative: the
+            worker finishes the in-flight round, then stops before the next one and
+            marks the job canceled — it never kills a running brief. */}
+        {jobIsActive(job) && (
+          <button
+            className="btn ghost"
+            onClick={onCancel}
+            disabled={!jobCanCancel(job)}
+            title={
+              jobIsCanceling(job)
+                ? "Canceling — finishing the in-flight round, then stopping"
+                : "Stop after the in-flight round; remaining briefs stay pending"
+            }
+          >
+            {jobIsCanceling(job) ? "Canceling…" : "Cancel"}
+          </button>
+        )}
         <button className="btn ghost" onClick={() => setOpen((v) => !v)}>
           {open ? "Hide briefs" : "Show briefs"}
         </button>

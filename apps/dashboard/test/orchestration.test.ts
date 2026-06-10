@@ -251,6 +251,8 @@ test("headline summarizes fleet activity or hides when empty", () => {
 import {
   jobIsActive,
   jobIsTerminal,
+  jobIsCanceling,
+  jobCanCancel,
   jobPhaseLabel,
   jobProgressLabel,
   jobRunningStepIds,
@@ -297,12 +299,45 @@ test("jobIsActive is true only while queued or running", () => {
   assert.equal(jobIsActive(undefined), false);
 });
 
-test("jobIsTerminal is true only for completed or failed", () => {
+test("jobIsTerminal is true for completed, failed, or canceled", () => {
   assert.equal(jobIsTerminal("completed"), true);
   assert.equal(jobIsTerminal("failed"), true);
+  assert.equal(jobIsTerminal("canceled"), true);
   assert.equal(jobIsTerminal("running"), false);
   assert.equal(jobIsTerminal("queued"), false);
   assert.equal(jobIsTerminal(undefined), false);
+});
+
+test("jobCanCancel only while active and no cancel pending", () => {
+  assert.equal(jobCanCancel(job("running")), true);
+  assert.equal(jobCanCancel(job("queued")), true);
+  // Once a cancel is requested, the control is no longer offered.
+  assert.equal(jobCanCancel(job("running", { cancel_requested: true })), false);
+  // Terminal jobs can't be canceled.
+  assert.equal(jobCanCancel(job("completed")), false);
+  assert.equal(jobCanCancel(job("canceled")), false);
+  assert.equal(jobCanCancel(null), false);
+});
+
+test("jobIsCanceling is true only while active with a pending cancel", () => {
+  assert.equal(jobIsCanceling(job("running", { cancel_requested: true })), true);
+  assert.equal(jobIsCanceling(job("queued", { cancel_requested: true })), true);
+  assert.equal(jobIsCanceling(job("running")), false);
+  // A canceled (terminal) job is no longer "canceling".
+  assert.equal(jobIsCanceling(job("canceled", { cancel_requested: true })), false);
+  assert.equal(jobIsCanceling(null), false);
+});
+
+test("jobPhaseLabel surfaces canceling and canceled states", () => {
+  assert.equal(
+    jobPhaseLabel(job("running", { cancel_requested: true, current_round: 0 })),
+    "Canceling…",
+  );
+  assert.equal(
+    jobPhaseLabel(job("running", { cancel_requested: true, current_round: 3 })),
+    "Canceling — finishing round 3",
+  );
+  assert.equal(jobPhaseLabel(job("canceled")), "Canceled");
 });
 
 test("jobPhaseLabel reflects the real lifecycle, not a spinner", () => {

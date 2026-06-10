@@ -2000,7 +2000,8 @@ GET  /v1/relux/prime/orchestrations/:id       # one record + full step chain
 POST /v1/relux/prime/orchestrations/:id/run   # governed dependency-aware batch ({ max?, concurrency? }), blocking
 POST /v1/relux/prime/orchestrations/:id/run-async  # start a NON-BLOCKING background job; returns { ...job, status_url } immediately
 GET  /v1/relux/prime/orchestrations/:id/job   # the latest job for this orchestration (poll by orchestration id)
-GET  /v1/relux/orchestration-jobs/:job_id     # poll one job: state queued/running/completed/failed + round/step statuses/result
+GET  /v1/relux/orchestration-jobs/:job_id     # poll one job: state queued/running/completed/failed/canceled + round/step statuses/result
+POST /v1/relux/orchestration-jobs/:job_id/cancel  # request cooperative cancellation; 200 + updated job, 404 unknown, 409 already finished
 ```
 
 Dashboard: the Prime page has an **Orchestration** panel (goal → preview plan →
@@ -2015,13 +2016,17 @@ button kicks off `run-async`, then a 1s poll loop renders the live phase
 (`ran/total briefs · completed · failed · blocked`), the worker's last event, and
 a real **running** badge on the brief(s) executing this round (taken from the job's
 step snapshot, never a guessed spinner). The button stays disabled while the job is
-active so a second click can't start a duplicate (the backend also rejects it). On
-completion the panel folds the job's aggregate result into the "Last batch" banner
-and refreshes the durable record. Home shows the newest unfinished orchestration
-with its progress and next action. Pure UI logic lives in
-`apps/dashboard/src/orchestration.ts` (job helpers: `jobIsActive` / `jobIsTerminal`
-/ `jobPhaseLabel` / `jobProgressLabel` / `jobRunningStepIds` / `runButtonLabel`)
-with unit coverage in `apps/dashboard/test/orchestration.test.ts`.
+active so a second click can't start a duplicate (the backend also rejects it).
+While a job is active the panel also shows a **Cancel** button: pressing it
+requests cooperative cancellation (`POST …/orchestration-jobs/:job_id/cancel`), the
+phase label flips to "Canceling — finishing round N", and once the worker stops the
+job shows **Canceled**. On completion (or cancellation) the panel folds the job's
+aggregate result into the "Last batch" banner and refreshes the durable record.
+Home shows the newest unfinished orchestration with its progress and next action.
+Pure UI logic lives in `apps/dashboard/src/orchestration.ts` (job helpers:
+`jobIsActive` / `jobIsTerminal` / `jobIsCanceling` / `jobCanCancel` /
+`jobPhaseLabel` / `jobProgressLabel` / `jobRunningStepIds` / `runButtonLabel`) with
+unit coverage in `apps/dashboard/test/orchestration.test.ts`.
 
 Progress visibility is now honestly **live**: a `run-async` job runs on a
 background thread that drives the SAME governed, tested `run_orchestration` one
@@ -2038,9 +2043,23 @@ still carries whatever rounds actually completed). The worker never spins: each
 round moves ≥1 brief to a terminal outcome and it stops as soon as a round runs no
 brief, the per-job budget is spent, or the orchestration is no longer `running`.
 Duplicate starts are rejected (409, one active job per orchestration) and the fleet
-is capped (429 past `MAX_ACTIVE_JOBS`). Backend job lifecycle/duplicate/cap/aggregate
-logic is unit-tested in `crates/relux-kernel/src/server.rs`; an end-to-end HTTP
-smoke (`scripts/smoke-orchestration-job.ps1`, plus a real-Claude-CLI variant
+is capped (429 past `MAX_ACTIVE_JOBS`).
+
+**Cancellation is cooperative and honest.** A cancel request sets a flag the worker
+checks **between** rounds (where the kernel lock is free and the prior round has
+fully persisted). It does **not** kill an adapter process mid-flight: the round that
+is already running finishes — every brief in it keeps its real recorded outcome —
+and the worker then stops *before* the next round and marks the job `canceled`. The
+remaining briefs are left in their durable (pending) state, so a human can resume
+with a fresh run later (a canceled job is terminal and no longer blocks a new one).
+The cancel endpoint only sets the flag; the worker owns the `canceled` state
+transition, so cancellation never races the worker on the state field. A cancel that
+arrives too late (the job finished its rounds first) leaves the job `completed` —
+never a faked cancellation. Backend job lifecycle/duplicate/cap/aggregate **and the
+cancel state machine + the cooperative worker stop (with a positive control proving
+the same plan runs to completion without a cancel)** are unit-tested in
+`crates/relux-kernel/src/server.rs`; an end-to-end HTTP smoke
+(`scripts/smoke-orchestration-job.ps1`, plus a real-Claude-CLI variant
 `scripts/smoke-orchestration-job-claude.ps1`) proves the start → poll → terminal
 path against a live kernel.
 
