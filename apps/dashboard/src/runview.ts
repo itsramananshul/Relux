@@ -168,6 +168,10 @@ export function artifactTypeLabel(type: string): string {
 // "proposed" so a future/unknown status still renders honestly.
 const KNOWN_CHANGE_STATUSES = new Set(["proposed", "approved", "rejected", "applied"]);
 
+// The set of known proposed-change actions; anything else (or absent) normalizes
+// to "replace" so older records and unknown future actions still render honestly.
+const KNOWN_CHANGE_ACTIONS = new Set(["replace", "create"]);
+
 // The reviewable proposed file changes a run captured from its adapter result
 // envelope (master plan §15 / §9.6). Defensive: only accepts well-formed entries
 // (object with string `path` + `new_content` + `status`), so a malformed payload
@@ -193,8 +197,13 @@ export function runProposedChanges(
       typeof rec.status === "string" && KNOWN_CHANGE_STATUSES.has(rec.status)
         ? (rec.status as string)
         : "proposed";
+    const action =
+      typeof rec.action === "string" && KNOWN_CHANGE_ACTIONS.has(rec.action)
+        ? (rec.action as string)
+        : "replace";
     out.push({
       path: rec.path,
+      action,
       new_content: rec.new_content,
       new_sha256: typeof rec.new_sha256 === "string" ? rec.new_sha256 : "",
       bytes: typeof rec.bytes === "number" ? rec.bytes : rec.new_content.length,
@@ -207,6 +216,19 @@ export function runProposedChanges(
     });
   }
   return out;
+}
+
+// A short, human label for a proposed-change action ("replace" / "create").
+// Anything unrecognized reads as "Replace" (the default), matching the parser.
+export function proposedChangeActionLabel(action: string | undefined): string {
+  if (action === "create") return "Create";
+  return "Replace";
+}
+
+// Whether this change creates a brand-new file (vs replacing an existing one).
+// A create needs no baseline; a replace does. Treats a missing action as replace.
+export function isCreateProposedChange(change: ReluxProposedChange): boolean {
+  return change.action === "create";
 }
 
 // A short, human label for a proposed-change status.
@@ -237,11 +259,14 @@ export function canReviewProposedChange(change: ReluxProposedChange): boolean {
   return change.status === "proposed";
 }
 
-// Whether an operator can apply this change from the UI: only an `approved`
-// change with a baseline hash is eligible (apply refuses without a baseline in
-// v1). The backend re-checks everything; this just avoids offering a dead button.
+// Whether an operator can apply this change from the UI: it must be `approved`,
+// and a `replace` additionally needs a baseline hash (apply refuses without one in
+// v1). A `create` needs no baseline (there is no prior file). The backend
+// re-checks everything; this just avoids offering a dead button.
 export function canApplyProposedChange(change: ReluxProposedChange): boolean {
-  return change.status === "approved" && typeof change.baseline_sha256 === "string";
+  if (change.status !== "approved") return false;
+  if (isCreateProposedChange(change)) return true;
+  return typeof change.baseline_sha256 === "string";
 }
 
 // The indices of the changes that are still reviewable (status "proposed"), in

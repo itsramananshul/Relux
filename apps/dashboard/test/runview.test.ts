@@ -18,6 +18,8 @@ import {
   runProposedChanges,
   proposedChangeStatusLabel,
   proposedChangeStatusTone,
+  proposedChangeActionLabel,
+  isCreateProposedChange,
   canReviewProposedChange,
   canApplyProposedChange,
   reviewableProposedChangeIndices,
@@ -163,7 +165,36 @@ test("runProposedChanges returns only well-formed changes and normalizes status"
   assert.equal(cs[0].path, "a.txt");
   assert.equal(cs[0].status, "approved");
   assert.equal(cs[0].baseline_sha256, "b");
+  assert.equal(cs[0].action, "replace"); // no action field → default replace
   assert.equal(cs[1].status, "proposed"); // unknown normalized
+});
+
+test("runProposedChanges parses the action field and normalizes unknown/absent to replace", () => {
+  const run = {
+    id: "r", task_id: "t", agent_id: "a", adapter_plugin: "p", status: "completed",
+    proposed_changes: [
+      { path: "new.txt", action: "create", new_content: "hi", new_sha256: "h", bytes: 2, source: "x", status: "proposed" },
+      { path: "old.txt", action: "replace", new_content: "yo", new_sha256: "h", bytes: 2, source: "x", status: "proposed", baseline_sha256: "b" },
+      { path: "weird.txt", action: "delete", new_content: "z", new_sha256: "h", bytes: 1, source: "x", status: "proposed" }, // unknown → replace
+      { path: "legacy.txt", new_content: "q", new_sha256: "h", bytes: 1, source: "x", status: "proposed" }, // absent → replace
+    ],
+  } as any;
+  const cs = runProposedChanges(run);
+  assert.equal(cs.length, 4);
+  assert.equal(cs[0].action, "create");
+  assert.equal(cs[1].action, "replace");
+  assert.equal(cs[2].action, "replace"); // unknown normalized
+  assert.equal(cs[3].action, "replace"); // absent normalized
+});
+
+test("proposedChangeActionLabel and isCreateProposedChange classify the action honestly", () => {
+  assert.equal(proposedChangeActionLabel("create"), "Create");
+  assert.equal(proposedChangeActionLabel("replace"), "Replace");
+  assert.equal(proposedChangeActionLabel(undefined), "Replace");
+  assert.equal(proposedChangeActionLabel("zzz"), "Replace");
+  assert.equal(isCreateProposedChange({ action: "create" } as any), true);
+  assert.equal(isCreateProposedChange({ action: "replace" } as any), false);
+  assert.equal(isCreateProposedChange({} as any), false); // missing → replace
 });
 
 test("runProposedChanges is empty for a run with none or a bad shape", () => {
@@ -181,29 +212,38 @@ test("proposedChangeStatusLabel and tone map known states honestly", () => {
   assert.equal(proposedChangeStatusTone("rejected"), "backlog");
 });
 
-test("canReview/canApply gate on status and a baseline hash", () => {
+test("canReview/canApply gate on status, action, and a baseline hash", () => {
   const mk = (status: string, baseline?: string) =>
     ({ path: "f", new_content: "x", new_sha256: "h", bytes: 1, source: "x", status, baseline_sha256: baseline }) as any;
+  const mkCreate = (status: string) =>
+    ({ path: "f", action: "create", new_content: "x", new_sha256: "h", bytes: 1, source: "x", status }) as any;
   assert.equal(canReviewProposedChange(mk("proposed")), true);
   assert.equal(canReviewProposedChange(mk("approved")), false);
-  // Apply needs an approved change WITH a baseline hash.
+  // A replace apply needs an approved change WITH a baseline hash.
   assert.equal(canApplyProposedChange(mk("approved", "abc")), true);
   assert.equal(canApplyProposedChange(mk("approved")), false); // no baseline → not applyable
   assert.equal(canApplyProposedChange(mk("proposed", "abc")), false);
+  // A create apply needs only approval — no baseline.
+  assert.equal(canApplyProposedChange(mkCreate("approved")), true);
+  assert.equal(canApplyProposedChange(mkCreate("proposed")), false);
 });
 
 test("batch helpers select reviewable/apply-eligible indices and gate the toolbar", () => {
   const mk = (status: string, baseline?: string) =>
     ({ path: "f", new_content: "x", new_sha256: "h", bytes: 1, source: "x", status, baseline_sha256: baseline }) as any;
+  const mkCreate = (status: string) =>
+    ({ path: "f", action: "create", new_content: "x", new_sha256: "h", bytes: 1, source: "x", status }) as any;
   const changes = [
     mk("proposed"),            // 0: reviewable, not apply-eligible
-    mk("approved", "abc"),     // 1: apply-eligible
-    mk("approved"),            // 2: approved but NO baseline → not apply-eligible
+    mk("approved", "abc"),     // 1: apply-eligible (replace + baseline)
+    mk("approved"),            // 2: approved replace but NO baseline → not apply-eligible
     mk("applied", "abc"),      // 3: terminal — neither
     mk("rejected"),            // 4: terminal — neither
+    mkCreate("approved"),      // 5: apply-eligible (create, no baseline needed)
+    mkCreate("proposed"),      // 6: reviewable, not apply-eligible
   ];
-  assert.deepEqual(reviewableProposedChangeIndices(changes), [0]);
-  assert.deepEqual(applyEligibleProposedChangeIndices(changes), [1]);
+  assert.deepEqual(reviewableProposedChangeIndices(changes), [0, 6]);
+  assert.deepEqual(applyEligibleProposedChangeIndices(changes), [1, 5]);
   // The batch toolbar shows only when there is MORE THAN ONE change.
   assert.equal(showBatchProposedChangeControls(changes), true);
   assert.equal(showBatchProposedChangeControls([mk("approved", "abc")]), false);

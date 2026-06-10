@@ -2629,13 +2629,24 @@ remain, in rough priority for the next slices:
    create a task assigned to that adapter and run it — the documented path that
    captures proposed changes with the safe review/apply flow. Structurally, the
    Prime chat response wire (`PrimeTurn`) carries no `proposed_changes`/`artifacts`
-   field, so a proposed change can never reach the chat surface. What is
-   still **not** done: multi-file/transactional apply, file create/rename/delete
-   (v1 is single-file full-content replacement over an existing baseline — a
-   missing target is a conflict); arbitrary patch/diff parsing (deliberately not
-   built — replacement is safer); live event streaming (the page polls/refreshes a
-   synchronous run rather than tailing it); and resuming a *partial* CLI run (retry
-   is a new attempt). Execution-environment runtimes are not implemented.
+   field, so a proposed change can never reach the chat surface. **Apply now
+   supports two actions** (`action: "replace"` — the default and historical
+   behavior — or `action: "create"`; a missing action defaults to `replace` for
+   backward compatibility): a `replace` is a full-content replacement over an
+   existing baseline file (a missing target is a conflict), while a `create` adds a
+   **new file** that must NOT already exist (an existing path is a conflict — never
+   overwritten), carries **no baseline**, and creates any missing parent
+   directories (each a sanitized, non-excluded, in-root component, with no symlink
+   crossing) before placing the file atomically (an O_EXCL reservation + temp +
+   rename, so a racing creator never clobbers). Both actions share the same
+   approval gate, path/exclusion checks, workspace-root confinement, transactional
+   set-apply (validate-all-then-write-all, with creates rolled back by deletion on a
+   mid-apply fault), and honest 409/422 refusals. What is still **not** done: file
+   rename/delete (only replace + create are modeled); arbitrary patch/diff parsing
+   (deliberately not built — replacement is safer); live event streaming (the page
+   polls/refreshes a synchronous run rather than tailing it); and resuming a
+   *partial* CLI run (retry is a new attempt). Execution-environment runtimes are
+   not implemented.
 4. **Multi-agent autonomy.** *(First slice addressed post-v0.1.2; depth slice
    added after.)* See "Orchestration (First Multi-Agent Slice)" below. Prime can
    decompose a multi-step goal into role-typed **briefs assigned to different

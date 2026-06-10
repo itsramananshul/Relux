@@ -3460,6 +3460,7 @@ mod tests {
         let mut run = run_with(Vec::new());
         run.proposed_changes = vec![relux_core::ProposedChange {
             path: "src/main.rs".into(),
+            action: relux_core::ProposedChangeAction::Replace,
             new_content: "fn main() {}\n".into(),
             baseline_sha256: Some(relux_core::sha256_hex(b"old")),
             new_sha256: relux_core::sha256_hex(b"fn main() {}\n"),
@@ -3475,6 +3476,7 @@ mod tests {
         assert_eq!(cs.len(), 1);
         assert_eq!(cs[0].get("path").and_then(|v| v.as_str()), Some("src/main.rs"));
         assert_eq!(cs[0].get("status").and_then(|v| v.as_str()), Some("approved"));
+        assert_eq!(cs[0].get("action").and_then(|v| v.as_str()), Some("replace"));
         assert_eq!(cs[0].get("new_content").and_then(|v| v.as_str()), Some("fn main() {}\n"));
     }
 

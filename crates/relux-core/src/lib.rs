@@ -49,8 +49,8 @@ pub use prime::{
     PrimeIntent, PrimePlan, PrimeTurn, StateSummary, TaskBrief,
 };
 pub use proposed_change::{
-    capture_proposed_changes, sha256_hex, ProposedChange, ProposedChangeStatus,
-    MAX_CONTENT_BYTES, MAX_PROPOSED_CHANGES,
+    capture_proposed_changes, sha256_hex, ProposedChange, ProposedChangeAction,
+    ProposedChangeStatus, MAX_CONTENT_BYTES, MAX_PROPOSED_CHANGES,
 };
 pub use redact::redact_secrets;
 pub use run::{Run, RunId, RunStatus};

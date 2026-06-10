@@ -9,6 +9,50 @@ once a stable release is cut.
 
 ### Added
 
+- **Safe new-file `create` action for proposed changes (master plan §15 / §9.6).**
+  Extends the proposed-change model beyond replace-over-an-existing-baseline with a
+  second action: a change now carries `action: "replace"` (the default and the
+  historical behavior) or `action: "create"` (a brand-new file). **Backward
+  compatible** — a missing `action` (older envelopes and persisted records)
+  deserializes as `replace`, and an unknown action string drops the change at
+  capture (we never store a change we could not safely interpret). (1) **Core** —
+  `relux_core::ProposedChangeAction` + a `#[serde(default)]` `action` field on
+  `ProposedChange`; capture parses the action, and a `create` is recorded with
+  **no baseline** (there is no prior file, so any declared baseline is dropped).
+  (2) **Kernel apply (the safety bar)** — a `create` requires the same explicit
+  **approval**, the same strict **safe relative / excluded-path** gate, and the
+  same **workspace-root confinement** (resolve inside the canonical `working_dir`,
+  no `..`/symlink escape) as a replace, but: it needs **no baseline**; the target
+  **must NOT already exist** (an existing file, dir, or symlink is an honest
+  **conflict** — never overwritten); any **missing parent directories** are created
+  (each component is a sanitized, non-excluded, in-root name and the existing
+  prefix has no symlink, so directory creation cannot be redirected outside the
+  root — chosen policy: create parents when every component is safe, else refuse);
+  and the file is placed **atomically** via an O_EXCL `create_new` reservation (so
+  a racing creator loses) followed by a temp-file + rename (crash-atomic content).
+  The **transactional set apply** validates every create/replace **together first**
+  (no writes) and only then writes all; on a mid-apply fault it rolls back —
+  replaces restored to their captured originals, **creates deleted** — leaving no
+  net change, with an honest message if a rollback could not fully complete.
+  (3) **API** — unchanged routes; a create-over-existing conflict maps to the
+  existing `409`, structural refusals to `422`. (4) **Dashboard** — Run Detail
+  shows the **action** (Create / Replace) per change, offers approve/apply and safe
+  batch apply for creates (a create is apply-eligible once approved — no baseline
+  needed), and replaces the "no baseline" note with an honest "New file — created
+  only if it does not already exist" note for creates. (5) **Tests** — core:
+  create capture, missing-action-defaults-to-replace, unknown-action-dropped,
+  legacy-record deserialization, action-on-the-wire; kernel: create writes a new
+  file (with parent dirs) / refuses an existing target as a conflict / refuses an
+  excluded path, end-to-end review→apply create, a **mixed create+replace set**
+  applied atomically, a create-conflict set leaving everything untouched, a genuine
+  **phase-2 rollback that deletes a created file**, and a **fake-CLI envelope with
+  one create + one replace** captured, approved, and set-applied into a temp
+  workspace; dashboard `runview` action parsing/labels + create apply-eligibility;
+  and the PowerShell smoke (`scripts/smoke-proposed-change-apply.ps1`) extended with
+  the eight new create kernel tests. **Caveats / still not done:** only `replace`
+  and `create` are modeled (no rename/delete); a create of an empty file is dropped
+  at capture (same non-empty-content rule as replace); and the transaction is still
+  over **one run's** changes (one adapter → one workspace root).
 - **First safe multi-file transactional apply for a run's proposed changes
   (master plan §15 / §9.6).** Extends the single-file apply below with an
   **all-or-nothing transaction** over a *set* of a run's proposed changes: every

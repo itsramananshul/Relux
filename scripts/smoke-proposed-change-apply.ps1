@@ -4,12 +4,13 @@
 # CHANGES (RELUX_MASTER_PLAN §15 / §9.6). Two layers, both honest:
 #
 #   1. End-to-end model test (always): runs the canonical kernel integration
-#      test that drives a FAKE Claude CLI emitting a `proposed_changes` envelope
-#      (a full-content replacement + a correct baseline sha256), captures it onto
-#      the durable run, approves it, and APPLIES it into a temp workspace —
-#      asserting the file content actually changed. This is the "fake CLI envelope
-#      producing a proposed change and apply to a temp workspace" smoke, and it is
-#      cross-platform + deterministic (no network, no real Claude).
+#      tests that drive a FAKE Claude CLI emitting a `proposed_changes` envelope —
+#      a full-content replacement (with a baseline sha256) AND a new-file create
+#      (no baseline) — captures them onto the durable run, approves them, and
+#      APPLIES them into a temp workspace, asserting the files actually changed /
+#      were created. This is the "fake CLI envelope producing a proposed change and
+#      apply to a temp workspace" smoke, and it is cross-platform + deterministic
+#      (no network, no real Claude).
 #
 #   2. HTTP wiring check (optional, default on): starts `relux-kernel serve` on a
 #      free loopback port against a THROWAWAY RELUX_DB and confirms the new
@@ -61,7 +62,19 @@ $tests = @(
     'cli_run_captures_two_proposed_changes_and_set_apply_writes_both_end_to_end',
     'change_set_applies_multiple_files_atomically',
     'change_set_partial_conflict_leaves_all_files_untouched',
-    'change_set_refuses_duplicate_target_paths'
+    'change_set_refuses_duplicate_target_paths',
+    # Create action — new-file create within the same transaction safety model
+    # (RELUX_MASTER_PLAN §15): create writes a new file (with parent dirs), an
+    # existing target is a conflict, and a mixed create+replace set applies/rolls
+    # back atomically. Includes a fake-CLI envelope with ONE create + ONE replace.
+    'create_to_workspace_writes_new_file_and_makes_parent_dirs',
+    'create_to_workspace_refuses_existing_file_as_conflict',
+    'review_then_apply_create_writes_a_new_file',
+    'apply_create_over_existing_file_refuses_as_conflict_and_leaves_it',
+    'change_set_mixes_create_and_replace_atomically',
+    'change_set_create_conflict_leaves_everything_untouched',
+    'change_set_rolls_back_a_created_file_on_a_later_write_failure',
+    'cli_run_captures_one_create_and_one_replace_and_set_apply_writes_both_end_to_end'
 )
 foreach ($t in $tests) {
     $out = & cargo test -p relux-kernel --lib $t 2>$null | Out-String

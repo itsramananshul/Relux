@@ -26,14 +26,21 @@
 //! - the `content` must be **text** (no NUL byte) and within [`MAX_CONTENT_BYTES`];
 //! - the count is capped at [`MAX_PROPOSED_CHANGES`];
 //! - a `baseline_sha256`, when present, is validated as 64 lowercase hex chars
-//!   (anything else is dropped to `None`).
+//!   (anything else is dropped to `None`);
+//! - the `action` is `replace` (the default — full-content replacement over an
+//!   existing baseline file) or `create` (a brand-new file that must NOT already
+//!   exist at apply time). A missing `action` defaults to `replace` so older
+//!   envelopes and persisted records stay valid; an unknown action string drops
+//!   the change (we never store a change we could not safely interpret).
 //!
 //! Apply itself lives in the kernel ([`crate::ProposedChange`] is the durable
-//! record it works from) and adds the rest of the bar: apply requires an explicit
-//! operator **approval**, **refuses without a baseline hash** (no force in v1),
-//! verifies the baseline still matches the on-disk file (**conflict** otherwise),
-//! and only ever writes inside the run's controlled workspace root. Capturing a
-//! proposed change NEVER applies it.
+//! record it works from) and adds the rest of the bar. A `replace` apply requires
+//! an explicit operator **approval**, **refuses without a baseline hash** (no force
+//! in v1), and verifies the baseline still matches the on-disk file (**conflict**
+//! otherwise). A `create` apply also requires **approval**, needs **no baseline**
+//! (there is no prior content), and refuses if the target **already exists** (a
+//! conflict — it never overwrites). Both only ever write inside the run's
+//! controlled workspace root. Capturing a proposed change NEVER applies it.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -100,6 +107,34 @@ impl ProposedChangeStatus {
     }
 }
 
+/// The filesystem action a [`ProposedChange`] applies.
+///
+/// `Replace` (the default) is a **full-content replacement** of an *existing*
+/// file, gated by a baseline hash. `Create` is a **brand-new file** that must NOT
+/// already exist at apply time and needs no baseline. The two-variant set is kept
+/// deliberately small — no rename/delete in this slice — so every apply maps to
+/// exactly one strict, well-understood write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposedChangeAction {
+    /// Full-content replacement of an existing baseline file (the historical
+    /// behavior and the serde default, so a missing `action` deserializes here).
+    #[default]
+    Replace,
+    /// Create a new file that must not already exist at apply time.
+    Create,
+}
+
+impl ProposedChangeAction {
+    /// The wire/string label (matches the serde rename).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProposedChangeAction::Replace => "replace",
+            ProposedChangeAction::Create => "create",
+        }
+    }
+}
+
 /// One reviewable, applyable proposed file change: a **full-content replacement**
 /// of one text file at a safe relative `path`, with the agent's declared
 /// `baseline_sha256` so apply can detect a conflict. Captured read-only from the
@@ -109,12 +144,18 @@ impl ProposedChangeStatus {
 pub struct ProposedChange {
     /// Safe, relative, `/`-separated target path inside the run's workspace root.
     pub path: String,
+    /// The filesystem action this change applies — `replace` (over an existing
+    /// baseline file) or `create` (a new file). `#[serde(default)]` means an older
+    /// record or envelope with no `action` deserializes as `replace`.
+    #[serde(default)]
+    pub action: ProposedChangeAction,
     /// The full proposed new content of the file (text, within
     /// [`MAX_CONTENT_BYTES`]). Stored verbatim so apply writes exactly this.
     pub new_content: String,
     /// SHA-256 (lowercase hex) of the content the agent based its edit on, when
-    /// the envelope declared it. Apply **refuses without this** (no force in v1)
-    /// and refuses when it no longer matches the on-disk file (a conflict).
+    /// the envelope declared it. A `replace` apply **refuses without this** (no
+    /// force in v1) and refuses when it no longer matches the on-disk file (a
+    /// conflict). A `create` change carries no baseline (there is no prior file).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline_sha256: Option<String>,
     /// SHA-256 (lowercase hex) of `new_content`, computed at capture. Display +
@@ -198,6 +239,20 @@ fn capture_one(item: &serde_json::Value, source: &str) -> Option<ProposedChange>
         .and_then(|v| v.as_str())?;
     let path = sanitize_change_path(raw_path)?;
 
+    // Action: `replace` (default) or `create`. A missing action defaults to
+    // replace (backward compatibility); an unknown action drops the change — we
+    // never store a change we could not safely interpret as a known write.
+    let action = match obj
+        .get("action")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        None | Some("") | Some("replace") => ProposedChangeAction::Replace,
+        Some("create") => ProposedChangeAction::Create,
+        Some(_) => return None,
+    };
+
     // Content: must be present text within the cap, and not binary (no NUL).
     let content = obj
         .get("content")
@@ -208,20 +263,26 @@ fn capture_one(item: &serde_json::Value, source: &str) -> Option<ProposedChange>
         return None;
     }
 
-    // Baseline hash: optional; validated as 64 lowercase hex chars or dropped.
-    let baseline_sha256 = obj
-        .get("baseline_sha256")
-        .or_else(|| obj.get("baseline"))
-        .or_else(|| obj.get("base_sha256"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim().to_ascii_lowercase())
-        .filter(|s| is_sha256_hex(s));
+    // Baseline hash: a `replace` may carry one (validated as 64 lowercase hex
+    // chars or dropped); a `create` has no prior file, so any declared baseline is
+    // meaningless and is dropped to keep the record honest.
+    let baseline_sha256 = match action {
+        ProposedChangeAction::Create => None,
+        ProposedChangeAction::Replace => obj
+            .get("baseline_sha256")
+            .or_else(|| obj.get("baseline"))
+            .or_else(|| obj.get("base_sha256"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| is_sha256_hex(s)),
+    };
 
     let new_content = content.to_string();
     let new_sha256 = sha256_hex(new_content.as_bytes());
     Some(ProposedChange {
         bytes: new_content.len() as u64,
         path,
+        action,
         new_content,
         baseline_sha256,
         new_sha256,
@@ -345,6 +406,77 @@ mod tests {
         assert_eq!(cs[0].new_sha256, sha256_hex(b"new\n"));
         assert_eq!(cs[0].source, "claude-cli");
         assert_eq!(cs[0].status, ProposedChangeStatus::Proposed);
+    }
+
+    #[test]
+    fn missing_action_defaults_to_replace_for_backward_compat() {
+        // An envelope item with no `action` field is the historical shape and must
+        // still capture as a replace (backward compatibility).
+        let value = json!([{ "path": "f.txt", "content": "x" }]);
+        let cs = capture_proposed_changes(Some(&value), "x");
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].action, ProposedChangeAction::Replace);
+    }
+
+    #[test]
+    fn explicit_replace_action_is_captured() {
+        let base = sha256_hex(b"old\n");
+        let value = json!([
+            { "path": "f.txt", "action": "replace", "content": "new\n", "baseline_sha256": base }
+        ]);
+        let cs = capture_proposed_changes(Some(&value), "x");
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].action, ProposedChangeAction::Replace);
+        assert_eq!(cs[0].baseline_sha256.as_deref(), Some(base.as_str()));
+    }
+
+    #[test]
+    fn create_action_is_captured_without_baseline() {
+        // A create has no prior file: any declared baseline is dropped, and the
+        // action is recorded so apply can require the target be absent.
+        let value = json!([
+            { "path": "new/file.rs", "action": "create", "content": "fn main() {}\n",
+              "baseline_sha256": sha256_hex(b"ignored") }
+        ]);
+        let cs = capture_proposed_changes(Some(&value), "claude-cli");
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].action, ProposedChangeAction::Create);
+        assert_eq!(cs[0].path, "new/file.rs");
+        assert_eq!(cs[0].new_content, "fn main() {}\n");
+        assert_eq!(cs[0].baseline_sha256, None);
+    }
+
+    #[test]
+    fn unknown_action_drops_the_change() {
+        let value = json!([
+            { "path": "f.txt", "action": "delete", "content": "x" },
+            { "path": "g.txt", "action": "rename", "content": "y" }
+        ]);
+        assert!(capture_proposed_changes(Some(&value), "x").is_empty());
+    }
+
+    #[test]
+    fn action_appears_on_the_wire() {
+        let value = json!([{ "path": "f.txt", "action": "create", "content": "x" }]);
+        let c = &capture_proposed_changes(Some(&value), "x")[0];
+        let v = serde_json::to_value(c).unwrap();
+        assert_eq!(v.get("action").and_then(|s| s.as_str()), Some("create"));
+    }
+
+    #[test]
+    fn legacy_record_without_action_deserializes_as_replace() {
+        // A persisted record from before the `action` field existed has no
+        // `action`; `#[serde(default)]` must read it back as a replace.
+        let legacy = json!({
+            "path": "f.txt",
+            "new_content": "hi",
+            "new_sha256": sha256_hex(b"hi"),
+            "bytes": 2,
+            "source": "x",
+            "status": "approved"
+        });
+        let c: ProposedChange = serde_json::from_value(legacy).unwrap();
+        assert_eq!(c.action, ProposedChangeAction::Replace);
     }
 
     #[test]

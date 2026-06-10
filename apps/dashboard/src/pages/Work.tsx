@@ -18,6 +18,8 @@ import {
   runProposedChanges,
   proposedChangeStatusLabel,
   proposedChangeStatusTone,
+  proposedChangeActionLabel,
+  isCreateProposedChange,
   canReviewProposedChange,
   canApplyProposedChange,
   reviewableProposedChangeIndices,
@@ -738,6 +740,9 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
                 <div key={`${c.path}-${i}`} className="card" style={{ padding: 10 }}>
                   <div className="row" style={{ alignItems: "center", gap: 8 }}>
                     <span className="mono" style={{ fontSize: 12 }}>{c.path}</span>
+                    <span className="badge backlog" title="The filesystem action this change applies">
+                      {proposedChangeActionLabel(c.action)}
+                    </span>
                     <span className={`badge ${proposedChangeStatusTone(c.status)}`}>
                       {proposedChangeStatusLabel(c.status)}
                     </span>
@@ -767,7 +772,9 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
                         disabled={pcBusy === i || !canApplyProposedChange(c)}
                         title={
                           canApplyProposedChange(c)
-                            ? "Write the new content into the run's workspace root"
+                            ? isCreateProposedChange(c)
+                              ? "Create the new file in the run's workspace root"
+                              : "Write the new content into the run's workspace root"
                             : "Apply needs a baseline hash (none was recorded)"
                         }
                         onClick={() => void applyChange(i)}
@@ -776,10 +783,16 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
                       </button>
                     )}
                   </div>
-                  {!c.baseline_sha256 && (
+                  {isCreateProposedChange(c) ? (
                     <div className="muted" style={{ fontSize: 10, marginTop: 4 }}>
-                      No baseline hash — apply is refused (no force in v1).
+                      New file — created only if it does not already exist (no baseline needed).
                     </div>
+                  ) : (
+                    !c.baseline_sha256 && (
+                      <div className="muted" style={{ fontSize: 10, marginTop: 4 }}>
+                        No baseline hash — apply is refused (no force in v1).
+                      </div>
+                    )
                   )}
                   {c.refused_reason && (
                     <div className="banner err" style={{ fontSize: 10, marginTop: 6 }}>
