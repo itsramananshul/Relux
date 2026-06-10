@@ -609,7 +609,18 @@ a > .stat-card:hover { border-color: var(--text-faint); }
    compact "raw" dump, B&W with semantic-only color. Reused on the Runs page
    and embedded in the Brief workroom. */
 .xtr { margin-top: 4px; }
-.xtr-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+/* Header: a meta group (title + live/progress/stalled cues) and an actions
+   group (nice/raw + Refresh) split with space-between — no flex-1 spacer, so
+   when the meta wraps in a narrow compact embed the controls stay together and
+   reachable instead of being stranded. */
+.xtr-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.xtr-bar-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; flex: 1 1 auto; }
+.xtr-bar-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+/* Compact embed (Brief workroom): tighten the header so the stalled cue fits a
+   narrow panel without crowding. The cue is kept — only the spacing shrinks. */
+.xtr-bar--compact { gap: 6px; }
+.xtr-bar--compact .xtr-bar-meta { gap: 6px; }
+.xtr-bar--compact .xtr-bar-actions { gap: 6px; }
 .xtr-scroll { overflow: auto; font-size: 12px; }
 .xtr-nice { display: flex; flex-direction: column; gap: 8px; }
 .xtr-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; vertical-align: middle; flex: 0 0 auto; }

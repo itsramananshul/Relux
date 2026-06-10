@@ -113,6 +113,29 @@ export function runTranscriptProgress(events: RunEvent[]): TranscriptProgress {
   };
 }
 
+// ── Compact-embed layout (relix-dashboard-design §8 / §11) ─────────────────
+// The same `<RunTranscript>` renders full-width on the Runs page AND embedded
+// in the Brief workroom Conversation. The embed is `compact`: a tighter header
+// (smaller gaps) and a shorter scroll viewport, so the live/stalled cues stay
+// readable in a narrow panel without crowding the nice/raw + Refresh controls
+// or pushing them offscreen. These are pure so the compact wiring is pinned by
+// tests and can't silently regress — the stalled cue itself is never dropped,
+// only laid out tighter.
+export const TRANSCRIPT_SCROLL_MAX = 420;
+export const TRANSCRIPT_SCROLL_MAX_COMPACT = 280;
+
+// Header bar class — adds the `--compact` modifier for the embed so its CSS can
+// tighten the gaps. The modifier never hides the live/stalled cues.
+export function transcriptBarClass(compact?: boolean): string {
+  return compact ? "xtr-bar xtr-bar--compact" : "xtr-bar";
+}
+
+// Scroll viewport max height (px): shorter in the compact embed so the
+// transcript doesn't dominate the Brief workroom.
+export function transcriptScrollMax(compact?: boolean): number {
+  return compact ? TRANSCRIPT_SCROLL_MAX_COMPACT : TRANSCRIPT_SCROLL_MAX;
+}
+
 // "just now" / "12s ago" / "3m ago" for the last-event clock on the progress
 // chip. `nowSecs` is injected so the helper stays pure + testable. Returns null
 // when there's no timestamp to age.

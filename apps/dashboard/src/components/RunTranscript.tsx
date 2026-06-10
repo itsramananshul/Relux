@@ -7,6 +7,8 @@ import {
   mergeRunEvents,
   noActivityLabel,
   runTranscriptProgress,
+  transcriptBarClass,
+  transcriptScrollMax,
 } from "../runtranscript";
 
 // ── Run transcript renderer (relix-dashboard-design §8) ────────────────────
@@ -361,47 +363,54 @@ export function RunTranscript({ runId, status, compact, refreshKey, onEvents }: 
 
   return (
     <div className="xtr">
-      <div className="xtr-bar">
-        <strong style={{ fontSize: 12 }}>Transcript</strong>
-        {running && (
-          <span
-            className={"badge " + LIVE_TONE[liveConn]}
-            style={{ fontSize: 9 }}
-            title="live run-event stream (auto-updates this transcript)"
-          >
-            ● {LIVE_LABEL[liveConn]}
-          </span>
-        )}
-        {running && progress.count > 0 && (
-          <span
-            className="muted mono"
-            style={{ fontSize: 10 }}
-            title="real transcript progress — event count · current phase · last event"
-          >
-            {progress.count} event{progress.count === 1 ? "" : "s"}
-            {progress.phase ? ` · ${progress.phase}` : ""}
-            {ago ? ` · ${ago}` : ""}
-          </span>
-        )}
-        {running && stalledNote && (
-          <span
-            className="badge in_progress"
-            style={{ fontSize: 9 }}
-            title="real elapsed silence — no new transcript event has arrived for a while (not a guaranteed stall, just no observed activity)"
-          >
-            ◌ {stalledNote}
-          </span>
-        )}
-        <div className="spacer" style={{ flex: 1 }} />
-        <div className="btn-group" role="group" aria-label="Transcript view mode">
-          <button className={"btn sm " + (mode === "nice" ? "" : "ghost")} onClick={() => setMode("nice")}>
-            nice
-          </button>
-          <button className={"btn sm " + (mode === "raw" ? "" : "ghost")} onClick={() => setMode("raw")}>
-            raw
-          </button>
+      <div className={transcriptBarClass(compact)}>
+        {/* Title + honest live/progress/stalled cues group on the left; the
+            view-mode + Refresh controls stay together on the right. Two groups
+            (not a flex-1 spacer) so a long stalled cue wraps within the meta
+            group in a narrow compact panel without stranding the controls. */}
+        <div className="xtr-bar-meta">
+          <strong style={{ fontSize: 12 }}>Transcript</strong>
+          {running && (
+            <span
+              className={"badge " + LIVE_TONE[liveConn]}
+              style={{ fontSize: 9 }}
+              title="live run-event stream (auto-updates this transcript)"
+            >
+              ● {LIVE_LABEL[liveConn]}
+            </span>
+          )}
+          {running && progress.count > 0 && (
+            <span
+              className="muted mono"
+              style={{ fontSize: 10 }}
+              title="real transcript progress — event count · current phase · last event"
+            >
+              {progress.count} event{progress.count === 1 ? "" : "s"}
+              {progress.phase ? ` · ${progress.phase}` : ""}
+              {ago ? ` · ${ago}` : ""}
+            </span>
+          )}
+          {running && stalledNote && (
+            <span
+              className="badge in_progress"
+              style={{ fontSize: 9 }}
+              title="real elapsed silence — no new transcript event has arrived for a while (not a guaranteed stall, just no observed activity)"
+            >
+              ◌ {stalledNote}
+            </span>
+          )}
         </div>
-        <button className="btn ghost sm" onClick={() => void load()}>Refresh</button>
+        <div className="xtr-bar-actions">
+          <div className="btn-group" role="group" aria-label="Transcript view mode">
+            <button className={"btn sm " + (mode === "nice" ? "" : "ghost")} onClick={() => setMode("nice")}>
+              nice
+            </button>
+            <button className={"btn sm " + (mode === "raw" ? "" : "ghost")} onClick={() => setMode("raw")}>
+              raw
+            </button>
+          </div>
+          <button className="btn ghost sm" onClick={() => void load()}>Refresh</button>
+        </div>
       </div>
       {loading && events.length === 0 ? (
         <div className="loading">Loading transcript…</div>
@@ -410,7 +419,7 @@ export function RunTranscript({ runId, status, compact, refreshKey, onEvents }: 
           {running ? "No transcript events yet — the Shift just started." : "No transcript events recorded."}
         </div>
       ) : (
-        <div className="xtr-scroll" style={{ maxHeight: compact ? 280 : 420 }}>
+        <div className="xtr-scroll" style={{ maxHeight: transcriptScrollMax(compact) }}>
           {mode === "nice" ? <NiceView blocks={blocks} /> : <RawView events={events} />}
         </div>
       )}

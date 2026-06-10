@@ -8,6 +8,10 @@ import {
   noActivityLabel,
   RUN_STALL_SECS,
   runTranscriptProgress,
+  transcriptBarClass,
+  transcriptScrollMax,
+  TRANSCRIPT_SCROLL_MAX,
+  TRANSCRIPT_SCROLL_MAX_COMPACT,
 } from "../src/runtranscript.ts";
 import { noActivityLabel as reluxNoActivityLabel } from "../src/reluxruntranscript.ts";
 import type { RunEvent } from "../src/api.ts";
@@ -81,6 +85,23 @@ test("lastEventAgo formats the last-event clock (pure, injected now)", () => {
   assert.equal(lastEventAgo(100, 100 + 185), "3m ago");
   // A clock skew (future ts) never goes negative.
   assert.equal(lastEventAgo(200, 100), "just now");
+});
+
+test("transcript compact layout: bar modifier + shorter scroll, cue never dropped", () => {
+  // The Runs-page (full) render gets the plain bar + the taller viewport.
+  assert.equal(transcriptBarClass(false), "xtr-bar");
+  assert.equal(transcriptBarClass(undefined), "xtr-bar");
+  assert.equal(transcriptScrollMax(false), TRANSCRIPT_SCROLL_MAX);
+  // The Brief-workroom embed (compact) tightens the header via the `--compact`
+  // modifier and shortens the viewport — but it only adds to the bar class, so
+  // every live/stalled cue rendered inside it survives.
+  assert.equal(transcriptBarClass(true), "xtr-bar xtr-bar--compact");
+  assert.ok(transcriptBarClass(true).startsWith("xtr-bar "));
+  assert.equal(transcriptScrollMax(true), TRANSCRIPT_SCROLL_MAX_COMPACT);
+  // Compact is genuinely shorter (so it doesn't dominate the workroom) but not
+  // collapsed away.
+  assert.ok(TRANSCRIPT_SCROLL_MAX_COMPACT < TRANSCRIPT_SCROLL_MAX);
+  assert.ok(TRANSCRIPT_SCROLL_MAX_COMPACT > 0);
 });
 
 test("noActivityLabel drives the legacy stalled cue (shared with the Relux surface)", () => {
