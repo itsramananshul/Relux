@@ -20,7 +20,8 @@
 //! `(message, StateSummary)`.
 
 use relux_core::{
-    PrimeAction, PrimeIntent, PrimePlan, RiskLevel, StateSummary, TaskBrief, TaskStatus,
+    plan_orchestration, PrimeAction, PrimeIntent, PrimePlan, RiskLevel, StateSummary, TaskBrief,
+    TaskStatus,
 };
 
 /// Leading verbs that signal the user wants new work created.
@@ -109,6 +110,39 @@ pub fn classify_intent(message: &str) -> PrimeIntent {
         || has(&["use the echo", "use the status", "the echo tool", "the status tool"])
     {
         return PrimeIntent::ToolInvocation;
+    }
+    // Orchestration: the user explicitly wants Prime to coordinate a goal across
+    // multiple agents. Gated on explicit coordination phrasing (never a bare verb)
+    // and checked before task creation/agent creation so "orchestrate X, Y and Z"
+    // is decomposed into briefs instead of being read as one task. The pure planner
+    // ([`relux_core::plan_orchestration`]) still decides whether the goal actually
+    // splits; a non-splittable goal becomes a clarifying question, not a storm.
+    if has(&[
+        "orchestrate",
+        "coordinate",
+        "split this across",
+        "split across agents",
+        "split it across",
+        "divide this",
+        "divide it across",
+        "fan out",
+        "fan this out",
+        "parallelize",
+        "in parallel across",
+        "multiple agents",
+        "several agents",
+        "across agents",
+        "across the agents",
+        "assign across",
+        "set up a team",
+        "spin up a team",
+        "have the team",
+        "have agents",
+        "team of agents",
+        "delegate across",
+        "plan and assign",
+    ]) {
+        return PrimeIntent::Orchestration;
     }
     if has(&["and run it", "and start it", "and execute it"])
         && (has(&["create", "make", "add", "new task"])
@@ -446,6 +480,31 @@ pub fn decide(message: &str, intent: &PrimeIntent, summary: &StateSummary) -> Pr
             text: "Tell me the goal and the constraints and I will outline options. I will not create tasks or agents until you confirm."
                 .to_string(),
         },
+        // Orchestration: decompose the goal across agents. The pure planner decides
+        // whether the goal genuinely splits into multiple briefs; only a real
+        // multi-agent plan becomes an `Act` (creating briefs is safe and in-scope,
+        // like single-task creation). A non-splittable goal clarifies instead of
+        // fanning out (section 10.4, section 10.5).
+        PrimeIntent::Orchestration => {
+            let goal = orchestration_goal(message);
+            let plan = plan_orchestration(&goal, summary);
+            if plan.is_multi_agent() {
+                let agents = plan.agent_labels();
+                PrimePlan::Act {
+                    action: PrimeAction::OrchestrateGoal { goal: goal.clone() },
+                    text: format!(
+                        "Planning an orchestration for \"{goal}\": {} briefs across {}.",
+                        plan.steps.len(),
+                        count_phrase(agents.len(), "agent"),
+                    ),
+                }
+            } else {
+                PrimePlan::Clarify {
+                    text: "That reads like a single piece of work, not something to split across agents. Give me the distinct steps - e.g. \"research the options, implement a prototype, and write the docs\" - or say \"create a task to ...\" and I'll make one brief."
+                        .to_string(),
+                }
+            }
+        }
         PrimeIntent::ApprovalResponse => PrimePlan::Clarify {
             text: "Tell me the approval id to approve or reject.".to_string(),
         },
@@ -750,6 +809,85 @@ fn echo_input_from(message: &str) -> String {
         "{}".to_string()
     } else {
         serde_json::json!({ "message": rest }).to_string()
+    }
+}
+
+/// Strip a leading orchestration directive ("orchestrate", "coordinate the work to",
+/// "split this across the agents to", ...) so what remains is the goal Prime should
+/// decompose. Conservative: it only removes a known lead-in, never the substance.
+fn orchestration_goal(message: &str) -> String {
+    let trimmed = message.trim();
+    let lower = trimmed.to_lowercase();
+    // Ordered longest-first so a compound lead-in wins over its shorter prefix.
+    const LEAD_INS: &[&str] = &[
+        "prime, ",
+        "prime ",
+        "please ",
+        "can you ",
+        "could you ",
+        "i need you to ",
+        "set up a team to ",
+        "spin up a team to ",
+        "have the team ",
+        "have agents ",
+        "split this across the agents to ",
+        "split this across agents to ",
+        "split this across agents and ",
+        "split this across agents ",
+        "split this across ",
+        "split it across agents to ",
+        "split it across ",
+        "divide this across agents to ",
+        "divide this into ",
+        "divide this ",
+        "divide it across ",
+        "fan this out to ",
+        "fan out to ",
+        "fan out ",
+        "parallelize ",
+        "delegate across agents to ",
+        "delegate across the agents to ",
+        "delegate across ",
+        "coordinate the work to ",
+        "coordinate the agents to ",
+        "coordinate ",
+        "orchestrate the agents to ",
+        "orchestrate this across agents to ",
+        "orchestrate this to ",
+        "orchestrate this: ",
+        "orchestrate this ",
+        "orchestrate: ",
+        "orchestrate ",
+        "plan and assign ",
+        "assign across the agents to ",
+        "assign across agents to ",
+        "assign across ",
+    ];
+    let mut start = 0usize;
+    loop {
+        let cur = &lower[start..];
+        let mut matched = false;
+        for lead in LEAD_INS {
+            if cur.starts_with(lead) {
+                start += lead.len();
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            break;
+        }
+    }
+    let goal = trimmed[start..]
+        .trim()
+        .trim_start_matches(':')
+        .trim()
+        .trim_end_matches('.')
+        .trim();
+    if goal.is_empty() {
+        trimmed.to_string()
+    } else {
+        goal.to_string()
     }
 }
 
@@ -1100,6 +1238,66 @@ mod tests {
             }
             other => panic!("permission change must be a Propose, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn classifies_orchestration_requests() {
+        assert_eq!(
+            classify_intent("orchestrate research the options, build a prototype, and write docs"),
+            PrimeIntent::Orchestration
+        );
+        assert_eq!(
+            classify_intent("split this across agents: investigate, implement, and test"),
+            PrimeIntent::Orchestration
+        );
+        assert_eq!(
+            classify_intent("coordinate the release across multiple agents"),
+            PrimeIntent::Orchestration
+        );
+        // A plain task creation is untouched (no coordination phrasing).
+        assert_eq!(
+            classify_intent("fix the login bug"),
+            PrimeIntent::TaskCreation
+        );
+        // A greeting never becomes orchestration.
+        assert_eq!(classify_intent("hey"), PrimeIntent::Greeting);
+    }
+
+    #[test]
+    fn orchestration_acts_on_a_multi_step_goal() {
+        let mut s = empty_summary();
+        s.all_agent_ids = vec![
+            "prime".to_string(),
+            "research-agent".to_string(),
+            "code-agent".to_string(),
+        ];
+        let plan = decide(
+            "orchestrate research the options, implement a prototype, and write the docs",
+            &PrimeIntent::Orchestration,
+            &s,
+        );
+        match plan {
+            PrimePlan::Act {
+                action: PrimeAction::OrchestrateGoal { goal },
+                ..
+            } => assert!(
+                goal.contains("research the options"),
+                "goal should keep the substance, got {goal:?}"
+            ),
+            other => panic!("expected Act/OrchestrateGoal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn orchestration_clarifies_a_single_step_goal() {
+        // A coordination request whose goal does not actually split must ask, not
+        // fan out a single brief into a fake "orchestration" (section 10.5).
+        let plan = decide(
+            "orchestrate summarizing the README",
+            &PrimeIntent::Orchestration,
+            &empty_summary(),
+        );
+        assert!(matches!(plan, PrimePlan::Clarify { .. }), "got {plan:?}");
     }
 
     #[test]

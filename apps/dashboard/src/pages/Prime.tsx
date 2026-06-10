@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { reluxAi, reluxPrime, type ReluxAiStatus, type ReluxPrimeTurn } from "../api";
 import { PrimeAutonomyPanel } from "../components/PrimeAutonomyPanel";
+import { OrchestrationPanel } from "../components/OrchestrationPanel";
 
 // Prime page (RELUX_MASTER_PLAN section 10 Prime Behavior, section 11.1 Prime Chat): the
 // conversational command surface for the local Relux control plane. It POSTs
@@ -30,6 +31,7 @@ const SUGGESTIONS = [
   "what is going on?",
   "create a task to summarize the README",
   "create an agent named researcher",
+  "orchestrate research the options, build a prototype, and write the docs",
   "assign task_0001 to researcher",
   "start it",
   "why did it fail?",
@@ -107,6 +109,9 @@ export function Prime() {
       <AiStatusBanner status={aiStatus} />
       <div style={{ padding: "0 10px 10px" }}>
         <PrimeAutonomyPanel />
+      </div>
+      <div style={{ padding: "0 10px 10px" }}>
+        <OrchestrationPanel />
       </div>
       <div className="chat-log" ref={logRef}>
         <div className="msg assistant">{GREETING}</div>

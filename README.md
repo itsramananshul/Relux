@@ -526,6 +526,36 @@ interval, max tasks per tick, optional auto-assignment, and a manual one-tick
 button. Prime autonomy never installs plugins, grants permissions, deletes data,
 or bypasses approvals.
 
+### Multi-agent orchestration (Prime as orchestrator)
+
+When a goal clearly spans multiple roles, Prime can split it into **briefs
+assigned to different agents** and run them as a **governed multi-agent batch** —
+not just one local task at a time. Planning is deterministic and conservative: a
+goal that does not split into at least two briefs is treated as a single task (no
+storm). Creating an orchestration mints one brief per step and assigns each to a
+fitting agent (a specialist on your roster, or Prime as a safe fallback); it does
+**not** run anything until you start it.
+
+```powershell
+relux-kernel prime orchestrate "research the options, implement a prototype, and write the docs"
+relux-kernel prime orchestration list
+relux-kernel prime orchestration show <id>
+relux-kernel prime orchestration run <id> [--max N]
+```
+
+Running a brief goes through **its assigned agent's own adapter**: a local agent
+echoes deterministically, while an agent on an **enabled** Claude/Codex CLI adapter
+runs the real CLI. A brief whose adapter runtime is disabled (or that is missing a
+permission) is recorded as **blocked** — never faked — with the exact next step.
+The batch is bounded, runs each brief once, records per-agent outcomes, and stops
+safely. The Prime page has an **Orchestration** panel (goal → preview plan →
+create → run/continue, showing per-agent briefs and outcomes), and Home surfaces
+the newest unfinished orchestration with its next action. Every orchestration is a
+durable, auditable trace of **goal → brief → agent → run**.
+
+The background autonomy timer above is unchanged (deterministic, echo-only, never a
+paid CLI); orchestration runs are operator-triggered from the UI, CLI, or API.
+
 ### Prime Brain (who answers Prime's chat)
 
 Prime's **conversational** replies can come from one of four "brains", chosen from

@@ -32,8 +32,9 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use relux_core::{
-    InstalledPlugin, PluginManifest, PluginSourceKind, PrimeAutonomyConfig, PrimeAutonomyTickResult,
-    PrimeTurn, ToolInvocationResult,
+    InstalledPlugin, Orchestration, OrchestrationBatchResult, OrchestrationId, OrchestrationPlan,
+    PluginManifest, PluginSourceKind, PrimeAutonomyConfig, PrimeAutonomyTickResult, PrimeTurn,
+    ToolInvocationResult,
 };
 use relux_kernel::{
     install_from_dir, install_from_github, install_from_zip, remove_plugin, AiConfig, AiMode,
@@ -243,6 +244,17 @@ fn router(state: AppState) -> Router {
         .route("/v1/relux/prime", post(run_prime))
         .route("/v1/relux/prime/autonomy", get(get_autonomy_config).put(update_autonomy_config).patch(update_autonomy_config))
         .route("/v1/relux/prime/autonomy/tick", post(run_autonomy_tick))
+        // Multi-agent orchestration (Prime as orchestrator).
+        .route(
+            "/v1/relux/prime/orchestrations",
+            get(list_orchestrations).post(create_orchestration),
+        )
+        .route("/v1/relux/prime/orchestrate/preview", post(preview_orchestration))
+        .route("/v1/relux/prime/orchestrations/:id", get(get_orchestration))
+        .route(
+            "/v1/relux/prime/orchestrations/:id/run",
+            post(run_orchestration_batch),
+        )
         .route("/v1/relux/tasks", get(list_tasks).post(create_task))
         .route("/v1/relux/tasks/:id", get(get_task))
         .route("/v1/relux/runs", get(list_runs))
@@ -1258,6 +1270,91 @@ async fn run_autonomy_tick(
     Ok(Json(result))
 }
 
+// --- Orchestration (multi-agent autonomy) ----------------------------------
+
+#[derive(Debug, Deserialize)]
+struct OrchestrateReq {
+    goal: String,
+}
+
+/// Preview a multi-agent plan for a goal WITHOUT committing anything. Read-only:
+/// lets the dashboard show "N briefs across M agents" before the user creates it.
+async fn preview_orchestration(
+    State(state): State<AppState>,
+    Json(req): Json<OrchestrateReq>,
+) -> Result<Json<OrchestrationPlan>, ApiError> {
+    let goal = req.goal.trim().to_string();
+    if goal.is_empty() {
+        return Err(ApiError::bad_request("goal is required"));
+    }
+    let plan = locked_read(&state, |kernel| {
+        Ok(relux_core::plan_orchestration(&goal, &kernel.inspect_state()))
+    })?;
+    Ok(Json(plan))
+}
+
+/// Create (plan + assign) an orchestration from a goal. Creates briefs assigned to
+/// agents but does not run them; running is a separate governed batch.
+async fn create_orchestration(
+    State(state): State<AppState>,
+    Json(req): Json<OrchestrateReq>,
+) -> Result<Json<Orchestration>, ApiError> {
+    let goal = req.goal.trim().to_string();
+    if goal.is_empty() {
+        return Err(ApiError::bad_request("goal is required"));
+    }
+    let record = locked_save(&state, |kernel| {
+        let ctx = crate::ensure_bootstrapped(kernel)?;
+        kernel.prime_orchestrate(&ctx, &goal)
+    })?;
+    Ok(Json(record))
+}
+
+async fn list_orchestrations(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<Orchestration>>, ApiError> {
+    let list = locked_read(&state, |kernel| {
+        Ok(kernel.orchestrations().into_iter().cloned().collect::<Vec<_>>())
+    })?;
+    Ok(Json(list))
+}
+
+async fn get_orchestration(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Orchestration>, ApiError> {
+    let oid = OrchestrationId::new(id.clone());
+    let rec = locked_read(&state, |kernel| {
+        kernel
+            .orchestration(&oid)
+            .cloned()
+            .ok_or(KernelError::UnknownOrchestration(id.clone()))
+    })?;
+    Ok(Json(rec))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RunOrchestrationReq {
+    /// Max briefs to run this batch (clamped to 1..=25 by the kernel). Defaults to
+    /// 25 (the whole plan) when omitted.
+    #[serde(default)]
+    max: Option<usize>,
+}
+
+/// Run a governed multi-agent batch for one orchestration. Persists even on
+/// partial failure so blocked/failed step records survive (like the run/retry
+/// path), then returns the per-agent batch result.
+async fn run_orchestration_batch(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    body: Option<Json<RunOrchestrationReq>>,
+) -> Result<Json<OrchestrationBatchResult>, ApiError> {
+    let oid = OrchestrationId::new(id);
+    let max = body.and_then(|b| b.0.max).unwrap_or(25);
+    let result = locked_save_persisting(&state, |kernel| kernel.run_orchestration(&oid, max))?;
+    Ok(Json(result))
+}
+
 #[derive(Debug, Deserialize)]
 struct InstallDirReq {
     path: String,
@@ -2090,7 +2187,11 @@ fn status_for(err: &KernelError) -> StatusCode {
         KernelError::PluginNotInstalled(_)
         | KernelError::ToolNotFound { .. }
         | KernelError::UnknownPlugin(_)
-        | KernelError::UnknownAgent(_) => StatusCode::NOT_FOUND,
+        | KernelError::UnknownAgent(_)
+        | KernelError::UnknownOrchestration(_) => StatusCode::NOT_FOUND,
+        // A goal that does not split into multiple briefs: honest unprocessable
+        // input, not a server fault.
+        KernelError::OrchestrationNotMultiAgent => StatusCode::UNPROCESSABLE_ENTITY,
         KernelError::BundledPluginProtected(_) => StatusCode::CONFLICT,
         KernelError::RuntimeNotConfigured { .. } => StatusCode::NOT_FOUND,
         // Adapter runtime errors, mapped honestly. "Not an adapter" / "not

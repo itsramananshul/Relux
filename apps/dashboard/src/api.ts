@@ -1418,6 +1418,101 @@ export const reluxPrimeAutonomy = {
   runTick: () => api.post<ReluxPrimeAutonomyTickResult>("/v1/relux/prime/autonomy/tick"),
 };
 
+// -- Relux Orchestration (multi-agent autonomy) ----------------------------
+
+// The specialist role Prime assigns a brief to (mirrors relux_core OrchestrationRole).
+export type ReluxOrchestrationRole =
+  | "research"
+  | "implementation"
+  | "testing"
+  | "review"
+  | "documentation"
+  | "operations"
+  | "general";
+
+// The outcome of one brief's most recent run inside a governed batch.
+export type ReluxStepOutcome = "pending" | "completed" | "failed" | "blocked";
+
+// Overall orchestration lifecycle.
+export type ReluxOrchestrationStatus =
+  | "planned"
+  | "running"
+  | "completed"
+  | "needs_attention";
+
+// A planned (uncommitted) brief from the preview endpoint.
+export interface ReluxPlannedStep {
+  title: string;
+  role: ReluxOrchestrationRole;
+  agent_id: string | null;
+}
+
+export interface ReluxOrchestrationPlan {
+  goal: string;
+  steps: ReluxPlannedStep[];
+  notes: string[];
+}
+
+// A committed brief: a real task assigned to a real agent, linked to its run.
+export interface ReluxOrchestrationStep {
+  task_id: string;
+  agent_id: string;
+  role: ReluxOrchestrationRole;
+  title: string;
+  outcome: ReluxStepOutcome;
+  run_id?: string | null;
+  note?: string | null;
+}
+
+export interface ReluxOrchestration {
+  id: string;
+  goal: string;
+  created_by: string;
+  namespace_id: string;
+  status: ReluxOrchestrationStatus;
+  steps: ReluxOrchestrationStep[];
+  notes: string[];
+  created_at: string;
+  updated_at: string;
+  last_batch_summary?: string | null;
+}
+
+export interface ReluxOrchestrationBatchResult {
+  orchestration_id: string;
+  ran: number;
+  completed: number;
+  failed: number;
+  blocked: number;
+  pending: number;
+  skipped_reasons: string[];
+  per_agent: string[];
+  summary: string;
+  next_action: string;
+  status: ReluxOrchestrationStatus;
+}
+
+export const reluxOrchestration = {
+  // Preview a multi-agent plan for a goal WITHOUT committing anything (read-only).
+  preview: (goal: string) =>
+    api.post<ReluxOrchestrationPlan>("/v1/relux/prime/orchestrate/preview", { goal }),
+  // Create (plan + assign) an orchestration from a goal. Creates briefs but does
+  // not run them.
+  create: (goal: string) =>
+    api.post<ReluxOrchestration>("/v1/relux/prime/orchestrations", { goal }),
+  // List all orchestrations (newest-first ordering is applied client-side).
+  list: () => api.get<ReluxOrchestration[]>("/v1/relux/prime/orchestrations"),
+  // Fetch one orchestration with its full step chain.
+  get: (id: string) =>
+    api.get<ReluxOrchestration>(`/v1/relux/prime/orchestrations/${encodeURIComponent(id)}`),
+  // Run a governed multi-agent batch for one orchestration. `max` caps how many
+  // briefs run this batch (kernel clamps to 1..=25); omit to run the whole plan.
+  run: (id: string, max?: number) =>
+    api.post<ReluxOrchestrationBatchResult>(
+      `/v1/relux/prime/orchestrations/${encodeURIComponent(id)}/run`,
+      max === undefined ? {} : { max },
+    ),
+};
+
 // -- Relux AI (OpenRouter) -------------------------------------------------
 
 // The four Prime brains (conversational reply providers).

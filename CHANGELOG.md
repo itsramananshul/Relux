@@ -9,6 +9,40 @@ once a stable release is cut.
 
 ### Added
 
+- **Multi-agent orchestration (first slice): Prime as an orchestrator.** Prime can
+  now decompose a multi-step goal into role-typed **briefs assigned to different
+  agents** and run them in a **governed multi-agent batch**, instead of being a
+  single local task runner (master plan section 10.4 Delegation Rules, section 15).
+  Planning is a pure, deterministic brain
+  (`relux_core::plan_orchestration`): it splits a goal into clauses, classifies
+  each to a role (`research`/`implementation`/`testing`/`review`/`documentation`/
+  `operations`/`general`), and grounds each role to a real agent on the roster (or
+  falls back to Prime with an honest "hire a specialist" note). It is conservative
+  — a goal that does not split into ≥2 briefs is not treated as multi-agent, so
+  greetings and single tasks never storm. Creating an orchestration mints one brief
+  (task) per step, assigns each to its agent, and records a durable
+  `Orchestration` linking **goal → brief → agent → run** (persisted in the kernel
+  snapshot/store, survives a refresh). Running is a separate governed batch: each
+  pending brief runs through **its assigned agent's own adapter** (local Prime
+  echoes; an **enabled** Claude/Codex CLI agent spawns the real CLI; a
+  disabled/unconfigured runtime or missing permission is recorded as **blocked**,
+  never faked), bounded by `max` (1..=25), running each brief at most once,
+  recording per-agent outcomes + the next human action, and **stopping safely** (no
+  loops, no runaway, never auto-runs downloaded plugin code). Surfaces:
+  `relux-kernel prime orchestrate "<goal>"` / `prime orchestration list|show|run`;
+  `POST /v1/relux/prime/orchestrate/preview`, `…/orchestrations` (create/list),
+  `…/orchestrations/:id` (get), `…/orchestrations/:id/run`; a Prime-page
+  **Orchestration** panel (goal → preview → create → run/continue with per-agent
+  briefs and outcomes) and a Home summary card (pure logic in
+  `apps/dashboard/src/orchestration.ts`, unit-covered). The background autonomy
+  timer is unchanged — still deterministic, echo-only, never a paid CLI;
+  orchestration is operator-triggered. **Proven against the real Claude CLI:** a
+  two-agent orchestration where Prime (local echo) handled the research brief and a
+  Claude-CLI `code-agent` handled the implementation brief — a real 44s Claude run
+  with reported token usage and cost, fully traced goal → brief → agent → run.
+  *Caveats:* briefs run sequentially (no parallelism), there is no inter-brief
+  dependency ordering, planning does not auto-create agents, and no background timer
+  drives orchestrations yet.
 - **Relux local release v0.1.2 (Windows bundle).** The `relux-kernel` /
   `relux-core` crates move from `0.1.1` to `0.1.2` for the first build that closes
   the three honest post-v0.1.1 gaps. **First-run brain onboarding:** Home's

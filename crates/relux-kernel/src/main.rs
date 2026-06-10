@@ -11,8 +11,8 @@ use std::process::ExitCode;
 
 use relux_core::namespace::NamespaceKind;
 use relux_core::{
-    AgentId, NamespaceId, Permission, PluginId, PluginSourceKind, PrimeContext, PrimeTurn, TaskId,
-    ToolExecutability,
+    AgentId, NamespaceId, OrchestrationId, Permission, PluginId, PluginSourceKind, PrimeContext,
+    PrimeTurn, TaskId, ToolExecutability,
 };
 use relux_kernel::{
     install_from_dir, install_from_github, install_from_zip, load_plugin_manifests,
@@ -62,6 +62,12 @@ fn main() -> ExitCode {
     let result = match args.split_first() {
         Some((cmd, rest)) if cmd == "prime" => match rest.split_first() {
             Some((prime_sub, prime_rest)) if prime_sub == "autonomy" => run_prime_autonomy(prime_rest),
+            Some((prime_sub, prime_rest)) if prime_sub == "orchestrate" => {
+                run_prime_orchestrate(prime_rest)
+            }
+            Some((prime_sub, prime_rest)) if prime_sub == "orchestration" => {
+                run_prime_orchestration(prime_rest)
+            }
             _ => {
                 let message = rest.join(" ");
                 if message.trim().is_empty() {
@@ -232,6 +238,184 @@ fn run_autonomy_configure(args: &[String]) -> Result<(), KernelError> {
             Ok("No changes applied to Prime autonomy configuration.".to_string())
         }
     })
+}
+
+/// `relux-kernel prime orchestrate "<goal>"` - decompose a goal into multiple
+/// role-typed briefs assigned to fitting agents, then print the plan. Creates work
+/// but does not run it; use `prime orchestration run <id>` to execute.
+fn run_prime_orchestrate(args: &[String]) -> Result<(), KernelError> {
+    let goal = args.join(" ");
+    let goal = goal.trim().to_string();
+    if goal.is_empty() {
+        return Err(KernelError::Storage(
+            "usage: relux-kernel prime orchestrate \"<goal with multiple steps>\"".to_string(),
+        ));
+    }
+    with_persistent_kernel(|kernel| {
+        let ctx = ensure_bootstrapped(kernel)?;
+        match kernel.prime_orchestrate(&ctx, &goal) {
+            Ok(record) => {
+                let mut out = format!(
+                    "Created orchestration {} for \"{}\" with {} briefs:\n",
+                    record.id,
+                    record.goal,
+                    record.steps.len()
+                );
+                for step in &record.steps {
+                    out.push_str(&format!(
+                        "  - {} \"{}\" -> {} ({}) [{}]\n",
+                        step.task_id,
+                        step.title,
+                        step.agent_id,
+                        step.role.label(),
+                        step.outcome.label()
+                    ));
+                }
+                for note in &record.notes {
+                    out.push_str(&format!("  note: {note}\n"));
+                }
+                out.push_str(&format!(
+                    "Nothing has run yet. Start it with: relux-kernel prime orchestration run {}",
+                    record.id
+                ));
+                Ok(out)
+            }
+            Err(KernelError::OrchestrationNotMultiAgent) => Ok(
+                "That goal reads as a single piece of work. Give it distinct steps (e.g. \"research X, implement Y, and document Z\") or create one task instead."
+                    .to_string(),
+            ),
+            Err(e) => Err(e),
+        }
+    })
+}
+
+/// Dispatches `relux-kernel prime orchestration <subcommand> ...`.
+fn run_prime_orchestration(args: &[String]) -> Result<(), KernelError> {
+    match args.split_first() {
+        Some((sub, _)) if sub == "list" => run_orchestration_list(),
+        Some((sub, rest)) if sub == "show" => run_orchestration_show(rest),
+        Some((sub, rest)) if sub == "run" => run_orchestration_run(rest),
+        _ => Err(KernelError::Storage(
+            "usage: relux-kernel prime orchestration <list|show <id>|run <id> [--max N]>"
+                .to_string(),
+        )),
+    }
+}
+
+fn run_orchestration_list() -> Result<(), KernelError> {
+    with_persistent_kernel(|kernel| {
+        let list = kernel.orchestrations();
+        if list.is_empty() {
+            return Ok("No orchestrations yet. Create one with `prime orchestrate \"<goal>\"`.".to_string());
+        }
+        let mut out = format!("Orchestrations ({}):\n", list.len());
+        for o in list {
+            out.push_str(&format!(
+                "  {} [{}] \"{}\" - {} briefs\n",
+                o.id,
+                o.status.label(),
+                o.goal,
+                o.steps.len()
+            ));
+        }
+        Ok(out.trim_end().to_string())
+    })
+}
+
+fn run_orchestration_show(args: &[String]) -> Result<(), KernelError> {
+    let id = args.first().ok_or_else(|| {
+        KernelError::Storage("usage: relux-kernel prime orchestration show <id>".to_string())
+    })?;
+    let oid = OrchestrationId::new(id.clone());
+    with_persistent_kernel(|kernel| {
+        let o = kernel
+            .orchestration(&oid)
+            .ok_or_else(|| KernelError::UnknownOrchestration(id.clone()))?;
+        let mut out = format!(
+            "Orchestration {} [{}]\n  goal: {}\n  briefs:\n",
+            o.id,
+            o.status.label(),
+            o.goal
+        );
+        for step in &o.steps {
+            out.push_str(&format!(
+                "    - {} \"{}\" -> {} ({}) [{}]{}\n",
+                step.task_id,
+                step.title,
+                step.agent_id,
+                step.role.label(),
+                step.outcome.label(),
+                step.run_id
+                    .as_ref()
+                    .map(|r| format!(" run {r}"))
+                    .unwrap_or_default()
+            ));
+            if let Some(note) = &step.note {
+                out.push_str(&format!("      note: {note}\n"));
+            }
+        }
+        if let Some(summary) = &o.last_batch_summary {
+            out.push_str(&format!("  last batch: {summary}\n"));
+        }
+        Ok(out.trim_end().to_string())
+    })
+}
+
+fn run_orchestration_run(args: &[String]) -> Result<(), KernelError> {
+    let mut id: Option<String> = None;
+    let mut max: usize = 25;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--max" => {
+                i += 1;
+                let val = args.get(i).ok_or_else(|| {
+                    KernelError::Storage("Missing value for --max".to_string())
+                })?;
+                max = val
+                    .parse()
+                    .map_err(|_| KernelError::Storage(format!("Invalid --max: {val}")))?;
+            }
+            other => {
+                if id.is_none() {
+                    id = Some(other.to_string());
+                } else {
+                    return Err(KernelError::Storage(format!("Unexpected argument: {other}")));
+                }
+            }
+        }
+        i += 1;
+    }
+    let id = id.ok_or_else(|| {
+        KernelError::Storage(
+            "usage: relux-kernel prime orchestration run <id> [--max N]".to_string(),
+        )
+    })?;
+    let oid = OrchestrationId::new(id);
+
+    // Persist even on partial failure so blocked/failed step records survive.
+    let path = db_path();
+    let mut store = SqliteStore::open(&path)?;
+    let mut kernel = store.load()?;
+    ensure_bootstrapped(&mut kernel)?;
+    let result = kernel.run_orchestration(&oid, max);
+    store.save(&kernel)?;
+    let result = result?;
+
+    let mut out = format!(
+        "Orchestration batch [{}]: {}\n",
+        result.status.label(),
+        result.summary
+    );
+    for line in &result.per_agent {
+        out.push_str(&format!("  {line}\n"));
+    }
+    for reason in &result.skipped_reasons {
+        out.push_str(&format!("  skipped: {reason}\n"));
+    }
+    out.push_str(&format!("Next: {}", result.next_action));
+    println!("{out}");
+    Ok(())
 }
 
 fn run_assigned_task(task_id_str: &str) -> Result<(), KernelError> {

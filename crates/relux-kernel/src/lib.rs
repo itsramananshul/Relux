@@ -87,6 +87,10 @@ pub enum KernelError {
     RunNotRetryable { run: String, status: String },
     #[error("unknown approval: {0}")]
     UnknownApproval(String),
+    #[error("unknown orchestration: {0}")]
+    UnknownOrchestration(String),
+    #[error("goal does not split into multiple briefs; it reads as a single task")]
+    OrchestrationNotMultiAgent,
     #[error("task {0} has no assigned agent")]
     TaskNotAssigned(String),
     #[error("plugin {plugin} has no tool named {tool}")]

@@ -3,13 +3,22 @@ import {
   reluxPlugins,
   reluxAi,
   reluxAdapters,
+  reluxOrchestration,
   type ReluxPlugin,
   type ReluxState,
   type ReluxAiStatus,
   type ReluxAdapterStatus,
+  type ReluxOrchestration,
 } from "../api";
 import { useAsync } from "../components/common";
 import { primeBrainStep } from "../onboarding";
+import {
+  activeOrchestration,
+  orchestrationHeadline,
+  orchestrationNextAction,
+  orchestrationProgressLabel,
+  orchestrationStatusTone,
+} from "../orchestration";
 
 // Relux Home (RELUX_MASTER_PLAN section 11 Dashboard, section 2 North Star): the first
 // screen of the standalone Relux product. It is backed ONLY by the local
@@ -90,6 +99,7 @@ export function ReluxHome() {
   const plugins = useAsync<ReluxPlugin[]>(() => reluxPlugins.list(), []);
   const ai = useAsync<ReluxAiStatus>(() => reluxAi.status(), []);
   const adapters = useAsync<ReluxAdapterStatus[]>(() => reluxAdapters.list(), []);
+  const orchestrations = useAsync<ReluxOrchestration[]>(() => reluxOrchestration.list(), []);
 
   // Compose the checklist with the LIVE brain step inserted right after
   // "Prime is available", so the very first thing a new user sees is whether
@@ -204,6 +214,9 @@ export function ReluxHome() {
         </div>
       )}
 
+      {/* Multi-agent orchestration at a glance — Prime coordinating the fleet. */}
+      <OrchestrationHomeCard orchestrations={orchestrations.data} loading={orchestrations.loading} />
+
       {/* The real product path: run work through a coding-agent adapter. */}
       <div className="card">
         <h3 style={{ marginTop: 0 }}>Run real work: Claude / Codex adapters</h3>
@@ -280,6 +293,63 @@ export function ReluxHome() {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+// Multi-agent orchestration summary (master plan section 10.4, section 15). Shows
+// the most relevant orchestration — the newest unfinished one — with its progress
+// and the exact next human action, linking to the Prime page where it is run.
+// Grounded entirely in what the control plane returned; hidden when there is none.
+function OrchestrationHomeCard({
+  orchestrations,
+  loading,
+}: {
+  orchestrations: ReluxOrchestration[] | null | undefined;
+  loading: boolean;
+}) {
+  const list = orchestrations ?? [];
+  const active = activeOrchestration(list);
+  const headline = orchestrationHeadline(list);
+  return (
+    <div className="card">
+      <div className="row" style={{ alignItems: "center", marginBottom: 8 }}>
+        <h3 style={{ margin: 0 }}>Orchestration (multi-agent)</h3>
+        <div className="spacer" style={{ flex: 1 }} />
+        <Link to="/prime" className="link" style={{ fontSize: 12 }}>
+          Open in Prime →
+        </Link>
+      </div>
+      {!active ? (
+        <p className="muted" style={{ marginTop: 0, fontSize: 13, lineHeight: 1.6 }}>
+          {loading
+            ? "Loading orchestrations..."
+            : "No orchestrations yet. On the Prime page, give Prime a multi-step goal (e.g. “research the options, implement a prototype, and write the docs”) and it will split the work into briefs across agents."}
+        </p>
+      ) : (
+        <>
+          {headline && (
+            <p className="muted" style={{ marginTop: 0, marginBottom: 8, fontSize: 12 }}>
+              {headline}
+            </p>
+          )}
+          <div className="row wrap" style={{ gap: 8, alignItems: "center" }}>
+            <span className={"badge " + orchestrationStatusTone(active.status)} style={{ fontSize: 9 }}>
+              {active.status.replace(/_/g, " ")}
+            </span>
+            <span className="mono" style={{ fontSize: 11 }}>
+              {active.id}
+            </span>
+            <span style={{ fontSize: 13 }}>{active.goal}</span>
+            <span className="muted" style={{ fontSize: 11, marginLeft: "auto" }}>
+              {orchestrationProgressLabel(active)}
+            </span>
+          </div>
+          <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+            Next: {orchestrationNextAction(active)}
+          </div>
+        </>
+      )}
     </div>
   );
 }

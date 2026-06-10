@@ -10,6 +10,7 @@ pub mod agent;
 pub mod approval;
 pub mod audit;
 pub mod namespace;
+pub mod orchestration;
 pub mod permission;
 pub mod plugin;
 pub mod prime;
@@ -30,6 +31,11 @@ pub use agent::{Agent, AgentId};
 pub use approval::{Approval, ApprovalId, ApprovalStatus};
 pub use audit::{AuditEvent, AuditResult};
 pub use namespace::{Namespace, NamespaceId};
+pub use orchestration::{
+    plan_orchestration, Orchestration, OrchestrationBatchResult, OrchestrationId,
+    OrchestrationPlan, OrchestrationRole, OrchestrationStatus, OrchestrationStep, PlannedStep,
+    StepOutcome,
+};
 pub use permission::{ApprovalRequirement, Permission, PermissionError, RiskLevel, ToolDefinition};
 pub use plugin::{
     InstalledPlugin, ManifestError, PluginCapability, PluginHealth, PluginId, PluginKind,

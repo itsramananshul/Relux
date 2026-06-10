@@ -24,12 +24,14 @@ use relux_core::agent::AgentStatus;
 use relux_core::namespace::NamespaceKind;
 use relux_core::plugin::PluginKind;
 use relux_core::{
-    clamp_runtime_timeout, validate_loopback_url, Agent, AgentId, Approval, ApprovalId,
-    ApprovalStatus, AuditEvent, AuditResult, InstalledPlugin, Namespace, NamespaceId, Permission,
-    PluginId, PluginManifest, PluginSourceKind, PrimeAction, PrimeAutonomyConfig,
-    PrimeAutonomyTickResult, PrimeContext, PrimeDisposition, PrimePlan, PrimeTurn, RiskLevel,
-    RuntimeKind, Run, RunId, RunStatus, StateSummary, Task, TaskBrief, TaskId, TaskStatus,
-    ToolDescriptor, ToolExecutability, ToolInvocationResult, ToolRuntimeConfig,
+    clamp_runtime_timeout, plan_orchestration, validate_loopback_url, Agent, AgentId, Approval,
+    ApprovalId, ApprovalStatus, AuditEvent, AuditResult, InstalledPlugin, Namespace, NamespaceId,
+    Orchestration, OrchestrationBatchResult, OrchestrationId, OrchestrationStatus,
+    OrchestrationStep, Permission, PluginId, PluginManifest, PluginSourceKind, PrimeAction,
+    PrimeAutonomyConfig, PrimeAutonomyTickResult, PrimeContext, PrimeDisposition, PrimePlan,
+    PrimeTurn, RiskLevel, RuntimeKind, Run, RunId, RunStatus, StateSummary, StepOutcome, Task,
+    TaskBrief, TaskId, TaskStatus, ToolDescriptor, ToolExecutability, ToolInvocationResult,
+    ToolRuntimeConfig,
 };
 use serde::{Deserialize, Serialize};
 
@@ -50,6 +52,10 @@ pub struct KernelCounters {
     pub next_approval: u64,
     pub next_audit: u64,
     pub next_event: u64,
+    /// Next orchestration id. Defaulted so snapshots from before multi-agent
+    /// autonomy load cleanly (orchestrations start at 0).
+    #[serde(default)]
+    pub next_orchestration: u64,
 }
 
 /// A flat, serializable export of the entire [`KernelState`].
@@ -81,6 +87,10 @@ pub struct KernelSnapshot {
     /// The append-only audit log, in emission order.
     pub audit_events: Vec<AuditEvent>,
     pub prime_autonomy_config: PrimeAutonomyConfig,
+    /// Durable Prime orchestrations (goal -> briefs -> agents -> runs), sorted by
+    /// id. Defaulted so older snapshots load cleanly.
+    #[serde(default)]
+    pub orchestrations: Vec<Orchestration>,
     pub counters: KernelCounters,
 }
 
@@ -98,6 +108,8 @@ pub struct KernelState {
     tasks: HashMap<TaskId, Task>,
     runs: HashMap<RunId, Run>,
     pub approvals: HashMap<ApprovalId, Approval>,
+    /// Durable Prime orchestrations, keyed by id.
+    orchestrations: HashMap<OrchestrationId, Orchestration>,
     /// Per-run transcripts, in emission order.
     run_events: Vec<RunEvent>,
     /// The append-only audit log, in emission order.
@@ -109,6 +121,7 @@ pub struct KernelState {
     next_approval: u64,
     next_audit: u64,
     next_event: u64,
+    next_orchestration: u64,
 }
 
 /// The outcome of idempotently refreshing one bundled plugin manifest into the
@@ -199,6 +212,7 @@ impl KernelState {
             run_events: self.run_events.clone(),
             audit_events: self.audit_log.clone(),
             prime_autonomy_config: self.prime_autonomy_config.clone(),
+            orchestrations: sorted(&self.orchestrations, |o| o.id.as_str()),
             counters: KernelCounters {
                 clock_secs: self.clock.secs(),
                 next_task: self.next_task,
@@ -206,6 +220,7 @@ impl KernelState {
                 next_approval: self.next_approval,
                 next_audit: self.next_audit,
                 next_event: self.next_event,
+                next_orchestration: self.next_orchestration,
             },
         }
     }
@@ -251,6 +266,11 @@ impl KernelState {
         for approval in snapshot.approvals {
             state.approvals.insert(approval.id.clone(), approval);
         }
+        for orchestration in snapshot.orchestrations {
+            state
+                .orchestrations
+                .insert(orchestration.id.clone(), orchestration);
+        }
         state.run_events = snapshot.run_events;
         state.audit_log = snapshot.audit_events;
         state.clock = Clock::from_secs(snapshot.counters.clock_secs);
@@ -259,6 +279,7 @@ impl KernelState {
         state.next_approval = snapshot.counters.next_approval;
         state.next_audit = snapshot.counters.next_audit;
         state.next_event = snapshot.counters.next_event;
+        state.next_orchestration = snapshot.counters.next_orchestration;
         state.prime_autonomy_config = snapshot.prime_autonomy_config;
         state
     }
@@ -1251,6 +1272,300 @@ impl KernelState {
     fn finish_autonomy_tick(&mut self, result: &PrimeAutonomyTickResult) {
         self.prime_autonomy_config.last_tick_at = Some(result.tick_at.clone());
         self.prime_autonomy_config.last_tick_summary = Some(result.summary.clone());
+    }
+
+    // --- Orchestration (multi-agent autonomy) ------------------------------
+    //
+    // The first slice of Prime-as-orchestrator (`docs/RELUX_MASTER_PLAN.md`
+    // section 10.4 Delegation Rules, section 15 "real multi-agent workloads").
+    // Planning is the pure brain ([`relux_core::plan_orchestration`]); the kernel
+    // turns a multi-agent plan into real briefs and later runs them in a governed
+    // batch through each agent's own adapter.
+
+    /// All orchestrations, sorted by id for deterministic listing.
+    pub fn orchestrations(&self) -> Vec<&Orchestration> {
+        let mut out: Vec<&Orchestration> = self.orchestrations.values().collect();
+        out.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+        out
+    }
+
+    pub fn orchestration(&self, id: &OrchestrationId) -> Option<&Orchestration> {
+        self.orchestrations.get(id)
+    }
+
+    pub fn orchestration_count(&self) -> usize {
+        self.orchestrations.len()
+    }
+
+    /// Decompose a goal into role-typed briefs, assign each to a fitting agent (or
+    /// Prime when no specialist exists), and record the durable goal -> brief ->
+    /// agent link. Creates and assigns work but does NOT run it - running is the
+    /// separate governed [`run_orchestration`] batch, so nothing executes (and no
+    /// paid CLI is ever spawned) without an explicit start (section 10.4).
+    pub fn prime_orchestrate(
+        &mut self,
+        ctx: &PrimeContext,
+        goal: &str,
+    ) -> Result<Orchestration, KernelError> {
+        let summary = self.inspect_state();
+        let plan = plan_orchestration(goal, &summary);
+        if !plan.is_multi_agent() {
+            return Err(KernelError::OrchestrationNotMultiAgent);
+        }
+
+        self.next_orchestration += 1;
+        let orch_id = OrchestrationId::new(format!("orch_{:04}", self.next_orchestration));
+        let now = self.clock.tick();
+
+        // Prime is the fallback assignee for any role without a specialist on the
+        // roster. It always exists once bootstrapped; if somehow absent, fall back
+        // to the acting agent so a brief is never left unassigned.
+        let prime_fallback = self.prime_agent_id().unwrap_or_else(|| ctx.agent.clone());
+
+        let mut steps: Vec<OrchestrationStep> = Vec::new();
+        for planned in &plan.steps {
+            let agent_id = planned
+                .agent_id
+                .as_ref()
+                .map(|id| AgentId::new(id.clone()))
+                .filter(|id| self.agents.contains_key(id))
+                .unwrap_or_else(|| prime_fallback.clone());
+
+            let task_id = self.create_task(
+                &planned.title,
+                serde_json::json!({
+                    "orchestration": orch_id.as_str(),
+                    "goal": plan.goal,
+                    "role": planned.role.label(),
+                }),
+                &ctx.actor,
+                &ctx.namespace,
+                vec![],
+            );
+            self.assign_task(&task_id, &agent_id)?;
+            steps.push(OrchestrationStep {
+                task_id,
+                agent_id,
+                role: planned.role,
+                title: planned.title.clone(),
+                outcome: StepOutcome::Pending,
+                run_id: None,
+                note: None,
+            });
+        }
+
+        let record = Orchestration {
+            id: orch_id.clone(),
+            goal: plan.goal.clone(),
+            created_by: ctx.actor.clone(),
+            namespace_id: ctx.namespace.clone(),
+            status: OrchestrationStatus::Planned,
+            steps,
+            notes: plan.notes.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+            last_batch_summary: None,
+        };
+        let agent_ids: Vec<&str> = record.steps.iter().map(|s| s.agent_id.as_str()).collect();
+        self.record_audit(
+            "agent",
+            ctx.agent.as_str(),
+            "orchestration:create",
+            Some("orchestration"),
+            Some(orch_id.as_str()),
+            Some(&ctx.namespace),
+            AuditResult::Success,
+            serde_json::json!({
+                "goal": record.goal,
+                "briefs": record.steps.len(),
+                "agents": agent_ids,
+            }),
+        );
+        self.orchestrations.insert(orch_id.clone(), record.clone());
+        Ok(record)
+    }
+
+    /// Run a governed multi-agent batch for one orchestration.
+    ///
+    /// Each pending brief is executed through ITS assigned agent's adapter via the
+    /// same governed path as the Work page ([`execute_assigned_run`]): the local
+    /// Prime adapter echoes deterministically; an **enabled** CLI adapter spawns
+    /// its binary; a disabled/unconfigured runtime or a missing permission is
+    /// recorded as `blocked` (a human action is required), never faked. The batch
+    /// is bounded by `max` (clamped 1..=25), runs each brief at most once, records
+    /// per-agent outcomes, updates the durable record, and stops safely - it never
+    /// loops, recurses, or spawns uncontrolled work, and never auto-runs downloaded
+    /// plugin code (section 10.4, section 8.1, section 8.2).
+    pub fn run_orchestration(
+        &mut self,
+        id: &OrchestrationId,
+        max: usize,
+    ) -> Result<OrchestrationBatchResult, KernelError> {
+        let max = max.clamp(1, 25);
+        let namespace = self
+            .orchestrations
+            .get(id)
+            .ok_or_else(|| KernelError::UnknownOrchestration(id.to_string()))?
+            .namespace_id
+            .clone();
+
+        // Snapshot the pending steps to run, bounded by `max`, detached from the
+        // record so we can mutate it as each brief finishes.
+        let pending: Vec<(usize, TaskId, AgentId)> = self
+            .orchestrations
+            .get(id)
+            .map(|o| {
+                o.steps
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.outcome == StepOutcome::Pending)
+                    .map(|(i, s)| (i, s.task_id.clone(), s.agent_id.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut result = OrchestrationBatchResult {
+            orchestration_id: id.clone(),
+            ran: 0,
+            completed: 0,
+            failed: 0,
+            blocked: 0,
+            pending: 0,
+            skipped_reasons: Vec::new(),
+            per_agent: Vec::new(),
+            summary: String::new(),
+            next_action: String::new(),
+            status: OrchestrationStatus::Planned,
+        };
+
+        for (idx, task_id, agent_id) in pending.into_iter().take(max) {
+            result.ran += 1;
+            let exec = self.execute_assigned_run(&task_id);
+            // The latest run for this task is the attempt we just made (run ids are
+            // zero-padded, so id order == creation order).
+            let run_id = self
+                .runs
+                .values()
+                .filter(|r| r.task_id == task_id)
+                .max_by(|a, b| a.id.0.cmp(&b.id.0))
+                .map(|r| r.id.clone());
+            let (outcome, note) = match exec {
+                Ok(_) => {
+                    result.completed += 1;
+                    (StepOutcome::Completed, None)
+                }
+                Err(e) => {
+                    // Distinguish "needs a human" (blocked) from a genuine run
+                    // failure (retryable). A disabled/unconfigured CLI runtime, a
+                    // missing binary, an invalid config, or a missing permission all
+                    // mean the brief cannot run until someone acts.
+                    let blocked = matches!(
+                        e,
+                        KernelError::AdapterRuntimeDisabled { .. }
+                            | KernelError::AdapterRuntimeNotConfigured { .. }
+                            | KernelError::InvalidAdapterConfig { .. }
+                            | KernelError::AdapterBinaryMissing { .. }
+                            | KernelError::PermissionDenied { .. }
+                    );
+                    if blocked {
+                        result.blocked += 1;
+                    } else {
+                        result.failed += 1;
+                    }
+                    let reason = e.to_string();
+                    result.skipped_reasons.push(format!("{task_id}: {reason}"));
+                    (
+                        if blocked {
+                            StepOutcome::Blocked
+                        } else {
+                            StepOutcome::Failed
+                        },
+                        Some(reason),
+                    )
+                }
+            };
+            result
+                .per_agent
+                .push(format!("{agent_id}: {task_id} {}", outcome.label()));
+            if let Some(o) = self.orchestrations.get_mut(id) {
+                if let Some(step) = o.steps.get_mut(idx) {
+                    step.outcome = outcome;
+                    step.run_id = run_id;
+                    step.note = note;
+                }
+            }
+        }
+
+        // Recompute overall status and the pending count from the full step set.
+        let (status, pending_left) = {
+            let o = self
+                .orchestrations
+                .get(id)
+                .ok_or_else(|| KernelError::UnknownOrchestration(id.to_string()))?;
+            let pending_left = o
+                .steps
+                .iter()
+                .filter(|s| s.outcome == StepOutcome::Pending)
+                .count();
+            let any_blocked = o.steps.iter().any(|s| s.outcome == StepOutcome::Blocked);
+            let any_failed = o.steps.iter().any(|s| s.outcome == StepOutcome::Failed);
+            let status = if pending_left > 0 {
+                OrchestrationStatus::Running
+            } else if any_blocked || any_failed {
+                OrchestrationStatus::NeedsAttention
+            } else {
+                OrchestrationStatus::Completed
+            };
+            (status, pending_left)
+        };
+        result.pending = pending_left as u32;
+        result.status = status;
+        result.summary = format!(
+            "{} brief(s) run: {} completed, {} failed, {} blocked; {} pending.",
+            result.ran, result.completed, result.failed, result.blocked, result.pending
+        );
+        result.next_action = match status {
+            OrchestrationStatus::Completed => "All briefs completed. Review the runs.".to_string(),
+            OrchestrationStatus::Running => format!(
+                "Run the orchestration again to continue {} remaining brief(s).",
+                result.pending
+            ),
+            OrchestrationStatus::NeedsAttention => format!(
+                "{} brief(s) need attention. Blocked briefs need their adapter runtime enabled (or reassignment); failed briefs can be retried. Then run again.",
+                result.blocked + result.failed
+            ),
+            OrchestrationStatus::Planned => {
+                "Run the orchestration to start the briefs.".to_string()
+            }
+        };
+
+        let now = self.clock.tick();
+        if let Some(o) = self.orchestrations.get_mut(id) {
+            o.status = status;
+            o.updated_at = now;
+            o.last_batch_summary = Some(result.summary.clone());
+        }
+        self.record_audit(
+            "agent",
+            "prime",
+            "orchestration:batch",
+            Some("orchestration"),
+            Some(id.as_str()),
+            Some(&namespace),
+            if result.failed > 0 || result.blocked > 0 {
+                AuditResult::Failed
+            } else {
+                AuditResult::Success
+            },
+            serde_json::json!({
+                "ran": result.ran,
+                "completed": result.completed,
+                "failed": result.failed,
+                "blocked": result.blocked,
+                "pending": result.pending,
+            }),
+        );
+        Ok(result)
     }
 
     // --- Runs --------------------------------------------------------------
@@ -2274,6 +2589,41 @@ impl KernelState {
                 tool_name,
                 input_json,
             } => self.prime_invoke_tool(ctx, intent, &action, &text, plugin_id, tool_name, input_json),
+            PrimeAction::OrchestrateGoal { goal } => match self.prime_orchestrate(ctx, goal) {
+                Ok(record) => {
+                    let reply = format!("{text} {}", render_orchestration_plan(&record));
+                    Ok(PrimeTurn {
+                        intent,
+                        reply,
+                        disposition: PrimeDisposition::Executed,
+                        // Surface the first brief as the "created task" so existing
+                        // UI/clients that follow `created_task` still navigate
+                        // somewhere sensible; the full chain is in the orchestration.
+                        created_task: record.steps.first().map(|s| s.task_id.clone()),
+                        action: Some(action),
+                        started_run: None,
+                        created_agent: None,
+                        approval: None,
+                        invoked_tool: None,
+                        tool_output: None,
+                        tool_error: None,
+                    })
+                }
+                Err(KernelError::OrchestrationNotMultiAgent) => Ok(PrimeTurn {
+                    intent,
+                    reply: "That goal reads as a single piece of work, not something to split across agents. Tell me the distinct steps, or ask me to create one task.".to_string(),
+                    disposition: PrimeDisposition::NeedsClarification,
+                    action: Some(action),
+                    created_task: None,
+                    started_run: None,
+                    created_agent: None,
+                    approval: None,
+                    invoked_tool: None,
+                    tool_output: None,
+                    tool_error: None,
+                }),
+                Err(e) => Err(e),
+            },
             other => Ok(PrimeTurn {
                 intent,
                 reply: format!(
@@ -3015,6 +3365,9 @@ fn describe_action(action: &PrimeAction) -> String {
             adapter_plugin,
         } => format!("create agent {name} on adapter {adapter_plugin}"),
         PrimeAction::DiscoverTools => "list the installed tools".to_string(),
+        PrimeAction::OrchestrateGoal { goal } => {
+            format!("orchestrate \"{goal}\" across multiple agents")
+        }
         PrimeAction::InvokeTool {
             plugin_id,
             tool_name,
@@ -3028,6 +3381,35 @@ fn describe_action(action: &PrimeAction) -> String {
         }
         other => format!("{other:?}"),
     }
+}
+
+/// Render a grounded, multi-line summary of an orchestration Prime just created:
+/// the goal, each brief with its assigned agent and role, any honest notes, and
+/// the exact next step to run it. Speaks only about what was actually created.
+fn render_orchestration_plan(o: &Orchestration) -> String {
+    let mut s = format!(
+        "I created orchestration {} for \"{}\" with {} briefs:",
+        o.id,
+        o.goal,
+        o.steps.len()
+    );
+    for step in &o.steps {
+        s.push_str(&format!(
+            "\n  - {} \"{}\" -> {} ({})",
+            step.task_id,
+            step.title,
+            step.agent_id,
+            step.role.label()
+        ));
+    }
+    for note in &o.notes {
+        s.push_str(&format!("\n  note: {note}"));
+    }
+    s.push_str(&format!(
+        "\nNothing is running yet. Start it from the Prime page's orchestration controls, or run `relux-kernel prime orchestration run {}` (CLI-adapter agents must have their runtime enabled first).",
+        o.id
+    ));
+    s
 }
 
 /// Render a grounded tool-catalogue reply for a `DiscoverTools` turn.
@@ -4922,5 +5304,191 @@ mod tests {
         assert_eq!(claude.state, AdapterRuntimeState::MissingBinary);
         assert!(claude.enabled);
         assert!(!claude.available_on_path);
+    }
+
+    // --- Orchestration (multi-agent autonomy) ------------------------------
+
+    /// A kernel with Prime plus a local-adapter `code-agent` that holds the echo
+    /// permission, so a brief assigned to it can actually run the deterministic
+    /// local path (mirrors a hired specialist on the safe local adapter).
+    fn orchestration_kernel() -> (KernelState, PrimeContext) {
+        let (mut k, ctx) = prime_chat_kernel();
+        let adapter = PluginId::new("relux-adapter-local-prime");
+        k.create_agent(
+            "code-agent",
+            "Code Agent",
+            "implements code",
+            &adapter,
+            &ctx.namespace,
+            None,
+            vec![Permission::new("tool:relux-tools-echo:say").unwrap()],
+        )
+        .unwrap();
+        (k, ctx)
+    }
+
+    #[test]
+    fn prime_orchestrate_creates_role_briefs_assigned_to_agents() {
+        let (mut k, ctx) = orchestration_kernel();
+        let record = k
+            .prime_orchestrate(
+                &ctx,
+                "research the options, implement the prototype, and document it",
+            )
+            .unwrap();
+
+        assert_eq!(record.steps.len(), 3);
+        assert_eq!(record.status, OrchestrationStatus::Planned);
+        // Implementation step routes to the code-agent specialist; research and
+        // documentation have no specialist, so they fall back to Prime.
+        assert_eq!(record.steps[0].agent_id.as_str(), "prime"); // research
+        assert_eq!(record.steps[1].agent_id.as_str(), "code-agent"); // implement
+        assert_eq!(record.steps[2].agent_id.as_str(), "prime"); // document
+        // Every brief became a real, assigned (Queued) task.
+        for step in &record.steps {
+            let task = k.task(&step.task_id).expect("brief task exists");
+            assert_eq!(task.status, TaskStatus::Queued);
+            assert!(task.assigned_agent.is_some());
+            assert_eq!(step.outcome, StepOutcome::Pending);
+        }
+        // The link is durable and auditable.
+        assert_eq!(k.orchestration_count(), 1);
+        assert!(k
+            .audit_log()
+            .iter()
+            .any(|e| e.action == "orchestration:create" && e.result == AuditResult::Success));
+        // Nothing ran yet.
+        assert_eq!(k.run_count(), 0);
+    }
+
+    #[test]
+    fn prime_orchestrate_rejects_a_single_step_goal() {
+        let (mut k, ctx) = orchestration_kernel();
+        let err = k.prime_orchestrate(&ctx, "summarize the README").unwrap_err();
+        assert!(matches!(err, KernelError::OrchestrationNotMultiAgent));
+        assert_eq!(k.orchestration_count(), 0, "no record on a non-split goal");
+    }
+
+    #[test]
+    fn run_orchestration_runs_multiple_agents_and_records_outcomes() {
+        let (mut k, ctx) = orchestration_kernel();
+        let record = k
+            .prime_orchestrate(&ctx, "implement the feature and document the result")
+            .unwrap();
+        let id = record.id.clone();
+
+        let batch = k.run_orchestration(&id, 25).unwrap();
+
+        assert_eq!(batch.ran, 2);
+        assert_eq!(batch.completed, 2);
+        assert_eq!(batch.failed, 0);
+        assert_eq!(batch.blocked, 0);
+        assert_eq!(batch.pending, 0);
+        assert_eq!(batch.status, OrchestrationStatus::Completed);
+        // Per-agent outcomes are recorded for both agents.
+        assert_eq!(batch.per_agent.len(), 2);
+        assert!(batch.per_agent.iter().any(|l| l.contains("code-agent")));
+        assert!(batch.per_agent.iter().any(|l| l.contains("prime")));
+        // The durable record links each brief to its run and is marked completed.
+        let stored = k.orchestration(&id).unwrap();
+        assert_eq!(stored.status, OrchestrationStatus::Completed);
+        for step in &stored.steps {
+            assert_eq!(step.outcome, StepOutcome::Completed);
+            assert!(step.run_id.is_some(), "completed brief has a run id");
+        }
+        assert!(k
+            .audit_log()
+            .iter()
+            .any(|e| e.action == "orchestration:batch"));
+    }
+
+    #[test]
+    fn run_orchestration_is_bounded_and_stops_safely() {
+        let (mut k, ctx) = orchestration_kernel();
+        let record = k
+            .prime_orchestrate(&ctx, "implement the feature and document the result")
+            .unwrap();
+        let id = record.id.clone();
+
+        // A capped batch runs only one brief and leaves the rest pending.
+        let first = k.run_orchestration(&id, 1).unwrap();
+        assert_eq!(first.ran, 1);
+        assert_eq!(first.pending, 1);
+        assert_eq!(first.status, OrchestrationStatus::Running);
+        assert!(first.next_action.contains("again"));
+
+        // Running again continues the remaining brief and completes.
+        let second = k.run_orchestration(&id, 25).unwrap();
+        assert_eq!(second.ran, 1);
+        assert_eq!(second.status, OrchestrationStatus::Completed);
+
+        // Running once more does nothing - no runaway, no re-running completed work.
+        let third = k.run_orchestration(&id, 25).unwrap();
+        assert_eq!(third.ran, 0);
+        assert_eq!(third.completed, 0);
+        assert_eq!(third.status, OrchestrationStatus::Completed);
+    }
+
+    #[test]
+    fn run_orchestration_blocks_on_a_disabled_cli_adapter() {
+        let (mut k, ctx) = orchestration_kernel();
+        // A research specialist on the Claude CLI adapter, whose runtime is NOT
+        // enabled (the default). A brief assigned to it must be reported as blocked,
+        // never faked, while the local Prime brief still completes.
+        install_bundled(&mut k, claude_adapter_manifest());
+        let claude = PluginId::new("relux-adapter-claude-cli");
+        k.create_agent(
+            "research-agent",
+            "Research Agent",
+            "investigates",
+            &claude,
+            &ctx.namespace,
+            None,
+            vec![],
+        )
+        .unwrap();
+
+        let record = k
+            .prime_orchestrate(&ctx, "research the options and document the result")
+            .unwrap();
+        let id = record.id.clone();
+        // research -> research-agent (Claude, disabled); document -> Prime (local).
+        assert_eq!(record.steps[0].agent_id.as_str(), "research-agent");
+
+        let batch = k.run_orchestration(&id, 25).unwrap();
+        assert_eq!(batch.blocked, 1);
+        assert_eq!(batch.completed, 1);
+        assert_eq!(batch.status, OrchestrationStatus::NeedsAttention);
+        assert!(batch.next_action.contains("attention"));
+
+        let stored = k.orchestration(&id).unwrap();
+        let blocked_step = stored
+            .steps
+            .iter()
+            .find(|s| s.agent_id.as_str() == "research-agent")
+            .unwrap();
+        assert_eq!(blocked_step.outcome, StepOutcome::Blocked);
+        assert!(blocked_step.note.is_some(), "blocked brief carries a reason");
+    }
+
+    #[test]
+    fn orchestration_persists_across_snapshot() {
+        let (mut k, ctx) = orchestration_kernel();
+        let record = k
+            .prime_orchestrate(&ctx, "implement the feature and document the result")
+            .unwrap();
+        let id = record.id.clone();
+
+        let restored = KernelState::from_snapshot(k.snapshot());
+        let stored = restored.orchestration(&id).expect("orchestration survived");
+        assert_eq!(stored.steps.len(), 2);
+        assert_eq!(stored.goal, record.goal);
+
+        // The counter resumes so the next orchestration id does not collide.
+        let mut restored = restored;
+        let next = restored
+            .prime_orchestrate(&ctx, "research the options and test the result")
+            .unwrap();
+        assert_ne!(next.id, id);
     }
 }

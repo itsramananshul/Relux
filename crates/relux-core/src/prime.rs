@@ -88,6 +88,11 @@ pub enum PrimeIntent {
     ExplanationRequest,
     DashboardNavigation,
     Brainstorming,
+    /// The user asked Prime to coordinate a goal across multiple agents ("orchestrate",
+    /// "split this across agents", "have the team..."). Prime decomposes the goal
+    /// into role-typed briefs and assigns them; running is a separate governed step.
+    /// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 10.4 (Delegation Rules).
+    Orchestration,
     /// The user asked which tools Prime can use ("what tools can you use?").
     /// Answered with grounded capability discovery, never a fabricated list.
     ToolDiscovery,
@@ -122,6 +127,12 @@ pub enum PrimeAction {
     },
     CreateAndRunTask {
         title: String,
+    },
+    /// Decompose a goal into multiple role-typed briefs and assign each to a fitting
+    /// agent, recording a durable orchestration. Creates work but does not run it;
+    /// running is a separate governed batch (`docs/RELUX_MASTER_PLAN.md` section 10.4).
+    OrchestrateGoal {
+        goal: String,
     },
     UpdateTask {
         task_id: String,
@@ -338,6 +349,7 @@ mod tests {
             PrimeIntent::ExplanationRequest,
             PrimeIntent::DashboardNavigation,
             PrimeIntent::Brainstorming,
+            PrimeIntent::Orchestration,
             PrimeIntent::ToolDiscovery,
             PrimeIntent::ToolInvocation,
             PrimeIntent::DirectAnswer,

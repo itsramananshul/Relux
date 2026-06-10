@@ -1856,6 +1856,69 @@ Dashboard: the Prime page exposes a Prime Autonomy panel with toggle, interval,
 max tasks per tick, auto-assign, last tick summary, and a "Run one tick now"
 control.
 
+### Orchestration (First Multi-Agent Slice)
+
+The first slice of Prime-as-orchestrator (section 10.4 Delegation Rules, section 15
+"Relux can support real multi-agent workloads"). It lets Prime coordinate several
+agents on one goal instead of being a single local task runner, while staying
+inside the existing permission/adapter/approval model.
+
+How it works:
+
+- **Planning is the pure brain.** `relux_core::plan_orchestration(goal, state)`
+  splits a goal into clauses on natural connectors ("then", ",", "and"),
+  classifies each clause to a role (`research`, `implementation`, `testing`,
+  `review`, `documentation`, `operations`, `general`), and resolves each role to a
+  real agent on the live roster (by id keyword) or `None` (→ Prime fallback, with
+  an honest hire note). It is conservative: a goal that does not split into ≥2
+  briefs is **not** treated as multi-agent, so a greeting or a single task never
+  becomes a storm (section 10.5). Step count is capped.
+- **Prime classifies orchestration intent** only on explicit coordination phrasing
+  ("orchestrate", "coordinate", "split this across agents", "have the team…"); a
+  bare imperative still creates a single task as before.
+- **Creating an orchestration** mints one brief (task) per step, assigns each to
+  its agent (specialist or Prime), and records a durable `Orchestration`
+  (`goal → steps[{task, agent, role, run, outcome}]`). It creates work but **does
+  not run it** — nothing executes, and no paid CLI is spawned, without an explicit
+  start.
+- **Running an orchestration** is a governed batch: each pending brief runs through
+  **its assigned agent's adapter** via the same path as the Work page
+  (`execute_assigned_run`) — local Prime echoes deterministically; an **enabled**
+  Claude/Codex CLI agent spawns the real CLI; a disabled/unconfigured runtime or a
+  missing permission is recorded as **blocked** (a human action is required), never
+  faked. The batch is bounded (`max`, clamped 1..=25), runs each brief at most
+  once, records per-agent outcomes + the next human action, updates the durable
+  record, and **stops safely** — it never loops, recurses, or auto-runs downloaded
+  plugin code (section 8.2). Re-running only picks up still-pending briefs.
+
+This is distinct from the background autonomy loop above, which stays deterministic
+(echo-only) and never spawns a paid CLI. Orchestration is operator-triggered.
+
+CLI:
+
+```powershell
+relux-kernel prime orchestrate "research the options, implement a prototype, and write the docs"
+relux-kernel prime orchestration list
+relux-kernel prime orchestration show <id>
+relux-kernel prime orchestration run <id> [--max N]
+```
+
+API:
+
+```text
+POST /v1/relux/prime/orchestrate/preview      # preview a plan, commit nothing
+POST /v1/relux/prime/orchestrations           # create (plan + assign) from { goal }
+GET  /v1/relux/prime/orchestrations           # list
+GET  /v1/relux/prime/orchestrations/:id       # one record + full step chain
+POST /v1/relux/prime/orchestrations/:id/run   # run a governed batch ({ max? })
+```
+
+Dashboard: the Prime page has an **Orchestration** panel (goal → preview plan →
+create → run/continue, with per-agent briefs and outcomes); Home shows the
+newest unfinished orchestration with its progress and next action. Pure UI logic
+lives in `apps/dashboard/src/orchestration.ts` with unit coverage in
+`apps/dashboard/test/orchestration.test.ts`.
+
 ### Tool Invocation Surface (First Honest Version)
 
 Installed ToolSet plugins are now visible, callable capabilities through the
@@ -2258,5 +2321,14 @@ remain, in rough priority for the next slices:
    polls/refreshes a synchronous run rather than tailing it) and resuming a
    *partial* CLI run (retry is a new attempt). Execution-environment runtimes are
    not implemented.
-4. **Multi-agent autonomy.** Prime's autonomy loop runs one safe governed tick at
-   a time; coordinated multi-Operative execution is later.
+4. **Multi-agent autonomy.** *(First slice addressed post-v0.1.2.)* See
+   "Orchestration (First Multi-Agent Slice)" below. Prime can now decompose a
+   multi-step goal into role-typed **briefs assigned to different agents** and run
+   them in a **governed multi-agent batch** through each agent's own adapter (local
+   Prime echoes; an enabled Claude/Codex CLI agent runs the real CLI), recording
+   per-agent outcomes and a durable goal → brief → agent → run trace. What is still
+   **not** done: parallel/concurrent brief execution (the batch runs briefs
+   sequentially), dependency ordering between briefs, automatic agent hiring during
+   planning (Prime falls back to itself and suggests a hire), and a background timer
+   that drives orchestrations (running is operator-triggered from the UI/CLI/API;
+   the background autonomy timer stays deterministic and never spawns a paid CLI).
