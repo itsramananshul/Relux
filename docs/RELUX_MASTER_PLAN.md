@@ -2044,11 +2044,22 @@ in kernel state.
   absolute grounding. The LLM is never asked to narrate real state changes.
 - **Conversational Shaping**: For greetings, status queries, and general chat, the
   LLM rephrases the kernel's grounded facts into natural dialogue.
-- **Configuration**:
+- **Configuration (dashboard, recommended; no env vars)**: Health → Prime AI
+  settings lets an operator set the OpenRouter key/model without environment
+  variables (§18: "do not hardcode one model provider"). The key is stored in a
+  local, gitignored secrets file under the data root (`<data-root>/ai-config.json`,
+  `0600` on Unix), is resolved live by `serve`/CLI, and is **never** returned by the
+  API. Endpoints:
+  - `GET /v1/relux/ai/status` — key-free status (mode/configured/model/reason).
+  - `PUT /v1/relux/ai/config` — `{ provider:"openrouter", api_key, model?, disabled? }`.
+  - `DELETE /v1/relux/ai/config` — clear the stored key/config.
+  Only OpenRouter takes a key; Claude/Codex adapters use their own local CLI login.
+- **Configuration (environment, CLI-only setups)**:
   - `RELUX_OPENROUTER_API_KEY`: Enables OpenRouter when set.
   - `RELUX_OPENROUTER_MODEL`: Model ID (default `openai/gpt-4o-mini`).
   - `RELUX_LLM_DISABLED`: Forces deterministic mode even if a key exists.
   - `RELUX_LLM_TIMEOUT_MS`: Request timeout (default 15000ms).
+  The dashboard secrets file wins per-field; omitted fields fall back to the env.
 
 The API never returns the key. The dashboard shows the current AI provider/mode.
 
@@ -2065,12 +2076,27 @@ The API never returns the key. The dashboard shows the current AI provider/mode.
   the old Relix web bridge + a login and degrades honestly when it is absent.
 - Prime has an optional LLM-backed path for conversational replies, but its
   core planning remains deterministic. Multi-agent autonomous execution is later.
+- The first-release **product path** is the Claude/Codex adapters + Prime tools.
+  The built-in deterministic handlers (`relux-tools-echo`, `relux-tools-status`)
+  are **internal dev/test tools** that prove the kernel/permission/audit loop and
+  back the offline smoke; they are not the recommended user path and are not
+  surfaced as a "run echo" affordance in the standalone shell.
 - Tool invocation executes built-in deterministic handlers (echo, status) plus
   installed ToolSet plugins that an operator has explicitly pointed at a loopback
   HTTP server (Plugin Runtime v1). Relux still does NOT auto-run downloaded plugin
   code: it never shells out, never runs GitHub/zip/folder install code in-process,
   and never calls a remote host - a plugin becomes executable only via an
   operator-run `http://127.0.0.1|localhost|[::1]:<port>` endpoint.
+- Installing a GitHub repo / folder / zip that has no `relux-plugin.json` no longer
+  hard fails: Relux generates a safe, **metadata-only** wrapper manifest (sanitized
+  id, no tools, no permissions, `Unverified`, marked generated). It runs nothing
+  until the operator configures a runtime or adds tool definitions; Relux never
+  infers tool commands from repo content. `/v1/relux/plugins` flags these with
+  `generated: true`.
+- Prime's AI provider/key is configurable from the dashboard (Health → Prime AI
+  settings) without environment variables; the key is stored in a local gitignored
+  secrets file and never returned by the API. Claude/Codex adapters use their own
+  local CLI login (no key in Relux).
 - Adapter Runtime v1 can drive an assigned task through a local coding-agent CLI
   (Claude CLI, Codex CLI, or a generic command), but only when the operator
   explicitly enables that adapter (disabled by default) and the binary is on PATH.

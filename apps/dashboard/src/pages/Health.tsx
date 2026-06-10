@@ -8,6 +8,7 @@ import {
   type ReluxAdapterStatus,
   type ReluxPrimeAutonomyStatusResponse,
 } from "../api";
+import { PrimeAiSettings } from "../components/PrimeAiSettings";
 
 // Relux Health / diagnostics (RELUX_MASTER_PLAN §11.9, §22). The local
 // readiness surface for the standalone product: state counts, plugin/tool/
@@ -240,6 +241,8 @@ export function Health() {
           </div>
         )}
       </div>
+
+      <PrimeAiSettings />
 
       <div className="card">
         <h3>AI Status</h3>

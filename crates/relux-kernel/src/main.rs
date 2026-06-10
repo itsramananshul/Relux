@@ -310,22 +310,24 @@ fn run_health() -> ExitCode {
         }
     }
 
-    // AI status
-    let ai_config = relux_kernel::AiConfig::from_env();
+    // AI status: resolve from the dashboard-written secrets file (when present)
+    // with environment fallback, so a key configured from the dashboard is
+    // honored here too.
+    let ai_config = relux_kernel::AiConfig::resolve(Some(&ai_config_path()));
     let ai_status = ai_config.status();
     match ai_status.mode {
         relux_kernel::AiMode::Openrouter => {
             if ai_status.configured {
                 println!("PASS: AI mode: OpenRouter (configured)");
             } else {
-                warnings.push("WARN: AI mode: OpenRouter (not configured, set RELUX_OPENROUTER_API_KEY)".to_string());
+                warnings.push("WARN: AI mode: OpenRouter (not configured; set a key in the dashboard AI settings or RELUX_OPENROUTER_API_KEY)".to_string());
                 if exit_code == ExitCode::SUCCESS {
                     exit_code = ExitCode::from(1);
                 }
             }
         }
         relux_kernel::AiMode::Deterministic => {
-            println!("INFO: AI mode: Deterministic (no OpenRouter config found)");
+            println!("INFO: AI mode: Deterministic (no OpenRouter key configured)");
         }
         relux_kernel::AiMode::DeterministicForAction => {
             println!("INFO: AI mode: Deterministic (for action)");
@@ -378,6 +380,19 @@ fn plugins_root() -> PathBuf {
     match db.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.join("plugins"),
         _ => PathBuf::from("dev-data/relux/plugins"),
+    }
+}
+
+/// The dashboard-written AI provider secrets file: `ai-config.json` next to the
+/// local dev database (`dev-data/relux/ai-config.json` by default, already
+/// gitignored). It lets an operator configure Prime's OpenRouter key from the
+/// dashboard without environment variables; the key is never returned over the
+/// API. See `docs/RELUX_MASTER_PLAN.md` "Optional LLM-backed Prime".
+fn ai_config_path() -> PathBuf {
+    let db = db_path();
+    match db.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join("ai-config.json"),
+        _ => PathBuf::from("dev-data/relux/ai-config.json"),
     }
 }
 

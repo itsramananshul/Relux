@@ -55,6 +55,20 @@ function getFirstRunChecklist(s: ReluxState | null): ChecklistItem[] {
       linkTo: "/approvals"
     },
     {
+      id: "coding-adapter",
+      label: "Set up a coding adapter (Claude / Codex)",
+      status: "link",
+      description: "Install + log in to the Claude or Codex CLI, then enable its adapter on the Crew page so Prime can run real assigned tasks.",
+      linkTo: "/crew"
+    },
+    {
+      id: "ai-provider",
+      label: "Configure Prime's AI provider (optional)",
+      status: "link",
+      description: "Add an OpenRouter API key from Health → Prime AI settings for natural chat. Claude/Codex adapters use their own local CLI login.",
+      linkTo: "/health"
+    },
+    {
       id: "installed-plugins",
       label: "Plugins installed",
       status: s.installed_plugins > 0 ? "done" : "todo",
@@ -100,7 +114,8 @@ export function ReluxHome() {
         <p className="muted" style={{ marginTop: 0, fontSize: 13, lineHeight: 1.6 }}>
           Relux is a Prime-centered control plane for agentic work, running locally
           on your machine. Talk to <strong>Prime</strong> to inspect state, create
-          tasks, and start runs; install <strong>plugins</strong> to add
+          tasks, and start runs; run real work through a <strong>Claude</strong> or{" "}
+          <strong>Codex</strong> adapter; install <strong>plugins</strong> to add
           capabilities. Everything here is served by <span className="mono">relux-kernel</span>{" "}
           - no login, no external bridge.
         </p>
@@ -176,6 +191,37 @@ export function ReluxHome() {
           </ul>
         </div>
       )}
+
+      {/* The real product path: run work through a coding-agent adapter. */}
+      <div className="card">
+        <h3 style={{ marginTop: 0 }}>Run real work: Claude / Codex adapters</h3>
+        <p className="muted" style={{ marginTop: 0, fontSize: 13, lineHeight: 1.6 }}>
+          Prime can drive a real coding-agent CLI to execute assigned tasks. This is
+          the recommended path:
+        </p>
+        <ol className="muted" style={{ fontSize: 13, lineHeight: 1.7, marginTop: 0, paddingLeft: 18 }}>
+          <li>
+            Install and log in to the <strong>Claude CLI</strong>{" "}
+            (<span className="mono">claude</span>) or the <strong>Codex CLI</strong>{" "}
+            (<span className="mono">codex</span>) so it is on your PATH. They use
+            their own local login — no API key goes into Relux.
+          </li>
+          <li>
+            On <Link to="/crew" className="link">Crew → Adapters</Link>, enable the
+            adapter. It is disabled by default and runs the CLI in a safe,
+            non-bypass mode.
+          </li>
+          <li>
+            Create a task on <Link to="/work" className="link">Work</Link>, assign it
+            to an agent using that adapter, and run it.
+          </li>
+        </ol>
+        <p className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+          Prefer natural Prime chat? Add an OpenRouter API key under{" "}
+          <Link to="/health" className="link">Health → Prime AI settings</Link>{" "}
+          (optional; Prime stays deterministic and grounded without it).
+        </p>
+      </div>
 
       {/* Installed plugins at a glance — the capability surface. */}
       <div className="card">

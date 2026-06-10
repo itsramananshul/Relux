@@ -51,13 +51,24 @@
 #   ... -SkipServe       # skip the HTTP serve checks AND the loopback test
 #   ... -SkipLoopback    # skip only the loopback runtime test
 #   ... -KeepTemp        # keep the temp RELUX_DB for inspection
+#   ... -RunRealClaudeAdapter  # opt-in: run ONE tiny non-mutating assigned task
+#                              # through the REAL Claude CLI adapter (needs `claude`
+#                              # on PATH + logged in). DISABLED by default. Never
+#                              # uses --dangerously-skip-permissions.
+#   ... -RunRealCodexAdapter   # same, for the real Codex CLI (`codex`).
+#
+# The real-adapter smokes need the HTTP serve (do not combine with -SkipServe).
+# When the CLI is not on PATH they SKIP; otherwise they record an honest PASS/FAIL
+# from the actual run. No bypass/danger flags are ever passed to the CLI.
 
 [CmdletBinding()]
 param(
     [switch]$SkipBuild,
     [switch]$SkipServe,
     [switch]$SkipLoopback,
-    [switch]$KeepTemp
+    [switch]$KeepTemp,
+    [switch]$RunRealClaudeAdapter,
+    [switch]$RunRealCodexAdapter
 )
 
 $ErrorActionPreference = 'Stop'
@@ -217,6 +228,8 @@ try {
         Section 'HTTP serve + loopback'
         Skip 'http serve checks' '-SkipServe'
         Skip 'loopback runtime' '-SkipServe (needs the API to grant Prime the tool permission)'
+        if ($RunRealClaudeAdapter) { Skip 'real claude adapter run' '-SkipServe (needs the serve API)' }
+        if ($RunRealCodexAdapter) { Skip 'real codex adapter run' '-SkipServe (needs the serve API)' }
     } else {
         Section 'HTTP serve + loopback'
 
@@ -291,12 +304,17 @@ try {
         $serveProc = Start-Process -FilePath $ReleaseExe -ArgumentList 'serve' -PassThru -WindowStyle Hidden -RedirectStandardOutput $serveOut -RedirectStandardError $serveErr
 
         $client = New-Object System.Net.Http.HttpClient
-        $client.Timeout = [TimeSpan]::FromSeconds(10)
+        # Generous timeout: execute-assigned is synchronous, and a REAL Claude/Codex
+        # adapter run (opt-in) blocks this call until the CLI finishes. Fast calls
+        # still return immediately, so a high ceiling is harmless.
+        $client.Timeout = [TimeSpan]::FromSeconds(180)
         function Invoke-Api {
             param([string]$Method, [string]$Path, [string]$Json)
             try {
                 if ($Method -eq 'GET') {
                     $r = $client.GetAsync("$base$Path").GetAwaiter().GetResult()
+                } elseif ($Method -eq 'DELETE') {
+                    $r = $client.DeleteAsync("$base$Path").GetAwaiter().GetResult()
                 } elseif ($Method -eq 'PUT') {
                     $c = New-Object System.Net.Http.StringContent($Json, [System.Text.Encoding]::UTF8, 'application/json')
                     $r = $client.PutAsync("$base$Path", $c).GetAwaiter().GetResult()
@@ -352,6 +370,49 @@ try {
                 $inv = Invoke-Api 'POST' '/v1/relux/tools/invoke' (@{ plugin_id = 'relux-tools-smoke'; tool_name = 'smoke.ping'; input = @{ hello = 'world' } } | ConvertTo-Json -Compress)
                 $loopOk = ($inv.Status -eq 200) -and ($inv.Body.Contains($lbToken))
                 Assert 'loopback runtime returns its output' $loopOk ("invoke=$($inv.Status), token flowed back=$($inv.Body.Contains($lbToken))")
+            }
+
+            # -- Real CLI adapter smoke (OPT-IN; never bypass flags) -----------
+            # Drives ONE tiny, non-mutating assigned task through the REAL Claude /
+            # Codex CLI: enable the adapter (auto-detected binary, no --command, no
+            # danger flags), create an agent that uses it, assign a trivial task,
+            # execute it, and record the honest run outcome. Skips cleanly when the
+            # CLI is not on PATH. Disabled by default.
+            $realAdapters = @(
+                @{ On = $RunRealClaudeAdapter; Bin = 'claude'; Adapter = 'relux-adapter-claude-cli'; Tag = 'claude' },
+                @{ On = $RunRealCodexAdapter;  Bin = 'codex';  Adapter = 'relux-adapter-codex-cli';  Tag = 'codex' }
+            )
+            foreach ($ra in $realAdapters) {
+                if (-not $ra.On) { continue }
+                $label = "real $($ra.Tag) adapter run"
+                $onPath = [bool](Get-Command $ra.Bin -ErrorAction SilentlyContinue)
+                if (-not $onPath) { Skip $label ("$($ra.Bin) not on PATH"); continue }
+
+                $agName = "smoke-$($ra.Tag)"
+                # Reset to a clean runtime first: an earlier step may have left a
+                # fake command on this adapter. Clear it, then enable with the real
+                # binary explicitly so detection cannot inherit stale config.
+                [void](Invoke-Api 'DELETE' "/v1/relux/adapters/$($ra.Adapter)/runtime" $null)
+                $en = Invoke-Api 'PUT' "/v1/relux/adapters/$($ra.Adapter)/runtime" (@{ enabled = $true; command = $ra.Bin } | ConvertTo-Json -Compress)
+                $ag = Invoke-Api 'POST' '/v1/relux/agents' (@{ id = $agName; name = $agName; adapter_plugin = $ra.Adapter } | ConvertTo-Json -Compress)
+                $tk = Invoke-Api 'POST' '/v1/relux/tasks' (@{ title = 'Reply with the single word OK and do nothing else. Do not create or modify any files.' } | ConvertTo-Json -Compress)
+                $taskId = $null; try { $taskId = ($tk.Body | ConvertFrom-Json).id } catch {}
+                if (-not $taskId) { Fail $label ("could not create task: enable=$($en.Status) agent=$($ag.Status) task=$($tk.Status)"); continue }
+                [void](Invoke-Api 'POST' "/v1/relux/tasks/$taskId/assign" (@{ agent_id = $agName } | ConvertTo-Json -Compress))
+
+                $ex = Invoke-Api 'POST' "/v1/relux/tasks/$taskId/execute-assigned" '{}'
+                $runId = $null; try { $runId = ($ex.Body | ConvertFrom-Json).run_id } catch {}
+                $runObj = $null
+                if ($runId) { try { $runObj = (Invoke-Api 'GET' "/v1/relux/runs/$runId" $null).Body | ConvertFrom-Json } catch {} }
+                $completed = ($ex.Status -eq 200) -and $runObj -and ($runObj.status -eq 'completed')
+                if ($completed) {
+                    Pass $label ("run $runId completed via real $($ra.Bin)")
+                } else {
+                    $why = if ($runObj) { "status=$($runObj.status) error=$($runObj.error)" } else { "execute=$($ex.Status)" }
+                    Fail $label $why
+                }
+                # Always disable the adapter again so no later step can spawn it.
+                [void](Invoke-Api 'DELETE' "/v1/relux/adapters/$($ra.Adapter)/runtime" $null)
             }
         } else {
             if (Test-Path $serveErr) {

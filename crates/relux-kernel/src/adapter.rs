@@ -148,14 +148,23 @@ pub fn find_on_path(binary: &str) -> Option<PathBuf> {
 
     let path_var = std::env::var_os("PATH")?;
     let exts = path_extensions();
+    // On Windows a bare, extension-less file (e.g. an npm shell shim named
+    // `claude` with no extension) is NOT directly executable by CreateProcess - it
+    // is a Unix-style script. So when probing a bare name there, prefer a PATHEXT
+    // variant (`claude.cmd` / `claude.exe`, which Rust runs correctly, routing
+    // `.cmd`/`.bat` through cmd.exe) and only accept the extension-less file when
+    // the name already carries an executable extension. On non-Windows `exts` is
+    // empty and the bare file is the executable, so behavior is unchanged.
+    let bare_is_executable = bare_name_is_executable(binary, &exts);
     for dir in std::env::split_paths(&path_var) {
         if dir.as_os_str().is_empty() {
             continue;
         }
-        // Try the bare name first, then each known executable extension.
-        let candidate = dir.join(binary);
-        if candidate.is_file() {
-            return Some(candidate);
+        if bare_is_executable {
+            let candidate = dir.join(binary);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
         for ext in &exts {
             let candidate = dir.join(format!("{binary}{ext}"));
@@ -165,6 +174,18 @@ pub fn find_on_path(binary: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Whether a bare program name is directly runnable as-is. On non-Windows
+/// (`exts` empty) it always is. On Windows it is only runnable when it already
+/// ends with a known executable extension (e.g. `foo.exe`); a bare `foo` must be
+/// resolved to a PATHEXT variant instead.
+fn bare_name_is_executable(name: &str, exts: &[String]) -> bool {
+    if exts.is_empty() {
+        return true;
+    }
+    let lower = name.to_ascii_lowercase();
+    exts.iter().any(|e| lower.ends_with(e.as_str()))
 }
 
 /// The executable extensions to probe for a bare binary name. On Windows this is
@@ -352,6 +373,18 @@ mod tests {
     fn find_on_path_returns_none_for_missing_binary() {
         assert!(find_on_path("relux-definitely-not-a-real-binary-xyz").is_none());
         assert!(find_on_path("").is_none());
+    }
+
+    #[test]
+    fn bare_name_executability_is_windows_aware() {
+        // Non-Windows (no PATHEXT entries): a bare name is the executable.
+        assert!(bare_name_is_executable("claude", &[]));
+        // Windows (PATHEXT present): a bare, extension-less name is NOT directly
+        // runnable - it must resolve to a `.cmd`/`.exe` variant first.
+        let exts = vec![".com".to_string(), ".exe".to_string(), ".cmd".to_string()];
+        assert!(!bare_name_is_executable("claude", &exts));
+        assert!(bare_name_is_executable("claude.cmd", &exts));
+        assert!(bare_name_is_executable("CLAUDE.EXE", &exts));
     }
 
     // --- Fake-binary spawn tests (no real Claude/Codex) --------------------

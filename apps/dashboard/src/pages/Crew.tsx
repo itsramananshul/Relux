@@ -163,11 +163,19 @@ function AdaptersSection() {
     <div className="section">
       <h2>Adapters</h2>
       <p className="muted" style={{ fontSize: 13, marginTop: -8 }}>
-        Adapters decide how an assigned task runs. The local Prime adapter is
-        deterministic. A CLI adapter (Claude / Codex / generic command) spawns a
-        local binary &mdash; <strong>disabled by default</strong>. Enabling one
-        means <em>Relux will run that local CLI when an assigned task starts</em>,
-        in a non-interactive, non-bypass mode.
+        Adapters decide how an assigned task runs. The real product path is a
+        coding-agent CLI: <strong>Claude</strong> or <strong>Codex</strong>. A CLI
+        adapter spawns a local binary &mdash; <strong>disabled by default</strong>.
+        Enabling one means <em>Relux will run that local CLI when an assigned task
+        starts</em>, in a non-interactive, non-bypass mode (it never passes{" "}
+        <span className="mono">--dangerously-skip-permissions</span>).
+      </p>
+      <p className="muted" style={{ fontSize: 13, marginTop: -4 }}>
+        <strong>Onboarding:</strong> install and log in to the Claude CLI
+        (<span className="mono">claude</span>) or the Codex CLI
+        (<span className="mono">codex</span>) so it is on your PATH, then enable the
+        matching adapter below. These CLIs use their own local login &mdash; there
+        is no API key to paste in Relux for them.
       </p>
       {error && (
         <div className="error-message">Error loading adapters: {String(error)}</div>

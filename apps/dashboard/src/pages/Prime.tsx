@@ -28,7 +28,6 @@ const DISPOSITION_TONE: Record<string, string> = {
 const SUGGESTIONS = [
   "what tools can you use?",
   "what is going on?",
-  "echo hello",
   "create a task to summarize the README",
   "create an agent named researcher",
   "assign task_0001 to researcher",
@@ -202,13 +201,17 @@ function ToolResult({ turn }: { turn: ReluxPrimeTurn }) {
 
 function AiStatusBanner({ status }: { status: ReluxAiStatus | null }) {
   if (!status) return null;
-  const isLlm = status.mode === "openrouter";
+  const isLlm = status.mode === "openrouter" && status.configured && !status.disabled;
   const icon = isLlm ? "✨" : "🤖";
   const label = isLlm ? `Prime: OpenRouter (${status.model})` : "Prime: deterministic";
   return (
-    <div className="row wrap muted" style={{ gap: 8, fontSize: 10, padding: "4px 8px", borderBottom: "1px solid var(--border)", marginBottom: 8 }} title={status.reason}>
+    <div className="row wrap muted" style={{ gap: 8, fontSize: 10, padding: "4px 8px", borderBottom: "1px solid var(--border)", marginBottom: 8, alignItems: "center" }} title={status.reason}>
       <span>{icon} {label}</span>
       {status.disabled && status.configured && <span className="badge todo" style={{fontSize: 8}}>LLM disabled</span>}
+      <div className="spacer" style={{ flex: 1 }} />
+      <Link to="/health" className="link" style={{ fontSize: 10 }} title="Configure Prime's AI provider / API key">
+        {isLlm ? "AI settings →" : "Set up Claude / Codex / OpenRouter →"}
+      </Link>
     </div>
   );
 }

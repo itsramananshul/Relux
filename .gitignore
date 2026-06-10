@@ -66,3 +66,9 @@ configs/policies/local.toml
 # docs/dashboard-redesign.md for the security model.
 bridge-secrets.toml
 **/bridge-secrets.toml
+
+# Relux dashboard-written AI provider secrets file (OpenRouter key configured via
+# Health -> Prime AI settings). Lives under the local data root (already covered by
+# dev-data/ above); this is belt-and-braces so a bundle's data dir is covered too.
+ai-config.json
+**/ai-config.json

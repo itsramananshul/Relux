@@ -24,8 +24,26 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
+use relux_core::permission::ToolDefinition;
 use relux_core::plugin::validate_manifest;
-use relux_core::{InstalledPlugin, PluginId, PluginManifest, PluginSourceKind};
+use relux_core::{
+    InstalledPlugin, PluginCapability, PluginHealth, PluginId, PluginKind, PluginManifest,
+    PluginSourceKind, TrustLevel,
+};
+
+/// The `author` sentinel stamped on a manifest Relux generated itself because a
+/// downloaded/imported source carried no `relux-plugin.json`. It is the honest
+/// marker the kernel/dashboard use to say "installed as metadata only" - the
+/// plugin ships no runnable tools until the operator configures a runtime or adds
+/// tool definitions. See [`scaffold_manifest`] and [`is_generated_manifest`].
+pub const GENERATED_MANIFEST_AUTHOR: &str = "relux (generated manifest)";
+
+/// Whether `manifest` was scaffolded by Relux (no `relux-plugin.json` was present
+/// in the source). A generated manifest declares no tools and is non-executable
+/// until the operator configures it.
+pub fn is_generated_manifest(manifest: &PluginManifest) -> bool {
+    manifest.author == GENERATED_MANIFEST_AUTHOR
+}
 
 use crate::loader::{load_plugin_manifests, MANIFEST_FILENAME};
 use crate::state::{BundledRefresh, BundledRefreshSummary};
@@ -42,7 +60,7 @@ pub fn install_from_dir(
     installed_root: &Path,
     kernel: &mut KernelState,
 ) -> Result<InstalledPlugin, KernelError> {
-    let (manifest_dir, manifest) = locate_plugin_dir(source_dir)?;
+    let (manifest_dir, manifest) = locate_or_scaffold(source_dir, &seed_from_path(source_dir))?;
     install_located(
         kernel,
         &manifest_dir,
@@ -71,7 +89,12 @@ pub fn install_from_zip(
 
     let result = (|| {
         extract_zip(zip_path, &staging)?;
-        let (manifest_dir, manifest) = locate_plugin_dir(&staging)?;
+        let zip_seed = zip_path
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .unwrap_or("plugin")
+            .to_string();
+        let (manifest_dir, manifest) = locate_or_scaffold(&staging, &zip_seed)?;
         install_located(
             kernel,
             &manifest_dir,
@@ -123,7 +146,7 @@ pub fn install_from_github(
             "git clone failed for {url}"
         ))),
         Ok(_) => {
-            let (manifest_dir, manifest) = locate_plugin_dir(&staging)?;
+            let (manifest_dir, manifest) = locate_or_scaffold(&staging, &github_repo_seed(url))?;
             install_located(
                 kernel,
                 &manifest_dir,
@@ -256,15 +279,37 @@ fn install_located(
     ))
 }
 
-/// Find the plugin folder (and parsed, validated manifest) inside `dir`.
+/// Locate the plugin folder + validated manifest inside `dir`, or scaffold a
+/// safe wrapper manifest when the source carries no `relux-plugin.json`.
+///
+/// This is what lets an arbitrary GitHub repo / local folder / zip be installed
+/// even with no Relux manifest (`docs/RELUX_MASTER_PLAN.md` section 7.4): the
+/// generated manifest is **metadata only** - it declares NO tools and is
+/// non-executable until the operator configures a loopback runtime or adds tool
+/// definitions. Relux never infers tool commands from repo content. An ambiguous
+/// source (more than one real plugin folder) is still a hard error rather than a
+/// silent guess.
+fn locate_or_scaffold(
+    dir: &Path,
+    id_seed: &str,
+) -> Result<(PathBuf, PluginManifest), KernelError> {
+    match try_locate_plugin_dir(dir)? {
+        Some(found) => Ok(found),
+        None => Ok((dir.to_path_buf(), scaffold_manifest(id_seed, dir)?)),
+    }
+}
+
+/// Find the plugin folder (and parsed, validated manifest) inside `dir`, or
+/// `Ok(None)` when no `relux-plugin.json` is present anywhere obvious.
 ///
 /// Accepts either a folder that directly contains `relux-plugin.json`, or a
-/// parent folder containing exactly one subdirectory that does.
-fn locate_plugin_dir(dir: &Path) -> Result<(PathBuf, PluginManifest), KernelError> {
+/// parent folder containing exactly one subdirectory that does. More than one
+/// candidate is an ambiguous source and a hard error (never a silent guess).
+fn try_locate_plugin_dir(dir: &Path) -> Result<Option<(PathBuf, PluginManifest)>, KernelError> {
     let direct = dir.join(MANIFEST_FILENAME);
     if direct.is_file() {
         let manifest = read_manifest(&direct)?;
-        return Ok((dir.to_path_buf(), manifest));
+        return Ok(Some((dir.to_path_buf(), manifest)));
     }
 
     let read = fs::read_dir(dir).map_err(io_err(dir))?;
@@ -282,16 +327,116 @@ fn locate_plugin_dir(dir: &Path) -> Result<(PathBuf, PluginManifest), KernelErro
         1 => {
             let plugin_dir = candidates.remove(0);
             let manifest = read_manifest(&plugin_dir.join(MANIFEST_FILENAME))?;
-            Ok((plugin_dir, manifest))
+            Ok(Some((plugin_dir, manifest)))
         }
-        0 => Err(KernelError::PluginInstall(format!(
-            "no {MANIFEST_FILENAME} found in {}",
-            dir.display()
-        ))),
+        0 => Ok(None),
         n => Err(KernelError::PluginInstall(format!(
             "found {n} plugin folders in {}; expected exactly one",
             dir.display()
         ))),
+    }
+}
+
+/// Build a safe, non-executable wrapper [`PluginManifest`] for a source that has
+/// no `relux-plugin.json`.
+///
+/// The id is derived from `id_seed` (repo/folder/zip name) and sanitized so it
+/// can never escape the install root or collide with a bundled id
+/// (`relux-plugin-<seed>`). The manifest declares NO tools and NO permissions, is
+/// stamped [`TrustLevel::Unverified`] and authored by [`GENERATED_MANIFEST_AUTHOR`]
+/// so it reads honestly as "metadata only". A README first line, when present,
+/// becomes the description.
+fn scaffold_manifest(id_seed: &str, dir: &Path) -> Result<PluginManifest, KernelError> {
+    let sanitized = sanitize_seed(id_seed);
+    let id = format!("relux-plugin-{sanitized}");
+    let summary = read_readme_summary(dir);
+    let description = match summary {
+        Some(s) => format!(
+            "{s} (Installed as metadata: no runnable tools yet - configure a runtime or add tool definitions before it can run.)"
+        ),
+        None => "Installed as metadata: no runnable tools yet - configure a runtime or add tool definitions before it can run.".to_string(),
+    };
+    let manifest = PluginManifest {
+        id: PluginId::new(&id),
+        name: format!("{sanitized} (metadata only)"),
+        version: "0.0.0".to_string(),
+        kind: PluginKind::ToolSet,
+        description,
+        author: GENERATED_MANIFEST_AUTHOR.to_string(),
+        trust_level: TrustLevel::Unverified,
+        capabilities: PluginCapability {
+            tools: Vec::<ToolDefinition>::new(),
+            permissions: Vec::new(),
+        },
+        health: PluginHealth::Unknown,
+    };
+    // Validate the generated manifest the same way a real one is validated, so a
+    // scaffolded record can never be subtly malformed (e.g. an empty id/name).
+    validate_manifest(&manifest).map_err(|source| KernelError::ManifestInvalid {
+        path: dir.display().to_string(),
+        source,
+    })?;
+    Ok(manifest)
+}
+
+/// The first non-empty line of a README in `dir` (bounded), or `None`. Used only
+/// to give a scaffolded manifest a human-readable description.
+fn read_readme_summary(dir: &Path) -> Option<String> {
+    for name in ["README.md", "README", "README.txt", "readme.md", "Readme.md"] {
+        let p = dir.join(name);
+        if p.is_file() {
+            if let Ok(text) = fs::read_to_string(&p) {
+                for line in text.lines() {
+                    let l = line.trim().trim_start_matches('#').trim();
+                    if !l.is_empty() {
+                        return Some(l.chars().take(200).collect());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The last path component of `path`, used as a plugin-id seed.
+fn seed_from_path(path: &Path) -> String {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("plugin")
+        .to_string()
+}
+
+/// Derive a plugin-id seed from a GitHub URL: the trailing repo name without a
+/// `.git` suffix.
+fn github_repo_seed(url: &str) -> String {
+    let trimmed = url.trim().trim_end_matches('/');
+    let last = trimmed.rsplit('/').next().unwrap_or("plugin");
+    last.strip_suffix(".git").unwrap_or(last).to_string()
+}
+
+/// Reduce a seed to a safe id fragment: lowercase ASCII alphanumerics, with any
+/// other character collapsed to a single `-`. Leading/trailing dashes are
+/// trimmed. The result never contains `..`, a path separator, or a `.`, so
+/// `relux-plugin-<seed>` always passes [`safe_plugin_id`]. An empty result
+/// degrades to `"plugin"`.
+fn sanitize_seed(seed: &str) -> String {
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for c in seed.trim().chars() {
+        let c = c.to_ascii_lowercase();
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+            prev_dash = false;
+        } else if !out.is_empty() && !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "plugin".to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -673,6 +818,91 @@ mod tests {
         assert!(validate_github_url("ftp://github.com/owner/repo").is_err());
         assert!(validate_github_url("https://tok@github.com/owner/repo").is_err());
         assert!(validate_github_url(" https://github.com/owner/repo ").is_err());
+    }
+
+    #[test]
+    fn install_dir_without_manifest_generates_safe_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A repo-like folder with NO relux-plugin.json, but a README.
+        let source = tmp.path().join("my-cool-repo");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("README.md"), "# My Cool Repo\n\nDoes cool things.\n").unwrap();
+        fs::write(source.join("main.py"), "print('hi')\n").unwrap();
+        let installed_root = tmp.path().join("installed");
+
+        let mut kernel = KernelState::new();
+        let installed = install_from_dir(&source, &installed_root, &mut kernel).expect("install ok");
+
+        // A safe, derived id; non-executable (no tools); marked generated.
+        assert_eq!(installed.id, PluginId::new("relux-plugin-my-cool-repo"));
+        assert_eq!(installed.version, "0.0.0");
+        assert_eq!(installed.source_kind, PluginSourceKind::LocalDir);
+        let manifest = kernel.plugin(&installed.id).expect("manifest registered");
+        assert!(is_generated_manifest(manifest), "manifest marked generated");
+        assert!(manifest.capabilities.tools.is_empty(), "no tools => non-executable");
+        assert!(manifest.capabilities.permissions.is_empty());
+        assert_eq!(manifest.trust_level, TrustLevel::Unverified);
+        assert!(manifest.description.contains("My Cool Repo"), "README summary used");
+        // No tool is runnable from a generated manifest.
+        let tools = kernel.discover_tools(None);
+        assert!(
+            !tools.iter().any(|t| t.plugin_id == installed.id.as_str()),
+            "generated plugin exposes no runnable tools"
+        );
+
+        // A real manifest in the same folder is still preferred over scaffolding.
+        let source2 = tmp.path().join("real");
+        write_plugin_dir(&source2, "relux-tools-real");
+        let installed2 = install_from_dir(&source2, &installed_root, &mut kernel).expect("ok");
+        assert_eq!(installed2.id, PluginId::new("relux-tools-real"));
+        assert!(!is_generated_manifest(kernel.plugin(&installed2.id).unwrap()));
+    }
+
+    #[test]
+    fn scaffold_sanitizes_malicious_seeds() {
+        // Path-traversal / separator / weird seeds all reduce to a safe id that
+        // passes safe_plugin_id and cannot escape the install root.
+        for (seed, expect) in [
+            ("../../etc/passwd", "relux-plugin-etc-passwd"),
+            ("..", "relux-plugin-plugin"),
+            ("a/b\\c", "relux-plugin-a-b-c"),
+            ("My Repo.git", "relux-plugin-my-repo-git"),
+            ("   ", "relux-plugin-plugin"),
+            ("UPPER_case", "relux-plugin-upper-case"),
+        ] {
+            let id = format!("relux-plugin-{}", sanitize_seed(seed));
+            assert_eq!(id, expect, "seed {seed:?}");
+            assert!(safe_plugin_id(&id).is_ok(), "{id} must be a safe id");
+        }
+    }
+
+    #[test]
+    fn github_repo_seed_strips_git_suffix_and_trailing_slash() {
+        assert_eq!(github_repo_seed("https://github.com/owner/repo"), "repo");
+        assert_eq!(github_repo_seed("https://github.com/owner/repo.git"), "repo");
+        assert_eq!(github_repo_seed("https://github.com/owner/repo/"), "repo");
+    }
+
+    #[test]
+    fn zip_without_manifest_generates_metadata_and_is_safe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let installed_root = tmp.path().join("installed");
+        // A zip with files but no relux-plugin.json anywhere.
+        let zip_path = tmp.path().join("toolbox.zip");
+        {
+            let file = fs::File::create(&zip_path).unwrap();
+            let mut zw = zip::ZipWriter::new(file);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zw.start_file("src/lib.rs", opts).unwrap();
+            zw.write_all(b"// code").unwrap();
+            zw.finish().unwrap();
+        }
+        let mut kernel = KernelState::new();
+        let installed = install_from_zip(&zip_path, &installed_root, &mut kernel).expect("zip ok");
+        assert_eq!(installed.id, PluginId::new("relux-plugin-toolbox"));
+        assert!(is_generated_manifest(kernel.plugin(&installed.id).unwrap()));
+        assert!(!installed_root.join(".staging-zip").exists(), "staging cleaned");
     }
 
     #[test]

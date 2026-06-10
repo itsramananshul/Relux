@@ -1284,6 +1284,10 @@ export interface ReluxPlugin {
   install_dir: string;
   protected: boolean;
   bundled: boolean;
+  // True when Relux scaffolded the manifest because the source had no
+  // relux-plugin.json. The plugin is installed as metadata only and runs nothing
+  // until a runtime/tools are configured.
+  generated?: boolean;
   trust_level?: string | null;
   health?: string | null;
 }
@@ -1419,8 +1423,21 @@ export interface ReluxAiStatus {
 }
 
 export const reluxAi = {
-  // Current AI configuration/status.
+  // Current AI configuration/status (key-free; never returns the API key).
   status: () => api.get<ReluxAiStatus>("/v1/relux/ai/status"),
+  // Configure Prime's AI provider from the dashboard (no env vars). Only
+  // OpenRouter takes a key today; Claude/Codex adapters use local CLI auth. The
+  // key is stored locally (gitignored) and never returned — the response is the
+  // key-free status. Pass api_key:"" to clear the stored key.
+  setConfig: (body: {
+    provider?: string;
+    api_key?: string;
+    model?: string;
+    disabled?: boolean;
+  }) => api.put<ReluxAiStatus>("/v1/relux/ai/config", body),
+  // Clear the dashboard-stored AI config entirely (falls back to env, then to
+  // deterministic Prime).
+  clearConfig: () => api.del<ReluxAiStatus>("/v1/relux/ai/config"),
 };
 
 // -- Relux Work (tasks + runs) ---------------------------------------------

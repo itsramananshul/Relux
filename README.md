@@ -26,6 +26,14 @@ with one command - no web bridge, no login:
 cargo run -p relux-kernel -- serve
 ```
 
+**Product path (first release):** real work runs through a coding-agent **adapter**
+- the **Claude CLI** or the **Codex CLI** - driven by **Prime** and its tools. Set
+up an adapter from the dashboard (Crew → Adapters) and, optionally, give Prime a
+natural voice with an OpenRouter key (Health → Prime AI settings). The bundled
+`relux-tools-echo` / `relux-tools-status` handlers are **internal dev/test tools**
+that prove the loop end-to-end (they back the offline smoke); they are not the
+recommended user path and are not surfaced as a "run echo" button in the product.
+
 Then open the dashboard it prints:
 
 ```text
@@ -50,9 +58,12 @@ honest: **only built-in deterministic tool handlers execute.** An
 installed-but-unimplemented tool is listed as `not_implemented` rather than
 faked, and arbitrary downloaded plugin code is never run.
 
-Two built-in tools ship today:
+Two built-in tools ship today. They are **internal dev/test built-ins** - the
+honest, deterministic floor that proves the kernel/permission/audit loop and backs
+the offline smoke. They are **not** the recommended product path (that is the
+Claude/Codex adapters above) and are intentionally not promoted in the UI:
 
-- `relux-tools-echo` / `echo.say` - returns its input unchanged.
+- `relux-tools-echo` / `echo.say` - returns its input unchanged (dev/test only).
 - `relux-tools-status` / `status.summary` - returns a deterministic summary of
   control-plane counts (read-only; no network or filesystem access).
 
@@ -181,6 +192,29 @@ set the loopback URL + timeout, disable, or clear it. Configured-and-enabled
 tools then show as `ready` in the Tools section and can be invoked from the
 existing invoke panel; unconfigured tools show `runtime not configured` with a
 configure affordance.
+
+### Installing plugins without a manifest (safe metadata wrapper)
+
+A Relux plugin normally ships a `relux-plugin.json` manifest. To make arbitrary
+GitHub repos / local folders / zips installable, the install paths no longer hard
+fail when no manifest is present: Relux **generates a safe wrapper manifest**
+instead.
+
+- The id is derived from the repo/folder/zip name and sanitized
+  (`relux-plugin-<name>`), so a hostile name can never escape the install root or
+  collide with a bundled id.
+- The generated manifest declares **no tools and no permissions**, is marked
+  `Unverified`, and is authored by a `relux (generated manifest)` sentinel. It is
+  **metadata only**: it runs nothing.
+- Relux **never infers tool commands from repo content**. The plugin stays
+  non-executable until you either configure an HTTP loopback runtime for it or add
+  real tool definitions.
+- An ambiguous source (more than one real plugin folder inside) is still a hard
+  error rather than a silent guess.
+
+The dashboard Plugins page shows a **metadata only** badge and explains that a
+wrapper manifest was generated and that a runtime/tools must be configured before
+it can run. `/v1/relux/plugins` exposes a `generated: true` flag for these records.
 
 ### Adapter Runtime v1 (local coding-agent CLIs)
 
@@ -394,11 +428,31 @@ conversational replies (greetings, status, explanations) are shaped by the model
 while actions (task creation, starting runs) stay grounded and deterministic in the
 kernel.
 
+**From the dashboard (recommended; no env vars).** Open **Health → Prime AI
+settings**, paste your OpenRouter key (and optionally a model), and save. The key
+is stored in a local, gitignored secrets file under the data root
+(`<data-root>/ai-config.json`, e.g. `dev-data/relux/ai-config.json`) at `0600` on
+Unix. It is **never** returned by the API or shown in the UI - only the key-free
+status (`mode` / `configured` / `model`) is exposed. `relux-kernel serve` picks the
+key up live, so no restart is needed. The API behind it:
+
+```text
+GET    /v1/relux/ai/status     # key-free: mode / configured / model / reason
+PUT    /v1/relux/ai/config     # { "provider":"openrouter", "api_key":"...", "model"?, "disabled"? }
+DELETE /v1/relux/ai/config     # clear the stored key/config
+```
+
+Only **OpenRouter** takes an API key. **Claude and Codex are run as adapters** and
+authenticate through their own local CLI login - there is no key to paste for them.
+
+**From the environment (CLI-only setups still work).**
+
 1. Set `RELUX_OPENROUTER_API_KEY` to your OpenRouter key.
 2. (Optional) Set `RELUX_OPENROUTER_MODEL` (default: `openai/gpt-4o-mini`).
 3. (Optional) Set `RELUX_LLM_DISABLED=1` to force deterministic mode.
 
-Keys are read from the environment and are never returned by the API or shown in the UI.
+A key in the dashboard secrets file wins per-field; any field it omits falls back
+to the environment. Keys are never returned by the API or shown in the UI.
 
 The dashboard opens on **Relux Home**, featuring a dynamic first-run checklist to guide initial setup, direct action links to key sections, and an overview of installed plugins. From there, you can chat with **Prime** (`POST /v1/relux/prime`), which now includes an action strip with practical example prompts for creating tasks, agents, and assigning work. Manage your **work** (tasks and runs) on the dedicated Work page, which offers a clear assignment/run workflow, conditional "Run assigned" actions, and task filtering. The **crew** (agents) page allows you to create and manage agents, with each agent's card linking directly to their assigned tasks. You can also install **plugins**, manage **approvals** and permissions, and check **health** — a local readiness surface with state counts, plugin/tool/adapter status, Prime autonomy status, and the package/check command hints. All of these are backed by the local `/v1/relux` API, with no dependency on the legacy Relix bridge. The old bridge-backed Relix pages are not part of this standalone shell and do not appear in its navigation; they remain reachable only at their legacy paths. Delegated tasks can be run by their assigned agent through the Work page, the API, or the CLI.
 The served bundle is the committed build under

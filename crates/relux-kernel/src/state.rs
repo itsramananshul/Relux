@@ -2479,14 +2479,20 @@ impl KernelState {
                 return Err(err);
             }
         };
-        if crate::adapter::find_on_path(&binary).is_none() {
-            let err = KernelError::AdapterBinaryMissing {
-                plugin: adapter.to_string(),
-                binary: binary.clone(),
-            };
-            self.fail_cli_run(&run_id, task_id, namespace.as_ref(), adapter, &err.to_string());
-            return Err(err);
-        }
+        // Resolve to the actual on-disk path. On Windows this turns a bare
+        // `claude` into the full path of `claude.cmd`/`claude.exe`, which the
+        // process spawner can run (a bare extension-less shim cannot be spawned).
+        let program = match crate::adapter::find_on_path(&binary) {
+            Some(p) => p.to_string_lossy().to_string(),
+            None => {
+                let err = KernelError::AdapterBinaryMissing {
+                    plugin: adapter.to_string(),
+                    binary: binary.clone(),
+                };
+                self.fail_cli_run(&run_id, task_id, namespace.as_ref(), adapter, &err.to_string());
+                return Err(err);
+            }
+        };
 
         // 3. Compose the prompt from the agent persona + task title/input.
         let (agent_name, persona) = {
@@ -2512,7 +2518,7 @@ impl KernelState {
         );
         let args = crate::adapter::build_adapter_args(&config.kind);
         let spec = crate::adapter::AdapterCommandSpec {
-            program: binary.clone(),
+            program: program.clone(),
             args,
             stdin: prompt,
             working_dir: config.working_dir.clone(),

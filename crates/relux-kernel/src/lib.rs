@@ -33,13 +33,16 @@ pub use adapter::{
     build_adapter_args, compose_prompt, find_on_path, run_adapter_command, AdapterCommandSpec,
     AdapterRunOutcome,
 };
-pub use ai::{shape_reply, AiConfig, AiMode, AiOutcome, AiStatus};
+pub use ai::{
+    clear_stored_config, read_stored_config, shape_reply, write_stored_config, AiConfig, AiMode,
+    AiOutcome, AiStatus, StoredAiConfig,
+};
 pub use builtin::{is_builtin_tool, BUILTIN_TOOLS};
 pub use clock::Clock;
 pub use event::RunEvent;
 pub use loader::{load_plugin_manifests, MANIFEST_FILENAME};
 pub use plugin_install::{
-    install_from_dir, install_from_github, install_from_zip, list_installed,
+    install_from_dir, install_from_github, install_from_zip, is_generated_manifest, list_installed,
     refresh_bundled_plugins, remove_plugin,
 };
 pub use prime::{classify_intent, decide};

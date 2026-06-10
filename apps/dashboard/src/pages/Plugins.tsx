@@ -341,6 +341,14 @@ function PluginRow({ plugin, onChanged }: { plugin: ReluxPlugin; onChanged: () =
               {plugin.description}
             </div>
           )}
+          {plugin.generated && (
+            <div className="muted" style={{ fontSize: 11, marginTop: 4, maxWidth: 380 }}>
+              ⚠ Installed as metadata: Relux generated a wrapper manifest because
+              the source had no <span className="mono">relux-plugin.json</span>. It
+              runs nothing until you configure a runtime (below) or add tool
+              definitions.
+            </div>
+          )}
           {err && (
             <div className="banner err" style={{ fontSize: 11, marginTop: 6, marginBottom: 0 }}>
               {err}
@@ -362,6 +370,11 @@ function PluginRow({ plugin, onChanged }: { plugin: ReluxPlugin; onChanged: () =
           {plugin.protected && (
             <span className="badge" style={{ marginLeft: 6 }} title="Bundled fixture; cannot be removed">
               protected
+            </span>
+          )}
+          {plugin.generated && (
+            <span className="badge backlog" style={{ marginLeft: 6 }} title="Wrapper manifest generated; no runnable tools yet">
+              metadata only
             </span>
           )}
         </td>
@@ -625,7 +638,9 @@ function InstallPanel({
           />
           <p className="muted" style={{ fontSize: 11, marginTop: 6 }}>
             Cloned with <span className="mono">git clone --depth 1</span> on the Relux host.
-            The repo must contain a <span className="mono">relux-plugin.json</span> manifest.
+            If the repo has a <span className="mono">relux-plugin.json</span> manifest it is used
+            directly; if not, Relux generates a safe <em>metadata-only</em> wrapper manifest
+            (no runnable tools) you can configure afterward.
           </p>
         </label>
       )}

@@ -36,10 +36,11 @@
 //! It is shaped as a free function plus a plain config so it can later move
 //! behind a `relux-adapter-openrouter` plugin without changing callers.
 
+use std::path::Path;
 use std::time::Duration;
 
 use relux_core::{PrimeDisposition, PrimeIntent, PrimeTurn};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// OpenRouter's OpenAI-compatible chat-completions endpoint.
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
@@ -168,6 +169,126 @@ impl AiConfig {
             reason,
         }
     }
+
+    /// Resolve the effective config from the local dashboard-written secrets file
+    /// (when present) with environment fallback.
+    ///
+    /// This is the first-release product path: an operator configures Prime's
+    /// OpenRouter key from the dashboard (no env vars). The file lives under the
+    /// local data root and is gitignored. A value present in the file wins for
+    /// that field; any field the file omits falls back to the environment, so the
+    /// existing CLI-only `RELUX_OPENROUTER_*` setup keeps working. The key is held
+    /// privately and is never serialized back out (see [`AiStatus`]).
+    pub fn resolve(path: Option<&Path>) -> Self {
+        let env = Self::from_env();
+        let Some(path) = path else {
+            return env;
+        };
+        let Some(stored) = read_stored_config(path) else {
+            return env;
+        };
+        let api_key = stored
+            .api_key
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
+            .or(env.api_key);
+        let model = stored
+            .model
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty())
+            .unwrap_or(env.model);
+        let disabled = stored.disabled.unwrap_or(env.disabled);
+        Self {
+            api_key,
+            model,
+            disabled,
+            timeout_ms: env.timeout_ms,
+        }
+    }
+}
+
+// --- Dashboard-configured secrets file -------------------------------------
+
+/// The on-disk AI provider configuration the dashboard writes.
+///
+/// It lives under the local data root (next to `RELUX_DB`) and is gitignored.
+/// It DOES hold the API key at rest so Prime can use it without environment
+/// variables, but it is never returned over the API: only the key-free
+/// [`AiStatus`] crosses the wire. Today only OpenRouter is supported; Claude and
+/// Codex adapters authenticate through their own local CLI login, not a key here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StoredAiConfig {
+    /// The provider id. Only `"openrouter"` is honored today; recorded for
+    /// forward-compatibility and so the dashboard can show what is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// The OpenRouter API key. Present only when the operator configured one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled: Option<bool>,
+}
+
+/// Read the stored AI config from `path`, or `None` when it is absent/unreadable
+/// or does not parse. Never panics; never logs the key.
+pub fn read_stored_config(path: &Path) -> Option<StoredAiConfig> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Persist (merge) the dashboard-configured AI settings to `path`.
+///
+/// Each `Some` field is applied over any existing file so a partial update keeps
+/// the rest; passing `api_key: Some("")` (or whitespace) clears the stored key
+/// without disturbing the model/disabled flags. Parent directories are created.
+/// On Unix the file is written `0600`. Returns an io error on failure; never logs
+/// the key.
+pub fn write_stored_config(
+    path: &Path,
+    provider: Option<String>,
+    api_key: Option<String>,
+    model: Option<String>,
+    disabled: Option<bool>,
+) -> std::io::Result<()> {
+    let mut current = read_stored_config(path).unwrap_or_default();
+    if let Some(p) = provider {
+        let p = p.trim().to_string();
+        current.provider = if p.is_empty() { None } else { Some(p) };
+    }
+    if let Some(k) = api_key {
+        let k = k.trim().to_string();
+        current.api_key = if k.is_empty() { None } else { Some(k) };
+    }
+    if let Some(m) = model {
+        let m = m.trim().to_string();
+        current.model = if m.is_empty() { None } else { Some(m) };
+    }
+    if let Some(d) = disabled {
+        current.disabled = Some(d);
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let json = serde_json::to_string_pretty(&current).unwrap_or_else(|_| "{}".to_string());
+    std::fs::write(path, json)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+/// Remove the stored AI config file entirely (a no-op when it is absent).
+pub fn clear_stored_config(path: &Path) -> std::io::Result<()> {
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
 }
 
 /// `true` for the usual truthy env spellings; anything else is false.
@@ -645,6 +766,51 @@ mod tests {
         );
         assert!(out.model.is_none());
         assert_eq!(out.note.as_deref(), Some("openrouter unavailable: timeout"));
+    }
+
+    #[test]
+    fn stored_config_round_trips_and_resolves_over_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ai-config.json");
+
+        // No file yet -> resolve falls back to env (deterministic here: no key).
+        let resolved = AiConfig::resolve(Some(&path));
+        assert!(!resolved.configured(), "no file, no env key");
+
+        // Write a key + model through the public writer.
+        let secret = ["sk", "or", "stored", "DO-NOT-LEAK"].join("-");
+        write_stored_config(
+            &path,
+            Some("openrouter".into()),
+            Some(secret.clone()),
+            Some("anthropic/claude-3.5-haiku".into()),
+            None,
+        )
+        .unwrap();
+
+        let resolved = AiConfig::resolve(Some(&path));
+        assert!(resolved.configured(), "file key is picked up");
+        assert!(resolved.enabled());
+        assert_eq!(resolved.model, "anthropic/claude-3.5-haiku");
+        // The status surface still never carries the key.
+        let json = serde_json::to_string(&resolved.status()).unwrap();
+        assert!(!json.contains(&secret), "status leaked the key: {json}");
+
+        // A partial update keeps the key but flips disabled.
+        write_stored_config(&path, None, None, None, Some(true)).unwrap();
+        let resolved = AiConfig::resolve(Some(&path));
+        assert!(resolved.configured(), "key preserved across partial update");
+        assert!(!resolved.enabled(), "disabled flag applied");
+
+        // Clearing only the key (empty string) removes it.
+        write_stored_config(&path, None, Some("   ".into()), None, None).unwrap();
+        let resolved = AiConfig::resolve(Some(&path));
+        assert!(!resolved.configured(), "blank key clears the stored key");
+
+        // Clearing the file entirely returns to env fallback.
+        clear_stored_config(&path).unwrap();
+        assert!(!path.exists());
+        assert!(!AiConfig::resolve(Some(&path)).configured());
     }
 
     #[test]

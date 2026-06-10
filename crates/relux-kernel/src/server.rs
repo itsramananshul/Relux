@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use axum::extract::{DefaultBodyLimit, Multipart, Path as AxumPath, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
@@ -58,8 +58,17 @@ struct AppState {
     /// built (a source-only checkout). `None` makes every dashboard route serve
     /// the honest missing-bundle notice instead of panicking.
     dashboard_dir: Option<PathBuf>,
-    ai_config: AiConfig,
+    /// The dashboard-written AI provider secrets file (gitignored). Resolved live
+    /// per request so a key set from the dashboard takes effect without a restart.
+    ai_config_path: PathBuf,
     lock: Arc<Mutex<()>>,
+}
+
+/// Resolve the effective AI config from the local secrets file (when present)
+/// with environment fallback. The key is never returned over the wire - only the
+/// key-free [`AiStatus`].
+fn resolve_ai(state: &AppState) -> AiConfig {
+    AiConfig::resolve(Some(&state.ai_config_path))
 }
 
 /// Build the tokio runtime and run the API server until the process is killed.
@@ -81,7 +90,7 @@ async fn serve() -> Result<(), KernelError> {
         plugins_root: crate::plugins_root(),
         uploads_root: crate::uploads_root(),
         dashboard_dir: crate::dashboard::resolve_dist_dir(),
-        ai_config: AiConfig::from_env(),
+        ai_config_path: crate::ai_config_path(),
         lock: Arc::new(Mutex::new(())),
     };
 
@@ -118,6 +127,8 @@ async fn serve() -> Result<(), KernelError> {
     println!("   GET    /dashboard                          (standalone Relux shell)");
     println!("   GET    /v1/relux/state");
     println!("   GET    /v1/relux/ai/status");
+    println!("   PUT    /v1/relux/ai/config                 {{ \"provider\":\"openrouter\", \"api_key\":\"...\", \"model\"?, \"disabled\"? }}");
+    println!("   DELETE /v1/relux/ai/config                 (clear the stored AI key/config)");
     println!("   GET    /v1/relux/tasks");
     println!("   GET    /v1/relux/tasks/:id");
     println!("   GET    /v1/relux/runs");
@@ -223,6 +234,10 @@ fn router(state: AppState) -> Router {
         // The /v1/relux control-plane API the dashboard calls on the same origin.
         .route("/v1/relux/state", get(get_state))
         .route("/v1/relux/ai/status", get(get_ai_status))
+        .route(
+            "/v1/relux/ai/config",
+            put(set_ai_config).patch(set_ai_config).delete(clear_ai_config),
+        )
         .route("/v1/relux/agents", get(list_agents).post(create_agent))
         .route("/v1/relux/prime", post(run_prime))
         .route("/v1/relux/prime/autonomy", get(get_autonomy_config).put(update_autonomy_config).patch(update_autonomy_config))
@@ -384,7 +399,58 @@ async fn get_state(State(state): State<AppState>) -> Result<Json<StateResponse>,
 }
 
 async fn get_ai_status(State(state): State<AppState>) -> Json<AiStatus> {
-    Json(state.ai_config.status())
+    Json(resolve_ai(&state).status())
+}
+
+/// Set or update Prime's AI provider configuration from the dashboard.
+///
+/// First-release product path (`docs/RELUX_MASTER_PLAN.md` "Optional LLM-backed
+/// Prime"): an operator configures the OpenRouter key WITHOUT environment
+/// variables. The key is stored in a local gitignored secrets file under the data
+/// root and is NEVER returned - the response is the key-free [`AiStatus`]. Claude
+/// and Codex adapters do not use a key here; they authenticate via their own
+/// local CLI login.
+async fn set_ai_config(
+    State(state): State<AppState>,
+    Json(req): Json<SetAiConfigReq>,
+) -> Result<Json<AiStatus>, ApiError> {
+    if let Some(p) = req.provider.as_ref() {
+        let p = p.trim().to_ascii_lowercase();
+        if !p.is_empty() && p != "openrouter" {
+            return Err(ApiError::bad_request(format!(
+                "unsupported provider '{p}'. Only 'openrouter' takes an API key today; \
+                 Claude and Codex adapters use their own local CLI login (no key here)."
+            )));
+        }
+    }
+    relux_kernel::write_stored_config(
+        &state.ai_config_path,
+        req.provider,
+        req.api_key,
+        req.model,
+        req.disabled,
+    )
+    .map_err(|e| ApiError::internal(format!("failed to write AI config: {e}")))?;
+    Ok(Json(resolve_ai(&state).status()))
+}
+
+/// Clear the dashboard-written AI config entirely (Prime falls back to env, then
+/// to deterministic mode). Returns the resulting key-free [`AiStatus`].
+async fn clear_ai_config(State(state): State<AppState>) -> Result<Json<AiStatus>, ApiError> {
+    relux_kernel::clear_stored_config(&state.ai_config_path)
+        .map_err(|e| ApiError::internal(format!("failed to clear AI config: {e}")))?;
+    Ok(Json(resolve_ai(&state).status()))
+}
+
+/// The dashboard's AI-config write payload. Only OpenRouter is honored; the key
+/// is accepted here but never echoed back. An empty `api_key` clears the stored
+/// key without disturbing the model/disabled flags.
+#[derive(Debug, Deserialize)]
+struct SetAiConfigReq {
+    provider: Option<String>,
+    api_key: Option<String>,
+    model: Option<String>,
+    disabled: Option<bool>,
 }
 
 async fn list_agents(State(state): State<AppState>) -> Result<Json<Vec<AgentRecord>>, ApiError> {
@@ -887,8 +953,10 @@ async fn run_prime(
     };
 
     // 2. Shape the reply (LLM or deterministic fallback). This happens OUTSIDE
-    // the lock because it might involve a slow network call.
-    let outcome = relux_kernel::shape_reply(&state.ai_config, &message, &turn).await;
+    // the lock because it might involve a slow network call. Resolve the config
+    // live so a key configured from the dashboard is picked up without a restart.
+    let ai_config = resolve_ai(&state);
+    let outcome = relux_kernel::shape_reply(&ai_config, &message, &turn).await;
 
     // 3. Merge the outcome into the response.
     let mut final_turn = turn;
@@ -1413,7 +1481,7 @@ async fn get_health(State(state): State<AppState>) -> Result<Json<HealthResponse
     let version = crate::get_kernel_version().to_string();
     let db_path = state.db_path.display().to_string();
     let dashboard_bundle_present = state.dashboard_dir.is_some();
-    let ai_status = state.ai_config.status();
+    let ai_status = resolve_ai(&state).status();
 
     if !dashboard_bundle_present {
         warnings.push("Dashboard bundle not found. Run `npm run build` in `apps/dashboard`".to_string());
@@ -1541,6 +1609,10 @@ struct PluginRecord {
     /// Bundled plugins are protected - they cannot be removed via the API.
     protected: bool,
     bundled: bool,
+    /// True when Relux scaffolded this plugin's manifest because the source had no
+    /// `relux-plugin.json`. Such a plugin is installed as metadata only and runs
+    /// nothing until the operator configures a runtime or adds tool definitions.
+    generated: bool,
     trust_level: Option<String>,
     health: Option<String>,
 }
@@ -1562,6 +1634,7 @@ fn plugin_record(installed: &InstalledPlugin, manifest: Option<&PluginManifest>)
         install_dir: installed.install_dir.clone(),
         protected: bundled,
         bundled,
+        generated: manifest.map(relux_kernel::is_generated_manifest).unwrap_or(false),
         trust_level: manifest.map(|m| format!("{:?}", m.trust_level)),
         health: manifest.map(|m| format!("{:?}", m.health)),
     }
