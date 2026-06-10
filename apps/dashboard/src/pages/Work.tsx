@@ -709,10 +709,17 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
           <h5 style={{ marginTop: 16, marginBottom: 8 }}>
             Transcript
             {/* The stall signal also rides next to the transcript header, where
-                an operator watching the live tail is looking. */}
+                an operator watching the live tail is looking. Same badge chip
+                language as the legacy RunTranscript stalled cue (◌ + the honest
+                "no activity" label, `badge in_progress`) so the two transcript
+                surfaces read identically (relix-dashboard-design §8 / §11). */}
             {stalledNote && (
-              <span className="muted" style={{ fontSize: 11, fontWeight: 400, marginLeft: 8 }}>
-                {stalledNote}
+              <span
+                className="badge in_progress"
+                style={{ fontSize: 9, fontWeight: 600, marginLeft: 8, verticalAlign: "middle" }}
+                title="real elapsed silence — no new event/phase has arrived for a while (not a guaranteed stall, just no observed activity)"
+              >
+                ◌ {stalledNote}
               </span>
             )}
           </h5>
