@@ -9,6 +9,36 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.2 (Windows bundle).** The `relux-kernel` /
+  `relux-core` crates move from `0.1.1` to `0.1.2` for the first build that closes
+  the three honest post-v0.1.1 gaps. **First-run brain onboarding:** Home's
+  first-run checklist now derives a **live "connect Prime to a brain" step** from
+  the control plane (`/v1/relux/ai/status` + `/v1/relux/adapters`) — it detects
+  whether the Claude/Codex CLI is on PATH, reports whether the selected brain is
+  actually usable, and routes the operator to Health → *Prime Brain / AI Runtime*
+  with the exact next step (pure derivation in `apps/dashboard/src/onboarding.ts`,
+  unit-covered). **Honest plugin install UX for metadata-only wrappers:** a
+  generated metadata-only GitHub/zip wrapper is badged **Needs configuration**
+  (never "enabled"/"ready"); its honest next step is **add tool definitions** (a
+  one-click *Set up* with a copy/download manifest template), the install flow
+  shows a **result summary** (tools discovered vs wrapper generated vs adapter),
+  and the Tools list shows **only runnable tools** by default
+  (`apps/dashboard/src/plugins.ts`, unit-covered). **Adapter run depth:** a CLI
+  adapter run is now observable and recoverable — Run Detail shows the adapter,
+  status, phase, a real measured duration, a redacted **output excerpt**, a clear
+  failure reason, and (when reported) cost/usage, all from the durable transcript;
+  the Claude adapter requests a **structured JSON result envelope** parsed into an
+  honest summary + metrics (`relux_core::parse_adapter_result`, an envelope
+  `is_error` is a failure even on a clean exit), Codex/generic commands degrade
+  honestly to plain text, and a **failed run is retryable** as a fresh run
+  (`prime.retry_run` → `POST /v1/relux/runs/:id/retry`) with lineage recorded
+  (`retried_from`). Proven against the **real Claude and Codex CLIs**. *Caveats:*
+  runs are synchronous (the page polls/refreshes rather than tailing live events),
+  Codex/generic output is plain text (no structured envelope), and retry is a
+  fresh attempt — **not** a resume of a partial CLI run. This version line is the
+  `relux-kernel` crate version (separate from the Relix workspace version below);
+  build the bundle with `scripts\relux-package-local.ps1 -FullE2E`. See
+  `docs/RELUX_MASTER_PLAN.md` → *Release history*.
 - **Relux local release v0.1.1 (Windows bundle).** The `relux-kernel` /
   `relux-core` crates move from `0.1.0` to `0.1.1` for the first build that makes
   **Prime brain selection** a first-class dashboard surface. Health → *Prime

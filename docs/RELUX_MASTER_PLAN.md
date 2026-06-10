@@ -1775,6 +1775,29 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.2** (2026-06-10) — first build on top of v0.1.1 that closes the three
+  honest post-v0.1.1 gaps (see *Status after v0.1.1*). **First-run onboarding:**
+  Home's first-run checklist now derives a **live "connect Prime to a brain"
+  step** from the control plane (`/v1/relux/ai/status` + `/v1/relux/adapters`) —
+  it detects whether the Claude/Codex CLI is on PATH, reports whether the selected
+  brain is actually usable, and routes the operator to Health → *Prime Brain / AI
+  Runtime* with the exact next step. **Honest plugin install UX:** a generated
+  metadata-only GitHub/zip wrapper is badged **Needs configuration** (never
+  "enabled"/"ready"), its honest next step is **add tool definitions** (a one-click
+  *Set up* with a copy/download manifest template), the install flow shows a
+  **result summary** (tools discovered vs wrapper generated vs adapter), and the
+  Tools list shows **only runnable tools** by default. **Adapter run depth:** a CLI
+  adapter run is now observable and recoverable — Run Detail shows the adapter,
+  status, phase, a real measured duration, a redacted output excerpt, a clear
+  failure reason, and (when reported) cost/usage, all from the durable transcript;
+  the Claude adapter requests a JSON result envelope parsed into an honest
+  summary + metrics (`relux_core::parse_adapter_result`, `is_error` is a failure
+  even on clean exit), Codex/generic degrade honestly to plain text, and a **failed
+  run is retryable** as a fresh run with lineage (`retried_from`). Proven against
+  the real Claude and Codex CLIs. *Caveats:* runs are synchronous (the page
+  polls/refreshes rather than tailing live events), Codex/generic output is plain
+  text (no structured envelope), and retry is a fresh attempt — not a resume of a
+  partial CLI run.
 - **v0.1.1** (2026-06-10) — first build that makes **Prime brain selection** a
   first-class dashboard surface. Health → *Prime Brain / AI Runtime* lets the
   operator pick who answers Prime's conversational turns — Local (deterministic),
