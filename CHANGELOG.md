@@ -9,6 +9,47 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.4 (Windows bundle).** The `relux-kernel` /
+  `relux-core` crates move from `0.1.3` to `0.1.4` for the first build on top of
+  v0.1.3 that makes the orchestrator's **run results reviewable and applyable** and
+  its **live progress honest**, while fixing a user-facing Prime-chat regression.
+  This release bundles the post-v0.1.3 work (detailed in the entries below):
+  **Prime CLI brain raw-JSON fix** — the Claude/Codex conversational path showed
+  the whole result envelope instead of the human answer; the reply is now shaped
+  through the same `parse_adapter_result` the assigned-run path uses
+  (`shape_cli_brain_reply`, never the raw JSON), and the Prime conversational brain
+  handles the `proposed_changes` envelope honestly. **First real Relux diff/apply
+  model** — a run captures read-only **artifacts** promoted into reviewed, applyable
+  **proposed changes** that **replace / create / rename-move / delete** files,
+  applied as a **single multi-file transactional apply** (all-or-nothing: a per-
+  change precondition/traversal failure rolls the whole batch back). **Live-tail +
+  stalled signals** — both the Relux **Work** Run Detail and the legacy **Run
+  transcript** do an efficient **incremental live-tail** and show an honest
+  **stalled / "No activity for Xs"** badge-chip when an in-flight run goes quiet,
+  with consistent wording across both surfaces. **Orchestration cancel / resume /
+  restart-honest** — cooperative cancel/stop for live multi-brief jobs,
+  resume-after-cancel, and restart-honest status reconstructed from the durable
+  record with an interrupted-job callout + **Continue** resume. **Run Detail deep
+  links + UX polish** — URL-driven in-shell Run Detail with orchestration `run_id`
+  deep links, a **Copy link** action, consolidated in-shell run navigation, honest
+  review/apply parity, per-brief recorded run duration, and a **status badge that
+  carries the error tone** for failed runs. Also an actionable **port-conflict**
+  message on `serve` bind failure plus a matching bundle-launcher preflight with
+  pinned wording parity. Every v0.1.3 safety property holds on every path:
+  dependency gating, at-most-once per round, permission + adapter-runtime gating
+  before any spawn, secret redaction, the durable run transcript, audit, retry,
+  sibling failure/panic isolation, and **no auto-run of downloaded plugin code**.
+  Proven against the real Claude and Codex CLIs and by deterministic unit/HTTP
+  smokes. *Known caveats:* the transactional apply is the **Relux kernel**
+  proposed-change surface (separate from the legacy `relix-runtime` brief-runs
+  apply); the in-memory job registry still does not survive a restart for
+  **by-job-id** polls (the by-orchestration-id poll stays restart-honest);
+  live-tail is incremental polling, not a server-push event stream; retry/resume is
+  a fresh attempt or a continued batch, not a partial-CLI-run resume; and the
+  standalone API remains loopback-only and unauthenticated by design. This version
+  line is the `relux-kernel` crate version (separate from the Relix workspace
+  version below); build the bundle with `scripts\relux-package-local.ps1 -FullE2E`.
+  See `docs/RELUX_MASTER_PLAN.md` → *Release history*.
 - **Failed-run status badge carries the error tone (relix-dashboard-design
   §12).** `runStatusTone` mapped a `failed` run to the neutral `backlog` chip —
   the same muted-grey tone used for unknown / pre-terminal statuses — so a failed

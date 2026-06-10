@@ -1817,6 +1817,52 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.4** (2026-06-10) — first build on top of v0.1.3 that makes the
+  orchestrator's **run results reviewable and applyable** and its **live progress
+  honest**, while fixing a user-facing Prime-chat regression. **Prime CLI brain
+  raw-JSON fix:** the Claude/Codex conversational path used the captured CLI stdout
+  verbatim, so with Claude's `--output-format json` the chat bubble showed the
+  whole result envelope (`type`, `result`, `is_error`, `usage`, `duration_ms`,
+  `session_id`, `total_cost_usd`, …) instead of the human answer. The reply is now
+  shaped through the same `parse_adapter_result` the assigned-run path uses — it
+  lifts the envelope `result` text, degrades to plain prose for Codex/text mode,
+  surfaces an `is_error` envelope as an honest fallback note (never the raw JSON),
+  and falls back on an empty answer. Extracted as a pure, unit-tested seam
+  (`shape_cli_brain_reply`) so the no-raw-JSON contract is pinned by tests.
+  **First real Relux diff/apply model:** a run can capture **proposed changes** —
+  read-only **artifacts** (name / type / summary / source, sanitized path + size)
+  promoted into reviewed, applyable changes that **replace, create, rename/move, or
+  delete** files, applied as a **single multi-file transactional apply** (all-or-
+  nothing: a per-change precondition/traversal failure rolls the whole batch back,
+  no partial writes), with the Prime conversational brain handling the
+  `proposed_changes` envelope honestly. **Live-tail + stalled signals:** both the
+  Relux **Work** Run Detail and the legacy **Run transcript** now do an efficient
+  **incremental live-tail** (append only new transcript lines, not a full re-fetch)
+  and show an honest **stalled / "No activity for Xs"** cue as a restrained
+  badge-chip when an in-flight run goes quiet — consistent wording across both
+  surfaces. **Orchestration cancel / resume / restart-honest:** orchestration jobs
+  gained **cooperative cancel/stop** (a live, multi-brief in-flight job stops at the
+  next safe point), **resume-after-cancel**, and **restart-honest** job status —
+  after a server restart a poll by orchestration id reconstructs status from the
+  durable record (`completed` / `interrupted`) and the dashboard shows an
+  interrupted-job callout with a **Continue** resume. **Run Detail deep links + UX
+  polish:** URL-driven in-shell Run Detail with orchestration `run_id` deep links, a
+  **Copy link** action, consolidated in-shell run navigation on the Work surface,
+  honest review/apply parity, per-brief recorded run duration, and a **status badge
+  that carries the error tone** for failed runs (no longer the neutral chip). Also
+  hardens first-run: an actionable **port-conflict** message on `serve` bind failure
+  and a matching bundle-launcher port preflight, with their wording pinned to parity.
+  Every safety property from v0.1.3 still holds on every path: dependency gating,
+  at-most-once per round, permission + adapter-runtime gating before any spawn,
+  secret redaction, the durable run transcript, audit, retry, sibling failure/panic
+  isolation, and **no auto-run of downloaded plugin code**. Proven against the real
+  Claude and Codex CLIs and by deterministic unit/HTTP smokes. *Caveats:* the
+  transactional apply is the **Relux kernel** proposed-change surface (separate from
+  the legacy `relix-runtime` brief-runs apply); the in-memory job registry still
+  does not survive a restart for **by-job-id** polls (the by-orchestration-id poll
+  stays restart-honest); live-tail is incremental polling, not a server-push event
+  stream; retry/resume is a fresh attempt or a continued batch, not a partial-CLI-run
+  resume; and the standalone API remains loopback-only and unauthenticated by design.
 - **v0.1.3** (2026-06-10) — first build on top of v0.1.2 that turns Prime from a
   single local task runner into a governed **multi-agent orchestrator**.
   **Multi-agent orchestration:** Prime decomposes a goal into role-typed briefs

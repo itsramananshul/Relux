@@ -3991,7 +3991,7 @@ dependencies = [
 
 [[package]]
 name = "relux-core"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -4001,7 +4001,7 @@ dependencies = [
 
 [[package]]
 name = "relux-kernel"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "axum",
  "relux-core",
