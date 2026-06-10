@@ -2136,6 +2136,21 @@ the session that pressed Run), the panel **hydrates** the durable job status onc
 load for any `running` orchestration — which also reconnects to a still-live job — and
 relies on the terminal gate so a reconstructed status schedules no further polling.
 
+**Per-brief timing is surfaced, honestly.** Because every brief carries the recorded
+`started_at`/`finished_at` from the kernel's logical clock, the brief detail now shows
+each brief's **recorded run duration** next to its round — the elapsed `finished −
+started`, formatted by the same single duration formatter the run view uses
+(`stepDurationLabel`). It only ever shows a *measured, terminal* duration: a brief that
+started but has not finished shows nothing (no fabricated live timer, consistent with
+the in-flight honesty contract), and an unparseable or backwards stamp pair is dropped
+rather than rendered as a wrong number. The interrupted-UX **render harness** proves the
+callout + Continue button actually render and ship (server-rendered real component +
+committed-bundle copy assertion); the one binding it does not cover — the browser click
+from Continue to the resume request — is deliberately **not** closed with a browser
+toolchain, because the resume itself is already proven end-to-end by the
+resume-after-cancel / restart unit tests and smokes, leaving only a one-line event
+binding not worth a 100s-of-MB engine download (see `apps/dashboard/README.md`).
+
 ### Tool Invocation Surface (First Honest Version)
 
 Installed ToolSet plugins are now visible, callable capabilities through the

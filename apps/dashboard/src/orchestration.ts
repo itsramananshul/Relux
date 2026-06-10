@@ -16,6 +16,7 @@ import type {
   ReluxOrchestrationStep,
   ReluxStepOutcome,
 } from "./api";
+import { formatRunDuration } from "./runview.ts";
 
 // Badge tone for an orchestration status. Reuses the dashboard's shared tones so
 // the orchestration view matches the rest of the B&W UI.
@@ -207,6 +208,28 @@ export function orchestrationRounds(
   return [...byRound.keys()]
     .sort((a, b) => a - b)
     .map((round) => ({ round, steps: byRound.get(round)! }));
+}
+
+// A brief's recorded run duration, derived purely from the kernel's recorded
+// `started_at`/`finished_at` timestamps — the same per-brief timing the master
+// plan says the orchestration view surfaces ("real, already-recorded per-brief
+// start/finish/round", RELUX_MASTER_PLAN Sec 15). Returns null when the timing is
+// incomplete — a brief that started but has not finished yet, so NO live ticking
+// duration is fabricated (the in-flight honesty contract) — or when either stamp
+// is unparseable or the finish precedes the start. So a row only ever shows a
+// measured, terminal duration, never an invented one. Reuses the run view's single
+// duration formatter so timings read identically across the dashboard.
+export function stepDurationLabel(
+  step: ReluxOrchestrationStep,
+): string | null {
+  const { started_at: start, finished_at: finish } = step;
+  if (!start || !finish) return null;
+  const startMs = Date.parse(start);
+  const finishMs = Date.parse(finish);
+  if (!Number.isFinite(startMs) || !Number.isFinite(finishMs)) return null;
+  const elapsed = finishMs - startMs;
+  if (elapsed < 0) return null;
+  return formatRunDuration(elapsed);
 }
 
 // True when an orchestration has briefs left to run (so the UI can offer a

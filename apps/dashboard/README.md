@@ -108,6 +108,32 @@ The render path catches **source** regressions; the shipped-bundle path catches
 a **stale committed bundle** — complementary to the dist-parity gate below
 (which rebuilds and diffs the whole bundle).
 
+**Why no live-browser click smoke.** The one link the render + bundle paths do
+not exercise is the actual browser binding from the **Continue** button's
+`onClick` to the resume request. Closing it honestly needs a real browser
+(Playwright/Puppeteer) — a 100s-of-MB engine download — or a `jsdom`-class DOM
+shim that still would not drive the real kernel over the network, only a
+half-measure that adds a dependency. Neither is worth it here: the resume API
+itself is already proven end-to-end against a live kernel by the unit test
+`a_second_job_resumes_only_pending_briefs_and_preserves_completed_runs` and the
+`scripts/smoke-orchestration-resume.ps1` / `-restart.ps1` smokes, and the button
+that triggers it is proven to render (and ship) by this harness. The remaining
+gap is a single one-line event binding, not worth a browser toolchain. If a
+live-DOM smoke is ever wanted, it should reuse an already-present engine, not
+commit a browser binary.
+
+### Per-brief recorded duration
+
+`OrchestrationRow` surfaces each brief's **recorded** run duration next to its
+round (RELUX_MASTER_PLAN Sec 15: the view shows "real, already-recorded per-brief
+start/finish/round"). `stepDurationLabel` in `src/orchestration.ts` derives it
+purely from the kernel's `started_at`/`finished_at` stamps and reuses the run
+view's single duration formatter, so timings read identically across the
+dashboard. It is honest by construction: a brief that started but has not
+finished shows **no** duration (no fabricated live timer), and an unparseable or
+backwards pair shows nothing rather than a wrong number. Pinned by
+`stepDurationLabel*` tests in `test/orchestration.test.ts`.
+
 ## Mesh policy
 
 The dashboard's board / inbox / crew / runs pages call the coordinator's

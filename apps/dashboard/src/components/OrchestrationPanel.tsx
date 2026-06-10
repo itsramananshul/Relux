@@ -18,6 +18,7 @@ import {
   stepLifecycle,
   stepLifecycleTone,
   stepDependencyLabel,
+  stepDurationLabel,
   orchestrationReadiness,
   jobIsActive,
   jobIsTerminal,
@@ -508,6 +509,9 @@ export function OrchestrationRow({
                 const idx = indexOfStep.get(s.task_id) ?? -1;
                 const lifecycle = idx >= 0 ? stepLifecycle(o, idx) : "waiting";
                 const depLabel = stepDependencyLabel(o, s);
+                // Recorded run duration (started → finished), shown only once a
+                // brief has finished — never a fabricated live timer.
+                const duration = stepDurationLabel(s);
                 return (
                   <div
                     key={s.task_id}
@@ -545,6 +549,15 @@ export function OrchestrationRow({
                     {typeof s.round === "number" && (
                       <span className="muted" style={{ fontSize: 10 }}>
                         round {s.round}
+                      </span>
+                    )}
+                    {duration && (
+                      <span
+                        className="muted"
+                        style={{ fontSize: 10 }}
+                        title="recorded run duration (started → finished)"
+                      >
+                        {duration}
                       </span>
                     )}
                     {s.run_id && (

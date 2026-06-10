@@ -122,6 +122,20 @@ once a stable release is cut.
   added frontend tests (reconstructed-id detection, terminal/non-cancelable state,
   the poll gate scheduling nothing, and the Continue CTA). Dashboard-only; no backend
   or API change.
+- **Per-brief recorded run duration in the orchestration view.** Each brief row now
+  shows the duration its run actually took, next to the round (master plan §15: the
+  view surfaces "real, already-recorded per-brief start/finish/round"). The new
+  `stepDurationLabel` helper derives it purely from the kernel's recorded
+  `started_at`/`finished_at` stamps and reuses the run view's single duration
+  formatter, so timings read identically everywhere. Honest by construction: a brief
+  that started but has not finished shows **no** duration (no fabricated live timer),
+  and an unparseable or backwards stamp pair shows nothing rather than a wrong number.
+  Pinned by `stepDurationLabel*` unit tests. Dashboard-only; no backend or API change.
+  *(A live-browser click smoke for the interrupted **Continue** flow was evaluated and
+  deliberately declined — it would need a 100s-of-MB browser engine or a DOM shim that
+  still would not drive the real kernel, while the resume API is already proven by the
+  resume/restart unit tests + smokes and the button by the render harness; see
+  `apps/dashboard/README.md`.)*
 - **Cooperative cancel/stop for orchestration jobs.** A running non-blocking job
   can be stopped honestly (master plan §15). `POST
   /v1/relux/orchestration-jobs/:job_id/cancel` sets a `cancel_requested` flag the

@@ -15,6 +15,7 @@ import {
   stepDependencyLabel,
   orchestrationReadiness,
   orchestrationRounds,
+  stepDurationLabel,
 } from "../src/orchestration.ts";
 import type { ReluxOrchestration, ReluxOrchestrationStep } from "../src/api.ts";
 
@@ -487,4 +488,43 @@ test("jobPhaseLabel for interrupted does not over-claim a restart as the only ca
   const label = jobPhaseLabel(reconstructedInterrupted());
   assert.equal(label, "Interrupted — no live worker");
   assert.doesNotMatch(label, /server restart/);
+});
+
+test("stepDurationLabel renders the recorded finished−started elapsed time", () => {
+  // The kernel stamps both timestamps from its logical clock (ISO-8601-shaped),
+  // so the label is the recorded delta — never wall-clock guessing.
+  const ran = step("task_0001", "research-agent", "completed", {
+    started_at: "2026-06-08T00:00:01Z",
+    finished_at: "2026-06-08T00:00:09Z",
+  });
+  assert.equal(stepDurationLabel(ran), "8.0 s");
+  const longer = step("task_0002", "doc-agent", "completed", {
+    started_at: "2026-06-08T00:00:00Z",
+    finished_at: "2026-06-08T00:02:05Z",
+  });
+  assert.equal(stepDurationLabel(longer), "2m 5s");
+});
+
+test("stepDurationLabel is null until a brief has actually finished", () => {
+  // A pending brief has no timing yet; a brief the worker only just started has a
+  // start but no finish. Neither fabricates a live ticking duration.
+  assert.equal(stepDurationLabel(step("task_0001", "a", "pending")), null);
+  const started = step("task_0002", "a", "pending", {
+    started_at: "2026-06-08T00:00:01Z",
+  });
+  assert.equal(stepDurationLabel(started), null);
+});
+
+test("stepDurationLabel refuses unparseable or backwards timestamps", () => {
+  const garbage = step("task_0001", "a", "completed", {
+    started_at: "not-a-time",
+    finished_at: "2026-06-08T00:00:09Z",
+  });
+  assert.equal(stepDurationLabel(garbage), null);
+  // A finish before the start is incoherent — show nothing rather than a negative.
+  const backwards = step("task_0002", "a", "completed", {
+    started_at: "2026-06-08T00:00:09Z",
+    finished_at: "2026-06-08T00:00:01Z",
+  });
+  assert.equal(stepDurationLabel(backwards), null);
 });
