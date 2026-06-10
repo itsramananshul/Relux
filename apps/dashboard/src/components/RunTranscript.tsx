@@ -1,5 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { runControls, subscribeRunEvents, type RunEvent, type RunEventConn } from "../api";
+import {
+  kindLabel,
+  latestEventId,
+  lastEventAgo,
+  mergeRunEvents,
+  runTranscriptProgress,
+} from "../runtranscript";
 
 // ── Run transcript renderer (relix-dashboard-design §8) ────────────────────
 // A standalone, reusable renderer over the durable `run_events` transcript.
@@ -35,33 +42,8 @@ function kindDot(kind?: string): string {
   return KIND_TONE[kind ?? ""] ?? "var(--text-faint)";
 }
 
-// Humanize a relix/codex lifecycle kind for the "nice" view.
-const KIND_LABEL: Record<string, string> = {
-  accepted: "accepted",
-  workspace_prepared: "workspace ready",
-  process_started: "process started",
-  process_exited: "process exited",
-  "artifacts.scan_started": "scanning changes",
-  "artifacts.detected": "changes detected",
-  "artifacts.scan_failed": "change-scan failed",
-  result: "result",
-  failed: "failed",
-  continued: "continued",
-  cancelled: "cancelled",
-  cancel_requested: "cancel requested",
-  thread_started: "thread started",
-  turn_started: "turn started",
-  turn_completed: "turn completed",
-  "apply.plan": "apply plan",
-  "apply.started": "apply started",
-  "apply.applied": "applied",
-  "apply.conflicted": "apply conflicted",
-  "apply.failed": "apply failed",
-  review: "review",
-};
-function kindLabel(kind?: string): string {
-  return KIND_LABEL[kind ?? ""] ?? (kind ?? "event");
-}
+// `kindLabel` (lifecycle/transcript kind → human label) lives in
+// ../runtranscript so it's shared with the progress summary and unit-tested.
 
 function ts(ev: RunEvent): string {
   return ev.ts ? new Date(ev.ts * 1000).toLocaleTimeString() : "";
@@ -271,7 +253,13 @@ export function RunTranscript({ runId, status, compact, refreshKey, onEvents }: 
 
   const onEventsRef = useRef(onEvents);
   onEventsRef.current = onEvents;
+  // The current events, mirrored in a ref so the cursor-based tail fetch reads
+  // the latest list without re-subscribing the stream / re-arming the poll.
+  const eventsRef = useRef<RunEvent[]>(events);
+  eventsRef.current = events;
 
+  // Full (re)load — resets the transcript and the live-tail cursor. Used on
+  // mount / run change / explicit Refresh / a parent mutation (refreshKey).
   async function load() {
     setLoading(true);
     try {
@@ -284,18 +272,35 @@ export function RunTranscript({ runId, status, compact, refreshKey, onEvents }: 
     }
   }
 
+  // Incremental tail — fetch ONLY events newer than the highest id we hold
+  // (`?since=`) and merge them on. This is the efficient live-tail: a poll or
+  // a stream nudge pulls the new tool calls / messages instead of re-reading
+  // the whole transcript. A 0 cursor (empty transcript) degrades to a full
+  // fetch, so the poll bootstraps an as-yet-unloaded run too.
+  async function loadTail() {
+    const since = latestEventId(eventsRef.current);
+    const ev = await runControls.events(runId, since);
+    const tail = Array.isArray(ev) ? ev : [];
+    if (tail.length === 0) return;
+    const merged = mergeRunEvents(eventsRef.current, tail);
+    eventsRef.current = merged;
+    setEvents(merged);
+    onEventsRef.current?.(merged);
+  }
+
   // Fetch on mount / run change / explicit refresh.
   useEffect(() => {
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runId, refreshKey]);
 
-  // Live tail: subscribe ONCE to the execution event stream. The stream is
-  // keyed by Brief (not run), so on any transition we refetch THIS run's
-  // transcript while it is in flight — cheap, and it keeps an in-flight Shift
-  // current without a manual click. Refs keep the subscription stable.
-  const loadRef = useRef(load);
-  loadRef.current = load;
+  // Live tail: subscribe ONCE to the execution event stream. That stream
+  // carries only coarse lifecycle transitions (run start/finish/review/apply),
+  // NOT the per-run transcript lines — so we use it as an immediate nudge to
+  // pull THIS run's new tail (which catches the terminal result promptly).
+  // Refs keep the subscription stable.
+  const loadTailRef = useRef(loadTail);
+  loadTailRef.current = loadTail;
   const runningRef = useRef(running);
   runningRef.current = running;
   useEffect(() => {
@@ -304,7 +309,7 @@ export function RunTranscript({ runId, status, compact, refreshKey, onEvents }: 
       () => {
         if (!runningRef.current) return;
         if (pending) clearTimeout(pending);
-        pending = setTimeout(() => void loadRef.current(), 500);
+        pending = setTimeout(() => void loadTailRef.current(), 500);
       },
       (state) => setLiveConn(state),
     );
@@ -314,15 +319,21 @@ export function RunTranscript({ runId, status, compact, refreshKey, onEvents }: 
     };
   }, []);
 
-  // Polling fallback: when the stream can't stay connected AND the run is
-  // still in flight, poll the transcript so it never silently freezes.
+  // Steady transcript poll while the Shift is in flight. The lifecycle stream
+  // doesn't carry transcript lines, so a steady `?since=` tail poll is what
+  // surfaces the agent's tool calls / messages as they land — whether or not
+  // the stream is connected. It stops the moment the run goes terminal.
   useEffect(() => {
-    if (!running || liveConn !== "unavailable") return;
-    const t = setInterval(() => void loadRef.current(), 4000);
+    if (!running) return;
+    const t = setInterval(() => void loadTailRef.current(), 2500);
     return () => clearInterval(t);
-  }, [running, liveConn]);
+  }, [running]);
 
   const blocks = useMemo(() => groupEvents(events), [events]);
+  // Honest in-flight summary: real event count, current phase (latest event,
+  // humanized), and when the last event landed. No fabricated progress bar.
+  const progress = runTranscriptProgress(events);
+  const ago = lastEventAgo(progress.lastTs, Math.floor(Date.now() / 1000));
 
   return (
     <div className="xtr">
@@ -335,6 +346,17 @@ export function RunTranscript({ runId, status, compact, refreshKey, onEvents }: 
             title="live run-event stream (auto-updates this transcript)"
           >
             ● {LIVE_LABEL[liveConn]}
+          </span>
+        )}
+        {running && progress.count > 0 && (
+          <span
+            className="muted mono"
+            style={{ fontSize: 10 }}
+            title="real transcript progress — event count · current phase · last event"
+          >
+            {progress.count} event{progress.count === 1 ? "" : "s"}
+            {progress.phase ? ` · ${progress.phase}` : ""}
+            {ago ? ` · ${ago}` : ""}
           </span>
         )}
         <div className="spacer" style={{ flex: 1 }} />

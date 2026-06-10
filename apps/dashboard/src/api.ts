@@ -178,8 +178,13 @@ export interface RunEvent {
 export const runControls = {
   // The chronological transcript for a run (oldest first). Optional surface →
   // degrades to [] so an unavailable transcript never blanks the embedding view.
-  events: (runId: string) =>
-    tryGet<RunEvent[]>(`/v1/runs/${encodeURIComponent(runId)}/events`, []),
+  // With `since` (an exclusive `event_id` cursor) it fetches only the new tail —
+  // the efficient incremental live-tail the transcript polls while a Shift runs,
+  // instead of re-reading the whole transcript on every tick.
+  events: (runId: string, since?: number) => {
+    const q = since && since > 0 ? `?since=${since}` : "";
+    return tryGet<RunEvent[]>(`/v1/runs/${encodeURIComponent(runId)}/events${q}`, []);
+  },
   // Record an operator accept/reject of a done run.
   review: (runId: string, decision: "accepted" | "rejected", note = "") =>
     api.post(`/v1/runs/${encodeURIComponent(runId)}/review`, { decision, note }),

@@ -10244,7 +10244,10 @@ fn register_node_type_handlers(
         }
         {
             // `run.events` — a run's transcript, chronological (`GET
-            // /v1/runs/:id/events`). Bounded + already redacted.
+            // /v1/runs/:id/events`). Bounded + already redacted. Args are
+            // `run_id` for the full transcript, or `run_id|since_event_id`
+            // for the efficient incremental tail the dashboard polls while a
+            // Shift is in flight (exclusive cursor; `0`/absent ⇒ full).
             let st = store.clone();
             bridge.register(
                 "run.events",
@@ -10252,8 +10255,16 @@ fn register_node_type_handlers(
                     move |ctx: crate::dispatch::InvocationCtx| {
                         let st = st.clone();
                         async move {
-                            let run_id = String::from_utf8_lossy(&ctx.args).trim().to_string();
-                            match st.list_run_events(&run_id, 500) {
+                            let raw = String::from_utf8_lossy(&ctx.args);
+                            let mut parts = raw.trim().splitn(2, '|');
+                            let run_id = parts.next().unwrap_or("").trim().to_string();
+                            let since: i64 = parts
+                                .next()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(0);
+                            match st.list_run_events_since(&run_id, since, 500) {
                                 Ok(events) => match serde_json::to_vec(&events) {
                                     Ok(b) => crate::dispatch::HandlerOutcome::Ok(b),
                                     Err(e) => crate::dispatch::HandlerOutcome::Err(

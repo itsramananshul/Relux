@@ -78,6 +78,16 @@ pub struct CostRollupQuery {
 }
 
 #[derive(Debug, Deserialize, Default)]
+pub struct RunEventsQuery {
+    /// Optional exclusive `event_id` cursor for the incremental live-tail
+    /// (`GET /v1/runs/:id/events?since=`). The dashboard sends the highest
+    /// event it already has so a poll returns only the new tail. Omitted (or
+    /// `0`) ⇒ the full transcript — the original behavior is preserved.
+    #[serde(default)]
+    pub since: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
 pub struct AssignCheckQuery {
     /// The Operative that would do the assigning.
     #[serde(default)]
@@ -1642,12 +1652,24 @@ pub async fn run_get(
     json_passthrough(call_peer(&state, "run.get", run_id.as_bytes()).await?)
 }
 
-/// `GET /v1/runs/:run_id/events` — a run's transcript, chronological.
+/// `GET /v1/runs/:run_id/events` — a run's transcript, chronological. With
+/// `?since=<event_id>` it returns only the events newer than that exclusive
+/// cursor — the efficient incremental tail the dashboard polls while a Shift
+/// is in flight. Without `since` (or `since=0`) it returns the full
+/// transcript, preserving the original behavior.
 pub async fn run_events(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
+    Query(q): Query<RunEventsQuery>,
 ) -> Result<Response, (StatusCode, Json<ApiError>)> {
-    json_passthrough(call_peer(&state, "run.events", run_id.as_bytes()).await?)
+    // Forward `run_id` (full) or `run_id|since` (incremental tail) to the
+    // peer `run.events` capability. A non-positive cursor degrades to the
+    // full transcript so a malformed `since` never hides the history.
+    let arg = match q.since {
+        Some(since) if since > 0 => format!("{run_id}|{since}"),
+        _ => run_id,
+    };
+    json_passthrough(call_peer(&state, "run.events", arg.as_bytes()).await?)
 }
 
 /// `POST /v1/runs/:run_id/cancel` — request cancellation of an in-flight

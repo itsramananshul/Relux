@@ -7417,18 +7417,36 @@ impl TaskStore {
         run_id: &str,
         limit: i64,
     ) -> Result<Vec<RunEvent>, CoordinatorError> {
+        // The full transcript is the `since_event_id = 0` case (event ids
+        // are AUTOINCREMENT > 0, so an exclusive `> 0` cursor selects all).
+        self.list_run_events_since(run_id, 0, limit)
+    }
+
+    /// A run's transcript from an exclusive `event_id` cursor, oldest event
+    /// first (chronological). Bounded. `since_event_id` is the highest event
+    /// the caller already has; only newer rows are returned. Pass `0` for the
+    /// full transcript. Backs the dashboard's efficient incremental live-tail
+    /// (`GET /v1/runs/:id/events?since=`): while a Shift runs, the dashboard
+    /// fetches only the new tail instead of re-reading the whole transcript on
+    /// every poll. The `run_events(run_id, event_id)` index makes this cheap.
+    pub fn list_run_events_since(
+        &self,
+        run_id: &str,
+        since_event_id: i64,
+        limit: i64,
+    ) -> Result<Vec<RunEvent>, CoordinatorError> {
         let limit = limit.clamp(1, MAX_RUN_EVENTS + 1);
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         let mut stmt = conn
             .prepare(
                 "SELECT event_id, run_id, ts, kind, source, message, payload_json, redacted
-                 FROM run_events WHERE run_id = ?1
+                 FROM run_events WHERE run_id = ?1 AND event_id > ?2
                  ORDER BY event_id ASC
-                 LIMIT ?2",
+                 LIMIT ?3",
             )
             .map_err(CoordinatorError::Db)?;
         let rows = stmt
-            .query_map(params![run_id, limit], RunEvent::from_row)
+            .query_map(params![run_id, since_event_id, limit], RunEvent::from_row)
             .map_err(CoordinatorError::Db)?;
         let mut out = Vec::new();
         for r in rows {
@@ -32336,6 +32354,52 @@ mod tests {
             &RunWorkspaceInfo::default(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn list_run_events_since_returns_only_the_new_tail() {
+        // Pins the incremental live-tail contract backing
+        // `GET /v1/runs/:id/events?since=` (relix-dashboard-design §8): a
+        // `since` cursor is EXCLUSIVE and returns only newer events, in
+        // chronological order; `0` is the full transcript.
+        let s = store();
+        let b = brief(&s, "streaming work");
+        running_run(&s, "run_s", &b, "agt_a");
+        // record_run_start already wrote lifecycle events; capture the
+        // current high-water mark so the test is robust to that prelude.
+        let base = s.list_run_events("run_s", 500).unwrap();
+        let cursor0 = base.iter().map(|e| e.event_id).max().unwrap_or(0);
+
+        // The agent works: three transcript events arrive over time.
+        s.append_run_event("run_s", "assistant_message", "claude", "thinking…", None, false)
+            .unwrap();
+        s.append_run_event("run_s", "tool_use", "claude", "Read file", None, false)
+            .unwrap();
+        s.append_run_event("run_s", "tool_use", "claude", "Edit file", None, false)
+            .unwrap();
+
+        // Full transcript (since 0) includes the prelude + the three new ones.
+        let full = s.list_run_events("run_s", 500).unwrap();
+        assert_eq!(full.len(), base.len() + 3);
+
+        // Tail from the pre-work cursor → exactly the three new events, oldest
+        // first, all with event_id strictly greater than the cursor.
+        let tail = s.list_run_events_since("run_s", cursor0, 500).unwrap();
+        assert_eq!(tail.len(), 3, "tail: {tail:?}");
+        assert!(tail.iter().all(|e| e.event_id > cursor0));
+        let msgs: Vec<&str> = tail.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(msgs, vec!["thinking…", "Read file", "Edit file"]);
+        assert!(
+            tail.windows(2).all(|w| w[0].event_id < w[1].event_id),
+            "tail must be chronological"
+        );
+
+        // A cursor at the newest event → empty (nothing newer yet).
+        let newest = full.iter().map(|e| e.event_id).max().unwrap();
+        assert!(
+            s.list_run_events_since("run_s", newest, 500).unwrap().is_empty(),
+            "cursor advanced to head: no new tail"
+        );
     }
 
     #[test]

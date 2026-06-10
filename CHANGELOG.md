@@ -9,6 +9,35 @@ once a stable release is cut.
 
 ### Added
 
+- **Efficient incremental live-tail for the Run transcript (relix-dashboard-design
+  §8 / §11).** The Run Detail transcript now stays current during a long
+  Claude/Codex Shift **without a manual refresh** — and does it cheaply. (1)
+  **API** — `GET /v1/runs/:id/events` gains an optional **`?since=<event_id>`**
+  exclusive cursor that returns only the events newer than that id (the new tail),
+  oldest-first; **without `since` (or `since=0`) it returns the full transcript,
+  exactly as before** (`GET /v1/runs/:id` is unchanged). A new
+  `TaskStore::list_run_events_since` backs it over the existing
+  `run_events(run_id, event_id)` index; `list_run_events` now delegates to it with
+  cursor `0`. The bridge forwards `run_id` (full) or `run_id|since` (tail) to the
+  peer `run.events` capability; a non-positive cursor degrades to the full
+  transcript so a malformed `since` never hides history. (2) **Why polling, not a
+  new SSE** — the existing per-tenant execution-event SSE firehose
+  (`/v1/runs/events/stream`) carries only **coarse lifecycle transitions** (run
+  start/finish, board move, review, apply) from `task_events`, **not** the per-run
+  transcript lines (`tool_use`/`assistant_message`/`command`/`result`) that live in
+  the separate `run_events` table — so it cannot drive a mid-run transcript without
+  overloading tenant-wide stream semantics. Instead `<RunTranscript>` polls the
+  per-run tail on a **steady 2.5 s cadence while the run is `running`**, fetching
+  only `?since=cursor` and **merging** the new events on (deduped by `event_id`),
+  and keeps the lifecycle SSE subscription as an **immediate nudge** (so the
+  terminal result lands promptly). (3) **Honest in-flight summary** — the
+  transcript bar now shows **real event count · current phase · last-event clock**
+  while running (e.g. `12 events · tool call · 3s ago`) — derived only from
+  recorded events, **no fabricated progress bar**. New pure helpers
+  (`mergeRunEvents`/`latestEventId`/`runTranscriptProgress`/`lastEventAgo`/`kindLabel`)
+  live in `apps/dashboard/src/runtranscript.ts` and are unit-tested; an end-to-end
+  mini-mesh test proves the `?since=` tail (full → tail → caught-up) over the real
+  bridge proxy path, and a store test pins the exclusive-cursor semantics.
 - **Safe `delete`/remove action for proposed changes (master plan §15 / §9.6).**
   Extends the proposed-change model with a fourth action that removes an existing
   file: a change now carries `action: "replace"` (default), `"create"`, `"rename"`,

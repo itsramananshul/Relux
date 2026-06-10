@@ -113,6 +113,109 @@ fn spawn_inbound_loop(mut events: mpsc::Receiver<Event>, bridge: Arc<DispatchBri
     });
 }
 
+/// Bring a configured responder `dispatch` online behind a discovered mesh and
+/// mount `build(state)`'s routes on an ephemeral axum listener. Returns the
+/// bound address (and the `TempDir`, which the caller must keep alive so the
+/// bridge's on-disk bundle/keys outlive the test). Shared by the snapshot-stream
+/// test and the run-events cursor test so neither re-derives the wiring.
+async fn serve_routes_against_peer(
+    dispatch: Arc<DispatchBridge>,
+    org_root: &SigningKey,
+    events: mpsc::Receiver<Event>,
+    addr: Multiaddr,
+    build: impl FnOnce(AppState) -> Router,
+) -> (std::net::SocketAddr, TempDir) {
+    spawn_inbound_loop(events, dispatch);
+
+    let tmpdir = TempDir::new().unwrap();
+    let bundle_bytes =
+        mint_bridge_bundle_bytes(org_root, "runs-stream-test-bridge", vec!["operators".into()]);
+    let bundle_path = tmpdir.path().join("bridge.bundle");
+    std::fs::write(&bundle_path, &bundle_bytes).unwrap();
+    let client_key_path = tmpdir.path().join("client.key");
+    let chat_template_path = tmpdir.path().join("chat.sol");
+    std::fs::write(
+        &chat_template_path,
+        r#"function start() -> str { return remote_call("coordinator", "noop", "{{SESSION}}|{{MESSAGE}}|"); }"#,
+    )
+    .unwrap();
+    let peers_path = tmpdir.path().join("peers.toml");
+    std::fs::write(
+        &peers_path,
+        format!(
+            r#"
+[peers.coordinator]
+addr = "{addr}"
+"#
+        ),
+    )
+    .unwrap();
+
+    let cfg = BridgeConfig {
+        bridge: BridgeSection {
+            listen_addr: "127.0.0.1:9999".into(),
+            secrets_path: Some(tmpdir.path().join("secrets.toml")),
+            token_path: Some(tmpdir.path().join("bridge-token")),
+            memory_db_path: None,
+        },
+        identity: IdentitySection {
+            bundle_path,
+            client_key_path,
+        },
+        transport: TransportSection {
+            peers_path,
+            deadline_secs: 30,
+            data_dir: Some(tmpdir.path().to_path_buf()),
+        },
+        flow: FlowSection {
+            template_path: chat_template_path,
+            tool_template_path: None,
+            streaming_template_path: None,
+        },
+        openai_compat: None,
+        sse: SseSection::default(),
+        coordinator: None,
+        mesh: MeshSection::default(),
+        observability: None,
+        auth: crate::config::AuthSection::default(),
+        logging: crate::config::LoggingSection::default(),
+    };
+    let base_state = AppState::try_new(cfg).expect("AppState::try_new");
+
+    use relix_runtime::flow_runner::{PeerEntry, PeersFile};
+    use relix_runtime::manifest::{DiscoveryOptions, discover_and_pin};
+    let mut peers_map = std::collections::HashMap::new();
+    peers_map.insert(
+        "coordinator".to_string(),
+        PeerEntry {
+            addr: addr.to_string(),
+        },
+    );
+    let peers_file = PeersFile { peers: peers_map };
+    let opts = DiscoveryOptions {
+        identity_bundle: base_state.identity_bundle.clone(),
+        client_key: base_state.client_key.clone(),
+        peers: peers_file,
+        deadline_secs: 30,
+        overall_timeout: Duration::from_secs(8),
+        local_port: None,
+        source_key_registry: None,
+    };
+    let (_cache, mesh) = discover_and_pin(opts).await.expect("discover_and_pin");
+    let state = AppState {
+        mesh_client: Some(Arc::new(mesh)),
+        ..base_state
+    };
+
+    let app = build(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bound = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (bound, tmpdir)
+}
+
 /// Two recent runs, newest first — the shape `brief.runs` returns for the
 /// Active Runs feed.
 fn runs_json() -> serde_json::Value {
@@ -345,4 +448,105 @@ addr = "{addr}"
         "expected an initial `event: actions` snapshot; buf=\n{buf}"
     );
     drop(resp);
+}
+
+/// End-to-end proof of the incremental run-transcript live-tail
+/// (relix-dashboard-design §8): `GET /v1/runs/:id/events` returns the full
+/// transcript, and `?since=<event_id>` returns ONLY the events newer than that
+/// exclusive cursor. The fake `run.events` responder parses the `run_id|since`
+/// arg exactly as the real coordinator handler does, so this pins the bridge's
+/// cursor forwarding (the proxy + arg-shaping path) without a live CLI: poll 1
+/// sees two events, then a poll from that cursor surfaces only the new third
+/// event — exactly how an in-flight Shift's transcript grows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn run_events_since_cursor_returns_only_the_new_tail() {
+    let (mut dispatch, org_root, _audit_dir) = fresh_responder_bridge(
+        r#"
+        [[rules]]
+        name = "ops_run_events"
+        method = "run.events"
+        allow_groups = ["operators"]
+        "#,
+    );
+
+    // The growing transcript: three durable events for one run. The responder
+    // honours the `run_id|since` arg, returning only ids strictly greater than
+    // the cursor — the same exclusive-cursor contract as the coordinator.
+    fn all_events() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({ "event_id": 1, "kind": "accepted", "source": "relix", "message": "accepted" }),
+            serde_json::json!({ "event_id": 2, "kind": "tool_use", "source": "claude", "message": "Read file" }),
+            serde_json::json!({ "event_id": 3, "kind": "result", "source": "claude", "message": "done" }),
+        ]
+    }
+    dispatch.register(
+        "run.events",
+        Arc::new(FnHandler(move |ctx: InvocationCtx| async move {
+            let raw = String::from_utf8_lossy(&ctx.args);
+            let mut parts = raw.trim().splitn(2, '|');
+            let _run_id = parts.next().unwrap_or("");
+            let since: i64 = parts
+                .next()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0);
+            let tail: Vec<serde_json::Value> = all_events()
+                .into_iter()
+                .filter(|e| e["event_id"].as_i64().unwrap_or(0) > since)
+                .collect();
+            HandlerOutcome::Ok(serde_json::to_vec(&tail).unwrap_or_default())
+        })),
+    );
+    let dispatch = Arc::new(dispatch);
+
+    let (_client, events, addr) = boot_peer(218).await;
+    let (bound, _tmpdir) = serve_routes_against_peer(
+        dispatch,
+        &org_root,
+        events,
+        addr,
+        |state| {
+            Router::new()
+                .route("/v1/runs/:run_id/events", get(crate::spine::run_events))
+                .with_state(state)
+        },
+    )
+    .await;
+
+    let http = reqwest::Client::new();
+
+    // Poll 1 — no cursor → the full transcript (all three events).
+    let url = format!("http://{bound}/v1/runs/run_x/events");
+    let resp = timeout(Duration::from_secs(15), http.get(&url).send())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let full: Vec<serde_json::Value> = resp.json().await.unwrap();
+    assert_eq!(full.len(), 3, "full transcript = all events; got {full:?}");
+    assert_eq!(full[0]["event_id"], 1);
+    assert_eq!(full[2]["event_id"], 3);
+
+    // Poll 2 — from the cursor at event 2 → ONLY the new tail (event 3). This is
+    // the in-flight case: the dashboard already holds events 1–2 and pulls just
+    // what landed since.
+    let url = format!("http://{bound}/v1/runs/run_x/events?since=2");
+    let resp = timeout(Duration::from_secs(15), http.get(&url).send())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let tail: Vec<serde_json::Value> = resp.json().await.unwrap();
+    assert_eq!(tail.len(), 1, "since=2 returns only the tail; got {tail:?}");
+    assert_eq!(tail[0]["event_id"], 3);
+    assert_eq!(tail[0]["message"], "done");
+
+    // Poll 3 — caught up (cursor at the head) → empty, no re-delivery.
+    let url = format!("http://{bound}/v1/runs/run_x/events?since=3");
+    let resp = timeout(Duration::from_secs(15), http.get(&url).send())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let none: Vec<serde_json::Value> = resp.json().await.unwrap();
+    assert!(none.is_empty(), "caught-up poll returns nothing; got {none:?}");
 }
