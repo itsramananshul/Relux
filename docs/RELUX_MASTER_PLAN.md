@@ -1775,6 +1775,44 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.3** (2026-06-10) — first build on top of v0.1.2 that turns Prime from a
+  single local task runner into a governed **multi-agent orchestrator**.
+  **Multi-agent orchestration:** Prime decomposes a goal into role-typed briefs
+  assigned to different agents and runs them as a governed batch
+  (goal → brief → agent → run), instead of running one task itself.
+  **Dependency-aware, round-based execution:** the planner infers simple ordering
+  (implementation waits on research; testing/review/documentation wait on
+  implementation) recorded as `depends_on` indices that only point at earlier
+  briefs (a DAG by construction), and a round scheduler runs the ready set,
+  repeats until nothing is ready or the round budget (1..=25) is spent, and
+  honestly marks any brief whose dependency failed/blocked as **blocked** (never
+  run, never faked). **Non-blocking, pollable jobs:**
+  `POST …/orchestrations/:id/run-async` starts a background job and returns a job
+  id immediately; `GET …/orchestration-jobs/:job_id` polls
+  queued → running → completed/failed with the current round, per-brief statuses,
+  running tallies, and the final aggregate (the worker persists the durable record
+  between rounds, so a mid-batch poll sees real progress). **True bounded
+  OS-parallel round execution:** independent briefs ready in the same round run as
+  **real concurrent OS adapter processes** (one OS thread per brief, up to a
+  concurrency cap, default 2, clamp 1..=4) with the kernel lock released around the
+  spawn window — not one-at-a-time under the lock. **Sync API / CLI parallel
+  parity:** the synchronous `POST …/orchestrations/:id/run` and
+  `prime orchestration run --concurrency N` now drive the **same** shared parallel
+  executor as the job worker (`prepare_orchestration_round` →
+  `run_briefs_in_parallel` → `finalize_prepared_brief`), so there is one execution
+  implementation, not two, and the paths can no longer diverge. Every safety
+  property holds on every path: dependency gating, at-most-once per round,
+  permission + adapter-runtime gating before any spawn, secret redaction, the
+  durable run transcript, audit, retry, sibling failure/panic isolation, and **no
+  auto-run of downloaded plugin code**. Proven by deterministic rendezvous tests
+  (two slow fake adapters that complete only if running at the same instant) and
+  against the **real Claude CLI**. *Caveats:* the in-memory job registry does not
+  survive a server restart (a mid-job poll 404s; the dashboard falls back to the
+  durable orchestration record); the concurrency cap is 1..=4 and the per-call
+  round budget is 1..=25; dependency inference is conservative
+  role-co-occurrence, not a full task graph; planning does not auto-create agents;
+  no background timer drives orchestrations (operator-triggered only); and a retry
+  is a fresh attempt, not a partial-run resume.
 - **v0.1.2** (2026-06-10) — first build on top of v0.1.1 that closes the three
   honest post-v0.1.1 gaps (see *Status after v0.1.1*). **First-run onboarding:**
   Home's first-run checklist now derives a **live "connect Prime to a brain"

@@ -9,6 +9,41 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.3 (Windows bundle).** The `relux-kernel` /
+  `relux-core` crates move from `0.1.2` to `0.1.3` for the first build that turns
+  Prime from a single local task runner into a governed **multi-agent
+  orchestrator**. This release bundles the post-v0.1.2 orchestration work
+  (detailed in the entries below): **multi-agent orchestration** — Prime
+  decomposes a goal into role-typed briefs assigned to different agents and runs
+  them as a governed batch (goal → brief → agent → run); **dependency-aware,
+  round-based execution** — the planner infers simple ordering (implementation
+  waits on research; testing/review/documentation wait on implementation) recorded
+  as a DAG, and a round scheduler honestly marks dependents of a failed/blocked
+  brief as blocked; **non-blocking, pollable jobs** — `…/orchestrations/:id/run-async`
+  returns a job id immediately and `GET …/orchestration-jobs/:job_id` polls
+  queued → running → completed/failed with live per-round/per-brief progress;
+  **true bounded OS-parallel round execution** — independent briefs ready in a
+  round run as real concurrent OS adapter processes (one thread per brief, up to a
+  1..=4 concurrency cap) with the kernel lock released around the spawn window;
+  and **sync API / CLI parallel parity** — the synchronous `POST …/run` and
+  `prime orchestration run --concurrency N` now drive the **same** shared parallel
+  executor as the job worker, so there is one execution implementation, not two.
+  Every safety property is preserved on every path: dependency gating, at-most-once
+  per round, permission + adapter-runtime gating before any spawn, secret
+  redaction, the durable run transcript, audit, retry, sibling failure/panic
+  isolation, and **no auto-run of downloaded plugin code** (only an explicitly
+  enabled, operator-configured local binary spawns). Proven by deterministic
+  rendezvous tests (two slow fake adapters that finish only if running at the same
+  instant) and against the **real Claude CLI**. *Known caveats:* the in-memory job
+  registry does not survive a server restart (a mid-job poll 404s and the dashboard
+  falls back to the durable orchestration record); the concurrency cap is 1..=4 and
+  the per-call round budget is 1..=25; dependency inference is conservative
+  role-co-occurrence (not a full task graph); planning does not auto-create agents;
+  no background timer drives orchestrations (operator-triggered only); and a retry
+  is a fresh attempt, not a partial-run resume. This version line is the
+  `relux-kernel` crate version (separate from the Relix workspace version below);
+  build the bundle with `scripts\relux-package-local.ps1 -FullE2E`. See
+  `docs/RELUX_MASTER_PLAN.md` → *Release history*.
 - **One shared parallel orchestration executor across the sync API, CLI, and async
   job.** The synchronous `POST /v1/relux/prime/orchestrations/:id/run` and the
   `prime orchestration run --concurrency N` CLI now perform the **same true bounded

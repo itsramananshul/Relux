@@ -26,14 +26,14 @@ with one command - no web bridge, no login:
 cargo run -p relux-kernel -- serve
 ```
 
-#### Run the packaged release (v0.1.2, no build needed)
+#### Run the packaged release (v0.1.3, no build needed)
 
 Prefer a prebuilt Windows bundle over building from source? Grab the latest
 [**Relux local release**](https://github.com/itsramananshul/Relux/releases) zip
-(`relux-local-0.1.2-windows-x64.zip`), extract it, and launch it - no Rust, no npm:
+(`relux-local-0.1.3-windows-x64.zip`), extract it, and launch it - no Rust, no npm:
 
 ```powershell
-# inside the extracted relux-local-0.1.2-windows-x64 folder
+# inside the extracted relux-local-0.1.3-windows-x64 folder
 powershell -NoProfile -ExecutionPolicy Bypass -File .\Start-Relux.ps1
 # override the port if 19891 is taken:  .\Start-Relux.ps1 -Port 20000
 ```
