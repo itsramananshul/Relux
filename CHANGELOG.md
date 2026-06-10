@@ -9,6 +9,30 @@ once a stable release is cut.
 
 ### Added
 
+- **Non-blocking orchestration jobs + live, pollable progress.** Running an
+  orchestration no longer blocks on one long request (master plan "Orchestration
+  (First Multi-Agent Slice)" — the previously-deferred non-blocking job model).
+  `POST /v1/relux/prime/orchestrations/:id/run-async` starts a background job and
+  returns immediately with a job id + `status_url`; `GET /v1/relux/orchestration-jobs/:job_id`
+  (and `GET …/orchestrations/:id/job` by orchestration id) polls **queued →
+  running → completed/failed** with the current round, per-brief statuses (briefs
+  executing this round reported as `running`), running tallies, and the final
+  aggregate result. The worker drives the SAME governed, tested `run_orchestration`
+  one round at a time — releasing the kernel lock and **persisting the record
+  between rounds** — so a mid-batch poll sees real, already-recorded progress;
+  nothing fabricates in-flight work. **Duplicate starts are rejected** (409, one
+  active job per orchestration) and the fleet is capped (429 past `MAX_ACTIVE_JOBS`).
+  **Honest restart contract:** the job registry is in-memory only — a server restart
+  mid-job loses the job record (a poll 404s) and the dashboard falls back to the
+  durable orchestration record, which still carries whatever rounds actually
+  completed. The dashboard **Run/Continue** now starts a job and polls it every 1s,
+  rendering the live phase, a running tally, the worker's last event, and a real
+  `running` badge on in-flight briefs (no bare spinner); the button is disabled
+  while a job is active to prevent a duplicate start. Backend job
+  lifecycle/duplicate/cap/aggregate logic and the frontend polling/progress helpers
+  are unit-tested; end-to-end HTTP smokes (`scripts/smoke-orchestration-job.ps1` +
+  a real-Claude-CLI variant `scripts/smoke-orchestration-job-claude.ps1`) prove the
+  start → poll → terminal path against a live kernel.
 - **Orchestration depth: dependency-aware, round-based batch execution.** The
   multi-agent batch is no longer a flat sequential loop (master plan §10.4
   Delegation Rules — "multiple tasks can run in parallel"; "Orchestration (First

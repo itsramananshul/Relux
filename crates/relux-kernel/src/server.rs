@@ -20,9 +20,11 @@
 //! - Errors are mapped to honest HTTP status codes + a `{ "error": ... }` JSON
 //!   body; a handler never panics on bad input. No secrets are returned.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{DefaultBodyLimit, Multipart, Path as AxumPath, State};
 use axum::http::{header, StatusCode};
@@ -33,8 +35,8 @@ use serde::{Deserialize, Serialize};
 
 use relux_core::{
     InstalledPlugin, Orchestration, OrchestrationBatchResult, OrchestrationId, OrchestrationPlan,
-    PluginManifest, PluginSourceKind, PrimeAutonomyConfig, PrimeAutonomyTickResult, PrimeTurn,
-    ToolInvocationResult,
+    OrchestrationStatus, PluginManifest, PluginSourceKind, PrimeAutonomyConfig,
+    PrimeAutonomyTickResult, PrimeTurn, StepOutcome, ToolInvocationResult,
 };
 use relux_kernel::{
     install_from_dir, install_from_github, install_from_zip, remove_plugin, AiConfig, AiMode,
@@ -63,6 +65,11 @@ struct AppState {
     /// per request so a key set from the dashboard takes effect without a restart.
     ai_config_path: PathBuf,
     lock: Arc<Mutex<()>>,
+    /// In-process registry of non-blocking orchestration jobs. Lives only for the
+    /// life of the server process: a restart honestly loses in-flight job records
+    /// (the durable orchestration record still carries the real per-brief progress
+    /// recorded round-by-round). See [`JobRegistry`].
+    jobs: JobRegistry,
 }
 
 /// Resolve the effective AI config from the local secrets file (when present)
@@ -93,6 +100,7 @@ async fn serve() -> Result<(), KernelError> {
         dashboard_dir: crate::dashboard::resolve_dist_dir(),
         ai_config_path: crate::ai_config_path(),
         lock: Arc::new(Mutex::new(())),
+        jobs: JobRegistry::default(),
     };
 
     // Bootstrap + persist once so a fresh store already lists the bundled
@@ -152,6 +160,9 @@ async fn serve() -> Result<(), KernelError> {
     println!("   GET    /v1/relux/plugins/:id/manifest-template  (starter relux-plugin.json)");
     println!("   DELETE /v1/relux/plugins/:id");
     println!("   GET    /v1/relux/adapters                  (adapter plugins + CLI runtime status)");
+    println!("   POST   /v1/relux/prime/orchestrations/:id/run-async  (start a background job; returns job + status_url)");
+    println!("   GET    /v1/relux/prime/orchestrations/:id/job         (latest job for this orchestration)");
+    println!("   GET    /v1/relux/orchestration-jobs/:job_id           (poll one job's status)");
     println!("   GET    /v1/relux/adapters/:id/runtime");
     println!("   PUT    /v1/relux/adapters/:id/runtime     {{ \"enabled\":true, \"command\"?, \"timeout_seconds\"?, \"max_output_bytes\"? }}");
     println!("   DELETE /v1/relux/adapters/:id/runtime     (clear adapter runtime config)");
@@ -254,6 +265,19 @@ fn router(state: AppState) -> Router {
         .route(
             "/v1/relux/prime/orchestrations/:id/run",
             post(run_orchestration_batch),
+        )
+        // Non-blocking orchestration runs: start a background job and poll it.
+        .route(
+            "/v1/relux/prime/orchestrations/:id/run-async",
+            post(start_orchestration_job),
+        )
+        .route(
+            "/v1/relux/prime/orchestrations/:id/job",
+            get(get_latest_orchestration_job),
+        )
+        .route(
+            "/v1/relux/orchestration-jobs/:job_id",
+            get(get_orchestration_job),
         )
         .route("/v1/relux/tasks", get(list_tasks).post(create_task))
         .route("/v1/relux/tasks/:id", get(get_task))
@@ -1360,6 +1384,518 @@ async fn run_orchestration_batch(
     let result =
         locked_save_persisting(&state, |kernel| kernel.run_orchestration(&oid, max, concurrency))?;
     Ok(Json(result))
+}
+
+// --- Non-blocking orchestration jobs ---------------------------------------
+//
+// The synchronous `/run` above holds the single-owner kernel lock for the whole
+// batch and only returns once every round is done, so the dashboard can show
+// progress only AFTER the call returns. These job endpoints make a run
+// non-blocking: `run-async` starts a background worker and returns immediately
+// with a job id + status URL; the worker drives the SAME governed, tested
+// `run_orchestration` one round at a time (a per-call budget equal to the round
+// size), releasing the lock and persisting the orchestration record between
+// rounds. Polling the job (or the durable record) therefore sees real,
+// already-recorded progress mid-batch — nothing is fabricated.
+//
+// Honesty contract on restart: the job registry is in-memory only. If the server
+// restarts mid-job the job record is lost and polling returns 404; the durable
+// orchestration record still carries whatever rounds actually completed (it never
+// claims completion the kernel did not record), and the dashboard falls back to
+// the record. The worker never loops forever: each underlying round moves ≥1
+// brief to a terminal outcome, and the worker stops as soon as a round runs no
+// brief or the orchestration is no longer `running`.
+
+/// The lifecycle state of a background orchestration job. Distinct from the
+/// orchestration's own status: a job is `completed` once the worker finished its
+/// rounds, even if the orchestration itself ended `needs_attention`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum JobState {
+    /// Created, worker not yet started.
+    Queued,
+    /// The worker is driving rounds.
+    Running,
+    /// The worker finished all rounds it could run (see the embedded `result`/
+    /// orchestration status for the real outcome).
+    Completed,
+    /// The worker hit an error it could not turn into a per-brief block (e.g. the
+    /// store failed); the message is in `error`.
+    Failed,
+}
+
+/// One brief's status as the job last observed it. `outcome` is the durable step
+/// outcome label (`pending`/`completed`/`failed`/`blocked`), except that briefs
+/// the worker is about to run this round are reported as `running` so a mid-batch
+/// poll shows real in-flight work.
+#[derive(Debug, Clone, Serialize)]
+struct JobStepStatus {
+    task_id: String,
+    agent_id: String,
+    title: String,
+    outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    round: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+}
+
+/// A pollable, in-memory record of one non-blocking orchestration run.
+#[derive(Debug, Clone, Serialize)]
+struct OrchestrationJob {
+    id: String,
+    orchestration_id: String,
+    state: JobState,
+    /// The per-call total cap (briefs) and round size the worker uses.
+    max: usize,
+    concurrency: usize,
+    /// Cumulative rounds the worker has completed so far.
+    current_round: u32,
+    /// Cumulative per-outcome tallies across the job's rounds.
+    ran: u32,
+    completed: u32,
+    failed: u32,
+    blocked: u32,
+    /// Wall-clock start/finish (unix millis). Real time, since a job is a runtime
+    /// artifact (not part of the deterministic kernel state).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    started_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completed_at_ms: Option<u64>,
+    /// The most recent human-readable event (e.g. a round summary), for the UI.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_event: Option<String>,
+    /// An honest error message when `state == Failed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    /// The latest per-brief snapshot the worker recorded.
+    steps: Vec<JobStepStatus>,
+    /// The aggregate batch result, set once the worker finishes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<OrchestrationBatchResult>,
+}
+
+/// Why a job could not be started.
+#[derive(Debug)]
+enum JobStartError {
+    /// A job for this orchestration is already queued/running.
+    Duplicate(String),
+    /// Too many jobs are active across the fleet right now.
+    TooManyActive(usize),
+}
+
+/// The most non-terminal jobs allowed at once across all orchestrations, so a
+/// burst of requests can never spawn unbounded worker threads.
+const MAX_ACTIVE_JOBS: usize = 4;
+
+/// A process-wide registry of orchestration jobs, guarded by its own short-lived
+/// mutex. Crucially this lock is NEVER held across kernel work, so polling a job
+/// stays responsive even while a worker holds the kernel lock for a round.
+#[derive(Clone, Default)]
+struct JobRegistry {
+    inner: Arc<Mutex<JobStore>>,
+}
+
+#[derive(Default)]
+struct JobStore {
+    jobs: HashMap<String, OrchestrationJob>,
+    counter: u64,
+}
+
+impl JobRegistry {
+    /// Atomically mint a new job for `orchestration_id`, rejecting a duplicate
+    /// (one already active for the same orchestration) or an over-cap fleet. The
+    /// returned job is `Queued`; the caller spawns the worker.
+    fn start(
+        &self,
+        orchestration_id: &str,
+        max: usize,
+        concurrency: usize,
+    ) -> Result<OrchestrationJob, JobStartError> {
+        let mut store = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let active = store
+            .jobs
+            .values()
+            .filter(|j| matches!(j.state, JobState::Queued | JobState::Running))
+            .count();
+        if let Some(existing) = store.jobs.values().find(|j| {
+            j.orchestration_id == orchestration_id
+                && matches!(j.state, JobState::Queued | JobState::Running)
+        }) {
+            return Err(JobStartError::Duplicate(existing.id.clone()));
+        }
+        if active >= MAX_ACTIVE_JOBS {
+            return Err(JobStartError::TooManyActive(active));
+        }
+        store.counter += 1;
+        let id = format!("job_{:04}", store.counter);
+        let job = OrchestrationJob {
+            id: id.clone(),
+            orchestration_id: orchestration_id.to_string(),
+            state: JobState::Queued,
+            max,
+            concurrency,
+            current_round: 0,
+            ran: 0,
+            completed: 0,
+            failed: 0,
+            blocked: 0,
+            started_at_ms: None,
+            completed_at_ms: None,
+            last_event: Some("queued".to_string()),
+            error: None,
+            steps: Vec::new(),
+            result: None,
+        };
+        store.jobs.insert(id, job.clone());
+        Ok(job)
+    }
+
+    /// Mutate a job in place (no-op if it was evicted). The closure runs under the
+    /// registry lock only — never call back into the kernel from it.
+    fn update(&self, job_id: &str, f: impl FnOnce(&mut OrchestrationJob)) {
+        let mut store = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(job) = store.jobs.get_mut(job_id) {
+            f(job);
+        }
+    }
+
+    fn get(&self, job_id: &str) -> Option<OrchestrationJob> {
+        let store = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        store.jobs.get(job_id).cloned()
+    }
+
+    /// The newest job for an orchestration (ids are zero-padded, so the lexically
+    /// greatest id is the newest), or `None` when none has ever been started.
+    fn latest_for(&self, orchestration_id: &str) -> Option<OrchestrationJob> {
+        let store = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        store
+            .jobs
+            .values()
+            .filter(|j| j.orchestration_id == orchestration_id)
+            .max_by(|a, b| a.id.cmp(&b.id))
+            .cloned()
+    }
+}
+
+/// Wall-clock now in unix millis (0 if the clock is before the epoch, which never
+/// happens in practice). Jobs use real time because they are runtime artifacts,
+/// not part of the deterministic, reproducible kernel state.
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The task ids of up to `n` briefs that are ready to run right now (pending with
+/// every dependency completed), in index order. Mirrors the kernel scheduler's
+/// readiness rule on the durable record so the job can mark in-flight briefs
+/// honestly before a round runs.
+fn ready_task_ids(orch: &Orchestration, n: usize) -> Vec<String> {
+    orch.steps
+        .iter()
+        .filter(|s| {
+            s.outcome == StepOutcome::Pending
+                && s.depends_on.iter().all(|&j| {
+                    orch.steps
+                        .get(j)
+                        .map(|d| d.outcome == StepOutcome::Completed)
+                        .unwrap_or(true)
+                })
+        })
+        .take(n)
+        .map(|s| s.task_id.to_string())
+        .collect()
+}
+
+/// Snapshot the orchestration's briefs for the job view. Any brief whose task id
+/// is in `running` and is still `pending` is reported as `running` (it is about to
+/// execute this round); everything else carries its real recorded outcome.
+fn job_steps(orch: &Orchestration, running: &[String]) -> Vec<JobStepStatus> {
+    orch.steps
+        .iter()
+        .map(|s| {
+            let id = s.task_id.to_string();
+            let outcome = if s.outcome == StepOutcome::Pending && running.contains(&id) {
+                "running".to_string()
+            } else {
+                s.outcome.label().to_string()
+            };
+            JobStepStatus {
+                task_id: id,
+                agent_id: s.agent_id.to_string(),
+                title: s.title.clone(),
+                outcome,
+                round: s.round,
+                note: s.note.clone(),
+            }
+        })
+        .collect()
+}
+
+/// Accumulates per-round [`OrchestrationBatchResult`]s into one job-level result.
+/// Counts that grow round-over-round are summed; the current truth (status,
+/// pending, waiting, next action) is taken from the most recent round.
+#[derive(Default)]
+struct JobAggregate {
+    ran: u32,
+    completed: u32,
+    failed: u32,
+    blocked: u32,
+    dependency_blocked: u32,
+    rounds: u32,
+    per_agent: Vec<String>,
+    skipped_reasons: Vec<String>,
+    last: Option<OrchestrationBatchResult>,
+}
+
+impl JobAggregate {
+    fn merge(&mut self, r: &OrchestrationBatchResult) {
+        self.ran += r.ran;
+        self.completed += r.completed;
+        self.failed += r.failed;
+        self.blocked += r.blocked;
+        self.dependency_blocked += r.dependency_blocked;
+        self.rounds += r.rounds;
+        self.per_agent.extend(r.per_agent.iter().cloned());
+        self.skipped_reasons.extend(r.skipped_reasons.iter().cloned());
+        self.last = Some(r.clone());
+    }
+
+    /// Build the job-level aggregate result. Falls back to an empty completed-style
+    /// result if no round ever ran (e.g. there was nothing pending).
+    fn into_result(self, oid: &OrchestrationId, concurrency: usize) -> OrchestrationBatchResult {
+        let last = self.last.clone();
+        let (pending, waiting, status, next_action) = match &last {
+            Some(r) => (r.pending, r.waiting, r.status, r.next_action.clone()),
+            None => (
+                0,
+                0,
+                OrchestrationStatus::Completed,
+                "No pending briefs to run.".to_string(),
+            ),
+        };
+        let summary = format!(
+            "{} round(s) across the job, up to {} brief(s) at a time: {} ran ({} completed, {} failed, {} blocked); {} blocked by a failed dependency; {} waiting on a dependency; {} pending.",
+            self.rounds,
+            concurrency,
+            self.ran,
+            self.completed,
+            self.failed,
+            self.blocked,
+            self.dependency_blocked,
+            waiting,
+            pending,
+        );
+        OrchestrationBatchResult {
+            orchestration_id: oid.clone(),
+            ran: self.ran,
+            completed: self.completed,
+            failed: self.failed,
+            blocked: self.blocked,
+            pending,
+            concurrency: concurrency as u32,
+            rounds: self.rounds,
+            waiting,
+            dependency_blocked: self.dependency_blocked,
+            skipped_reasons: self.skipped_reasons,
+            per_agent: self.per_agent,
+            summary,
+            next_action,
+            status,
+        }
+    }
+}
+
+/// Drive one orchestration job to completion on a background thread.
+///
+/// Each iteration runs ONE governed round (a per-call budget equal to the round
+/// size) through the existing, tested `run_orchestration`, releasing the kernel
+/// lock and persisting the record between rounds so progress is recorded
+/// incrementally. It stops when the per-job `max` budget is spent, a round runs no
+/// brief, or the orchestration is no longer `running`.
+fn drive_orchestration_job(
+    state: AppState,
+    job_id: String,
+    oid: OrchestrationId,
+    user_max: usize,
+    concurrency: usize,
+) {
+    let jobs = state.jobs.clone();
+    jobs.update(&job_id, |j| {
+        j.state = JobState::Running;
+        j.started_at_ms.get_or_insert(now_millis());
+        j.last_event = Some("running".to_string());
+    });
+
+    // The per-round budget: at most `concurrency` briefs per kernel call, so the
+    // lock is released after every round-sized slice of work.
+    let per_call = concurrency.clamp(1, 4);
+    let mut total_ran = 0usize;
+    let mut agg = JobAggregate::default();
+
+    loop {
+        if total_ran >= user_max {
+            break;
+        }
+
+        // Mark the briefs about to run this round as `running` for a mid-batch
+        // poll. Read-only; tolerant of a vanished record (next step handles it).
+        if let Ok(Some(orch)) = locked_read(&state, |k| Ok(k.orchestration(&oid).cloned())) {
+            let ready = ready_task_ids(&orch, per_call);
+            if !ready.is_empty() {
+                jobs.update(&job_id, |j| {
+                    j.steps = job_steps(&orch, &ready);
+                    j.last_event =
+                        Some(format!("round {}: {} brief(s) starting", j.current_round + 1, ready.len()));
+                });
+            }
+        }
+
+        let budget = per_call.min(user_max - total_ran).max(1);
+        let outcome = locked_save_persisting(&state, |kernel| {
+            let r = kernel.run_orchestration(&oid, budget, concurrency)?;
+            let snap = kernel.orchestration(&oid).cloned();
+            Ok((r, snap))
+        });
+
+        match outcome {
+            Ok((result, snap)) => {
+                total_ran += result.ran as usize;
+                let ran_this = result.ran;
+                let status = result.status;
+                agg.merge(&result);
+                jobs.update(&job_id, |j| {
+                    j.current_round += result.rounds;
+                    j.ran = agg.ran;
+                    j.completed = agg.completed;
+                    j.failed = agg.failed;
+                    j.blocked = agg.blocked;
+                    if let Some(orch) = snap.as_ref() {
+                        j.steps = job_steps(orch, &[]);
+                    }
+                    j.last_event = Some(result.summary.clone());
+                });
+                // Stop when no brief ran (nothing ready) or the orchestration is no
+                // longer running (completed / needs attention). Either way the
+                // pending set has stopped shrinking, so continuing would spin.
+                if ran_this == 0 || !matches!(status, OrchestrationStatus::Running) {
+                    break;
+                }
+            }
+            Err(e) => {
+                jobs.update(&job_id, |j| {
+                    j.state = JobState::Failed;
+                    j.error = Some(e.message.clone());
+                    j.completed_at_ms = Some(now_millis());
+                    j.last_event = Some("failed".to_string());
+                });
+                return;
+            }
+        }
+    }
+
+    let final_snap = locked_read(&state, |k| Ok(k.orchestration(&oid).cloned()))
+        .ok()
+        .flatten();
+    let final_result = agg.into_result(&oid, concurrency);
+    jobs.update(&job_id, |j| {
+        j.state = JobState::Completed;
+        j.completed_at_ms = Some(now_millis());
+        if let Some(orch) = final_snap.as_ref() {
+            j.steps = job_steps(orch, &[]);
+        }
+        j.last_event = Some(final_result.summary.clone());
+        j.result = Some(final_result);
+    });
+}
+
+/// The `run-async` response: the freshly-created job plus the URL to poll it.
+#[derive(Debug, Serialize)]
+struct StartJobResponse {
+    #[serde(flatten)]
+    job: OrchestrationJob,
+    /// The relative URL the dashboard polls for this job's live status.
+    status_url: String,
+}
+
+/// POST `/v1/relux/prime/orchestrations/:id/run-async` — start a non-blocking
+/// run. Returns immediately with the queued job and a `status_url`. Rejects a
+/// duplicate concurrent job for the same orchestration (409) and an over-cap fleet
+/// (429). The orchestration must exist (404).
+async fn start_orchestration_job(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    body: Option<Json<RunOrchestrationReq>>,
+) -> Result<Json<StartJobResponse>, ApiError> {
+    let oid = OrchestrationId::new(id.clone());
+    let req = body.map(|b| b.0).unwrap_or_default();
+    let max = req.max.unwrap_or(25).clamp(1, 25);
+    let concurrency = req.concurrency.unwrap_or(2).clamp(1, 4);
+
+    // Validate the orchestration exists before minting a job, so a bad id is an
+    // honest 404 rather than a job that fails on its first round.
+    locked_read(&state, |kernel| {
+        kernel
+            .orchestration(&oid)
+            .map(|_| ())
+            .ok_or_else(|| KernelError::UnknownOrchestration(id.clone()))
+    })?;
+
+    let job = state.jobs.start(&id, max, concurrency).map_err(|e| match e {
+        JobStartError::Duplicate(existing) => ApiError {
+            status: StatusCode::CONFLICT,
+            message: format!(
+                "an orchestration job ({existing}) is already running for {id}; poll it instead of starting another"
+            ),
+        },
+        JobStartError::TooManyActive(n) => ApiError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: format!(
+                "too many orchestration jobs are active ({n}/{MAX_ACTIVE_JOBS}); wait for one to finish"
+            ),
+        },
+    })?;
+
+    // Spawn the worker on a dedicated OS thread: a job can run for minutes (real
+    // CLI briefs), so it must not occupy the async reactor or the bounded blocking
+    // pool the chat CLI path uses.
+    let worker_state = state.clone();
+    let worker_job = job.id.clone();
+    let worker_oid = oid.clone();
+    std::thread::spawn(move || {
+        drive_orchestration_job(worker_state, worker_job, worker_oid, max, concurrency);
+    });
+
+    let status_url = format!("/v1/relux/orchestration-jobs/{}", job.id);
+    Ok(Json(StartJobResponse { job, status_url }))
+}
+
+/// GET `/v1/relux/orchestration-jobs/:job_id` — poll one job's live status. 404
+/// when the id is unknown (never started, or lost to a restart).
+async fn get_orchestration_job(
+    State(state): State<AppState>,
+    AxumPath(job_id): AxumPath<String>,
+) -> Result<Json<OrchestrationJob>, ApiError> {
+    state.jobs.get(&job_id).map(Json).ok_or_else(|| ApiError {
+        status: StatusCode::NOT_FOUND,
+        message: format!("no orchestration job {job_id} (it may have been lost to a server restart)"),
+    })
+}
+
+/// GET `/v1/relux/prime/orchestrations/:id/job` — the latest job for an
+/// orchestration, so the dashboard can poll by orchestration id without tracking
+/// the job id. 404 when none has been started (the dashboard then shows the
+/// durable record's recorded progress instead).
+async fn get_latest_orchestration_job(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<OrchestrationJob>, ApiError> {
+    state.jobs.latest_for(&id).map(Json).ok_or_else(|| ApiError {
+        status: StatusCode::NOT_FOUND,
+        message: format!("no orchestration job has been started for {id}"),
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -2585,5 +3121,184 @@ mod tests {
         assert_eq!(outcome.reply, "Idle.");
         let note = outcome.note.expect("a note");
         assert!(note.to_lowercase().contains("enable"), "note: {note}");
+    }
+
+    // --- Non-blocking orchestration job tests -----------------------------
+
+    use relux_core::{
+        AgentId, NamespaceId, Orchestration, OrchestrationRole, OrchestrationStep, TaskId,
+    };
+
+    fn step(task: &str, role: OrchestrationRole, outcome: StepOutcome, deps: Vec<usize>) -> OrchestrationStep {
+        OrchestrationStep {
+            task_id: TaskId::new(task),
+            agent_id: AgentId::new("prime"),
+            role,
+            title: format!("brief {task}"),
+            outcome,
+            depends_on: deps,
+            run_id: None,
+            note: None,
+            started_at: None,
+            finished_at: None,
+            round: None,
+        }
+    }
+
+    fn orchestration_with(steps: Vec<OrchestrationStep>) -> Orchestration {
+        Orchestration {
+            id: OrchestrationId::new("orch_0001"),
+            goal: "goal".to_string(),
+            created_by: "founder".to_string(),
+            namespace_id: NamespaceId::new("workspace"),
+            status: OrchestrationStatus::Planned,
+            steps,
+            notes: vec![],
+            created_at: "t0".to_string(),
+            updated_at: "t0".to_string(),
+            last_batch_summary: None,
+        }
+    }
+
+    #[test]
+    fn registry_starts_a_queued_job_with_a_status_url_shape() {
+        let reg = JobRegistry::default();
+        let job = reg.start("orch_0001", 25, 2).expect("first job starts");
+        assert_eq!(job.state, JobState::Queued);
+        assert_eq!(job.orchestration_id, "orch_0001");
+        assert_eq!(job.id, "job_0001");
+        assert_eq!(job.max, 25);
+        assert_eq!(job.concurrency, 2);
+        assert!(job.started_at_ms.is_none(), "queued job has not started");
+        assert!(reg.get("job_0001").is_some());
+        assert!(reg.get("nope").is_none());
+    }
+
+    #[test]
+    fn registry_rejects_a_duplicate_concurrent_job_for_the_same_orchestration() {
+        let reg = JobRegistry::default();
+        let first = reg.start("orch_0001", 25, 2).expect("first starts");
+        match reg.start("orch_0001", 25, 2) {
+            Err(JobStartError::Duplicate(existing)) => assert_eq!(existing, first.id),
+            other => panic!("expected duplicate rejection, got {:?}", other.is_ok()),
+        }
+        // A different orchestration is allowed concurrently.
+        assert!(reg.start("orch_0002", 25, 2).is_ok());
+    }
+
+    #[test]
+    fn registry_allows_a_new_job_once_the_prior_one_is_terminal() {
+        let reg = JobRegistry::default();
+        let first = reg.start("orch_0001", 25, 2).unwrap();
+        reg.update(&first.id, |j| j.state = JobState::Completed);
+        // The completed job no longer blocks a fresh run of the same orchestration.
+        let second = reg.start("orch_0001", 25, 2).expect("a new job after completion");
+        assert_ne!(second.id, first.id);
+        // latest_for returns the newest (zero-padded ids sort lexically).
+        assert_eq!(reg.latest_for("orch_0001").unwrap().id, second.id);
+    }
+
+    #[test]
+    fn registry_caps_the_number_of_active_jobs() {
+        let reg = JobRegistry::default();
+        for i in 0..MAX_ACTIVE_JOBS {
+            reg.start(&format!("orch_{i:04}"), 25, 2)
+                .expect("under the cap");
+        }
+        match reg.start("orch_overflow", 25, 2) {
+            Err(JobStartError::TooManyActive(n)) => assert_eq!(n, MAX_ACTIVE_JOBS),
+            _ => panic!("expected the active-job cap to reject the overflow"),
+        }
+    }
+
+    #[test]
+    fn ready_task_ids_respects_dependencies_and_the_limit() {
+        // brief 0 pending (ready), brief 1 depends on 0 (not ready), brief 2 pending
+        // independent (ready).
+        let orch = orchestration_with(vec![
+            step("task_0", OrchestrationRole::Research, StepOutcome::Pending, vec![]),
+            step("task_1", OrchestrationRole::Implementation, StepOutcome::Pending, vec![0]),
+            step("task_2", OrchestrationRole::Research, StepOutcome::Pending, vec![]),
+        ]);
+        let ready = ready_task_ids(&orch, 4);
+        assert_eq!(ready, vec!["task_0".to_string(), "task_2".to_string()]);
+        // The limit caps how many are returned, in index order.
+        assert_eq!(ready_task_ids(&orch, 1), vec!["task_0".to_string()]);
+        // Once the dependency completes, the dependent becomes ready too.
+        let orch2 = orchestration_with(vec![
+            step("task_0", OrchestrationRole::Research, StepOutcome::Completed, vec![]),
+            step("task_1", OrchestrationRole::Implementation, StepOutcome::Pending, vec![0]),
+        ]);
+        assert_eq!(ready_task_ids(&orch2, 4), vec!["task_1".to_string()]);
+    }
+
+    #[test]
+    fn job_steps_marks_in_flight_briefs_running_and_keeps_real_outcomes() {
+        let orch = orchestration_with(vec![
+            step("task_0", OrchestrationRole::Research, StepOutcome::Completed, vec![]),
+            step("task_1", OrchestrationRole::Implementation, StepOutcome::Pending, vec![]),
+            step("task_2", OrchestrationRole::Testing, StepOutcome::Pending, vec![]),
+        ]);
+        let running = vec!["task_1".to_string()];
+        let snap = job_steps(&orch, &running);
+        assert_eq!(snap[0].outcome, "completed"); // real outcome preserved
+        assert_eq!(snap[1].outcome, "running"); // about-to-run brief is marked running
+        assert_eq!(snap[2].outcome, "pending"); // not in the running set: untouched
+    }
+
+    #[test]
+    fn job_aggregate_sums_counts_and_takes_current_truth_from_the_last_round() {
+        let oid = OrchestrationId::new("orch_0001");
+        let mut agg = JobAggregate::default();
+        let round1 = OrchestrationBatchResult {
+            orchestration_id: oid.clone(),
+            ran: 2,
+            completed: 2,
+            failed: 0,
+            blocked: 0,
+            pending: 2,
+            concurrency: 2,
+            rounds: 1,
+            waiting: 1,
+            dependency_blocked: 0,
+            skipped_reasons: vec![],
+            per_agent: vec!["round 1 prime: task_0 completed".to_string()],
+            summary: "r1".to_string(),
+            next_action: "continue".to_string(),
+            status: OrchestrationStatus::Running,
+        };
+        let mut round2 = round1.clone();
+        round2.ran = 2;
+        round2.completed = 1;
+        round2.failed = 1;
+        round2.rounds = 1;
+        round2.pending = 0;
+        round2.waiting = 0;
+        round2.status = OrchestrationStatus::NeedsAttention;
+        round2.next_action = "fix the failed brief".to_string();
+        round2.per_agent = vec!["round 2 prime: task_2 failed".to_string()];
+        agg.merge(&round1);
+        agg.merge(&round2);
+        let result = agg.into_result(&oid, 2);
+        // Counts are summed across rounds.
+        assert_eq!(result.ran, 4);
+        assert_eq!(result.completed, 3);
+        assert_eq!(result.failed, 1);
+        assert_eq!(result.rounds, 2);
+        assert_eq!(result.per_agent.len(), 2);
+        // Current truth (status / pending / next action) comes from the last round.
+        assert_eq!(result.status, OrchestrationStatus::NeedsAttention);
+        assert_eq!(result.pending, 0);
+        assert_eq!(result.next_action, "fix the failed brief");
+    }
+
+    #[test]
+    fn job_aggregate_with_no_rounds_reports_a_completed_empty_result() {
+        let oid = OrchestrationId::new("orch_0001");
+        let agg = JobAggregate::default();
+        let result = agg.into_result(&oid, 2);
+        assert_eq!(result.ran, 0);
+        assert_eq!(result.rounds, 0);
+        assert_eq!(result.status, OrchestrationStatus::Completed);
     }
 }

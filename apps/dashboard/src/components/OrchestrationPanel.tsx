@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   reluxOrchestration,
@@ -6,6 +6,7 @@ import {
   type ReluxOrchestration,
   type ReluxOrchestrationPlan,
   type ReluxOrchestrationBatchResult,
+  type ReluxOrchestrationJob,
 } from "../api";
 import {
   orchestrationStatusTone,
@@ -18,7 +19,16 @@ import {
   stepLifecycleTone,
   stepDependencyLabel,
   orchestrationReadiness,
+  jobIsActive,
+  jobIsTerminal,
+  jobPhaseLabel,
+  jobProgressLabel,
+  jobRunningStepIds,
+  runButtonLabel,
 } from "../orchestration";
+
+// How often to poll an in-flight orchestration job for live progress.
+const JOB_POLL_MS = 1000;
 
 // Orchestration panel (master plan section 10.4 Delegation Rules, section 15
 // multi-agent workloads): Prime as an orchestrator. The operator types a goal,
@@ -33,13 +43,24 @@ export function OrchestrationPanel() {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [lastBatch, setLastBatch] = useState<ReluxOrchestrationBatchResult | null>(null);
+  // Live background-job state, keyed by orchestration id (the backend guarantees
+  // at most one active job per orchestration). Drives the non-blocking Run path.
+  const [jobs, setJobs] = useState<Record<string, ReluxOrchestrationJob>>({});
+  // Avoid setState after unmount when a poll resolves late.
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
 
   async function refresh() {
     try {
       const l = await reluxOrchestration.list();
       // Newest first (ids are zero-padded so lexical desc == newest).
       l.sort((a, b) => (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
-      setList(l);
+      if (mounted.current) setList(l);
     } catch (e) {
       setError(e instanceof ApiError ? e.message : "Failed to load orchestrations");
     }
@@ -48,6 +69,45 @@ export function OrchestrationPanel() {
   useEffect(() => {
     void refresh();
   }, []);
+
+  // Poll every active job until it finishes. On completion, fold the job's
+  // aggregate result into the "Last batch" banner and refresh the durable record
+  // so the per-brief outcomes/rounds shown are the recorded truth. A 404 means the
+  // job was lost to a server restart — drop it and fall back to the record.
+  useEffect(() => {
+    const activeIds = Object.values(jobs)
+      .filter((j) => jobIsActive(j))
+      .map((j) => j.orchestration_id);
+    if (activeIds.length === 0) return;
+    let cancelled = false;
+    const handle = window.setTimeout(async () => {
+      const updates: Record<string, ReluxOrchestrationJob> = {};
+      const drop: string[] = [];
+      let terminalResult: ReluxOrchestrationBatchResult | null = null;
+      for (const oid of activeIds) {
+        try {
+          const j = await reluxOrchestration.latestJob(oid);
+          updates[oid] = j;
+          if (jobIsTerminal(j.state) && j.result) terminalResult = j.result;
+        } catch (e) {
+          if (e instanceof ApiError && e.status === 404) drop.push(oid);
+        }
+      }
+      if (cancelled || !mounted.current) return;
+      setJobs((prev) => {
+        const next = { ...prev, ...updates };
+        for (const oid of drop) delete next[oid];
+        return next;
+      });
+      const anyTerminal = Object.values(updates).some((j) => jobIsTerminal(j.state));
+      if (terminalResult) setLastBatch(terminalResult);
+      if (anyTerminal || drop.length > 0) await refresh();
+    }, JOB_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(handle);
+    };
+  }, [jobs]);
 
   async function preview() {
     if (!goal.trim() || busy) return;
@@ -79,19 +139,18 @@ export function OrchestrationPanel() {
     }
   }
 
+  // Start a NON-BLOCKING run: kick off a background job and let the poll effect
+  // drive it to completion. The button stays disabled while the job is active, so
+  // a second click can't start a duplicate (the backend also rejects duplicates).
   async function run(id: string) {
-    if (busy) return;
-    setBusy(`run:${id}`);
+    if (jobIsActive(jobs[id])) return;
     setError(null);
     setLastBatch(null);
     try {
-      const result = await reluxOrchestration.run(id);
-      setLastBatch(result);
-      await refresh();
+      const started = await reluxOrchestration.runAsync(id);
+      if (mounted.current) setJobs((prev) => ({ ...prev, [id]: started }));
     } catch (e) {
-      setError(e instanceof ApiError ? e.message : "Failed to run orchestration");
-    } finally {
-      setBusy(null);
+      setError(e instanceof ApiError ? e.message : "Failed to start orchestration run");
     }
   }
 
@@ -217,9 +276,8 @@ export function OrchestrationPanel() {
             <OrchestrationRow
               key={o.id}
               o={o}
+              job={jobs[o.id] ?? null}
               onRun={() => void run(o.id)}
-              running={busy === `run:${o.id}`}
-              disabled={busy != null}
             />
           ))
         )}
@@ -230,18 +288,18 @@ export function OrchestrationPanel() {
 
 function OrchestrationRow({
   o,
+  job,
   onRun,
-  running,
-  disabled,
 }: {
   o: ReluxOrchestration;
+  job: ReluxOrchestrationJob | null;
   onRun: () => void;
-  running: boolean;
-  disabled: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const groups = groupStepsByAgent(o);
   const readiness = orchestrationReadiness(o);
+  const active = jobIsActive(job);
+  const runningIds = new Set(jobRunningStepIds(job));
   // The dependency-aware shape of remaining work, shown so an operator sees what
   // is runnable now vs still gated before pressing Run.
   const readinessBits = [
@@ -277,18 +335,41 @@ function OrchestrationRow({
         </div>
       )}
 
+      {/* Live job status: real phase/round/progress from the polled job, shown
+          while a run is in flight (and the failure reason if it failed) — never a
+          bare spinner. */}
+      {job && (job.state !== "completed" || jobIsActive(job)) && (
+        <div
+          className={"banner" + (job.state === "failed" ? " err" : "")}
+          style={{ fontSize: 11, marginTop: 6 }}
+        >
+          <strong>{jobPhaseLabel(job)}</strong>
+          {jobProgressLabel(job) ? ` — ${jobProgressLabel(job)}` : ""}
+          {job.last_event && (
+            <div className="muted" style={{ fontSize: 10, marginTop: 2 }}>
+              {job.last_event}
+            </div>
+          )}
+          {job.error && (
+            <div style={{ fontSize: 10, marginTop: 2 }}>{job.error}</div>
+          )}
+        </div>
+      )}
+
       <div className="row" style={{ gap: 8, marginTop: 8 }}>
         <button
           className="btn"
           onClick={onRun}
-          disabled={disabled || !canRunOrchestration(o)}
+          disabled={active || !canRunOrchestration(o)}
           title={
-            canRunOrchestration(o)
-              ? "Run a governed batch of the pending briefs"
-              : "No pending briefs to run"
+            active
+              ? "A run is already in progress"
+              : canRunOrchestration(o)
+                ? "Run a governed batch of the pending briefs"
+                : "No pending briefs to run"
           }
         >
-          {running ? "Running..." : o.status === "planned" ? "Run orchestration" : "Continue"}
+          {runButtonLabel(o, job)}
         </button>
         <button className="btn ghost" onClick={() => setOpen((v) => !v)}>
           {open ? "Hide briefs" : "Show briefs"}
@@ -320,9 +401,16 @@ function OrchestrationRow({
                     <span className={"badge " + stepOutcomeTone(s.outcome)} style={{ fontSize: 9 }}>
                       {s.outcome}
                     </span>
+                    {/* A brief the live job is executing this round shows a real
+                        "running" badge (from the polled job snapshot), not a guess. */}
+                    {active && s.outcome === "pending" && runningIds.has(s.task_id) && (
+                      <span className="badge in_progress" style={{ fontSize: 9 }} title="running now">
+                        running
+                      </span>
+                    )}
                     {/* The derived lifecycle adds the dependency-aware state the raw
                         outcome can't show: a pending brief is "ready" or "waiting". */}
-                    {s.outcome === "pending" && (
+                    {s.outcome === "pending" && !runningIds.has(s.task_id) && (
                       <span
                         className={"badge " + stepLifecycleTone(lifecycle)}
                         style={{ fontSize: 9 }}

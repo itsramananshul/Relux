@@ -1428,14 +1428,41 @@ impl KernelState {
     ) -> Result<OrchestrationBatchResult, KernelError> {
         let max = max.clamp(1, 25);
         let concurrency = concurrency.clamp(1, 4);
-        let namespace = self
-            .orchestrations
-            .get(id)
-            .ok_or_else(|| KernelError::UnknownOrchestration(id.to_string()))?
-            .namespace_id
-            .clone();
+        let mut result = self.new_orchestration_batch_result(id, concurrency)?;
 
-        let mut result = OrchestrationBatchResult {
+        // Drive the rounds to completion. Each round is one call to
+        // [`run_one_orchestration_round`], which the non-blocking background job
+        // also calls one-at-a-time (persisting between rounds) so the same
+        // dependency-aware, round-numbered scheduling is the single source of truth
+        // for both the synchronous and the job path.
+        let mut round_no: u32 = 0;
+        loop {
+            let next_round = round_no + 1;
+            if !self.run_one_orchestration_round(id, max, concurrency, next_round, &mut result)? {
+                break;
+            }
+            round_no = next_round;
+        }
+        result.rounds = round_no;
+        self.finalize_orchestration_batch(id, &mut result)?;
+        Ok(result)
+    }
+
+    /// Build the fresh, empty [`OrchestrationBatchResult`] accumulator for a batch,
+    /// validating that the orchestration exists. Its status starts `Planned`;
+    /// [`finalize_orchestration_batch`] recomputes the real status from the steps.
+    /// The non-blocking job path uses this to own the accumulator across the
+    /// lock-released rounds it drives.
+    pub fn new_orchestration_batch_result(
+        &self,
+        id: &OrchestrationId,
+        concurrency: usize,
+    ) -> Result<OrchestrationBatchResult, KernelError> {
+        let concurrency = concurrency.clamp(1, 4);
+        self.orchestrations
+            .get(id)
+            .ok_or_else(|| KernelError::UnknownOrchestration(id.to_string()))?;
+        Ok(OrchestrationBatchResult {
             orchestration_id: id.clone(),
             ran: 0,
             completed: 0,
@@ -1451,116 +1478,154 @@ impl KernelState {
             summary: String::new(),
             next_action: String::new(),
             status: OrchestrationStatus::Planned,
-        };
+        })
+    }
 
-        let mut round_no: u32 = 0;
-        loop {
-            // Budget guard: never attempt more than `max` briefs in one call, so a
-            // single run can never spin the whole fleet without an explicit ask.
-            if result.ran as usize >= max {
-                break;
-            }
+    /// Execute at most ONE dependency-aware round, mutating `result` and the
+    /// durable step records, stamping each brief run this round with the absolute
+    /// `round_no`. Returns `true` when a round ran (≥1 brief attempted), `false`
+    /// when the `max` budget is spent or no brief is ready (the batch is complete).
+    ///
+    /// It deliberately does NOT finalize the orchestration status/summary or
+    /// persist anything: the caller drives the rounds. The synchronous
+    /// [`run_orchestration`] calls it in a tight loop; the non-blocking job calls
+    /// it one round at a time, releasing the kernel lock and saving the record
+    /// between rounds so a mid-batch poll sees real, already-recorded progress.
+    /// Passing the absolute `round_no` keeps the per-brief `round` correct across a
+    /// job that spans many separately-locked calls.
+    pub fn run_one_orchestration_round(
+        &mut self,
+        id: &OrchestrationId,
+        max: usize,
+        concurrency: usize,
+        round_no: u32,
+        result: &mut OrchestrationBatchResult,
+    ) -> Result<bool, KernelError> {
+        let max = max.clamp(1, 25);
+        let concurrency = concurrency.clamp(1, 4);
 
-            // Honestly mark any brief whose dependency failed/blocked as `Blocked`
-            // before choosing this round's work, so a failed upstream never silently
-            // strands its dependents as "pending".
-            result.dependency_blocked += self.propagate_dependency_blocks(id);
+        // Budget guard: never attempt more than `max` briefs in one call, so a
+        // single run can never spin the whole fleet without an explicit ask.
+        if result.ran as usize >= max {
+            return Ok(false);
+        }
 
-            // A brief is ready when it is still pending and every dependency has
-            // `Completed`. Collected in index order so the lowest-index ready brief
-            // (which, post-propagation, always exists while anything is pending)
-            // runs first.
-            let ready: Vec<(usize, TaskId, AgentId)> = self
-                .orchestrations
-                .get(id)
-                .map(|o| {
-                    o.steps
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, s)| {
-                            s.outcome == StepOutcome::Pending
-                                && s.depends_on.iter().all(|&j| {
-                                    o.steps
-                                        .get(j)
-                                        .map(|d| d.outcome == StepOutcome::Completed)
-                                        .unwrap_or(true)
-                                })
-                        })
-                        .map(|(i, s)| (i, s.task_id.clone(), s.agent_id.clone()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            if ready.is_empty() {
-                break;
-            }
+        // Honestly mark any brief whose dependency failed/blocked as `Blocked`
+        // before choosing this round's work, so a failed upstream never silently
+        // strands its dependents as "pending".
+        result.dependency_blocked += self.propagate_dependency_blocks(id);
 
-            let budget_left = max - result.ran as usize;
-            let take = concurrency.min(budget_left);
-            round_no += 1;
-            for (idx, task_id, agent_id) in ready.into_iter().take(take) {
-                result.ran += 1;
-                let started_at = self.clock.tick();
-                let exec = self.execute_assigned_run(&task_id);
-                let finished_at = self.clock.tick();
-                // The latest run for this task is the attempt we just made (run ids
-                // are zero-padded, so id order == creation order).
-                let run_id = self
-                    .runs
-                    .values()
-                    .filter(|r| r.task_id == task_id)
-                    .max_by(|a, b| a.id.0.cmp(&b.id.0))
-                    .map(|r| r.id.clone());
-                let (outcome, note) = match exec {
-                    Ok(_) => {
-                        result.completed += 1;
-                        (StepOutcome::Completed, None)
+        // A brief is ready when it is still pending and every dependency has
+        // `Completed`. Collected in index order so the lowest-index ready brief
+        // (which, post-propagation, always exists while anything is pending)
+        // runs first.
+        let ready: Vec<(usize, TaskId, AgentId)> = self
+            .orchestrations
+            .get(id)
+            .map(|o| {
+                o.steps
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| {
+                        s.outcome == StepOutcome::Pending
+                            && s.depends_on.iter().all(|&j| {
+                                o.steps
+                                    .get(j)
+                                    .map(|d| d.outcome == StepOutcome::Completed)
+                                    .unwrap_or(true)
+                            })
+                    })
+                    .map(|(i, s)| (i, s.task_id.clone(), s.agent_id.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if ready.is_empty() {
+            return Ok(false);
+        }
+
+        let budget_left = max - result.ran as usize;
+        let take = concurrency.min(budget_left);
+        for (idx, task_id, agent_id) in ready.into_iter().take(take) {
+            result.ran += 1;
+            let started_at = self.clock.tick();
+            let exec = self.execute_assigned_run(&task_id);
+            let finished_at = self.clock.tick();
+            // The latest run for this task is the attempt we just made (run ids
+            // are zero-padded, so id order == creation order).
+            let run_id = self
+                .runs
+                .values()
+                .filter(|r| r.task_id == task_id)
+                .max_by(|a, b| a.id.0.cmp(&b.id.0))
+                .map(|r| r.id.clone());
+            let (outcome, note) = match exec {
+                Ok(_) => {
+                    result.completed += 1;
+                    (StepOutcome::Completed, None)
+                }
+                Err(e) => {
+                    // Distinguish "needs a human" (blocked) from a genuine run
+                    // failure (retryable). A disabled/unconfigured CLI runtime, a
+                    // missing binary, an invalid config, or a missing permission
+                    // all mean the brief cannot run until someone acts.
+                    let blocked = matches!(
+                        e,
+                        KernelError::AdapterRuntimeDisabled { .. }
+                            | KernelError::AdapterRuntimeNotConfigured { .. }
+                            | KernelError::InvalidAdapterConfig { .. }
+                            | KernelError::AdapterBinaryMissing { .. }
+                            | KernelError::PermissionDenied { .. }
+                    );
+                    if blocked {
+                        result.blocked += 1;
+                    } else {
+                        result.failed += 1;
                     }
-                    Err(e) => {
-                        // Distinguish "needs a human" (blocked) from a genuine run
-                        // failure (retryable). A disabled/unconfigured CLI runtime, a
-                        // missing binary, an invalid config, or a missing permission
-                        // all mean the brief cannot run until someone acts.
-                        let blocked = matches!(
-                            e,
-                            KernelError::AdapterRuntimeDisabled { .. }
-                                | KernelError::AdapterRuntimeNotConfigured { .. }
-                                | KernelError::InvalidAdapterConfig { .. }
-                                | KernelError::AdapterBinaryMissing { .. }
-                                | KernelError::PermissionDenied { .. }
-                        );
+                    let reason = e.to_string();
+                    result.skipped_reasons.push(format!("{task_id}: {reason}"));
+                    (
                         if blocked {
-                            result.blocked += 1;
+                            StepOutcome::Blocked
                         } else {
-                            result.failed += 1;
-                        }
-                        let reason = e.to_string();
-                        result.skipped_reasons.push(format!("{task_id}: {reason}"));
-                        (
-                            if blocked {
-                                StepOutcome::Blocked
-                            } else {
-                                StepOutcome::Failed
-                            },
-                            Some(reason),
-                        )
-                    }
-                };
-                result
-                    .per_agent
-                    .push(format!("round {round_no} {agent_id}: {task_id} {}", outcome.label()));
-                if let Some(o) = self.orchestrations.get_mut(id) {
-                    if let Some(step) = o.steps.get_mut(idx) {
-                        step.outcome = outcome;
-                        step.run_id = run_id;
-                        step.note = note;
-                        step.started_at = Some(started_at);
-                        step.finished_at = Some(finished_at);
-                        step.round = Some(round_no);
-                    }
+                            StepOutcome::Failed
+                        },
+                        Some(reason),
+                    )
+                }
+            };
+            result
+                .per_agent
+                .push(format!("round {round_no} {agent_id}: {task_id} {}", outcome.label()));
+            if let Some(o) = self.orchestrations.get_mut(id) {
+                if let Some(step) = o.steps.get_mut(idx) {
+                    step.outcome = outcome;
+                    step.run_id = run_id;
+                    step.note = note;
+                    step.started_at = Some(started_at);
+                    step.finished_at = Some(finished_at);
+                    step.round = Some(round_no);
                 }
             }
         }
-        result.rounds = round_no;
+        Ok(true)
+    }
+
+    /// Finalize a batch: recompute the orchestration's status/pending/waiting from
+    /// the full step set, fill the summary + next action, update the durable record,
+    /// and write the audit entry. Called once after the last round by both the
+    /// synchronous [`run_orchestration`] and the non-blocking job. `result.rounds`
+    /// must already be set by the caller.
+    pub fn finalize_orchestration_batch(
+        &mut self,
+        id: &OrchestrationId,
+        result: &mut OrchestrationBatchResult,
+    ) -> Result<(), KernelError> {
+        let namespace = self
+            .orchestrations
+            .get(id)
+            .ok_or_else(|| KernelError::UnknownOrchestration(id.to_string()))?
+            .namespace_id
+            .clone();
 
         // A brief whose dependency failed in the final round must be marked blocked
         // too (the loop may have exited on the budget guard before re-propagating).
@@ -1673,7 +1738,7 @@ impl KernelState {
                 "pending": result.pending,
             }),
         );
-        Ok(result)
+        Ok(())
     }
 
     /// Mark every still-pending brief whose dependency `Failed`/`Blocked` as

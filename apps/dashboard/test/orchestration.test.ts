@@ -245,3 +245,111 @@ test("headline summarizes fleet activity or hides when empty", () => {
     "1 orchestration, all completed.",
   );
 });
+
+// --- Non-blocking orchestration job helpers --------------------------------
+
+import {
+  jobIsActive,
+  jobIsTerminal,
+  jobPhaseLabel,
+  jobProgressLabel,
+  jobRunningStepIds,
+  runButtonLabel,
+} from "../src/orchestration.ts";
+import type {
+  ReluxOrchestrationJob,
+  ReluxJobStepStatus,
+} from "../src/api.ts";
+
+function jobStep(
+  taskId: string,
+  outcome: ReluxJobStepStatus["outcome"],
+): ReluxJobStepStatus {
+  return { task_id: taskId, agent_id: "prime", title: `Brief ${taskId}`, outcome };
+}
+
+function job(
+  state: ReluxOrchestrationJob["state"],
+  extra: Partial<ReluxOrchestrationJob> = {},
+): ReluxOrchestrationJob {
+  return {
+    id: "job_0001",
+    orchestration_id: "orch_0001",
+    state,
+    max: 25,
+    concurrency: 2,
+    current_round: 0,
+    ran: 0,
+    completed: 0,
+    failed: 0,
+    blocked: 0,
+    steps: [],
+    ...extra,
+  };
+}
+
+test("jobIsActive is true only while queued or running", () => {
+  assert.equal(jobIsActive(job("queued")), true);
+  assert.equal(jobIsActive(job("running")), true);
+  assert.equal(jobIsActive(job("completed")), false);
+  assert.equal(jobIsActive(job("failed")), false);
+  assert.equal(jobIsActive(null), false);
+  assert.equal(jobIsActive(undefined), false);
+});
+
+test("jobIsTerminal is true only for completed or failed", () => {
+  assert.equal(jobIsTerminal("completed"), true);
+  assert.equal(jobIsTerminal("failed"), true);
+  assert.equal(jobIsTerminal("running"), false);
+  assert.equal(jobIsTerminal("queued"), false);
+  assert.equal(jobIsTerminal(undefined), false);
+});
+
+test("jobPhaseLabel reflects the real lifecycle, not a spinner", () => {
+  assert.equal(jobPhaseLabel(job("queued")), "Queued");
+  assert.equal(jobPhaseLabel(job("running", { current_round: 0 })), "Running — starting");
+  assert.equal(jobPhaseLabel(job("running", { current_round: 2 })), "Running — round 2");
+  assert.equal(jobPhaseLabel(job("completed")), "Completed");
+  assert.equal(jobPhaseLabel(job("failed")), "Failed");
+  assert.equal(jobPhaseLabel(null), "");
+});
+
+test("jobProgressLabel summarizes ran/completed/failed/blocked from the job", () => {
+  const j = job("running", {
+    ran: 3,
+    completed: 2,
+    failed: 1,
+    steps: [
+      jobStep("t0", "completed"),
+      jobStep("t1", "failed"),
+      jobStep("t2", "running"),
+      jobStep("t3", "pending"),
+    ],
+  });
+  assert.equal(jobProgressLabel(j), "3/4 briefs run · 2 completed · 1 failed");
+  assert.equal(jobProgressLabel(null), "");
+});
+
+test("jobRunningStepIds returns only briefs the job is executing now", () => {
+  const j = job("running", {
+    steps: [jobStep("t0", "completed"), jobStep("t1", "running"), jobStep("t2", "pending")],
+  });
+  assert.deepEqual(jobRunningStepIds(j), ["t1"]);
+  assert.deepEqual(jobRunningStepIds(null), []);
+});
+
+test("runButtonLabel tracks the live job and resting verb", () => {
+  const planned = orch("orch_0001", "planned", [step("t0", "a", "pending")]);
+  const running = orch("orch_0001", "running", [
+    step("t0", "a", "completed"),
+    step("t1", "b", "pending"),
+  ]);
+  // No job: resting verb depends on whether there is recorded progress.
+  assert.equal(runButtonLabel(planned, null), "Run orchestration");
+  assert.equal(runButtonLabel(running, null), "Continue");
+  // Active job: live phase wins.
+  assert.equal(runButtonLabel(planned, job("queued")), "Queued...");
+  assert.equal(runButtonLabel(planned, job("running")), "Running...");
+  // After a failure: offer a retry.
+  assert.equal(runButtonLabel(running, job("failed")), "Retry");
+});

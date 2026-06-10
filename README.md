@@ -562,10 +562,21 @@ ready/waiting/blocked readiness, per-agent briefs, and the round each ran in), a
 Home surfaces the newest unfinished orchestration with its next action. Every
 orchestration is a durable, auditable trace of **goal → brief → agent → run**.
 
+Runs are **non-blocking and pollable**: **Run/Continue** starts a background job
+(`POST …/orchestrations/:id/run-async`, returning a job id + `status_url`) and the
+panel polls it (`GET /v1/relux/orchestration-jobs/:job_id`) about once a second,
+showing the live phase (Queued → Running — round N → Completed/Failed), a running
+tally, and a real **running** badge on the brief(s) executing this round. The worker
+drives the same governed scheduler one round at a time, **persisting progress
+between rounds**, so the live view is recorded truth — nothing is faked. A second
+start while a job is active is refused (one job per orchestration), and the button
+is disabled while a job runs. The job registry is in-memory, so a server restart
+mid-job is reported honestly (the poll 404s and the UI falls back to the durable
+record, which still shows the rounds that actually completed).
+
 *Honest limit:* briefs **within** a round currently execute sequentially through the
 kernel's single-owner lock (the cap bounds round size; OS-parallel CLI spawns are a
-later slice), and an HTTP run is synchronous so the dashboard shows recorded
-round/dependency state after the batch returns rather than a live mid-run feed.
+later slice).
 
 The background autonomy timer above is unchanged (deterministic, echo-only, never a
 paid CLI); orchestration runs are operator-triggered from the UI, CLI, or API.

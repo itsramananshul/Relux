@@ -10,6 +10,8 @@
 
 import type {
   ReluxOrchestration,
+  ReluxOrchestrationJob,
+  ReluxJobState,
   ReluxOrchestrationStatus,
   ReluxOrchestrationStep,
   ReluxStepOutcome,
@@ -259,6 +261,80 @@ export function groupStepsByAgent(
     map.get(s.agent_id)!.push(s);
   }
   return order.map((agentId) => ({ agentId, steps: map.get(agentId)! }));
+}
+
+// --- Non-blocking orchestration jobs --------------------------------------
+//
+// These derive UI state from a polled background-job record. A job is the
+// runtime twin of a governed batch run: the dashboard starts one, polls it until
+// it finishes, and renders its real, recorded progress (phase, round, per-brief
+// status) instead of a bare spinner. Every helper only classifies what the job
+// already reported — nothing fabricates in-flight progress.
+
+// True while a job is still working (queued or running), so the UI can disable a
+// second Run/Continue and keep polling.
+export function jobIsActive(job: ReluxOrchestrationJob | null | undefined): boolean {
+  return job != null && (job.state === "queued" || job.state === "running");
+}
+
+// True once a job has stopped working (completed or failed); the UI then stops
+// polling, refreshes the durable record, and re-enables Run/Continue.
+export function jobIsTerminal(state: ReluxJobState | undefined): boolean {
+  return state === "completed" || state === "failed";
+}
+
+// A short human phase label for the job, used in place of a spinner. Reflects the
+// real lifecycle the worker reported, never a guessed step.
+export function jobPhaseLabel(job: ReluxOrchestrationJob | null | undefined): string {
+  if (!job) return "";
+  switch (job.state) {
+    case "queued":
+      return "Queued";
+    case "running":
+      return job.current_round > 0
+        ? `Running — round ${job.current_round}`
+        : "Running — starting";
+    case "completed":
+      return "Completed";
+    case "failed":
+      return "Failed";
+    default:
+      return "";
+  }
+}
+
+// A compact "3/5 briefs ran · 2 completed" progress line from the job's running
+// tallies. Returns "" when there is nothing to show yet.
+export function jobProgressLabel(job: ReluxOrchestrationJob | null | undefined): string {
+  if (!job) return "";
+  const total = job.steps.length;
+  const bits = [`${job.ran}/${total} briefs run`];
+  if (job.completed > 0) bits.push(`${job.completed} completed`);
+  if (job.failed > 0) bits.push(`${job.failed} failed`);
+  if (job.blocked > 0) bits.push(`${job.blocked} blocked`);
+  return bits.join(" · ");
+}
+
+// The task ids of briefs the job is currently running this round (marked
+// "running" in the job's step snapshot). Lets the panel highlight in-flight work.
+export function jobRunningStepIds(job: ReluxOrchestrationJob | null | undefined): string[] {
+  if (!job) return [];
+  return job.steps.filter((s) => s.outcome === "running").map((s) => s.task_id);
+}
+
+// The Run/Continue button label given the current job and orchestration. While a
+// job is active it reflects the live phase; otherwise it is the resting verb
+// (Run for a fresh plan, Continue for one with progress, Retry after a failure).
+export function runButtonLabel(
+  o: ReluxOrchestration,
+  job: ReluxOrchestrationJob | null | undefined,
+): string {
+  if (jobIsActive(job)) {
+    return job!.state === "queued" ? "Queued..." : "Running...";
+  }
+  if (job?.state === "failed") return "Retry";
+  if (o.status === "planned") return "Run orchestration";
+  return "Continue";
 }
 
 // A one-line Home headline summarizing orchestration activity across the fleet,

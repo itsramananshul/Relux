@@ -1929,7 +1929,10 @@ POST /v1/relux/prime/orchestrate/preview      # preview a plan, commit nothing
 POST /v1/relux/prime/orchestrations           # create (plan + assign) from { goal }
 GET  /v1/relux/prime/orchestrations           # list
 GET  /v1/relux/prime/orchestrations/:id       # one record + full step chain
-POST /v1/relux/prime/orchestrations/:id/run   # governed dependency-aware batch ({ max?, concurrency? })
+POST /v1/relux/prime/orchestrations/:id/run   # governed dependency-aware batch ({ max?, concurrency? }), blocking
+POST /v1/relux/prime/orchestrations/:id/run-async  # start a NON-BLOCKING background job; returns { ...job, status_url } immediately
+GET  /v1/relux/prime/orchestrations/:id/job   # the latest job for this orchestration (poll by orchestration id)
+GET  /v1/relux/orchestration-jobs/:job_id     # poll one job: state queued/running/completed/failed + round/step statuses/result
 ```
 
 Dashboard: the Prime page has an **Orchestration** panel (goal → preview plan →
@@ -1938,17 +1941,40 @@ brief's inferred dependencies; each orchestration shows a dependency-aware
 readiness line (how many briefs are **ready** now vs **waiting** on a dependency vs
 **blocked**), per-brief derived lifecycle badges (ready/waiting on a pending
 brief), the **round** each brief ran in, and the last batch's rounds + concurrency
-cap. Home shows the newest unfinished orchestration with its progress and next
-action. Pure UI logic lives in `apps/dashboard/src/orchestration.ts` with unit
-coverage in `apps/dashboard/test/orchestration.test.ts`.
+cap. **Run/Continue now starts a non-blocking background job and polls it:** the
+button kicks off `run-async`, then a 1s poll loop renders the live phase
+("Queued" → "Running — round N" → "Completed"/"Failed"), a running tally
+(`ran/total briefs · completed · failed · blocked`), the worker's last event, and
+a real **running** badge on the brief(s) executing this round (taken from the job's
+step snapshot, never a guessed spinner). The button stays disabled while the job is
+active so a second click can't start a duplicate (the backend also rejects it). On
+completion the panel folds the job's aggregate result into the "Last batch" banner
+and refreshes the durable record. Home shows the newest unfinished orchestration
+with its progress and next action. Pure UI logic lives in
+`apps/dashboard/src/orchestration.ts` (job helpers: `jobIsActive` / `jobIsTerminal`
+/ `jobPhaseLabel` / `jobProgressLabel` / `jobRunningStepIds` / `runButtonLabel`)
+with unit coverage in `apps/dashboard/test/orchestration.test.ts`.
 
-Progress visibility is honest about the current architecture: an HTTP run is
-synchronous (the kernel is single-owner-locked for the batch), so the panel renders
-the **recorded** per-brief start/finish/round and the dependency-aware
-ready/waiting/blocked state **after** the batch returns (it refreshes on
-completion) rather than streaming a live mid-run feed. Live mid-run streaming needs
-a non-blocking job model (a later slice); nothing here fabricates in-flight
-progress.
+Progress visibility is now honestly **live**: a `run-async` job runs on a
+background thread that drives the SAME governed, tested `run_orchestration` one
+round at a time — releasing the single-owner kernel lock and persisting the
+orchestration record **between** rounds — so polling the job (or the durable
+record) sees real, already-recorded per-brief start/finish/round and the
+dependency-aware ready/waiting/blocked state **as the batch progresses**, not only
+after it returns. The blocking `/run` endpoint stays for the CLI/tests. Two honesty
+contracts hold: (1) the briefs about to run this round are reported as `running`
+from the durable readiness rule — nothing fabricates in-flight progress; (2) the
+job registry is **in-memory only**, so a server restart mid-job loses the job
+record (a poll then 404s and the dashboard falls back to the durable record, which
+still carries whatever rounds actually completed). The worker never spins: each
+round moves ≥1 brief to a terminal outcome and it stops as soon as a round runs no
+brief, the per-job budget is spent, or the orchestration is no longer `running`.
+Duplicate starts are rejected (409, one active job per orchestration) and the fleet
+is capped (429 past `MAX_ACTIVE_JOBS`). Backend job lifecycle/duplicate/cap/aggregate
+logic is unit-tested in `crates/relux-kernel/src/server.rs`; an end-to-end HTTP
+smoke (`scripts/smoke-orchestration-job.ps1`, plus a real-Claude-CLI variant
+`scripts/smoke-orchestration-job-claude.ps1`) proves the start → poll → terminal
+path against a live kernel.
 
 ### Tool Invocation Surface (First Honest Version)
 

@@ -1509,6 +1509,52 @@ export interface ReluxOrchestrationBatchResult {
   status: ReluxOrchestrationStatus;
 }
 
+// --- Non-blocking orchestration jobs --------------------------------------
+
+// The lifecycle of a background orchestration run. Distinct from the
+// orchestration's own status: a job is "completed" once its worker finished its
+// rounds, even if the orchestration itself ended "needs_attention".
+export type ReluxJobState = "queued" | "running" | "completed" | "failed";
+
+// One brief's status as the job last observed it. `outcome` is the durable step
+// outcome, except briefs the worker is about to run this round are reported as
+// "running" so a mid-batch poll shows real in-flight work.
+export interface ReluxJobStepStatus {
+  task_id: string;
+  agent_id: string;
+  title: string;
+  outcome: ReluxStepOutcome | "running";
+  round?: number | null;
+  note?: string | null;
+}
+
+// A pollable, in-memory record of one non-blocking orchestration run. Lost on a
+// server restart (the durable orchestration record keeps the real per-brief
+// progress); a poll for a lost job returns 404.
+export interface ReluxOrchestrationJob {
+  id: string;
+  orchestration_id: string;
+  state: ReluxJobState;
+  max: number;
+  concurrency: number;
+  current_round: number;
+  ran: number;
+  completed: number;
+  failed: number;
+  blocked: number;
+  started_at_ms?: number | null;
+  completed_at_ms?: number | null;
+  last_event?: string | null;
+  error?: string | null;
+  steps: ReluxJobStepStatus[];
+  result?: ReluxOrchestrationBatchResult | null;
+}
+
+// The run-async response: the queued job plus the URL to poll it.
+export interface ReluxStartJobResponse extends ReluxOrchestrationJob {
+  status_url: string;
+}
+
 export const reluxOrchestration = {
   // Preview a multi-agent plan for a goal WITHOUT committing anything (read-only).
   preview: (goal: string) =>
@@ -1530,6 +1576,25 @@ export const reluxOrchestration = {
     api.post<ReluxOrchestrationBatchResult>(
       `/v1/relux/prime/orchestrations/${encodeURIComponent(id)}/run`,
       opts ?? {},
+    ),
+  // Start a NON-BLOCKING run: returns immediately with a queued job + status_url.
+  // The dashboard polls the job until it finishes instead of waiting on one long
+  // request. Rejects a duplicate concurrent job (409) or an over-cap fleet (429).
+  runAsync: (id: string, opts?: { max?: number; concurrency?: number }) =>
+    api.post<ReluxStartJobResponse>(
+      `/v1/relux/prime/orchestrations/${encodeURIComponent(id)}/run-async`,
+      opts ?? {},
+    ),
+  // The latest job for an orchestration (poll target). 404 when none has been
+  // started — the caller then shows the durable record's recorded progress.
+  latestJob: (id: string) =>
+    api.get<ReluxOrchestrationJob>(
+      `/v1/relux/prime/orchestrations/${encodeURIComponent(id)}/job`,
+    ),
+  // Poll one job by id. 404 when unknown (never started, or lost to a restart).
+  job: (jobId: string) =>
+    api.get<ReluxOrchestrationJob>(
+      `/v1/relux/orchestration-jobs/${encodeURIComponent(jobId)}`,
     ),
 };
 
