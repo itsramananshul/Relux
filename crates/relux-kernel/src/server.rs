@@ -1210,6 +1210,56 @@ async fn run_prime(
 /// Cap on a CLI brain's reply, mirroring the OpenRouter reply cap.
 const CLI_REPLY_MAX_CHARS: usize = 4_000;
 
+/// Shape a CLI brain's captured `stdout` into the human answer to show in chat,
+/// or `Err(note)` when the envelope reported an error / produced no usable text.
+///
+/// This is the seam that guarantees the chat bubble shows only the human reply,
+/// never the raw `--output-format json` result envelope. The Claude CLI emits a
+/// single JSON envelope (`{ "type":"result", "result":"...", "is_error":false,
+/// "usage":{...}, "duration_ms":.., "session_id":".." }`); Codex `exec` and text
+/// mode emit plain prose. [`parse_adapter_result`] lifts the human text out of a
+/// recognized envelope and degrades to the raw text otherwise, exactly as the
+/// assigned-run path does (master plan section 9.6). Kept pure so the
+/// no-raw-JSON contract is pinned by unit tests without spawning a process.
+fn shape_cli_brain_reply(
+    stdout: &str,
+    stdout_truncated: bool,
+    kind: relux_core::AdapterKind,
+    label: &str,
+) -> Result<String, String> {
+    let parsed = relux_core::parse_adapter_result(stdout, kind);
+    // An envelope can report an error even on a clean process exit. Surface it
+    // honestly as a fallback note instead of presenting the error text (or, worse,
+    // the raw JSON) as a confident answer.
+    if parsed.is_error == Some(true) {
+        let detail = parsed
+            .text
+            .lines()
+            .next()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .unwrap_or("the CLI reported an error");
+        return Err(format!(
+            "{label} reported an error ({detail}); showing the grounded reply. \
+             Check that the CLI is logged in and try again."
+        ));
+    }
+    let answer = parsed.text.trim();
+    if answer.is_empty() {
+        return Err(format!(
+            "{label} returned an empty answer; showing the grounded reply. Please try again."
+        ));
+    }
+    let mut reply: String = answer.chars().take(CLI_REPLY_MAX_CHARS).collect();
+    // A structured envelope that parsed cleanly carries the complete `result`
+    // text, so the byte-cap on raw stdout did not cut the answer. Only flag
+    // truncation for unstructured (plain-text) output.
+    if stdout_truncated && !parsed.structured {
+        reply.push_str("\n\n[output truncated]");
+    }
+    Ok(reply)
+}
+
 /// Delegate one conversational Prime turn to a local CLI brain (Claude / Codex).
 ///
 /// Safety + honesty contract (`docs/RELUX_MASTER_PLAN.md` section 8.1, section
@@ -1297,15 +1347,14 @@ async fn run_cli_brain(
 
     match run {
         Ok(Ok(outcome)) if outcome.success && !outcome.stdout.trim().is_empty() => {
-            let mut reply: String = outcome.stdout.trim().chars().take(CLI_REPLY_MAX_CHARS).collect();
-            if outcome.stdout_truncated {
-                reply.push_str("\n\n[output truncated]");
-            }
-            AiOutcome {
-                mode,
-                reply,
-                model: Some(label.to_string()),
-                note: None,
+            match shape_cli_brain_reply(&outcome.stdout, outcome.stdout_truncated, kind, label) {
+                Ok(reply) => AiOutcome {
+                    mode,
+                    reply,
+                    model: Some(label.to_string()),
+                    note: None,
+                },
+                Err(note) => fallback(note),
             }
         }
         Ok(Ok(outcome)) if outcome.timed_out => fallback(format!(
@@ -4192,5 +4241,81 @@ mod tests {
             "every brief reached a terminal outcome"
         );
         assert!(rebuilt.ran >= 1, "at least one brief ran");
+    }
+
+    // --- Prime CLI brain reply shaping (no raw JSON envelope) ----------------
+    //
+    // Regression guard for the reported bug: Prime with the Claude CLI selected
+    // showed the entire `--output-format json` envelope (`{ "type":"result", ...
+    // "result":"Hey...", "duration_ms":.., "session_id":.., "usage":{..} }`) as
+    // the chat answer. These pin that the bubble shows only the human text.
+
+    #[test]
+    fn claude_cli_brain_shows_only_human_text_not_raw_envelope() {
+        let stdout = r#"{
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "result": "Hey! How can I help you today?",
+            "duration_ms": 1234,
+            "session_id": "abc-123-session",
+            "total_cost_usd": 0.0021,
+            "num_turns": 1,
+            "usage": { "input_tokens": 12, "output_tokens": 8 }
+        }"#;
+        let reply = shape_cli_brain_reply(stdout, false, relux_core::AdapterKind::ClaudeCli, "Claude CLI")
+            .expect("a success envelope yields a human reply");
+        assert_eq!(reply, "Hey! How can I help you today?");
+        // None of the envelope scaffolding/metadata leaks into the chat bubble.
+        assert!(!reply.contains('{'), "no JSON braces: {reply}");
+        assert!(!reply.contains("duration_ms"), "no duration field: {reply}");
+        assert!(!reply.contains("session_id"), "no session field: {reply}");
+        assert!(!reply.contains("usage"), "no usage field: {reply}");
+        assert!(!reply.contains("total_cost_usd"), "no cost field: {reply}");
+        assert!(!reply.contains("\"type\""), "no type field: {reply}");
+    }
+
+    #[test]
+    fn claude_cli_brain_error_envelope_falls_back_with_note_not_json() {
+        let stdout = r#"{"type":"result","subtype":"error","is_error":true,"result":"hit a rate limit","session_id":"x"}"#;
+        let err = shape_cli_brain_reply(stdout, false, relux_core::AdapterKind::ClaudeCli, "Claude CLI")
+            .expect_err("an error envelope must not be shown as a confident answer");
+        assert!(err.contains("Claude CLI reported an error"), "note: {err}");
+        assert!(err.contains("hit a rate limit"), "surfaces the error detail: {err}");
+        assert!(!err.contains('{'), "never dumps the raw JSON: {err}");
+        assert!(!err.contains("session_id"), "no metadata leak: {err}");
+    }
+
+    #[test]
+    fn codex_cli_brain_plain_text_passes_through_unchanged() {
+        // Codex `exec` / text-mode brains emit prose; it must round-trip verbatim.
+        let stdout = "Sure — here is a quick summary of the repo.";
+        let reply = shape_cli_brain_reply(stdout, false, relux_core::AdapterKind::CodexCli, "Codex CLI")
+            .expect("plain prose is a valid reply");
+        assert_eq!(reply, stdout);
+    }
+
+    #[test]
+    fn cli_brain_empty_result_falls_back() {
+        // An envelope whose `result` is blank is not a usable answer.
+        let stdout = r#"{"type":"result","is_error":false,"result":"   "}"#;
+        let err = shape_cli_brain_reply(stdout, false, relux_core::AdapterKind::ClaudeCli, "Claude CLI")
+            .expect_err("a blank result yields a fallback");
+        assert!(err.contains("empty answer"), "note: {err}");
+    }
+
+    #[test]
+    fn cli_brain_truncation_marker_only_on_plain_text() {
+        // Plain text that was byte-capped gets the marker.
+        let plain = shape_cli_brain_reply("a long answer", true, relux_core::AdapterKind::CodexCli, "Codex CLI")
+            .expect("plain reply");
+        assert!(plain.ends_with("[output truncated]"), "plain marker: {plain}");
+        // A cleanly-parsed structured envelope carries its full `result`, so no
+        // misleading truncation marker is appended.
+        let envelope = r#"{"type":"result","is_error":false,"result":"complete answer"}"#;
+        let structured = shape_cli_brain_reply(envelope, true, relux_core::AdapterKind::ClaudeCli, "Claude CLI")
+            .expect("structured reply");
+        assert_eq!(structured, "complete answer");
+        assert!(!structured.contains("[output truncated]"), "no marker: {structured}");
     }
 }
