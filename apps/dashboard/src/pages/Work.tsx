@@ -1,6 +1,11 @@
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect, useRef } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { runIdFromSearch, workRunShareUrl } from "../routing";
+import {
+  latestReluxEventId,
+  mergeReluxRunEvents,
+  noActivityLabel,
+} from "../reluxruntranscript";
 import { reluxWork, reluxAudit, type ReluxTask, type ReluxRun, type ReluxAgent, type ReluxTaskDetail, type ReluxRunDetail, type ReluxAuditEntry, type ReluxRunEvent } from "../api";
 import { useAsync } from "../components/common";
 import {
@@ -411,10 +416,21 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
     () => reluxWork.getRun(runId),
     [runId],
   );
-  const { data: events, loading: loadingEvents, error: errorEvents, reload: reloadEvents } = useAsync<ReluxRunEvent[]>(
-    () => reluxWork.getRunEvents(runId),
-    [runId],
-  );
+  // Incremental live-tail for the transcript. Instead of re-fetching the whole
+  // transcript each poll (the old behavior), we keep the accumulated events and
+  // re-fetch only the tail past `cursorRef` (the highest event id we hold),
+  // merging the new events on. The first load (and any recovery) fetches the
+  // full transcript by passing no cursor.
+  const [events, setEvents] = useState<ReluxRunEvent[] | null>(null);
+  const [eventsLoading, setEventsLoading] = useState(true);
+  const [eventsError, setEventsError] = useState<string | null>(null);
+  const cursorRef = useRef<string | null>(null);
+  // Wall-clock instant of the last observed activity (a new transcript event or
+  // a run phase/status change). Drives the honest "no activity" stalled signal —
+  // the Relux event `ts` is a logical clock, so staleness must be measured here
+  // against real time, never derived from `ts`.
+  const [lastActivityAt, setLastActivityAt] = useState<number | null>(null);
+  const [nowMs, setNowMs] = useState<number>(() => Date.now());
   const [retrying, setRetrying] = useState(false);
   // Copy-link state: the shareable absolute `/work?run=` URL is the same one a
   // deep link restores, so an operator can hand a run to a teammate. Reset when
@@ -434,19 +450,81 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
     }
   }
 
-  // Light polling while the run is still in flight. Execution is synchronous, so
-  // a run is usually already terminal when this panel opens; this only keeps a
-  // panel left open during a long CLI run fresh. No fake progress: we just
-  // re-fetch the real recorded run + transcript.
   const inFlight = isRunInFlight(run?.status);
+
+  // First load (and on run switch): fetch the FULL transcript, seed the cursor,
+  // and mark activity. Resets the accumulated state so a different run never
+  // shows the prior run's events.
+  useEffect(() => {
+    let on = true;
+    setEvents(null);
+    setEventsLoading(true);
+    setEventsError(null);
+    cursorRef.current = null;
+    reluxWork
+      .getRunEvents(runId)
+      .then((evs) => {
+        if (!on) return;
+        setEvents(evs);
+        cursorRef.current = latestReluxEventId(evs);
+        setLastActivityAt(Date.now());
+      })
+      .catch((e) => {
+        if (on) setEventsError(e instanceof Error ? e.message : String(e));
+      })
+      .finally(() => {
+        if (on) setEventsLoading(false);
+      });
+    return () => {
+      on = false;
+    };
+  }, [runId]);
+
+  // Light incremental polling while the run is still in flight. Execution is
+  // synchronous, so a run is usually already terminal when this panel opens;
+  // this only keeps a panel left open during a long CLI run fresh. The run
+  // record is small (re-fetched whole), but the transcript fetches ONLY the
+  // tail past our cursor and merges it on — no full re-fetch, no fake progress.
   useEffect(() => {
     if (!inFlight) return;
     const t = setInterval(() => {
       reloadRun();
-      reloadEvents();
+      reluxWork
+        .getRunEvents(runId, cursorRef.current ?? undefined)
+        .then((tail) => {
+          if (tail.length === 0) return; // nothing new — let the stall signal grow
+          setEvents((prev) => mergeReluxRunEvents(prev ?? [], tail));
+          const next = latestReluxEventId(tail);
+          if (next) cursorRef.current = next;
+          setLastActivityAt(Date.now());
+        })
+        .catch(() => {
+          // Transient poll error: keep the last good transcript rather than
+          // clearing it. The next tick retries from the same cursor.
+        });
     }, 1500);
     return () => clearInterval(t);
-  }, [inFlight, reloadRun, reloadEvents]);
+  }, [inFlight, runId, reloadRun]);
+
+  // A run phase/status change is real activity even if no transcript event
+  // arrived this tick. Resetting here also counts the panel opening as activity,
+  // so the stall signal only fires after genuine silence.
+  useEffect(() => {
+    setLastActivityAt(Date.now());
+  }, [run?.phase, run?.status]);
+
+  // Tick a wall clock once a second while in flight so the "no activity for Xs"
+  // signal ages live without re-fetching anything. Stops when the run settles.
+  useEffect(() => {
+    if (!inFlight) return;
+    setNowMs(Date.now());
+    const t = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [inFlight]);
+
+  // Honest stalled signal: in-flight but no new event/phase for a while. Null
+  // while activity is recent (normal live indicator shown instead).
+  const stalledNote = inFlight ? noActivityLabel(lastActivityAt, nowMs) : null;
 
   async function retry() {
     setRetrying(true);
@@ -554,7 +632,14 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
       <div className="row" style={{ alignItems: "center", marginBottom: 12 }}>
         <h4 style={{ margin: 0 }}>Run Detail</h4>
         {run && <span className={`badge ${runStatusTone(run.status)}`} style={{ marginLeft: 8 }}>{run.status}</span>}
-        {inFlight && <span className="muted" style={{ fontSize: 11, marginLeft: 8 }}>live · refreshing…</span>}
+        {inFlight && (
+          <span className="muted" style={{ fontSize: 11, marginLeft: 8 }}>
+            {/* Honest in-flight state: the stall signal reports real elapsed
+                silence (no new event/phase for a while); otherwise the normal
+                live indicator. Never a fabricated progress bar. */}
+            {stalledNote ? `live · ${stalledNote}` : "live · refreshing…"}
+          </span>
+        )}
         <div className="spacer" style={{ flex: 1 }} />
         <button className="btn ghost sm" style={{ marginRight: 8 }} title="Copy a shareable link to this run" onClick={() => void copyLink()}>
           Copy link
@@ -612,12 +697,21 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
               <pre className="code" style={{ whiteSpace: "pre-wrap", maxHeight: 240, overflow: "auto" }}>{run.output_excerpt}</pre>
             </div>
           )}
-          <h5 style={{ marginTop: 16, marginBottom: 8 }}>Transcript</h5>
-          {loadingEvents && !events ? (
+          <h5 style={{ marginTop: 16, marginBottom: 8 }}>
+            Transcript
+            {/* The stall signal also rides next to the transcript header, where
+                an operator watching the live tail is looking. */}
+            {stalledNote && (
+              <span className="muted" style={{ fontSize: 11, fontWeight: 400, marginLeft: 8 }}>
+                {stalledNote}
+              </span>
+            )}
+          </h5>
+          {eventsLoading && !events ? (
             <div className="loading">Loading events...</div>
-          ) : errorEvents ? (
+          ) : eventsError ? (
             <div className="banner err" style={{ fontSize: 12 }}>
-              Error loading events: {String(errorEvents)}
+              Error loading events: {String(eventsError)}
             </div>
           ) : events && events.length > 0 ? (
             <div className="table-scroll" style={{ maxHeight: 300 }}>

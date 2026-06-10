@@ -9,6 +9,34 @@ once a stable release is cut.
 
 ### Added
 
+- **Incremental live-tail + honest stalled signal for the Relux Work Run Detail
+  (relix-dashboard-design §8 / §11).** The previous transcript live-tail slice
+  improved only the **legacy bridge** surface (`/v1/runs/:id/events`, the
+  `<RunTranscript>` renderer on the Runs page); the **Relux local-shell** Run
+  model (`/v1/relux/runs/:id`, the `RunDetailPanel` on the **Work** page) was
+  untouched and still re-fetched the **whole** transcript every 1.5 s while a run
+  was in flight. This slice brings the same efficiency to the Relux run model and
+  adds a stalled-run indicator. (1) **API** — `GET /v1/relux/runs/:id/events`
+  gains an optional **`?since=<event_id>`** exclusive cursor that returns only the
+  events strictly after that id (oldest-first); **absent/empty `since` returns the
+  full transcript, exactly as before** (`GET /v1/relux/runs/:id` is unchanged). A
+  new `KernelState::run_events_since` backs it; `run_events` now delegates with no
+  cursor. The cursor compares on the **numeric** suffix of the `revent_NNNN` event
+  id (correct even past the 4-digit zero-pad width), and a `None`/empty/unparseable
+  cursor degrades to the full transcript so a malformed `since` never hides
+  history. (2) **UI** — the Work `RunDetailPanel` now keeps the accumulated events
+  and, while the run is in flight, re-fetches **only the tail past its cursor**
+  (1.5 s cadence) and merges the new events on (deduped by id); the small run
+  record is still re-fetched whole. (3) **Honest stalled signal** — when an
+  in-flight run goes quiet (no new transcript event and no run phase/status change
+  for ≥ 10 s), the header + transcript show **`No activity for Xs`** (real
+  wall-clock elapsed, since the Relux event `ts` is a logical clock) instead of
+  the normal `live · refreshing…` cue. **No fabricated progress bar** — it only
+  reports elapsed silence. New pure helpers
+  (`latestReluxEventId`/`mergeReluxRunEvents`/`reluxEventSeq`/`noActivityLabel`)
+  live in `apps/dashboard/src/reluxruntranscript.ts` and are unit-tested; a kernel
+  store test pins the exclusive-cursor semantics (full → tail → caught-up,
+  None/empty/unparseable → full).
 - **Efficient incremental live-tail for the Run transcript (relix-dashboard-design
   §8 / §11).** The Run Detail transcript now stays current during a long
   Claude/Codex Shift **without a manual refresh** — and does it cheaply. (1)

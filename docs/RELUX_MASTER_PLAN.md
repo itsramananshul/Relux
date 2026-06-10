@@ -757,6 +757,16 @@ Fields:
 - message
 - structured_payload
 
+`GET /v1/relux/runs/:id/events` accepts an optional `?since=<event_id>` exclusive
+cursor that returns only the events strictly after that id (the incremental
+live-tail); absent/empty `since` returns the full transcript. The Work-page Run
+Detail uses this to live-tail an in-flight run cheaply (fetch only the new tail,
+merge by id) instead of re-fetching the whole transcript each poll. `ts` is a
+logical-clock string (ordering, not wall time), so the dashboard's honest
+"No activity for Xs" stalled-run signal is measured against real wall-clock
+elapsed time in the client, never derived from `ts` — and it is never a
+fabricated progress bar.
+
 ### 9.8 Tool Call
 
 A tool invocation routed through the kernel.
@@ -1655,7 +1665,7 @@ Also available:
   GET /v1/relux/tasks/:id
   POST /v1/relux/tasks/:id/execute-assigned
   GET /v1/relux/runs/:id
-  GET /v1/relux/runs/:id/events
+  GET /v1/relux/runs/:id/events[?since=<event_id>]   # since = exclusive tail cursor; absent = full transcript
   GET /v1/relux/audit?limit=N
   GET /v1/relux/tools
   POST /v1/relux/tools/invoke

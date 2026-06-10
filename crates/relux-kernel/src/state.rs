@@ -4345,9 +4345,29 @@ impl KernelState {
 
     /// The transcript for one run, in emission order.
     pub fn run_events(&self, run_id: &RunId) -> Vec<&RunEvent> {
+        self.run_events_since(run_id, None)
+    }
+
+    /// The transcript for one run in emission order, optionally only the tail
+    /// strictly AFTER `since` (an exclusive event-id cursor). This backs the
+    /// dashboard's incremental live-tail for the Relux run model: a panel left
+    /// open during a long run re-fetches only the new events past its cursor
+    /// instead of the whole transcript each poll.
+    ///
+    /// A `None`, empty, or unparseable cursor returns the FULL transcript, so a
+    /// client that lost its place (or sent `since=0`) degrades to a full fetch
+    /// rather than silently dropping events.
+    pub fn run_events_since(&self, run_id: &RunId, since: Option<&str>) -> Vec<&RunEvent> {
+        let cursor = since.and_then(run_event_seq);
         self.run_events
             .iter()
             .filter(|e| &e.run_id == run_id)
+            .filter(|e| match cursor {
+                // Keep only events whose sequence is strictly past the cursor.
+                // An id we can't parse is kept (never drop a real event).
+                Some(c) => run_event_seq(&e.id).map(|n| n > c).unwrap_or(true),
+                None => true,
+            })
             .collect()
     }
 
@@ -4405,6 +4425,15 @@ impl KernelState {
             payload,
         });
     }
+}
+
+/// Parse the numeric sequence from a `revent_NNNN` event id. The kernel mints
+/// ids as `revent_{:04}` off a monotonic counter, so the numeric suffix orders
+/// events even past the 4-digit zero-pad width (where lexicographic compare on
+/// the raw id would break). Returns `None` for an id with no parseable suffix,
+/// so the caller treats it as "keep" rather than guessing an order.
+fn run_event_seq(id: &str) -> Option<u64> {
+    id.rsplit('_').next().and_then(|n| n.parse::<u64>().ok())
 }
 
 /// Map a `created_by` string onto an `(actor_type, actor_id)` pair for the audit
@@ -5680,6 +5709,48 @@ mod tests {
             .audit_log()
             .iter()
             .any(|e| e.action == "tool:relux-tools-echo:say" && e.result == AuditResult::Success));
+    }
+
+    #[test]
+    fn run_events_since_returns_only_the_exclusive_tail() {
+        // The incremental live-tail cursor: `run_events_since` must drop every
+        // event up to AND INCLUDING the cursor, and return the rest in order.
+        let (mut k, prime, task, run, echo) = primed_kernel();
+        k.call_tool(
+            &run,
+            &prime,
+            &echo,
+            "echo.say",
+            serde_json::json!({ "message": "hi" }),
+        )
+        .expect("tool call allowed");
+        k.complete_run(&run, "done").unwrap();
+        k.complete_task(&task).unwrap();
+
+        // Full transcript: start -> tool_call -> completed.
+        let full = k.run_events(&run);
+        assert_eq!(full.len(), 3, "expected three transcript events");
+        let first_id = full[0].id.clone();
+        let second_id = full[1].id.clone();
+        let third_id = full[2].id.clone();
+
+        // A cursor at the first event returns only events 2 and 3.
+        let tail = k.run_events_since(&run, Some(&first_id));
+        let tail_kinds: Vec<&str> = tail.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(tail_kinds, vec!["tool_call", "run_completed"]);
+
+        // A cursor at the last event returns an empty tail (nothing newer).
+        assert!(k.run_events_since(&run, Some(&third_id)).is_empty());
+
+        // The cursor is EXCLUSIVE: pointing at event 2 never re-emits event 2.
+        let after_second = k.run_events_since(&run, Some(&second_id));
+        assert_eq!(after_second.len(), 1);
+        assert_eq!(after_second[0].kind, "run_completed");
+
+        // None / empty / unparseable cursors all degrade to the full transcript.
+        assert_eq!(k.run_events_since(&run, None).len(), 3);
+        assert_eq!(k.run_events_since(&run, Some("")).len(), 3);
+        assert_eq!(k.run_events_since(&run, Some("not-an-id")).len(), 3);
     }
 
     #[test]

@@ -143,7 +143,7 @@ async fn serve() -> Result<(), KernelError> {
     println!("   GET    /v1/relux/tasks/:id");
     println!("   GET    /v1/relux/runs");
     println!("   GET    /v1/relux/runs/:id");
-    println!("   GET    /v1/relux/runs/:id/events");
+    println!("   GET    /v1/relux/runs/:id/events            (optional ?since=<event_id> tail)");
     println!("   POST   /v1/relux/runs/:id/proposed-changes/:index/review {{ \"decision\": \"approve|reject\" }}");
     println!("   POST   /v1/relux/runs/:id/proposed-changes/:index/apply");
     println!("   GET    /v1/relux/audit");
@@ -743,17 +743,36 @@ async fn get_run(
     Ok(Json(record))
 }
 
+/// Query params for `GET /v1/relux/runs/:id/events`.
+#[derive(Debug, Deserialize)]
+struct RunEventsQuery {
+    /// Optional exclusive event-id cursor: return ONLY events strictly after
+    /// this id (the incremental live-tail). Absent/empty returns the full
+    /// transcript, so a first load (or a client that lost its place) still gets
+    /// everything. Mirrors the legacy bridge `/v1/runs/:id/events?since=`
+    /// (relix-dashboard-design §8) for the Relux run model.
+    #[serde(default)]
+    since: Option<String>,
+}
+
 async fn get_run_events(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
+    query: axum::extract::Query<RunEventsQuery>,
 ) -> Result<Json<Vec<relux_kernel::RunEvent>>, ApiError> {
     let run_id = relux_core::RunId::new(id);
+    // An empty `since` degrades to a full transcript (treated as "no cursor").
+    let since = query.since.as_deref().filter(|s| !s.is_empty());
     let events = locked_read(&state, |kernel| {
         // Check if the run exists to return 404 if not.
         kernel
             .run(&run_id)
             .ok_or_else(|| KernelError::UnknownRun(run_id.to_string()))?;
-        Ok(kernel.run_events(&run_id).into_iter().cloned().collect())
+        Ok(kernel
+            .run_events_since(&run_id, since)
+            .into_iter()
+            .cloned()
+            .collect())
     })?;
     Ok(Json(events))
 }

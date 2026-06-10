@@ -1866,9 +1866,14 @@ export const reluxWork = {
   listRuns: () => api.get<ReluxRun[]>("/v1/relux/runs"),
   // Get a specific run by id.
   getRun: (id: string) => api.get<ReluxRunDetail>(`/v1/relux/runs/${encodeURIComponent(id)}`),
-  // Get the durable, capped, redacted transcript for a specific run.
-  getRunEvents: (id: string) =>
-    api.get<ReluxRunEvent[]>(`/v1/relux/runs/${encodeURIComponent(id)}/events`),
+  // Get the durable, capped, redacted transcript for a specific run. With
+  // `since` (an event id), fetches only the tail STRICTLY AFTER that cursor —
+  // the incremental live-tail the Work Run Detail merges onto what it already
+  // has. Omitting `since` returns the full transcript (first load / recovery).
+  getRunEvents: (id: string, since?: string) => {
+    const q = since ? `?since=${encodeURIComponent(since)}` : "";
+    return api.get<ReluxRunEvent[]>(`/v1/relux/runs/${encodeURIComponent(id)}/events${q}`);
+  },
   // All agents, sorted by id.
   listAgents: () => api.get<ReluxAgent[]>("/v1/relux/agents"),
   // Create a new task and assign it to Prime.
