@@ -11,6 +11,8 @@ import {
   phaseLabel,
   isRunInFlight,
   eventPayloadPreview,
+  toolCallSummary,
+  reviewApplyAvailability,
 } from "../runview";
 
 // Relux Work page: standalone surface for tasks and runs.
@@ -446,6 +448,14 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
   const error = errorRun;
   const duration = run ? formatRunDuration(run.duration_ms) : null;
   const metrics = run ? runMetricsLine(run) : null;
+  // Tool-call count is derived from the real transcript (not the run record), so
+  // it only appears once the events have loaded and the kernel actually recorded
+  // tool activity. §11.3 Active Runs lists "tool calls" as a run-depth field.
+  const toolCalls = toolCallSummary(events);
+  // Honest applicability of the legacy artifact/diff/apply/review affordances for
+  // THIS run. Relux run records carry none of that data, so we surface the reason
+  // instead of hiding it or wiring dead buttons.
+  const reviewApply = run ? reviewApplyAvailability(run) : null;
 
   return (
     <div style={{ paddingBottom: 16 }}>
@@ -484,6 +494,7 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
           <div className="kv"><span>Phase:</span><span>{phaseLabel(run.phase, run.status)}</span></div>
           <div className="kv"><span>Duration:</span><span>{duration ?? "—"}</span></div>
           {metrics && <div className="kv"><span>Metrics:</span><span>{metrics}</span></div>}
+          {toolCalls && <div className="kv"><span>Tool calls:</span><span>{toolCalls}</span></div>}
           {run.retried_from && (
             <div className="kv"><span>Retry of:</span>
               {/* Same Relux ledger → inspect the parent run in-shell via /work?run=. */}
@@ -551,6 +562,16 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
             </div>
           ) : (
             <div className="empty sm">No events found for this run.</div>
+          )}
+          {/* Artifact/diff/apply and accept/reject review are legacy-Runs-only
+              affordances. Relux run records carry none of that data, so we state
+              that honestly rather than hiding it or rendering dead controls. If a
+              run ever grows a real artifact set, reviewApplyAvailability flips. */}
+          <h5 style={{ marginTop: 16, marginBottom: 8 }}>Review &amp; Apply</h5>
+          {reviewApply && !reviewApply.available && (
+            <div className="banner" style={{ fontSize: 11, lineHeight: 1.5 }}>
+              {reviewApply.reason}
+            </div>
           )}
         </div>
       ) : (

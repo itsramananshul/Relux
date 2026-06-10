@@ -2561,10 +2561,20 @@ remain, in rough priority for the next slices:
    retryable** from the UI/API/CLI as a fresh run on the same task
    (`prime.retry_run` → `POST /v1/relux/runs/:id/retry`), with lineage recorded
    (`retried_from`); the HTTP path persists a failed run so its transcript
-   survives a refresh. What is still **not** done: live event streaming (the page
-   polls/refreshes a synchronous run rather than tailing it) and resuming a
-   *partial* CLI run (retry is a new attempt). Execution-environment runtimes are
-   not implemented.
+   survives a refresh. Run Detail also ports the run-depth **tool calls** field
+   (§11.3) — derived honestly from the durable transcript (`toolCallSummary`
+   counts real `tool_call` / `tool_call_denied` / `tool_call_failed` events, never
+   inferred) — and surfaces an **honest review/apply state**: the legacy `/runs`
+   artifact preview/diff, apply plan, and accept/reject review are **not part of
+   the Relux run model** (a relux-kernel run record carries no artifact set, diff
+   plan, or review verdict), so the panel states that (`reviewApplyAvailability`)
+   instead of hiding it or wiring dead controls — and deliberately does **not** call
+   the legacy `/v1/runs/:id/{artifacts,diff,apply,review}` endpoints, because those
+   ids belong to the separate `brief_runs` ledger. What is still **not** done: live
+   event streaming (the page polls/refreshes a synchronous run rather than tailing
+   it) and resuming a *partial* CLI run (retry is a new attempt); artifact/diff/apply
+   and review remain legacy-`/runs`-only until the Relux run model records workspace
+   artifacts. Execution-environment runtimes are not implemented.
 4. **Multi-agent autonomy.** *(First slice addressed post-v0.1.2; depth slice
    added after.)* See "Orchestration (First Multi-Agent Slice)" below. Prime can
    decompose a multi-step goal into role-typed **briefs assigned to different

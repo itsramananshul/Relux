@@ -171,6 +171,36 @@ bundle is asserted to carry the **Copy link** affordance.
 > stay on `/runs`; they are *not* rewritten to `/work?run=` (that would 404 on the
 > Relux backend). Only relux-kernel runs route to the in-shell Work surface.
 
+### Run-detail review/apply parity (honest port)
+
+The in-shell Run Detail now carries the run-depth fields the legacy `/runs`
+console showed, **only where the Relux run record actually backs them**:
+
+- **Tool calls** (master plan §11.3 Active Runs). Derived from the durable
+  transcript by `toolCallSummary` (`src/runview.ts`), counting the kernel's real
+  `tool_call` / `tool_call_denied` / `tool_call_failed` events — never inferred
+  from an `adapter_output`. The row appears only once events load and a tool was
+  actually used (no misleading "0 tool calls").
+- **Review & Apply state.** Legacy `/runs` offers artifact preview/diff, an apply
+  plan, and accept/reject review. Those are **not part of the Relux run model**: a
+  relux-kernel run record has no workspace artifact set, diff plan, or review
+  verdict. Rather than hide that or wire dead buttons, the panel renders the honest
+  reason from `reviewApplyAvailability` (`src/runview.ts`): Relux runs are read-only
+  execution records, and diff/apply/review live on the legacy Runs surface, which
+  uses a separate run store whose ids are not Relux run ids. The helper is
+  **future-proof** — if a run record ever grows a real `artifacts` array it flips to
+  available rather than silently lying. We deliberately do **not** call the legacy
+  `/v1/runs/:id/{artifacts,diff,apply,review}` endpoints from the Relux shell,
+  because the ids do not cross the two ledgers.
+
+Both derivations are pure and unit-covered in `test/runview.test.ts`; the shipped
+bundle is asserted to carry the `tool call`, `Review`, `read-only execution
+records`, and `legacy Runs surface` copy in `test/render-interrupted.test.mjs`
+(stale-dist guard). What legacy `/runs` still **solely** owns: artifact
+preview/diff viewers, the per-file apply plan with conflict detection, and the
+accept/reject review lifecycle — all backed by the coordinator's `brief_runs`
+store, not relux-kernel.
+
 ## Mesh policy
 
 The dashboard's board / inbox / crew / runs pages call the coordinator's

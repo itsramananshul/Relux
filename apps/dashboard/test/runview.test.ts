@@ -8,6 +8,9 @@ import {
   phaseLabel,
   isRunInFlight,
   eventPayloadPreview,
+  toolCallSummary,
+  reviewApplyAvailability,
+  REVIEW_APPLY_UNAVAILABLE_REASON,
 } from "../src/runview.ts";
 
 // The Work page's run-depth view must read HONESTLY: it only formats/classifies
@@ -68,4 +71,40 @@ test("eventPayloadPreview drops bulky stdout/stderr and nulls", () => {
   const preview = eventPayloadPreview({ stdout: "huge", exit_code: 0, structured: true });
   assert.ok(preview && preview.includes("exit_code"));
   assert.ok(preview && !preview.includes("huge"));
+});
+
+const ev = (kind: string): any => ({ id: "e", run_id: "r", ts: "t", kind, source: "kernel", message: "" });
+
+test("toolCallSummary counts only real tool events, and is null when there are none", () => {
+  assert.equal(toolCallSummary(undefined), null);
+  assert.equal(toolCallSummary([]), null);
+  // run_started/adapter_output are NOT tool calls — never fabricate one from them.
+  assert.equal(toolCallSummary([ev("run_started"), ev("adapter_output"), ev("run_completed")]), null);
+  assert.equal(toolCallSummary([ev("tool_call")]), "1 tool call");
+  assert.equal(toolCallSummary([ev("tool_call"), ev("tool_call")]), "2 tool calls");
+  assert.equal(
+    toolCallSummary([ev("tool_call"), ev("tool_call_denied"), ev("tool_call_failed"), ev("tool_call_failed")]),
+    "1 tool call · 1 denied · 2 failed",
+  );
+});
+
+test("reviewApplyAvailability is honestly unavailable for a plain Relux run", () => {
+  const base = { id: "r", task_id: "t", agent_id: "a", adapter_plugin: "p", status: "completed" } as any;
+  const verdict = reviewApplyAvailability(base);
+  assert.equal(verdict.available, false);
+  assert.equal(verdict.reason, REVIEW_APPLY_UNAVAILABLE_REASON);
+  // The reason must name where the capability actually lives and why ids don't cross.
+  assert.match(verdict.reason, /read-only execution records/);
+  assert.match(verdict.reason, /legacy Runs surface/);
+  assert.match(verdict.reason, /not Relux run ids/);
+});
+
+test("reviewApplyAvailability flips to available only when a real artifact set is present", () => {
+  const withArtifacts = {
+    id: "r", task_id: "t", agent_id: "a", adapter_plugin: "p", status: "completed",
+    artifacts: [{ rel_path: "src/main.rs" }],
+  } as any;
+  assert.equal(reviewApplyAvailability(withArtifacts).available, true);
+  // An empty artifact array is not a capability — stay honest.
+  assert.equal(reviewApplyAvailability({ ...withArtifacts, artifacts: [] }).available, false);
 });

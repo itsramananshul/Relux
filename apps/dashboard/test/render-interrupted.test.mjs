@@ -209,3 +209,17 @@ test("the shipped JS bundle carries the Run Detail copy-link affordance (no stal
   assert.match(bundle, /Copy link/);
   assert.match(bundle, /\/dashboard/);
 });
+
+test("the shipped JS bundle carries the Run Detail review/apply parity affordances (no stale dist)", () => {
+  const assetsDir = join(distDir, "assets");
+  const jsFiles = readdirSync(assetsDir).filter((f) => f.endsWith(".js"));
+  const bundle = jsFiles.map((f) => readFileSync(join(assetsDir, f), "utf8")).join("\n");
+  // The Run Detail panel ported the run-depth "tool calls" field (§11.3) and an
+  // HONEST not-applicable state for the legacy artifact/diff/apply/review controls.
+  // These ASCII fragments survive minification; their absence means the committed
+  // bundle is stale relative to the source that owns these affordances.
+  assert.match(bundle, /tool call/);
+  assert.match(bundle, /Review/);
+  assert.match(bundle, /read-only execution records/);
+  assert.match(bundle, /legacy Runs surface/);
+});

@@ -77,6 +77,53 @@ export function isRunInFlight(status: string | undefined): boolean {
   return status === "running" || status === "pending" || status === "waiting_for_approval";
 }
 
+// An honest one-line tool-call summary derived from the run transcript (master
+// plan section 11.3 Active Runs lists "tool calls"). We only count the kernel's
+// real tool events — `tool_call` (a permitted, attempted call), `tool_call_denied`
+// (blocked by permissions), and `tool_call_failed` (errored) — and never invent a
+// call from an `adapter_output`. Returns null when the transcript recorded no tool
+// activity, so the UI can omit the row rather than show a misleading "0".
+export function toolCallSummary(events: ReluxRunEvent[] | undefined | null): string | null {
+  if (!events || events.length === 0) return null;
+  let calls = 0;
+  let denied = 0;
+  let failed = 0;
+  for (const e of events) {
+    if (e.kind === "tool_call") calls += 1;
+    else if (e.kind === "tool_call_denied") denied += 1;
+    else if (e.kind === "tool_call_failed") failed += 1;
+  }
+  if (calls === 0 && denied === 0 && failed === 0) return null;
+  const parts: string[] = [`${calls} tool call${calls === 1 ? "" : "s"}`];
+  if (denied > 0) parts.push(`${denied} denied`);
+  if (failed > 0) parts.push(`${failed} failed`);
+  return parts.join(" · ");
+}
+
+// The honest reason that explains why this surface offers no artifact/diff/apply
+// or accept/reject review affordance. A Relux run record carries a transcript,
+// output excerpt, and metrics — but NO workspace artifact set, diff plan, or
+// review verdict (those fields do not exist on the run). Diff/apply/review live on
+// the legacy Runs surface, which is backed by a separate run store whose ids are
+// NOT Relux run ids — so we must never link this run there or fake the controls.
+// Future-proof: if a run record ever gains a real `artifacts` field, this flips to
+// available rather than silently lying.
+export const REVIEW_APPLY_UNAVAILABLE_REASON =
+  "Relux runs are read-only execution records — a transcript, output excerpt, and metrics. " +
+  "Workspace artifacts, diff/apply, and accept/reject review are not part of the Relux run model; " +
+  "those affordances live on the legacy Runs surface, which uses a separate run store (its run ids are not Relux run ids).";
+
+export function reviewApplyAvailability(
+  run: ReluxRunDetail,
+): { available: boolean; reason: string } {
+  // Only claim the capability if the record actually carries an artifact set.
+  const artifacts = (run as unknown as { artifacts?: unknown }).artifacts;
+  if (Array.isArray(artifacts) && artifacts.length > 0) {
+    return { available: true, reason: "" };
+  }
+  return { available: false, reason: REVIEW_APPLY_UNAVAILABLE_REASON };
+}
+
 // Pretty-print an event's payload object for the transcript detail, dropping the
 // bulky/duplicated stdout/stderr (already shown as the excerpt) so the row stays
 // legible. Returns null when there is nothing useful to show.
