@@ -141,6 +141,39 @@ if (-not (Test-Path -LiteralPath $Exe)) {
     exit 1
 }
 
+# -- port preflight --------------------------------------------------------
+# A second Relux (or any other process) already holding the loopback port is the
+# most common first-run failure. Without this check the kernel would still fail
+# to bind and exit, but only AFTER this script printed a dashboard URL that
+# actually points at the OTHER process - a misleading "it started" message.
+# Probe 127.0.0.1:$Port up front and stop with an actionable message instead.
+function Test-PortListening {
+    param([int]$ProbePort)
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $async = $client.BeginConnect("127.0.0.1", $ProbePort, $null, $null)
+        if (-not $async.AsyncWaitHandle.WaitOne(400)) { return $false }
+        try { $client.EndConnect($async) } catch { return $false }
+        return $client.Connected
+    } catch {
+        return $false
+    } finally {
+        $client.Close()
+    }
+}
+
+if (Test-PortListening -ProbePort $Port) {
+    $alt = if ($Port -eq 20000) { 20001 } else { 20000 }
+    Write-Host ""
+    Write-Host ("ERROR: port {0} on 127.0.0.1 is already in use; Relux did not start." -f $Port) -ForegroundColor Red
+    Write-Host "The most likely cause is that Relux is already running on this port." -ForegroundColor Yellow
+    Write-Host ("  If so, open the running instance: http://127.0.0.1:{0}/dashboard" -f $Port) -ForegroundColor Cyan
+    Write-Host "Otherwise another program holds that port. Start Relux on a free port, e.g.:" -ForegroundColor Yellow
+    Write-Host ("  powershell -NoProfile -ExecutionPolicy Bypass -File .\Start-Relux.ps1 -Port {0}" -f $alt) -ForegroundColor Green
+    Write-Host ""
+    exit 1
+}
+
 $DashboardDist = Join-Path $Root "dashboard-dist"
 $DataDir = Join-Path $Root "data"
 New-Item -ItemType Directory -Path $DataDir -Force | Out-Null

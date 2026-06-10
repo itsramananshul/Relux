@@ -1751,7 +1751,10 @@ What the bundle includes (`dist\relux-local-<version>-windows-x64\`, plus a zip)
 - `Start-Relux.ps1` - a robust launcher: it sets `RELUX_HTTP_ADDR`, `RELUX_DB`
   (under `.\data\local.db` in the bundle), and `RELUX_DASHBOARD_DIST`, prints the
   dashboard URL, supports `-Port`, and fails clearly if `relux-kernel.exe` is
-  missing.
+  missing. Before launching it preflights `127.0.0.1:<port>`: if the port is
+  already in use it stops with an actionable message (open the running instance,
+  or re-run with `-Port <free port>`) rather than printing a dashboard URL that
+  points at the other process.
 - `VERSION.txt` (machine-friendly) + `RELEASE-NOTES.txt` (human-friendly) -
   release metadata: version, git commit (short + full), git branch, working-tree
   cleanliness, build timestamp (UTC), the verification mode that produced the

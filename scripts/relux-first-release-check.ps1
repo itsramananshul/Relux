@@ -69,6 +69,14 @@ if ($Npm) {
     Invoke-NativeStep -Name "dashboard build" -Exe $Npm -Arguments @("run", "build") -WorkingDirectory (Join-Path $Root "apps\dashboard")
 }
 
+# The bundle launcher's port preflight must hold the actionable behavior (busy
+# port -> non-zero exit + dashboard URL + alt -Port command). This validates the
+# SOURCE here-string in relux-package-local.ps1, so a regression is caught before
+# a package is cut. No build needed.
+$launcherCheck = Join-Path $PSScriptRoot "check-launcher-preflight.ps1"
+[void](Invoke-NativeStep -Name "bundle launcher preflight" -Exe "powershell" `
+    -Arguments @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $launcherCheck))
+
 if (Test-Path -LiteralPath $ReleaseExe) {
     Invoke-NativeStep -Name "release doctor" -Exe $ReleaseExe -Arguments @("doctor")
 } elseif ($Cargo) {

@@ -497,7 +497,11 @@ self-describing:
 - `docs\RELUX_MASTER_PLAN.md` and `README.md` - the design plan + reference.
 - `Start-Relux.ps1` - a robust launcher that sets `RELUX_HTTP_ADDR`, `RELUX_DB`,
   and `RELUX_DASHBOARD_DIST`, prints the dashboard URL, and fails clearly if
-  `relux-kernel.exe` is missing (`-Port` overrides the default 19891).
+  `relux-kernel.exe` is missing (`-Port` overrides the default 19891). It also
+  preflights the port: if `127.0.0.1:<port>` is already in use it stops before
+  launching (instead of printing a dashboard URL that points at the other
+  process) and tells you to open the running instance or re-run with
+  `-Port <free port>`.
 - `VERSION.txt` + `RELEASE-NOTES.txt` - release metadata: version, git commit,
   build timestamp (UTC), the verification mode used (full e2e / quick / skipped),
   and the supported core loops (Prime chat, Work/task run, plugins, loopback tool
