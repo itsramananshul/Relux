@@ -132,6 +132,11 @@ pub enum KernelError {
     PermissionAlreadyGranted(String, String),
     #[error("storage error: {0}")]
     Storage(String),
+    /// `serve` could not bind its listen address (e.g. a port conflict). The
+    /// payload is already a complete, operator-facing message, so it is shown
+    /// verbatim with no extra prefix.
+    #[error("{0}")]
+    ServeBind(String),
     #[error("plugin install failed: {0}")]
     PluginInstall(String),
     #[error("plugin not installed: {0}")]

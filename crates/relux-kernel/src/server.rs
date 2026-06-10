@@ -112,9 +112,10 @@ async fn serve() -> Result<(), KernelError> {
     let dashboard_missing = state.dashboard_dir.is_none();
     let app = router(state.clone()); // Clone state for the background task
 
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|e| KernelError::Storage(format!("failed to bind {addr}: {e}")))?;
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => listener,
+        Err(e) => return Err(KernelError::ServeBind(bind_failure_message(addr, &e))),
+    };
     let bound = listener
         .local_addr()
         .map_err(|e| KernelError::Storage(format!("failed to read bound address: {e}")))?;
@@ -223,6 +224,41 @@ async fn run_autonomy_loop(state: AppState) {
         }
 
         tokio::time::sleep(tokio::time::Duration::from_secs(sleep_seconds)).await;
+    }
+}
+
+/// Build an actionable error message when `serve` cannot bind `addr`.
+///
+/// The common first-run failure is a port conflict: a second Relux, a leftover
+/// process, or another app already on `19891`. Instead of a bare OS error, point
+/// the operator at the documented override — `RELUX_HTTP_ADDR` for a source
+/// checkout and `-Port` for the packaged `Start-Relux.ps1` bundle (see the
+/// README "override the port if 19891 is taken" note and RELUX_MASTER_PLAN §22).
+fn bind_failure_message(addr: SocketAddr, err: &std::io::Error) -> String {
+    use std::io::ErrorKind;
+    // Suggest a clearly-different port than the one that is busy.
+    let alt = if addr.port() == 20000 { 20001 } else { 20000 };
+    match err.kind() {
+        ErrorKind::AddrInUse => format!(
+            "cannot start Relux: {addr} is already in use.\n\
+             \n\
+             Most likely Relux is already running - open http://{addr}/dashboard to check.\n\
+             To run on a different port, set RELUX_HTTP_ADDR before starting, e.g.\n    \
+             PowerShell:  $env:RELUX_HTTP_ADDR='127.0.0.1:{alt}'; relux-kernel serve\n    \
+             bash:        RELUX_HTTP_ADDR=127.0.0.1:{alt} relux-kernel serve\n\
+             Packaged bundle:  .\\Start-Relux.ps1 -Port {alt}"
+        ),
+        ErrorKind::PermissionDenied => format!(
+            "cannot start Relux: permission denied binding {addr}.\n\
+             Choose a non-privileged port (>=1024) via RELUX_HTTP_ADDR, e.g. \
+             RELUX_HTTP_ADDR=127.0.0.1:{alt} relux-kernel serve."
+        ),
+        ErrorKind::AddrNotAvailable => format!(
+            "cannot start Relux: the address {addr} is not available on this machine.\n\
+             Relux binds loopback by default; set RELUX_HTTP_ADDR to a valid local \
+             address such as 127.0.0.1:{alt}."
+        ),
+        _ => format!("failed to bind {addr}: {err}"),
     }
 }
 
@@ -2873,6 +2909,53 @@ mod tests {
             },
             health: PluginHealth::Unknown,
         }
+    }
+
+    #[test]
+    fn bind_failure_message_addr_in_use_is_actionable() {
+        let addr: SocketAddr = "127.0.0.1:19891".parse().unwrap();
+        let err = std::io::Error::new(std::io::ErrorKind::AddrInUse, "address in use");
+        let msg = bind_failure_message(addr, &err);
+        // Names the busy address and explains the likely cause.
+        assert!(msg.contains("127.0.0.1:19891"), "got: {msg}");
+        assert!(msg.contains("already in use"), "got: {msg}");
+        assert!(msg.contains("http://127.0.0.1:19891/dashboard"), "got: {msg}");
+        // Surfaces the documented override on both a source checkout and the bundle.
+        assert!(msg.contains("RELUX_HTTP_ADDR"), "got: {msg}");
+        assert!(msg.contains("Start-Relux.ps1 -Port"), "got: {msg}");
+        // Suggests a concrete alternative port to use.
+        assert!(msg.contains("20000"), "got: {msg}");
+    }
+
+    #[test]
+    fn bind_failure_message_suggests_distinct_alt_port() {
+        // When the busy port already equals the suggested alternative, suggest another.
+        let addr: SocketAddr = "127.0.0.1:20000".parse().unwrap();
+        let err = std::io::Error::new(std::io::ErrorKind::AddrInUse, "address in use");
+        let msg = bind_failure_message(addr, &err);
+        assert!(msg.contains("20001"), "got: {msg}");
+    }
+
+    #[test]
+    fn bind_failure_message_other_errors_stay_generic() {
+        let addr: SocketAddr = "127.0.0.1:19891".parse().unwrap();
+        let err = std::io::Error::other("boom");
+        let msg = bind_failure_message(addr, &err);
+        assert!(msg.starts_with("failed to bind 127.0.0.1:19891"), "got: {msg}");
+        assert!(msg.contains("boom"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn bind_failure_message_maps_a_real_port_conflict() {
+        // Hold an ephemeral loopback port, then try to bind the SAME address again.
+        // A second bind without SO_REUSEADDR is AddrInUse on Linux/macOS/Windows.
+        let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = held.local_addr().unwrap();
+        let err = tokio::net::TcpListener::bind(addr).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse, "real second bind kind");
+        let msg = bind_failure_message(addr, &err);
+        assert!(msg.contains(&addr.to_string()), "got: {msg}");
+        assert!(msg.contains("already in use"), "got: {msg}");
     }
 
     #[test]

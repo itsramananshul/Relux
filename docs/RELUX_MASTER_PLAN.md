@@ -1672,7 +1672,13 @@ The dashboard bundle is the committed Vite build at
 Configuration:
 
 - `RELUX_DB` - the durable SQLite store (default `dev-data/relux/local.db`).
-- `RELUX_HTTP_ADDR` - the bind address (default `127.0.0.1:19891`).
+- `RELUX_HTTP_ADDR` - the bind address (default `127.0.0.1:19891`). When the
+  port is already in use (commonly because Relux is already running), `serve`
+  stops with an actionable message that names the busy address, points at
+  `http://127.0.0.1:19891/dashboard` to check for a running instance, and gives
+  the exact command to pick another port (`RELUX_HTTP_ADDR` for a source
+  checkout, `Start-Relux.ps1 -Port <port>` for the bundle) - never a bare OS
+  error.
 - `RELUX_DASHBOARD_DIST` - override the dashboard bundle directory.
 
 Local first-release checks:

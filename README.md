@@ -26,6 +26,11 @@ with one command - no web bridge, no login:
 cargo run -p relux-kernel -- serve
 ```
 
+It serves on `http://127.0.0.1:19891` by default. If that port is already taken
+(often because Relux is already running), `serve` stops with a clear message and
+the exact command to pick another port — set `RELUX_HTTP_ADDR=127.0.0.1:<port>`
+for a source checkout, or use `.\Start-Relux.ps1 -Port <port>` with the bundle.
+
 #### Run the packaged release (v0.1.3, no build needed)
 
 Prefer a prebuilt Windows bundle over building from source? Grab the latest
