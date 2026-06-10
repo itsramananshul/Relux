@@ -1,6 +1,6 @@
 import { useState, useMemo, useEffect } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
-import { runIdFromSearch } from "../routing";
+import { runIdFromSearch, workRunShareUrl } from "../routing";
 import { reluxWork, reluxAudit, type ReluxTask, type ReluxRun, type ReluxAgent, type ReluxTaskDetail, type ReluxRunDetail, type ReluxAuditEntry, type ReluxRunEvent } from "../api";
 import { useAsync } from "../components/common";
 import {
@@ -157,6 +157,7 @@ export function Work() {
                   <RunDetailPanel
                     runId={selectedRunId}
                     onClose={() => setSelectedRunId(null)}
+                    onOpenRun={handleInspectRun}
                     onRetried={(newRunId) => {
                       handleReload();
                       setSelectedRunId(newRunId);
@@ -188,7 +189,16 @@ export function Work() {
                             {run.id}
                             {run.retried_from && (
                               <span className="muted" style={{ fontSize: 9, display: "block" }}>
-                                retry of {run.retried_from}
+                                retry of{" "}
+                                {/* Lineage stays on the Work surface: the parent run is
+                                    in the same Relux ledger, so inspect it via /work?run=. */}
+                                <a
+                                  className="link"
+                                  href={`?run=${encodeURIComponent(run.retried_from)}`}
+                                  onClick={(e) => { e.preventDefault(); handleInspectRun(run.retried_from!); }}
+                                >
+                                  {run.retried_from}
+                                </a>
                               </span>
                             )}
                           </td>
@@ -379,7 +389,7 @@ function TaskDetailPanel({ taskId, onClose }: { taskId: string; onClose: () => v
   );
 }
 
-function RunDetailPanel({ runId, onClose, onRetried }: { runId: string; onClose: () => void; onRetried: (newRunId: string) => void }) {
+function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: string; onClose: () => void; onOpenRun: (runId: string) => void; onRetried: (newRunId: string) => void }) {
   const { data: run, loading: loadingRun, error: errorRun, reload: reloadRun } = useAsync<ReluxRunDetail>(
     () => reluxWork.getRun(runId),
     [runId],
@@ -389,6 +399,23 @@ function RunDetailPanel({ runId, onClose, onRetried }: { runId: string; onClose:
     [runId],
   );
   const [retrying, setRetrying] = useState(false);
+  // Copy-link state: the shareable absolute `/work?run=` URL is the same one a
+  // deep link restores, so an operator can hand a run to a teammate. Reset when
+  // the panel switches runs so a stale "copied" note never sticks.
+  const [shareNote, setShareNote] = useState<string | null>(null);
+  useEffect(() => { setShareNote(null); }, [runId]);
+
+  async function copyLink() {
+    const url = workRunShareUrl(runId, window.location.origin);
+    try {
+      await navigator.clipboard?.writeText(url);
+      setShareNote("✓ link copied");
+    } catch {
+      // Clipboard blocked (insecure context / denied) — surface the URL inline
+      // so it can still be copied by hand. Never silently fail.
+      setShareNote(url);
+    }
+  }
 
   // Light polling while the run is still in flight. Execution is synchronous, so
   // a run is usually already terminal when this panel opens; this only keeps a
@@ -427,6 +454,9 @@ function RunDetailPanel({ runId, onClose, onRetried }: { runId: string; onClose:
         {run && <span className={`badge ${runStatusTone(run.status)}`} style={{ marginLeft: 8 }}>{run.status}</span>}
         {inFlight && <span className="muted" style={{ fontSize: 11, marginLeft: 8 }}>live · refreshing…</span>}
         <div className="spacer" style={{ flex: 1 }} />
+        <button className="btn ghost sm" style={{ marginRight: 8 }} title="Copy a shareable link to this run" onClick={() => void copyLink()}>
+          Copy link
+        </button>
         {run && canRetryRun(run) && (
           <button className="btn sm" style={{ marginRight: 8 }} onClick={() => void retry()} disabled={retrying}>
             {retrying ? "Retrying…" : "Retry"}
@@ -434,6 +464,9 @@ function RunDetailPanel({ runId, onClose, onRetried }: { runId: string; onClose:
         )}
         <button className="btn ghost sm" onClick={onClose}>Close</button>
       </div>
+      {shareNote && (
+        <div className="muted mono" style={{ fontSize: 11, marginBottom: 8, wordBreak: "break-all" }}>{shareNote}</div>
+      )}
       {loadingRun && !run ? (
         <div className="loading">Loading run details...</div>
       ) : error ? (
@@ -451,7 +484,18 @@ function RunDetailPanel({ runId, onClose, onRetried }: { runId: string; onClose:
           <div className="kv"><span>Phase:</span><span>{phaseLabel(run.phase, run.status)}</span></div>
           <div className="kv"><span>Duration:</span><span>{duration ?? "—"}</span></div>
           {metrics && <div className="kv"><span>Metrics:</span><span>{metrics}</span></div>}
-          {run.retried_from && <div className="kv"><span>Retry of:</span><span className="mono">{run.retried_from}</span></div>}
+          {run.retried_from && (
+            <div className="kv"><span>Retry of:</span>
+              {/* Same Relux ledger → inspect the parent run in-shell via /work?run=. */}
+              <a
+                className="link mono"
+                href={`?run=${encodeURIComponent(run.retried_from)}`}
+                onClick={(e) => { e.preventDefault(); onOpenRun(run.retried_from!); }}
+              >
+                {run.retried_from}
+              </a>
+            </div>
+          )}
           {/* Logical-sequence timestamps (ordering, not wall-clock). Real timing is "Duration" above. */}
           <div className="kv"><span>Sequence:</span><span className="mono">{run.started_at ?? "—"} → {run.ended_at ?? "(in progress)"}</span></div>
           {run.failure_reason && (

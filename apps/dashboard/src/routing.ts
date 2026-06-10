@@ -58,6 +58,17 @@ export function workRunHref(runId: string): string {
   return `/work?run=${encodeURIComponent(runId)}`;
 }
 
+/// Build an absolute, copy-paste-able link to a run's in-shell detail panel.
+///
+/// The SPA is mounted under `/dashboard` (relux-kernel serves it there, and the
+/// bridge mirrors that basename), so a shareable URL must carry the basename on
+/// top of the in-shell href. Composing `workRunHref` keeps the `?run=` encoding
+/// single-sourced. `origin` is injected (callers pass `window.location.origin`)
+/// so this stays a pure, unit-testable function with no DOM dependency.
+export function workRunShareUrl(runId: string, origin: string): string {
+  return `${origin}/dashboard${workRunHref(runId)}`;
+}
+
 /// Read the run id a `/work` URL is pointing at, or null when none is present.
 /// Accepts the raw `location.search` (with or without the leading `?`).
 export function runIdFromSearch(search: string): string | null {

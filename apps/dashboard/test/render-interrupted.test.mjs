@@ -198,3 +198,14 @@ test("the shipped JS bundle carries the in-shell run-detail deep link (no stale 
   // was never rebuilt, it's absent → fail. The literal survives minification.
   assert.match(bundle, /\/work\?run=/);
 });
+
+test("the shipped JS bundle carries the Run Detail copy-link affordance (no stale dist)", () => {
+  const assetsDir = join(distDir, "assets");
+  const jsFiles = readdirSync(assetsDir).filter((f) => f.endsWith(".js"));
+  const bundle = jsFiles.map((f) => readFileSync(join(assetsDir, f), "utf8")).join("\n");
+  // The Run Detail header gained a "Copy link" button that copies the shareable
+  // `${origin}/dashboard/work?run=<id>` URL (workRunShareUrl). Both literals
+  // survive minification; their absence means the committed bundle is stale.
+  assert.match(bundle, /Copy link/);
+  assert.match(bundle, /\/dashboard/);
+});

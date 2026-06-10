@@ -154,6 +154,23 @@ to the bridge-gated legacy console. A step that produced **no** run shows no lin
 / `runIdFromSearch*` tests in `test/routing.test.ts`, and the shipped bundle is
 asserted to carry the `/work?run=` literal in `test/render-interrupted.test.mjs`.
 
+Every in-shell run reference now resolves to this one surface. **Retry lineage**
+on the Work page is navigable: a run's `retried_from` parent (Recent Runs row and
+the Run Detail "Retry of" field) is a `/work?run=<parent>` link — the parent is in
+the **same** Relux ledger (`/v1/relux/runs`), so inspecting it stays in-shell. The
+Run Detail header carries a **Copy link** button that copies the absolute,
+copy-paste-able URL `workRunShareUrl(run_id, origin)` →
+`<origin>/dashboard/work?run=<id>` (the SPA's `/dashboard` basename on top of the
+in-shell href); if the clipboard API is unavailable the URL is surfaced inline to
+copy by hand, never a silent failure. The URL builder is pinned by
+`workRunShareUrl*` tests (round-tripping through `runIdFromSearch`) and the shipped
+bundle is asserted to carry the **Copy link** affordance.
+
+> The legacy `/runs` console is a **separate** run ledger (`/v1/runs`, the bridge's
+> `brief_runs`) whose ids do **not** exist on relux-kernel. Its run links therefore
+> stay on `/runs`; they are *not* rewritten to `/work?run=` (that would 404 on the
+> Relux backend). Only relux-kernel runs route to the in-shell Work surface.
+
 ## Mesh policy
 
 The dashboard's board / inbox / crew / runs pages call the coordinator's

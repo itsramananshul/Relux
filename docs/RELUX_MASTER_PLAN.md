@@ -2547,7 +2547,14 @@ remain, in rough priority for the next slices:
    browser back/forward/refresh restore it, and a missing run degrades to an honest
    notice). An orchestration step's `run_id` deep-links here via `workRunHref`,
    keeping the operator on the Relux Work surface rather than the legacy `/runs`
-   console. The Claude adapter requests a JSON result envelope that the kernel
+   console. Every in-shell run reference resolves to this one surface: a run's
+   `retried_from` lineage (Recent Runs + the Run Detail "Retry of" field) is a
+   `/work?run=` link to the parent in the same Relux ledger, and the Run Detail
+   header carries a **Copy link** button that copies the absolute
+   `<origin>/dashboard/work?run=<id>` URL (`workRunShareUrl`, clipboard-with-inline
+   fallback). The legacy `/runs` console is a *separate* ledger (`/v1/runs`,
+   `brief_runs`) whose ids do not exist on relux-kernel, so its links stay on
+   `/runs` and are deliberately **not** rewritten to `/work?run=`. The Claude adapter requests a JSON result envelope that the kernel
    parses into an honest summary + metrics (`relux_core::parse_adapter_result`),
    and an envelope `is_error` is treated as a failure even on a clean exit; Codex
    and generic commands degrade honestly to plain text. A **failed run is

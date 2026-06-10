@@ -5,6 +5,7 @@ import {
   LEGACY_PATHS,
   RELUX_PATHS,
   workRunHref,
+  workRunShareUrl,
   runIdFromSearch,
 } from "../src/routing.ts";
 
@@ -74,4 +75,28 @@ test("runIdFromSearch returns null when no run is selected", () => {
   for (const s of ["", "?", "?status=running", "?run="]) {
     assert.equal(runIdFromSearch(s), null, `'${s}' must select no run`);
   }
+});
+
+// workRunShareUrl builds the copy-paste-able absolute link to the in-shell run
+// detail. It must carry the `/dashboard` basename and reuse workRunHref's
+// encoding so a shared link round-trips through runIdFromSearch.
+
+test("workRunShareUrl prefixes the /dashboard basename onto the in-shell href", () => {
+  assert.equal(
+    workRunShareUrl("run_0001", "https://host:9000"),
+    "https://host:9000/dashboard/work?run=run_0001",
+  );
+});
+
+test("workRunShareUrl reuses workRunHref encoding so odd ids stay query-safe", () => {
+  const origin = "https://h";
+  assert.equal(workRunShareUrl("a b&c=d", origin), `${origin}/dashboard${workRunHref("a b&c=d")}`);
+  assert.equal(workRunShareUrl("a b&c=d", origin), "https://h/dashboard/work?run=a%20b%26c%3Dd");
+});
+
+test("a shared workRunShareUrl round-trips back to the same run id", () => {
+  const id = "durable:orch_0001/2 3";
+  const url = new URL(workRunShareUrl(id, "https://host"));
+  assert.equal(url.pathname, "/dashboard/work");
+  assert.equal(runIdFromSearch(url.search), id);
 });
