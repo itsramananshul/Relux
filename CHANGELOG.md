@@ -9,6 +9,30 @@ once a stable release is cut.
 
 ### Added
 
+- **Session expiry / idle visibility in the dashboard Account control.** The
+  Account modal now shows the signed-in operator their session policy at a glance:
+  *"Signs out after 12h of inactivity"* and *"Re-sign-in required after 7d"*, each
+  with a live *"… left"* countdown. `GET /v1/auth/me` is extended to return safe,
+  secret-free session metadata alongside the username — the idle and absolute
+  deadlines (`idle_expires_at` / `absolute_expires_at`, unix seconds), the seconds
+  remaining on each (`idle_expires_in_secs` / `absolute_expires_in_secs`, clamped
+  ≥0), the configured policy windows (`idle_timeout_secs` / `absolute_max_secs`),
+  and the server clock (`server_now`). It **never** exposes the session id, the
+  cookie value, or the admin hash (a test asserts the body contains neither).
+  **Pre- vs post-refresh (documented):** `/v1/auth/me` is public — it sits outside
+  the sliding `require_session` middleware and reads via a **non-mutating**
+  `session_meta`, so polling it does **not** slide the idle window; the deadlines
+  returned are the **current, pre-refresh** values (a real protected `/v1/relux/*`
+  request still slides the session). This means the Account modal can poll the
+  readout without keeping an otherwise-idle console alive. The dashboard counts
+  down locally from the kernel-computed remaining seconds (skew-free) with a single
+  un-noisy **per-minute** timer, started only when there is a window to show (never
+  under the `RELUX_AUTH_DISABLED` dev bypass, which surfaces an honest *"Session
+  expiry is disabled"* note instead). An older kernel that returns only
+  `{ username }` simply hides the readout — the password-change form is unchanged.
+  Tests pin the kernel metadata + non-sliding read semantics and the frontend
+  formatting helpers (`formatDuration`, `idle/absoluteRemaining`, the policy
+  descriptions). See `docs/RELUX_MASTER_PLAN.md` → *Local operator login v1*.
 - **In-product password change for the local operator login.** The signed-in
   operator can now change the local admin password from the dashboard — no CLI for
   the normal case. The Relux shell's signed-in name is an **Account** control that

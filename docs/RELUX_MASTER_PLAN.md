@@ -2604,7 +2604,19 @@ The API never returns the key. The dashboard shows the current AI provider/mode.
   is attached **only** on an authenticated request that returns a success status —
   a 401 from the guard, or a 4xx/5xx from the handler, never carries a session
   cookie. Status polls (`/v1/auth/status`, `/v1/auth/me`) validate **without**
-  sliding, so background polling alone does not keep a session alive. Public by
+  sliding, so background polling alone does not keep a session alive. To make the
+  rolling policy *visible*, `/v1/auth/me` returns safe, secret-free **session
+  metadata** alongside the username: the idle and absolute deadlines
+  (`idle_expires_at` / `absolute_expires_at`), the seconds remaining on each
+  (`idle_expires_in_secs` / `absolute_expires_in_secs`, clamped ≥0), the configured
+  policy windows (`idle_timeout_secs` / `absolute_max_secs`), and the server clock
+  (`server_now`). It **never** exposes the session id, the cookie value, or the
+  admin hash. Because the read is non-sliding, the deadlines are the **current,
+  pre-refresh** values (what the cookie reflects now — not a window bumped by the
+  read). The dashboard **Account** control renders this as *"Signs out after 12h of
+  inactivity"* / *"Re-sign-in required after 7d"* with a live, locally-counted
+  *"… left"* readout (a single per-minute timer; under `RELUX_AUTH_DISABLED` it
+  shows an honest *"Session expiry is disabled"* note instead). Public by
   design: the static dashboard (so the setup/login screen always renders — never a
   blank page), the public auth endpoints (`/v1/auth/status`/`setup`/`login`/
   `logout`/`me`), and `/v1/relux/health` (liveness probe). `POST

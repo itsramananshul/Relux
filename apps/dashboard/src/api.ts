@@ -89,6 +89,29 @@ export const api = {
   del: <T = unknown>(path: string) => request("DELETE", path) as Promise<T>,
 };
 
+// ── Current session metadata (`GET /v1/auth/me`) ──────────────────────────
+// The signed-in operator + safe session-expiry metadata for the Account control
+// (idle/absolute deadlines + remaining seconds; never the session id or hash).
+// `/v1/auth/me` is an auth path, so a 401 here is just "not signed in" — it does
+// NOT fire the session-expired signal (see `isAuthPath`). Reading it does not
+// slide the session, so the Account modal can poll it without keeping an idle
+// console alive. Throws an ApiError on 401 so the caller can choose to ignore it.
+export interface SessionMetaResponse {
+  username: string;
+  idle_expires_at?: number;
+  absolute_expires_at?: number;
+  idle_expires_in_secs?: number;
+  absolute_expires_in_secs?: number;
+  idle_timeout_secs?: number;
+  absolute_max_secs?: number;
+  server_now?: number;
+  auth_disabled?: boolean;
+}
+
+export const session = {
+  me: () => api.get<SessionMetaResponse>("/v1/auth/me"),
+};
+
 // Best-effort GET that resolves to a fallback instead of throwing, so a
 // single unavailable surface degrades to an empty/placeholder state
 // rather than blanking the whole page. Use this ONLY for genuinely-optional

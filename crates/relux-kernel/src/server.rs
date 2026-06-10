@@ -701,14 +701,63 @@ async fn auth_change_password(
     }
 }
 
-/// `GET /v1/auth/me` — the logged-in username, or 401.
+/// `GET /v1/auth/me` — the logged-in username plus safe session-expiry metadata,
+/// or 401.
+///
+/// The body carries ONLY non-secret fields the Account control needs to render an
+/// idle/re-auth readout: the username, the two absolute deadlines (unix seconds),
+/// the seconds remaining on each, the configured policy windows, and the server's
+/// own clock. It NEVER carries the session id, the cookie value, or the admin
+/// hash.
+///
+/// **Pre- vs post-refresh:** this route is PUBLIC (it sits outside the
+/// `require_session` sliding middleware) and reads via the non-mutating
+/// [`relux_kernel::DashboardAuth::session_meta`], so polling it does NOT slide the
+/// idle window. The deadlines returned are therefore the **current, pre-refresh**
+/// values — exactly what the operator's cookie reflects right now, not a window
+/// bumped by the act of asking. (A real protected `/v1/relux/*` request still
+/// slides the window as before; this read deliberately does not.) The Account
+/// modal can poll this safely without keeping an otherwise-idle console alive.
 async fn auth_me(State(state): State<AppState>, headers: header::HeaderMap) -> Response {
     if state.auth_disabled {
-        return (StatusCode::OK, Json(serde_json::json!({ "username": "dev" }))).into_response();
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({ "username": "dev", "auth_disabled": true })),
+        )
+            .into_response();
     }
-    match session_user(&state, &headers) {
-        Some(username) => {
-            (StatusCode::OK, Json(serde_json::json!({ "username": username }))).into_response()
+    let Some(sid) = relux_kernel::session_cookie_from_headers(&headers) else {
+        return auth_err(StatusCode::UNAUTHORIZED, "not logged in");
+    };
+    match state.dashboard_auth.session_meta(&sid) {
+        Some(meta) => {
+            let now = now_secs();
+            // Clamp remaining at 0 — a session at/just past a deadline reads as
+            // "0 left", never a negative countdown.
+            let idle_remaining = (meta.idle_expires_at - now).max(0);
+            let absolute_remaining = (meta.absolute_expires_at - now).max(0);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "username": meta.username,
+                    // Absolute instants (unix seconds) so a client can anchor its
+                    // own countdown to the server clock if it prefers.
+                    "idle_expires_at": meta.idle_expires_at,
+                    "absolute_expires_at": meta.absolute_expires_at,
+                    // Pre-computed remaining seconds (skew-free for a simple local
+                    // countdown), clamped at 0.
+                    "idle_expires_in_secs": idle_remaining,
+                    "absolute_expires_in_secs": absolute_remaining,
+                    // The configured policy windows, so the UI can state the rule
+                    // ("signs out after Nh idle / re-auth after Nd") plainly.
+                    "idle_timeout_secs": relux_kernel::SESSION_TTL_SECS,
+                    "absolute_max_secs": relux_kernel::SESSION_ABSOLUTE_MAX_SECS,
+                    // The server's own clock, so the client can compute an offset
+                    // rather than trusting the browser's wall time.
+                    "server_now": now,
+                })),
+            )
+                .into_response()
         }
         None => auth_err(StatusCode::UNAUTHORIZED, "not logged in"),
     }
@@ -2281,6 +2330,16 @@ fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Current wall-clock in unix SECONDS. Used by `/v1/auth/me` to turn a session's
+/// absolute deadlines into "remaining seconds" so the Account control can render
+/// an idle/re-auth readout without trusting the browser clock.
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
 
@@ -5230,5 +5289,75 @@ mod tests {
         .await;
         assert_eq!(bad, StatusCode::UNAUTHORIZED);
         assert!(bad_cookie.is_none(), "an invalid session must not set a cookie");
+    }
+
+    #[tokio::test]
+    async fn auth_me_exposes_safe_session_expiry_metadata() {
+        let (state, _dir) = auth_state(false);
+        // Setup mints a session cookie.
+        let (_, set_cookie, _) = call(
+            &state,
+            "POST",
+            "/v1/auth/setup",
+            None,
+            Some(r#"{"username":"ops","password":"hunter2pass"}"#),
+        )
+        .await;
+        let cookie = session_pair(&set_cookie.expect("setup sets a cookie"));
+
+        let (ok, me_cookie, body) = call(&state, "GET", "/v1/auth/me", Some(&cookie), None).await;
+        assert_eq!(ok, StatusCode::OK);
+        // /v1/auth/me is PUBLIC (outside the sliding middleware): reading it must
+        // NOT refresh the session, so no Set-Cookie rides the response.
+        assert!(
+            me_cookie.is_none(),
+            "reading /v1/auth/me must not slide/refresh the session"
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).expect("me body is json");
+        assert_eq!(v["username"], "ops");
+        // The policy windows are surfaced verbatim from the kernel constants.
+        assert_eq!(v["idle_timeout_secs"].as_i64(), Some(relux_kernel::SESSION_TTL_SECS));
+        assert_eq!(
+            v["absolute_max_secs"].as_i64(),
+            Some(relux_kernel::SESSION_ABSOLUTE_MAX_SECS)
+        );
+        // A fresh session's remaining idle window is ~the full idle timeout, and
+        // the absolute remaining is ~the full absolute cap (allow a couple secs of
+        // test execution slack).
+        let idle_left = v["idle_expires_in_secs"].as_i64().expect("idle remaining");
+        assert!(
+            (idle_left - relux_kernel::SESSION_TTL_SECS).abs() <= 3,
+            "idle remaining should be ~the full window; got {idle_left}"
+        );
+        let abs_left = v["absolute_expires_in_secs"].as_i64().expect("absolute remaining");
+        assert!(
+            (abs_left - relux_kernel::SESSION_ABSOLUTE_MAX_SECS).abs() <= 3,
+            "absolute remaining should be ~the full cap; got {abs_left}"
+        );
+        // Absolute instants are present and ordered, and the server clock is shown.
+        let idle_at = v["idle_expires_at"].as_i64().expect("idle_expires_at");
+        let abs_at = v["absolute_expires_at"].as_i64().expect("absolute_expires_at");
+        let now = v["server_now"].as_i64().expect("server_now");
+        assert!(idle_at <= abs_at, "idle deadline must be within the absolute ceiling");
+        assert!(now <= idle_at, "server_now must be before the idle deadline");
+        // CRUCIAL: no secret ever rides this body — not the session id/cookie, not
+        // the admin hash.
+        let sid = cookie.trim_start_matches("relux_session=");
+        assert!(!body.contains(sid), "the session id must never appear in /v1/auth/me");
+        assert!(!body.contains("argon2"), "no password hash may appear in /v1/auth/me");
+
+        // Unauthenticated → 401, no metadata leaked.
+        let (no_sess, _, _) = call(&state, "GET", "/v1/auth/me", None, None).await;
+        assert_eq!(no_sess, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_me_reports_dev_identity_under_the_bypass() {
+        let (state, _dir) = auth_state(true);
+        let (ok, _, body) = call(&state, "GET", "/v1/auth/me", None, None).await;
+        assert_eq!(ok, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("me body is json");
+        assert_eq!(v["username"], "dev");
+        assert_eq!(v["auth_disabled"], true);
     }
 }

@@ -1,6 +1,15 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { useAuth } from "../auth";
-import { MIN_PASSWORD_LEN, validatePasswordChange } from "../account";
+import { session, type SessionMetaResponse } from "../api";
+import {
+  MIN_PASSWORD_LEN,
+  validatePasswordChange,
+  formatDuration,
+  idleRemaining,
+  absoluteRemaining,
+  describeIdlePolicy,
+  describeAbsolutePolicy,
+} from "../account";
 
 // The signed-in operator's Account modal (RELUX_MASTER_PLAN "Local operator
 // login v1" — the in-product password change that complements the local
@@ -20,6 +29,15 @@ export function AccountPanel({ who, onClose }: { who: string; onClose: () => voi
   const [busy, setBusy] = useState(false);
   const firstFieldRef = useRef<HTMLInputElement>(null);
 
+  // Safe session-expiry metadata (GET /v1/auth/me — idle/absolute deadlines, no
+  // secret). `anchorMs` is the wall-clock instant the metadata was fetched, so a
+  // once-a-minute tick can count down locally without re-fetching (the windows
+  // are hours-scale). A failure (older kernel, transient) just hides the readout
+  // — the password-change form below still works.
+  const [meta, setMeta] = useState<SessionMetaResponse | null>(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const anchorMs = useRef<number>(Date.now());
+
   // Focus the first field on open and close on Escape — standard modal manners.
   useEffect(() => {
     firstFieldRef.current?.focus();
@@ -29,6 +47,45 @@ export function AccountPanel({ who, onClose }: { who: string; onClose: () => voi
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
+
+  // Load the session metadata once on open. Reading /v1/auth/me does NOT slide
+  // the session, so this is a pure status read.
+  useEffect(() => {
+    let alive = true;
+    session
+      .me()
+      .then((m) => {
+        if (!alive) return;
+        anchorMs.current = Date.now();
+        setMeta(m);
+        setNowMs(Date.now());
+      })
+      .catch(() => {
+        /* no readout — the password-change form still renders */
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  // A single, simple per-minute countdown — only when there is actually a window
+  // to count down (never under the dev bypass, which sends no deadlines). The
+  // windows are hours/days, so 60s is plenty and keeps the timer un-noisy.
+  const hasCountdown =
+    !!meta &&
+    (typeof meta.idle_expires_in_secs === "number" ||
+      typeof meta.absolute_expires_in_secs === "number");
+  useEffect(() => {
+    if (!hasCountdown) return;
+    const id = setInterval(() => setNowMs(Date.now()), 60_000);
+    return () => clearInterval(id);
+  }, [hasCountdown]);
+
+  const elapsedSecs = meta ? Math.max(0, Math.floor((nowMs - anchorMs.current) / 1000)) : 0;
+  const idleLeft = meta ? idleRemaining(meta, elapsedSecs) : null;
+  const absLeft = meta ? absoluteRemaining(meta, elapsedSecs) : null;
+  const idlePolicy = meta ? describeIdlePolicy(meta) : null;
+  const absPolicy = meta ? describeAbsolutePolicy(meta) : null;
 
   async function submit(e: FormEvent) {
     e.preventDefault();
@@ -73,6 +130,58 @@ export function AccountPanel({ who, onClose }: { who: string; onClose: () => voi
             ✕
           </button>
         </div>
+
+        {meta && (idlePolicy || absPolicy || meta.auth_disabled) && (
+          <div className="account-session" style={{ padding: "0 16px 8px" }}>
+            {meta.auth_disabled ? (
+              <p className="muted" style={{ fontSize: 12, margin: "4px 0 0" }}>
+                Session expiry is disabled on this server (
+                <span className="mono">RELUX_AUTH_DISABLED</span>).
+              </p>
+            ) : (
+              <ul style={{ listStyle: "none", margin: "4px 0 0", padding: 0 }}>
+                {idlePolicy && (
+                  <li
+                    className="muted"
+                    style={{
+                      fontSize: 12,
+                      display: "flex",
+                      justifyContent: "space-between",
+                      gap: 8,
+                      lineHeight: 1.7,
+                    }}
+                  >
+                    <span>{idlePolicy}</span>
+                    {idleLeft != null && (
+                      <span className="mono" title="Time left before idle sign-out">
+                        {formatDuration(idleLeft)} left
+                      </span>
+                    )}
+                  </li>
+                )}
+                {absPolicy && (
+                  <li
+                    className="muted"
+                    style={{
+                      fontSize: 12,
+                      display: "flex",
+                      justifyContent: "space-between",
+                      gap: 8,
+                      lineHeight: 1.7,
+                    }}
+                  >
+                    <span>{absPolicy}</span>
+                    {absLeft != null && (
+                      <span className="mono" title="Time left before re-sign-in is required">
+                        {formatDuration(absLeft)} left
+                      </span>
+                    )}
+                  </li>
+                )}
+              </ul>
+            )}
+          </div>
+        )}
 
         {done ? (
           <div style={{ padding: "4px 16px 16px" }}>

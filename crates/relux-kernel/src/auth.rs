@@ -271,6 +271,29 @@ pub fn reset_admin_credential(
 
 // ── Sessions (in-memory) ────────────────────────────────────────
 
+/// Safe, secret-free snapshot of a live session for the dashboard Account
+/// control. Carries only the operator name and the two deadlines — **never** the
+/// session id, the cookie value, the admin hash, or any other secret — so it can
+/// be serialized to the page without leaking anything that admits a request.
+///
+/// Read by [`DashboardAuth::session_meta`], which (like [`SessionStore::validate`])
+/// is **non-mutating on the idle window**: fetching this snapshot does NOT slide
+/// the session forward, so the Account modal can poll it without keeping an
+/// otherwise-idle console alive. The deadlines are therefore the *current,
+/// pre-refresh* values — what the operator's cookie reflects right now, not a
+/// window bumped by the act of reading it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMeta {
+    /// The signed-in operator's username.
+    pub username: String,
+    /// Idle deadline (unix seconds): the session expires at this instant unless a
+    /// real authenticated control-plane request slides it forward first.
+    pub idle_expires_at: i64,
+    /// Absolute ceiling (unix seconds): the session is forced to re-authenticate
+    /// at this instant regardless of activity. Always `>= idle_expires_at`.
+    pub absolute_expires_at: i64,
+}
+
 struct Session {
     username: String,
     /// Idle deadline: the session is valid until this instant unless an
@@ -330,6 +353,32 @@ impl SessionStore {
         if let Ok(m) = self.inner.read() {
             match m.get(sid) {
                 Some(s) if Self::is_live(s, now) => return Some(s.username.clone()),
+                Some(_) => {} // expired → fall through to prune
+                None => return None,
+            }
+        }
+        if let Ok(mut m) = self.inner.write() {
+            m.remove(sid);
+        }
+        None
+    }
+
+    /// Return a non-secret [`SessionMeta`] for a live session, or `None` (pruning
+    /// the entry) when it is missing or past either deadline. **Non-mutating on the
+    /// idle window** — like [`Self::validate`], reading metadata never slides the
+    /// session, so the Account modal can poll it without keeping an idle console
+    /// alive. The deadlines returned are the current pre-refresh values.
+    fn meta(&self, sid: &str) -> Option<SessionMeta> {
+        let now = now_secs();
+        if let Ok(m) = self.inner.read() {
+            match m.get(sid) {
+                Some(s) if Self::is_live(s, now) => {
+                    return Some(SessionMeta {
+                        username: s.username.clone(),
+                        idle_expires_at: s.expires_at,
+                        absolute_expires_at: s.absolute_deadline,
+                    });
+                }
                 Some(_) => {} // expired → fall through to prune
                 None => return None,
             }
@@ -500,6 +549,15 @@ impl DashboardAuth {
     /// status endpoints to report login state. Returns the username.
     pub fn validate_session(&self, sid: &str) -> Option<String> {
         self.sessions.validate(sid)
+    }
+
+    /// A non-secret [`SessionMeta`] snapshot for a raw session-cookie value, or
+    /// `None` when the session is missing/expired. Like [`Self::validate_session`]
+    /// this does **not** slide the idle window, so the dashboard Account control
+    /// can poll it for an expiry/idle readout without keeping an idle console
+    /// alive. The returned deadlines are pre-refresh (the current cookie state).
+    pub fn session_meta(&self, sid: &str) -> Option<SessionMeta> {
+        self.sessions.meta(sid)
     }
 
     /// Slide a live session forward by the idle timeout and return the cookie
@@ -738,6 +796,41 @@ mod tests {
             "the absolute ceiling must force expiry even with idle time left"
         );
         assert!(auth.validate_session("sid").is_none());
+    }
+
+    #[test]
+    fn session_meta_reports_deadlines_without_sliding() {
+        let (auth, _tmp) = auth();
+        let now = now_secs();
+        let idle = now + 1234;
+        let abs = now + SESSION_ABSOLUTE_MAX_SECS;
+        auth.sessions.insert_raw("sid", "ops", idle, abs);
+        let meta = auth.session_meta("sid").expect("a live session has metadata");
+        assert_eq!(meta.username, "ops");
+        assert_eq!(meta.idle_expires_at, idle);
+        assert_eq!(meta.absolute_expires_at, abs);
+        // Reading metadata must NOT slide the idle window (so the Account modal can
+        // poll it without keeping an idle console alive).
+        let (after, after_abs) = auth.sessions.peek("sid").unwrap();
+        assert_eq!(after, idle, "session_meta must not move the idle deadline");
+        assert_eq!(after_abs, abs, "session_meta must not move the absolute ceiling");
+    }
+
+    #[test]
+    fn session_meta_rejects_and_prunes_an_expired_session() {
+        let (auth, _tmp) = auth();
+        let now = now_secs();
+        // Idle deadline already past (absolute ceiling still ahead).
+        auth.sessions
+            .insert_raw("sid", "ops", now - 1, now + SESSION_ABSOLUTE_MAX_SECS);
+        assert!(
+            auth.session_meta("sid").is_none(),
+            "an idle-expired session exposes no metadata"
+        );
+        // The dead entry was pruned, exactly like validate.
+        assert!(auth.sessions.peek("sid").is_none());
+        // An unknown session id is simply None (no panic, no entry created).
+        assert!(auth.session_meta("deadbeef").is_none());
     }
 
     #[test]
