@@ -168,8 +168,10 @@ try {
     Assert 'greeting does not call a tool' ($greetNoTool -and $greetIsGreeting) 'no tool/work from "hey"'
 
     $disc = Exe prime 'what tools can you use?'
-    $discOk = ($disc -match 'ToolDiscovery') -and ($disc -match 'relux-tools-echo/echo\.say') -and ($disc -match 'relux-tools-status/status\.summary')
-    Assert 'tool discovery lists real tools' $discOk 'lists echo.say + status.summary'
+    # echo is an internal dev/test fixture: it must be HIDDEN from Prime's
+    # user-facing tool catalogue; the genuine status tool is shown.
+    $discOk = ($disc -match 'ToolDiscovery') -and ($disc -notmatch 'echo\.say') -and ($disc -match 'relux-tools-status/status\.summary')
+    Assert 'tool discovery hides echo, lists real tools' $discOk 'status.summary listed; echo hidden'
 
     $status = Exe prime 'what is going on?'
     $statusOk = ($status -match 'tool\s+>\s+relux-tools-status/status\.summary')
@@ -411,6 +413,27 @@ try {
                     $why = if ($runObj) { "status=$($runObj.status) error=$($runObj.error)" } else { "execute=$($ex.Status)" }
                     Fail $label $why
                 }
+
+                # -- Prime Brain chat through the real CLI -----------------------
+                # Select this CLI as Prime's brain and ask a conversational
+                # question; the reply must come back tagged with the CLI's ai_mode
+                # (not deterministic), proving Prime talks THROUGH the CLI.
+                $brainLabel = "real $($ra.Tag) Prime brain chat"
+                $brainVal = "$($ra.Tag)_cli"
+                [void](Invoke-Api 'PUT' '/v1/relux/ai/config' (@{ brain = $brainVal } | ConvertTo-Json -Compress))
+                $brainTok = ($ra.Tag.ToUpper() + 'OK')
+                $primeBody = @{ message = ("Reply with exactly one short sentence. Begin it with the token {0}." -f $brainTok) } | ConvertTo-Json -Compress
+                $pr = Invoke-Api 'POST' '/v1/relux/prime' $primeBody
+                $prTurn = $null; try { $prTurn = $pr.Body | ConvertFrom-Json } catch {}
+                $brainOk = ($pr.Status -eq 200) -and $prTurn -and ($prTurn.ai_mode -eq $brainVal) -and ($prTurn.reply)
+                if ($brainOk) {
+                    Pass $brainLabel ("ai_mode=$($prTurn.ai_mode); reply len=$($prTurn.reply.Length)")
+                } else {
+                    $why = if ($prTurn) { "ai_mode=$($prTurn.ai_mode) note=$($prTurn.ai_note)" } else { "prime=$($pr.Status)" }
+                    Fail $brainLabel $why
+                }
+                [void](Invoke-Api 'DELETE' '/v1/relux/ai/config' $null)
+
                 # Always disable the adapter again so no later step can spawn it.
                 [void](Invoke-Api 'DELETE' "/v1/relux/adapters/$($ra.Adapter)/runtime" $null)
             }

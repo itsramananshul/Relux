@@ -80,6 +80,9 @@ pub struct AiConfig {
     pub disabled: bool,
     /// Request timeout in milliseconds (already clamped to a sane range).
     pub timeout_ms: u64,
+    /// The explicitly-selected Prime brain, or `None` for the legacy auto choice
+    /// (OpenRouter when a key is present and not disabled, otherwise Local).
+    pub brain: Option<PrimeBrain>,
 }
 
 impl AiConfig {
@@ -106,11 +109,16 @@ impl AiConfig {
         let timeout_ms = std::env::var("RELUX_LLM_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok());
-        Self::from_parts(api_key, model, disabled, timeout_ms)
+        let brain = std::env::var("RELUX_PRIME_BRAIN")
+            .ok()
+            .and_then(|v| PrimeBrain::parse(&v));
+        Self::from_parts(api_key, model, disabled, timeout_ms).with_brain(brain)
     }
 
     /// Build a config from already-read parts. Pure (no env access), so config
     /// resolution and defaults are unit-testable without touching process env.
+    /// The brain defaults to `None` (legacy auto choice); set it with
+    /// [`AiConfig::with_brain`].
     pub fn from_parts(
         api_key: Option<String>,
         model: Option<String>,
@@ -129,12 +137,35 @@ impl AiConfig {
             model,
             disabled,
             timeout_ms,
+            brain: None,
         }
     }
 
-    /// Whether the LLM path is actually live: a key is present AND not disabled.
+    /// Set the explicit Prime brain (builder-style), returning `self`.
+    pub fn with_brain(mut self, brain: Option<PrimeBrain>) -> Self {
+        self.brain = brain;
+        self
+    }
+
+    /// Whether the OpenRouter LLM path is actually live: a key is present AND not
+    /// disabled. (Independent of which brain is selected.)
     pub fn enabled(&self) -> bool {
         self.api_key.is_some() && !self.disabled
+    }
+
+    /// The effective Prime brain: the explicit choice, or the legacy auto choice
+    /// (OpenRouter when a key is configured and not disabled, else Local).
+    pub fn effective_brain(&self) -> PrimeBrain {
+        match self.brain {
+            Some(b) => b,
+            None => {
+                if self.enabled() {
+                    PrimeBrain::Openrouter
+                } else {
+                    PrimeBrain::Local
+                }
+            }
+        }
     }
 
     /// Whether a key is configured at all (independent of the disabled flag).
@@ -143,25 +174,52 @@ impl AiConfig {
     }
 
     /// Build the safe, key-free status surface for `GET /v1/relux/ai/status`.
+    ///
+    /// `mode` and `reason` reflect the *effective brain*. For the CLI brains the
+    /// kernel layers in live adapter availability before this is returned (the
+    /// status here only knows the selection, not whether the binary is on PATH).
     pub fn status(&self) -> AiStatus {
-        let mode = if self.enabled() {
-            AiMode::Openrouter
-        } else {
-            AiMode::Deterministic
+        let brain = self.effective_brain();
+        let mode = match brain {
+            PrimeBrain::Local => AiMode::Deterministic,
+            PrimeBrain::Openrouter => {
+                if self.enabled() {
+                    AiMode::Openrouter
+                } else {
+                    AiMode::Deterministic
+                }
+            }
+            PrimeBrain::ClaudeCli => AiMode::ClaudeCli,
+            PrimeBrain::CodexCli => AiMode::CodexCli,
         };
-        let reason = if self.enabled() {
-            format!(
+        let reason = match brain {
+            PrimeBrain::Openrouter if self.enabled() => format!(
                 "OpenRouter configured; conversational replies use {}. Actions stay deterministic and kernel-grounded.",
                 self.model
-            )
-        } else if self.configured() && self.disabled {
-            "An OpenRouter key is set but RELUX_LLM_DISABLED forces deterministic Prime."
-                .to_string()
-        } else {
-            "No OpenRouter API key configured; Prime runs fully deterministic.".to_string()
+            ),
+            PrimeBrain::Openrouter if self.configured() && self.disabled => {
+                "An OpenRouter key is set but RELUX_LLM_DISABLED forces deterministic Prime."
+                    .to_string()
+            }
+            PrimeBrain::Openrouter => {
+                "OpenRouter brain selected but no API key is configured; Prime stays deterministic until you add one."
+                    .to_string()
+            }
+            PrimeBrain::ClaudeCli => {
+                "Claude CLI brain selected; conversational replies are delegated to the local `claude` CLI when its adapter is enabled. Actions stay deterministic and kernel-grounded."
+                    .to_string()
+            }
+            PrimeBrain::CodexCli => {
+                "Codex CLI brain selected; conversational replies are delegated to the local `codex` CLI when its adapter is enabled. Actions stay deterministic and kernel-grounded."
+                    .to_string()
+            }
+            PrimeBrain::Local => {
+                "Local brain: Prime runs fully deterministic and grounded in control-plane state.".to_string()
+            }
         };
         AiStatus {
             mode,
+            brain: brain.as_str().to_string(),
             configured: self.configured(),
             disabled: self.disabled,
             model: self.model.clone(),
@@ -198,11 +256,17 @@ impl AiConfig {
             .filter(|m| !m.is_empty())
             .unwrap_or(env.model);
         let disabled = stored.disabled.unwrap_or(env.disabled);
+        let brain = stored
+            .brain
+            .as_deref()
+            .and_then(PrimeBrain::parse)
+            .or(env.brain);
         Self {
             api_key,
             model,
             disabled,
             timeout_ms: env.timeout_ms,
+            brain,
         }
     }
 }
@@ -229,6 +293,10 @@ pub struct StoredAiConfig {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled: Option<bool>,
+    /// The selected Prime brain (`local` | `openrouter` | `claude_cli` |
+    /// `codex_cli`). Omitted means the legacy auto choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brain: Option<String>,
 }
 
 /// Read the stored AI config from `path`, or `None` when it is absent/unreadable
@@ -251,6 +319,7 @@ pub fn write_stored_config(
     api_key: Option<String>,
     model: Option<String>,
     disabled: Option<bool>,
+    brain: Option<String>,
 ) -> std::io::Result<()> {
     let mut current = read_stored_config(path).unwrap_or_default();
     if let Some(p) = provider {
@@ -267,6 +336,12 @@ pub fn write_stored_config(
     }
     if let Some(d) = disabled {
         current.disabled = Some(d);
+    }
+    if let Some(b) = brain {
+        let b = b.trim().to_string();
+        // Normalize to the canonical wire string; an empty/unknown value clears
+        // the selection (back to the legacy auto choice).
+        current.brain = PrimeBrain::parse(&b).map(|pb| pb.as_str().to_string());
     }
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -312,12 +387,63 @@ pub enum AiMode {
     DeterministicForAction,
     /// The reply text was shaped by the OpenRouter model.
     Openrouter,
+    /// The reply text came from the local Claude CLI adapter (`claude -p`).
+    ClaudeCli,
+    /// The reply text came from the local Codex CLI adapter (`codex exec`).
+    CodexCli,
+}
+
+/// Which provider Prime uses for its *conversational* replies (its "brain").
+///
+/// This is an explicit operator choice (`docs/RELUX_MASTER_PLAN.md` section 8.1 —
+/// adapter plugins are how Relux connects to a model/agent runtime). It never
+/// affects durable actions: every state change still comes from the deterministic
+/// kernel path regardless of the brain. `Local` is the always-available grounded
+/// stand-in; `Openrouter` uses the configured API key; `ClaudeCli`/`CodexCli`
+/// delegate to a local coding-agent CLI the operator has installed and enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrimeBrain {
+    /// The deterministic, grounded local operator. No external call.
+    Local,
+    /// OpenRouter (an API key configured in the dashboard or env).
+    Openrouter,
+    /// The local Claude CLI adapter (`relux-adapter-claude-cli`).
+    ClaudeCli,
+    /// The local Codex CLI adapter (`relux-adapter-codex-cli`).
+    CodexCli,
+}
+
+impl PrimeBrain {
+    /// The stable wire string for this brain.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PrimeBrain::Local => "local",
+            PrimeBrain::Openrouter => "openrouter",
+            PrimeBrain::ClaudeCli => "claude_cli",
+            PrimeBrain::CodexCli => "codex_cli",
+        }
+    }
+
+    /// Parse a wire string into a brain, accepting a few friendly spellings.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().replace(['-', ' '], "_").as_str() {
+            "local" | "deterministic" => Some(PrimeBrain::Local),
+            "openrouter" => Some(PrimeBrain::Openrouter),
+            "claude_cli" | "claude" => Some(PrimeBrain::ClaudeCli),
+            "codex_cli" | "codex" => Some(PrimeBrain::CodexCli),
+            _ => None,
+        }
+    }
 }
 
 /// The safe, serializable AI status. Deliberately carries NO key material.
 #[derive(Debug, Clone, Serialize)]
 pub struct AiStatus {
     pub mode: AiMode,
+    /// The selected Prime brain wire string (`local` | `openrouter` |
+    /// `claude_cli` | `codex_cli`).
+    pub brain: String,
     /// Whether an API key is present (never the key itself).
     pub configured: bool,
     pub disabled: bool,
@@ -348,6 +474,19 @@ impl AiOutcome {
             note: None,
         }
     }
+    /// A deterministic outcome that keeps the grounded reply but carries an
+    /// optional, secret-free note explaining why a richer brain was not used
+    /// (e.g. a CLI brain that is selected but unavailable). Public so the kernel's
+    /// CLI-brain path can build it.
+    pub fn deterministic_fallback(reply: String, note: Option<String>) -> Self {
+        Self {
+            mode: AiMode::Deterministic,
+            reply,
+            model: None,
+            note,
+        }
+    }
+
     fn deterministic_for_action(reply: String) -> Self {
         Self {
             mode: AiMode::DeterministicForAction,
@@ -393,14 +532,43 @@ pub fn is_actionful(turn: &PrimeTurn) -> bool {
 }
 
 /// Decide the path for a turn given the config. Pure: no env, no network.
+///
+/// [`shape_reply`] handles only the text-based brains (Local and OpenRouter). For
+/// the CLI brains the kernel intercepts the turn before calling this and spawns
+/// the adapter itself, so here a CLI brain falls through to `Deterministic`
+/// (which is also the correct fallback when a CLI turn is actionful).
 pub fn plan_turn(cfg: &AiConfig, turn: &PrimeTurn) -> AiPlan {
-    if !cfg.enabled() {
-        AiPlan::Deterministic
-    } else if is_actionful(turn) {
-        AiPlan::DeterministicForAction
-    } else {
-        AiPlan::Augment
+    if is_actionful(turn) {
+        return AiPlan::DeterministicForAction;
     }
+    match cfg.effective_brain() {
+        PrimeBrain::Openrouter if cfg.enabled() => AiPlan::Augment,
+        // Local, OpenRouter-without-a-key, and the CLI brains (handled elsewhere)
+        // all keep the grounded deterministic reply here.
+        _ => AiPlan::Deterministic,
+    }
+}
+
+/// Compose the single conversational prompt handed to a CLI brain on stdin
+/// (`claude -p` / `codex exec`). It mirrors [`build_messages`]: it pins Prime's
+/// identity and the hard "you did NOT perform any action" rule, supplies the
+/// grounded deterministic reply as facts the CLI may rely on, and asks it to
+/// answer the user naturally. Kept ASCII and self-contained so it works as a
+/// one-shot prompt with no system-message channel.
+pub fn compose_chat_prompt(message: &str, grounded_facts: &str) -> String {
+    format!(
+        "You are Prime, the operator of a local Relux control plane (a Codex-like agentic \
+control plane built around tasks, runs, agents, plugins, permissions, approvals, and an \
+audit log). Speak naturally and concisely, like a capable operator.\n\n\
+Hard rules: you did NOT perform any action this turn, so never claim you created a task, \
+started a run, installed a plugin, changed a permission, or modified any state. If the user \
+wants such a thing, tell them briefly what to say (for example: 'create a task to summarize \
+the README') instead of pretending it is done. Do not invent runs, tasks, plugins, or \
+numbers. Stay consistent with the grounded facts below. Use plain ASCII.\n\n\
+Grounded control-plane facts you may rely on (do not contradict them, do not claim any \
+action was performed):\n{grounded_facts}\n\nUser message:\n{message}\n\nReply to the user \
+naturally."
+    )
 }
 
 /// Shape one Prime reply, optionally via OpenRouter.
@@ -686,6 +854,7 @@ mod tests {
         assert_eq!(
             keys,
             [
+                "brain",
                 "configured",
                 "disabled",
                 "mode",
@@ -785,6 +954,7 @@ mod tests {
             Some(secret.clone()),
             Some("anthropic/claude-3.5-haiku".into()),
             None,
+            None,
         )
         .unwrap();
 
@@ -797,13 +967,13 @@ mod tests {
         assert!(!json.contains(&secret), "status leaked the key: {json}");
 
         // A partial update keeps the key but flips disabled.
-        write_stored_config(&path, None, None, None, Some(true)).unwrap();
+        write_stored_config(&path, None, None, None, Some(true), None).unwrap();
         let resolved = AiConfig::resolve(Some(&path));
         assert!(resolved.configured(), "key preserved across partial update");
         assert!(!resolved.enabled(), "disabled flag applied");
 
         // Clearing only the key (empty string) removes it.
-        write_stored_config(&path, None, Some("   ".into()), None, None).unwrap();
+        write_stored_config(&path, None, Some("   ".into()), None, None, None).unwrap();
         let resolved = AiConfig::resolve(Some(&path));
         assert!(!resolved.configured(), "blank key clears the stored key");
 
@@ -819,5 +989,80 @@ mod tests {
         assert_eq!(truncate_chars("hello", 3), "hel");
         // Multi-byte chars must not panic on a non-boundary cut.
         assert_eq!(truncate_chars("aaa", 2).chars().count(), 2);
+    }
+
+    #[test]
+    fn brain_parse_round_trips_and_accepts_aliases() {
+        for b in [
+            PrimeBrain::Local,
+            PrimeBrain::Openrouter,
+            PrimeBrain::ClaudeCli,
+            PrimeBrain::CodexCli,
+        ] {
+            assert_eq!(PrimeBrain::parse(b.as_str()), Some(b));
+        }
+        assert_eq!(PrimeBrain::parse("claude"), Some(PrimeBrain::ClaudeCli));
+        assert_eq!(PrimeBrain::parse("CLAUDE-CLI"), Some(PrimeBrain::ClaudeCli));
+        assert_eq!(PrimeBrain::parse("codex"), Some(PrimeBrain::CodexCli));
+        assert_eq!(PrimeBrain::parse("deterministic"), Some(PrimeBrain::Local));
+        assert_eq!(PrimeBrain::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn effective_brain_defaults_to_auto_then_explicit_wins() {
+        // No key, no explicit brain -> Local.
+        let local = AiConfig::from_parts(None, None, false, None);
+        assert_eq!(local.effective_brain(), PrimeBrain::Local);
+        // Key present, no explicit brain -> OpenRouter (legacy auto).
+        let auto = AiConfig::from_parts(Some("k".into()), None, false, None);
+        assert_eq!(auto.effective_brain(), PrimeBrain::Openrouter);
+        // Explicit Local wins even with a key present.
+        let forced_local = auto.clone().with_brain(Some(PrimeBrain::Local));
+        assert_eq!(forced_local.effective_brain(), PrimeBrain::Local);
+        // Explicit Claude CLI is honored regardless of key.
+        let claude = local.with_brain(Some(PrimeBrain::ClaudeCli));
+        assert_eq!(claude.effective_brain(), PrimeBrain::ClaudeCli);
+        assert_eq!(claude.status().brain, "claude_cli");
+        assert_eq!(claude.status().mode, AiMode::ClaudeCli);
+    }
+
+    #[test]
+    fn cli_brain_keeps_shape_reply_deterministic() {
+        // shape_reply only handles text brains; a CLI brain falls through to the
+        // grounded deterministic reply here (the kernel spawns the CLI itself).
+        let cfg = AiConfig::from_parts(Some("k".into()), None, false, None)
+            .with_brain(Some(PrimeBrain::ClaudeCli));
+        let conversational = turn(PrimeDisposition::Answered, "There is 1 active run.");
+        assert_eq!(plan_turn(&cfg, &conversational), AiPlan::Deterministic);
+    }
+
+    #[test]
+    fn explicit_local_brain_ignores_present_key() {
+        let cfg = AiConfig::from_parts(Some("k".into()), None, false, None)
+            .with_brain(Some(PrimeBrain::Local));
+        let conversational = turn(PrimeDisposition::Answered, "grounded.");
+        // Even though a key is present, the operator chose Local: no OpenRouter.
+        assert_eq!(plan_turn(&cfg, &conversational), AiPlan::Deterministic);
+    }
+
+    #[test]
+    fn brain_persists_through_stored_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ai-config.json");
+        write_stored_config(&path, None, None, None, None, Some("claude_cli".into())).unwrap();
+        let resolved = AiConfig::resolve(Some(&path));
+        assert_eq!(resolved.effective_brain(), PrimeBrain::ClaudeCli);
+        // An unknown brain string clears the selection (back to auto).
+        write_stored_config(&path, None, None, None, None, Some("nope".into())).unwrap();
+        let resolved = AiConfig::resolve(Some(&path));
+        assert_eq!(resolved.brain, None);
+    }
+
+    #[test]
+    fn chat_prompt_carries_facts_and_no_action_rule() {
+        let p = compose_chat_prompt("hey", "There is 1 active run.");
+        assert!(p.contains("hey"));
+        assert!(p.contains("There is 1 active run."));
+        assert!(p.contains("did NOT perform any action"));
     }
 }

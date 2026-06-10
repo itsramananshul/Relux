@@ -97,11 +97,13 @@ Prime chat is tool-aware and runs the built-in tools through the **same**
 permission/audit path as `/v1/relux/tools/invoke`:
 
 - "what tools can you use?" - lists the installed tools with their honest
-  executable status (grounded discovery; it never invents a tool).
+  executable status (grounded discovery; it never invents a tool). Internal
+  dev/test fixtures like `echo` are **hidden** from this catalogue and from the
+  dashboard Plugins/Tools lists, so they are never offered as a real ability.
 - "give me a status summary" / "what is going on?" - consults
   `relux-tools-status/status.summary` and answers from the real output.
-- "echo hello" / "use echo.say with {\"n\":1}" - runs `relux-tools-echo/echo.say`
-  with the parsed input and shows the returned JSON.
+- (dev/test only) `echo.say` is still invokable by exact name for the offline
+  smoke, but it is intentionally not surfaced or suggested anywhere in the product.
 
 Prime stays honest: a plain "hey" never becomes a tool call, and a request to use
 an installed-but-unimplemented tool (e.g. a GitHub ToolSet) is reported as
@@ -112,7 +114,6 @@ implemented.** The CLI prints the invoked tool and its output too:
 
 ```powershell
 relux-kernel prime "what tools can you use?"
-relux-kernel prime "echo hello"
 relux-kernel prime "give me a status summary"
 ```
 
@@ -420,13 +421,41 @@ interval, max tasks per tick, optional auto-assignment, and a manual one-tick
 button. Prime autonomy never installs plugins, grants permissions, deletes data,
 or bypasses approvals.
 
-### Optional LLM-backed Prime
+### Prime Brain (who answers Prime's chat)
 
-By default, Prime is deterministic and rule-based. You can enable a natural,
-LLM-backed chat path by configuring an OpenRouter API key. In this mode,
-conversational replies (greetings, status, explanations) are shaped by the model
-while actions (task creation, starting runs) stay grounded and deterministic in the
-kernel.
+Prime's **conversational** replies can come from one of four "brains", chosen from
+**Health → Prime Brain / AI Runtime**. Prime's **actions** (creating tasks,
+starting runs, approvals) always stay deterministic and kernel-grounded no matter
+which brain is selected:
+
+- **Local** (default) - the grounded, rule-based operator. Always available; no
+  external call.
+- **OpenRouter** - shape replies with an OpenRouter model (needs an API key; see
+  below).
+- **Claude CLI** - delegate replies to your local `claude` CLI (uses your Claude
+  login; no key stored in Relux).
+- **Codex CLI** - delegate replies to your local `codex` CLI (uses your ChatGPT
+  login; no key stored in Relux).
+
+For the CLI brains, the panel shows the live adapter status (installed/on-PATH,
+enabled/disabled) and a one-click **"Use Claude/Codex for Prime"** that enables the
+adapter and selects it as the brain. If the chosen CLI is missing or disabled, the
+chat shows a clear, actionable note (with the exact next step) and falls back to the
+grounded reply - never a blank page or a fabricated answer. Every Prime reply shows
+which provider produced it (`via Claude CLI` / `via OpenRouter` / `deterministic`).
+The brain is stored in the same local `ai-config.json`; the API is
+`PUT /v1/relux/ai/config { "brain": "claude_cli" }` (values: `local` | `openrouter`
+| `claude_cli` | `codex_cli`).
+
+CLI brains are spawned the same safe way as assigned runs: argv-only, prompt on
+stdin, a wall-clock timeout, an output cap, and secret redaction. Claude is invoked
+in `--permission-mode default` (never `--dangerously-skip-permissions`).
+
+#### Optional LLM-backed Prime (OpenRouter)
+
+The OpenRouter brain enables a natural, LLM-backed chat path. Conversational
+replies (greetings, status, explanations) are shaped by the model while actions
+stay grounded and deterministic in the kernel.
 
 **From the dashboard (recommended; no env vars).** Open **Health → Prime AI
 settings**, paste your OpenRouter key (and optionally a model), and save. The key
@@ -437,8 +466,8 @@ status (`mode` / `configured` / `model`) is exposed. `relux-kernel serve` picks 
 key up live, so no restart is needed. The API behind it:
 
 ```text
-GET    /v1/relux/ai/status     # key-free: mode / configured / model / reason
-PUT    /v1/relux/ai/config     # { "provider":"openrouter", "api_key":"...", "model"?, "disabled"? }
+GET    /v1/relux/ai/status     # key-free: mode / brain / configured / model / reason
+PUT    /v1/relux/ai/config     # { "provider":"openrouter", "api_key":"...", "model"?, "disabled"?, "brain"? }
 DELETE /v1/relux/ai/config     # clear the stored key/config
 ```
 

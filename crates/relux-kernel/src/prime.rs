@@ -477,7 +477,7 @@ pub fn decide(message: &str, intent: &PrimeIntent, summary: &StateSummary) -> Pr
                 }
             }
             None => PrimePlan::Clarify {
-                text: "Which tool should I run? I can run relux-tools-echo/echo.say and relux-tools-status/status.summary; other installed tools are listed but not runnable here yet."
+                text: "Which tool should I run? For example I can run relux-tools-status/status.summary; other installed tools are listed on the Plugins page but are not all runnable here yet."
                     .to_string(),
             },
         },

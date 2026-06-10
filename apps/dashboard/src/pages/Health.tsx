@@ -8,7 +8,7 @@ import {
   type ReluxAdapterStatus,
   type ReluxPrimeAutonomyStatusResponse,
 } from "../api";
-import { PrimeAiSettings } from "../components/PrimeAiSettings";
+import { PrimeBrainPanel } from "../components/PrimeBrainPanel";
 
 // Relux Health / diagnostics (RELUX_MASTER_PLAN §11.9, §22). The local
 // readiness surface for the standalone product: state counts, plugin/tool/
@@ -28,6 +28,7 @@ interface HealthResponse {
   run_count: number;
   ai_status: {
     mode: string;
+    brain?: string;
     configured: boolean;
     disabled: boolean;
     model: string;
@@ -242,7 +243,7 @@ export function Health() {
         )}
       </div>
 
-      <PrimeAiSettings />
+      <PrimeBrainPanel />
 
       <div className="card">
         <h3>AI Status</h3>
@@ -250,6 +251,9 @@ export function Health() {
           <table className="table">
             <tbody>
               <tr><td>Mode</td><td>{healthData.ai_status.mode}</td></tr>
+              {healthData.ai_status.brain && (
+                <tr><td>Brain</td><td>{healthData.ai_status.brain}</td></tr>
+              )}
               <tr><td>Configured</td><td>{healthData.ai_status.configured ? "Yes" : "No"}</td></tr>
               <tr><td>Disabled</td><td>{healthData.ai_status.disabled ? "Yes" : "No"}</td></tr>
               <tr><td>Model</td><td>{healthData.ai_status.model}</td></tr>

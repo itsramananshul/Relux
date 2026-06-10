@@ -34,6 +34,24 @@ pub fn is_builtin_tool(plugin_id: &str, tool_name: &str) -> bool {
         .any(|(p, t)| *p == plugin_id && *t == tool_name)
 }
 
+/// Plugins that exist only as internal dev/test fixtures and must NEVER be shown
+/// as a user-facing capability.
+///
+/// The echo ToolSet (`echo.say`) is a trivial loop-prover with no product value:
+/// it returns its input unchanged. It stays installed so the internal test
+/// harness and the dev smoke can exercise the tool/run path, but it is hidden
+/// from every normal product surface (the Plugins list, the Tools list, and
+/// Prime's "what tools can you use?" catalogue) so an operator never mistakes it
+/// for a real ability. Dev/test callers opt back in explicitly (e.g. the
+/// `?include_internal=true` API flag).
+pub const INTERNAL_PLUGIN_IDS: &[&str] = &["relux-tools-echo"];
+
+/// True when a plugin is an internal dev/test fixture that should be hidden from
+/// user-facing product surfaces by default.
+pub fn is_internal_plugin(plugin_id: &str) -> bool {
+    INTERNAL_PLUGIN_IDS.contains(&plugin_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -44,5 +62,14 @@ mod tests {
         assert!(is_builtin_tool("relux-tools-status", "status.summary"));
         assert!(!is_builtin_tool("relux-tools-github", "github.create_pr"));
         assert!(!is_builtin_tool("relux-tools-echo", "echo.shout"));
+    }
+
+    #[test]
+    fn echo_is_internal_status_is_not() {
+        // The echo fixture is hidden from user-facing surfaces; the read-only
+        // status tool is a genuine capability and stays visible.
+        assert!(is_internal_plugin("relux-tools-echo"));
+        assert!(!is_internal_plugin("relux-tools-status"));
+        assert!(!is_internal_plugin("relux-adapter-claude-cli"));
     }
 }

@@ -1,4 +1,5 @@
-import { Navigate, Route, Routes, useLocation } from "react-router-dom";
+import { Link, Navigate, Route, Routes, useLocation } from "react-router-dom";
+import { isLegacyPath } from "./routing";
 import { useAuth } from "./auth";
 import { Login } from "./pages/Login";
 import { Layout } from "./components/Layout";
@@ -24,35 +25,60 @@ import { Crew } from "./pages/Crew"; // Import the new Crew page
 import ReluxApprovals from "./pages/ReluxApprovals"; // Import the new ReluxApprovals page
 import { Health } from "./pages/Health"; // Import the new Health page
 
-// Routes served entirely by the local Relux control plane (/v1/relux). They need
-// no web bridge and no login, so they render in the standalone ReluxShell — this
-// is what makes `relux-kernel serve` open into a usable product instead of an
-// old Relix login wall.
-const RELUX_LOCAL = new Set(["/", "/prime", "/work", "/plugins", "/crew", "/approvals", "/health"]);
+// Route ownership (Relux shell as the default, legacy paths as the exception)
+// lives in ./routing as a pure, testable module. Making the Relux shell the
+// DEFAULT (rather than an allow-list) is what prevents a blank page: a deep link
+// or a stray sub-path (e.g. /crew/<id>) can never silently fall into the
+// bridge-gated dashboard and render nothing under `relux-kernel serve`.
+
+// Shown for any unknown path inside the Relux shell, so a bad link renders a real,
+// navigable view instead of a blank page.
+function ReluxNotFound() {
+  return (
+    <div className="grid">
+      <div className="card">
+        <h3 style={{ marginTop: 0 }}>Page not found</h3>
+        <p className="muted" style={{ fontSize: 13, lineHeight: 1.6 }}>
+          That path is not part of the Relux control plane. Use the sidebar, or
+          jump to a known surface:
+        </p>
+        <div className="row wrap" style={{ gap: 8 }}>
+          <Link to="/"><button className="btn sm">Home</button></Link>
+          <Link to="/prime"><button className="btn ghost sm">Prime</button></Link>
+          <Link to="/work"><button className="btn ghost sm">Work</button></Link>
+          <Link to="/crew"><button className="btn ghost sm">Crew</button></Link>
+          <Link to="/plugins"><button className="btn ghost sm">Plugins</button></Link>
+          <Link to="/health"><button className="btn ghost sm">Health</button></Link>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 export function App() {
   const loc = useLocation();
 
-  // The Relux-local surfaces are the default product. They are deliberately
-  // OUTSIDE the bridge auth gate: opening /dashboard lands on Relux Home, talks
-  // to Prime, and manages plugins without ever touching the old bridge.
-  if (RELUX_LOCAL.has(loc.pathname)) {
-    return (
-      <ReluxShell>
-        <Routes>
-          <Route path="/" element={<ReluxHome />} />
-          <Route path="/prime" element={<Prime />} />
-          <Route path="/work" element={<Work />} />
-          <Route path="/plugins" element={<Plugins />} />
-          <Route path="/crew" element={<Crew />} />
-          <Route path="/approvals" element={<ReluxApprovals />} />
-          <Route path="/health" element={<Health />} />
-        </Routes>
-      </ReluxShell>
-    );
+  // Legacy bridge-backed pages keep their exact paths behind the auth gate.
+  if (isLegacyPath(loc.pathname)) {
+    return <LegacyDashboard />;
   }
 
-  return <LegacyDashboard />;
+  // The Relux-local surfaces are the default product, OUTSIDE the bridge auth
+  // gate. A catch-all renders an in-shell "not found" so no path is ever blank.
+  return (
+    <ReluxShell>
+      <Routes>
+        <Route path="/" element={<ReluxHome />} />
+        <Route path="/prime" element={<Prime />} />
+        <Route path="/work" element={<Work />} />
+        <Route path="/plugins" element={<Plugins />} />
+        <Route path="/crew" element={<Crew />} />
+        <Route path="/approvals" element={<ReluxApprovals />} />
+        <Route path="/health" element={<Health />} />
+        <Route path="*" element={<ReluxNotFound />} />
+      </Routes>
+    </ReluxShell>
+  );
 }
 
 // The legacy bridge-backed dashboard (the original Relix operator console). It

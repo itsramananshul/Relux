@@ -37,7 +37,7 @@ use relux_core::{
 };
 use relux_kernel::{
     install_from_dir, install_from_github, install_from_zip, remove_plugin, AiConfig, AiMode,
-    AiStatus, KernelError, KernelState, SqliteStore,
+    AiOutcome, AiStatus, KernelError, KernelState, SqliteStore,
 };
 
 /// The default loopback bind address; override with `RELUX_HTTP_ADDR`.
@@ -423,12 +423,23 @@ async fn set_ai_config(
             )));
         }
     }
+    // Validate the brain selection up front so a typo is a clear 400, not a
+    // silently-ignored field. An empty string clears the selection.
+    if let Some(b) = req.brain.as_ref() {
+        let b = b.trim();
+        if !b.is_empty() && relux_kernel::PrimeBrain::parse(b).is_none() {
+            return Err(ApiError::bad_request(format!(
+                "unsupported brain '{b}'. Use one of: local, openrouter, claude_cli, codex_cli."
+            )));
+        }
+    }
     relux_kernel::write_stored_config(
         &state.ai_config_path,
         req.provider,
         req.api_key,
         req.model,
         req.disabled,
+        req.brain,
     )
     .map_err(|e| ApiError::internal(format!("failed to write AI config: {e}")))?;
     Ok(Json(resolve_ai(&state).status()))
@@ -451,6 +462,9 @@ struct SetAiConfigReq {
     api_key: Option<String>,
     model: Option<String>,
     disabled: Option<bool>,
+    /// The selected Prime brain (`local` | `openrouter` | `claude_cli` |
+    /// `codex_cli`). An empty string clears the selection (legacy auto choice).
+    brain: Option<String>,
 }
 
 async fn list_agents(State(state): State<AppState>) -> Result<Json<Vec<AgentRecord>>, ApiError> {
@@ -460,19 +474,36 @@ async fn list_agents(State(state): State<AppState>) -> Result<Json<Vec<AgentReco
     Ok(Json(records))
 }
 
+/// Optional `?include_internal=true` reveals internal dev/test fixtures (e.g. the
+/// echo ToolSet) that are hidden from normal product surfaces by default.
+#[derive(Debug, Deserialize, Default)]
+struct IncludeInternalQuery {
+    include_internal: Option<bool>,
+}
+
 async fn list_plugins(
     State(state): State<AppState>,
+    query: axum::extract::Query<IncludeInternalQuery>,
 ) -> Result<Json<Vec<PluginRecord>>, ApiError> {
+    let include_internal = query.include_internal.unwrap_or(false);
     let records = locked_read(&state, |kernel| Ok(plugin_records(kernel)))?;
+    // Hide internal dev/test fixtures (echo) from the normal Plugins surface so an
+    // operator never mistakes them for a real capability.
+    let records = records
+        .into_iter()
+        .filter(|p| include_internal || !relux_kernel::is_internal_plugin(&p.id))
+        .collect();
     Ok(Json(records))
 }
 
 /// Optional `?agent=<id>` scoping for tool discovery: when supplied, each tool's
 /// executable status reflects whether THAT agent holds the permission
 /// (`ready`/`missing_permission`); when absent, discovery is permission-agnostic.
+/// `?include_internal=true` reveals hidden dev/test tools (echo).
 #[derive(Debug, Deserialize)]
 struct ToolsQuery {
     agent: Option<String>,
+    include_internal: Option<bool>,
 }
 
 /// GET `/v1/relux/tools` - list installed plugin tools with their honest
@@ -489,9 +520,16 @@ async fn list_tools(
         .map(|a| a.trim())
         .filter(|a| !a.is_empty())
         .map(relux_core::AgentId::new);
+    let include_internal = query.include_internal.unwrap_or(false);
     let tools = locked_read(&state, |kernel| {
         Ok(kernel.discover_tools(agent_id.as_ref()))
     })?;
+    // Hide internal dev/test tools (echo) from the normal Tools surface unless a
+    // dev explicitly opts in.
+    let tools = tools
+        .into_iter()
+        .filter(|t| include_internal || !relux_kernel::is_internal_plugin(&t.plugin_id))
+        .collect();
     Ok(Json(tools))
 }
 
@@ -940,23 +978,53 @@ async fn run_prime(
         return Err(ApiError::bad_request("message is required"));
     }
 
-    // 1. Run the deterministic kernel turn (must happen under the lock).
-    let (turn, summary) = {
+    // Resolve the AI config (and therefore the selected brain) live, so a brain
+    // chosen from the dashboard takes effect without a restart.
+    let ai_config = resolve_ai(&state);
+    let brain = ai_config.effective_brain();
+    let cli_adapter_id = match brain {
+        relux_kernel::PrimeBrain::ClaudeCli => Some(relux_core::CLAUDE_CLI_ADAPTER_ID),
+        relux_kernel::PrimeBrain::CodexCli => Some(relux_core::CODEX_CLI_ADAPTER_ID),
+        _ => None,
+    };
+
+    // 1. Run the deterministic kernel turn (must happen under the lock). While we
+    // hold the lock, also snapshot the runtime status of the brain's CLI adapter
+    // (if any), so the spawn below can happen outside the lock.
+    let (turn, summary, cli_status) = {
         let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut store = SqliteStore::open(&state.db_path)?;
         let mut kernel = store.load()?;
         let ctx = crate::ensure_bootstrapped(&mut kernel)?;
         let turn = kernel.prime_turn(&ctx, &message)?;
         let summary = state_response(&kernel, &state.db_path);
+        let cli_status = cli_adapter_id.and_then(|id| {
+            kernel
+                .adapter_runtime_status()
+                .into_iter()
+                .find(|a| a.plugin_id == id)
+        });
         store.save(&kernel)?;
-        (turn, summary)
+        (turn, summary, cli_status)
     };
 
-    // 2. Shape the reply (LLM or deterministic fallback). This happens OUTSIDE
-    // the lock because it might involve a slow network call. Resolve the config
-    // live so a key configured from the dashboard is picked up without a restart.
-    let ai_config = resolve_ai(&state);
-    let outcome = relux_kernel::shape_reply(&ai_config, &message, &turn).await;
+    // 2. Produce the conversational reply through the selected brain. Actions are
+    // never delegated: an actionful turn (a real state change / approval / tool
+    // result) always keeps the grounded deterministic reply. Conversational turns
+    // route to the chosen brain. This happens OUTSIDE the lock because it can
+    // involve a slow network/process call.
+    let outcome = if !relux_kernel::is_actionful(&turn)
+        && matches!(
+            brain,
+            relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli
+        ) {
+        run_cli_brain(brain, cli_status, &message, &turn).await
+    } else {
+        // Local / OpenRouter (and actionful turns) go through shape_reply, which
+        // keeps actionful turns deterministic and only augments via OpenRouter
+        // when that brain is selected and a key is configured.
+        relux_kernel::shape_reply(&ai_config, &message, &turn).await
+    };
 
     // 3. Merge the outcome into the response.
     let mut final_turn = turn;
@@ -969,6 +1037,135 @@ async fn run_prime(
         ai_model: outcome.model,
         ai_note: outcome.note,
     }))
+}
+
+/// Cap on a CLI brain's reply, mirroring the OpenRouter reply cap.
+const CLI_REPLY_MAX_CHARS: usize = 4_000;
+
+/// Delegate one conversational Prime turn to a local CLI brain (Claude / Codex).
+///
+/// Safety + honesty contract (`docs/RELUX_MASTER_PLAN.md` section 8.1, section
+/// 17.5): the CLI is spawned in the same bounded, non-bypass mode the assigned-run
+/// path uses (argv-only, prompt on stdin, wall-clock timeout, output cap, secret
+/// redaction). It only ever *shapes a conversational reply*; it never performs a
+/// durable action. If the adapter is missing / disabled / off-PATH, this returns
+/// the grounded deterministic reply with a clear, actionable note instead of a
+/// blank or fabricated answer.
+async fn run_cli_brain(
+    brain: relux_kernel::PrimeBrain,
+    status: Option<relux_core::AdapterRuntimeStatus>,
+    message: &str,
+    turn: &PrimeTurn,
+) -> AiOutcome {
+    let (label, bin, kind, mode) = match brain {
+        relux_kernel::PrimeBrain::ClaudeCli => (
+            "Claude CLI",
+            "claude",
+            relux_core::AdapterKind::ClaudeCli,
+            AiMode::ClaudeCli,
+        ),
+        relux_kernel::PrimeBrain::CodexCli => (
+            "Codex CLI",
+            "codex",
+            relux_core::AdapterKind::CodexCli,
+            AiMode::CodexCli,
+        ),
+        // Not a CLI brain — caller never routes these here.
+        _ => return AiOutcome::deterministic_fallback(turn.reply.clone(), None),
+    };
+
+    // A clear, actionable fallback that keeps the grounded reply.
+    let fallback = |note: String| AiOutcome::deterministic_fallback(turn.reply.clone(), Some(note));
+
+    let Some(st) = status else {
+        return fallback(format!(
+            "{label} is selected as Prime's brain, but its adapter is not installed. \
+             Install the `{bin}` CLI and enable its adapter on Crew → Adapters."
+        ));
+    };
+
+    // The adapter must be enabled with its binary resolved on PATH.
+    if st.state != relux_core::AdapterRuntimeState::Available {
+        let next = match st.state {
+            relux_core::AdapterRuntimeState::MissingBinary => format!(
+                "install the `{bin}` CLI and make sure it is on PATH, then refresh on Crew → Adapters"
+            ),
+            relux_core::AdapterRuntimeState::Disabled
+            | relux_core::AdapterRuntimeState::NeedsConfiguration => {
+                "enable it on Crew → Adapters (it is disabled by default)".to_string()
+            }
+            _ => "configure it on Crew → Adapters".to_string(),
+        };
+        return fallback(format!(
+            "{label} is selected as Prime's brain, but its adapter is not ready ({}). To use it, {next}.",
+            st.state.as_str()
+        ));
+    }
+
+    let Some(program) = st.resolved_path.clone() else {
+        return fallback(format!(
+            "{label} is selected, but the `{bin}` binary could not be resolved on PATH. \
+             Reinstall it or set an explicit command on Crew → Adapters."
+        ));
+    };
+
+    let prompt = relux_kernel::compose_chat_prompt(message, &turn.reply);
+    let spec = relux_kernel::AdapterCommandSpec {
+        program,
+        args: relux_kernel::build_adapter_args(&kind),
+        stdin: prompt,
+        working_dir: st.working_dir.clone(),
+        timeout: std::time::Duration::from_secs(
+            st.timeout_seconds
+                .unwrap_or(relux_core::DEFAULT_ADAPTER_TIMEOUT_SECONDS),
+        ),
+        max_output_bytes: st
+            .max_output_bytes
+            .unwrap_or(relux_core::DEFAULT_ADAPTER_MAX_OUTPUT_BYTES) as usize,
+    };
+
+    // The spawn is blocking (poll loop); keep it off the async reactor.
+    let run = tokio::task::spawn_blocking(move || relux_kernel::run_adapter_command(&spec)).await;
+
+    match run {
+        Ok(Ok(outcome)) if outcome.success && !outcome.stdout.trim().is_empty() => {
+            let mut reply: String = outcome.stdout.trim().chars().take(CLI_REPLY_MAX_CHARS).collect();
+            if outcome.stdout_truncated {
+                reply.push_str("\n\n[output truncated]");
+            }
+            AiOutcome {
+                mode,
+                reply,
+                model: Some(label.to_string()),
+                note: None,
+            }
+        }
+        Ok(Ok(outcome)) if outcome.timed_out => fallback(format!(
+            "{label} timed out after {}s; showing the grounded reply. Raise the timeout on Crew → Adapters or try again.",
+            st.timeout_seconds.unwrap_or(relux_core::DEFAULT_ADAPTER_TIMEOUT_SECONDS)
+        )),
+        Ok(Ok(outcome)) => {
+            // Ran but produced no usable answer (non-zero exit or empty stdout).
+            let detail = outcome
+                .stderr
+                .lines()
+                .next()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .unwrap_or_else(|| format!("exit code {:?}", outcome.exit_code));
+            fallback(format!(
+                "{label} did not return an answer ({detail}); showing the grounded reply. \
+                 Check that the CLI is logged in and try again."
+            ))
+        }
+        Ok(Err(e)) => fallback(format!(
+            "{label} could not be started ({e}); showing the grounded reply. \
+             Verify the `{bin}` CLI is installed and enabled on Crew → Adapters."
+        )),
+        Err(_) => fallback(format!(
+            "{label} run was interrupted; showing the grounded reply. Please try again."
+        )),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1912,5 +2109,68 @@ mod tests {
             }),
             StatusCode::BAD_GATEWAY
         );
+    }
+
+    fn conversational_turn(reply: &str) -> PrimeTurn {
+        PrimeTurn {
+            intent: relux_core::PrimeIntent::Greeting,
+            reply: reply.to_string(),
+            disposition: relux_core::PrimeDisposition::Answered,
+            action: None,
+            created_task: None,
+            started_run: None,
+            created_agent: None,
+            approval: None,
+            invoked_tool: None,
+            tool_output: None,
+            tool_error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_brain_not_installed_falls_back_with_actionable_note() {
+        // No adapter status at all -> keep the grounded reply, tell the operator
+        // exactly what to do. Never blank, never a fabricated Claude answer.
+        let turn = conversational_turn("There is 1 active run.");
+        let outcome =
+            run_cli_brain(relux_kernel::PrimeBrain::ClaudeCli, None, "hey", &turn).await;
+        assert_eq!(outcome.mode, AiMode::Deterministic);
+        assert_eq!(outcome.reply, "There is 1 active run.");
+        let note = outcome.note.expect("a note explaining the next step");
+        assert!(note.contains("Claude CLI"), "note: {note}");
+        assert!(note.contains("Crew"), "note points to Crew → Adapters: {note}");
+    }
+
+    #[tokio::test]
+    async fn cli_brain_disabled_adapter_explains_how_to_enable() {
+        // Adapter exists but is disabled -> actionable "enable it" note, grounded
+        // reply preserved, mode stays deterministic (Claude did not answer).
+        let turn = conversational_turn("Idle.");
+        let status = relux_core::AdapterRuntimeStatus {
+            plugin_id: relux_core::CLAUDE_CLI_ADAPTER_ID.to_string(),
+            adapter_name: "Claude CLI".to_string(),
+            kind: Some("claude_cli".to_string()),
+            configured: true,
+            enabled: false,
+            command: Some("claude".to_string()),
+            available_on_path: true,
+            resolved_path: None,
+            timeout_seconds: Some(120),
+            max_output_bytes: Some(1_000_000),
+            working_dir: None,
+            state: relux_core::AdapterRuntimeState::Disabled,
+            detail: "configured but disabled".to_string(),
+        };
+        let outcome = run_cli_brain(
+            relux_kernel::PrimeBrain::ClaudeCli,
+            Some(status),
+            "hey",
+            &turn,
+        )
+        .await;
+        assert_eq!(outcome.mode, AiMode::Deterministic);
+        assert_eq!(outcome.reply, "Idle.");
+        let note = outcome.note.expect("a note");
+        assert!(note.to_lowercase().contains("enable"), "note: {note}");
     }
 }

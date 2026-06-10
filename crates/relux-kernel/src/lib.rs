@@ -34,10 +34,10 @@ pub use adapter::{
     AdapterRunOutcome,
 };
 pub use ai::{
-    clear_stored_config, read_stored_config, shape_reply, write_stored_config, AiConfig, AiMode,
-    AiOutcome, AiStatus, StoredAiConfig,
+    clear_stored_config, compose_chat_prompt, is_actionful, read_stored_config, shape_reply,
+    write_stored_config, AiConfig, AiMode, AiOutcome, AiStatus, PrimeBrain, StoredAiConfig,
 };
-pub use builtin::{is_builtin_tool, BUILTIN_TOOLS};
+pub use builtin::{is_builtin_tool, is_internal_plugin, BUILTIN_TOOLS, INTERNAL_PLUGIN_IDS};
 pub use clock::Clock;
 pub use event::RunEvent;
 pub use loader::{load_plugin_manifests, MANIFEST_FILENAME};

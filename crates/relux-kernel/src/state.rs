@@ -2136,7 +2136,13 @@ impl KernelState {
                 })
             }
             PrimeAction::DiscoverTools => {
-                let tools = self.discover_tools(Some(&ctx.agent));
+                // Hide internal dev/test fixtures (echo) from the user-facing
+                // catalogue so Prime never offers it as a real ability.
+                let tools: Vec<_> = self
+                    .discover_tools(Some(&ctx.agent))
+                    .into_iter()
+                    .filter(|t| !crate::builtin::is_internal_plugin(&t.plugin_id))
+                    .collect();
                 let reply = render_tool_catalog(&text, &tools);
                 Ok(PrimeTurn {
                     intent,
@@ -4042,14 +4048,20 @@ mod tests {
         let turn = k.prime_turn(&ctx, "what tools can you use?").unwrap();
         assert_eq!(turn.intent, relux_core::PrimeIntent::ToolDiscovery);
         assert_eq!(turn.disposition, PrimeDisposition::Answered);
-        // The two installed built-in tools are listed, with honest status.
-        assert!(turn.reply.contains("relux-tools-echo/echo.say"), "got: {}", turn.reply);
+        // The genuine read-only status tool is listed, with honest status.
         assert!(
             turn.reply.contains("relux-tools-status/status.summary"),
             "got: {}",
             turn.reply
         );
         assert!(turn.reply.contains("ready"), "ready tools marked: {}", turn.reply);
+        // The internal echo fixture is HIDDEN from the user-facing catalogue so
+        // Prime never offers it as a real ability.
+        assert!(
+            !turn.reply.contains("echo.say"),
+            "echo must be hidden from Prime's tool catalogue: {}",
+            turn.reply
+        );
         // It must not fabricate a tool that is not installed.
         assert!(!turn.reply.contains("github"), "no fabricated tools: {}", turn.reply);
         assert!(turn.invoked_tool.is_none(), "discovery lists, it does not invoke");

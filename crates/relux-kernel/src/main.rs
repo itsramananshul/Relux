@@ -332,6 +332,12 @@ fn run_health() -> ExitCode {
         relux_kernel::AiMode::DeterministicForAction => {
             println!("INFO: AI mode: Deterministic (for action)");
         }
+        relux_kernel::AiMode::ClaudeCli => {
+            println!("INFO: AI mode: Claude CLI brain (conversational replies via the local `claude` CLI)");
+        }
+        relux_kernel::AiMode::CodexCli => {
+            println!("INFO: AI mode: Codex CLI brain (conversational replies via the local `codex` CLI)");
+        }
     }
 
     // Output warnings and errors

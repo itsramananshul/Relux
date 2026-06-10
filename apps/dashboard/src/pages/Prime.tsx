@@ -35,6 +35,23 @@ const SUGGESTIONS = [
   "why did it fail?",
 ];
 
+// Human label for which provider produced a reply, shown on each Prime turn so
+// the answer's source is always transparent.
+function providerLabel(mode: ReluxPrimeTurn["ai_mode"]): string {
+  switch (mode) {
+    case "openrouter":
+      return "via OpenRouter";
+    case "claude_cli":
+      return "via Claude CLI";
+    case "codex_cli":
+      return "via Codex CLI";
+    case "deterministic_for_action":
+      return "deterministic (action)";
+    default:
+      return "deterministic";
+  }
+}
+
 const GREETING =
   "I am Prime, the local Relux operator. Ask me what is going on, tell me to create a task, " +
   "or start a run. I act through the control plane and ask before anything risky.";
@@ -201,16 +218,26 @@ function ToolResult({ turn }: { turn: ReluxPrimeTurn }) {
 
 function AiStatusBanner({ status }: { status: ReluxAiStatus | null }) {
   if (!status) return null;
-  const isLlm = status.mode === "openrouter" && status.configured && !status.disabled;
-  const icon = isLlm ? "✨" : "🤖";
-  const label = isLlm ? `Prime: OpenRouter (${status.model})` : "Prime: deterministic";
+  const brain = status.brain ?? "local";
+  let icon = "🤖";
+  let label = "Prime: Local (deterministic)";
+  if (brain === "openrouter") {
+    icon = "✨";
+    label = status.configured ? `Prime: OpenRouter (${status.model})` : "Prime: OpenRouter (no key)";
+  } else if (brain === "claude_cli") {
+    icon = "✦";
+    label = "Prime: Claude CLI";
+  } else if (brain === "codex_cli") {
+    icon = "✦";
+    label = "Prime: Codex CLI";
+  }
   return (
     <div className="row wrap muted" style={{ gap: 8, fontSize: 10, padding: "4px 8px", borderBottom: "1px solid var(--border)", marginBottom: 8, alignItems: "center" }} title={status.reason}>
       <span>{icon} {label}</span>
       {status.disabled && status.configured && <span className="badge todo" style={{fontSize: 8}}>LLM disabled</span>}
       <div className="spacer" style={{ flex: 1 }} />
-      <Link to="/health" className="link" style={{ fontSize: 10 }} title="Configure Prime's AI provider / API key">
-        {isLlm ? "AI settings →" : "Set up Claude / Codex / OpenRouter →"}
+      <Link to="/health" className="link" style={{ fontSize: 10 }} title="Choose Prime's brain (Local / OpenRouter / Claude CLI / Codex CLI)">
+        Prime Brain settings →
       </Link>
     </div>
   );
@@ -231,13 +258,21 @@ function PrimeTurnCard({ turn }: { turn: ReluxPrimeTurn }) {
         <span className={"badge " + tone} style={{ fontSize: 9 }} title="How the turn resolved">
           {turn.disposition.replace(/_/g, " ")}
         </span>
-        {turn.ai_mode !== "openrouter" && turn.ai_note && (
-           <span className="muted" style={{ fontSize: 9, marginLeft: "auto" }}>
-             {turn.ai_note.includes("Action executed") ? "deterministic for action" : "deterministic fallback"}
-           </span>
-        )}
+        <span className="muted" style={{ fontSize: 9, marginLeft: "auto" }} title="Which provider produced this reply">
+          {providerLabel(turn.ai_mode)}
+        </span>
       </div>
       <div style={{ whiteSpace: "pre-wrap" }}>{turn.reply}</div>
+
+      {/* An actionable note — e.g. a CLI brain that was unavailable and fell back,
+          with the exact next step. Surfaced so the user is never left guessing. */}
+      {turn.ai_note &&
+        turn.ai_mode !== "openrouter" &&
+        !turn.ai_note.includes("Action executed") && (
+          <div className="banner" style={{ fontSize: 11, marginTop: 8, marginBottom: 0 }}>
+            {turn.ai_note}
+          </div>
+        )}
 
       <ToolResult turn={turn} />
 
@@ -255,7 +290,7 @@ function PrimeTurnCard({ turn }: { turn: ReluxPrimeTurn }) {
           )}
           {turn.created_agent && (
             <span className="muted">
-              agent <Link to={`/crew/${turn.created_agent}`} className="mono" title="View agent details">{turn.created_agent}</Link>
+              agent <Link to="/crew" className="mono" title="View the crew">{turn.created_agent}</Link>
             </span>
           )}
           {turn.approval && (

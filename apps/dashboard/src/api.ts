@@ -1349,11 +1349,17 @@ export interface ReluxPrimeTurn {
   tool_output?: unknown;
   tool_error?: string | null;
   state: ReluxState;
-  /// Which path produced the reply (deterministic or LLM).
-  ai_mode: "deterministic" | "deterministic_for_action" | "openrouter";
-  /// The model used, if LLM-backed.
+  /// Which path produced the reply (local deterministic, OpenRouter, or a local
+  /// CLI brain). `claude_cli`/`codex_cli` mean the answer came from that CLI.
+  ai_mode:
+    | "deterministic"
+    | "deterministic_for_action"
+    | "openrouter"
+    | "claude_cli"
+    | "codex_cli";
+  /// The model (OpenRouter) or brain label (CLI) that produced the reply.
   ai_model?: string;
-  /// A safe, non-secret note (e.g. why LLM was skipped or fell back).
+  /// A safe, non-secret note (e.g. why a CLI brain fell back, with the next step).
   ai_note?: string;
 }
 
@@ -1411,9 +1417,19 @@ export const reluxPrimeAutonomy = {
 
 // -- Relux AI (OpenRouter) -------------------------------------------------
 
+// The four Prime brains (conversational reply providers).
+export type ReluxPrimeBrain = "local" | "openrouter" | "claude_cli" | "codex_cli";
+
 export interface ReluxAiStatus {
-  mode: "deterministic" | "deterministic_for_action" | "openrouter";
-  /// Whether an API key is present (never the key itself).
+  mode:
+    | "deterministic"
+    | "deterministic_for_action"
+    | "openrouter"
+    | "claude_cli"
+    | "codex_cli";
+  /// The selected Prime brain.
+  brain: ReluxPrimeBrain;
+  /// Whether an OpenRouter API key is present (never the key itself).
   configured: boolean;
   disabled: boolean;
   model: string;
@@ -1425,15 +1441,17 @@ export interface ReluxAiStatus {
 export const reluxAi = {
   // Current AI configuration/status (key-free; never returns the API key).
   status: () => api.get<ReluxAiStatus>("/v1/relux/ai/status"),
-  // Configure Prime's AI provider from the dashboard (no env vars). Only
-  // OpenRouter takes a key today; Claude/Codex adapters use local CLI auth. The
-  // key is stored locally (gitignored) and never returned — the response is the
-  // key-free status. Pass api_key:"" to clear the stored key.
+  // Configure Prime's AI provider/brain from the dashboard (no env vars). Only
+  // OpenRouter takes a key; Claude/Codex adapters use local CLI auth. The key is
+  // stored locally (gitignored) and never returned — the response is the
+  // key-free status. Pass api_key:"" to clear the stored key. Pass `brain` to
+  // pick which provider answers Prime's conversational turns.
   setConfig: (body: {
     provider?: string;
     api_key?: string;
     model?: string;
     disabled?: boolean;
+    brain?: ReluxPrimeBrain | "";
   }) => api.put<ReluxAiStatus>("/v1/relux/ai/config", body),
   // Clear the dashboard-stored AI config entirely (falls back to env, then to
   // deterministic Prime).
