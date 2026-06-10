@@ -253,6 +253,9 @@ import {
   jobIsTerminal,
   jobIsCanceling,
   jobCanCancel,
+  jobIsReconstructed,
+  jobIsInterrupted,
+  jobPendingCount,
   jobPhaseLabel,
   jobProgressLabel,
   jobRunningStepIds,
@@ -355,10 +358,7 @@ test("jobPhaseLabel reflects the real lifecycle, not a spinner", () => {
   assert.equal(jobPhaseLabel(job("running", { current_round: 2 })), "Running — round 2");
   assert.equal(jobPhaseLabel(job("completed")), "Completed");
   assert.equal(jobPhaseLabel(job("failed")), "Failed");
-  assert.equal(
-    jobPhaseLabel(job("interrupted")),
-    "Interrupted — run was lost to a server restart",
-  );
+  assert.equal(jobPhaseLabel(job("interrupted")), "Interrupted — no live worker");
   assert.equal(jobPhaseLabel(null), "");
 });
 
@@ -400,4 +400,91 @@ test("runButtonLabel tracks the live job and resting verb", () => {
   assert.equal(runButtonLabel(planned, job("running")), "Running...");
   // After a failure: offer a retry.
   assert.equal(runButtonLabel(running, job("failed")), "Retry");
+});
+
+// --- Restart-honest reconstructed status (interrupted jobs) ----------------
+// When the in-memory job registry is lost (server restart), a poll by
+// orchestration id RECONSTRUCTS a job-like status from the durable record, with a
+// synthetic `durable:<id>` id and state "interrupted" if briefs remain. These pin
+// that the UI labels it honestly, treats it as terminal (so polling stops — no
+// broken loop), and re-offers Continue to resume.
+
+// A reconstructed interrupted job: synthetic id, no live worker, pending briefs.
+function reconstructedInterrupted(): ReluxOrchestrationJob {
+  return job("interrupted", {
+    id: "durable:orch_0001",
+    ran: 2,
+    completed: 2,
+    current_round: 1,
+    steps: [
+      jobStep("t0", "completed"),
+      jobStep("t1", "completed"),
+      jobStep("t2", "pending"),
+      jobStep("t3", "pending"),
+    ],
+  });
+}
+
+test("jobIsReconstructed detects the synthetic durable id, not a live worker", () => {
+  assert.equal(jobIsReconstructed(reconstructedInterrupted()), true);
+  // A live worker's process-local id is never treated as reconstructed.
+  assert.equal(jobIsReconstructed(job("running", { id: "job_0001" })), false);
+  assert.equal(jobIsReconstructed(job("completed", { id: "job_0007" })), false);
+  assert.equal(jobIsReconstructed(null), false);
+  assert.equal(jobIsReconstructed(undefined), false);
+});
+
+test("jobIsInterrupted is true only for the interrupted state", () => {
+  assert.equal(jobIsInterrupted(reconstructedInterrupted()), true);
+  assert.equal(jobIsInterrupted(job("running")), false);
+  assert.equal(jobIsInterrupted(job("completed")), false);
+  assert.equal(jobIsInterrupted(null), false);
+});
+
+test("jobPendingCount counts the briefs a Continue run would resume", () => {
+  assert.equal(jobPendingCount(reconstructedInterrupted()), 2);
+  assert.equal(jobPendingCount(job("completed", { steps: [jobStep("t0", "completed")] })), 0);
+  assert.equal(jobPendingCount(null), 0);
+});
+
+test("an interrupted reconstructed job is terminal and never active/cancelable", () => {
+  const j = reconstructedInterrupted();
+  // Terminal => the poll effect stops (it only polls active jobs): no broken loop.
+  assert.equal(jobIsTerminal(j.state), true);
+  assert.equal(jobIsActive(j), false);
+  assert.equal(jobCanCancel(j), false);
+  assert.equal(jobIsCanceling({ ...j, cancel_requested: true }), false);
+});
+
+test("the poll effect schedules nothing for a reconstructed interrupted job", () => {
+  // Mirrors OrchestrationPanel's poll gate: only jobs that are still active drive a
+  // timeout. A reconstructed interrupted job must not, or the UI would poll forever.
+  const jobs: Record<string, ReluxOrchestrationJob> = {
+    orch_0001: reconstructedInterrupted(),
+  };
+  const activeIds = Object.values(jobs)
+    .filter((j) => jobIsActive(j))
+    .map((j) => j.orchestration_id);
+  assert.deepEqual(activeIds, []);
+});
+
+test("an interrupted run re-offers Continue to resume the pending briefs", () => {
+  // The orchestration record after a partial run: some briefs completed, some
+  // pending, status still "running" (no worker is driving it now).
+  const partiallyRun = orch("orch_0001", "running", [
+    step("t0", "a", "completed"),
+    step("t1", "a", "completed"),
+    step("t2", "b", "pending"),
+    step("t3", "b", "pending"),
+  ]);
+  assert.equal(canRunOrchestration(partiallyRun), true);
+  assert.equal(runButtonLabel(partiallyRun, reconstructedInterrupted()), "Continue");
+});
+
+test("jobPhaseLabel for interrupted does not over-claim a restart as the only cause", () => {
+  // Honest: the reconstructed state covers finished/canceled/restart-lost runs, so
+  // the headline stays cause-neutral and the callout body carries the full reason.
+  const label = jobPhaseLabel(reconstructedInterrupted());
+  assert.equal(label, "Interrupted — no live worker");
+  assert.doesNotMatch(label, /server restart/);
 });

@@ -23,6 +23,9 @@ import {
   jobIsTerminal,
   jobIsCanceling,
   jobCanCancel,
+  jobIsReconstructed,
+  jobIsInterrupted,
+  jobPendingCount,
   jobPhaseLabel,
   jobProgressLabel,
   jobRunningStepIds,
@@ -50,6 +53,8 @@ export function OrchestrationPanel() {
   const [jobs, setJobs] = useState<Record<string, ReluxOrchestrationJob>>({});
   // Avoid setState after unmount when a poll resolves late.
   const mounted = useRef(true);
+  // Hydrate the durable job status at most once per mount (see below).
+  const hydrated = useRef(false);
   useEffect(() => {
     mounted.current = true;
     return () => {
@@ -71,6 +76,33 @@ export function OrchestrationPanel() {
   useEffect(() => {
     void refresh();
   }, []);
+
+  // Hydrate the durable job status once after the first list load. A `running`
+  // orchestration is the signal that a job was (or still is) in flight: polling
+  // by orchestration id (`latestJob`) either reconnects to a live job — so the
+  // poll effect resumes it after a page reload — or, when the in-memory registry
+  // was lost to a server restart, returns the RECONSTRUCTED restart-honest status
+  // ("interrupted" with the durable progress). Without this, the interrupted
+  // callout would only ever appear in the same session that pressed Run; a
+  // reload after a restart would silently hide it (RELUX_MASTER_PLAN Sec 15). A
+  // 404 means "no job ever started" — we keep the planned record and show nothing.
+  useEffect(() => {
+    if (hydrated.current || list.length === 0) return;
+    hydrated.current = true;
+    void (async () => {
+      for (const o of list) {
+        if (o.status !== "running") continue;
+        try {
+          const j = await reluxOrchestration.latestJob(o.id);
+          if (!mounted.current) return;
+          // Never clobber a job we are already tracking (e.g. one just started).
+          setJobs((prev) => (prev[o.id] ? prev : { ...prev, [o.id]: j }));
+        } catch {
+          /* 404 (no job started) or transient — fall back to the planned record */
+        }
+      }
+    })();
+  }, [list]);
 
   // Poll every active job until it finishes. On completion, fold the job's
   // aggregate result into the "Last batch" banner and refresh the durable record
@@ -322,6 +354,12 @@ function OrchestrationRow({
   const groups = groupStepsByAgent(o);
   const readiness = orchestrationReadiness(o);
   const active = jobIsActive(job);
+  // A restart-honest reconstructed status (no live worker) with pending briefs
+  // left to resume. The kernel marks these with a synthetic `durable:` id, so we
+  // render a distinct callout — never the live-job banner — and never present
+  // that id as a live worker (RELUX_MASTER_PLAN Sec 15).
+  const interrupted = jobIsReconstructed(job) && jobIsInterrupted(job);
+  const pending = jobPendingCount(job);
   const runningIds = new Set(jobRunningStepIds(job));
   // The dependency-aware shape of remaining work, shown so an operator sees what
   // is runnable now vs still gated before pressing Run.
@@ -358,25 +396,58 @@ function OrchestrationRow({
         </div>
       )}
 
-      {/* Live job status: real phase/round/progress from the polled job, shown
-          while a run is in flight (and the failure reason if it failed) — never a
-          bare spinner. */}
-      {job && (job.state !== "completed" || jobIsActive(job)) && (
+      {/* Interrupted (restart-honest) callout: a prior run is no longer live and
+          briefs remain. Distinct from the live-job banner — it explains what
+          happened, shows the DURABLE progress (completed vs pending), labels the
+          status as reconstructed (never a live worker id), and points at Continue
+          to resume only the pending briefs (RELUX_MASTER_PLAN Sec 15). */}
+      {interrupted ? (
         <div
-          className={"banner" + (job.state === "failed" ? " err" : "")}
-          style={{ fontSize: 11, marginTop: 6 }}
+          className="banner"
+          style={{ fontSize: 11, marginTop: 6, borderColor: "var(--warn)" }}
+          role="status"
         >
-          <strong>{jobPhaseLabel(job)}</strong>
-          {jobProgressLabel(job) ? ` — ${jobProgressLabel(job)}` : ""}
-          {job.last_event && (
+          <strong style={{ color: "var(--warn)" }}>
+            Run interrupted — no live worker
+          </strong>
+          <div className="muted" style={{ fontSize: 10, marginTop: 2 }}>
+            Reconstructed from the durable record (this is not a live run): a
+            previous run finished, was canceled, or was lost to a server restart,
+            and nothing is driving this orchestration now.
+          </div>
+          <div style={{ fontSize: 11, marginTop: 4 }}>
+            {jobProgressLabel(job)}
+            {pending > 0 ? ` · ${pending} pending` : ""}
+          </div>
+          {pending > 0 && (
             <div className="muted" style={{ fontSize: 10, marginTop: 2 }}>
-              {job.last_event}
+              Continue starts a fresh run that resumes the {pending} pending
+              brief{pending === 1 ? "" : "s"}; completed briefs are never re-run.
             </div>
           )}
-          {job.error && (
-            <div style={{ fontSize: 10, marginTop: 2 }}>{job.error}</div>
-          )}
         </div>
+      ) : (
+        /* Live job status: real phase/round/progress from the polled job, shown
+           while a run is in flight (and the failure reason if it failed) — never a
+           bare spinner. Hidden once a live job completes cleanly. */
+        job &&
+        (job.state !== "completed" || jobIsActive(job)) && (
+          <div
+            className={"banner" + (job.state === "failed" ? " err" : "")}
+            style={{ fontSize: 11, marginTop: 6 }}
+          >
+            <strong>{jobPhaseLabel(job)}</strong>
+            {jobProgressLabel(job) ? ` — ${jobProgressLabel(job)}` : ""}
+            {job.last_event && (
+              <div className="muted" style={{ fontSize: 10, marginTop: 2 }}>
+                {job.last_event}
+              </div>
+            )}
+            {job.error && (
+              <div style={{ fontSize: 10, marginTop: 2 }}>{job.error}</div>
+            )}
+          </div>
+        )
       )}
 
       <div className="row" style={{ gap: 8, marginTop: 8 }}>

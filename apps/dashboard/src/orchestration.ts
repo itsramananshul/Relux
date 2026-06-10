@@ -337,8 +337,10 @@ export function jobPhaseLabel(job: ReluxOrchestrationJob | null | undefined): st
     case "canceled":
       return "Canceled";
     case "interrupted":
-      // Reconstructed from the durable record after a restart (no live worker).
-      return "Interrupted — run was lost to a server restart";
+      // Reconstructed from the durable record; no live worker is driving the run
+      // (it finished, was canceled, or was lost to a server restart). Honest, not
+      // over-claiming a specific cause — the callout body carries the full reason.
+      return "Interrupted — no live worker";
     default:
       return "";
   }
@@ -361,6 +363,31 @@ export function jobProgressLabel(job: ReluxOrchestrationJob | null | undefined):
 export function jobRunningStepIds(job: ReluxOrchestrationJob | null | undefined): string[] {
   if (!job) return [];
   return job.steps.filter((s) => s.outcome === "running").map((s) => s.task_id);
+}
+
+// True when a job's status was RECONSTRUCTED from the durable record rather than
+// reported by a live in-process worker. The kernel mints a clearly-synthetic
+// `durable:<orch_id>` id for these (RELUX_MASTER_PLAN Sec 15) precisely so a
+// client can tell them apart — the UI uses this to label the status honestly
+// ("reconstructed, no live worker") and to NEVER present the synthetic id as a
+// live job/worker id.
+export function jobIsReconstructed(job: ReluxOrchestrationJob | null | undefined): boolean {
+  return typeof job?.id === "string" && job.id.startsWith("durable:");
+}
+
+// True when a job ended "interrupted": a prior worker ran but is gone (finished,
+// canceled, or lost to a server restart) and pending briefs remain. Terminal for
+// that job (no worker is coming back), resumable with a fresh Continue run.
+export function jobIsInterrupted(job: ReluxOrchestrationJob | null | undefined): boolean {
+  return job?.state === "interrupted";
+}
+
+// How many of a job's briefs are still pending (not yet run to a terminal
+// outcome) — the count a Continue run would resume. Computed from the job's own
+// step snapshot so it matches exactly what the job reported; nothing fabricated.
+export function jobPendingCount(job: ReluxOrchestrationJob | null | undefined): number {
+  if (!job) return 0;
+  return job.steps.filter((s) => s.outcome === "pending").length;
 }
 
 // The Run/Continue button label given the current job and orchestration. While a

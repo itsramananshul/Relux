@@ -103,6 +103,25 @@ once a stable release is cut.
   synchronous `POST …/run` and `prime orchestration run` CLI were brought onto the
   same shared parallel executor in the follow-up entry above — they are no longer
   single-lock sequential.)*
+- **Dashboard polish for interrupted (restart-honest) orchestration jobs.** When a
+  poll by orchestration id returns a status RECONSTRUCTED from the durable record
+  (no live worker; master plan §15), the orchestration panel now renders a
+  **distinct restart-honest callout** instead of the live-job banner: it labels the
+  status as reconstructed — explicitly *not* a live run — shows the completed-vs-
+  pending split, and points at **Continue** to resume only the pending briefs
+  (completed briefs are never re-run). A reconstructed status is detected by its
+  synthetic `durable:<id>` (`jobIsReconstructed`), so that id is never shown as a
+  live worker. The panel also **hydrates** the durable job status once on load for
+  any `running` orchestration, so a page reload after a restart still surfaces the
+  callout (not only the session that pressed Run) — and the same path reconnects to
+  a still-live job and resumes polling it. Because `interrupted` is terminal
+  (`jobIsTerminal`), a reconstructed status schedules no further polling (no broken
+  loop). New `orchestration.ts` helpers (`jobIsReconstructed` / `jobIsInterrupted` /
+  `jobPendingCount`) and the refined cause-neutral phase label ("Interrupted — no
+  live worker", no longer over-claiming a restart as the only cause) are pinned by
+  added frontend tests (reconstructed-id detection, terminal/non-cancelable state,
+  the poll gate scheduling nothing, and the Continue CTA). Dashboard-only; no backend
+  or API change.
 - **Cooperative cancel/stop for orchestration jobs.** A running non-blocking job
   can be stopped honestly (master plan §15). `POST
   /v1/relux/orchestration-jobs/:job_id/cancel` sets a `cancel_requested` flag the

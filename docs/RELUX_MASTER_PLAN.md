@@ -2125,7 +2125,16 @@ kernel that is genuinely stopped and restarted: a `max=1` job leaves briefs pend
 restart #1 reconstructs `interrupted` (and the lost job id 404s), a fresh job
 resumes to `completed`, and restart #2 reconstructs `completed`. The dashboard treats
 `interrupted` as terminal (`jobIsTerminal`) with an honest phase label, so it stops
-polling, shows the durable progress, and re-enables Continue to resume.
+polling, shows the durable progress, and re-enables Continue to resume. The
+orchestration panel renders this as a **distinct restart-honest callout** (separate
+from the live-job banner): it labels the status as reconstructed from the durable
+record — explicitly *not* a live run — surfaces the completed-vs-pending split, and
+points at Continue to resume only the pending briefs. It detects a reconstructed
+status by the synthetic `durable:<id>` (`jobIsReconstructed`) and never presents that
+id as a live worker. So a reload after a restart still surfaces the callout (not only
+the session that pressed Run), the panel **hydrates** the durable job status once on
+load for any `running` orchestration — which also reconnects to a still-live job — and
+relies on the terminal gate so a reconstructed status schedules no further polling.
 
 ### Tool Invocation Surface (First Honest Version)
 
