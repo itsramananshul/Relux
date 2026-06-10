@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/itsramananshul/Relix/releases"><img src="https://img.shields.io/github/v/release/itsramananshul/Relix?include_prereleases&style=for-the-badge" alt="Release"></a>
+  <a href="https://github.com/itsramananshul/Relux/releases"><img src="https://img.shields.io/github/v/release/itsramananshul/Relux?include_prereleases&amp;style=for-the-badge" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg?style=for-the-badge" alt="MIT OR Apache-2.0"></a>
 </p>
 
@@ -1042,4 +1042,3 @@ Unless you explicitly state otherwise, any contribution
 intentionally submitted for inclusion in the work by you, as
 defined in the Apache-2.0 license, shall be dual licensed as
 above, without any additional terms or conditions.
-rms or conditions.
