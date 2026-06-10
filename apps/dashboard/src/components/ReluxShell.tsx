@@ -1,7 +1,9 @@
-import { useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { NavLink, useLocation } from "react-router-dom";
 import { useAuth } from "../auth";
 import { AccountPanel } from "./AccountPanel";
+import { session, type SessionMetaResponse } from "../api";
+import { sessionWarning } from "../account";
 
 // The standalone Relux product shell (RELUX_MASTER_PLAN section 11 Dashboard,
 // section 21 Final Product Feeling). This is what relux-kernel serves at /dashboard:
@@ -69,6 +71,69 @@ export function ReluxShell({ children }: { children: ReactNode }) {
   const who = status?.username ?? "admin";
   const [accountOpen, setAccountOpen] = useState(false);
 
+  // Passive, low-noise session-expiry warning (RELUX_MASTER_PLAN "Local operator
+  // login v1"). We read the safe, non-sliding /v1/auth/me metadata SPARSELY —
+  // once on mount and again only on cheap, event-driven moments (the tab
+  // becoming visible, the Account panel closing) — never a busy poll. Polling it
+  // would be pointless anyway: /v1/auth/me does not slide the session, so it
+  // cannot keep an idle console alive. A single per-minute timer counts the
+  // deadlines down locally so the chip can appear or clear between fetches with
+  // no extra round trips. A fetch failure (older kernel, transient) just leaves
+  // the chip hidden — the rest of the shell is unaffected.
+  const [sessionMeta, setSessionMeta] = useState<SessionMetaResponse | null>(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const anchorMs = useRef<number>(Date.now());
+
+  const loadMeta = useCallback(() => {
+    session
+      .me()
+      .then((m) => {
+        anchorMs.current = Date.now();
+        setSessionMeta(m);
+        setNowMs(Date.now());
+      })
+      .catch(() => {
+        /* no chip — the shell stays fully usable without the readout */
+      });
+  }, []);
+
+  // One fetch on mount, plus a re-anchor whenever the operator returns to the
+  // tab: their idle deadline may have slid forward (active use elsewhere) or
+  // genuinely lapsed while the tab was hidden. Event-driven and non-sliding —
+  // not a steady poll.
+  useEffect(() => {
+    loadMeta();
+    const onVisible = () => {
+      if (document.visibilityState === "visible") loadMeta();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [loadMeta]);
+
+  // Re-anchor after the Account panel closes — the operator likely just acted
+  // (which slides the idle deadline), so refresh the chip's basis once.
+  const prevAccountOpen = useRef(accountOpen);
+  useEffect(() => {
+    if (prevAccountOpen.current && !accountOpen) loadMeta();
+    prevAccountOpen.current = accountOpen;
+  }, [accountOpen, loadMeta]);
+
+  // A single per-minute local countdown — only while there is actually a window
+  // to count down (never under the dev bypass, which sends no deadlines). The
+  // windows are hours/days, so 60s keeps the chip honest without churn.
+  const hasWindows =
+    !!sessionMeta &&
+    (typeof sessionMeta.idle_expires_in_secs === "number" ||
+      typeof sessionMeta.absolute_expires_in_secs === "number");
+  useEffect(() => {
+    if (!hasWindows) return;
+    const id = setInterval(() => setNowMs(Date.now()), 60_000);
+    return () => clearInterval(id);
+  }, [hasWindows]);
+
+  const elapsedSecs = sessionMeta ? Math.max(0, Math.floor((nowMs - anchorMs.current) / 1000)) : 0;
+  const warn = sessionMeta ? sessionWarning(sessionMeta, elapsedSecs) : null;
+
   return (
     <div className="app">
       <aside className="sidebar" id="app-sidebar">
@@ -92,6 +157,20 @@ export function ReluxShell({ children }: { children: ReactNode }) {
             <span className="sub">{meta.sub}</span>
           </div>
           <div className="spacer" style={{ flex: 1 }} />
+          {warn && (
+            <button
+              className={"session-warn-chip" + (warn.kind === "absolute" ? " hard" : "")}
+              title={
+                warn.kind === "absolute"
+                  ? "This session reaches its hard 7-day limit soon. Sign out and back in to continue — open Account for details."
+                  : "This session will sign out for inactivity soon. Any action keeps it alive — open Account for details."
+              }
+              onClick={() => setAccountOpen(true)}
+            >
+              <span className="dot" aria-hidden="true" />
+              {warn.message}
+            </button>
+          )}
           <NavLink to="/prime" title="Talk to Prime">
             <button className="btn sm">Ask Prime →</button>
           </NavLink>

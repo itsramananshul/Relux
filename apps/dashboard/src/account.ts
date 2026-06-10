@@ -111,3 +111,65 @@ export function describeAbsolutePolicy(meta: SessionMeta): string | null {
   if (typeof meta.absolute_max_secs !== "number") return null;
   return `Re-sign-in required after ${formatDuration(meta.absolute_max_secs)}`;
 }
+
+// ── Passive session-expiry warning (shell chip) ───────────────────────────
+// A quiet, low-noise heads-up the Relux shell surfaces when the signed-in
+// session is close to ending (RELUX_MASTER_PLAN "Local operator login v1").
+// Computed from the SAME non-sliding `/v1/auth/me` metadata the Account control
+// reads, so the shell can fetch it sparsely (once on mount + on sparse events)
+// rather than busy-polling — and since reading `/v1/auth/me` never slides the
+// session, a warning is never silenced just by checking. This is a pure
+// decision helper: the shell renders whatever it returns and invents nothing.
+//
+// Two windows, two meanings, two thresholds:
+//  - ABSOLUTE: the 7-day hard ceiling. It never slides, so once it is close the
+//    operator WILL be signed out and must re-authenticate — nothing they do in
+//    the console extends it. Warned earlier (≤30 min) because the only fix is a
+//    fresh sign-in.
+//  - IDLE: the rolling inactivity timeout. Any authenticated action slides it
+//    forward, so it only bites once the console has genuinely gone idle. Warned
+//    later (≤10 min) because normal use clears it on its own.
+export const ABSOLUTE_WARN_SECS = 30 * 60;
+export const IDLE_WARN_SECS = 10 * 60;
+
+export type SessionWarningKind = "absolute" | "idle";
+
+export interface SessionWarning {
+  kind: SessionWarningKind;
+  // Seconds left on the warned window at the moment evaluated (clamped ≥0).
+  secsLeft: number;
+  // A short, glanceable line for the chip (already includes the countdown).
+  message: string;
+}
+
+// Decide whether to show a passive expiry warning, given the metadata and how
+// many seconds have elapsed locally since it was fetched. Returns null when
+// nothing is close enough to warn about — the common case, where the chip stays
+// hidden. When both windows are inside their thresholds the MORE URGENT one
+// wins (fewest seconds left); a tie favours `absolute`, since only a fresh
+// sign-in clears it. Never warns under the dev bypass (no deadlines are sent),
+// and stays silent for an older kernel that omits the remaining-seconds fields.
+export function sessionWarning(meta: SessionMeta, elapsedSecs = 0): SessionWarning | null {
+  if (meta.auth_disabled) return null;
+  const absLeft = absoluteRemaining(meta, elapsedSecs);
+  const idleLeft = idleRemaining(meta, elapsedSecs);
+  const candidates: SessionWarning[] = [];
+  if (absLeft != null && absLeft <= ABSOLUTE_WARN_SECS) {
+    candidates.push({
+      kind: "absolute",
+      secsLeft: absLeft,
+      message: `Re-sign-in required in ${formatDuration(absLeft)}`,
+    });
+  }
+  if (idleLeft != null && idleLeft <= IDLE_WARN_SECS) {
+    candidates.push({
+      kind: "idle",
+      secsLeft: idleLeft,
+      message: `Signs out for inactivity in ${formatDuration(idleLeft)}`,
+    });
+  }
+  if (candidates.length === 0) return null;
+  // Most urgent first; on a tie, absolute (only a fresh sign-in clears it).
+  candidates.sort((a, b) => a.secsLeft - b.secsLeft || (a.kind === "absolute" ? -1 : 1));
+  return candidates[0];
+}

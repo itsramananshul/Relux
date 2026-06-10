@@ -81,6 +81,22 @@ button { font-family: inherit; }
 .ident-chip .dot.warn { background: var(--warn); }
 @media (max-width: 980px) { .topbar .ident { display: none; } }
 
+/* Passive session-expiry chip in the Relux shell topbar (RELUX_MASTER_PLAN
+   "Local operator login v1"). A quiet heads-up, not an alarm: it appears only
+   when a deadline is close and clicks through to the Account panel. Color is
+   reserved for meaning — amber for the rolling idle window, red for the hard
+   absolute ceiling (a fresh sign-in is the only fix). */
+.session-warn-chip {
+  display: inline-flex; align-items: center; gap: 7px;
+  background: transparent; border: 1px solid var(--border); border-radius: 999px;
+  padding: 4px 11px; font-size: 12px; color: var(--text-dim);
+  cursor: pointer; white-space: nowrap;
+}
+.session-warn-chip:hover { border-color: var(--warn); color: var(--text); }
+.session-warn-chip.hard:hover { border-color: var(--err); }
+.session-warn-chip .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--warn); flex: 0 0 auto; }
+.session-warn-chip.hard .dot { background: var(--err); }
+
 /* ── Building blocks ───────────────────────────────────── */
 .grid { display: grid; gap: 14px; }
 .cols-2 { grid-template-columns: repeat(2, 1fr); }

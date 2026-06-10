@@ -2616,7 +2616,18 @@ The API never returns the key. The dashboard shows the current AI provider/mode.
   read). The dashboard **Account** control renders this as *"Signs out after 12h of
   inactivity"* / *"Re-sign-in required after 7d"* with a live, locally-counted
   *"… left"* readout (a single per-minute timer; under `RELUX_AUTH_DISABLED` it
-  shows an honest *"Session expiry is disabled"* note instead). Public by
+  shows an honest *"Session expiry is disabled"* note instead). The shell also
+  surfaces a **passive, low-noise expiry chip** in the topbar that appears only
+  when a deadline is close — amber for the rolling idle window (≤10 min left,
+  since any action slides it forward) and red for the hard absolute ceiling (≤30
+  min left, warned earlier because only a fresh sign-in clears it; on a tie the
+  absolute warning wins). Clicking it opens the Account control. The chip reads
+  the SAME non-sliding `/v1/auth/me` metadata sparsely — once on shell mount, then
+  re-anchored only on event-driven moments (the tab regaining visibility, the
+  Account panel closing) — never a busy poll, which would be pointless since the
+  read does not slide the session; a single per-minute timer counts down locally
+  between fetches, and the chip stays hidden under `RELUX_AUTH_DISABLED` or for an
+  older kernel that omits the deadlines. Public by
   design: the static dashboard (so the setup/login screen always renders — never a
   blank page), the public auth endpoints (`/v1/auth/status`/`setup`/`login`/
   `logout`/`me`), and `/v1/relux/health` (liveness probe). `POST

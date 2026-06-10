@@ -8,6 +8,9 @@ import {
   absoluteRemaining,
   describeIdlePolicy,
   describeAbsolutePolicy,
+  sessionWarning,
+  ABSOLUTE_WARN_SECS,
+  IDLE_WARN_SECS,
   type SessionMeta,
 } from "../src/account.ts";
 
@@ -95,4 +98,71 @@ test("policy descriptions read in friendly form, or null when absent", () => {
   const bare: SessionMeta = { username: "ops" };
   assert.equal(describeIdlePolicy(bare), null);
   assert.equal(describeAbsolutePolicy(bare), null);
+});
+
+// ── Passive session-expiry warning (shell chip) ──────────────────────────
+// These pin the decision the Relux shell uses to show its quiet expiry chip
+// from the SAME non-sliding /v1/auth/me metadata (RELUX_MASTER_PLAN "Local
+// operator login v1"). The shell renders whatever this returns — so the rules
+// (when to warn, which window wins, when to stay silent) are pinned here.
+
+test("sessionWarning thresholds match the documented windows", () => {
+  assert.equal(ABSOLUTE_WARN_SECS, 30 * 60);
+  assert.equal(IDLE_WARN_SECS, 10 * 60);
+});
+
+test("sessionWarning stays hidden when both windows are comfortably open", () => {
+  // META has 12h idle + 7d absolute remaining — nothing to warn about.
+  assert.equal(sessionWarning(META, 0), null);
+});
+
+test("sessionWarning fires on the absolute ceiling within 30 min", () => {
+  const m: SessionMeta = { username: "ops", absolute_expires_in_secs: 20 * 60 };
+  const w = sessionWarning(m, 0);
+  assert.equal(w?.kind, "absolute");
+  assert.equal(w?.secsLeft, 20 * 60);
+  assert.match(w?.message ?? "", /re-sign-in required in/i);
+});
+
+test("sessionWarning fires on idle inactivity within 10 min", () => {
+  const m: SessionMeta = { username: "ops", idle_expires_in_secs: 8 * 60 };
+  const w = sessionWarning(m, 0);
+  assert.equal(w?.kind, "idle");
+  assert.equal(w?.secsLeft, 8 * 60);
+  assert.match(w?.message ?? "", /inactivity/i);
+});
+
+test("sessionWarning shows the more urgent window; a tie favours absolute", () => {
+  // Idle closer than absolute → idle wins (it signs out sooner).
+  const closerIdle: SessionMeta = {
+    username: "ops",
+    absolute_expires_in_secs: 25 * 60,
+    idle_expires_in_secs: 5 * 60,
+  };
+  assert.equal(sessionWarning(closerIdle, 0)?.kind, "idle");
+  // Equal seconds left → absolute (only a fresh sign-in clears it).
+  const tie: SessionMeta = {
+    username: "ops",
+    absolute_expires_in_secs: 6 * 60,
+    idle_expires_in_secs: 6 * 60,
+  };
+  assert.equal(sessionWarning(tie, 0)?.kind, "absolute");
+});
+
+test("sessionWarning honours local elapsed time and the threshold edge", () => {
+  const m: SessionMeta = { username: "ops", absolute_expires_in_secs: 31 * 60 };
+  assert.equal(sessionWarning(m, 0), null); // 31m out — just outside the window
+  assert.equal(sessionWarning(m, 2 * 60)?.kind, "absolute"); // 29m left — now warns
+});
+
+test("sessionWarning stays silent under the dev bypass and for an older kernel", () => {
+  // RELUX_AUTH_DISABLED sends no deadlines — never warn.
+  const bypass: SessionMeta = {
+    username: "ops",
+    auth_disabled: true,
+    absolute_expires_in_secs: 60,
+  };
+  assert.equal(sessionWarning(bypass, 0), null);
+  // An older kernel sends only { username } — hide the chip, don't invent it.
+  assert.equal(sessionWarning({ username: "ops" }, 0), null);
 });

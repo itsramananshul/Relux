@@ -9,6 +9,23 @@ once a stable release is cut.
 
 ### Added
 
+- **Passive session-expiry warning in the Relux shell.** The dashboard topbar now
+  shows a quiet chip when the signed-in session is close to ending — amber for the
+  rolling **idle** window (*"Signs out for inactivity in 8m"*, ≤10 min left) and
+  red for the hard **absolute** 7-day ceiling (*"Re-sign-in required in 25m"*, ≤30
+  min left). Clicking it opens the **Account** panel, where the full readout and
+  the `reset-admin` recovery note live; the absolute case makes clear a fresh
+  sign-in is the only fix (it never slides). It reads the SAME safe, non-sliding
+  `GET /v1/auth/me` metadata the Account control uses — once on shell mount, then
+  re-anchored only on sparse, event-driven moments (the tab regaining visibility,
+  the Account panel closing), never a busy poll (and pointless to poll anyway:
+  `/v1/auth/me` does not slide the session). A single un-noisy **per-minute** timer
+  counts down locally between fetches. When both windows are close the more urgent
+  one shows (a tie favours absolute); the chip stays hidden under the
+  `RELUX_AUTH_DISABLED` dev bypass and for an older kernel that omits the deadlines.
+  Tests pin the warning decision helper (`sessionWarning` — thresholds, which
+  window wins, elapsed-time handling, the silent cases). Backend untouched. See
+  `docs/RELUX_MASTER_PLAN.md` → *Local operator login v1*.
 - **Session expiry / idle visibility in the dashboard Account control.** The
   Account modal now shows the signed-in operator their session policy at a glance:
   *"Signs out after 12h of inactivity"* and *"Re-sign-in required after 7d"*, each
