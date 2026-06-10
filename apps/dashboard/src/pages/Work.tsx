@@ -1,5 +1,6 @@
 import { useState, useMemo, useEffect } from "react";
-import { useLocation } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
+import { runIdFromSearch } from "../routing";
 import { reluxWork, reluxAudit, type ReluxTask, type ReluxRun, type ReluxAgent, type ReluxTaskDetail, type ReluxRunDetail, type ReluxAuditEntry, type ReluxRunEvent } from "../api";
 import { useAsync } from "../components/common";
 import {
@@ -17,9 +18,15 @@ import {
 
 export function Work() {
   const location = useLocation();
+  const navigate = useNavigate();
   const queryParams = useMemo(() => new URLSearchParams(location.search), [location.search]);
   const filterAgentId = queryParams.get("agentId");
   const filterStatus = queryParams.get("status");
+  // Run detail is URL-driven: `/work?run=<id>` opens that run's panel. Making the
+  // URL the source of truth (rather than only local state) lets a deep link from
+  // an orchestration step's run_id, plus browser back/forward/refresh, restore the
+  // same view. A missing/empty param simply shows no run panel.
+  const selectedRunId = runIdFromSearch(location.search);
 
   const { data: tasks, loading: loadingTasks, error: errorTasks, reload: reloadTasks } = useAsync<ReluxTask[]>(
     () => reluxWork.listTasks(),
@@ -37,7 +44,18 @@ export function Work() {
   const [newTaskTitle, setNewTaskTitle] = useState("");
   const [creating, setCreating] = useState(false);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
-  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+
+  // Point the URL at a run (or clear it), preserving any other Work filters in the
+  // querystring. This is the single way run selection changes, so it stays in sync
+  // with deep links and the browser history.
+  const setSelectedRunId = (runId: string | null) => {
+    if ((runId ?? null) === selectedRunId) return; // no-op: don't push a duplicate history entry
+    const next = new URLSearchParams(location.search);
+    if (runId) next.set("run", runId);
+    else next.delete("run");
+    const search = next.toString();
+    navigate({ search: search ? `?${search}` : "" }, { replace: false });
+  };
 
   async function createTask() {
     if (!newTaskTitle.trim()) return;
@@ -420,7 +438,8 @@ function RunDetailPanel({ runId, onClose, onRetried }: { runId: string; onClose:
         <div className="loading">Loading run details...</div>
       ) : error ? (
         <div className="banner err" style={{ fontSize: 12 }}>
-          Error loading run: {String(error)}
+          Could not load run <span className="mono">{runId}</span> ({String(error)}).
+          It may no longer exist or the Relux API is unreachable — use Close to go back.
         </div>
       ) : run ? (
         <div className="grid" style={{ gap: 8, fontSize: 12 }}>

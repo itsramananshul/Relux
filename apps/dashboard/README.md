@@ -134,6 +134,26 @@ finished shows **no** duration (no fabricated live timer), and an unparseable or
 backwards pair shows nothing rather than a wrong number. Pinned by
 `stepDurationLabel*` tests in `test/orchestration.test.ts`.
 
+### Run-detail deep links (in-shell)
+
+A run's detail belongs to the **Relux Work surface**, not the legacy `/runs`
+console. So a deep link to a run is **`/work?run=<run_id>`** — the same
+query-param style the Work page already uses for `?agentId` / `?status`. The
+Work page reads that param (`runIdFromSearch` in `src/routing.ts`) and opens that
+run's detail panel; the param is the **single source of truth**, so a deep link
+and browser **back / forward / refresh** all restore the same view (and selecting
+or closing a run just updates the URL). A run that no longer exists degrades
+honestly — the panel shows a "could not load run `<id>`" notice with a Close path,
+never a blank page or a fake link.
+
+This is what an orchestration step's `run_id` links to: `OrchestrationRow` renders
+a completed/failed brief's `run_id` as a link built by `workRunHref(run_id)`
+(`/work?run=<id>`), keeping the operator inside the Relux shell instead of hopping
+to the bridge-gated legacy console. A step that produced **no** run shows no link
+(never a fabricated one). The link construction/parse are pinned by `workRunHref*`
+/ `runIdFromSearch*` tests in `test/routing.test.ts`, and the shipped bundle is
+asserted to carry the `/work?run=` literal in `test/render-interrupted.test.mjs`.
+
 ## Mesh policy
 
 The dashboard's board / inbox / crew / runs pages call the coordinator's

@@ -188,3 +188,13 @@ test("the shipped JS bundle carries the interrupted callout copy (no stale dist)
   assert.match(bundle, /Reconstructed from the durable record/);
   assert.match(bundle, /Continue starts a fresh run that resumes the/);
 });
+
+test("the shipped JS bundle carries the in-shell run-detail deep link (no stale dist)", () => {
+  const assetsDir = join(distDir, "assets");
+  const jsFiles = readdirSync(assetsDir).filter((f) => f.endsWith(".js"));
+  const bundle = jsFiles.map((f) => readFileSync(join(assetsDir, f), "utf8")).join("\n");
+  // An orchestration step's run_id deep-links to the Work surface via this exact
+  // literal (workRunHref). If the source gained the link but the committed bundle
+  // was never rebuilt, it's absent → fail. The literal survives minification.
+  assert.match(bundle, /\/work\?run=/);
+});

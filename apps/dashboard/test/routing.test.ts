@@ -1,6 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { isLegacyPath, LEGACY_PATHS, RELUX_PATHS } from "../src/routing.ts";
+import {
+  isLegacyPath,
+  LEGACY_PATHS,
+  RELUX_PATHS,
+  workRunHref,
+  runIdFromSearch,
+} from "../src/routing.ts";
 
 // Guard against the blank-page regression: the Relux shell must own every path
 // except the explicit legacy set. If a Relux route (or any unknown sub-path) ever
@@ -34,5 +40,38 @@ test("Relux and legacy path sets do not overlap", () => {
   const legacy = new Set(LEGACY_PATHS);
   for (const p of RELUX_PATHS) {
     assert.equal(legacy.has(p), false, `${p} is claimed by both shells`);
+  }
+});
+
+// Run-detail deep links stay in the Relux shell (Work surface), never the legacy
+// `/runs` console. workRunHref builds the link; runIdFromSearch reads it back.
+
+test("workRunHref points a run into the in-shell Work surface, not legacy /runs", () => {
+  const href = workRunHref("run_0001");
+  assert.equal(href, "/work?run=run_0001");
+  // Owned by the Relux shell so it never falls into the bridge-gated console.
+  assert.equal(isLegacyPath("/work"), false);
+});
+
+test("workRunHref percent-encodes ids so odd characters can't break the query", () => {
+  assert.equal(workRunHref("a b&c=d"), "/work?run=a%20b%26c%3Dd");
+});
+
+test("runIdFromSearch round-trips the id workRunHref encodes", () => {
+  const tricky = "durable:orch_0001/2 3";
+  const search = new URL(`http://x${workRunHref(tricky)}`).search;
+  assert.equal(runIdFromSearch(search), tricky);
+});
+
+test("runIdFromSearch reads the run param with or without a leading '?'", () => {
+  assert.equal(runIdFromSearch("?run=run_42"), "run_42");
+  assert.equal(runIdFromSearch("run=run_42"), "run_42");
+  // Other Work filters alongside it don't confuse the read.
+  assert.equal(runIdFromSearch("?status=running&run=run_42"), "run_42");
+});
+
+test("runIdFromSearch returns null when no run is selected", () => {
+  for (const s of ["", "?", "?status=running", "?run="]) {
+    assert.equal(runIdFromSearch(s), null, `'${s}' must select no run`);
   }
 });

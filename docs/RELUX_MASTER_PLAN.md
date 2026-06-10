@@ -2542,7 +2542,12 @@ remain, in rough priority for the next slices:
    the adapter, status, current/last **phase**, a **real measured duration**, a
    redacted **output excerpt**, a clear **failure reason**, and (when the CLI
    reported them) **cost/usage** — all read from the durable transcript, never
-   fabricated. The Claude adapter requests a JSON result envelope that the kernel
+   fabricated. Run Detail is **URL-addressable in-shell**: `/work?run=<run_id>`
+   opens that run's panel (the param is the source of truth, so deep links and
+   browser back/forward/refresh restore it, and a missing run degrades to an honest
+   notice). An orchestration step's `run_id` deep-links here via `workRunHref`,
+   keeping the operator on the Relux Work surface rather than the legacy `/runs`
+   console. The Claude adapter requests a JSON result envelope that the kernel
    parses into an honest summary + metrics (`relux_core::parse_adapter_result`),
    and an envelope `is_error` is treated as a failure even on a clean exit; Codex
    and generic commands degrade honestly to plain text. A **failed run is

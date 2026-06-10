@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
+import { workRunHref } from "../routing";
 import {
   reluxOrchestration,
   ApiError,
@@ -560,8 +561,16 @@ export function OrchestrationRow({
                         {duration}
                       </span>
                     )}
+                    {/* Only a brief that actually produced a run gets a link, and it
+                        deep-links to that run's detail inside the Work surface
+                        (`/work?run=<id>`) — never a fake link for a step with no run. */}
                     {s.run_id && (
-                      <Link to="/work" className="mono muted" style={{ fontSize: 10 }}>
+                      <Link
+                        to={workRunHref(s.run_id)}
+                        className="mono muted"
+                        style={{ fontSize: 10 }}
+                        title="open this brief's run detail"
+                      >
                         {s.run_id}
                       </Link>
                     )}

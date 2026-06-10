@@ -42,3 +42,25 @@ const LEGACY_SET = new Set(LEGACY_PATHS);
 export function isLegacyPath(pathname: string): boolean {
   return LEGACY_SET.has(pathname);
 }
+
+// Run-detail deep links stay INSIDE the Relux shell.
+//
+// IA decision: a run's detail is part of the Relux Work surface, not the legacy
+// `/runs` console. So a deep link to a run is `/work?run=<id>` — the same
+// query-param style the Work page already uses for `?agentId`/`?status`, and the
+// Work page reads it to open that run's detail panel. This keeps an operator on
+// the Relux shell (and out of the bridge-gated legacy console) when they follow a
+// run from anywhere — e.g. an orchestration step's `run_id`. The param is the
+// single source of truth, so browser back/forward/refresh restore the same view.
+
+/// Build the in-shell href that opens a run's detail on the Work page.
+export function workRunHref(runId: string): string {
+  return `/work?run=${encodeURIComponent(runId)}`;
+}
+
+/// Read the run id a `/work` URL is pointing at, or null when none is present.
+/// Accepts the raw `location.search` (with or without the leading `?`).
+export function runIdFromSearch(search: string): string | null {
+  const id = new URLSearchParams(search).get("run");
+  return id && id.length > 0 ? id : null;
+}
