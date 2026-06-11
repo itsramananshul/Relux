@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import {
   reluxWork,
   reluxAdapters,
+  agentSelfAssignTask,
   type ReluxAgent,
   type ReluxAgentConfig,
   type ReluxAgentPreset,
@@ -20,6 +21,11 @@ import {
   permissionInvalidReason,
   managerGrantAvailability,
   parseTokenTtlSecs,
+  assignTaskFormReason,
+  assignTaskCurlSnippet,
+  managerGrantCurlSnippet,
+  AGENT_SELF_ASSIGN_TASK_ROUTE,
+  AGENT_SELF_MANAGER_GRANT_ROUTE,
   type ManagerGrantAgent,
 } from "../governance";
 import { parseSkillsInput, formatSkillsInput } from "../skills";
@@ -738,6 +744,7 @@ function GovernanceSection({
         onChanged={onChanged}
       />
       <AgentTokenPanel agentId={agentId} />
+      <ManagerTokenActionsPanel agentId={agentId} targets={managerGrant.targets} />
     </div>
   );
 }
@@ -922,6 +929,226 @@ function AgentTokenPanel({ agentId }: { agentId: string }) {
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+// A compact, HONEST manager-actions panel for the per-agent token path. It documents the
+// two agent-self routes a token unlocks (`manager-grant` / `assign-task`), shows copy-paste
+// curl snippets that embed NO secret (the token is the `$RELUX_AGENT_TOKEN` shell var), and
+// offers a local test form for `assign-task`. The form requires the operator to PASTE the
+// raw token deliberately — the dashboard cannot reuse a minted token (only its hash is
+// stored, copy-once), so it never fakes the credential, and it drives the bearer path
+// (`agentSelfAssignTask`, `credentials: "omit"`) so the operator session is NOT used to
+// bypass the token. The acting manager is always the token subject; the kernel re-checks
+// own-Branch + Active + the `agent:<id>:subtree:assign_task` scope.
+// docs/HERMES_OPENCLAW_DEEP_AUDIT.md §20 / §21.
+export function ManagerTokenActionsPanel({
+  agentId,
+  targets,
+}: {
+  agentId: string;
+  targets: string[];
+}) {
+  const [open, setOpen] = useState(false);
+  const [token, setToken] = useState("");
+  const [taskId, setTaskId] = useState("");
+  const [target, setTarget] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<ReluxTask | null>(null);
+  const [snippetCopied, setSnippetCopied] = useState(false);
+
+  const notReady = assignTaskFormReason(token, taskId, target);
+  const snippet = assignTaskCurlSnippet(taskId, target);
+
+  async function copySnippet() {
+    try {
+      await navigator.clipboard.writeText(snippet);
+      setSnippetCopied(true);
+    } catch {
+      setSnippetCopied(false);
+    }
+  }
+
+  async function runAssign() {
+    const reason = assignTaskFormReason(token, taskId, target);
+    if (reason) {
+      setError(reason);
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setResult(null);
+    try {
+      const updated = await agentSelfAssignTask(token.trim(), taskId.trim(), target.trim());
+      setResult(updated);
+      // The credential has done its single job — drop it from state immediately so a
+      // pasted token does not linger in memory longer than the request needs it.
+      setToken("");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Assignment failed.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div
+      className="manager-token-actions-panel"
+      style={{ marginTop: 12, borderTop: "1px dashed var(--border, #2a2a2a)", paddingTop: 10 }}
+    >
+      <h4 style={{ margin: "0 0 4px" }}>Manager actions (token-authenticated)</h4>
+      <p className="muted" style={{ fontSize: 12, marginTop: 0 }}>
+        A per-agent token authenticates a request <strong>as this agent</strong> on two
+        agent-self manager routes, each needing the matching{" "}
+        <span className="mono">agent:{agentId}:subtree:&lt;action&gt;</span> scope (own Branch ·
+        live · scoped — the kernel re-checks it):
+      </p>
+      <ul className="muted" style={{ fontSize: 12, margin: "0 0 6px", paddingLeft: 18 }}>
+        <li>
+          <span className="mono">POST {AGENT_SELF_MANAGER_GRANT_ROUTE}</span> — grant a permission
+          to a Branch operative (<span className="mono">grant_permission</span>).
+        </li>
+        <li>
+          <span className="mono">POST {AGENT_SELF_ASSIGN_TASK_ROUTE}</span> — assign a live task to
+          a Branch operative (<span className="mono">assign_task</span>).
+        </li>
+      </ul>
+      <p className="muted" style={{ fontSize: 11, marginTop: 0 }}>
+        The raw token is shown <strong>once</strong> at mint and stored only as a hash, so the
+        dashboard cannot replay it — paste it yourself to test. These routes never accept the
+        operator session; only the bearer token acts.
+      </p>
+
+      <details
+        open={open}
+        onToggle={(e) => setOpen((e.currentTarget as HTMLDetailsElement).open)}
+        style={{ marginTop: 6 }}
+      >
+        <summary style={{ cursor: "pointer", fontSize: 12 }}>
+          Test <span className="mono">assign-task</span> with a token
+        </summary>
+
+        <div className="form-group" style={{ marginTop: 8 }}>
+          <label htmlFor={`mta-${agentId}-token`}>Raw agent token (paste once):</label>
+          <input
+            id={`mta-${agentId}-token`}
+            type="password"
+            autoComplete="off"
+            value={token}
+            onChange={(e) => setToken(e.target.value)}
+            placeholder="relux_agt_…"
+            style={{ width: "100%" }}
+          />
+        </div>
+        <div className="form-group" style={{ marginTop: 6 }}>
+          <label htmlFor={`mta-${agentId}-task`}>Task id:</label>
+          <input
+            id={`mta-${agentId}-task`}
+            type="text"
+            className="mono"
+            value={taskId}
+            onChange={(e) => setTaskId(e.target.value)}
+            placeholder="e.g. task_0001"
+            style={{ width: "100%" }}
+          />
+        </div>
+        <div className="form-group" style={{ marginTop: 6 }}>
+          <label htmlFor={`mta-${agentId}-target`}>Target subordinate id:</label>
+          {targets.length > 0 ? (
+            <select
+              id={`mta-${agentId}-target`}
+              value={target}
+              onChange={(e) => setTarget(e.target.value)}
+              style={{ width: "100%" }}
+            >
+              <option value="">— choose a Branch operative —</option>
+              {targets.map((id) => (
+                <option key={id} value={id}>{id}</option>
+              ))}
+            </select>
+          ) : (
+            <input
+              id={`mta-${agentId}-target`}
+              type="text"
+              className="mono"
+              value={target}
+              onChange={(e) => setTarget(e.target.value)}
+              placeholder="a subordinate in this agent's Branch"
+              style={{ width: "100%" }}
+            />
+          )}
+        </div>
+
+        {error && <div className="error-message">{error}</div>}
+        {result && (
+          <div
+            className="assign-result"
+            style={{ margin: "6px 0", fontSize: 12, color: "var(--ok, #2aa198)" }}
+          >
+            Assigned <span className="mono">{result.id}</span> →{" "}
+            <span className="mono">{result.assigned_agent ?? "—"}</span> · status{" "}
+            <span className="mono">{result.status}</span>
+          </div>
+        )}
+
+        <button
+          type="button"
+          className="btn sm"
+          onClick={() => void runAssign()}
+          disabled={busy || !!notReady}
+          style={{ marginTop: 4 }}
+        >
+          {busy ? "…" : "Assign as manager (token)"}
+        </button>
+        {notReady && (
+          <p className="muted" style={{ fontSize: 11, marginTop: 2 }}>{notReady}</p>
+        )}
+
+        <div style={{ marginTop: 10 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span className="muted" style={{ fontSize: 11 }}>
+              Or call it yourself (no secret in this snippet):
+            </span>
+            <button type="button" className="btn ghost sm" onClick={() => void copySnippet()}>
+              {snippetCopied ? "Copied" : "Copy curl"}
+            </button>
+          </div>
+          <pre
+            className="mono"
+            style={{
+              fontSize: 11,
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-all",
+              background: "var(--code-bg, #111)",
+              padding: 8,
+              borderRadius: 4,
+              marginTop: 4,
+            }}
+          >
+            {snippet}
+          </pre>
+          <p className="muted" style={{ fontSize: 11, marginTop: 2 }}>
+            Set <span className="mono">RELUX_AGENT_TOKEN</span> to the raw token, then run the
+            above. The sibling grant call:
+          </p>
+          <pre
+            className="mono"
+            style={{
+              fontSize: 11,
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-all",
+              background: "var(--code-bg, #111)",
+              padding: 8,
+              borderRadius: 4,
+              marginTop: 4,
+            }}
+          >
+            {managerGrantCurlSnippet(target, "tool:relux-tools-echo:say")}
+          </pre>
+        </div>
+      </details>
     </div>
   );
 }

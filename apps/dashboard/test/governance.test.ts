@@ -19,6 +19,12 @@ import {
   managerSubtreeActions,
   managerGrantAvailability,
   parseTokenTtlSecs,
+  agentTokenLooksValid,
+  assignTaskFormReason,
+  assignTaskCurlSnippet,
+  managerGrantCurlSnippet,
+  AGENT_SELF_ASSIGN_TASK_ROUTE,
+  AGENT_SELF_MANAGER_GRANT_ROUTE,
   type ManagerGrantAgent,
 } from "../src/governance.ts";
 
@@ -197,6 +203,49 @@ test("control-plane prefixes are elevated; tool/task/audit are standard", () => 
     assert.equal(permissionRisk(p), "standard", `${p} should be standard`);
     assert.equal(isElevatedPermission(p), false);
   }
+});
+
+test("agentTokenLooksValid accepts the relux_agt_ shape only", () => {
+  assert.equal(agentTokenLooksValid("relux_agt_deadbeef01234567"), true);
+  assert.equal(agentTokenLooksValid("  relux_agt_abc123  "), true);
+  // Wrong prefix / empty / shaped-like-something-else are rejected.
+  assert.equal(agentTokenLooksValid("relux_session_abc"), false);
+  assert.equal(agentTokenLooksValid("agt_abc"), false);
+  assert.equal(agentTokenLooksValid(""), false);
+  assert.equal(agentTokenLooksValid("relux_agt_"), false);
+});
+
+test("assignTaskFormReason gates the token test form, null when ready", () => {
+  // Missing/!shaped token, missing task, missing target each get an honest reason.
+  assert.match(assignTaskFormReason("", "task_1", "ic")!, /raw token/);
+  assert.match(assignTaskFormReason("not-a-token", "task_1", "ic")!, /relux_agt_/);
+  assert.match(assignTaskFormReason("relux_agt_abc", "", "ic")!, /task id/);
+  assert.match(assignTaskFormReason("relux_agt_abc", "task_1", "")!, /target/);
+  // All present + well-shaped → ready.
+  assert.equal(assignTaskFormReason("relux_agt_abc", "task_1", "ic"), null);
+});
+
+test("the curl snippets embed NO secret (token is the $RELUX_AGENT_TOKEN var) and hit the real routes", () => {
+  const assign = assignTaskCurlSnippet("task_0001", "ic");
+  // The real route + body field names, never the operator console.
+  assert.ok(assign.includes(AGENT_SELF_ASSIGN_TASK_ROUTE));
+  assert.match(assign, /"task_id":"task_0001"/);
+  assert.match(assign, /"target_agent_id":"ic"/);
+  // The token is a shell variable — never an inlined secret.
+  assert.match(assign, /Bearer \$RELUX_AGENT_TOKEN/);
+  assert.ok(!assign.includes("relux_agt_"), "snippet must not inline a raw token");
+
+  // Blank ids fall back to clear placeholders (no crash, shape stays obvious).
+  const blank = assignTaskCurlSnippet("", "");
+  assert.match(blank, /<task_id>/);
+  assert.match(blank, /<target_agent_id>/);
+
+  const grant = managerGrantCurlSnippet("ic", "tool:relux-tools-echo:say");
+  assert.ok(grant.includes(AGENT_SELF_MANAGER_GRANT_ROUTE));
+  assert.match(grant, /"target_id":"ic"/);
+  assert.match(grant, /"permission":"tool:relux-tools-echo:say"/);
+  assert.match(grant, /Bearer \$RELUX_AGENT_TOKEN/);
+  assert.ok(!grant.includes("relux_agt_"), "snippet must not inline a raw token");
 });
 
 test("parseTokenTtlSecs converts days→secs and treats blank/invalid as unspecified", () => {

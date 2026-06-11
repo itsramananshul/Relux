@@ -89,6 +89,45 @@ export const api = {
   del: <T = unknown>(path: string, body?: unknown) => request("DELETE", path, body) as Promise<T>,
 };
 
+// ── Per-agent bearer-token path (NOT the operator session) ─────────────────
+// The agent-self routes (`/v1/relux/agents/me/*`) are gated by the per-agent
+// access token, NEVER the operator cookie. `agentSelfAssignTask` drives the
+// token-authenticated manager-subtree task assignment (docs/HERMES_OPENCLAW_DEEP_AUDIT.md §21):
+// the acting manager is the TOKEN SUBJECT — the kernel reads it from the bearer
+// token, never from the body — so this is the real per-agent-authenticated path,
+// not the operator standing in. We deliberately:
+//   - send `Authorization: Bearer <token>` (the only thing that authenticates here), and
+//   - `credentials: "omit"` so the operator's `relux_session` cookie plays NO part.
+// The raw token is used in-memory for this single request and never stored or logged
+// here. A 401 means a bad/expired TOKEN (not an operator-session lapse), so this path
+// must NOT fire the session-expired signal — it throws an honest ApiError instead.
+export async function agentSelfAssignTask(
+  token: string,
+  taskId: string,
+  targetAgentId: string,
+): Promise<ReluxTask> {
+  const res = await fetch("/v1/relux/agents/me/assign-task", {
+    method: "POST",
+    credentials: "omit",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ task_id: taskId, target_agent_id: targetAgentId }),
+  });
+  const data = await parse(res);
+  if (!res.ok) {
+    const msg =
+      (data && typeof data === "object" && "error" in data
+        ? String((data as Record<string, unknown>).error)
+        : typeof data === "string" && data
+          ? data
+          : `HTTP ${res.status}`) || `HTTP ${res.status}`;
+    throw new ApiError(res.status, msg);
+  }
+  return data as ReluxTask;
+}
+
 // ── Current session metadata (`GET /v1/auth/me`) ──────────────────────────
 // The signed-in operator + safe session-expiry metadata for the Account control
 // (idle/absolute deadlines + remaining seconds; never the session id or hash).

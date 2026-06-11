@@ -1111,11 +1111,28 @@ section for the full reference read + applied-change record. In brief:
   + the exact scope; the only thing that changed is that a manager may now exercise **assignment** over its
   Branch (not just permission-granting), each scoped and individually revocable as its own capability row.
 
-- **No new UI this round (honest, API + docs).** The Crew Governance panel already classifies any
-  `agent:<id>:subtree:<action>` scope as elevated and documents the manager-subtree rule (§19); adding a
-  dedicated manager-token *assignment* console affordance is deferred rather than faked — the capability is
-  reachable over the documented `POST /v1/relux/agents/me/assign-task` route and the scope is grantable/
-  revocable through the existing governance form. No fake assignment UI was added.
+- **UI (SHIPPED — the deferred affordance, built honestly).** The Crew Governance card gains a compact
+  **Manager actions (token-authenticated)** panel (`ManagerTokenActionsPanel` in
+  `apps/dashboard/src/pages/Crew.tsx`), placed under the §20 Access-tokens panel. It (1) documents BOTH
+  agent-self routes a token unlocks — `POST /v1/relux/agents/me/manager-grant` (`grant_permission`) and
+  `POST /v1/relux/agents/me/assign-task` (`assign_task`) — spelling out the required
+  `agent:<this-agent>:subtree:<action>` scope and the own-Branch + Active rule the kernel re-checks; (2)
+  offers copy-paste **curl snippets** that embed NO secret — the token is referenced as the
+  `$RELUX_AGENT_TOKEN` shell variable, never inlined; and (3) provides a collapsible **local test form** for
+  `assign-task`. The form is honest about the trust boundary: because the raw token is shown copy-once and
+  stored only as a hash, the dashboard **cannot** replay a minted token, so the operator must **paste it
+  deliberately** into a `type="password"` field (cleared from state the moment the request returns). The
+  form drives the new `agentSelfAssignTask(token, task_id, target_agent_id)` API helper
+  (`apps/dashboard/src/api.ts`), which sends `Authorization: Bearer <token>` and **`credentials: "omit"`** so
+  the operator's `relux_session` cookie plays no part — it is the genuine per-agent bearer path, never the
+  operator standing in. A 401/403 on this path means a bad/expired **token** (not an operator-session lapse),
+  so it throws an honest `ApiError` and deliberately does **not** fire the dashboard's session-expired
+  signal. Pure helpers live in `apps/dashboard/src/governance.ts` (`assignTaskFormReason`,
+  `agentTokenLooksValid`, `assignTaskCurlSnippet`, `managerGrantCurlSnippet`, and the route constants). The
+  panel never widens authority — it is a thin client over the documented route; the kernel remains the sole
+  authority. **Trust boundary (UI):** the operator pastes a credential it cannot otherwise obtain, the bearer
+  (not the cookie) authenticates, the acting manager is always the token subject, and no raw token is ever
+  stored, re-displayed, or embedded in a snippet.
 
 - **Tests.** `permission.rs::subtree_grant_action_is_exact_and_generic_over_the_action_name` (an
   `assign_task` scope authorizes only `assign_task`, no bleed with `grant_permission`, self never a target).
@@ -1129,12 +1146,22 @@ section for the full reference read + applied-change record. In brief:
   target 403, missing task 400, paused manager 403, and the `agent:token_authenticated_manager_assign_task`
   + inner `task:assign` audit rows present with the raw token absent; the operator-route boundary check now
   also asserts the new route is bearer-gated. Full `relux-core` (159) + `relux-kernel` lib (639) + bin/server
-  (113) suites green; clippy clean on both crates.
+  (113) suites green; clippy clean on both crates. **Frontend (UI slice):** `governance.test.ts` pins
+  `agentTokenLooksValid`, `assignTaskFormReason`, and that both curl snippets hit the real routes with the
+  right body field names while embedding **no** raw token (the `$RELUX_AGENT_TOKEN` var only).
+  `manager-token-actions.test.ts` stubs `fetch` and pins the `agentSelfAssignTask` request shape — the
+  agent-self route, `POST`, `credentials: "omit"` (no operator cookie), the `Bearer` header, a body of only
+  `{task_id,target_agent_id}` — and that a 403 throws an `ApiError` WITHOUT firing the session-expired signal.
+  `manager-token-actions-render.test.mjs` server-renders the real panel (both routes documented, the required
+  scope shown, a `type="password"` paste field, the bearer-var snippet, the Branch target picker, **no raw
+  `relux_agt_<chars>` token in the markup**) and asserts the committed bundle carries the panel copy (no
+  stale dist). Dashboard typecheck + tests (300) + bundle rebuild green.
 
 - **Still missing (honest).** More subtree *actions* still open (`revoke`, status changes, …); agent-driven
   token enrollment/rotation; project / namespace scopes; governed budgets; persistent `allow-always` grants;
-  a richer agent self-service + a manager-token *assignment* UI affordance; and Board-style oversight all
-  remain open.
+  a richer agent self-service surface; a *full* manager console (Board-style oversight, a manager-grant test
+  form beyond the documented snippet, live task pickers) — the §21 UI is a compact honest test affordance,
+  not a console; and Board-style oversight all remain open.
 
 ---
 

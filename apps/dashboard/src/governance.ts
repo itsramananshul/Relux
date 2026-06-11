@@ -227,6 +227,84 @@ export function managerGrantAvailability(
   return { available: true, reason: "", targets };
 }
 
+// --- Token-authenticated manager actions (Crew Access-tokens panel) ----------
+//
+// A per-agent access token authenticates a request AS its subject on the tiny agent-self
+// route subset (`/v1/relux/agents/me/*`) and NOTHING else — it never touches the operator
+// console. Two manager-subtree actions are reachable today, each requiring the matching
+// `agent:<manager-id>:subtree:<action>` scope on the acting manager (own-Branch + Active):
+//   - `manager-grant`  → `POST /v1/relux/agents/me/manager-grant`  (grant_permission)
+//   - `assign-task`    → `POST /v1/relux/agents/me/assign-task`    (assign_task)
+// These helpers build copy-paste snippets and validate the local test form. The raw token
+// is NEVER inlined into a snippet (it is referenced as a shell variable) and is never
+// stored — only the operator who just minted it (copy-once) can paste it.
+// docs/HERMES_OPENCLAW_DEEP_AUDIT.md §20 / §21.
+
+/** The agent-self manager-action routes a per-agent token unlocks (the ONLY routes it reaches). */
+export const AGENT_SELF_MANAGER_GRANT_ROUTE = "/v1/relux/agents/me/manager-grant";
+export const AGENT_SELF_ASSIGN_TASK_ROUTE = "/v1/relux/agents/me/assign-task";
+
+// The raw per-agent token shape (`relux_agt_<hex>`), mirrored from
+// `crates/relux-kernel/src/agent_auth.rs`. Used only to reject an obviously-wrong paste
+// BEFORE the request — the kernel is the real authority and re-validates every token.
+const AGENT_TOKEN_RE = /^relux_agt_[A-Za-z0-9]+$/;
+
+/** Whether a pasted string has the per-agent raw-token shape (`relux_agt_…`). */
+export function agentTokenLooksValid(token: string): boolean {
+  return AGENT_TOKEN_RE.test(token.trim());
+}
+
+/**
+ * Honest reason the token-authenticated assign-task test form is not ready to submit, or
+ * null when every field is present and well-shaped. A UI gate only (the kernel re-checks
+ * authority, Branch membership, and task assignability) — it never widens anything.
+ */
+export function assignTaskFormReason(
+  token: string,
+  taskId: string,
+  targetAgentId: string,
+): string | null {
+  if (!token.trim()) return "Paste the agent's raw token (shown once at mint).";
+  if (!agentTokenLooksValid(token)) {
+    return "That does not look like a per-agent token (expected `relux_agt_…`).";
+  }
+  if (!taskId.trim()) return "Enter the task id to assign.";
+  if (!targetAgentId.trim()) return "Enter the target subordinate's id.";
+  return null;
+}
+
+/**
+ * A copy-paste curl snippet for the token-authenticated assign-task call. The token is
+ * referenced as the `$RELUX_AGENT_TOKEN` shell variable and is NEVER embedded, so the
+ * snippet carries no secret and is safe to display/copy. Blank ids fall back to angle-
+ * bracket placeholders so the shape is always clear.
+ */
+export function assignTaskCurlSnippet(taskId: string, targetAgentId: string): string {
+  const t = taskId.trim() || "<task_id>";
+  const a = targetAgentId.trim() || "<target_agent_id>";
+  return [
+    `curl -sS -X POST http://127.0.0.1:19891${AGENT_SELF_ASSIGN_TASK_ROUTE} \\`,
+    `  -H "Authorization: Bearer $RELUX_AGENT_TOKEN" \\`,
+    `  -H "content-type: application/json" \\`,
+    `  -d '{"task_id":"${t}","target_agent_id":"${a}"}'`,
+  ].join("\n");
+}
+
+/**
+ * A copy-paste curl snippet for the token-authenticated manager-grant call (the sibling
+ * action). Same no-secret discipline: the token is the `$RELUX_AGENT_TOKEN` variable.
+ */
+export function managerGrantCurlSnippet(targetAgentId: string, permission: string): string {
+  const a = targetAgentId.trim() || "<target_agent_id>";
+  const p = permission.trim() || "<permission>";
+  return [
+    `curl -sS -X POST http://127.0.0.1:19891${AGENT_SELF_MANAGER_GRANT_ROUTE} \\`,
+    `  -H "Authorization: Bearer $RELUX_AGENT_TOKEN" \\`,
+    `  -H "content-type: application/json" \\`,
+    `  -d '{"target_id":"${a}","permission":"${p}"}'`,
+  ].join("\n");
+}
+
 /**
  * Parse the optional "lifetime (days)" field on the agent-token mint form into a TTL in
  * seconds, or `undefined` when blank/invalid (the backend then applies its default and
