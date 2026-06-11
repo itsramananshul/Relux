@@ -18,6 +18,7 @@ pub mod prime;
 pub mod proposed_change;
 pub mod redact;
 pub mod run;
+pub mod run_failure;
 pub mod runtime;
 pub mod task;
 pub mod tool;
@@ -59,6 +60,10 @@ pub use proposed_change::{
 };
 pub use redact::redact_secrets;
 pub use run::{Run, RunId, RunStatus};
+pub use run_failure::{
+    classify_failure, retry_delay_secs, safe_public_message, RunFailureClass, RunRetryState,
+    MAX_PUBLIC_MESSAGE_CHARS, MAX_TRANSIENT_RETRIES, RETRY_BACKOFF_SECS,
+};
 pub use runtime::{
     clamp_runtime_timeout, parse_loopback_url, validate_loopback_url, LoopbackUrl, LoopbackUrlError,
     RuntimeKind, ToolRuntimeConfig, DEFAULT_RUNTIME_TIMEOUT_MS, MAX_RUNTIME_TIMEOUT_MS,

@@ -29,9 +29,10 @@ use relux_core::{
     AuditResult, InstalledPlugin, Namespace, NamespaceId, Orchestration, OrchestrationBatchResult,
     OrchestrationId, OrchestrationStatus, OrchestrationStep, Permission, PluginId, PluginManifest,
     PluginSourceKind, PrimeAction, PrimeAutonomyConfig, PrimeAutonomyTickResult, PrimeContext,
-    PrimeDisposition, PrimePlan, PrimeTurn, RiskLevel, RuntimeKind, Run, RunId, RunStatus,
-    StateSummary, StepOutcome, Task, TaskBrief, TaskId, TaskStatus, ToolDefinition, ToolDescriptor,
-    ToolExecutability, ToolInvocationResult, ToolRuntimeConfig,
+    classify_failure, PrimeDisposition, PrimePlan, PrimeTurn, RiskLevel, RunFailureClass, RunId,
+    RunRetryState, RunStatus, RuntimeKind, Run, StateSummary, StepOutcome, Task, TaskBrief, TaskId,
+    TaskStatus, ToolDefinition, ToolDescriptor, ToolExecutability, ToolInvocationResult,
+    ToolRuntimeConfig,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1630,6 +1631,56 @@ impl KernelState {
             }
         };
 
+        // Bounded transient-retry pass (the honest "next-tick retry-ready" state,
+        // `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §7). A failed run whose class is an
+        // auto-retryable transient and whose `[2m,10m,30m,2h]` backoff has elapsed
+        // is re-attempted here through the SAME governed `retry_run` path (which
+        // re-checks the enabled runtime, binary on PATH, and permission, and stamps
+        // the `retried_from` lineage so the next attempt's backoff grows). There is
+        // no background scheduler: eligibility is checked against real wall time
+        // only when an operator/cron invokes a tick. Bounded by the per-tick cap.
+        let ready = self.transient_retry_ready(real_now_secs());
+        for run_id in ready.into_iter().take(max_tasks) {
+            let namespace = self
+                .runs
+                .get(&run_id)
+                .and_then(|r| self.tasks.get(&r.task_id))
+                .map(|t| t.namespace_id.clone());
+            match self.retry_run(&run_id) {
+                Ok(new_run_id) => {
+                    result.transient_retries += 1;
+                    result.actions_taken += 1;
+                    self.record_audit(
+                        "kernel",
+                        "prime",
+                        "autonomy:transient_retry",
+                        Some("run"),
+                        Some(new_run_id.as_str()),
+                        namespace.as_ref(),
+                        AuditResult::Success,
+                        serde_json::json!({ "retried_from": run_id.as_str() }),
+                    );
+                }
+                Err(e) => {
+                    // A re-attempt that fails again is honest, not fatal to the
+                    // tick: record why and move on (the new run carries its own
+                    // class + next backoff, or is exhausted).
+                    let reason = format!("Transient retry of run {run_id} failed: {e}");
+                    result.skipped_reasons.push(reason.clone());
+                    self.record_audit(
+                        "kernel",
+                        "prime",
+                        "autonomy:transient_retry_failed",
+                        Some("run"),
+                        Some(run_id.as_str()),
+                        namespace.as_ref(),
+                        AuditResult::Failed,
+                        serde_json::json!({ "reason": reason }),
+                    );
+                }
+            }
+        }
+
         let mut candidates: Vec<TaskId> = self
             .tasks
             .values()
@@ -2550,6 +2601,8 @@ impl KernelState {
             retried_from: None,
             artifacts: Vec::new(),
             proposed_changes: Vec::new(),
+            failure_class: None,
+            retry: None,
         };
         self.runs.insert(run_id.clone(), run);
 
@@ -3740,6 +3793,26 @@ impl KernelState {
         if let Some(new_run_id) = new_run_id.clone() {
             if let Some(run) = self.runs.get_mut(&new_run_id) {
                 run.retried_from = Some(run_id.clone());
+            }
+            // The retry lineage is now linked, so the new run's transient-retry
+            // attempt index (its `retried_from` depth) is finally correct. If this
+            // re-attempt ALSO failed transiently, re-plan its bounded-retry state
+            // against that attempt so the backoff grows across attempts and the
+            // budget can exhaust (at fail time the lineage was not yet stamped, so
+            // the attempt read as 0). Non-retryable failures are left untouched.
+            let retry_class = self.runs.get(&new_run_id).and_then(|run| {
+                if run.status == RunStatus::Failed {
+                    run.failure_class.filter(|c| c.retryable())
+                } else {
+                    None
+                }
+            });
+            if let Some(class) = retry_class {
+                let attempt = self.transient_attempt_for(&new_run_id);
+                let replanned = RunRetryState::plan(class, attempt, real_now_secs());
+                if let Some(run) = self.runs.get_mut(&new_run_id) {
+                    run.retry = replanned;
+                }
             }
             self.push_run_event(
                 &new_run_id,
@@ -6065,14 +6138,14 @@ impl KernelState {
                 let err = KernelError::AdapterRuntimeDisabled {
                     plugin: adapter.to_string(),
                 };
-                self.fail_cli_run(&run_id, task_id, namespace.as_ref(), adapter, &err.to_string());
+                self.fail_cli_run(&run_id, task_id, namespace.as_ref(), adapter, &err.to_string(), RunFailureClass::AdapterMissing);
                 return Err(err);
             }
             None => {
                 let err = KernelError::AdapterRuntimeNotConfigured {
                     plugin: adapter.to_string(),
                 };
-                self.fail_cli_run(&run_id, task_id, namespace.as_ref(), adapter, &err.to_string());
+                self.fail_cli_run(&run_id, task_id, namespace.as_ref(), adapter, &err.to_string(), RunFailureClass::AdapterMissing);
                 return Err(err);
             }
         };
@@ -6085,7 +6158,7 @@ impl KernelState {
                     plugin: adapter.to_string(),
                     message: "no command configured".to_string(),
                 };
-                self.fail_cli_run(&run_id, task_id, namespace.as_ref(), adapter, &err.to_string());
+                self.fail_cli_run(&run_id, task_id, namespace.as_ref(), adapter, &err.to_string(), RunFailureClass::AdapterMissing);
                 return Err(err);
             }
         };
@@ -6099,7 +6172,7 @@ impl KernelState {
                     plugin: adapter.to_string(),
                     binary: binary.clone(),
                 };
-                self.fail_cli_run(&run_id, task_id, namespace.as_ref(), adapter, &err.to_string());
+                self.fail_cli_run(&run_id, task_id, namespace.as_ref(), adapter, &err.to_string(), RunFailureClass::AdapterMissing);
                 return Err(err);
             }
         };
@@ -6239,7 +6312,23 @@ impl KernelState {
                     // an explicit approval + action and is never automatic).
                     self.set_run_artifacts(&run_id, parsed.artifacts.clone());
                     self.set_run_proposed_changes(&run_id, parsed.proposed_changes.clone());
-                    self.fail_cli_run(&run_id, task_id, namespace.as_ref(), adapter, &reason);
+                    // Classify from the model's own error text: a transient cause
+                    // (rate limit, overload) becomes a retryable TransientProvider;
+                    // any other error result is OutputValidation (operator review).
+                    let envelope_class = match classify_failure(&parsed.text, false) {
+                        RunFailureClass::TransientProvider => RunFailureClass::TransientProvider,
+                        RunFailureClass::Timeout => RunFailureClass::Timeout,
+                        RunFailureClass::AuthRequired => RunFailureClass::AuthRequired,
+                        _ => RunFailureClass::OutputValidation,
+                    };
+                    self.fail_cli_run(
+                        &run_id,
+                        task_id,
+                        namespace.as_ref(),
+                        adapter,
+                        &reason,
+                        envelope_class,
+                    );
                     return Err(KernelError::AdapterExecutionFailed {
                         plugin: adapter.to_string(),
                         message: reason,
@@ -6303,7 +6392,23 @@ impl KernelState {
                     }),
                 );
                 self.set_run_metrics(&run_id, outcome.duration_ms, None, None);
-                self.fail_cli_run(&run_id, task_id, namespace.as_ref(), adapter, &reason);
+                // A wall-clock timeout is a safe-to-retry transient; a non-zero
+                // exit is genuinely unclassifiable (the cause could be anything) so
+                // it stays Unknown — NOT auto-retried, since a coding-agent run can
+                // mutate a workspace.
+                let exit_class = if outcome.timed_out {
+                    RunFailureClass::Timeout
+                } else {
+                    classify_failure(&reason, false)
+                };
+                self.fail_cli_run(
+                    &run_id,
+                    task_id,
+                    namespace.as_ref(),
+                    adapter,
+                    &reason,
+                    exit_class,
+                );
                 Err(KernelError::AdapterExecutionFailed {
                     plugin: adapter.to_string(),
                     message: reason,
@@ -6311,7 +6416,18 @@ impl KernelState {
             }
             Err(e) => {
                 let reason = format!("failed to spawn adapter '{binary}': {e}");
-                self.fail_cli_run(&run_id, task_id, namespace.as_ref(), adapter, &reason);
+                // A spawn failure on a binary that resolved on PATH is an
+                // environment/exec fault — classify from the text (Unknown unless
+                // the OS error names a transient cause).
+                let spawn_class = classify_failure(&reason, false);
+                self.fail_cli_run(
+                    &run_id,
+                    task_id,
+                    namespace.as_ref(),
+                    adapter,
+                    &reason,
+                    spawn_class,
+                );
                 Err(KernelError::AdapterExecutionFailed {
                     plugin: adapter.to_string(),
                     message: reason,
@@ -6321,7 +6437,10 @@ impl KernelState {
     }
 
     /// Mark a CLI run + its task failed and audit the failure. Shared by every
-    /// honest failure exit of [`execute_cli_run`].
+    /// honest failure exit of [`execute_cli_run`]. The caller passes the structured
+    /// [`RunFailureClass`] it knows definitively (a missing/disabled adapter, a
+    /// timeout, an error envelope classified from its text), so the run records an
+    /// honest class + retry state (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §7).
     fn fail_cli_run(
         &mut self,
         run_id: &RunId,
@@ -6329,13 +6448,14 @@ impl KernelState {
         namespace: Option<&NamespaceId>,
         adapter: &PluginId,
         reason: &str,
+        class: RunFailureClass,
     ) {
         let agent = self
             .runs
             .get(run_id)
             .map(|r| r.agent_id.as_str().to_string())
             .unwrap_or_else(|| "agent".to_string());
-        let _ = self.fail_run(run_id, reason);
+        let _ = self.fail_run_classified(run_id, reason, class);
         let _ = self.fail_task(task_id);
         self.record_audit(
             "agent",
@@ -6350,8 +6470,34 @@ impl KernelState {
     }
 
     /// Mark a run failed with an error message and record it on the transcript.
+    ///
+    /// The failure is classified from its reason text (the deterministic rail);
+    /// callers with a more specific structured signal use
+    /// [`Self::fail_run_classified`] instead.
     pub fn fail_run(&mut self, run_id: &RunId, error: &str) -> Result<(), KernelError> {
+        let class = classify_failure(error, false);
+        self.fail_run_classified(run_id, error, class)
+    }
+
+    /// Mark a run failed and stamp its structured [`RunFailureClass`] +
+    /// bounded-retry state (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §7).
+    ///
+    /// A failed run records WHY it failed (the class), and — for an auto-retryable
+    /// transient class only — a [`RunRetryState`] scheduling the next attempt on the
+    /// bounded `[2m,10m,30m,2h]` backoff (the attempt index is the run's
+    /// `retried_from` lineage length). A non-retryable class records only the class
+    /// (it waits for an operator). The retry is never fired by a background thread;
+    /// it becomes eligible at a real instant and is consumed by `retry_run` or the
+    /// next autonomy tick.
+    pub fn fail_run_classified(
+        &mut self,
+        run_id: &RunId,
+        error: &str,
+        class: RunFailureClass,
+    ) -> Result<(), KernelError> {
         let ended = self.clock.tick();
+        let attempt = self.transient_attempt_for(run_id);
+        let retry = RunRetryState::plan(class, attempt, real_now_secs());
         let (agent_id, task_id) = {
             let run = self
                 .runs
@@ -6360,10 +6506,18 @@ impl KernelState {
             run.status = RunStatus::Failed;
             run.ended_at = Some(ended);
             run.error = Some(error.to_string());
+            run.failure_class = Some(class);
+            run.retry = retry;
             (run.agent_id.clone(), run.task_id.clone())
         };
         let task_namespace = self.tasks.get(&task_id).map(|t| t.namespace_id.clone());
-        self.push_run_event(run_id, "run_failed", "kernel", error, serde_json::Value::Null);
+        self.push_run_event(
+            run_id,
+            "run_failed",
+            "kernel",
+            error,
+            serde_json::json!({ "failure_class": class.as_str() }),
+        );
         self.record_audit(
             "agent",
             agent_id.as_str(),
@@ -6375,6 +6529,100 @@ impl KernelState {
             serde_json::Value::Null,
         );
         Ok(())
+    }
+
+    /// The transient-retry attempt index for `run_id`: the length of its
+    /// `retried_from` lineage (0 for an original run, 1 for the first retry, …).
+    /// Bounded against a pathological cycle. This is the 0-based attempt the
+    /// bounded backoff schedule is indexed by.
+    fn transient_attempt_for(&self, run_id: &RunId) -> u32 {
+        let mut attempt: u32 = 0;
+        let mut cursor = self.runs.get(run_id).and_then(|r| r.retried_from.clone());
+        // The lineage can never exceed the transient budget by more than a small
+        // margin; cap the walk well above it as a cycle backstop.
+        while let Some(prev) = cursor {
+            attempt = attempt.saturating_add(1);
+            if attempt > 64 {
+                break;
+            }
+            cursor = self.runs.get(&prev).and_then(|r| r.retried_from.clone());
+        }
+        attempt
+    }
+
+    /// The newest run per task (by monotonic run id), as a deterministic,
+    /// id-sorted list. The basis for the run-recovery projections below — a task's
+    /// CURRENT disposition is its latest run, not any earlier attempt.
+    fn newest_run_per_task(&self) -> Vec<&Run> {
+        let mut newest: HashMap<&TaskId, &Run> = HashMap::new();
+        for run in self.runs.values() {
+            newest
+                .entry(&run.task_id)
+                .and_modify(|cur| {
+                    if run.id.0 > cur.id.0 {
+                        *cur = run;
+                    }
+                })
+                .or_insert(run);
+        }
+        let mut out: Vec<&Run> = newest.into_values().collect();
+        out.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+        out
+    }
+
+    /// The failed runs whose bounded transient retry is ELIGIBLE at `now_secs`:
+    /// the task's newest run failed with an auto-retryable class, its retry state
+    /// is scheduled (not exhausted) with `not_before_secs <= now_secs`, and the
+    /// task is still assigned. Read-only — the honest "retry-ready" projection a
+    /// manual retry or an autonomy tick consumes. No background scheduler.
+    pub fn transient_retry_ready(&self, now_secs: u64) -> Vec<RunId> {
+        self.newest_run_per_task()
+            .into_iter()
+            .filter(|run| {
+                run.status == RunStatus::Failed
+                    && run.failure_class.map(|c| c.retryable()).unwrap_or(false)
+                    && run.retry.as_ref().map(|r| r.eligible_at(now_secs)).unwrap_or(false)
+                    && self
+                        .tasks
+                        .get(&run.task_id)
+                        .map(|t| t.assigned_agent.is_some())
+                        .unwrap_or(false)
+            })
+            .map(|run| run.id.clone())
+            .collect()
+    }
+
+    /// Count of tasks whose newest run failed with a class that needs an operator
+    /// to act (auth/adapter/permission/invalid/output-validation/unknown). Drives
+    /// the Doctor `runs.recovery` row.
+    pub fn runs_needing_operator_action(&self) -> usize {
+        self.newest_run_per_task()
+            .into_iter()
+            .filter(|run| {
+                run.status == RunStatus::Failed
+                    && run
+                        .failure_class
+                        .map(|c| c.needs_operator_action())
+                        .unwrap_or(false)
+            })
+            .count()
+    }
+
+    /// Count of tasks whose newest run failed transiently and has a scheduled
+    /// (not-yet-exhausted) bounded retry pending. Drives the Doctor `runs.recovery`
+    /// row's informational note.
+    pub fn runs_retry_pending(&self) -> usize {
+        self.newest_run_per_task()
+            .into_iter()
+            .filter(|run| {
+                run.status == RunStatus::Failed
+                    && run
+                        .retry
+                        .as_ref()
+                        .map(|r| !r.exhausted && r.not_before_secs.is_some())
+                        .unwrap_or(false)
+            })
+            .count()
     }
 
     /// Mark a task failed.
@@ -6510,6 +6758,22 @@ impl KernelState {
 /// so the caller treats it as "keep" rather than guessing an order.
 fn run_event_seq(id: &str) -> Option<u64> {
     id.rsplit('_').next().and_then(|n| n.parse::<u64>().ok())
+}
+
+/// The current real wall-clock instant in unix seconds.
+///
+/// The kernel's logical [`Clock`] is deliberately NOT wall-clock (it orders
+/// events reproducibly). But the bounded transient-retry backoff
+/// (`[2m,10m,30m,2h]`, `relux_core::run_failure`) is a GENUINELY time-based
+/// feature, so — exactly like `auth.rs` session expiry — it reads real time. This
+/// is the only honest representation of a real backoff: a logical-tick "deadline"
+/// would advance per kernel operation, not per second. The retry-state math stays
+/// pure (it takes `now_secs` as input); only this one read touches the OS clock.
+fn real_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Map a `created_by` string onto an `(actor_type, actor_id)` pair for the audit
@@ -14057,6 +14321,105 @@ mod tests {
         assert_eq!(k.run(&run_id).unwrap().status, RunStatus::Completed);
         let err = k.retry_run(&run_id).unwrap_err();
         assert!(matches!(err, KernelError::RunNotRetryable { .. }));
+    }
+
+    #[test]
+    fn a_transient_failure_schedules_a_bounded_retry() {
+        // A transient (provider) failure records a retryable class and schedules a
+        // bounded retry; the run is retry-ready only at/after its `not_before`.
+        let (mut k, _agent, task, run, _echo) = primed_kernel();
+        k.fail_run(&run, "provider returned 503 service unavailable")
+            .unwrap();
+        let r = k.run(&run).unwrap();
+        assert_eq!(r.status, RunStatus::Failed);
+        assert_eq!(r.failure_class, Some(RunFailureClass::TransientProvider));
+        let retry = r.retry.as_ref().expect("a transient failure is retry-scheduled");
+        assert_eq!(retry.attempt, 0);
+        assert_eq!(retry.max_attempts, relux_core::MAX_TRANSIENT_RETRIES);
+        assert!(!retry.exhausted);
+        let nb = retry.not_before_secs.expect("a scheduled retry has a not-before");
+
+        // Not eligible before the backoff elapses; eligible at/after it.
+        assert!(
+            k.transient_retry_ready(0).is_empty(),
+            "a freshly-failed transient is not eligible immediately"
+        );
+        assert!(k.transient_retry_ready(nb).iter().any(|id| id == &run));
+
+        // Doctor projections: a pending retry, nothing needing operator action.
+        assert_eq!(k.runs_retry_pending(), 1);
+        assert_eq!(k.runs_needing_operator_action(), 0);
+        let _ = task;
+    }
+
+    #[test]
+    fn a_non_retryable_failure_records_a_class_but_never_auto_retries() {
+        // An auth / permission / config failure is classified but NEVER scheduled
+        // for an automatic retry — it waits for an operator.
+        for (reason, class) in [
+            (
+                "permission denied: agent prime lacks plugin:install",
+                RunFailureClass::PermissionDenied,
+            ),
+            ("401 Unauthorized: invalid api key", RunFailureClass::AuthRequired),
+        ] {
+            let (mut k, _agent, _task, run, _echo) = primed_kernel();
+            k.fail_run(&run, reason).unwrap();
+            let r = k.run(&run).unwrap();
+            assert_eq!(r.failure_class, Some(class));
+            assert!(r.retry.is_none(), "{class:?} must not schedule a retry");
+            assert!(
+                k.transient_retry_ready(u64::MAX).is_empty(),
+                "{class:?} is never retry-ready, even far in the future"
+            );
+            assert_eq!(k.runs_needing_operator_action(), 1);
+            assert_eq!(k.runs_retry_pending(), 0);
+        }
+    }
+
+    #[test]
+    fn transient_retry_attempt_grows_and_exhausts_on_the_bounded_schedule() {
+        // A CLI that always emits a transient (rate-limit) error envelope: every
+        // attempt classifies as a retryable transient, so the bounded `[2m,10m,
+        // 30m,2h]` budget grows attempt-by-attempt and exhausts after 4 retries.
+        let dir = tempfile::tempdir().unwrap();
+        let fake = write_fake_cli(
+            dir.path(),
+            "fake-transient",
+            r#"{"type":"result","is_error":true,"result":"rate limit reached"}"#,
+        );
+        let mut k = adapter_kernel();
+        enable_claude_with(&mut k, &fake);
+        let (_agent, task) = cli_task(&mut k);
+
+        let _ = k.execute_assigned_run(&task).unwrap_err();
+        let first = k.runs().into_iter().next_back().unwrap();
+        assert_eq!(first.failure_class, Some(RunFailureClass::TransientProvider));
+        assert_eq!(first.retry.as_ref().unwrap().attempt, 0);
+        let mut latest = first.id.clone();
+
+        // Retry up to the cap; each re-attempt's lineage depth (and thus backoff
+        // index) grows by one until the budget is exhausted.
+        for expected_attempt in 1..=relux_core::MAX_TRANSIENT_RETRIES {
+            let _ = k.retry_run(&latest).unwrap_err(); // same envelope still fails
+            let newest = k.runs().into_iter().next_back().unwrap();
+            assert_eq!(newest.retried_from.as_ref(), Some(&latest));
+            let retry = newest.retry.as_ref().expect("still classified transient");
+            assert_eq!(retry.attempt, expected_attempt);
+            if expected_attempt < relux_core::MAX_TRANSIENT_RETRIES {
+                assert!(!retry.exhausted);
+                assert!(retry.not_before_secs.is_some());
+            } else {
+                // Past the bounded schedule: exhausted, no further auto-retry.
+                assert!(retry.exhausted, "the transient budget must exhaust at the cap");
+                assert!(retry.not_before_secs.is_none());
+                assert!(
+                    k.transient_retry_ready(u64::MAX).is_empty(),
+                    "an exhausted run is never retry-ready"
+                );
+            }
+            latest = newest.id.clone();
+        }
     }
 
     #[test]

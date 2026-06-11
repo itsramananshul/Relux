@@ -5326,7 +5326,7 @@ async fn get_doctor(
 
     // One serialized read of the store; on any open/load failure we still produce
     // an honest report whose `kernel.store` row fails (rather than 500ing).
-    let (db_ok, adapters, tools, agent_count, pending_approvals) = {
+    let (db_ok, adapters, tools, agent_count, pending_approvals, runs_needing_action, runs_retry_pending) = {
         let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
         match SqliteStore::open(&state.db_path).and_then(|store| store.load()) {
             Ok(kernel) => {
@@ -5341,9 +5341,11 @@ async fn get_doctor(
                     tools,
                     kernel.agent_count(),
                     kernel.pending_approval_count(),
+                    kernel.runs_needing_operator_action(),
+                    kernel.runs_retry_pending(),
                 )
             }
-            Err(_) => (false, Vec::new(), Vec::new(), 0, 0),
+            Err(_) => (false, Vec::new(), Vec::new(), 0, 0, 0, 0),
         }
     };
 
@@ -5361,6 +5363,8 @@ async fn get_doctor(
             tools: &tools,
             agent_count,
             pending_approvals,
+            runs_needing_action,
+            runs_retry_pending,
         },
         generated_at,
     );
@@ -5398,6 +5402,11 @@ struct RunRecord {
     /// The honest failure reason for a failed run (the run's recorded error).
     #[serde(skip_serializing_if = "Option::is_none")]
     failure_reason: Option<String>,
+    /// The safe, static operator remediation for the run's failure class (single
+    /// source of truth in `relux_core::run_failure`), so the UI shows guidance
+    /// without re-implementing the class→advice mapping. `None` unless failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_remediation: Option<String>,
     /// Whether the dashboard should offer a Retry action: a failed run whose task
     /// still exists and is still assigned.
     retryable: bool,
@@ -5427,6 +5436,7 @@ fn build_run_record(kernel: &KernelState, run: relux_core::Run) -> RunRecord {
         })
         .filter(|s| !s.is_empty());
     let failure_reason = run.error.clone();
+    let failure_remediation = run.failure_class.map(|c| c.remediation().to_string());
     let retryable = run.status == relux_core::RunStatus::Failed
         && task.map(|t| t.assigned_agent.is_some()).unwrap_or(false);
     RunRecord {
@@ -5435,6 +5445,7 @@ fn build_run_record(kernel: &KernelState, run: relux_core::Run) -> RunRecord {
         phase,
         output_excerpt,
         failure_reason,
+        failure_remediation,
         retryable,
     }
 }
@@ -5747,6 +5758,8 @@ mod tests {
             retried_from: None,
             artifacts,
             proposed_changes: Vec::new(),
+            failure_class: None,
+            retry: None,
         }
     }
 
@@ -5757,6 +5770,7 @@ mod tests {
             phase: Some("run_completed".into()),
             output_excerpt: None,
             failure_reason: None,
+            failure_remediation: None,
             retryable: false,
         }
     }

@@ -2152,6 +2152,26 @@ export interface ReluxRun {
   // Reviewable proposed file changes the adapter declared (full-content
   // replacements with a baseline hash). Absent/empty when none.
   proposed_changes?: ReluxProposedChange[];
+  // Structured classification of WHY a failed run failed (failed runs only):
+  // "transient_provider" | "auth_required" | "adapter_missing" |
+  // "permission_denied" | "invalid_prompt" | "timeout" | "cancelled" |
+  // "output_validation" | "unknown". Absent until the run fails.
+  failure_class?: string;
+  // Bounded transient-retry state for a failed run whose class is auto-retryable
+  // (transient_provider / timeout). Absent for successes and non-retryable
+  // failures (those wait for an operator). `not_before_secs` is the earliest real
+  // unix-second instant a retry may run; `exhausted` means the bounded
+  // [2m,10m,30m,2h] budget is spent. There is no background scheduler — the retry
+  // is consumed by a manual Retry or the next autonomy tick.
+  retry?: ReluxRunRetry;
+}
+
+// The bounded transient-retry state stamped on a failed, auto-retryable run.
+export interface ReluxRunRetry {
+  attempt: number;
+  max_attempts: number;
+  not_before_secs?: number;
+  exhausted: boolean;
 }
 
 // One Relux run-transcript event from `/v1/relux/runs/:id/events`. This is the
@@ -2193,6 +2213,9 @@ export interface ReluxRunDetail extends ReluxRun {
   output_excerpt?: string;
   // The honest failure reason for a failed run.
   failure_reason?: string;
+  // The safe, static operator remediation for the run's failure class (single
+  // source of truth in the kernel). Present only for failed runs.
+  failure_remediation?: string;
   // Whether the dashboard should offer a Retry action.
   retryable?: boolean;
 }

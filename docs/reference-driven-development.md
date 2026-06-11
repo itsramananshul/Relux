@@ -2046,3 +2046,72 @@ hard provider failure (`parse_decision(&text).ok()` → `None` → fall back), w
   is kernel-authored (not user content), so it cannot carry an instruction. Total brain calls stay bounded
   (`MAX_DECISION_ROUNDS + MAX_DECISION_CORRECTIONS`); a provider failure is never retried. Worst case is
   byte-for-byte today's behavior. See the applied-change record in `docs/prime-processing-audit.md`.
+
+---
+
+## Reference read — structured run-failure classifier + bounded transient retry (this slice)
+
+The audit's next P1 (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §7, gap #2): Relux's only
+recovery affordance was `prime.retry_run` — a fresh run with NO error taxonomy and NO
+backoff. A failed run recorded a free-text `error` string and nothing else, so the
+dashboard/Prime/Doctor could not tell a safe-to-retry transient (a provider rate limit)
+from a failure that needs an operator (a missing adapter, an auth error). This slice adds a
+structured `RunFailureClass`, a bounded transient-retry policy on the Paperclip
+`[2m,10m,30m,2h]` schedule, and an honest "retry-ready" state (no faked background timer).
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/agent/error_classifier.py` — `FailoverReason` (enum:
+  `auth`/`auth_permanent`/`billing`/`rate_limit`/`overloaded`/`server_error`/`timeout`/
+  `context_overflow`/`model_not_found`/`format_error`/…/`unknown`), `ClassifiedError`
+  (carries `retryable`/`should_compress`/`should_rotate_credential`/`should_fallback`), and
+  `classify_api_error(...)` — a **priority-ordered** pipeline (provider-specific patterns →
+  HTTP status → error code → message patterns → transport heuristics → unknown). **Pattern:
+  a closed enum of failure reasons + a priority-ordered, pattern-driven classifier whose
+  result carries an explicit `retryable` decision; auth/billing/format are NOT retryable,
+  rate-limit/overloaded/server-error/timeout ARE.** Crucially, auth patterns set
+  `retryable=False` ("the credential is invalid and retrying with the same key will always
+  fail").
+- `reference/hermes-agent-main/agent/message_sanitization.py` — `_sanitize_tool_error`
+  (L515-528, 2000-char clamp) and `_extract_message` (500-char clamp): **CLAMP every
+  model/provider-produced string before it is surfaced.** Mirrored in
+  `safe_public_message` (redact + single-line + clamp to `MAX_PUBLIC_MESSAGE_CHARS`).
+
+### Paperclip (openclaw) — files read
+
+- `references/paperclip/server/src/services/run-liveness.ts` — `classifyRunActionability`
+  (→ `runnable`/`manager_review`/`blocked_external`/`approval_required`/`unknown`) and
+  `classifyRunLiveness` (→ `RunLivenessState` `failed`/`completed`/`blocked`/`empty_response`/
+  `advanced`/`plan_only`/`needs_followup`, each with a human `livenessReason`). **Pattern:
+  classify a finished run into a small closed set + a human reason, and decide auto-continue
+  ONLY for the safe class** (`runnable`); a blocker/approval/manager-review is surfaced, not
+  auto-continued.
+- `references/paperclip/server/src/services/heartbeat.ts` —
+  `BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS = [2m,10m,30m,2h]` (L221-226),
+  `BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS = delays.length` (L230),
+  `computeBoundedTransientHeartbeatRetrySchedule(attempt, now, random)` (L481-499, returns
+  `{attempt, baseDelayMs, delayMs, dueAt, maxAttempts}`), and `readHeartbeatRunErrorFamily`
+  (L257-268, only `codex_transient_upstream`/`claude_transient_upstream` → the
+  `transient_upstream` family retries). **Pattern: ONLY the transient family retries, on that
+  exact bounded schedule, capped at the schedule length, with a `dueAt` not-before instant.**
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| Hermes: **closed enum of failure reasons + priority-ordered, pattern-driven classifier with a `retryable` decision** | `crates/relux-core/src/run_failure.rs` `RunFailureClass` (`transient_provider`/`auth_required`/`adapter_missing`/`permission_denied`/`invalid_prompt`/`timeout`/`cancelled`/`output_validation`/`unknown`) + `classify_failure(reason, timed_out)` — priority-ordered (timeout → cancelled → permission → auth → adapter-missing → transient → invalid → output-validation → unknown), matched against the kernel's own reason strings. `retryable()` / `needs_operator_action()` / `remediation()` are the recovery hints. |
+| Hermes: **auth/format are NEVER retried (same input fails the same way)** | only `TransientProvider` + `Timeout` are `retryable()`. **Stricter than Hermes:** because a Relux run can MUTATE a workspace, the `unknown` bucket is NON-retryable here (Hermes retries it) — it waits for a deliberate manual retry. |
+| Paperclip: **only the transient family retries, bounded `[2m,10m,30m,2h]`, capped at the schedule length** | `RETRY_BACKOFF_SECS = [120,600,1800,7200]`, `MAX_TRANSIENT_RETRIES = 4`, `retry_delay_secs(attempt)`, and `RunRetryState::plan(class, attempt, now_secs)` — schedules `not_before_secs = now + backoff[attempt]` for a retryable class while the budget remains, marks `exhausted` once `attempt` reaches the cap, and returns `None` (no retry block) for every non-retryable class. The attempt index is the run's `retried_from` lineage depth (`transient_attempt_for`). |
+| Paperclip: **a `dueAt` not-before instant** | `not_before_secs` is a REAL unix-second instant (kernel `real_now_secs()`, the same wall-clock seam `auth.rs` uses for session expiry) — the only honest representation of a real backoff. The retry-state math stays pure (takes `now_secs`); only one kernel read touches the OS clock. |
+| Paperclip: **classify into a small set; auto-continue ONLY the safe class** | `KernelState::transient_retry_ready(now_secs)` is the read-only "retry-ready" projection (newest run per task, failed + retryable class + `eligible_at(now)` + still assigned). It is consumed by the MANUAL `retry_run` or the next autonomy tick — there is **no background scheduler** (the audit's explicit honesty constraint). `one_autonomy_tick` re-attempts eligible transients through the unchanged governed `retry_run` path, bounded by the per-tick cap. |
+| Hermes: **clamp + redact every surfaced string** | `safe_public_message` redacts known secret shapes (`redact_secrets`), collapses to one line, and clamps to 500 chars. The run's recorded `error` is already secret-redacted upstream; the class + static `remediation()` never echo the provider envelope. |
+
+**What we deliberately do differently:** the classifier is a pure, deterministic projection
+— it grants NO authority and changes no control flow except to mark a transient failure
+retry-ready. A retry, whether manual or autonomy-driven, flows through the UNCHANGED governed
+run path (`retry_run` → `execute_assigned_run`, re-checking enabled runtime, binary on PATH,
+and the permission gate, and stamping `retried_from` so the backoff grows attempt-by-attempt
+and exhausts). Auto-retry is restricted to the two unambiguously-safe, upstream-caused classes
+(`TransientProvider`, `Timeout`); every other failure — including the `unknown` catch-all —
+surfaces a remediation and waits for an operator. There is no faked timer: eligibility is a
+real-wall-clock not-before checked only when an operator/cron invokes a tick.

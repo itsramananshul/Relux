@@ -41,7 +41,7 @@ Relux roots audited: `crates/relux-core/src/`, `crates/relux-kernel/src/`, `apps
 | # | Gap | Dim | Priority | Surfaces |
 |---|-----|-----|----------|----------|
 | 1 | **Self-correction on a malformed brain decision** — a correctable reply is collapsed into the same `None` as a hard provider failure and silently falls back; no bounded re-prompt with the validation error. Hermes (`_invalid_json_retries`/`_invalid_tool_retries`) and OpenClaw (retry instructions) both do this. | 1, 7 | **P0** *(shipped — see §1)* | backend, tests, docs |
-| 2 | **Structured error/liveness classifier + bounded transient retry** — Relux retry is a fresh run with no error taxonomy and no backoff; Paperclip classifies (`run-liveness.ts`) and retries transient upstream failures on a bounded `[2m,10m,30m,2h]` schedule. | 7 | P1 | backend, tests |
+| 2 | **Structured error/liveness classifier + bounded transient retry** — Relux retry is a fresh run with no error taxonomy and no backoff; Paperclip classifies (`run-liveness.ts`) and retries transient upstream failures on a bounded `[2m,10m,30m,2h]` schedule. | 7 | **P1** *(shipped — see §14)* | backend, frontend, docs, tests |
 | 3 | **Governed budgets (soft/hard, auto-pause)** — Paperclip enforces per-company/agent/project spend with warn + hard-stop + cancel-work. Relux records run `cost`/`usage` but enforces nothing. | 5 | P1 | backend, frontend, docs, tests |
 | 4 | **Scoped permission grants (subtree / project)** — Relux permissions are exact-string match only; Paperclip has fine-grained grants scoped to manager-subtrees/projects. | 5 | P1 | backend, tests |
 | 5 | **Memory compaction / cross-session recall** — Relux keeps a bounded 12-turn ring with no summarization; Hermes/OpenClaw compact + summarize + (Hermes) FTS5 cross-session search. Low urgency at current turn volume but blocks long-running Prime sessions. | 6 | P1/P2 | backend, tests |
@@ -322,24 +322,34 @@ safe (adds no authority), bounded, feasible in one commit, and reuses existing v
   (session_expired/model_not_found/auth/rate_limit/overflow/timeout), profile rotation, idle-timeout
   breaker, retry instructions (§1).
 
-### Relux mapping — **partial / missing**
+### Relux mapping — **partial** *(error classifier + bounded transient retry now implemented — see §14)*
 
 - `crates/relux-core/src/adapter_result.rs` — honest parse, plain-text fallback, never fabricates
   success/failure. `KernelError` taxonomy (UnknownTask/Agent, PermissionDenied, …).
-- `crates/relux-kernel/src/state.rs` — run status FSM; `PrimeAction::RetryRun` is an **explicit fresh
-  run** (no partial resume, no backoff, no classification).
-- Brain loop: `DecisionLoop` stops on provider failure keeping the interim decision; until this slice,
-  **no self-correction** of a malformed decision.
-- **Missing**: an error/liveness classifier, automatic bounded transient retry with backoff,
-  circuit-breaking, output-silence/stranded recovery.
+- `crates/relux-core/src/run_failure.rs` — **the structured classifier**: `RunFailureClass`
+  (`transient_provider`/`auth_required`/`adapter_missing`/`permission_denied`/`invalid_prompt`/
+  `timeout`/`cancelled`/`output_validation`/`unknown`), priority-ordered `classify_failure`,
+  `retryable()`/`needs_operator_action()`/`remediation()`, the bounded `RETRY_BACKOFF_SECS =
+  [2m,10m,30m,2h]` schedule, and `RunRetryState::plan`. Now stamped on every failed `Run`
+  (`failure_class` + `retry`).
+- `crates/relux-kernel/src/state.rs` — `fail_run_classified` stamps the class + bounded-retry state;
+  `transient_retry_ready(now)` is the read-only retry-ready projection; `one_autonomy_tick` re-attempts
+  eligible transients through the unchanged governed `retry_run` path (which still re-checks runtime/
+  PATH/permission and stamps `retried_from`, so the backoff grows + exhausts). No background scheduler:
+  eligibility is a real wall-clock not-before checked only on a manual retry or an operator/cron tick.
+- Brain loop: `DecisionLoop` distinguishes a malformed-but-correctable reply from a hard provider
+  failure and self-corrects once (§1/§13).
+- **Still missing**: output-silence/stranded recovery for long orchestration runs, circuit-breaking,
+  partial-run resume.
 
 ### Priority & slices
 
 - **P0 — self-correction on malformed decisions (SHIPPED, §1/§13).**
-- **P1 — error classifier + bounded transient retry**: a `RunFailureClass` (transient-upstream /
-  permission / config / fatal) + a bounded backoff retry for transient classes only, behind the
-  existing governed run path. Maps to Paperclip `run-liveness.ts` + the `[2m,10m,30m,2h]` schedule.
-  *(backend, tests.)*
+- **P1 — error classifier + bounded transient retry (SHIPPED THIS ROUND, §14).** A `RunFailureClass`
+  (transient_provider / timeout / auth / adapter / permission / invalid / cancelled / output_validation /
+  unknown) + a bounded `[2m,10m,30m,2h]` backoff retry for the two safe transient classes only, behind
+  the existing governed run path. Maps to Paperclip `run-liveness.ts` + the `[2m,10m,30m,2h]` schedule
+  and Hermes `error_classifier.py`.
 - **P2 — output-silence/stranded recovery** for long orchestration runs. Pairs with §4 monitor. *(backend, tests.)*
 
 ---
@@ -515,6 +525,38 @@ record. In brief:
   or weaker validator. The synchronous twin `run_decision_loop_with_correction` and the async driver
   share the SAME `DecisionLoop::step_outcome` stepper, so the control flow (round cap, correction cap,
   read-only execution, stop-on-progress) is pinned once.
+
+---
+
+## 14. Implemented this round — the error classifier + bounded transient retry slice (§7 P1)
+
+See the matching "Reference read — structured run-failure classifier + bounded transient retry"
+entry in [`reference-driven-development.md`](reference-driven-development.md) for the full reference
+read + mapping. In brief:
+
+- **What.** A structured `RunFailureClass` (`crates/relux-core/src/run_failure.rs`) classifies every
+  failed run into one of nine classes — `transient_provider`, `auth_required`, `adapter_missing`,
+  `permission_denied`, `invalid_prompt`, `timeout`, `cancelled`, `output_validation`, `unknown` —
+  via a priority-ordered, pattern-driven `classify_failure` (mirroring Hermes `error_classifier.py`).
+  Each class carries `retryable()`, `needs_operator_action()`, and a safe static `remediation()`. A
+  failed `Run` now records `failure_class` and, for an auto-retryable class, a `RunRetryState` that
+  schedules the next attempt on the bounded `[2m,10m,30m,2h]` backoff (Paperclip
+  `heartbeat.ts` `BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS`), capped at four attempts.
+- **Where it surfaces.** The class + retry state + a derived `failure_remediation` flow onto the run
+  wire (`server.rs` `RunRecord`); the Work page shows a Failure-class chip, an honest Recovery line
+  (scheduled / due / exhausted / needs-operator-action), and the remediation; a new Doctor
+  `runs.recovery` row warns when failed runs need an operator and notes transient retries pending.
+- **Retry without a faked scheduler.** There is NO background timer (the audit's explicit honesty
+  constraint). `not_before_secs` is a real wall-clock instant; `transient_retry_ready(now)` is a
+  read-only projection consumed either by the MANUAL `prime.retry_run` or by `one_autonomy_tick`,
+  which re-attempts eligible transients through the UNCHANGED governed `retry_run` path (re-checking
+  the enabled runtime, the binary on PATH, and the permission gate, and stamping `retried_from` so
+  the backoff grows attempt-by-attempt and exhausts at the cap).
+- **Why it is safe.** The classifier is a pure, deterministic projection that grants no authority. Only
+  the two unambiguously-safe, upstream-caused classes (`transient_provider`, `timeout`) auto-retry;
+  every other failure — including, stricter than Hermes, the `unknown` catch-all (a Relux run can
+  mutate a workspace) — surfaces a remediation and waits for an operator. A retry never bypasses the
+  adapter/approval gates. Surfaced strings are redacted + clamped (`safe_public_message`).
 
 ---
 

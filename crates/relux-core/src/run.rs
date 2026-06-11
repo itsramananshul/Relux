@@ -4,6 +4,7 @@ use crate::agent::AgentId;
 use crate::artifact::RunArtifact;
 use crate::plugin::PluginId;
 use crate::proposed_change::ProposedChange;
+use crate::run_failure::{RunFailureClass, RunRetryState};
 use crate::task::TaskId;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -98,6 +99,20 @@ pub struct Run {
     /// fabricated; apply never happens without an explicit operator action.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proposed_changes: Vec<ProposedChange>,
+    /// The structured classification of why this run failed (set only for failed
+    /// runs). Drives the honest "retryable vs needs-operator-action" surface in run
+    /// records, Prime replies, and the Doctor (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md`
+    /// §7). `None` for runs that have not failed. Never fabricated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<RunFailureClass>,
+    /// The bounded transient-retry state for a failed run whose class is
+    /// auto-retryable ([`RunFailureClass::retryable`]): which attempt it is, the
+    /// cap, and the earliest real instant a retry may run. `None` for a successful
+    /// run, or a failure whose class is not auto-retryable (those wait for an
+    /// operator). There is no background scheduler — the retry is consumed manually
+    /// (`prime.retry_run`) or on the next autonomy tick.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RunRetryState>,
 }
 
 #[cfg(test)]
@@ -122,6 +137,8 @@ mod tests {
             retried_from: None,
             artifacts: Vec::new(),
             proposed_changes: Vec::new(),
+            failure_class: None,
+            retry: None,
         }
     }
 

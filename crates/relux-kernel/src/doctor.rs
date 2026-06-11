@@ -110,6 +110,13 @@ pub struct DoctorInputs<'a> {
     pub agent_count: usize,
     /// Number of approvals awaiting an operator decision.
     pub pending_approvals: usize,
+    /// Number of tasks whose newest run failed with a class that needs an operator
+    /// to act (auth / adapter / permission / invalid request / output validation /
+    /// unknown). `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §7.
+    pub runs_needing_action: usize,
+    /// Number of tasks whose newest run failed transiently and has a bounded retry
+    /// scheduled (not yet exhausted) on the `[2m,10m,30m,2h]` backoff.
+    pub runs_retry_pending: usize,
 }
 
 fn check(
@@ -413,6 +420,57 @@ fn approvals_check(pending: usize) -> DoctorCheck {
     }
 }
 
+/// The `runs.recovery` row — failed runs that need attention vs. transient
+/// failures already scheduled to retry. Mirrors Paperclip's run-liveness surface
+/// (`run-liveness.ts`): a failure that needs an operator (auth/adapter/permission/
+/// invalid/validation/unknown) is the attention signal; a transient failure with a
+/// bounded retry pending is informational, not a problem. A clean board is `Ok`.
+fn runs_recovery_check(needs_action: usize, retry_pending: usize) -> DoctorCheck {
+    const ID: &str = "runs.recovery";
+    const LABEL: &str = "Run recovery";
+
+    if needs_action > 0 {
+        let plural = if needs_action == 1 { "" } else { "s" };
+        let needs = if needs_action == 1 { "needs" } else { "need" };
+        let retry_note = if retry_pending > 0 {
+            let rp = if retry_pending == 1 { "" } else { "s" };
+            format!(" {retry_pending} transient failure{rp} will retry automatically.")
+        } else {
+            String::new()
+        };
+        return check(
+            ID,
+            LABEL,
+            DoctorSeverity::Warn,
+            format!("{needs_action} failed run{plural} {needs} operator action (auth, adapter, permission, request, or review).{retry_note}"),
+            Some("Review the failed runs on Work, fix the cause, and retry."),
+            Some("/work"),
+        );
+    }
+
+    if retry_pending > 0 {
+        let plural = if retry_pending == 1 { "" } else { "s" };
+        let is = if retry_pending == 1 { "is" } else { "are" };
+        return check(
+            ID,
+            LABEL,
+            DoctorSeverity::Info,
+            format!("{retry_pending} transient run failure{plural} {is} scheduled to retry on a bounded backoff."),
+            None,
+            Some("/work"),
+        );
+    }
+
+    check(
+        ID,
+        LABEL,
+        DoctorSeverity::Ok,
+        "No failed runs need attention.",
+        None,
+        Some("/work"),
+    )
+}
+
 fn store_check(db_ok: bool) -> DoctorCheck {
     const ID: &str = "kernel.store";
     const LABEL: &str = "Kernel state store";
@@ -472,6 +530,7 @@ pub fn build_doctor_report(inputs: &DoctorInputs, generated_at: i64) -> DoctorRe
         tools_check(inputs.tools),
         crew_check(inputs.agent_count),
         approvals_check(inputs.pending_approvals),
+        runs_recovery_check(inputs.runs_needing_action, inputs.runs_retry_pending),
     ];
 
     let mut summary = DoctorSummary {
@@ -570,6 +629,8 @@ mod tests {
             tools: &[],
             agent_count: 1,
             pending_approvals: 0,
+            runs_needing_action: 0,
+            runs_retry_pending: 0,
         }
     }
 
@@ -730,6 +791,34 @@ mod tests {
         assert_eq!(report.overall, DoctorSeverity::Ok);
         assert_eq!(report.summary.fail, 0);
         assert_eq!(report.summary.warn, 0);
-        assert_eq!(report.checks.len(), 7);
+        assert_eq!(report.checks.len(), 8);
+    }
+
+    #[test]
+    fn runs_recovery_warns_on_action_needed_and_infos_on_retry_pending() {
+        let a = ai("local", false, false, "");
+
+        // A failure that needs an operator → warn, with a /work action link.
+        let mut inp = healthy_inputs(&a);
+        inp.runs_needing_action = 2;
+        inp.runs_retry_pending = 1;
+        let report = build_doctor_report(&inp, 0);
+        let row = find(&report, "runs.recovery");
+        assert_eq!(row.severity, DoctorSeverity::Warn);
+        assert!(row.message.contains('2'));
+        assert!(row.message.contains("retry automatically"));
+        assert_eq!(row.action_link.as_deref(), Some("/work"));
+
+        // Only transient retries pending → info, never a failure.
+        let mut inp2 = healthy_inputs(&a);
+        inp2.runs_retry_pending = 3;
+        let report2 = build_doctor_report(&inp2, 0);
+        let row2 = find(&report2, "runs.recovery");
+        assert_eq!(row2.severity, DoctorSeverity::Info);
+        assert_eq!(report2.overall, DoctorSeverity::Ok);
+
+        // Clean board → ok.
+        let report3 = build_doctor_report(&healthy_inputs(&a), 0);
+        assert_eq!(find(&report3, "runs.recovery").severity, DoctorSeverity::Ok);
     }
 }

@@ -28,6 +28,9 @@ import {
   reviewableProposedChangeIndices,
   applyEligibleProposedChangeIndices,
   showBatchProposedChangeControls,
+  failureClassLabel,
+  failureClassTone,
+  recoveryStatusLine,
 } from "../src/runview.ts";
 
 // The Work page's run-depth view must read HONESTLY: it only formats/classifies
@@ -344,4 +347,59 @@ test("artifactTypeLabel maps known kinds and falls back to Other", () => {
   assert.equal(artifactTypeLabel("diff"), "Diff");
   assert.equal(artifactTypeLabel("url"), "URL");
   assert.equal(artifactTypeLabel("mystery"), "Other");
+});
+
+// --- Failure class + recovery surface (HERMES_OPENCLAW_DEEP_AUDIT.md §7) -----
+
+test("failureClassLabel maps known classes and falls back without going blank", () => {
+  assert.equal(failureClassLabel("transient_provider"), "Transient provider error");
+  assert.equal(failureClassLabel("auth_required"), "Authentication required");
+  assert.equal(failureClassLabel("adapter_missing"), "Adapter not available");
+  assert.equal(failureClassLabel("timeout"), "Timed out");
+  assert.equal(failureClassLabel("unknown"), "Unknown failure");
+  // A class the UI doesn't know yet still renders the raw token, never blank.
+  assert.equal(failureClassLabel("some_new_class"), "some_new_class");
+  assert.equal(failureClassLabel(undefined), null);
+});
+
+test("failureClassTone: transient auto-recovers (running), others block, cancel is neutral", () => {
+  assert.equal(failureClassTone("transient_provider"), "running");
+  assert.equal(failureClassTone("timeout"), "running");
+  assert.equal(failureClassTone("auth_required"), "blocked");
+  assert.equal(failureClassTone("permission_denied"), "blocked");
+  assert.equal(failureClassTone("cancelled"), "backlog");
+});
+
+test("recoveryStatusLine distinguishes scheduled / due / exhausted / operator-action", () => {
+  // No class → no line (a successful or in-flight run).
+  assert.equal(recoveryStatusLine({} as any, 1000), null);
+
+  // A scheduled transient retry waiting on its not-before instant.
+  const scheduled = {
+    failure_class: "transient_provider",
+    retry: { attempt: 0, max_attempts: 4, not_before_secs: 1120, exhausted: false },
+  } as any;
+  const sLine = recoveryStatusLine(scheduled, 1000);
+  assert.ok(sLine && sLine.includes("Retry 1/4"));
+  assert.ok(sLine && /auto-recovering/.test(sLine));
+
+  // The same retry once its instant has passed → due.
+  const dueLine = recoveryStatusLine(scheduled, 5000);
+  assert.ok(dueLine && /is due/.test(dueLine));
+
+  // Exhausted budget → manual-retry guidance, never another auto attempt.
+  const exhausted = {
+    failure_class: "timeout",
+    retry: { attempt: 4, max_attempts: 4, exhausted: true },
+  } as any;
+  const eLine = recoveryStatusLine(exhausted, 5000);
+  assert.ok(eLine && /exhausted/.test(eLine));
+
+  // A non-retryable class → operator action.
+  const authLine = recoveryStatusLine({ failure_class: "auth_required" } as any, 5000);
+  assert.equal(authLine, "Needs operator action before it can succeed.");
+
+  // An intentional cancel is neither a retry nor an operator-action problem.
+  const cancelLine = recoveryStatusLine({ failure_class: "cancelled" } as any, 5000);
+  assert.ok(cancelLine && /Cancelled/.test(cancelLine));
 });

@@ -46,6 +46,11 @@ pub struct PrimeAutonomyTickResult {
     pub tasks_run: u32,
     /// Number of tasks successfully assigned in this tick.
     pub tasks_assigned: u32,
+    /// Number of bounded transient-retry re-attempts dispatched this tick (a
+    /// failed run whose `[2m,10m,30m,2h]` backoff elapsed; re-run through the
+    /// governed `retry_run` path). `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §7.
+    #[serde(default)]
+    pub transient_retries: u32,
     /// Number of actions taken (e.g., runs started, tasks assigned).
     pub actions_taken: u32,
     /// A summary of what happened during this tick.
@@ -60,6 +65,7 @@ impl Default for PrimeAutonomyTickResult {
             tick_at: String::new(),
             tasks_run: 0,
             tasks_assigned: 0,
+            transient_retries: 0,
             actions_taken: 0,
             summary: "No actions taken.".to_string(),
             skipped_reasons: Vec::new(),

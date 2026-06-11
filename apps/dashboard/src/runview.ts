@@ -381,6 +381,86 @@ export function reviewApplyAvailability(
   return { available: false, reason: REVIEW_APPLY_UNAVAILABLE_REASON };
 }
 
+// A short human label for a structured run-failure class (kernel
+// `relux_core::run_failure::RunFailureClass`). An unknown/absent class falls back
+// to a neutral label so a new server class never renders blank.
+export function failureClassLabel(failureClass: string | undefined): string | null {
+  if (!failureClass) return null;
+  switch (failureClass) {
+    case "transient_provider":
+      return "Transient provider error";
+    case "auth_required":
+      return "Authentication required";
+    case "adapter_missing":
+      return "Adapter not available";
+    case "permission_denied":
+      return "Permission denied";
+    case "invalid_prompt":
+      return "Invalid request";
+    case "timeout":
+      return "Timed out";
+    case "cancelled":
+      return "Cancelled";
+    case "output_validation":
+      return "Output validation failed";
+    case "unknown":
+      return "Unknown failure";
+    default:
+      return failureClass;
+  }
+}
+
+// The B&W status tone for a failure class: a transient that will retry is the
+// "running/in-progress" tone (auto-recovering), an operator-action failure is the
+// "blocked" tone, an intentional cancel is neutral backlog.
+export function failureClassTone(
+  failureClass: string | undefined,
+): "running" | "blocked" | "backlog" {
+  switch (failureClass) {
+    case "transient_provider":
+    case "timeout":
+      return "running";
+    case "cancelled":
+      return "backlog";
+    default:
+      return "blocked";
+  }
+}
+
+// The honest one-line recovery status for a failed run: whether a bounded
+// transient retry is scheduled / exhausted, or the operator must act. Returns
+// null when the run did not fail or carries no class. Pure (no clock): the caller
+// passes `nowSecs` so the "eligible now vs. waiting" read is testable.
+export function recoveryStatusLine(
+  run: ReluxRun | ReluxRunDetail,
+  nowSecs: number,
+): string | null {
+  const failureClass = (run as ReluxRun).failure_class;
+  if (!failureClass) return null;
+  const retry = (run as ReluxRun).retry;
+  if (retry) {
+    if (retry.exhausted) {
+      return `Automatic retries exhausted (${retry.max_attempts} attempts). Retry manually if still wanted.`;
+    }
+    const nb = retry.not_before_secs;
+    if (typeof nb === "number" && nb > nowSecs) {
+      return `Retry ${retry.attempt + 1}/${retry.max_attempts} scheduled in ~${formatWait(nb - nowSecs)} (transient — auto-recovering).`;
+    }
+    return `Retry ${retry.attempt + 1}/${retry.max_attempts} is due (transient — re-runs on the next tick or a manual retry).`;
+  }
+  if (failureClass === "cancelled") {
+    return "Cancelled. Start a fresh run if it is still wanted.";
+  }
+  return "Needs operator action before it can succeed.";
+}
+
+// Compact, approximate wait formatting for the recovery line (seconds/minutes/hours).
+function formatWait(secs: number): string {
+  if (secs < 90) return `${Math.max(1, Math.round(secs))}s`;
+  if (secs < 90 * 60) return `${Math.round(secs / 60)}m`;
+  return `${Math.round(secs / 3600)}h`;
+}
+
 // Pretty-print an event's payload object for the transcript detail, dropping the
 // bulky/duplicated stdout/stderr (already shown as the excerpt) so the row stays
 // legible. Returns null when there is nothing useful to show.

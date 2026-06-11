@@ -33,6 +33,9 @@ import {
   reviewableProposedChangeIndices,
   applyEligibleProposedChangeIndices,
   showBatchProposedChangeControls,
+  failureClassLabel,
+  failureClassTone,
+  recoveryStatusLine,
 } from "../runview";
 
 // Relux Work page: standalone surface for tasks and runs.
@@ -714,9 +717,27 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
           )}
           {/* Logical-sequence timestamps (ordering, not wall-clock). Real timing is "Duration" above. */}
           <div className="kv"><span>Sequence:</span><span className="mono">{run.started_at ?? "—"} → {run.ended_at ?? "(in progress)"}</span></div>
+          {run.failure_class && (
+            <div className="kv"><span>Failure class:</span>
+              <span className={`badge ${failureClassTone(run.failure_class)}`} style={{ fontSize: 10 }}>
+                {failureClassLabel(run.failure_class)}
+              </span>
+            </div>
+          )}
+          {run.failure_class && (() => {
+            // Recovery status reads against the current wall clock; the kernel
+            // owns the authoritative not-before instant, this is a display read.
+            const line = recoveryStatusLine(run, Math.floor(Date.now() / 1000));
+            return line ? <div className="kv"><span>Recovery:</span><span>{line}</span></div> : null;
+          })()}
           {run.failure_reason && (
             <div className="kv stretch"><span>Failure reason:</span>
               <pre className="code" style={{ whiteSpace: "pre-wrap", color: "var(--err, #b00)" }}>{run.failure_reason}</pre>
+            </div>
+          )}
+          {run.failure_remediation && (
+            <div className="kv stretch"><span>Remediation:</span>
+              <span className="muted">{run.failure_remediation}</span>
             </div>
           )}
           {run.summary && <div className="kv stretch"><span>Summary:</span><pre className="code" style={{ whiteSpace: "pre-wrap" }}>{run.summary}</pre></div>}
