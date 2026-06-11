@@ -1657,3 +1657,83 @@ its own, and is rendered into the prompt only when a brain is configured (the de
 byte-for-byte unchanged — empty history leaves the decision prompt identical). A new
 `POST /v1/relux/prime/reset` drops only this advisory memory (history + any pending clarification);
 no durable entity is touched.
+
+---
+
+## Reference read — in-app first-run / operational readiness guide (this slice)
+
+The dashboard had grown many capabilities (Prime brain selection, Claude/Codex
+adapters, crew, plugins/tools, approvals) but the operator still had to read
+scattered docs to learn how to configure a brain, enable an adapter, add crew,
+configure a plugin, and start the first work. The ad-hoc first-run checklist on
+Relux Home (`getFirstRunChecklist`) was a static list of counts that nagged with
+"todo" even for things that are optional (no agents, no tasks) and lacked the
+real readiness signals (real-work adapter, tool/wrapper config state, the single
+clear first action). This slice replaces it with a derived, honest readiness
+report and a compact, app-like guide.
+
+This is a **dashboard/state-read** slice (it reads existing GET endpoints and
+mutates nothing), but the readiness *computation* — turning live booleans into an
+honest pass/warn/fail without a faked green check — is exactly the doctor/health
+shape the reference systems encode, so it is grounded in them.
+
+### Paperclip (openclaw) — files read
+
+- `reference/openclaw-main/apps/macos/Sources/OpenClaw/HealthStore.swift` —
+  `HealthSnapshot` (Codable per-channel `configured` / `linked` / `probe.ok`) and
+  the derived `var state: HealthState` (L197-213): a priority cascade that maps
+  the live snapshot to `.ok` / `.linkingNeeded` / `.degraded(reason)` / `.unknown`,
+  plus `summaryLine` / `detailLine` for a one-line human status. **Pattern: derive a
+  small honest state enum from live booleans in priority order, and carry a concrete
+  human reason for every non-ok state — never a bare "down".**
+- `reference/openclaw-main/apps/ios/Sources/Onboarding/OnboardingStateStore.swift` —
+  `shouldPresentOnLaunch(...)`: onboarding shows only when there is no prior/working
+  connection (`gatewayServerName == nil`). **Pattern: a first-run surface keys off
+  real configuration state, and steps aside once the core path works** — mirrored by
+  the "operational" mode that replaces the checklist with a concise summary once
+  nothing blocks.
+- `reference/openclaw-main/apps/android/.../ui/OnboardingFlow.kt` — `StepRail`
+  (L992-1028) renders each step complete/active/future from real state, and
+  `canFinishOnboarding(isConnected, isNodeConnected)` (L956-959) gates "done" on
+  actual connectivity. **Pattern: a step's completeness is a function of live state,
+  and the terminal "ready" is a real predicate, not a click count.**
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/hermes_cli/status.py` — `show_status(args)` (L90-571)
+  and the `check_mark(ok)` / `redact_key` helpers: a hierarchical status display where
+  every line is a concrete check (model configured, provider resolved, each API key
+  set or "(not set)", each adapter logged-in/expired) rendered ✓/✗ with secret-free
+  detail. **Pattern: one honest check per capability, the exact configured/missing
+  fact, secrets redacted.**
+- `reference/hermes-agent-main/hermes_cli/doctor.py` — `run_doctor(args)` (L337+) with
+  `check_ok` / `check_warn` / `check_fail` / `check_info` and `_fail_and_issue(...,
+  fix, issues)`: a deeper diagnostic that classifies each finding into pass / warn /
+  fail / info and attaches the concrete remediation ("Run: hermes auth add …").
+  **Pattern: three honest severities (a "warn" for installed-but-unconfigured is
+  distinct from a "fail"), each carrying its exact next step.**
+- `reference/hermes-agent-main/tui_gateway/server.py` `@method("setup.status")` →
+  `{"provider_configured": bool(...)}`: a lightweight readiness RPC the UI calls to
+  decide its flow. **Pattern: readiness is a cheap derivation over already-known
+  config, not a fresh deep probe per render** — mirrored by deriving the whole report
+  from the four reads Home already makes.
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| openclaw `HealthStore`: **derive a small honest state from live booleans in priority order, with a concrete reason per non-ok state** | `apps/dashboard/src/readiness.ts` `buildReadiness(inputs)` composes one report from the live reads (`state`, `ai/status`, `adapters`, `plugins`, `tools`); each item carries a `status` (`done`/`todo`/`warn`/`link`/`info`) and an honest `description` + the exact `linkTo` page that fixes it. |
+| Hermes `doctor`: **three severities — warn (installed-but-unconfigured) ≠ fail** | a SELECTED-but-broken brain (OpenRouter w/o key, Claude CLI off PATH/disabled) is the only **blocker** (`todo`); a local brain WORKS (`link`, a recommendation); a metadata-only wrapper or a tool needing a loopback runtime is **attention** (`warn`), surfaced but never blocking. Reuses the already-tested `onboarding.ts::primeBrainStep` and `plugins.ts::pluginCategory`/`toolReadiness` so the surfaces never disagree. |
+| openclaw onboarding: **step aside once the core path works** | `ready = blockers.length === 0`; `apps/dashboard/src/components/ReadinessGuide.tsx` then shows a concise one-line operational summary + the first action (checks tucked behind a native `<details>`), instead of the full nag. |
+| Hermes `status`: **one honest check per capability, secrets redacted** | items cover brain, real-work adapter (Claude/Codex enabled+on-PATH), crew (else the honest "Prime is your built-in operative" local fallback), plugins/tools (configured/needs-runtime/needs-approval/wrapper-needs-config), and pending approvals; the summary is secret-free (brain *label* only, never a key). |
+| Hermes `setup.status`: **cheap derivation, not a per-render deep probe** | the report is a pure function of the four GET reads the page already makes; no new endpoint was added. `deriveFirstAction(state)` returns the single clearest next step in priority order (pending approval → active run → start/assign a task → ask Prime). |
+
+**What we deliberately do differently:** the guide is **read-only** — it derives and
+displays, mutating nothing, and every "fix" is a `<Link>` to an existing page
+(`/health` for the brain, `/crew` for adapters/crew, `/plugins` for tools, `/work`
+and `/prime` for work). It never fabricates a green check: an unreachable tools
+probe stays an honest `info` ("tool readiness unavailable"), not "no tools
+configured". The pure derivation lives in `readiness.ts` (React-free, like
+`routing`/`onboarding`/`plugins`) so `node --test` pins all four required states
+(`test/readiness.test.ts`) and a render test (`test/readiness-render.test.mjs`)
+proves Home mounts and the committed bundle carries the copy.

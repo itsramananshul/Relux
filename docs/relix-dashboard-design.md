@@ -240,4 +240,71 @@ The migration is safe because the web-bridge keeps serving one bundle; the legac
 
 ---
 
+---
+
+## 15. The Home readiness guide (IMPLEMENTED)
+
+> **STATUS: shipped.** Unlike the rest of this doc (ideas-only for the goal-facing
+> reshape), this section documents the **current, live** behavior of the standalone
+> Relux SPA's Home page (`apps/dashboard/src/pages/ReluxHome.tsx`), served at
+> `/dashboard` by `relux-kernel`. It is the first-run/operational guidance surface,
+> grounded entirely in the local `/v1/relux` control plane.
+
+**The goal:** a new operator should learn, from Home alone, how to configure
+Prime's brain, enable a Claude/Codex adapter, add crew, configure plugins/tools,
+and start the first work — without reading scattered docs — and a configured
+operator should get a concise operational summary, not a nag.
+
+**Where it lives.** A single compact, app-like card (`ReadinessGuide`,
+`apps/dashboard/src/components/ReadinessGuide.tsx`) on Home, between the product
+framing card and the orchestration/plugins cards. No hero, no nested cards; it
+never blocks normal dashboard use.
+
+**What it derives (honest, live).** A pure, React-free module
+(`apps/dashboard/src/readiness.ts`, `buildReadiness(inputs)`) turns the four reads
+Home already makes — `reluxPlugins.state()`, `reluxAi.status()`,
+`reluxAdapters.list()`, `reluxPlugins.list()` + `reluxTools.list()` — into one
+report. No new endpoint. Each capability is one honest check with the exact page
+that fixes it:
+
+- **Prime brain** — reuses `onboarding.ts::primeBrainStep`. A SELECTED-but-broken
+  brain (OpenRouter without a key; Claude/Codex CLI selected but off PATH or
+  disabled) is the **only** blocker; a local deterministic brain *works* (shown as
+  a recommendation to connect a richer brain, not a failure). Action → `/health`.
+- **Real-work adapter** — whether a Claude/Codex CLI adapter is enabled and on PATH
+  to *execute* assigned tasks (distinct from the brain). Optional, so an
+  unavailable/disabled adapter is an actionable link, never a blocker. Action →
+  `/crew`.
+- **Crew** — at least one agent, else the honest local fallback ("Prime is your
+  built-in operative and can do the work itself"). Action → `/crew`.
+- **Plugins & tools** — reuses `plugins.ts::pluginCategory`/`toolReadiness`. A
+  metadata-only wrapper (generated, zero tools) or a tool needing a loopback
+  runtime is **attention** (`warn`); ready tools are `done`; approval-gated tools
+  are noted, never counted as ready; an unreachable tools probe stays an honest
+  `info`, never "no tools configured". Action → `/plugins`.
+- **Pending approvals** — surfaced only when something actually waits on a decision.
+  Action → `/approvals`.
+
+**Two modes (the no-nag rule).** `ready = blockers.length === 0`.
+- **Setup needed** (a blocker exists): the full checklist renders with per-item
+  action buttons so the operator finishes setup.
+- **Operational** (nothing blocks): a one-line, secret-free summary (`Brain: <label>.
+  N agents, M tools ready. K open tasks, J running.`), any `warn` attention items
+  shown quietly, and the full checks tucked behind a native `<details>` disclosure.
+
+**The first action.** `deriveFirstAction(state)` always returns one clear next step
+in priority order: review a pending approval → watch an active run → start/assign a
+task → ask Prime to start the first task. Prime is always available, so even the
+fresh state has a real action.
+
+**Tests.** `apps/dashboard/test/readiness.test.ts` pins the four required states
+(fresh/local-only, Claude available but disabled, metadata plugin needs config,
+fully ready) plus the blocker and first-action priority;
+`apps/dashboard/test/readiness-render.test.mjs` proves Home mounts under the
+declarative router and the committed bundle carries the copy. Reference grounding
+(openclaw `HealthStore`/onboarding, Hermes `status`/`doctor`/`setup.status`) is
+recorded in `docs/reference-driven-development.md`.
+
+---
+
 *This is the dashboard-and-companion design. With the company model (`relix-company-model.md`), the execution spine (`relix-execution-and-issue-design.md`), and this, the three docs cover the product, the engine, and the surface — all grounded in the complete Paperclip read, all ideas-only. The next concrete step is to pick the first build slice (Phase 0/1) and design its exact data shape against Relix's coordinator schema.*

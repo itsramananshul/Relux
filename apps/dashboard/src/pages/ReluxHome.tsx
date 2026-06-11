@@ -3,15 +3,18 @@ import {
   reluxPlugins,
   reluxAi,
   reluxAdapters,
+  reluxTools,
   reluxOrchestration,
   type ReluxPlugin,
   type ReluxState,
   type ReluxAiStatus,
   type ReluxAdapterStatus,
+  type ReluxToolDescriptor,
   type ReluxOrchestration,
 } from "../api";
 import { useAsync } from "../components/common";
-import { primeBrainStep } from "../onboarding";
+import { buildReadiness } from "../readiness";
+import { ReadinessGuide } from "../components/ReadinessGuide";
 import {
   activeOrchestration,
   orchestrationHeadline,
@@ -28,90 +31,36 @@ import {
 // plane) and points at the two things you can do right now: talk to Prime and
 // manage plugins.
 
-interface ChecklistItem {
-  id: string;
-  label: string;
-  status: "todo" | "done" | "info" | "link";
-  description: string;
-  linkTo?: string;
-}
-
-function getFirstRunChecklist(s: ReluxState | null): ChecklistItem[] {
-  if (!s) {
-    return [
-      { id: "loading", label: "Loading system state...", status: "info", description: "Fetching current Relux operational state." }
-    ];
-  }
-
-  const checklist: ChecklistItem[] = [
-    {
-      id: "prime-available",
-      label: "Prime is available",
-      status: "done", // Prime is always available in the local control plane
-      description: "Your local Relux operator is ready to chat.",
-      linkTo: "/prime"
-    },
-    {
-      id: "at-least-one-agent",
-      label: "At least one agent exists",
-      status: s.agents > 0 ? "done" : "todo",
-      description: s.agents > 0 ? `You have ${s.agents} configured agent(s).` : "Create your first agent to delegate tasks.",
-      linkTo: "/crew"
-    },
-    {
-      id: "at-least-one-task",
-      label: "At least one task exists",
-      status: s.tasks > 0 ? "done" : "todo",
-      description: s.tasks > 0 ? `You have ${s.tasks} total task(s).` : "Create a task for Prime or an agent to work on.",
-      linkTo: "/work"
-    },
-    {
-      id: "pending-approvals",
-      label: "Pending approvals",
-      status: s.pending_approvals > 0 ? "todo" : "done",
-      description: s.pending_approvals > 0 ? `You have ${s.pending_approvals} pending approval(s) requiring your decision.` : "No pending approvals at the moment.",
-      linkTo: "/approvals"
-    },
-    // The "connect Prime to a brain" step is derived live from the control plane
-    // (AI status + adapters) and inserted by the component via primeBrainStep, so
-    // it reflects real readiness and the exact next step — not a static link.
-    {
-      id: "installed-plugins",
-      label: "Plugins installed",
-      status: s.installed_plugins > 0 ? "done" : "todo",
-      description: s.installed_plugins > 0 ? `You have ${s.installed_plugins} plugin(s) installed, extending Relux capabilities.` : "Install plugins to add new tools and adapters.",
-      linkTo: "/plugins"
-    },
-    {
-      id: "health-status",
-      label: "Check system health",
-      status: "link",
-      description: "Monitor the operational status and diagnostics of your Relux instance.",
-      linkTo: "/health"
-    },
-  ];
-
-  return checklist;
-}
-
 export function ReluxHome() {
   const state = useAsync<ReluxState>(() => reluxPlugins.state(), []);
   const plugins = useAsync<ReluxPlugin[]>(() => reluxPlugins.list(), []);
   const ai = useAsync<ReluxAiStatus>(() => reluxAi.status(), []);
   const adapters = useAsync<ReluxAdapterStatus[]>(() => reluxAdapters.list(), []);
+  const tools = useAsync<ReluxToolDescriptor[]>(() => reluxTools.list(), []);
   const orchestrations = useAsync<ReluxOrchestration[]>(() => reluxOrchestration.list(), []);
 
-  // Compose the checklist with the LIVE brain step inserted right after
-  // "Prime is available", so the very first thing a new user sees is whether
-  // Prime is connected to a real brain and exactly how to connect one.
-  const checklist = (() => {
-    const items = getFirstRunChecklist(state.data);
-    if (!state.data) return items; // still loading the control plane
-    const brain: ChecklistItem = { ...primeBrainStep(ai.data, adapters.data) };
-    const primeIdx = items.findIndex((i) => i.id === "prime-available");
-    const at = primeIdx >= 0 ? primeIdx + 1 : 0;
-    return [...items.slice(0, at), brain, ...items.slice(at)];
-  })();
+  // The whole readiness report is derived (pure) from the live control-plane
+  // reads — the brain, the real-work adapter, crew, plugins/tools and any
+  // pending approvals — so the guide reflects HONEST readiness, never a faked
+  // green check. Null state means the control plane was not reachable; we render
+  // the loading report and the honest error banner below.
+  const report = state.data
+    ? buildReadiness({
+        state: state.data,
+        ai: ai.data,
+        adapters: adapters.data,
+        plugins: plugins.data,
+        tools: tools.error ? null : tools.data,
+      })
+    : null;
+
+  const refreshAll = () => {
+    state.reload();
+    plugins.reload();
+    ai.reload();
+    adapters.reload();
+    tools.reload();
+  };
 
   return (
     <div className="grid">
@@ -120,16 +69,7 @@ export function ReluxHome() {
         <div className="row" style={{ alignItems: "center", marginBottom: 8 }}>
           <h3 style={{ margin: 0 }}>Relux - local control plane</h3>
           <div className="spacer" style={{ flex: 1 }} />
-          <button
-            className="btn ghost sm"
-            onClick={() => {
-              state.reload();
-              plugins.reload();
-              ai.reload();
-              adapters.reload();
-            }}
-            disabled={state.loading}
-          >
+          <button className="btn ghost sm" onClick={refreshAll} disabled={state.loading}>
             {state.loading ? "Loading..." : "Refresh"}
           </button>
         </div>
@@ -172,46 +112,7 @@ export function ReluxHome() {
           </div>
         </div>
       ) : (
-        <div className="card">
-          <h3>First-run checklist</h3>
-          <ul className="checklist">
-            {checklist.map((item) => (
-              <li key={item.id} className="checklist-item">
-                <span className={`checklist-icon ${item.status}`}>
-                  {item.status === "done" && "✓"}
-                  {item.status === "todo" && "✗"}
-                  {item.status === "info" && "…"}
-                  {item.status === "link" && "→"}
-                </span>
-                {item.linkTo ? (
-                  <Link to={item.linkTo} className="checklist-label">
-                    {item.label}
-                  </Link>
-                ) : (
-                  <span className="checklist-label">{item.label}</span>
-                )}
-                <span className="checklist-description">{item.description}</span>
-              </li>
-            ))}
-            <li className="checklist-item">
-              <span className="checklist-icon info">ℹ</span>
-              <span className="checklist-label">Tasks status overview</span>
-              <span className="checklist-description">
-                <Link to="/work" className="link">
-                  Open tasks: {state.data?.open_tasks ?? 0}
-                </Link>
-                {" · "}
-                <Link to="/work" className="link">
-                  Active runs: {state.data?.active_runs ?? 0}
-                </Link>
-                {" · "}
-                <Link to="/work" className="link">
-                  Waiting approval: {state.data?.waiting_approval ?? 0}
-                </Link>
-              </span>
-            </li>
-          </ul>
-        </div>
+        <ReadinessGuide report={report} loading={state.loading} onRefresh={refreshAll} />
       )}
 
       {/* Multi-agent orchestration at a glance — Prime coordinating the fleet. */}
@@ -353,59 +254,3 @@ function OrchestrationHomeCard({
     </div>
   );
 }
-
-// Add some basic styles for the checklist
-const styleSheet = document.createElement("style");
-styleSheet.innerText = `
-  .checklist {
-    list-style: none;
-    padding: 0;
-    margin: 0;
-  }
-  .checklist-item {
-    display: flex;
-    align-items: center;
-    margin-bottom: 8px;
-    font-size: 14px;
-  }
-  .checklist-icon {
-    width: 20px;
-    height: 20px;
-    border-radius: 50%;
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    margin-right: 8px;
-    font-weight: bold;
-    color: var(--text-color);
-  }
-  .checklist-icon.done {
-    background-color: var(--green-600); /* Example green */
-    color: white;
-  }
-  .checklist-icon.todo {
-    background-color: var(--yellow-600); /* Example yellow */
-    color: black;
-  }
-  .checklist-icon.info {
-    background-color: var(--blue-600); /* Example blue */
-    color: white;
-  }
-  .checklist-icon.link {
-    background-color: var(--gray-500); /* Example gray for links */
-    color: white;
-  }
-  .checklist-label {
-    flex-shrink: 0;
-    margin-right: 8px;
-    font-weight: 600;
-  }
-  .checklist-description {
-    color: var(--text-muted);
-  }
-  .checklist-item .link {
-    color: var(--link-color);
-    text-decoration: underline;
-  }
-`;
-document.head.appendChild(styleSheet);
