@@ -1,3 +1,4 @@
+import { lazy, Suspense } from "react";
 import { Link, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { isLegacyPath } from "./routing";
 import { useAuth } from "./auth";
@@ -5,26 +6,46 @@ import { Login } from "./pages/Login";
 import { Layout } from "./components/Layout";
 import { ReluxShell } from "./components/ReluxShell";
 import { ErrorBoundary } from "./components/ErrorBoundary";
-import { ReluxHome } from "./pages/ReluxHome";
-import { Prime } from "./pages/Prime";
-import { Overview } from "./pages/Overview";
-import { Briefs } from "./pages/Briefs";
-import { Mandates } from "./pages/Mandates";
-import { Agents } from "./pages/Agents";
-import { Lattice } from "./pages/Lattice";
-import { Company } from "./pages/Company";
-import { Costs } from "./pages/Costs";
-import { Assign } from "./pages/Assign";
-import { Runs } from "./pages/Runs";
-import { Approvals } from "./pages/Approvals";
-import { Chat } from "./pages/Chat";
-import { Scheduled } from "./pages/Scheduled";
-import { Plugins } from "./pages/Plugins";
-import { Work } from "./pages/Work";
-import { Settings } from "./pages/Settings";
-import { Crew } from "./pages/Crew"; // Import the new Crew page
-import ReluxApprovals from "./pages/ReluxApprovals"; // Import the new ReluxApprovals page
-import { Health } from "./pages/Health"; // Import the new Health page
+
+// Route-level code splitting. The shell (App + ReluxShell/Layout + auth gate)
+// loads eagerly; every page is fetched on demand the first time its route is
+// visited. This keeps the initial JS chunk well under Vite's 500 kB warning
+// threshold and means a user who only touches the Relux surfaces never downloads
+// the legacy dashboard pages (or vice-versa). Behavior is unchanged: the same
+// components render at the same paths — they just arrive in per-route chunks.
+//
+// Pages export named symbols, so each import is mapped to a `default` for
+// React.lazy; ReluxApprovals is already a default export.
+const ReluxHome = lazy(() => import("./pages/ReluxHome").then((m) => ({ default: m.ReluxHome })));
+const Prime = lazy(() => import("./pages/Prime").then((m) => ({ default: m.Prime })));
+const Overview = lazy(() => import("./pages/Overview").then((m) => ({ default: m.Overview })));
+const Briefs = lazy(() => import("./pages/Briefs").then((m) => ({ default: m.Briefs })));
+const Mandates = lazy(() => import("./pages/Mandates").then((m) => ({ default: m.Mandates })));
+const Agents = lazy(() => import("./pages/Agents").then((m) => ({ default: m.Agents })));
+const Lattice = lazy(() => import("./pages/Lattice").then((m) => ({ default: m.Lattice })));
+const Company = lazy(() => import("./pages/Company").then((m) => ({ default: m.Company })));
+const Costs = lazy(() => import("./pages/Costs").then((m) => ({ default: m.Costs })));
+const Assign = lazy(() => import("./pages/Assign").then((m) => ({ default: m.Assign })));
+const Runs = lazy(() => import("./pages/Runs").then((m) => ({ default: m.Runs })));
+const Approvals = lazy(() => import("./pages/Approvals").then((m) => ({ default: m.Approvals })));
+const Chat = lazy(() => import("./pages/Chat").then((m) => ({ default: m.Chat })));
+const Scheduled = lazy(() => import("./pages/Scheduled").then((m) => ({ default: m.Scheduled })));
+const Plugins = lazy(() => import("./pages/Plugins").then((m) => ({ default: m.Plugins })));
+const Work = lazy(() => import("./pages/Work").then((m) => ({ default: m.Work })));
+const Settings = lazy(() => import("./pages/Settings").then((m) => ({ default: m.Settings })));
+const Crew = lazy(() => import("./pages/Crew").then((m) => ({ default: m.Crew })));
+const ReluxApprovals = lazy(() => import("./pages/ReluxApprovals"));
+const Health = lazy(() => import("./pages/Health").then((m) => ({ default: m.Health })));
+
+// Shown while a route's chunk is in flight. Kept lightweight so the shell chrome
+// (sidebar/header) stays painted and only the content area shows a brief hint.
+function RouteFallback() {
+  return (
+    <div className="muted" style={{ padding: 16, fontSize: 13 }}>
+      Loading…
+    </div>
+  );
+}
 
 // Route ownership (Relux shell as the default, legacy paths as the exception)
 // lives in ./routing as a pure, testable module. Making the Relux shell the
@@ -86,16 +107,18 @@ export function App() {
           instead of white-screening the whole SPA (§17.6; the reported blank
           pages). Keyed on the path so navigating away clears the error. */}
       <ErrorBoundary resetKey={loc.pathname}>
-        <Routes>
-          <Route path="/" element={<ReluxHome />} />
-          <Route path="/prime" element={<Prime />} />
-          <Route path="/work" element={<Work />} />
-          <Route path="/plugins" element={<Plugins />} />
-          <Route path="/crew" element={<Crew />} />
-          <Route path="/approvals" element={<ReluxApprovals />} />
-          <Route path="/health" element={<Health />} />
-          <Route path="*" element={<ReluxNotFound />} />
-        </Routes>
+        <Suspense fallback={<RouteFallback />}>
+          <Routes>
+            <Route path="/" element={<ReluxHome />} />
+            <Route path="/prime" element={<Prime />} />
+            <Route path="/work" element={<Work />} />
+            <Route path="/plugins" element={<Plugins />} />
+            <Route path="/crew" element={<Crew />} />
+            <Route path="/approvals" element={<ReluxApprovals />} />
+            <Route path="/health" element={<Health />} />
+            <Route path="*" element={<ReluxNotFound />} />
+          </Routes>
+        </Suspense>
       </ErrorBoundary>
     </ReluxShell>
   );
@@ -122,22 +145,24 @@ function LegacyDashboard() {
   return (
     <Layout>
       <ErrorBoundary resetKey={loc.pathname}>
-        <Routes>
-        <Route path="/overview" element={<Overview />} />
-        <Route path="/mandates" element={<Mandates />} />
-        <Route path="/briefs" element={<Briefs />} />
-        <Route path="/agents" element={<Agents />} />
-        <Route path="/lattice" element={<Lattice />} />
-        <Route path="/company" element={<Company />} />
-        <Route path="/costs" element={<Costs />} />
-        <Route path="/assign" element={<Assign />} />
-        <Route path="/runs" element={<Runs />} />
-        <Route path="/approvals" element={<Approvals />} />
-        <Route path="/chat" element={<Chat />} />
-        <Route path="/scheduled" element={<Scheduled />} />
-          <Route path="/settings" element={<Settings />} />
-          <Route path="*" element={<Navigate to="/overview" replace />} />
-        </Routes>
+        <Suspense fallback={<RouteFallback />}>
+          <Routes>
+          <Route path="/overview" element={<Overview />} />
+          <Route path="/mandates" element={<Mandates />} />
+          <Route path="/briefs" element={<Briefs />} />
+          <Route path="/agents" element={<Agents />} />
+          <Route path="/lattice" element={<Lattice />} />
+          <Route path="/company" element={<Company />} />
+          <Route path="/costs" element={<Costs />} />
+          <Route path="/assign" element={<Assign />} />
+          <Route path="/runs" element={<Runs />} />
+          <Route path="/approvals" element={<Approvals />} />
+          <Route path="/chat" element={<Chat />} />
+          <Route path="/scheduled" element={<Scheduled />} />
+            <Route path="/settings" element={<Settings />} />
+            <Route path="*" element={<Navigate to="/overview" replace />} />
+          </Routes>
+        </Suspense>
       </ErrorBoundary>
     </Layout>
   );

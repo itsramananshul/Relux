@@ -1,0 +1,1 @@
+function l(o,t,r=10){if(o==null)return null;const n=Math.floor((t-o)/1e3);if(n<r)return null;if(n<60)return`No activity for ${n}s`;const e=Math.floor(n/60),i=n%60;return`No activity for ${e}m ${i}s`}export{l as n};

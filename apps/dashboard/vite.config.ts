@@ -17,6 +17,20 @@ export default defineConfig({
     emptyOutDir: true,
     modulePreload: { polyfill: false },
     target: "es2020",
+    rollupOptions: {
+      output: {
+        // Split the runtime deps (react/react-dom/react-router-dom) into a
+        // single long-lived `vendor` chunk. Combined with the route-level
+        // React.lazy splitting in App.tsx, this keeps every emitted chunk
+        // under Vite's 500 kB warning threshold without fragmenting the
+        // graph into dozens of tiny files.
+        manualChunks(id) {
+          if (id.indexOf("node_modules") !== -1) {
+            return "vendor";
+          }
+        },
+      },
+    },
   },
   server: {
     port: 5273,
