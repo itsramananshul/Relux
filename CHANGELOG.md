@@ -9,6 +9,35 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.8 (Windows bundle).** The `relux-kernel` /
+  `relux-core` crates move from `0.1.7` to `0.1.8`, bundling the post-v0.1.7
+  **Prime intelligence** slice into a fresh Windows release. This line makes Prime
+  *brain-mediated end to end* while keeping every master-plan safety property: the
+  deterministic keyword cascade is now only the **fallback rail**, a configured brain
+  (OpenRouter or the local Claude/Codex CLI) genuinely decides each turn, and every
+  brain output is validated against the live state behind a **fail-closed gate**
+  before anything mutates. Headlines: **brain-mediated intent classification** (the
+  brain proposes a `PrimeIntent`, validated against the allowlist and reconciled by a
+  safety gate that may sharpen but never weaken a misread); **brain-assisted, validated
+  slots** for task creation (title/details/assignee/priority), agent hiring, plugin
+  install, and permission grants, plus **brain-refined clarification wording with a
+  persona seed**; **multi-turn clarification memory** so a follow-up answer ("task_0001
+  to 8") continues the prior clarify instead of starting over; **roster-aware fuzzy
+  assignee resolution** and **brain-assisted assignment continuation**; **by-id run
+  start** with a resolvable run-start clarification; **safe by-id task UPDATE** as a
+  real mutating action (allowlisted fields, clamped/sanitized values, terminal-state
+  guard, no fake completions); and the capstone **unified Prime brain decision
+  envelope** — one call now carries intent + slots + clarification wording + the
+  conversational reply + the plan-preview polish, computed off-lock and validated
+  post-turn through the existing chokepoints (`validate_polish`, `parse_adapter_result`,
+  the slot/intent gates) so a single brain round trip drives the whole turn without
+  loosening any guard. Built reference-first per `docs/reference-driven-development.md`
+  (Hermes' allowlist-validated tool loop + `coerce_tool_args` sanitization;
+  Paperclip/openclaw's fail-closed mutation gate, balanced-JSON parsing, and
+  `update-plan-tool` status allowlist) and audited in `docs/prime-processing-audit.md`.
+  Build the bundle with `scripts\relux-package-local.ps1 -FullE2E`. This version line is
+  the `relux-kernel` crate version (separate from the legacy Relix workspace versions in
+  the dated sections below). See `docs/RELUX_MASTER_PLAN.md` → *Release history*.
 - **Safe by-id task UPDATE for Prime (post-v0.1.7).** `PrimeAction::UpdateTask
   { task_id, patch }` is now a REAL, safe mutating action instead of an always-clarify
   dead end (`crates/relux-kernel/src/prime_update_slots.rs`). A deterministic rail
@@ -1628,7 +1657,7 @@ First public alpha. Everything below is real and ships.
   versions; they were never cut as individual GitHub releases in this repo, so they
   point at the Releases list rather than non-existent `vX.Y.Z` tags (which 404).
 -->
-[Unreleased]: https://github.com/itsramananshul/Relix/compare/relux-v0.1.7...HEAD
+[Unreleased]: https://github.com/itsramananshul/Relix/compare/relux-v0.1.8...HEAD
 [0.4.3-beta.1]: https://github.com/itsramananshul/Relix/releases
 [0.4.2]: https://github.com/itsramananshul/Relix/releases
 [0.4.1]: https://github.com/itsramananshul/Relix/releases

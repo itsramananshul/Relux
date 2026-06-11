@@ -1836,6 +1836,29 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.8** (2026-06-11) — a **Prime intelligence** slice on top of v0.1.7 that makes
+  Prime brain-mediated end to end while keeping every safety property. The deterministic
+  keyword cascade is now only the **fallback rail**: a configured brain (OpenRouter or
+  the local Claude/Codex CLI) genuinely decides each turn, and every brain output is
+  validated against the live state behind a **fail-closed gate** before anything mutates.
+  **Brain-mediated intent:** the brain proposes a `PrimeIntent`, validated against the
+  allowlist and reconciled by a gate that may sharpen but never weaken a misread.
+  **Brain-assisted validated slots:** task creation (title/details/assignee/priority),
+  agent hiring, plugin install, and permission grants are filled by the brain and
+  hard-validated, with brain-refined clarification wording and a persona seed.
+  **Multi-turn clarify memory:** a follow-up answer continues the prior clarify instead
+  of restarting. **Fuzzy continuation:** roster-aware assignee resolution and
+  brain-assisted assignment continuation, plus **by-id run start** with a resolvable
+  run-start clarification. **Safe by-id task UPDATE:** a real mutating action with an
+  allowlisted field set, clamped/sanitized values, a terminal-state guard, and no fake
+  completions. **Unified decision envelope:** one brain call now carries intent + slots
+  + clarification wording + conversational reply + plan-preview polish, computed off-lock
+  and validated post-turn through the existing chokepoints (`validate_polish`,
+  `parse_adapter_result`, the slot/intent gates), so a single round trip drives the whole
+  turn without loosening any guard. Built reference-first per
+  `docs/reference-driven-development.md` (Hermes + Paperclip/openclaw) and audited in
+  `docs/prime-processing-audit.md`. Proven by `relux-kernel` / `relux-core` unit tests;
+  every safety property from v0.1.7 still holds.
 - **v0.1.7** (2026-06-11) — a product slice on top of v0.1.6 that adds a first-class
   **idea → plan → tasks** rung and hardens the dashboard against page crashes.
   **Plan-preview proposal card:** Prime renders an *action-free* preview of a
