@@ -1836,6 +1836,37 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.11** (2026-06-11) — a **plugin tool-invocation** slice on top of v0.1.10. Where
+  v0.1.10 closed the Prime observe-then-act + governed-orchestration line, this line makes
+  the ToolSet-plugin tool-invocation surface honest and usable end-to-end on the
+  dashboard, with no safety property weakened. **In-UI tool configuration:** a fail-closed
+  `plugin_tool_config` parser (allowlisted fields, sanitize/clamp, `RiskLevel` allowlist)
+  plus `KernelState::configure_plugin_tool` / `remove_plugin_tool` add or replace one tool
+  on an installed, non-bundled ToolSet manifest, transactionally on a re-validated clone,
+  with the permission DERIVED (`tool:<id>:<verb>`, never operator-supplied), via
+  `POST`/`DELETE /v1/relux/plugins/:id/tools` and an in-UI add-a-tool form. **Honesty
+  fix:** the manifest `approval` field is now load-bearing via
+  `relux_core::approval_blocks_direct_invocation` behind a new
+  `ToolExecutability::NeedsApproval` refusal in `call_tool`/`invoke_tool`, so a
+  non-low-risk configured tool is never runnable just because a loopback runtime is enabled
+  (bundled fixtures are `approval:never`, unchanged). **Honest readiness classifier:** a
+  single `toolReadiness` helper (mirroring openclaw `approval-classifier`) maps the
+  kernel's six executable states to `{ runnable, label, tone, reason, nextStep }`
+  (`runnable` true only for `ready`); every non-ready tool renders an inline "Why not?"
+  panel with the refusal/disabled reason + next step, never a blank page. **Per-tool-call
+  approval flow:** an operator requests approval for ONE invocation (tool id + exact args)
+  via `request_tool_invocation_approval` (`POST /v1/relux/tools/request-approval`),
+  creating a Pending Approval + a `PendingToolInvocation` binding to the exact
+  `(plugin, tool, agent, args + SHA-256)`; `execute_approved_tool_invocation`
+  (`POST /v1/relux/approvals/:id/execute`) runs only when Approved AND unconsumed,
+  re-validates existence/permission/args-hash, executes the STORED snapshot (never
+  client-resupplied args), and consumes the binding on a single attempt. Built
+  reference-first per `docs/reference-driven-development.md` (openclaw two-phase exec
+  approval + consume-once handoff + approval-classifier). No blanket/reusable grant; no
+  remote/non-loopback execution; `decide → prime_execute / approval` stays the sole
+  durable-state path. Proven by `relux-kernel` / `relux-core` unit and integration tests
+  plus dashboard `toolReadiness` assertions; every safety property from v0.1.10 still
+  holds.
 - **v0.1.10** (2026-06-11) — a **Prime observe-then-act + governed orchestration** slice
   on top of v0.1.9. Where v0.1.9 gave the brain a single-shot governed tool surface, this
   line lets one turn *inspect then act* and extends the safe write surface to

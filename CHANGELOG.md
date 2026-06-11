@@ -9,6 +9,49 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.11 (Windows bundle).** The `relux-kernel` /
+  `relux-core` crates move from `0.1.10` to `0.1.11`, bundling the post-v0.1.10 **plugin
+  tool-invocation** slice into a fresh Windows release. v0.1.10 closed the Prime
+  observe-then-act + governed-orchestration line; this line makes the ToolSet-plugin
+  tool-invocation surface honest and usable end-to-end on the dashboard, with no
+  master-plan safety property weakened. Headlines: **in-UI tool configuration for
+  metadata-only plugin wrappers** — a new fail-closed `plugin_tool_config` parser
+  (allowlisted fields, sanitize/clamp, `RiskLevel` allowlist) plus
+  `KernelState::configure_plugin_tool` / `remove_plugin_tool` add or replace one tool on
+  an installed, non-bundled ToolSet manifest, transactionally on a re-validated clone,
+  with the permission DERIVED (`tool:<id>:<verb>`, never operator-supplied), exposed via
+  `POST`/`DELETE /v1/relux/plugins/:id/tools` and an in-UI add-a-tool form (the
+  copy/download manifest template drops to an Advanced fallback). An **honesty fix** makes
+  the manifest `approval` field load-bearing for the first time via
+  `relux_core::approval_blocks_direct_invocation` behind a new
+  `ToolExecutability::NeedsApproval` refusal in `call_tool`/`invoke_tool`, so a
+  non-low-risk configured tool is never runnable just because a loopback runtime is
+  enabled (bundled fixtures are `approval:never`, so unchanged). A single **honest
+  readiness classifier** (`toolReadiness` in `apps/dashboard/src/plugins.ts`, mirroring
+  openclaw `approval-classifier`) maps the kernel's six executable states to
+  `{ runnable, label, tone, reason, nextStep }` with `runnable` true only for `ready`;
+  every non-ready tool now renders an inline "Why not?" panel stating the refusal/disabled
+  reason + next step instead of a terse "not callable", and tools stay inline on the
+  Plugins page (a non-ready tool never opens a blank page). The capstone is a **real
+  per-tool-call approval flow** for gated tools: an operator requests approval for ONE
+  specific invocation (tool id + exact args) via `request_tool_invocation_approval`
+  (`POST /v1/relux/tools/request-approval`) — validating the tool exists, the subject
+  holds its permission, the tool actually requires approval, and the args are bounded —
+  which creates a Pending Approval + a `PendingToolInvocation` binding to the exact
+  `(plugin, tool, agent, args snapshot + SHA-256)`; `execute_approved_tool_invocation`
+  (`POST /v1/relux/approvals/:id/execute`) runs only when Approved AND unconsumed,
+  re-validates existence/permission/args-hash, executes the STORED snapshot (never
+  client-resupplied args), and consumes the binding on a single attempt (success or
+  failure), with the Approvals page showing the bound tool + a secret-redacted args
+  preview and an Execute-once button. Built reference-first per
+  `docs/reference-driven-development.md` (openclaw two-phase
+  `registerExecApprovalRequest` + consume-once handoff + approval-classifier;
+  `readPlanSteps`/`sessions-spawn` per-entry validation). No blanket/reusable grant; no
+  remote/non-loopback execution; `decide → prime_execute / approval` stays the sole path
+  that changes durable state. Build the bundle with `scripts\relux-package-local.ps1
+  -FullE2E`. This version line is the `relux-kernel` crate version (separate from the
+  legacy Relix workspace versions in the dated sections below). See
+  `docs/RELUX_MASTER_PLAN.md` → *Release history*.
 - **Relux local release v0.1.10 (Windows bundle).** The `relux-kernel` /
   `relux-core` crates move from `0.1.9` to `0.1.10`, bundling the post-v0.1.9 **Prime
   observe-then-act + governed orchestration** slice into a fresh Windows release. v0.1.9

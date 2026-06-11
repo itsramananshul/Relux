@@ -17,11 +17,11 @@
     cache (which lagged a full version behind after v0.1.10 shipped).
     On every release, bump the tag `relux-vX.Y.Z` in BOTH the href and the badge
     `message` below (hyphens in the badge message are doubled: relux--vX.Y.Z),
-    then bump the matching `v0.1.10` / `relux-local-0.1.10-...` strings in the
+    then bump the matching `v0.1.11` / `relux-local-0.1.11-...` strings in the
     "Run the packaged release" section. `scripts/relux-package-local.ps1` warns
     if these drift from the crate version being packaged.
   -->
-  <a href="https://github.com/itsramananshul/Relux/releases/tag/relux-v0.1.10"><img src="https://img.shields.io/badge/release-relux--v0.1.10-blue?style=for-the-badge" alt="Release relux-v0.1.10"></a>
+  <a href="https://github.com/itsramananshul/Relux/releases/tag/relux-v0.1.11"><img src="https://img.shields.io/badge/release-relux--v0.1.11-blue?style=for-the-badge" alt="Release relux-v0.1.11"></a>
   <a href="https://github.com/itsramananshul/Relux/releases"><img src="https://img.shields.io/badge/all%20releases-list-lightgrey?style=for-the-badge" alt="All releases"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg?style=for-the-badge" alt="MIT OR Apache-2.0"></a>
 </p>
@@ -43,14 +43,14 @@ It serves on `http://127.0.0.1:19891` by default. If that port is already taken
 the exact command to pick another port — set `RELUX_HTTP_ADDR=127.0.0.1:<port>`
 for a source checkout, or use `.\Start-Relux.ps1 -Port <port>` with the bundle.
 
-#### Run the packaged release (v0.1.10, no build needed)
+#### Run the packaged release (v0.1.11, no build needed)
 
 Prefer a prebuilt Windows bundle over building from source? Grab the latest
 [**Relux local release**](https://github.com/itsramananshul/Relux/releases) zip
-(`relux-local-0.1.10-windows-x64.zip`), extract it, and launch it - no Rust, no npm:
+(`relux-local-0.1.11-windows-x64.zip`), extract it, and launch it - no Rust, no npm:
 
 ```powershell
-# inside the extracted relux-local-0.1.10-windows-x64 folder
+# inside the extracted relux-local-0.1.11-windows-x64 folder
 powershell -NoProfile -ExecutionPolicy Bypass -File .\Start-Relux.ps1
 # override the port if 19891 is taken:  .\Start-Relux.ps1 -Port 20000
 ```
