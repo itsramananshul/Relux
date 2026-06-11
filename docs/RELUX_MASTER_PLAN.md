@@ -1836,6 +1836,34 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.20** (2026-06-11) — a **third token-authenticated manager-subtree action** slice on
+  top of v0.1.19, driven by `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` (§22). After `grant_permission`
+  (§19/§20) and `assign_task` (§21), a manager that authenticated its OWN request with a per-agent
+  access token may now do a third self-driven action — revoke an explicit permission from one of
+  its own-Branch subordinates — with no operator in the loop, and no master-plan safety property is
+  weakened. **Token-authenticated `revoke_permission` (§22):** no new permission grammar
+  (`agent:<id>:subtree:<action>` is action-generic, so `:revoke_permission` parses/stores/revokes
+  unchanged and the pure `manager_subtree_authorizes` matcher takes the action with no cross-action
+  bleed); `KernelState::manager_revoke_permission_from_subordinate` routes through the same
+  own-Branch + Active-manager + exact-scope chokepoint, checked first, and removes EXACTLY the
+  stored grant via the unchanged `revoke_permission_from_agent` (`matches_exact`, no pattern
+  expansion), so an unheld permission is the honest `PermissionNotGranted` (404), an
+  unauthorized/out-of-Branch/unknown target → 403, a malformed body → 400, every denial audited.
+  **Agent-authenticated surface:** `POST /v1/relux/agents/me/manager-revoke` on the bearer
+  `agent_router`, body `{target_id, permission}`, where the acting manager is the token subject
+  (never the body), with an `agent:token_authenticated_manager_revoke_permission` provenance audit
+  (public `token_ref` only); operator routes stay closed to bearer tokens. **Manager-actions UI:**
+  the Crew Governance "Manager actions (token-authenticated)" panel now offers a local test form
+  for all three agent-self routes (manager-grant / assign-task / manager-revoke), each a compact
+  collapsible form requiring the operator to paste the copy-once raw token deliberately
+  (`type=password`, cleared after), with a Branch target picker, exact-permission validation, a
+  secret-free curl snippet (`$RELUX_AGENT_TOKEN`), and a bearer helper (`agentSelfManagerGrant` /
+  `agentSelfAssignTask` / `agentSelfManagerRevoke`) sent with `credentials: omit` so the operator
+  session never bypasses the token path. Built reference-first per
+  `docs/reference-driven-development.md`; `cargo test` + `clippy` clean on
+  `relux-core`/`relux-kernel`, dashboard tests + typecheck + build green, the tracked
+  `dashboard-dist` bundle rebuilt and committed in sync. Every safety property from v0.1.19 still
+  holds.
 - **v0.1.19** (2026-06-11) — a **second token-authenticated manager-subtree action** slice on
   top of v0.1.18, driven by `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` (§21). Building on the §20
   per-agent identity, a manager that authenticated its OWN request with a per-agent access token
