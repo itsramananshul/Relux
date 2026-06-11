@@ -14,6 +14,11 @@ clones** of the reference systems under `reference/` (gitignored, never tracked)
   TypeScript coding-agent / control-plane with the tool/approval/process model.
 - `reference/open-webui-main/` — a chat UI reference.
 
+For the durable, mechanism-level, 12-dimension map of how the three reference systems
+work and where Relux is implemented / partial / missing (with priorities and concrete
+slices), see [`HERMES_OPENCLAW_DEEP_AUDIT.md`](HERMES_OPENCLAW_DEEP_AUDIT.md). This
+per-slice ledger records the individual reference reads; that audit is the map.
+
 The user's standing complaint is the thing this rule exists to kill: **Relux keeps
 feeling like brittle hard-coded keyword rules instead of a real intelligent
 operator like Hermes / Paperclip / Codex / Claude.** That happens when we build
