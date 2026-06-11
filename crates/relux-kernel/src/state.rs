@@ -1727,6 +1727,104 @@ impl KernelState {
         result
     }
 
+    /// **Per-agent-authenticated** manager grant: the same real manager-subtree
+    /// authorization as [`Self::manager_grant_permission_to_subordinate`], driven by a
+    /// manager that authenticated its OWN request with a per-agent access token (no
+    /// operator in the loop). This is the genuinely-per-agent path §19 of
+    /// `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` called out as missing: the kernel trusts the
+    /// authenticated agent identity as the acting manager, exactly as Paperclip attributes
+    /// a request to `req.actor = { type: "agent", agentId: claims.sub }`
+    /// (`references/paperclip/server/src/middleware/auth.ts`).
+    ///
+    /// `token_ref` is the **public, non-secret** token handle (`agt_<hex>`) that
+    /// authenticated the request — recorded for provenance only; the raw token is NEVER
+    /// passed here or logged. Authority is unchanged: the manager still only reaches
+    /// operatives inside its own Branch, only for `grant_permission`, and only while
+    /// Active (`manager_subtree_authorizes`). On top of the inner agent-actor audit
+    /// (`agent:grant_permission` / `agent:manager_grant_permission`) this adds one
+    /// `agent:token_authenticated_manager_grant` row (Success/Denied) marking that a
+    /// per-agent token — not an operator — drove the grant.
+    pub fn manager_grant_permission_to_subordinate_as_agent(
+        &mut self,
+        token_ref: &str,
+        manager_id: &AgentId,
+        target_id: &AgentId,
+        permission: Permission,
+    ) -> Result<(), KernelError> {
+        let result = self.manager_grant_permission_to_subordinate(
+            manager_id,
+            target_id,
+            permission.clone(),
+        );
+        let namespace = self.agents.get(target_id).map(|a| a.namespace_id.clone());
+        self.record_audit(
+            "agent",
+            manager_id.as_str(),
+            "agent:token_authenticated_manager_grant",
+            Some("agent"),
+            Some(target_id.as_str()),
+            namespace.as_ref(),
+            if result.is_ok() {
+                AuditResult::Success
+            } else {
+                AuditResult::Denied
+            },
+            serde_json::json!({
+                "permission": permission.as_str(),
+                "auth_source": "agent_token",
+                "token_ref": token_ref,
+                "trust_boundary": "a per-agent access token authenticated the manager directly (no operator in the loop); the manager-subtree authorization was NOT bypassed",
+            }),
+        );
+        result
+    }
+
+    /// Record that the operator minted a per-agent access token for `agent_id`. The
+    /// token store ([`crate::agent_auth`]) lives outside the kernel (an auth-layer
+    /// concern, like operator sessions), but its lifecycle is recorded in the SAME
+    /// durable audit log so an operator can see who minted/revoked agent credentials.
+    /// Only the **public** `token_id` handle is recorded — never the raw token.
+    pub fn audit_agent_token_minted(&mut self, operator: &str, agent_id: &AgentId, token_id: &str) {
+        let namespace = self.agents.get(agent_id).map(|a| a.namespace_id.clone());
+        self.record_audit(
+            "operator",
+            operator,
+            "agent:mint_token",
+            Some("agent"),
+            Some(agent_id.as_str()),
+            namespace.as_ref(),
+            AuditResult::Success,
+            serde_json::json!({ "token_id": token_id }),
+        );
+    }
+
+    /// Record that the operator revoked a per-agent access token. `found` distinguishes
+    /// a real revocation (Success) from a no-op revoke of an unknown token (Denied). Only
+    /// the public `token_id` is recorded — never the raw token.
+    pub fn audit_agent_token_revoked(
+        &mut self,
+        operator: &str,
+        agent_id: &AgentId,
+        token_id: &str,
+        found: bool,
+    ) {
+        let namespace = self.agents.get(agent_id).map(|a| a.namespace_id.clone());
+        self.record_audit(
+            "operator",
+            operator,
+            "agent:revoke_token",
+            Some("agent"),
+            Some(agent_id.as_str()),
+            namespace.as_ref(),
+            if found {
+                AuditResult::Success
+            } else {
+                AuditResult::Denied
+            },
+            serde_json::json!({ "token_id": token_id }),
+        );
+    }
+
     // --- Tasks -------------------------------------------------------------
 
     /// Create a durable unit of work (`docs/RELUX_MASTER_PLAN.md` section 9.5).
@@ -12843,6 +12941,60 @@ mod tests {
             .audit_log()
             .iter()
             .any(|e| e.action == "agent:manager_grant_permission" && e.result == AuditResult::Denied));
+    }
+
+    #[test]
+    fn agent_authenticated_manager_grant_enforces_authority_and_records_token_provenance() {
+        // The per-agent-authenticated path (§19 follow-up): a manager that authenticated
+        // its OWN request via a token drives the grant, with no operator in the loop. The
+        // authority check is identical to the operator-assisted path; only the audit
+        // provenance differs (token-actor vs operator).
+        let (mut k, _prime, _task, _run, _echo) = primed_kernel();
+        let ns = NamespaceId::new("workspace");
+        let adapter = PluginId::new("relux-adapter-local-prime");
+        let mk = |k: &mut KernelState, id: &str, lead: Option<AgentId>| {
+            k.create_agent_with_skills(id, id, "", &adapter, &ns, None, vec![], vec![], lead)
+                .unwrap()
+        };
+        let lead = mk(&mut k, "lead", None);
+        let ic = mk(&mut k, "ic", Some(lead.clone()));
+        let outsider = mk(&mut k, "outsider", None);
+
+        let scope = Permission::new("agent:lead:subtree:grant_permission").unwrap();
+        k.grant_permission_to_agent(&lead, scope).unwrap();
+        let perm = Permission::new("tool:relux-tools-github:create_pr").unwrap();
+
+        // Authorized: the token-authenticated lead grants to its own subordinate.
+        k.manager_grant_permission_to_subordinate_as_agent("agt_abc123", &lead, &ic, perm.clone())
+            .expect("token-authenticated lead may grant to its subordinate");
+        assert!(k.agent_holds_permission(&ic, &perm));
+        // The inner agent-actor audit AND the token-provenance audit are both present.
+        assert!(k.audit_log().iter().any(|e| {
+            e.action == "agent:grant_permission" && e.result == AuditResult::Success
+        }));
+        let prov = k
+            .audit_log()
+            .iter()
+            .find(|e| {
+                e.action == "agent:token_authenticated_manager_grant"
+                    && e.result == AuditResult::Success
+            })
+            .expect("a token-provenance audit row");
+        assert_eq!(prov.actor_type, "agent");
+        assert_eq!(prov.actor_id, "lead");
+        // The PUBLIC token handle is recorded; the raw token never reaches the kernel.
+        assert_eq!(prov.metadata["token_ref"], "agt_abc123");
+        assert_eq!(prov.metadata["auth_source"], "agent_token");
+
+        // Denied: the same actor cannot reach an unrelated operative, and the denial is
+        // audited as a token-authenticated attempt (Denied).
+        let err = k
+            .manager_grant_permission_to_subordinate_as_agent("agt_abc123", &lead, &outsider, perm)
+            .unwrap_err();
+        assert!(matches!(err, KernelError::PermissionDenied { .. }), "got {err:?}");
+        assert!(k.audit_log().iter().any(|e| {
+            e.action == "agent:token_authenticated_manager_grant" && e.result == AuditResult::Denied
+        }));
     }
 
     #[test]

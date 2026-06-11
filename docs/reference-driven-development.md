@@ -2375,3 +2375,64 @@ session identity the kernel trusts (openclaw's `sessionKey`/`spawnedBy` analogue
 disabled-manager decision is **explicit**: a non-`Active` manager wields no subtree authority
 (fail-closed), even over a genuine subordinate — the place a "disabled-Lead can't act" rule lives, exactly
 as foreshadowed by the §18 lattice slice.
+
+## Reference read — the first per-agent identity / access-token primitive (this slice)
+
+The follow-up that closes (for one action) the trust-boundary gap the manager-subtree slice left open: a
+bounded, hashed-at-rest, revocable **per-agent access token** the local operator mints, so a manager can
+authenticate its OWN request and drive the manager-grant path with **no operator in the loop**. Audit ref:
+`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §19 (the "still missing: per-agent-authenticated actor" item).
+
+### Paperclip (openclaw) — files read (VENDORED — `references/paperclip/`)
+
+- `references/paperclip/server/src/agent-auth-jwt.ts` — `createLocalAgentJwt(agentId, …)` / `verifyLocalAgentJwt`:
+  a per-agent credential whose subject (`sub`) is the agent id, with a bounded `exp`/`iat`, signed
+  HMAC-SHA256 and verified with a **timing-safe** compare (`safeCompare` → `crypto.timingSafeEqual`)
+  before a request is trusted. This is the per-agent-identity target Relux lacked.
+- `references/paperclip/server/src/middleware/auth.ts` — on a valid token the middleware sets
+  `req.actor = { type: "agent", agentId: claims.sub, source: "agent_jwt" }`, and **rejects a
+  terminated/pending agent**. The request's acting identity comes from the verified token's subject, never
+  the body — exactly the discipline Relux's agent-self routes follow.
+- `references/paperclip/packages/db/src/schema/principal_permission_grants.ts` +
+  `references/paperclip/server/src/services/authorization.ts` (`scopeAllows` + `agentIsInSubtree`) —
+  confirm the authenticated agent actor is what the subtree scope is checked against. Relux already has the
+  subtree gate (§19); this slice supplies the missing authenticated actor that drives it.
+
+### openclaw — files read
+
+- `reference/openclaw-main/src/acp/session-lineage-meta.ts` — `subagentControlScope: "children" | "none"`,
+  **default narrow**: a node's authority is its children subtree or nothing. Relux's token is narrow the
+  same way — it unlocks ONLY the agent-self route subset (`/v1/relux/agents/me*`), where the manager's
+  reach is still bounded to its own Branch by the unchanged kernel gate; it never reaches the operator
+  console.
+- `reference/openclaw-main/src/acp/permission-relay.ts` — `allow-once`/`allow-always`/`deny`,
+  **deny-by-default**. The agent-token middleware mirrors this: absent a valid token the request is a clean
+  401; there is no `RELUX_AUTH_DISABLED` bypass on the agent surface (an agent's identity is meaningless
+  without a real token).
+
+### Relux local pattern reused
+
+- `crates/relux-kernel/src/auth.rs` (the operator `SessionStore`) — the proven local discipline: store
+  only the **SHA-256 hash** of a high-entropy opaque credential (never the raw value), persist atomically
+  to a permission-restricted gitignored file, prune/revoke in place. The new `AgentTokenStore`
+  (`crates/relux-kernel/src/agent_auth.rs`) reuses the exact same hashed-at-rest, file-backed shape and the
+  shared `atomic_write_restricted`.
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| **a per-agent credential whose subject is an agent id** (Paperclip JWT `claims.sub`) | `AgentTokenStore::mint(agent_id, …)` issues an opaque `relux_agt_<hex>` token bound to that agent; `authenticate(raw)` returns `AgentTokenIdentity { agent_id, token_id }`. Relux mints an **opaque hashed token, not a signed JWT** — there is no multi-tenant verifier to satisfy and a hashed-at-rest opaque token is simpler to revoke and impossible to forge from the stored file. |
+| **timing-safe verify of a stored secret** (`safeCompare`) | The token is a 256-bit CSPRNG secret stored only as its SHA-256 hash, looked up by hash — preimage resistance makes it unforgeable; there is no low-entropy secret to time-attack (same rationale as `auth.rs` session ids). The raw token is shown **once** at mint and never persisted/returned. |
+| **`req.actor = { type: "agent", agentId: claims.sub }`; identity from the token, not the body** (Paperclip middleware) | `require_agent_token` middleware validates the bearer token and inserts `AgentTokenIdentity` into the request extensions; `POST /v1/relux/agents/me/manager-grant` reads the acting manager from that identity, NEVER the body — a token can only ever act as itself. |
+| **reject a terminated/pending agent; narrow scope** (Paperclip + openclaw control-scope) | The token grants no authority of its own: the manager-grant-as-self path still flows through the unchanged `manager_subtree_authorizes` gate (own-Branch + `Active` + scope). The route allowlist is tiny (`/agents/me`, `/agents/me/manager-grant`); an agent token is **never** accepted on an operator route (those only check the session cookie). |
+| **per-agent grant lifecycle is auditable** | The new `agent:token_authenticated_manager_grant` audit row (token-actor provenance, public `token_id` only) sits on top of the existing agent-actor audit; operator mint/revoke are audited (`agent:mint_token` / `agent:revoke_token`). The raw token never appears in any audit/log, and the redactor masks the `relux_agt_` prefix defensively. |
+
+**What we deliberately do differently / leave out:** Relux mints an **opaque hashed token, not a signed
+JWT** (no issuer/audience/HMAC-secret machinery — there is no multi-tenant verifier, and a local hashed
+token is simpler + revocable). The agent surface is intentionally a **two-route allowlist**; broadening it
+(richer agent self-service, more subtree *actions* than `grant_permission`, an agent minting/rotating its
+own token) is future work. The token is still **operator-minted** — there is no agent-driven enrollment /
+bootstrap (an agent cannot mint its own first credential), which is the correct trust posture for a
+local-first console. This is not an internet auth system: loopback-only, single local operator, no
+JWT/OAuth.

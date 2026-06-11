@@ -35,6 +35,9 @@ const SECRET_PREFIXES: &[&str] = &[
     "AKIA",
     "ASIA",
     "AIza",
+    // Relux per-agent access token (crate::agent_auth). Defence-in-depth: a token
+    // should never reach a transcript/log, but mask its prefix if one ever does.
+    "relux_agt_",
 ];
 
 /// Key-name fragments that mark the right-hand side of a `key=value` /
@@ -235,6 +238,16 @@ mod tests {
         let out = redact_secrets(&quoted);
         assert!(out.starts_with("(\""));
         assert!(out.ends_with("\")"));
+        assert!(out.contains(REDACTION_PLACEHOLDER));
+    }
+
+    #[test]
+    fn masks_relux_agent_token_prefix() {
+        // A leaked per-agent access token (crate::agent_auth) is masked by its prefix.
+        let agt = token("relux_agt_", "0123456789abcdef0123456789abcdef");
+        let input = format!("Authorization: Bearer {agt}");
+        let out = redact_secrets(&input);
+        assert!(!out.contains(&agt), "agent token leaked: {out}");
         assert!(out.contains(REDACTION_PLACEHOLDER));
     }
 

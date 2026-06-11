@@ -18,6 +18,7 @@ import {
   pluginWildcardPermission,
   managerSubtreeActions,
   managerGrantAvailability,
+  parseTokenTtlSecs,
   type ManagerGrantAgent,
 } from "../src/governance.ts";
 
@@ -196,4 +197,17 @@ test("control-plane prefixes are elevated; tool/task/audit are standard", () => 
     assert.equal(permissionRisk(p), "standard", `${p} should be standard`);
     assert.equal(isElevatedPermission(p), false);
   }
+});
+
+test("parseTokenTtlSecs converts days→secs and treats blank/invalid as unspecified", () => {
+  // Blank / whitespace → undefined (backend applies its default + clamp).
+  assert.equal(parseTokenTtlSecs(""), undefined);
+  assert.equal(parseTokenTtlSecs("   "), undefined);
+  // Non-positive / non-numeric → undefined (never mints a dead or garbage TTL).
+  assert.equal(parseTokenTtlSecs("0"), undefined);
+  assert.equal(parseTokenTtlSecs("-5"), undefined);
+  assert.equal(parseTokenTtlSecs("abc"), undefined);
+  // A positive day count converts to seconds.
+  assert.equal(parseTokenTtlSecs("7"), 7 * 86400);
+  assert.equal(parseTokenTtlSecs("1.5"), Math.round(1.5 * 86400));
 });

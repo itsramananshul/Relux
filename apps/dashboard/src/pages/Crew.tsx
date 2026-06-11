@@ -6,6 +6,8 @@ import {
   type ReluxAgent,
   type ReluxAgentConfig,
   type ReluxAgentPreset,
+  type ReluxAgentTokenMeta,
+  type ReluxMintedAgentToken,
   type ReluxTask,
   type ReluxAdapterStatus,
 } from "../api";
@@ -17,6 +19,7 @@ import {
   isScopedWildcard,
   permissionInvalidReason,
   managerGrantAvailability,
+  parseTokenTtlSecs,
   type ManagerGrantAgent,
 } from "../governance";
 import { parseSkillsInput, formatSkillsInput } from "../skills";
@@ -734,6 +737,191 @@ function GovernanceSection({
         roster={roster}
         onChanged={onChanged}
       />
+      <AgentTokenPanel agentId={agentId} />
+    </div>
+  );
+}
+
+// Per-agent access tokens (the first per-agent auth identity). The operator mints a
+// bounded, hashed-at-rest, revocable token that authenticates a request AS this agent
+// on the tiny agent-self route subset (`/v1/relux/agents/me*`) — notably the
+// manager-grant-as-self path, where a manager drives its own grant with NO operator in
+// the loop. The raw token is shown EXACTLY ONCE at mint (copy-once) and never again;
+// the dashboard only ever lists non-secret metadata. docs/HERMES_OPENCLAW_DEEP_AUDIT.md §19.
+function AgentTokenPanel({ agentId }: { agentId: string }) {
+  const { data: tokens, loading, error, reload } = useAsync<ReluxAgentTokenMeta[]>(
+    () => reluxWork.listAgentTokens(agentId),
+    [agentId],
+  );
+  const [label, setLabel] = useState("");
+  const [ttlDays, setTtlDays] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [mintError, setMintError] = useState<string | null>(null);
+  // The just-minted raw token, shown once behind a copy-once warning. Cleared on dismiss
+  // — it is never re-fetchable (the backend stores only a hash).
+  const [justMinted, setJustMinted] = useState<ReluxMintedAgentToken | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  const fmt = (secs: number): string => {
+    try {
+      return new Date(secs * 1000).toLocaleString();
+    } catch {
+      return String(secs);
+    }
+  };
+
+  async function mint() {
+    setBusy(true);
+    setMintError(null);
+    try {
+      const ttlSecs = parseTokenTtlSecs(ttlDays);
+      const minted = await reluxWork.mintAgentToken(agentId, label.trim(), ttlSecs);
+      setJustMinted(minted);
+      setCopied(false);
+      setLabel("");
+      setTtlDays("");
+      reload();
+    } catch (e) {
+      setMintError(e instanceof Error ? e.message : "Mint failed.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function revoke(tokenId: string) {
+    if (
+      !window.confirm(
+        `Revoke token "${tokenId}"? Any request using it stops authenticating immediately.`,
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    setMintError(null);
+    try {
+      await reluxWork.revokeAgentToken(agentId, tokenId);
+      reload();
+    } catch (e) {
+      setMintError(e instanceof Error ? e.message : "Revoke failed.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function copyToken() {
+    if (!justMinted) return;
+    try {
+      await navigator.clipboard.writeText(justMinted.token);
+      setCopied(true);
+    } catch {
+      // Clipboard may be unavailable; the operator can still select the text manually.
+      setCopied(false);
+    }
+  }
+
+  return (
+    <div
+      className="agent-token-panel"
+      style={{ marginTop: 12, borderTop: "1px dashed var(--border, #2a2a2a)", paddingTop: 10 }}
+    >
+      <h4 style={{ margin: "0 0 4px" }}>Access tokens (per-agent auth)</h4>
+      <p className="muted" style={{ fontSize: 12, marginTop: 0 }}>
+        Mint a bounded, revocable token that authenticates a request <strong>as this agent</strong>{" "}
+        on the agent-self routes only (e.g. <span className="mono">POST /v1/relux/agents/me/manager-grant</span>,
+        where a manager drives its own Branch grant with no operator in the loop). It can never
+        reach the operator console. The token is stored only as a hash and{" "}
+        <strong>shown to you exactly once</strong> at mint — copy it then.
+      </p>
+      {justMinted && (
+        <div
+          className="token-once"
+          style={{
+            margin: "8px 0",
+            padding: 8,
+            border: "1px solid var(--warn, #b58900)",
+            borderRadius: 4,
+          }}
+        >
+          <p style={{ margin: "0 0 4px", fontSize: 12 }}>
+            <strong>Copy this token now — it will never be shown again.</strong>
+          </p>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <code className="mono" style={{ flex: 1, wordBreak: "break-all", fontSize: 12 }}>
+              {justMinted.token}
+            </code>
+            <button type="button" className="btn sm" onClick={() => void copyToken()}>
+              {copied ? "Copied" : "Copy"}
+            </button>
+            <button
+              type="button"
+              className="btn ghost sm"
+              onClick={() => {
+                setJustMinted(null);
+                setCopied(false);
+              }}
+            >
+              Dismiss
+            </button>
+          </div>
+          <p className="muted" style={{ fontSize: 11, marginTop: 4 }}>
+            token id <span className="mono">{justMinted.token_id}</span> · expires {fmt(justMinted.expires_at)}
+          </p>
+        </div>
+      )}
+      {mintError && <div className="error-message">{mintError}</div>}
+      {error && <div className="error-message">{error}</div>}
+      {loading ? (
+        <p className="muted" style={{ fontSize: 12 }}>Loading tokens…</p>
+      ) : !tokens || tokens.length === 0 ? (
+        <p className="muted" style={{ fontSize: 12 }}>No active tokens.</p>
+      ) : (
+        <ul className="token-list" style={{ margin: "4px 0", paddingLeft: 0, listStyle: "none" }}>
+          {tokens.map((t) => (
+            <li
+              key={t.token_id}
+              style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}
+            >
+              <span style={{ flex: 1, fontSize: 12 }}>
+                <span className="mono">{t.token_id}</span>
+                {t.label ? ` · ${t.label}` : ""}
+                <span className="muted"> · expires {fmt(t.expires_at)}</span>
+              </span>
+              <button
+                type="button"
+                className="btn ghost sm"
+                onClick={() => void revoke(t.token_id)}
+                disabled={busy}
+              >
+                Revoke
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      <div className="form-group" style={{ marginTop: 6 }}>
+        <label htmlFor={`tok-${agentId}-label`}>Mint a token:</label>
+        <div style={{ display: "flex", gap: 8 }}>
+          <input
+            id={`tok-${agentId}-label`}
+            type="text"
+            value={label}
+            onChange={(e) => setLabel(e.target.value)}
+            placeholder="label (e.g. ci-runner)"
+            style={{ flex: 1 }}
+          />
+          <input
+            type="number"
+            min="1"
+            value={ttlDays}
+            onChange={(e) => setTtlDays(e.target.value)}
+            placeholder="days (opt)"
+            style={{ width: 96 }}
+          />
+          <button type="button" className="btn sm" onClick={() => void mint()} disabled={busy}>
+            {busy ? "…" : "Mint"}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

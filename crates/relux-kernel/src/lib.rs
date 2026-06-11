@@ -17,6 +17,7 @@
 //! plugins will later sit behind.
 
 pub mod adapter;
+pub mod agent_auth;
 pub mod agent_config;
 pub mod agent_presets;
 pub mod ai;
@@ -67,6 +68,11 @@ pub use ai::{
     polish_clarify_via_openrouter, polish_from_cli_text, polish_proposal, proposal_wants_polish,
     read_stored_config, shape_reply, write_stored_config, AiConfig, AiMode, AiOutcome, AiStatus,
     PrimeBrain, StoredAiConfig,
+};
+pub use agent_auth::{
+    bearer_token_from_headers, AgentTokenIdentity, AgentTokenMeta, AgentTokenStore,
+    MintedAgentToken, AGENT_TOKEN_DEFAULT_TTL_SECS, AGENT_TOKEN_MAX_TTL_SECS,
+    AGENT_TOKEN_MIN_TTL_SECS, AGENT_TOKEN_PREFIX,
 };
 pub use auth::{
     admin_path_for_db, clear_session_cookie, read_admin_username, reset_admin_credential,

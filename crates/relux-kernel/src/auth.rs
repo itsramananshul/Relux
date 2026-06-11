@@ -298,7 +298,11 @@ fn write_admin_record(path: &Path, username: &str, password: &str) -> Result<Adm
 /// persistence so both secret-bearing local files use the identical durable,
 /// permission-restricted path. The temp file is hardened before the rename so the
 /// final path is never momentarily world-readable.
-fn atomic_write_restricted(path: &Path, body: &[u8]) -> Result<(), String> {
+///
+/// `pub(crate)` so the parallel agent-token store ([`crate::agent_auth`]) — another
+/// secret-bearing local file — reuses the exact same durable, permission-restricted
+/// write instead of re-implementing it.
+pub(crate) fn atomic_write_restricted(path: &Path, body: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;

@@ -228,6 +228,20 @@ export function managerGrantAvailability(
 }
 
 /**
+ * Parse the optional "lifetime (days)" field on the agent-token mint form into a TTL in
+ * seconds, or `undefined` when blank/invalid (the backend then applies its default and
+ * always clamps to its own bounded window — this is only a convenience conversion, not a
+ * security boundary). A non-positive or non-finite value is treated as "unspecified".
+ */
+export function parseTokenTtlSecs(input: string): number | undefined {
+  const trimmed = input.trim();
+  if (!trimmed) return undefined;
+  const days = Number(trimmed);
+  if (!Number.isFinite(days) || days <= 0) return undefined;
+  return Math.round(days * 86400);
+}
+
+/**
  * The ids that (transitively) report to `rootId` — its Branch, excluding itself. A
  * bounded walk down the `reports_to` lattice (each id visited once, so it is total even
  * under a stray cycle). Mirrors `crates/relux-core/src/hierarchy.rs` `is_in_subtree` and

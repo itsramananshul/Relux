@@ -43,7 +43,7 @@ Relux roots audited: `crates/relux-core/src/`, `crates/relux-kernel/src/`, `apps
 | 1 | **Self-correction on a malformed brain decision** — a correctable reply is collapsed into the same `None` as a hard provider failure and silently falls back; no bounded re-prompt with the validation error. Hermes (`_invalid_json_retries`/`_invalid_tool_retries`) and OpenClaw (retry instructions) both do this. | 1, 7 | **P0** *(shipped — see §1)* | backend, tests, docs |
 | 2 | **Structured error/liveness classifier + bounded transient retry** — Relux retry is a fresh run with no error taxonomy and no backoff; Paperclip classifies (`run-liveness.ts`) and retries transient upstream failures on a bounded `[2m,10m,30m,2h]` schedule. | 7 | **P1** *(shipped — see §14)* | backend, frontend, docs, tests |
 | 3 | **Governed budgets (soft/hard, auto-pause)** — Paperclip enforces per-company/agent/project spend with warn + hard-stop + cancel-work. Relux records run `cost`/`usage` but enforces nothing. | 5 | P1 | backend, frontend, docs, tests |
-| 4 | **Scoped permission grants (subtree / project)** — Relux permissions are exact-string match only; Paperclip has fine-grained grants scoped to manager-subtrees/projects. *(minimal plugin-scope `tool:<plugin>:*` SHIPPED — see §17; the `reports_to` org-lattice + acyclic-graph model SHIPPED — see §18; the manager-subtree SCOPED grant + one real enforcement path — a live manager granting a permission to a subordinate inside its own Branch — SHIPPED, see §19; broader subtree actions / project / namespace scopes + an agent-actor surface that invokes the manager-grant path still missing.)* | 5 | P1 | backend, tests |
+| 4 | **Scoped permission grants (subtree / project)** — Relux permissions are exact-string match only; Paperclip has fine-grained grants scoped to manager-subtrees/projects. *(minimal plugin-scope `tool:<plugin>:*` SHIPPED — see §17; the `reports_to` org-lattice + acyclic-graph model SHIPPED — see §18; the manager-subtree SCOPED grant + one real enforcement path SHIPPED — see §19; the first **per-agent identity / access token** that lets a manager drive its own grant with no operator in the loop SHIPPED — see §20; broader subtree actions / project / namespace scopes + agent-driven enrollment still missing.)* | 5 | P1 | backend, frontend, docs, tests |
 | 5 | **Memory compaction / cross-session recall** — Relux kept a bounded 12-turn ring with no summarization; Hermes/OpenClaw compact + summarize + (Hermes) FTS5 cross-session search. *(in-session compaction beyond the ring SHIPPED — see §16; cross-session FTS recall still missing.)* | 6 | P1/P2 | backend, tests |
 | 6 | **`execute_code` (RPC-from-script deterministic glue)** — the cheapest multi-step primitive; routes back through the same tool gate. Big, but high-leverage. | 2, 4 | P1 | backend, tests, docs |
 | 7 | **Goal/issue hierarchy + monitor/recovery** — Relux orchestration is a flat ≤6-step DAG; Paperclip has Goal→Project→Issue→Run with monitor scheduling + stranded-issue recovery. | 4 | P2 | backend, frontend, docs, tests |
@@ -282,9 +282,11 @@ safe (adds no authority), bounded, feasible in one commit, and reuses existing v
   grammar+`is_in_subtree` matcher, and the kernel `manager_grant_permission_to_subordinate` path lets a
   *live* manager grant a permission to an operative inside its OWN Branch (and only there). **Still
   missing**: budgets/spend enforcement (runs record `cost`/`usage` but nothing enforces a ceiling), the
-  *broader* scope vocabulary (project / namespace scopes; more subtree *actions* than `grant_permission`;
-  an HTTP/agent-actor surface that invokes the manager-grant path — the kernel primitive + model are real
-  and tested, but no production caller wires it yet), persistent `allow-always` grants, Board-style
+  *broader* scope vocabulary (project / namespace scopes; more subtree *actions* than `grant_permission`).
+  The **agent-actor surface that invokes the manager-grant path now exists** (SHIPPED — see §20: a
+  per-agent access token authenticates the manager directly on `POST /v1/relux/agents/me/manager-grant`,
+  no operator in the loop); the operator-assisted HTTP/UI path (§19) remains as the operator-console
+  affordance. Still open: persistent `allow-always` grants, agent-driven token enrollment, Board-style
   multi-party oversight.
 
 ### Priority & slices
@@ -949,9 +951,98 @@ section for the full reference read + applied-change record. In brief:
   dashboard typecheck + tests (289) + bundle rebuild green.
 
 - **Still missing (honest).** A **truly per-agent-authenticated** actor surface (a manager driving its own
-  grant without an operator in the loop — the operator-assisted HTTP path above is the interim), more
-  subtree *actions* than `grant_permission` (e.g. assign_task, revoke), project / namespace scopes,
-  governed budgets, persistent `allow-always` grants, and Board-style oversight all remain open.
+  grant without an operator in the loop) **SHIPPED in §20** (a bounded per-agent access token authenticates
+  the manager directly on `POST /v1/relux/agents/me/manager-grant`). The operator-assisted path above
+  remains as the operator-console affordance. Still open: more subtree *actions* than `grant_permission`
+  (e.g. assign_task, revoke), project / namespace scopes, governed budgets, persistent `allow-always`
+  grants, agent-driven token enrollment, and Board-style oversight.
+
+---
+
+## 20. Implemented this round — the first per-agent identity / access-token primitive (§19 follow-up / §5 P1)
+
+- **Reference read (BINDING).** The per-agent-identity target is **Paperclip, which IS vendored** under
+  `references/paperclip/`: `references/paperclip/server/src/agent-auth-jwt.ts` (`createLocalAgentJwt(agentId, …)`
+  / `verifyLocalAgentJwt` — a per-agent credential whose subject `sub` is the agent id, bounded `exp`/`iat`,
+  signed HMAC-SHA256 and verified with a **timing-safe** compare) and `references/paperclip/server/src/middleware/auth.ts`
+  (on a valid token, `req.actor = { type: "agent", agentId: claims.sub, source: "agent_jwt" }`, rejecting a
+  terminated/pending agent — the acting identity comes from the verified token's subject, never the body).
+  The narrow-by-default discipline is grounded in the **vendored** OpenClaw
+  `reference/openclaw-main/src/acp/session-lineage-meta.ts` (`subagentControlScope: "children" | "none"`)
+  and `reference/openclaw-main/src/acp/permission-relay.ts` (deny-by-default). The proven Relux local
+  pattern reused is `crates/relux-kernel/src/auth.rs`'s operator `SessionStore` (hash-at-rest a
+  high-entropy opaque credential; atomic permission-restricted file; prune/revoke in place). Relux files
+  read/mapped: `crates/relux-kernel/src/{auth.rs,state.rs,server.rs,main.rs,lib.rs}`,
+  `crates/relux-core/src/{redact.rs,permission.rs,agent.rs,hierarchy.rs}`,
+  `apps/dashboard/src/{api.ts,governance.ts,pages/Crew.tsx}`.
+
+- **Token model (bounded, hashed, revocable).** New `crates/relux-kernel/src/agent_auth.rs` —
+  `AgentTokenStore` mints an opaque `relux_agt_<64 hex>` token bound to a specific agent (the **subject**,
+  Paperclip's `claims.sub`) with a public, non-secret `agt_<hex>` handle for display/revocation. Only the
+  token's **SHA-256 hash** is persisted (`dashboard-agent-tokens.json`, gitignored, written through the
+  same atomic, permission-restricted path as the admin credential); the raw token is returned **exactly
+  once** at mint and never again. Relux mints an **opaque hashed token, not a signed JWT** — there is no
+  multi-tenant verifier to satisfy and a hashed-at-rest opaque token is simpler to revoke and impossible to
+  forge from the stored file. Every token carries a bounded, clamped TTL (`[60s, 90d]`, default 30d) and is
+  individually revocable. The `relux_agt_` prefix is added to `relux_core::redact` so a leaked token is
+  masked defensively.
+
+- **Auth surface (a two-route allowlist; never the operator console).** A new `require_agent_token`
+  middleware validates `Authorization: Bearer <token>`, resolves `AgentTokenIdentity { agent_id, token_id }`,
+  and inserts it into the request extensions. It gates a deliberately tiny `agent_router`: `GET
+  /v1/relux/agents/me` (self-info, incl. the agent's Branch direct-reports) and `POST
+  /v1/relux/agents/me/manager-grant`. The acting agent is **always the token subject** — read from the
+  validated identity, NEVER the path/body — so a token can only ever act as itself. An agent token is
+  **never** accepted on an operator route (those only ever check the `relux_session` cookie), and unlike the
+  operator middleware this surface has **no `RELUX_AUTH_DISABLED` bypass** (an agent's identity is
+  meaningless without a real token). Operator-only mint/list/revoke live on the session-gated
+  `POST/GET /v1/relux/agents/:id/tokens` + `DELETE /v1/relux/agents/:id/tokens/:token_id`.
+
+- **The grant path, per-agent-authenticated (the gap §19 left open, now closed for one action).**
+  `KernelState::manager_grant_permission_to_subordinate_as_agent(token_ref, manager, target, permission)`
+  drives the SAME unchanged authority gate as the operator-assisted path (`manager_subtree_authorizes` —
+  own-Branch + `Active` + `agent:<id>:subtree:grant_permission` scope), but with **no operator in the
+  loop**: the kernel trusts the authenticated agent identity as the acting manager (Paperclip's
+  `req.actor.agentId = claims.sub`). It adds one `agent:token_authenticated_manager_grant` audit row
+  (Success/Denied) carrying the **public** `token_ref` for provenance — the raw token never reaches the
+  kernel or any log. Authority is unchanged; only the actor (a per-agent token, not an operator) differs.
+
+- **UI.** `apps/dashboard/src/api.ts` gains `listAgentTokens` / `mintAgentToken` / `revokeAgentToken` (+
+  `ReluxAgentTokenMeta` / `ReluxMintedAgentToken`); `governance.ts` gains the pure `parseTokenTtlSecs`
+  helper. The Crew Governance card adds an **Access tokens (per-agent auth)** panel: mint (label + optional
+  lifetime-in-days), a **copy-once** box that shows the raw token exactly once with a Copy/Dismiss control
+  and a "never shown again" warning, a list of live tokens' non-secret metadata (id · label · expiry), and
+  a per-token Revoke. The stored token is never re-displayed.
+
+- **HONEST trust boundary (what changed).** Relux now HAS a per-agent auth identity for the manager-grant
+  action: a manager presents its own bounded token and the kernel attributes the request to it directly —
+  the §19 "genuinely-missing piece" for this one path. It is **operator-MINTED, not agent-enrolled**: the
+  local operator issues the credential (an agent cannot bootstrap its own first token), which is the correct
+  posture for a local-first console. The token is narrow — it unlocks only the agent-self routes; it grants
+  no authority of its own (the own-Branch + Active + scope gate is unchanged); and it never touches the
+  operator console. This is **not** an internet auth system: loopback-only, single local operator, opaque
+  hashed token (no JWT/OAuth/issuer machinery).
+
+- **Tests.** `agent_auth.rs`: mint↔authenticate roundtrip + subject-scoping, **raw token never persisted
+  (only its hash)**, agent-scoped revoke, expiry prune, TTL clamp, list-without-secrets, restart
+  persistence, bearer-header parsing. `state.rs::agent_authenticated_manager_grant_enforces_authority_and_records_token_provenance`:
+  a token-authenticated lead grants to its subordinate (Success, token-provenance audit with the public
+  handle), an unrelated target is denied (audited Denied). `server.rs::agent_token_mint_authenticate_self_grant_and_revoke_over_http`:
+  the end-to-end HTTP path — mint (copy-once warning, raw token shape), list (no raw token / hash), mint for
+  unknown agent → 404, self-info auth success (shows the Branch), no/garbage token → 401, self manager-grant
+  Success then out-of-Branch 403 + malformed 400, revoke then the same token → 401, unknown-token revoke →
+  404, and the mint/revoke/token-grant audit rows with the raw token absent.
+  `server.rs::an_agent_token_does_not_open_operator_routes`: an agent token is 401 on `/state`, `/agents`,
+  `/audit`, and the operator mint route still needs a session. `redact.rs`: the `relux_agt_` prefix is
+  masked. `governance.test.ts`: `parseTokenTtlSecs`. Full `relux-core` (157) + `relux-kernel` lib (638) +
+  bin/server (112) suites green; clippy clean on both crates; dashboard typecheck + tests (290) + bundle
+  rebuild green.
+
+- **Still missing (honest).** Agent-driven token **enrollment / rotation** (an agent minting or rotating
+  its own credential — today the operator mints); more subtree *actions* than `grant_permission` (assign_task,
+  revoke) and a richer agent self-service surface; project / namespace scopes; governed budgets; persistent
+  `allow-always` grants; and Board-style oversight all remain open. The token is opaque-hashed, not a
+  verifiable JWT — fine for a local single-operator console, but it does not federate across hosts.
 
 ---
 

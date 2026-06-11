@@ -2019,6 +2019,28 @@ export interface ReluxAgentPermissions {
   permissions: string[];
 }
 
+// Non-secret metadata for one per-agent access token (the operator list view). The
+// raw token and its hash are NEVER returned here.
+export interface ReluxAgentTokenMeta {
+  token_id: string;
+  agent_id: string;
+  label: string;
+  created_at: number;
+  expires_at: number;
+}
+
+// The mint response. `token` is the raw secret, returned EXACTLY ONCE — it is stored
+// only as a hash and never shown again. Show it behind a copy-once warning, then drop it.
+export interface ReluxMintedAgentToken {
+  token_id: string;
+  token: string;
+  agent_id: string;
+  label: string;
+  created_at: number;
+  expires_at: number;
+  warning: string;
+}
+
 // Operator-supplied fields for creating/editing a crew member (agent). Every field
 // is optional on the wire: create requires `name`; edit treats an absent field as
 // "leave unchanged" and an empty `persona` as "clear". The backend
@@ -2313,6 +2335,23 @@ export const reluxWork = {
     api.post<ReluxAgentPermissions>(
       `/v1/relux/agents/${encodeURIComponent(managerId)}/manager-grant`,
       { target_id: targetId, permission },
+    ),
+  // Per-agent access tokens (operator-only). List an agent's live tokens' metadata
+  // (never the raw token or hash).
+  listAgentTokens: (id: string) =>
+    api.get<ReluxAgentTokenMeta[]>(`/v1/relux/agents/${encodeURIComponent(id)}/tokens`),
+  // Mint a bounded, hashed-at-rest, revocable token that authenticates AS this agent.
+  // The raw `token` is returned ONCE and never shown again — surface it behind a
+  // copy-once warning, then forget it. An optional `ttl_secs` is clamped server-side.
+  mintAgentToken: (id: string, label: string, ttlSecs?: number) =>
+    api.post<ReluxMintedAgentToken>(`/v1/relux/agents/${encodeURIComponent(id)}/tokens`, {
+      label,
+      ...(ttlSecs ? { ttl_secs: ttlSecs } : {}),
+    }),
+  // Revoke one of an agent's tokens by its public id (revoking an unknown id is a 404).
+  revokeAgentToken: (id: string, tokenId: string) =>
+    api.del<{ ok: boolean; revoked: string }>(
+      `/v1/relux/agents/${encodeURIComponent(id)}/tokens/${encodeURIComponent(tokenId)}`,
     ),
   // Create a new task and assign it to Prime.
   createTask: (title: string) => api.post<ReluxTask>("/v1/relux/tasks", { title }),

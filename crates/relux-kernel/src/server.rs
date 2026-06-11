@@ -68,9 +68,18 @@ struct AppState {
     /// session table. The auth middleware admits a request carrying a valid
     /// `relux_session` cookie; `/v1/auth/*` mint/clear it. See [`crate`] auth.
     dashboard_auth: relux_kernel::DashboardAuth,
+    /// Per-agent access tokens: the first per-agent auth identity. The operator mints
+    /// a bounded, hashed-at-rest, revocable token for a specific agent; a request
+    /// carrying it (as `Authorization: Bearer <token>`) is authenticated AS that agent
+    /// and admitted ONLY on the tiny agent-self route subset (`/v1/relux/agents/me*`)
+    /// — never the operator console. See [`crate::agent_auth`] and
+    /// `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §19.
+    agent_tokens: relux_kernel::AgentTokenStore,
     /// Dev/test-only escape hatch: when `RELUX_AUTH_DISABLED` is truthy the auth
     /// middleware passes every request through (a loud warning is printed at
     /// startup). OFF by default — production/normal use always enforces login.
+    /// NOTE: this bypass covers the OPERATOR session middleware only; the agent-token
+    /// middleware never bypasses (an agent's identity must come from a real token).
     auth_disabled: bool,
     lock: Arc<Mutex<()>>,
     /// In-process registry of non-blocking orchestration jobs. Lives only for the
@@ -111,6 +120,7 @@ async fn serve() -> Result<(), KernelError> {
             &crate::admin_path(),
             &crate::session_path(),
         ),
+        agent_tokens: relux_kernel::AgentTokenStore::from_path(&crate::agent_tokens_path()),
         auth_disabled: auth_disabled_from_env(),
         lock: Arc::new(Mutex::new(())),
         jobs: JobRegistry::default(),
@@ -336,8 +346,19 @@ fn router(state: AppState) -> Router {
         state.clone(),
         require_session,
     ));
+    // The agent-token route subset rides a SEPARATE middleware (`require_agent_token`):
+    // a request is authenticated AS an agent by a bearer token, not by the operator
+    // session cookie. This is a deliberately tiny allowlist (`/v1/relux/agents/me*`) —
+    // an agent token never reaches the operator console (those routes only ever check
+    // the session cookie). The `me` static segment coexists with the protected `:id`
+    // param routes (matchit gives static segments priority).
+    let agent = agent_router().route_layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        require_agent_token,
+    ));
     public_router()
         .merge(protected)
+        .merge(agent)
         // Bound the request body so a large zip upload is refused cleanly.
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .with_state(state)
@@ -494,6 +515,29 @@ fn protected_router() -> Router<AppState> {
             "/v1/relux/agents/:id/manager-grant",
             post(manager_grant_to_subordinate),
         )
+        // Per-agent access tokens (operator-only mint/list/revoke). The operator
+        // console is the human authority that issues an agent its credential; the
+        // raw token is returned exactly once at mint and never again.
+        .route(
+            "/v1/relux/agents/:id/tokens",
+            get(list_agent_tokens).post(mint_agent_token),
+        )
+        .route(
+            "/v1/relux/agents/:id/tokens/:token_id",
+            delete(revoke_agent_token),
+        )
+}
+
+/// The tiny route subset an agent may reach with its OWN access token (bearer auth
+/// via [`require_agent_token`]). The acting agent is always the token's subject —
+/// every handler reads its identity from the validated token, never from the path
+/// or body, so a token can only ever act as itself. This is deliberately minimal:
+/// agent self-info and the manager-grant-as-self path, nothing that touches the
+/// operator console.
+fn agent_router() -> Router<AppState> {
+    Router::new()
+        .route("/v1/relux/agents/me", get(agent_self_info))
+        .route("/v1/relux/agents/me/manager-grant", post(agent_self_manager_grant))
 }
 
 /// Whether the dev/test auth bypass is requested via `RELUX_AUTH_DISABLED`.
@@ -573,6 +617,38 @@ async fn require_session(
         }
     }
     resp
+}
+
+/// Auth middleware for the per-agent token route subset. A request must carry a
+/// valid `Authorization: Bearer <token>` that authenticates AS a specific agent;
+/// the resolved [`relux_kernel::AgentTokenIdentity`] is inserted into the request
+/// extensions for the handler to read (so the acting agent comes from the token,
+/// never the path/body). On failure the request is a clean 401.
+///
+/// Unlike [`require_session`], this middleware has **no `RELUX_AUTH_DISABLED`
+/// bypass**: an agent's identity is meaningless without a real token, so even in
+/// the dev/test operator bypass an agent route still requires a valid token. This
+/// keeps the agent-actor surface honest — it can never act as an unspecified agent.
+async fn require_agent_token(
+    State(state): State<AppState>,
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let identity = relux_kernel::bearer_token_from_headers(req.headers())
+        .and_then(|raw| state.agent_tokens.authenticate(&raw));
+    match identity {
+        Some(identity) => {
+            req.extensions_mut().insert(identity);
+            next.run(req).await
+        }
+        None => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "agent token authentication required — present a valid Authorization: Bearer <agent token>"
+            })),
+        )
+            .into_response(),
+    }
 }
 
 // --- Local operator login handlers -----------------------------------------
@@ -1588,6 +1664,216 @@ async fn manager_grant_to_subordinate(
     let updated = locked_save(&state, |kernel| {
         kernel.manager_grant_permission_to_subordinate_as_operator(
             &operator,
+            &manager_id,
+            &target_id,
+            permission,
+        )?;
+        let agent = kernel
+            .agent(&target_id)
+            .ok_or_else(|| KernelError::UnknownAgent(target_id.to_string()))?;
+        Ok(AgentPermissionsRecord {
+            agent_id: agent.id.to_string(),
+            permissions: agent.permissions.iter().map(|p| p.to_string()).collect(),
+        })
+    })?;
+    Ok(Json(updated))
+}
+
+// --- Per-agent access tokens (operator mint/list/revoke) -------------------
+
+#[derive(Debug, Deserialize)]
+struct MintAgentTokenReq {
+    /// Operator label for the token (e.g. "ci-runner"); optional, bounded/sanitized.
+    #[serde(default)]
+    label: String,
+    /// Optional lifetime override (seconds); clamped to the bounded window. Omitted
+    /// → the default TTL.
+    #[serde(default)]
+    ttl_secs: Option<i64>,
+}
+
+/// The mint response. The `token` is the raw secret, returned EXACTLY ONCE — it is
+/// stored only as a hash and never shown again. The `warning` makes the copy-once
+/// contract explicit for any API caller.
+#[derive(Debug, Serialize)]
+struct MintedAgentTokenRecord {
+    token_id: String,
+    token: String,
+    agent_id: String,
+    label: String,
+    created_at: i64,
+    expires_at: i64,
+    warning: &'static str,
+}
+
+/// Non-secret token metadata for the operator list (never the hash or raw secret).
+#[derive(Debug, Serialize)]
+struct AgentTokenMetaRecord {
+    token_id: String,
+    agent_id: String,
+    label: String,
+    created_at: i64,
+    expires_at: i64,
+}
+
+/// `POST /v1/relux/agents/:id/tokens` — operator mints a bounded, hashed-at-rest,
+/// revocable access token for agent `:id`. The agent must exist. The raw token is
+/// returned ONCE in the response and never persisted in plaintext; the mint is
+/// audited (`agent:mint_token`, recording only the public `token_id`).
+async fn mint_agent_token(
+    State(state): State<AppState>,
+    AxumPath(agent_id_str): AxumPath<String>,
+    headers: header::HeaderMap,
+    Json(req): Json<MintAgentTokenReq>,
+) -> Result<Json<MintedAgentTokenRecord>, ApiError> {
+    let agent_id = relux_core::AgentId::new(agent_id_str.clone());
+    let operator = session_user(&state, &headers).unwrap_or_else(|| "operator".to_string());
+
+    // Verify the agent exists before minting a credential for it.
+    locked_read(&state, |kernel| {
+        if kernel.agent(&agent_id).is_none() {
+            return Err(KernelError::UnknownAgent(agent_id_str.clone()));
+        }
+        Ok(())
+    })?;
+
+    let minted = state
+        .agent_tokens
+        .mint(agent_id.as_str(), &req.label, req.ttl_secs);
+
+    // Audit the mint in the durable kernel log (public token_id only).
+    let token_id_for_audit = minted.token_id.clone();
+    locked_save(&state, |kernel| {
+        kernel.audit_agent_token_minted(&operator, &agent_id, &token_id_for_audit);
+        Ok(())
+    })?;
+
+    Ok(Json(MintedAgentTokenRecord {
+        token_id: minted.token_id,
+        token: minted.secret,
+        agent_id: minted.agent_id,
+        label: minted.label,
+        created_at: minted.created_at,
+        expires_at: minted.expires_at,
+        warning: "copy this token now — it is stored only as a hash and will never be shown again",
+    }))
+}
+
+/// `GET /v1/relux/agents/:id/tokens` — list the live tokens' non-secret metadata for
+/// agent `:id`. Never returns a hash or a raw token.
+async fn list_agent_tokens(
+    State(state): State<AppState>,
+    AxumPath(agent_id_str): AxumPath<String>,
+) -> Result<Json<Vec<AgentTokenMetaRecord>>, ApiError> {
+    let agent_id = relux_core::AgentId::new(agent_id_str.clone());
+    // Honest 404 for an unknown agent (rather than a silent empty list).
+    locked_read(&state, |kernel| {
+        if kernel.agent(&agent_id).is_none() {
+            return Err(KernelError::UnknownAgent(agent_id_str.clone()));
+        }
+        Ok(())
+    })?;
+    let list = state
+        .agent_tokens
+        .list_for_agent(agent_id.as_str())
+        .into_iter()
+        .map(|m| AgentTokenMetaRecord {
+            token_id: m.token_id,
+            agent_id: m.agent_id,
+            label: m.label,
+            created_at: m.created_at,
+            expires_at: m.expires_at,
+        })
+        .collect();
+    Ok(Json(list))
+}
+
+/// `DELETE /v1/relux/agents/:id/tokens/:token_id` — revoke one of agent `:id`'s
+/// tokens by its public id. Revoking an unknown token is an honest 404. The revoke
+/// is audited (`agent:revoke_token`).
+async fn revoke_agent_token(
+    State(state): State<AppState>,
+    AxumPath((agent_id_str, token_id)): AxumPath<(String, String)>,
+    headers: header::HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let agent_id = relux_core::AgentId::new(agent_id_str.clone());
+    let operator = session_user(&state, &headers).unwrap_or_else(|| "operator".to_string());
+    let found = state.agent_tokens.revoke(agent_id.as_str(), &token_id);
+
+    let token_id_for_audit = token_id.clone();
+    locked_save(&state, |kernel| {
+        kernel.audit_agent_token_revoked(&operator, &agent_id, &token_id_for_audit, found);
+        Ok(())
+    })?;
+
+    if found {
+        Ok(Json(serde_json::json!({ "ok": true, "revoked": token_id })))
+    } else {
+        Err(ApiError::not_found(format!(
+            "no token '{token_id}' for agent '{agent_id_str}'"
+        )))
+    }
+}
+
+// --- Agent-authenticated self routes (bearer agent token) ------------------
+
+/// `GET /v1/relux/agents/me` — the agent identified by the bearer token reads its
+/// OWN record (id/name/status/permissions + its Branch direct reports). Proves
+/// agent-token auth and lets a manager see who is inside its Branch. The acting
+/// agent is the token subject (from the validated [`relux_kernel::AgentTokenIdentity`]
+/// in the request extensions), never a path/body value.
+async fn agent_self_info(
+    State(state): State<AppState>,
+    axum::Extension(identity): axum::Extension<relux_kernel::AgentTokenIdentity>,
+) -> Result<Json<AgentRecord>, ApiError> {
+    let agent_id = relux_core::AgentId::new(identity.agent_id.clone());
+    let record = locked_read(&state, |kernel| {
+        let agent = kernel
+            .agent(&agent_id)
+            .ok_or_else(|| KernelError::UnknownAgent(identity.agent_id.clone()))?;
+        let mut rec = agent_record(agent);
+        // Enrich the single record with its Lead name + direct reports so a manager
+        // can see its Branch from self-info (the same shape the list endpoint builds).
+        let agents = kernel.agents();
+        if let Some(lead) = &agent.reports_to {
+            rec.reports_to_name = agents
+                .iter()
+                .find(|a| &a.id == lead)
+                .map(|a| a.name.clone());
+        }
+        rec.reports = agents
+            .iter()
+            .filter(|a| a.reports_to.as_ref() == Some(&agent_id))
+            .map(|a| a.id.as_str().to_string())
+            .collect();
+        Ok(rec)
+    })?;
+    Ok(Json(record))
+}
+
+/// `POST /v1/relux/agents/me/manager-grant` — the **per-agent-authenticated**
+/// manager-subtree grant (§19 follow-up): the manager that authenticated the request
+/// with its own token grants a permission to one of its own-Branch subordinates, with
+/// NO operator in the loop. The acting manager is the token subject — inferred from the
+/// validated token, NOT from the request body — so a token can only ever grant as
+/// itself. Authority is unchanged: the kernel still enforces own-Branch + Active +
+/// `agent:<id>:subtree:grant_permission` scope. Malformed permission → 400; an
+/// unauthorized manager (no scope / not Active / target outside its Branch / unknown
+/// target) → 403, granting nothing.
+async fn agent_self_manager_grant(
+    State(state): State<AppState>,
+    axum::Extension(identity): axum::Extension<relux_kernel::AgentTokenIdentity>,
+    Json(req): Json<ManagerGrantReq>,
+) -> Result<Json<AgentPermissionsRecord>, ApiError> {
+    let manager_id = relux_core::AgentId::new(identity.agent_id.clone());
+    let target_id = relux_core::AgentId::new(req.target_id);
+    let permission = relux_core::Permission::new(&req.permission)
+        .map_err(|e| ApiError::bad_request(format!("invalid permission string: {e}")))?;
+    let token_ref = identity.token_id.clone();
+
+    let updated = locked_save(&state, |kernel| {
+        kernel.manager_grant_permission_to_subordinate_as_agent(
+            &token_ref,
             &manager_id,
             &target_id,
             permission,
@@ -5744,6 +6030,12 @@ impl ApiError {
             message: message.into(),
         }
     }
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        }
+    }
     fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -6711,6 +7003,9 @@ mod tests {
             dashboard_auth: relux_kernel::DashboardAuth::from_admin_path(
                 &dir.path().join("dashboard-admin.json"),
             ),
+            agent_tokens: relux_kernel::AgentTokenStore::from_path(
+                &dir.path().join("dashboard-agent-tokens.json"),
+            ),
             auth_disabled: false,
             lock: Arc::new(Mutex::new(())),
             jobs: JobRegistry::default(),
@@ -6874,6 +7169,9 @@ mod tests {
             ai_config_path: dir.path().join("ai.json"),
             dashboard_auth: relux_kernel::DashboardAuth::from_admin_path(
                 &dir.path().join("dashboard-admin.json"),
+            ),
+            agent_tokens: relux_kernel::AgentTokenStore::from_path(
+                &dir.path().join("dashboard-agent-tokens.json"),
             ),
             auth_disabled: false,
             lock: Arc::new(Mutex::new(())),
@@ -7855,6 +8153,9 @@ mod tests {
             dashboard_auth: relux_kernel::DashboardAuth::from_admin_path(
                 &dir.path().join("dashboard-admin.json"),
             ),
+            agent_tokens: relux_kernel::AgentTokenStore::from_path(
+                &dir.path().join("dashboard-agent-tokens.json"),
+            ),
             auth_disabled,
             lock: Arc::new(Mutex::new(())),
             jobs: JobRegistry::default(),
@@ -8239,6 +8540,190 @@ mod tests {
         assert!(audit.contains("\"trust_boundary\""), "trust-boundary detail missing: {audit}");
     }
 
+    /// Issue a request carrying an `Authorization: Bearer <token>` (and no cookie),
+    /// returning (status, body). The bearer-auth twin of [`call`].
+    async fn call_bearer(
+        state: &AppState,
+        method: &str,
+        path: &str,
+        bearer: Option<&str>,
+        json_body: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut builder = axum::http::Request::builder().method(method).uri(path);
+        if let Some(t) = bearer {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        let body = match json_body {
+            Some(b) => {
+                builder = builder.header(header::CONTENT_TYPE, "application/json");
+                axum::body::Body::from(b.to_string())
+            }
+            None => axum::body::Body::empty(),
+        };
+        let req = builder.body(body).unwrap();
+        let resp = router(state.clone()).oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    #[tokio::test]
+    async fn agent_token_mint_authenticate_self_grant_and_revoke_over_http() {
+        let (state, _dir) = auth_state(true);
+
+        // Topology: lead <- ic ; outsider top-level + unrelated.
+        for (id, reports_to) in [("lead", None), ("ic", Some("lead")), ("outsider", None)] {
+            let body = match reports_to {
+                Some(r) => format!(r#"{{"id":"{id}","name":"{id}","reports_to":"{r}"}}"#),
+                None => format!(r#"{{"id":"{id}","name":"{id}"}}"#),
+            };
+            let (status, _, b) =
+                call(&state, "POST", "/v1/relux/agents", None, Some(&body)).await;
+            assert_eq!(status, StatusCode::OK, "create {id} failed: {b}");
+        }
+        // Grant the lead its manager-subtree scope via the operator path.
+        let (status, _, _) = call(
+            &state,
+            "POST",
+            "/v1/relux/agents/lead/permissions",
+            None,
+            Some(r#"{"permission":"agent:lead:subtree:grant_permission"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // (1) MINT a token for the lead. The raw token is returned ONCE; the response
+        // states the copy-once contract.
+        let (status, mint_body) =
+            call_bearer(&state, "POST", "/v1/relux/agents/lead/tokens", None, Some(r#"{"label":"ci"}"#)).await;
+        assert_eq!(status, StatusCode::OK, "mint failed: {mint_body}");
+        let minted: serde_json::Value = serde_json::from_str(&mint_body).unwrap();
+        let raw = minted["token"].as_str().expect("raw token in mint response").to_string();
+        let token_id = minted["token_id"].as_str().unwrap().to_string();
+        assert!(raw.starts_with("relux_agt_"), "token shape: {raw}");
+        assert!(mint_body.contains("never be shown again"), "copy-once warning missing: {mint_body}");
+
+        // (2) LIST returns metadata but NEVER the raw token or a hash.
+        let (status, list_body) =
+            call_bearer(&state, "GET", "/v1/relux/agents/lead/tokens", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(list_body.contains(&token_id), "token id should list: {list_body}");
+        assert!(!list_body.contains(&raw), "raw token must NOT appear in list: {list_body}");
+
+        // (3) MINT for an unknown agent → 404.
+        let (status, _) =
+            call_bearer(&state, "POST", "/v1/relux/agents/ghost/tokens", None, Some("{}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // (4) AUTH SUCCESS: the token authenticates as the lead on the self route; the
+        // self record shows its Branch (ic is a direct report).
+        let (status, me) =
+            call_bearer(&state, "GET", "/v1/relux/agents/me", Some(&raw), None).await;
+        assert_eq!(status, StatusCode::OK, "self-info failed: {me}");
+        assert!(me.contains("\"id\":\"lead\""), "self id wrong: {me}");
+        assert!(me.contains("\"ic\""), "branch direct report missing: {me}");
+
+        // (5) AUTH FAILURE: no token, and a garbage token, are both 401.
+        let (status, _) = call_bearer(&state, "GET", "/v1/relux/agents/me", None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) =
+            call_bearer(&state, "GET", "/v1/relux/agents/me", Some("relux_agt_bogus"), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // (6) SELF MANAGER-GRANT SUCCESS: the lead grants to its subordinate ic, with no
+        // operator in the loop — the acting manager is the token subject.
+        let perm = r#""permission":"tool:relux-tools-github:create_pr""#;
+        let (status, b) = call_bearer(
+            &state,
+            "POST",
+            "/v1/relux/agents/me/manager-grant",
+            Some(&raw),
+            Some(&format!(r#"{{"target_id":"ic",{perm}}}"#)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "self manager-grant failed: {b}");
+        assert!(b.contains("tool:relux-tools-github:create_pr"), "ic should hold it: {b}");
+
+        // (7) SELF MANAGER-GRANT DENIAL: the lead cannot reach an unrelated operative.
+        let (status, _) = call_bearer(
+            &state,
+            "POST",
+            "/v1/relux/agents/me/manager-grant",
+            Some(&raw),
+            Some(&format!(r#"{{"target_id":"outsider",{perm}}}"#)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "target outside Branch must be denied");
+
+        // (8) MALFORMED permission → 400 before any authority check.
+        let (status, _) = call_bearer(
+            &state,
+            "POST",
+            "/v1/relux/agents/me/manager-grant",
+            Some(&raw),
+            Some(r#"{"target_id":"ic","permission":"not-a-valid-prefix"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // (9) REVOKE the token; the same token then fails auth (401). Revoking an
+        // unknown token id is an honest 404.
+        let (status, _) = call_bearer(
+            &state,
+            "DELETE",
+            &format!("/v1/relux/agents/lead/tokens/{token_id}"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "revoke failed");
+        let (status, _) =
+            call_bearer(&state, "GET", "/v1/relux/agents/me", Some(&raw), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "a revoked token must not authenticate");
+        let (status, _) = call_bearer(
+            &state,
+            "DELETE",
+            "/v1/relux/agents/lead/tokens/agt_nope",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // (10) AUDIT: mint, the token-authenticated grant, and revoke are all recorded.
+        let (status, _, audit) =
+            call(&state, "GET", "/v1/relux/audit?limit=500", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(audit.contains("agent:mint_token"), "mint audit missing: {audit}");
+        assert!(audit.contains("agent:revoke_token"), "revoke audit missing: {audit}");
+        assert!(
+            audit.contains("agent:token_authenticated_manager_grant"),
+            "token-authenticated grant audit missing: {audit}"
+        );
+        // The raw token NEVER appears in the audit trail (only the public token_id).
+        assert!(!audit.contains(&raw), "raw token leaked into audit: {audit}");
+    }
+
+    #[tokio::test]
+    async fn an_agent_token_does_not_open_operator_routes() {
+        // With real operator auth ON, an agent token must NOT authenticate any operator
+        // control-plane route, and the operator token-mint route still needs a session.
+        let (state, _dir) = auth_state(false);
+        // White-box mint (no operator session needed for this trust-boundary check).
+        let minted = state.agent_tokens.mint("lead", "t", None);
+        let raw = minted.secret;
+
+        // The token is rejected on operator routes (those only ever check the cookie).
+        for path in ["/v1/relux/state", "/v1/relux/agents", "/v1/relux/audit"] {
+            let (status, _) = call_bearer(&state, "GET", path, Some(&raw), None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "agent token must not open {path}");
+        }
+        // The operator-only token-mint route requires a session, not a bearer token.
+        let (status, _) =
+            call_bearer(&state, "POST", "/v1/relux/agents/lead/tokens", Some(&raw), Some("{}")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "minting needs an operator session");
+    }
+
     #[tokio::test]
     async fn agent_presets_list_and_create_with_preset_over_http() {
         let (state, _dir) = auth_state(true);
@@ -8392,6 +8877,9 @@ mod tests {
             dashboard_dir: None,
             ai_config_path: dir.path().join("ai.json"),
             dashboard_auth: relux_kernel::DashboardAuth::from_paths(&admin, &sessions),
+            agent_tokens: relux_kernel::AgentTokenStore::from_path(
+                &dir.path().join("dashboard-agent-tokens.json"),
+            ),
             auth_disabled: false,
             lock: Arc::new(Mutex::new(())),
             jobs: JobRegistry::default(),

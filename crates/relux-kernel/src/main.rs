@@ -685,6 +685,17 @@ fn session_path() -> PathBuf {
     }
 }
 
+/// The per-agent access-token file: `dashboard-agent-tokens.json` next to the admin
+/// credential by default (so it inherits the gitignored `dev-data/` root).
+/// `RELUX_AGENT_TOKENS_FILE` overrides it. Stores only SHA-256 hashes of agent
+/// tokens plus their subject + deadline — never the raw token. See `agent_auth.rs`.
+fn agent_tokens_path() -> PathBuf {
+    match std::env::var("RELUX_AGENT_TOKENS_FILE") {
+        Ok(p) if !p.trim().is_empty() => PathBuf::from(p),
+        _ => relux_kernel::AgentTokenStore::path_for_db(&db_path()),
+    }
+}
+
 /// Whether the dev/test auth bypass (`RELUX_AUTH_DISABLED`) is requested. Mirrors
 /// the same parse the `serve` middleware uses so `doctor` reports it honestly.
 fn auth_disabled_env() -> bool {
