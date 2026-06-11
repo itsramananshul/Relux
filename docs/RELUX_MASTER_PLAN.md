@@ -1836,6 +1836,35 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.13** (2026-06-11) — an **in-app first-run / operational readiness guide +
+  dashboard build hygiene** slice on top of v0.1.12. Entirely dashboard-side: no new
+  product surface, no new endpoint, and no master-plan safety property weakened.
+  **Readiness guide:** a pure `apps/dashboard` `buildReadiness()` (`readiness.ts`) turns
+  the four control-plane reads Home already makes (state, `ai/status`, adapters,
+  plugins+tools) into one honest report — items for Prime brain (reusing
+  `onboarding::primeBrainStep`), real-work adapter, crew (local-Prime fallback),
+  plugins/tools (reusing `plugins::pluginCategory`/`toolReadiness`), and pending
+  approvals. A *selected-but-broken* brain is the only blocker; a local brain works;
+  metadata wrappers / unconfigured runtimes are surfaced as attention, never a faked
+  green check. `ReadinessGuide.tsx` renders one compact card (setup = checklist with
+  per-item action links; operational = concise summary + single first action behind
+  `<details>`), shared across Home (replacing its static checklist; redundant
+  Claude/Codex prose card dropped) and Health (same derivation over the reads it already
+  makes — no duplicated logic). **Partial-read honesty:** a `ReadinessFailed` flag set
+  distinguishes a failed read from one still in flight — a failed read becomes a
+  retryable "… unavailable" warn row and forces the report degraded (`ready` = false) so
+  a Health-OK-but-state-read-failed instance never paints a faked "operational" badge,
+  while a still-loading read stays a neutral "Checking readiness…" row. **Build
+  hygiene:** the dashboard `typecheck` script type-checks each project directly so
+  `npm run typecheck` passes (was failing TS6310 on composite `tsconfig.node.json`), and
+  route-level `React.lazy` + a `manualChunks` vendor rule replace the old single ~653 kB
+  bundle (largest chunk now the ~165 kB vendor chunk) so `vite build` no longer warns
+  about chunks over 500 kB — same components at the same paths, per-route chunks behind a
+  Suspense fallback. Built reference-first per `docs/reference-driven-development.md`
+  (in-app readiness guide) and conforms to `docs/relix-dashboard-design.md` §15. Proven
+  by `readiness.test.ts` plus the `readiness-render` / `health-render` /
+  `readiness-guide-render` `.mjs` render harnesses; the tracked `dashboard-dist` bundle
+  was rebuilt and committed in sync. Every safety property from v0.1.12 still holds.
 - **v0.1.12** (2026-06-11) — a **source-checkout launcher + bounded Prime conversation
   memory** slice on top of v0.1.11. No new product surface and no master-plan safety
   property weakened; this line makes the documented one-command boot actually work from a

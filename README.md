@@ -17,11 +17,11 @@
     cache (which lagged a full version behind after v0.1.10 shipped).
     On every release, bump the tag `relux-vX.Y.Z` in BOTH the href and the badge
     `message` below (hyphens in the badge message are doubled: relux--vX.Y.Z),
-    then bump the matching `v0.1.12` / `relux-local-0.1.12-...` strings in the
+    then bump the matching `v0.1.13` / `relux-local-0.1.13-...` strings in the
     "Run the packaged release" section. `scripts/relux-package-local.ps1` warns
     if these drift from the crate version being packaged.
   -->
-  <a href="https://github.com/itsramananshul/Relux/releases/tag/relux-v0.1.12"><img src="https://img.shields.io/badge/release-relux--v0.1.12-blue?style=for-the-badge" alt="Release relux-v0.1.12"></a>
+  <a href="https://github.com/itsramananshul/Relux/releases/tag/relux-v0.1.13"><img src="https://img.shields.io/badge/release-relux--v0.1.13-blue?style=for-the-badge" alt="Release relux-v0.1.13"></a>
   <a href="https://github.com/itsramananshul/Relux/releases"><img src="https://img.shields.io/badge/all%20releases-list-lightgrey?style=for-the-badge" alt="All releases"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg?style=for-the-badge" alt="MIT OR Apache-2.0"></a>
 </p>
@@ -66,14 +66,14 @@ launcher; the same-named `Start-Relux.ps1` inside an extracted release bundle is
 **different**, prebuilt launcher (see "Run the packaged release" below) — run that
 one from inside the extracted folder, this one from the repo root.
 
-#### Run the packaged release (v0.1.12, no build needed)
+#### Run the packaged release (v0.1.13, no build needed)
 
 Prefer a prebuilt Windows bundle over building from source? Grab the latest
 [**Relux local release**](https://github.com/itsramananshul/Relux/releases) zip
-(`relux-local-0.1.12-windows-x64.zip`), extract it, and launch it - no Rust, no npm:
+(`relux-local-0.1.13-windows-x64.zip`), extract it, and launch it - no Rust, no npm:
 
 ```powershell
-# inside the extracted relux-local-0.1.12-windows-x64 folder
+# inside the extracted relux-local-0.1.13-windows-x64 folder
 powershell -NoProfile -ExecutionPolicy Bypass -File .\Start-Relux.ps1
 # override the port if 19891 is taken:  .\Start-Relux.ps1 -Port 20000
 ```

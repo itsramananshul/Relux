@@ -9,6 +9,48 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.13 (Windows bundle).** The `relux-kernel` /
+  `relux-core` crates move from `0.1.12` to `0.1.13`, bundling the post-v0.1.12
+  **in-app first-run / operational readiness guide + dashboard build hygiene**
+  slice into a fresh Windows release. No new product surface, no new endpoint, and
+  no master-plan safety property is weakened: this line is entirely dashboard-side
+  and makes the Home/Health first-run experience honest and the dashboard build
+  warning-clean. Headlines: a derived, honest **readiness guide** on Home and
+  Health. A new pure `apps/dashboard/src/.../readiness.ts` `buildReadiness()` turns
+  the four control-plane reads Home already makes (state, `ai/status`, adapters,
+  plugins+tools) into one report — **no new endpoint** — with items for Prime brain
+  (reusing `onboarding::primeBrainStep`), real-work adapter, crew (with local-Prime
+  fallback), plugins/tools (reusing `plugins::pluginCategory`/`toolReadiness`), and
+  pending approvals; a *selected-but-broken* brain is the only blocker, a local
+  brain works, and metadata wrappers / unconfigured runtimes are surfaced as
+  attention — **never a faked green check**. `ReadinessGuide.tsx` renders one
+  compact card (setup mode = checklist with per-item action links; operational mode
+  = concise summary + single first action behind `<details>` so a configured
+  instance is not nagged), shared on both Home (replacing the old static checklist)
+  and Health (built from the same derivation over the reads Health already makes —
+  no duplicated business logic), and Home's redundant "Run real work: Claude/Codex
+  adapters" prose card was dropped. **Partial-read honesty:** `buildReadiness` now
+  distinguishes a *failed* read from one still *in flight* via a `ReadinessFailed`
+  flag set (state/ai/adapters/plugins/tools) — a failed read becomes an explicit,
+  retryable "… unavailable" warn row and marks the report degraded (`ready` forced
+  false) so a Health-OK-but-state-read-failed instance can never paint a faked
+  "operational" badge from partial data, while a still-loading null read stays a
+  neutral "Checking readiness…" row. **Build hygiene:** the dashboard `typecheck`
+  script now type-checks each project directly (outside `tsc -b` build mode) so
+  `npm run typecheck` passes instead of failing TS6310 on the composite
+  `tsconfig.node.json`, and route-level `React.lazy` + a `manualChunks` vendor rule
+  replace the old single ~653 kB bundle (largest chunk now the ~165 kB vendor
+  chunk) so `vite build` no longer warns about chunks over 500 kB — same components
+  at the same paths, now per-route chunks behind a Suspense fallback. Built
+  reference-first per `docs/reference-driven-development.md` (in-app readiness
+  guide) and conforms to `docs/relix-dashboard-design.md` §15. Proven by
+  `readiness.test.ts` (the four states + blocker + first-action priority +
+  failed-vs-loading per read) and the `readiness-render`/`health-render`/
+  `readiness-guide-render` `.mjs` render harnesses; the tracked `dashboard-dist`
+  bundle was rebuilt and committed in sync. Build the bundle with
+  `scripts\relux-package-local.ps1 -FullE2E`. This version line is the
+  `relux-kernel` crate version (separate from the legacy Relix workspace versions
+  in the dated sections below). See `docs/RELUX_MASTER_PLAN.md` → *Release history*.
 - **Relux local release v0.1.12 (Windows bundle).** The `relux-kernel` /
   `relux-core` crates move from `0.1.11` to `0.1.12`, bundling the post-v0.1.11
   **source-checkout launcher + bounded Prime conversation memory** slice into a fresh
