@@ -43,7 +43,7 @@ Relux roots audited: `crates/relux-core/src/`, `crates/relux-kernel/src/`, `apps
 | 1 | **Self-correction on a malformed brain decision** — a correctable reply is collapsed into the same `None` as a hard provider failure and silently falls back; no bounded re-prompt with the validation error. Hermes (`_invalid_json_retries`/`_invalid_tool_retries`) and OpenClaw (retry instructions) both do this. | 1, 7 | **P0** *(shipped — see §1)* | backend, tests, docs |
 | 2 | **Structured error/liveness classifier + bounded transient retry** — Relux retry is a fresh run with no error taxonomy and no backoff; Paperclip classifies (`run-liveness.ts`) and retries transient upstream failures on a bounded `[2m,10m,30m,2h]` schedule. | 7 | **P1** *(shipped — see §14)* | backend, frontend, docs, tests |
 | 3 | **Governed budgets (soft/hard, auto-pause)** — Paperclip enforces per-company/agent/project spend with warn + hard-stop + cancel-work. Relux records run `cost`/`usage` but enforces nothing. | 5 | P1 | backend, frontend, docs, tests |
-| 4 | **Scoped permission grants (subtree / project)** — Relux permissions are exact-string match only; Paperclip has fine-grained grants scoped to manager-subtrees/projects. *(minimal plugin-scope `tool:<plugin>:*` SHIPPED — see §17; the `reports_to` org-lattice + acyclic-graph model SHIPPED — see §18; the manager-subtree SCOPED grant + one real enforcement path SHIPPED — see §19; the first **per-agent identity / access token** that lets a manager drive its own grant with no operator in the loop SHIPPED — see §20; broader subtree actions / project / namespace scopes + agent-driven enrollment still missing.)* | 5 | P1 | backend, frontend, docs, tests |
+| 4 | **Scoped permission grants (subtree / project)** — Relux permissions are exact-string match only; Paperclip has fine-grained grants scoped to manager-subtrees/projects. *(minimal plugin-scope `tool:<plugin>:*` SHIPPED — see §17; the `reports_to` org-lattice + acyclic-graph model SHIPPED — see §18; the manager-subtree SCOPED grant + one real enforcement path SHIPPED — see §19; the first **per-agent identity / access token** that lets a manager drive its own grant with no operator in the loop SHIPPED — see §20; a **second token-authenticated subtree action, `assign_task`,** SHIPPED — see §21; broader subtree actions / project / namespace scopes + agent-driven enrollment still missing.)* | 5 | P1 | backend, frontend, docs, tests |
 | 5 | **Memory compaction / cross-session recall** — Relux kept a bounded 12-turn ring with no summarization; Hermes/OpenClaw compact + summarize + (Hermes) FTS5 cross-session search. *(in-session compaction beyond the ring SHIPPED — see §16; cross-session FTS recall still missing.)* | 6 | P1/P2 | backend, tests |
 | 6 | **`execute_code` (RPC-from-script deterministic glue)** — the cheapest multi-step primitive; routes back through the same tool gate. Big, but high-leverage. | 2, 4 | P1 | backend, tests, docs |
 | 7 | **Goal/issue hierarchy + monitor/recovery** — Relux orchestration is a flat ≤6-step DAG; Paperclip has Goal→Project→Issue→Run with monitor scheduling + stranded-issue recovery. | 4 | P2 | backend, frontend, docs, tests |
@@ -282,7 +282,8 @@ safe (adds no authority), bounded, feasible in one commit, and reuses existing v
   grammar+`is_in_subtree` matcher, and the kernel `manager_grant_permission_to_subordinate` path lets a
   *live* manager grant a permission to an operative inside its OWN Branch (and only there). **Still
   missing**: budgets/spend enforcement (runs record `cost`/`usage` but nothing enforces a ceiling), the
-  *broader* scope vocabulary (project / namespace scopes; more subtree *actions* than `grant_permission`).
+  *broader* scope vocabulary (project / namespace scopes; more subtree *actions* — `grant_permission`
+  SHIPPED §19/§20, `assign_task` SHIPPED §21, others e.g. `revoke` still open).
   The **agent-actor surface that invokes the manager-grant path now exists** (SHIPPED — see §20: a
   per-agent access token authenticates the manager directly on `POST /v1/relux/agents/me/manager-grant`,
   no operator in the loop); the operator-assisted HTTP/UI path (§19) remains as the operator-console
@@ -953,8 +954,9 @@ section for the full reference read + applied-change record. In brief:
 - **Still missing (honest).** A **truly per-agent-authenticated** actor surface (a manager driving its own
   grant without an operator in the loop) **SHIPPED in §20** (a bounded per-agent access token authenticates
   the manager directly on `POST /v1/relux/agents/me/manager-grant`). The operator-assisted path above
-  remains as the operator-console affordance. Still open: more subtree *actions* than `grant_permission`
-  (e.g. assign_task, revoke), project / namespace scopes, governed budgets, persistent `allow-always`
+  remains as the operator-console affordance. The **second** subtree action, `assign_task`, **SHIPPED in §21**
+  (`POST /v1/relux/agents/me/assign-task`). Still open: more subtree *actions* than `grant_permission` /
+  `assign_task` (e.g. revoke), project / namespace scopes, governed budgets, persistent `allow-always`
   grants, agent-driven token enrollment, and Board-style oversight.
 
 ---
@@ -1039,10 +1041,100 @@ section for the full reference read + applied-change record. In brief:
   rebuild green.
 
 - **Still missing (honest).** Agent-driven token **enrollment / rotation** (an agent minting or rotating
-  its own credential — today the operator mints); more subtree *actions* than `grant_permission` (assign_task,
-  revoke) and a richer agent self-service surface; project / namespace scopes; governed budgets; persistent
-  `allow-always` grants; and Board-style oversight all remain open. The token is opaque-hashed, not a
-  verifiable JWT — fine for a local single-operator console, but it does not federate across hosts.
+  its own credential — today the operator mints); more subtree *actions* than `grant_permission` (the
+  second action, `assign_task`, **SHIPPED in §21**; `revoke` and others still open) and a richer agent
+  self-service surface; project / namespace scopes; governed budgets; persistent `allow-always` grants;
+  and Board-style oversight all remain open. The token is opaque-hashed, not a verifiable JWT — fine for
+  a local single-operator console, but it does not federate across hosts.
+
+---
+
+## 21. Implemented this round — a second manager-subtree action: token-authenticated `assign_task` (§20 follow-up / §5 P1)
+
+- **Reference read (BINDING).** The target is Paperclip's `principal_permission_grants` with scope =
+  `managerAgentId-subtree`, resolved by `authorization.ts` `scopeAllows` + `agentIsInSubtree` (the same
+  bounded `reportsTo` walk §19 mapped), only here the `permissionKey` is the **assignment** capability
+  rather than the grant capability — a manager's authority over its Branch is *per-action*, not a single
+  blanket power. Paperclip is **vendored** under `references/paperclip/`; the per-agent-actor attribution
+  that drives it without an operator is `references/paperclip/server/src/middleware/auth.ts` (`req.actor =
+  { type: "agent", agentId: claims.sub }`, the actor read from the verified token subject, never the body).
+  The narrow-by-default discipline stays grounded in the **vendored** OpenClaw
+  `reference/openclaw-main/src/acp/session-lineage-meta.ts` (`subagentControlScope: "children" | "none"`)
+  and `reference/openclaw-main/src/acp/permission-relay.ts` (deny-by-default). Relux files read/mapped:
+  `crates/relux-core/src/permission.rs` (the `manager_subtree_authorizes` matcher is already action-generic),
+  `crates/relux-core/src/hierarchy.rs` (`is_in_subtree`), `crates/relux-core/src/task.rs`
+  (`Task`/`TaskStatus`), `crates/relux-kernel/src/state.rs` (`manager_subtree_authorizes` chokepoint,
+  `assign_task`, the §19/§20 grant primitives, `prime_update_slots::is_terminal_status`),
+  `crates/relux-kernel/src/agent_auth.rs` (the per-agent token identity), `crates/relux-kernel/src/server.rs`
+  (the `agent_router` bearer surface + the §20 `agent_self_manager_grant` handler), `crates/relux-kernel/src/lib.rs`
+  (`KernelError`).
+
+- **No new grammar.** The manager-subtree scope grammar (`agent:<manager-id>:subtree:<action>`) was
+  already **action-generic** — `<action>` is any well-formed segment — so `agent:<id>:subtree:assign_task`
+  parses, stores, and revokes exactly like `…:grant_permission` with **zero** change to `permission.rs`.
+  The pure `manager_subtree_authorizes(grant, holder, action, target, reports_to)` matcher already takes
+  the `action`, and a `…:grant_permission` scope authorizes ONLY `grant_permission` (and vice-versa) — no
+  cross-action bleed (pinned by `permission.rs::subtree_grant_action_is_exact_and_generic_over_the_action_name`).
+
+- **Enforcement (the second real subtree-authority path).**
+  `KernelState::manager_assign_task_to_subordinate(manager, target, task)` is the second production
+  mutation (after the §19 grant) that consults `reports_to` for *authority*, through the SAME kernel
+  chokepoint `manager_subtree_authorizes(manager, "assign_task", target)` — own-Branch + **Active** manager
+  + the exact `agent:<manager>:subtree:assign_task` scope. Authorization is checked **first** (an
+  unauthorized manager never learns whether the task exists). On success it assigns through the unchanged
+  `assign_task` (sets `assigned_agent`, moves the task to `Queued`, audited `task:assign`). It does **not**
+  widen the operator/Prime assignment path — it is a strictly *narrower* agent-authority path.
+
+- **Assignment semantics (the simple model, documented).** Relux's `assign_task` is a single-pointer
+  assignment: it sets `assigned_agent` and moves the task to `Queued`. The manager path adds exactly one
+  guard — the task must EXIST and be **assignable**, i.e. NOT in a terminal state
+  (`Completed`/`Failed`/`Cancelled`/`Expired`, via `prime_update_slots::is_terminal_status`). A live but
+  already-assigned task is simply re-pointed (the same semantics the operator/Prime path has). A terminal
+  task is a resolvable conflict (`KernelError::TaskNotAssignable` → **409**), a missing task is the
+  kernel's existing `UnknownTask` (**400**, unchanged from every other task route), and an unauthorized
+  manager / unknown-or-out-of-Branch target is a **403** that assigns nothing — every denial audited.
+
+- **Per-agent-authenticated surface.** `POST /v1/relux/agents/me/assign-task` (body `{ "task_id",
+  "target_agent_id" }`) rides the §20 `require_agent_token` bearer middleware on the tiny `agent_router`
+  allowlist. The acting manager is **always the token subject** (`AgentTokenIdentity.agent_id`), read from
+  the validated token and NEVER from the body, so a token can only ever assign *as itself*. The handler
+  calls `KernelState::manager_assign_task_to_subordinate_as_agent(token_ref, manager, target, task)`, which
+  drives the unchanged authority gate and adds one `agent:token_authenticated_manager_assign_task` audit
+  row (Success/Denied) carrying the **public** `token_ref` (the raw token never reaches the kernel or any
+  log). An agent token is **never** accepted on an operator route (pinned by the extended
+  `an_agent_token_does_not_open_operator_routes` boundary check), and operator routes are never reachable
+  with a bearer. On success the route returns the updated `TaskRecord`.
+
+- **HONEST trust boundary (unchanged from §20).** This adds a second *action* to the per-agent-authenticated
+  manager surface; it grants no new authority shape. The token is operator-MINTED (an agent cannot enrol
+  itself), opaque-hashed (not a JWT), loopback-only, single-operator. Authority is still own-Branch + Active
+  + the exact scope; the only thing that changed is that a manager may now exercise **assignment** over its
+  Branch (not just permission-granting), each scoped and individually revocable as its own capability row.
+
+- **No new UI this round (honest, API + docs).** The Crew Governance panel already classifies any
+  `agent:<id>:subtree:<action>` scope as elevated and documents the manager-subtree rule (§19); adding a
+  dedicated manager-token *assignment* console affordance is deferred rather than faked — the capability is
+  reachable over the documented `POST /v1/relux/agents/me/assign-task` route and the scope is grantable/
+  revocable through the existing governance form. No fake assignment UI was added.
+
+- **Tests.** `permission.rs::subtree_grant_action_is_exact_and_generic_over_the_action_name` (an
+  `assign_task` scope authorizes only `assign_task`, no bleed with `grant_permission`, self never a target).
+  `state.rs::agent_authenticated_manager_assign_task_enforces_authority_and_assignability`: a token-auth lead
+  assigns a live task to its subordinate (target assigned + `Queued`, `task:assign` + token-provenance audit
+  with the public handle); sibling / ancestor / self / unrelated all denied; a no-scope manager denied; a
+  missing task is `UnknownTask`; a terminal (completed) task is `TaskNotAssignable` and left untouched; a
+  paused manager wields no authority; the token-authenticated denial is audited.
+  `server.rs::agent_token_assign_task_to_subordinate_over_http`: the end-to-end HTTP path — self-assign
+  success (200, task assigned + queued), sibling/ancestor/self/unrelated 403, no-scope manager 403, unknown
+  target 403, missing task 400, paused manager 403, and the `agent:token_authenticated_manager_assign_task`
+  + inner `task:assign` audit rows present with the raw token absent; the operator-route boundary check now
+  also asserts the new route is bearer-gated. Full `relux-core` (159) + `relux-kernel` lib (639) + bin/server
+  (113) suites green; clippy clean on both crates.
+
+- **Still missing (honest).** More subtree *actions* still open (`revoke`, status changes, …); agent-driven
+  token enrollment/rotation; project / namespace scopes; governed budgets; persistent `allow-always` grants;
+  a richer agent self-service + a manager-token *assignment* UI affordance; and Board-style oversight all
+  remain open.
 
 ---
 

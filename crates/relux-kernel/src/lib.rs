@@ -235,6 +235,8 @@ pub enum KernelError {
     OrchestrationNotMultiAgent,
     #[error("task {0} has no assigned agent")]
     TaskNotAssigned(String),
+    #[error("task {task} is not assignable in status {status}; only a non-terminal task can be (re)assigned")]
+    TaskNotAssignable { task: String, status: String },
     #[error("plugin {plugin} has no tool named {tool}")]
     ToolNotFound { plugin: String, tool: String },
     #[error("tool {tool} on plugin {plugin} has no runtime handler yet (installed as metadata only; arbitrary plugin code is not executed)")]

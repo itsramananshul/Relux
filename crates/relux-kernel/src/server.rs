@@ -538,6 +538,7 @@ fn agent_router() -> Router<AppState> {
     Router::new()
         .route("/v1/relux/agents/me", get(agent_self_info))
         .route("/v1/relux/agents/me/manager-grant", post(agent_self_manager_grant))
+        .route("/v1/relux/agents/me/assign-task", post(agent_self_assign_task))
 }
 
 /// Whether the dev/test auth bypass is requested via `RELUX_AUTH_DISABLED`.
@@ -1885,6 +1886,54 @@ async fn agent_self_manager_grant(
             agent_id: agent.id.to_string(),
             permissions: agent.permissions.iter().map(|p| p.to_string()).collect(),
         })
+    })?;
+    Ok(Json(updated))
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentAssignTaskReq {
+    /// The existing task to assign.
+    task_id: String,
+    /// The subordinate to assign it to — must be a proper descendant of the acting
+    /// manager's Branch.
+    target_agent_id: String,
+}
+
+/// `POST /v1/relux/agents/me/assign-task` — the **per-agent-authenticated**
+/// manager-subtree task assignment (the §20 follow-up that adds a second subtree action
+/// beyond `grant_permission`). The manager that authenticated the request with its own
+/// token assigns an existing, non-terminal task to one of its own-Branch subordinates,
+/// with NO operator in the loop. The acting manager is the token subject — inferred from
+/// the validated token, NOT from the request body — so a token can only ever assign as
+/// itself.
+///
+/// Authority is the same gate as the manager-grant path: own-Branch + Active +
+/// `agent:<id>:subtree:assign_task` scope. An unauthorized manager (no scope / not Active
+/// / target outside its Branch / unknown target) → 403, assigning nothing. A missing task
+/// → 400 (the kernel's existing `UnknownTask` mapping for every task route); a terminal
+/// task → 409. On success it returns the updated task record.
+async fn agent_self_assign_task(
+    State(state): State<AppState>,
+    axum::Extension(identity): axum::Extension<relux_kernel::AgentTokenIdentity>,
+    Json(req): Json<AgentAssignTaskReq>,
+) -> Result<Json<TaskRecord>, ApiError> {
+    let manager_id = relux_core::AgentId::new(identity.agent_id.clone());
+    let target_id = relux_core::AgentId::new(req.target_agent_id);
+    let task_id = relux_core::TaskId::new(req.task_id);
+    let token_ref = identity.token_id.clone();
+
+    let updated = locked_save(&state, |kernel| {
+        kernel.manager_assign_task_to_subordinate_as_agent(
+            &token_ref,
+            &manager_id,
+            &target_id,
+            &task_id,
+        )?;
+        let task = kernel
+            .task(&task_id)
+            .ok_or_else(|| KernelError::UnknownTask(task_id.to_string()))?;
+        let agent = task.assigned_agent.as_ref().and_then(|id| kernel.agent(id));
+        Ok(task_record(task, agent))
     })?;
     Ok(Json(updated))
 }
@@ -6106,6 +6155,9 @@ fn status_for(err: &KernelError) -> StatusCode {
         KernelError::AdapterRuntimeDisabled { .. } => StatusCode::CONFLICT,
         // Retrying a run that is not in a failed state is a resolvable conflict.
         KernelError::RunNotRetryable { .. } => StatusCode::CONFLICT,
+        // (Re)assigning a task that has reached a terminal state is a resolvable
+        // conflict — the operator/manager must target a live task.
+        KernelError::TaskNotAssignable { .. } => StatusCode::CONFLICT,
         // An honest "this run cannot be resumed" (no captured session, an adapter
         // without safe non-interactive resume, or a run still in flight): the
         // request is well-formed but the action does not apply — unprocessable.
@@ -8722,6 +8774,128 @@ mod tests {
         let (status, _) =
             call_bearer(&state, "POST", "/v1/relux/agents/lead/tokens", Some(&raw), Some("{}")).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "minting needs an operator session");
+    }
+
+    /// End-to-end HTTP for the per-agent-authenticated manager-subtree TASK ASSIGNMENT
+    /// (`POST /v1/relux/agents/me/assign-task`). Exercises the real authority gate (the
+    /// acting manager is the token subject, never the body) + the assignability rule, and
+    /// confirms success/denials are audited under `agent:token_authenticated_manager_assign_task`.
+    #[tokio::test]
+    async fn agent_token_assign_task_to_subordinate_over_http() {
+        let (state, _dir) = auth_state(true);
+
+        // Topology: director <- lead <- ic ; peer <- director (lead's sibling); outsider unrelated.
+        for (id, reports_to) in [
+            ("director", None),
+            ("lead", Some("director")),
+            ("ic", Some("lead")),
+            ("peer", Some("director")),
+            ("outsider", None),
+        ] {
+            let body = match reports_to {
+                Some(r) => format!(r#"{{"id":"{id}","name":"{id}","reports_to":"{r}"}}"#),
+                None => format!(r#"{{"id":"{id}","name":"{id}"}}"#),
+            };
+            let (status, _, b) = call(&state, "POST", "/v1/relux/agents", None, Some(&body)).await;
+            assert_eq!(status, StatusCode::OK, "create {id} failed: {b}");
+        }
+        // Scope the lead ONLY for the assign_task subtree action.
+        let (status, _, _) = call(
+            &state,
+            "POST",
+            "/v1/relux/agents/lead/permissions",
+            None,
+            Some(r#"{"permission":"agent:lead:subtree:assign_task"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Mint a token for the lead and one for the director (who has a subordinate but no scope).
+        let mint = |id: &str| {
+            let st = state.clone();
+            let id = id.to_string();
+            async move {
+                let (s, b) =
+                    call_bearer(&st, "POST", &format!("/v1/relux/agents/{id}/tokens"), None, Some("{}")).await;
+                assert_eq!(s, StatusCode::OK, "mint {id} failed: {b}");
+                let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+                v["token"].as_str().unwrap().to_string()
+            }
+        };
+        let lead_tok = mint("lead").await;
+        let director_tok = mint("director").await;
+
+        // Create a task via the operator route (auto-assigned to Prime, non-terminal).
+        let (status, _, tb) =
+            call(&state, "POST", "/v1/relux/tasks", None, Some(r#"{"title":"ship it"}"#)).await;
+        assert_eq!(status, StatusCode::OK, "task create failed: {tb}");
+        let task: serde_json::Value = serde_json::from_str(&tb).unwrap();
+        let task_id = task["id"].as_str().unwrap().to_string();
+
+        let assign = |tok: &str, target: &str, tid: &str| {
+            let st = state.clone();
+            let (tok, target, tid) = (tok.to_string(), target.to_string(), tid.to_string());
+            async move {
+                call_bearer(
+                    &st,
+                    "POST",
+                    "/v1/relux/agents/me/assign-task",
+                    Some(&tok),
+                    Some(&format!(r#"{{"task_id":"{tid}","target_agent_id":"{target}"}}"#)),
+                )
+                .await
+            }
+        };
+
+        // (1) SUCCESS: the lead assigns the live task to its subordinate ic.
+        let (status, b) = assign(&lead_tok, "ic", &task_id).await;
+        assert_eq!(status, StatusCode::OK, "self assign-task failed: {b}");
+        assert!(b.contains("\"assigned_agent\":\"ic\""), "task should be assigned to ic: {b}");
+        assert!(b.contains("\"status\":\"queued\""), "task should be queued: {b}");
+
+        // (2) DENIALS: sibling / ancestor / self / unrelated targets are all 403.
+        for bad in ["peer", "director", "lead", "outsider"] {
+            let (status, _) = assign(&lead_tok, bad, &task_id).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "target {bad} must be denied");
+        }
+
+        // (3) NO SCOPE: the director holds no subtree scope — denied even over subordinate lead.
+        let (status, _) = assign(&director_tok, "lead", &task_id).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "manager without scope must be denied");
+
+        // (4) INVALID TARGET: an unknown target folds into the fail-closed authority check → 403.
+        let (status, _) = assign(&lead_tok, "ghost", &task_id).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "unknown target must be denied");
+
+        // (5) MISSING TASK: after authority passes, an unknown task is rejected as bad
+        // input (UnknownTask → 400, the kernel's existing mapping for every task route).
+        let (status, _) = assign(&lead_tok, "ic", "task_does_not_exist").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "missing task must be a 400");
+
+        // (6) PAUSED MANAGER: pause the lead via the operator route — its token now wields no
+        // subtree authority (liveness), even over a real subordinate.
+        let (status, _, _) = call(
+            &state,
+            "PATCH",
+            "/v1/relux/agents/lead",
+            None,
+            Some(r#"{"status":"paused"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "pause lead failed");
+        let (status, _) = assign(&lead_tok, "ic", &task_id).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "paused manager must be denied");
+
+        // (7) AUDIT: the token-authenticated assignment is recorded; the raw token never leaks.
+        let (status, _, audit) =
+            call(&state, "GET", "/v1/relux/audit?limit=500", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            audit.contains("agent:token_authenticated_manager_assign_task"),
+            "token-authenticated assign audit missing: {audit}"
+        );
+        assert!(audit.contains("task:assign"), "inner task:assign audit missing: {audit}");
+        assert!(!audit.contains(&lead_tok), "raw token leaked into audit: {audit}");
     }
 
     #[tokio::test]

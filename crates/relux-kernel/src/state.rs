@@ -1779,6 +1779,131 @@ impl KernelState {
         result
     }
 
+    /// A manager agent assigns an existing task to one of its (transitive) subordinates,
+    /// authorized by a manager-subtree scope (`agent:<manager>:subtree:assign_task`) it
+    /// holds over its OWN Branch and `target` actually sitting in that Branch. This is the
+    /// **second** real enforcement path (after
+    /// [`Self::manager_grant_permission_to_subordinate`]) that consults `reports_to` for
+    /// *authority* — the same `manager_subtree_authorizes` gate, only the `action` differs.
+    ///
+    /// **Assignment semantics (deliberately the simple model the kernel already uses).**
+    /// The task must EXIST and be **assignable** — i.e. not in a terminal state
+    /// (`Completed`/`Failed`/`Cancelled`/`Expired`, per
+    /// [`crate::prime_update_slots::is_terminal_status`]). On success the task's
+    /// `assigned_agent` is set to `target` and it moves to `Queued` through the unchanged
+    /// [`Self::assign_task`] (audited `task:assign`); a non-terminal task that was already
+    /// assigned elsewhere is simply re-pointed, exactly as the operator/Prime path does.
+    ///
+    /// It does NOT widen the operator/Prime assignment path (those stay kernel/operator
+    /// actions with no actor gate). It adds a strictly *narrower* agent-authority path: a
+    /// manager can only reach operatives inside its own subtree, only for the `assign_task`
+    /// action it was scoped, and only while Active. An unauthorized manager, a missing
+    /// task, or a terminal task is denied + audited and assigns nothing. Authorization is
+    /// checked FIRST, so an unauthorized manager never learns whether the task exists.
+    pub fn manager_assign_task_to_subordinate(
+        &mut self,
+        manager_id: &AgentId,
+        target_id: &AgentId,
+        task_id: &TaskId,
+    ) -> Result<(), KernelError> {
+        // (1) Authority: own-Branch + Active + `assign_task` scope.
+        if !self.manager_subtree_authorizes(manager_id, "assign_task", target_id) {
+            let namespace = self.agents.get(target_id).map(|a| a.namespace_id.clone());
+            self.record_audit(
+                "agent",
+                manager_id.as_str(),
+                "agent:manager_assign_task",
+                Some("task"),
+                Some(task_id.as_str()),
+                namespace.as_ref(),
+                AuditResult::Denied,
+                serde_json::json!({
+                    "target": target_id.as_str(),
+                    "reason": "manager-subtree authorization failed (not a live manager of the target's Branch)"
+                }),
+            );
+            return Err(KernelError::PermissionDenied {
+                agent: manager_id.to_string(),
+                permission: format!("agent:{}:subtree:assign_task", manager_id),
+            });
+        }
+        // (2) The task must exist and be assignable (not terminal). A terminal task is a
+        //     resolvable conflict, audited so a denied (re)assignment is visible.
+        match self.tasks.get(task_id) {
+            None => return Err(KernelError::UnknownTask(task_id.to_string())),
+            Some(task) if crate::prime_update_slots::is_terminal_status(&task.status) => {
+                let status = format!("{:?}", task.status);
+                let namespace = task.namespace_id.clone();
+                self.record_audit(
+                    "agent",
+                    manager_id.as_str(),
+                    "agent:manager_assign_task",
+                    Some("task"),
+                    Some(task_id.as_str()),
+                    Some(&namespace),
+                    AuditResult::Denied,
+                    serde_json::json!({
+                        "target": target_id.as_str(),
+                        "reason": "task is in a terminal state and cannot be reassigned",
+                        "status": status,
+                    }),
+                );
+                return Err(KernelError::TaskNotAssignable {
+                    task: task_id.to_string(),
+                    status,
+                });
+            }
+            Some(_) => {}
+        }
+        // (3) Authorized + assignable: perform the assignment (audited `task:assign` inside).
+        self.assign_task(task_id, target_id)
+    }
+
+    /// **Per-agent-authenticated** task assignment: the same real manager-subtree
+    /// authorization as [`Self::manager_assign_task_to_subordinate`], driven by a manager
+    /// that authenticated its OWN request with a per-agent access token (no operator in the
+    /// loop). The token actor analogue of
+    /// [`Self::manager_grant_permission_to_subordinate_as_agent`] for the `assign_task`
+    /// action.
+    ///
+    /// `token_ref` is the **public, non-secret** token handle (`agt_<hex>`) that
+    /// authenticated the request — recorded for provenance only; the raw token is NEVER
+    /// passed here or logged. Authority is unchanged (own-Branch + `Active` +
+    /// `agent:<id>:subtree:assign_task` scope). On top of the inner agent-actor audit
+    /// (`task:assign` on success / `agent:manager_assign_task` on a denial) this adds one
+    /// `agent:token_authenticated_manager_assign_task` row (Success/Denied) marking that a
+    /// per-agent token — not an operator — drove the assignment.
+    pub fn manager_assign_task_to_subordinate_as_agent(
+        &mut self,
+        token_ref: &str,
+        manager_id: &AgentId,
+        target_id: &AgentId,
+        task_id: &TaskId,
+    ) -> Result<(), KernelError> {
+        let result = self.manager_assign_task_to_subordinate(manager_id, target_id, task_id);
+        let namespace = self.agents.get(target_id).map(|a| a.namespace_id.clone());
+        self.record_audit(
+            "agent",
+            manager_id.as_str(),
+            "agent:token_authenticated_manager_assign_task",
+            Some("task"),
+            Some(task_id.as_str()),
+            namespace.as_ref(),
+            if result.is_ok() {
+                AuditResult::Success
+            } else {
+                AuditResult::Denied
+            },
+            serde_json::json!({
+                "target": target_id.as_str(),
+                "auth_source": "agent_token",
+                "token_ref": token_ref,
+                "trust_boundary": "a per-agent access token authenticated the manager directly (no operator in the loop); the manager-subtree authorization was NOT bypassed",
+            }),
+        );
+        result
+    }
+
     /// Record that the operator minted a per-agent access token for `agent_id`. The
     /// token store ([`crate::agent_auth`]) lives outside the kernel (an auth-layer
     /// concern, like operator sessions), but its lifecycle is recorded in the SAME
@@ -12994,6 +13119,113 @@ mod tests {
         assert!(matches!(err, KernelError::PermissionDenied { .. }), "got {err:?}");
         assert!(k.audit_log().iter().any(|e| {
             e.action == "agent:token_authenticated_manager_grant" && e.result == AuditResult::Denied
+        }));
+    }
+
+    #[test]
+    fn agent_authenticated_manager_assign_task_enforces_authority_and_assignability() {
+        // The second subtree action (`assign_task`): a manager that authenticated its OWN
+        // request via a token assigns an existing task to one of its Branch subordinates.
+        // Authority is the SAME `manager_subtree_authorizes` gate as the grant path; here
+        // the action is `assign_task` and an extra assignability (non-terminal) rule applies.
+        let (mut k, _prime, _task, _run, _echo) = primed_kernel();
+        let ns = NamespaceId::new("workspace");
+        let adapter = PluginId::new("relux-adapter-local-prime");
+        let mk = |k: &mut KernelState, id: &str, lead: Option<AgentId>| {
+            k.create_agent_with_skills(id, id, "", &adapter, &ns, None, vec![], vec![], lead)
+                .unwrap()
+        };
+        // director <- lead <- ic ; peer reports to director (lead's sibling); outsider unrelated.
+        let director = mk(&mut k, "director", None);
+        let lead = mk(&mut k, "lead", Some(director.clone()));
+        let ic = mk(&mut k, "ic", Some(lead.clone()));
+        let peer = mk(&mut k, "peer", Some(director.clone()));
+        let outsider = mk(&mut k, "outsider", None);
+
+        // lead is scoped ONLY for assign_task over its own Branch.
+        let scope = Permission::new("agent:lead:subtree:assign_task").unwrap();
+        k.grant_permission_to_agent(&lead, scope).unwrap();
+
+        let mk_task = |k: &mut KernelState| {
+            k.create_task("ship it", serde_json::Value::Null, "operator", &ns, vec![])
+        };
+
+        // (1) Authorized: the token-authenticated lead assigns a live task to subordinate ic.
+        let t1 = mk_task(&mut k);
+        k.manager_assign_task_to_subordinate_as_agent("agt_x1", &lead, &ic, &t1)
+            .expect("lead may assign to its subordinate ic");
+        let assigned = k.task(&t1).unwrap();
+        assert_eq!(assigned.assigned_agent.as_ref(), Some(&ic));
+        assert_eq!(assigned.status, TaskStatus::Queued);
+        // Both the inner `task:assign` and the token-provenance row are recorded.
+        assert!(k.audit_log().iter().any(|e| {
+            e.action == "task:assign" && e.result == AuditResult::Success
+        }));
+        let prov = k
+            .audit_log()
+            .iter()
+            .find(|e| {
+                e.action == "agent:token_authenticated_manager_assign_task"
+                    && e.result == AuditResult::Success
+            })
+            .expect("a token-provenance audit row");
+        assert_eq!(prov.actor_type, "agent");
+        assert_eq!(prov.actor_id, "lead");
+        assert_eq!(prov.metadata["token_ref"], "agt_x1");
+        assert_eq!(prov.metadata["auth_source"], "agent_token");
+        assert_eq!(prov.metadata["target"], "ic");
+
+        // (2) Sibling / ancestor / self / unrelated targets are all denied (403-equivalent).
+        let t2 = mk_task(&mut k);
+        for bad in [&peer, &director, &lead, &outsider] {
+            let err = k
+                .manager_assign_task_to_subordinate_as_agent("agt_x1", &lead, bad, &t2)
+                .unwrap_err();
+            assert!(
+                matches!(err, KernelError::PermissionDenied { .. }),
+                "target {bad:?} must be denied: {err:?}"
+            );
+        }
+        // t2 was never assigned by a denied attempt.
+        assert!(k.task(&t2).unwrap().assigned_agent.is_none());
+
+        // (3) A manager WITHOUT an assign_task scope is denied even over a real subordinate
+        // (director has subordinate lead but holds no subtree scope).
+        let err = k
+            .manager_assign_task_to_subordinate_as_agent("agt_x1", &director, &lead, &t2)
+            .unwrap_err();
+        assert!(matches!(err, KernelError::PermissionDenied { .. }), "no scope => denied: {err:?}");
+
+        // (4) Missing task → UnknownTask (after authority passes), assigns nothing.
+        let ghost = TaskId::new("task_does_not_exist");
+        let err = k
+            .manager_assign_task_to_subordinate_as_agent("agt_x1", &lead, &ic, &ghost)
+            .unwrap_err();
+        assert!(matches!(err, KernelError::UnknownTask(_)), "missing task: {err:?}");
+
+        // (5) Terminal task → TaskNotAssignable; a completed task cannot be reassigned.
+        let t3 = mk_task(&mut k);
+        k.complete_task(&t3).unwrap();
+        let err = k
+            .manager_assign_task_to_subordinate_as_agent("agt_x1", &lead, &ic, &t3)
+            .unwrap_err();
+        assert!(matches!(err, KernelError::TaskNotAssignable { .. }), "terminal task: {err:?}");
+        // The completed task is untouched.
+        assert_eq!(k.task(&t3).unwrap().status, TaskStatus::Completed);
+
+        // (6) Liveness: a paused manager wields no subtree authority, even over a subordinate.
+        k.update_agent(&lead, None, None, None, None, Some(AgentStatus::Paused))
+            .unwrap();
+        let t4 = mk_task(&mut k);
+        let err = k
+            .manager_assign_task_to_subordinate_as_agent("agt_x1", &lead, &ic, &t4)
+            .unwrap_err();
+        assert!(matches!(err, KernelError::PermissionDenied { .. }), "paused manager denied: {err:?}");
+
+        // A token-authenticated denial was audited.
+        assert!(k.audit_log().iter().any(|e| {
+            e.action == "agent:token_authenticated_manager_assign_task"
+                && e.result == AuditResult::Denied
         }));
     }
 

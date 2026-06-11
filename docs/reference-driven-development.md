@@ -2436,3 +2436,58 @@ own token) is future work. The token is still **operator-minted** — there is n
 bootstrap (an agent cannot mint its own first credential), which is the correct trust posture for a
 local-first console. This is not an internet auth system: loopback-only, single local operator, no
 JWT/OAuth.
+
+## Reference read — a second manager-subtree action: token-authenticated `assign_task` (this slice)
+
+The follow-up that exercises the per-agent-authenticated manager surface for a **second** subtree action
+beyond `grant_permission`: a manager that authenticated its own request (the §20 token) may **assign an
+existing task** to one of its own-Branch subordinates, with no operator in the loop. Audit ref:
+`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §21 (and the §20 "more subtree *actions* than `grant_permission`"
+open item).
+
+### Paperclip — files read (VENDORED — `references/paperclip/`)
+
+- `references/paperclip/server/src/services/authorization.ts` (`scopeAllows` + `agentIsInSubtree`) +
+  `references/paperclip/packages/db/src/schema/principal_permission_grants.ts` — a manager's authority over
+  its Branch is keyed **per `permissionKey`**, not a blanket power: the assignment capability is a distinct
+  grant from the grant capability, resolved by the same subtree walk. This is the "second action" shape.
+- `references/paperclip/server/src/middleware/auth.ts` — `req.actor = { type: "agent", agentId: claims.sub }`:
+  the acting agent is the verified token subject, never the request body — the discipline Relux's
+  `agent_self_assign_task` follows (manager id from `AgentTokenIdentity`, target/task from the body).
+
+### openclaw — files read
+
+- `reference/openclaw-main/src/acp/session-lineage-meta.ts` — `subagentControlScope: "children" | "none"`,
+  default narrow: a node's authority is its children subtree or nothing. The `assign_task` scope is narrow
+  the same way — own-Branch proper descendants only, the exact action only, Active manager only.
+- `reference/openclaw-main/src/acp/permission-relay.ts` — deny-by-default: an unauthorized assignment is a
+  clean 403 that mutates nothing; a malformed/missing/terminal target is rejected, never silently coerced.
+
+### Relux files read / mapped
+
+- `crates/relux-core/src/permission.rs` — `manager_subtree_authorizes(grant, holder, action, target,
+  reports_to)` was **already action-generic**; an `agent:<id>:subtree:assign_task` scope parses/stores/
+  revokes with no grammar change and authorizes only its own action.
+- `crates/relux-core/src/task.rs` — `Task` / `TaskStatus`; the single-pointer `assigned_agent` model.
+- `crates/relux-kernel/src/state.rs` — the `manager_subtree_authorizes` kernel chokepoint (Active-manager
+  liveness), `assign_task` (sets `assigned_agent` → `Queued`, audits `task:assign`),
+  `prime_update_slots::is_terminal_status`, and the §19/§20 grant primitives the new pair mirrors.
+- `crates/relux-kernel/src/agent_auth.rs` — the per-agent `AgentTokenIdentity`.
+- `crates/relux-kernel/src/server.rs` — the `agent_router` bearer allowlist + the §20
+  `agent_self_manager_grant` handler shape; `crates/relux-kernel/src/lib.rs` — `KernelError`.
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| **per-action subtree authority** (Paperclip `permissionKey` per grant) | The existing action-generic matcher needed NO change; `KernelState::manager_assign_task_to_subordinate` calls the same `manager_subtree_authorizes(manager, "assign_task", target)` chokepoint. A `…:grant_permission` scope never authorizes `assign_task` and vice-versa (pinned by `subtree_grant_action_is_exact_and_generic_over_the_action_name`). |
+| **actor from the verified token subject** (Paperclip `claims.sub`) | `POST /v1/relux/agents/me/assign-task` reads the acting manager from `AgentTokenIdentity.agent_id`; the body carries only `task_id` + `target_agent_id`. `manager_assign_task_to_subordinate_as_agent` adds an `agent:token_authenticated_manager_assign_task` provenance row (public `token_ref` only). |
+| **deny-by-default; reject invalid targets** (openclaw relay) | Authorization is checked **first** (an unauthorized manager never learns the task exists): no-scope / not-Active / out-of-Branch / unknown target → 403, nothing mutated. The one extra guard is **assignability**: a terminal task (`is_terminal_status`) is a 409 `TaskNotAssignable`; a missing task is the kernel's existing `UnknownTask` (400). |
+| **narrow, auditable, revocable** | The scope is one explicit `agent:<id>:subtree:assign_task` capability row, granted/revoked through the unchanged operator governance path; the per-agent token surface stays a tiny allowlist that never opens an operator route (boundary check extended). |
+
+**What we deliberately do differently / leave out:** no new permission grammar (the subtree scope was
+already action-generic); no change to the operator/Prime assignment path (this is a strictly narrower
+agent-authority path); assignment keeps the simple single-pointer model (re-point a live task; refuse a
+terminal one); no dedicated manager-token *assignment* UI affordance this round (API + docs, scope
+grantable through the existing governance form) rather than a faked control. More subtree actions
+(`revoke`, …), project/namespace scopes, and agent-driven enrollment remain future work.

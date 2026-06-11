@@ -473,6 +473,27 @@ mod tests {
     }
 
     #[test]
+    fn subtree_grant_action_is_exact_and_generic_over_the_action_name() {
+        // The subtree grammar accepts ANY well-formed action segment, so a second action
+        // (`assign_task`) is a valid, distinct scope — and only ever authorizes its own
+        // action over a real subordinate (no cross-action bleed with `grant_permission`).
+        let m = rmap(&[("ic", "lead"), ("lead", "director")]);
+        let assign = Permission::new("agent:lead:subtree:assign_task").unwrap();
+        assert!(assign.is_manager_subtree());
+        assert_eq!(assign.agent_subtree_parts(), Some(("lead", "assign_task")));
+
+        // Authorizes `assign_task` on a subordinate…
+        assert!(manager_subtree_authorizes(&assign, &aid("lead"), "assign_task", &aid("ic"), &m));
+        // …but NOT a different action (an assign_task scope is not a grant_permission scope).
+        assert!(!manager_subtree_authorizes(&assign, &aid("lead"), "grant_permission", &aid("ic"), &m));
+        // …and a grant_permission scope is likewise not an assign_task scope.
+        let grant = Permission::new("agent:lead:subtree:grant_permission").unwrap();
+        assert!(!manager_subtree_authorizes(&grant, &aid("lead"), "assign_task", &aid("ic"), &m));
+        // Self is still never an assignment target via the subtree path.
+        assert!(!manager_subtree_authorizes(&assign, &aid("lead"), "assign_task", &aid("lead"), &m));
+    }
+
+    #[test]
     fn subtree_grant_cannot_borrow_another_managers_branch() {
         // A grant naming `director`'s subtree, but HELD by `lead`, authorizes nothing —
         // even over a node that IS in director's subtree. Authority is over the holder's
