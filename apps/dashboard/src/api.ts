@@ -2000,6 +2000,16 @@ export interface ReluxAgent {
   // The agent's specialty tags/skills (bounded slugs). Always present (possibly empty);
   // used to route work to a specialist and rendered as chips on the Crew card.
   skills?: string[];
+  // The agent's Lead (`reports_to`) — the id of its manager in the org lattice, when set.
+  // Omitted/absent => top-level (reports to no one). The internal id stays `reports_to`;
+  // the product term is "Lead" (docs/relix-lexicon.md two-layer rule).
+  reports_to?: string;
+  // The Lead's display name, resolved server-side against the roster (list endpoint
+  // only). Omitted when there is no Lead or it can't be resolved.
+  reports_to_name?: string;
+  // Ids of this agent's DIRECT reports (the first level of its Branch), resolved
+  // server-side (list endpoint only). Always present (possibly empty) on list responses.
+  reports?: string[];
   created_at: string;
 }
 
@@ -2024,6 +2034,11 @@ export interface ReluxAgentConfig {
   // whole list (an empty array clears it); absent => leave unchanged. The backend
   // re-validates/sanitizes/bounds each entry.
   skills?: string[];
+  // Optional Lead (`reports_to`) — an existing crew member's id this operative reports
+  // to. On create, absent/blank => top-level. On edit, a present blank string CLEARS the
+  // Lead (top-level); absent => leave unchanged. The backend validates it against the
+  // live roster (must exist, cannot be self, no reporting cycle).
+  reports_to?: string;
   // Optional role-preset id (create only). When set, the backend fills any
   // role/persona/skills the request omitted from the curated bundle, then validates
   // the merged input through the same path. A preset grants NO permission and picks no

@@ -172,6 +172,7 @@ mod tests {
                     persona: Some(p.persona),
                     adapter_plugin: None,
                     skills: Some(&skills),
+                    reports_to: None,
                 },
                 &adapters(),
                 &[],

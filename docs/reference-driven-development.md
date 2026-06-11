@@ -2273,3 +2273,52 @@ a single plugin so it can never become a back door to a global `*`. The UI mirro
 grammar (`apps/dashboard/src/governance.ts`) so a malformed scope is rejected before the API, and the
 Crew Governance panel badges scoped rows + explains the exact-vs-scope rule — no fake budget controls
 were added.
+
+## Reference read — the `reports_to` org-lattice / chain-of-command model (this slice)
+
+Implements `HERMES_OPENCLAW_DEEP_AUDIT.md` §3 P2 (and unblocks the §5 subtree-scope half): the
+durable **Lead** (`reports_to`) pointer + the pure subtree/chain helpers a future manager-subtree
+scoped grant will read. The MODEL ships now; **no permission consults it yet** — enforcement is
+unchanged this round.
+
+### openclaw — files read
+
+- `reference/openclaw-main/src/acp/session-lineage-meta.ts` — `toAcpSessionLineageMeta` resolves a
+  child's **parent pointer** as `parentSessionId = parentSessionKey ?? spawnedBy`, a **bounded**
+  non-negative integer `spawnDepth` (`readInteger` rejects negatives/non-integers), and
+  `subagentControlScope: "children" | "none"` (a node's authority is its children subtree, or
+  nothing). **Pattern: one parent pointer per node, a hard-bounded depth, and a node's reach is its
+  own subtree — default narrow.**
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/tools/delegate_tool.py` — `MAX_DEPTH = 1` ("flat by default: parent
+  (0) → child (1); grandchild rejected unless `max_spawn_depth` raised"), per-record
+  `{subagent_id, parent_id, depth, …}`, `_get_max_spawn_depth`. **Pattern: a parent/depth lineage
+  with a small default depth cap that must be explicitly raised.**
+
+### Paperclip — referenced (not vendored)
+
+- Paperclip's `packages/db/src/schema/agents.ts` `reportsTo` org tree (indexed `(companyId,
+  reportsTo)`) + `authorization.ts` `agentIsInSubtree` (a 50-depth upward walk) are summarized in the
+  audit's §3/§5 from the original read. The source is **not present** under `reference/`, so only the
+  bounded-walk *shape* (depth 50, walk up the `reportsTo` chain) was taken — never the scope
+  enforcement, which stays explicitly future.
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| **one parent pointer per node** (openclaw `parentSessionId`, Hermes `parent_id`, Paperclip `reportsTo`) | `relux_core::Agent` gains `reports_to: Option<AgentId>` (the **Lead**; internal id stays `reports_to` per the two-layer rule). `#[serde(default)]` ⇒ every pre-existing snapshot loads as top-level (backwards compatible). |
+| **a hard-bounded ancestry walk** (Paperclip `agentIsInSubtree` 50-deep; Hermes/openclaw bounded depth) | `relux_core::hierarchy` — `chain_of_command`, `is_in_subtree` (proper-descendant), `would_create_cycle`, all bounded by `MAX_HIERARCHY_DEPTH = 50` with a repeat-guard, so every walk is **total even on a malformed/cyclic map**. |
+| **a node's reach is its own subtree** (openclaw `subagentControlScope: "children"`) | `is_in_subtree(manager, child)` is the exact predicate a future manager-subtree grant will read. It is built + tested but **deliberately consulted by nothing** this round — enforcement (`agent_holds_permission`, `start_run`) is byte-for-byte unchanged. |
+| **the graph is validated, not assumed** | Create/edit resolve the Lead against the live roster (`agent_config::resolve_manager` → exists + not-self); the kernel owns the graph invariant under its lock — a created leaf needs only existence+self, an **edit additionally rejects a cycle** (`would_create_cycle`). Honest `400`s throughout. |
+
+**What we deliberately do differently / leave out:** the lattice is **display + validation only** this
+round — it widens no permission and does not touch orchestration/assignment routing. A Lead may be a
+paused/disabled operative (status ⊥ org structure; the edge grants no authority, so there is no safety
+reason to forbid it — and any future scoped grant, not the edge, is where a disabled-Lead check would
+live). The Crew picker excludes self + the operative's own Branch so an obvious cycle can't be chosen,
+but the backend re-validates regardless (the client is convenience, never the authority). The
+manager-subtree **scoped permission enforcement** — wiring `is_in_subtree` into a grant (Paperclip
+`scopeAllows` + `agentIsInSubtree`) — is the explicitly-deferred next slice.

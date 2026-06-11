@@ -18,6 +18,7 @@ import {
 } from "../governance";
 import { parseSkillsInput, formatSkillsInput } from "../skills";
 import { applyPreset, presetFieldsDirty } from "../presets";
+import { managerOptions, leadLabel, directReportsSummary } from "../hierarchy";
 
 type Agent = ReluxAgent;
 
@@ -124,6 +125,7 @@ export function Crew() {
                     mode="edit"
                     agent={agent}
                     adapters={adapters}
+                    roster={agents}
                     onSaved={() => {
                       setEditingId(null);
                       afterChange();
@@ -147,6 +149,26 @@ export function Crew() {
                   )}
                   <p><strong>Status:</strong> {agent.status || "—"}</p>
                   <p><strong>Adapter:</strong> {agent.adapter_plugin || "—"}</p>
+                  <p>
+                    <strong>Reports to (Lead):</strong>{" "}
+                    {agent.reports_to ? (
+                      <span className="mono">
+                        {leadLabel(agent.reports_to, agent.reports_to_name)}
+                      </span>
+                    ) : (
+                      <span className="muted">none (top-level)</span>
+                    )}
+                  </p>
+                  <p>
+                    <strong>Direct reports:</strong>{" "}
+                    {(agent.reports?.length ?? 0) === 0 ? (
+                      <span className="muted">none</span>
+                    ) : (
+                      <span title={(agent.reports ?? []).join(", ")}>
+                        {directReportsSummary(agent.reports)}
+                      </span>
+                    )}
+                  </p>
                   <SkillChips skills={agent.skills ?? []} />
                   <PermissionsList permissions={agent.permissions ?? []} />
                   <p>
@@ -183,7 +205,12 @@ export function Crew() {
           persona (operating style), and which adapter runs its work. The id is derived
           from the name when you leave it blank.
         </p>
-        <CrewMemberForm mode="create" adapters={adapters} onSaved={afterChange} />
+        <CrewMemberForm
+          mode="create"
+          adapters={adapters}
+          roster={agents}
+          onSaved={afterChange}
+        />
       </div>
     </div>
   );
@@ -196,12 +223,17 @@ function CrewMemberForm({
   mode,
   agent,
   adapters,
+  roster,
   onSaved,
   onCancel,
 }: {
   mode: "create" | "edit";
   agent?: ReluxAgent;
   adapters: ReluxAdapterStatus[];
+  // The live roster, used to populate the "Reports to (Lead)" picker. In edit mode the
+  // agent itself and its own Branch (descendants) are excluded so the dropdown can't
+  // offer an obvious cycle (the backend re-validates regardless).
+  roster: ReluxAgent[];
   onSaved: () => void;
   onCancel?: () => void;
 }) {
@@ -212,9 +244,17 @@ function CrewMemberForm({
   const [skillsText, setSkillsText] = useState(formatSkillsInput(agent?.skills));
   const [adapter, setAdapter] = useState(agent?.adapter_plugin ?? "");
   const [status, setStatus] = useState((agent?.status ?? "active").toLowerCase());
+  const [reportsTo, setReportsTo] = useState(agent?.reports_to ?? "");
   const [presetId, setPresetId] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Eligible Leads: every crew member except (in edit mode) this operative and its own
+  // Branch. Mirrors crates/relux-core/src/hierarchy.rs — the backend is authoritative.
+  const leadChoices = useMemo(
+    () => managerOptions(roster, mode === "edit" ? agent?.id : undefined),
+    [roster, mode, agent?.id],
+  );
 
   // Curated role presets for the create form (read-only, advisory). Edit mode never
   // offers presets — they seed a NEW member, they don't reshape an existing one.
@@ -260,6 +300,7 @@ function CrewMemberForm({
         const body: ReluxAgentConfig = { name, role, persona, skills };
         if (id.trim()) body.id = id.trim();
         if (adapter) body.adapter_plugin = adapter;
+        if (reportsTo) body.reports_to = reportsTo;
         await reluxWork.createAgent(body);
         // Reset the create form for the next member.
         setName("");
@@ -268,12 +309,14 @@ function CrewMemberForm({
         setPersona("");
         setSkillsText("");
         setAdapter("");
+        setReportsTo("");
         setPresetId("");
       } else if (agent) {
-        // Send every field so an empty value is a deliberate clear (persona/skills) or
-        // keeps the current value. The backend leaves absent fields unchanged; a present
-        // (possibly empty) skills array REPLACES the whole list.
-        const body: ReluxAgentConfig = { name, role, persona, status, skills };
+        // Send every field so an empty value is a deliberate clear (persona/skills/Lead)
+        // or keeps the current value. The backend leaves absent fields unchanged; a
+        // present (possibly empty) skills array REPLACES the whole list, and a present
+        // blank `reports_to` CLEARS the Lead (top-level).
+        const body: ReluxAgentConfig = { name, role, persona, status, skills, reports_to: reportsTo };
         if (adapter) body.adapter_plugin = adapter;
         await reluxWork.updateAgent(agent.id, body);
       }
@@ -389,6 +432,27 @@ function CrewMemberForm({
             </option>
           ))}
         </select>
+      </div>
+      <div className="form-group">
+        <label htmlFor={`${idPrefix}-reports-to`}>Reports to (Lead, optional):</label>
+        <select
+          id={`${idPrefix}-reports-to`}
+          value={reportsTo}
+          onChange={(e) => setReportsTo(e.target.value)}
+        >
+          <option value="">None (top-level)</option>
+          {leadChoices.map((a) => (
+            <option key={a.id} value={a.id}>
+              {a.name} ({a.id})
+            </option>
+          ))}
+        </select>
+        <p className="muted" style={{ fontSize: 11, marginTop: 2 }}>
+          The operative this one escalates to. An operative cannot report to itself or
+          into its own branch (those are excluded above); the server re-validates and
+          rejects any reporting cycle. This sets chain-of-command only — it does NOT widen
+          any permission.
+        </p>
       </div>
       {mode === "edit" && (
         <div className="form-group">

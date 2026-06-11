@@ -43,7 +43,7 @@ Relux roots audited: `crates/relux-core/src/`, `crates/relux-kernel/src/`, `apps
 | 1 | **Self-correction on a malformed brain decision** — a correctable reply is collapsed into the same `None` as a hard provider failure and silently falls back; no bounded re-prompt with the validation error. Hermes (`_invalid_json_retries`/`_invalid_tool_retries`) and OpenClaw (retry instructions) both do this. | 1, 7 | **P0** *(shipped — see §1)* | backend, tests, docs |
 | 2 | **Structured error/liveness classifier + bounded transient retry** — Relux retry is a fresh run with no error taxonomy and no backoff; Paperclip classifies (`run-liveness.ts`) and retries transient upstream failures on a bounded `[2m,10m,30m,2h]` schedule. | 7 | **P1** *(shipped — see §14)* | backend, frontend, docs, tests |
 | 3 | **Governed budgets (soft/hard, auto-pause)** — Paperclip enforces per-company/agent/project spend with warn + hard-stop + cancel-work. Relux records run `cost`/`usage` but enforces nothing. | 5 | P1 | backend, frontend, docs, tests |
-| 4 | **Scoped permission grants (subtree / project)** — Relux permissions are exact-string match only; Paperclip has fine-grained grants scoped to manager-subtrees/projects. *(minimal plugin-scope `tool:<plugin>:*` SHIPPED — see §17; subtree/project scope still missing.)* | 5 | P1 | backend, tests |
+| 4 | **Scoped permission grants (subtree / project)** — Relux permissions are exact-string match only; Paperclip has fine-grained grants scoped to manager-subtrees/projects. *(minimal plugin-scope `tool:<plugin>:*` SHIPPED — see §17; the `reports_to` org-lattice + acyclic-graph model SHIPPED — see §18; subtree-SCOPED permission enforcement still missing — the helper exists, but no grant reads it yet.)* | 5 | P1 | backend, tests |
 | 5 | **Memory compaction / cross-session recall** — Relux kept a bounded 12-turn ring with no summarization; Hermes/OpenClaw compact + summarize + (Hermes) FTS5 cross-session search. *(in-session compaction beyond the ring SHIPPED — see §16; cross-session FTS recall still missing.)* | 6 | P1/P2 | backend, tests |
 | 6 | **`execute_code` (RPC-from-script deterministic glue)** — the cheapest multi-step primitive; routes back through the same tool gate. Big, but high-leverage. | 2, 4 | P1 | backend, tests, docs |
 | 7 | **Goal/issue hierarchy + monitor/recovery** — Relux orchestration is a flat ≤6-step DAG; Paperclip has Goal→Project→Issue→Run with monitor scheduling + stranded-issue recovery. | 4 | P2 | backend, frontend, docs, tests |
@@ -171,7 +171,7 @@ safe (adds no authority), bounded, feasible in one commit, and reuses existing v
   (indexed `(companyId, reportsTo)`), roles, capabilities, per-agent budget, `lastHeartbeatAt`;
   `authorization.ts` `agentIsInSubtree` (50-depth walk). The **durable, outlive-the-turn** model.
 
-### Relux mapping — **partial** *(session identity / handoff + Claude resume now implemented — see §15)*
+### Relux mapping — **partial** *(session identity / handoff + Claude resume now implemented — see §15; the `reports_to` org-lattice model now implemented — see §18)*
 
 - `crates/relux-core/src/agent.rs` — `Agent` (id/name/description/adapter/persona/skills/status/
   permissions/namespace), `AgentStatus`. `crates/relux-kernel/src/agent_config.rs`,
@@ -186,15 +186,22 @@ safe (adds no authority), bounded, feasible in one commit, and reuses existing v
   session through the governed gate (Claude `-p --resume <id>`, `build_resume_adapter_args`,
   threaded in `prepare_cli_run` only when `resumed_from` is set); Codex/Command honestly refuse.
   Maps OpenClaw `getCliSessionBinding(...).sessionId` + `runCliWithSession(nextCliSessionId, ...)`.
-- **Durable agents** exist (they outlive the turn and run via the orchestration batch). **Still
-  missing**: an explicit `reports_to` org tree / chain-of-command, subagent spawn-depth/children caps
-  (orchestration has step/concurrency caps instead), and resume of a Codex session / mid-run partial
-  resume (no provider session id is captured on the Codex plain-text path).
+- **Durable agents** exist (they outlive the turn and run via the orchestration batch). The
+  **`reports_to` org-lattice / chain-of-command model is now implemented** (see §18): an optional Lead
+  pointer on every operative, validated acyclic at the config boundary, with pure
+  `relux_core::hierarchy` walks (`chain_of_command`, `is_in_subtree`, `would_create_cycle`). **Still
+  missing**: subagent spawn-depth/children caps (orchestration has step/concurrency caps instead),
+  resume of a Codex session / mid-run partial resume (no provider session id is captured on the Codex
+  plain-text path), and the **subtree-SCOPED permission enforcement** the helper is built for (it pairs
+  with §5 — no grant reads the subtree yet, by design this round).
 
 ### Priority & slices
 
-- **P2 — `reports_to` chain-of-command + manager-subtree authority** (Paperclip): pairs with scoped
-  grants (§5). The lexicon already reserves `reports_to` as a stable internal id. *(backend, tests, docs.)*
+- **P2 — `reports_to` chain-of-command (SHIPPED THIS ROUND, §18).** The org-lattice MODEL — an
+  optional Lead pointer, acyclic-validated on create/edit, with pure subtree/chain helpers — now
+  exists. The remaining half is **manager-subtree authority**: a permission grant that reads
+  `is_in_subtree` (Paperclip `scopeAllows` + `agentIsInSubtree`); that enforcement is deliberately NOT
+  wired this round (the model ships first, the scope later). *(backend, tests, docs.)*
 - **P1 — session identity / handoff + safe Claude resume (SHIPPED THIS ROUND, §15).** Capture +
   persist the adapter session id (bounded/redacted), expose it on the run detail (copyable, honest
   resume-supported label), and a real `run.resume` for the Claude CLI through the existing governed
@@ -268,20 +275,25 @@ safe (adds no authority), bounded, feasible in one commit, and reuses existing v
   any path-like string is rejected fail-closed), and enforcement compares grant-vs-required through
   `Permission::authorizes` (exact OR same-plugin scope) at the one `agent_holds_permission` chokepoint
   + the `start_run` task check. Grant/revoke bookkeeping stays exact-match, so a scope is one explicit,
-  individually-revocable row that never pattern-expands. **Still missing**: budgets/spend enforcement
-  (runs record `cost`/`usage` but nothing enforces a ceiling), agent-subtree / project / namespace
-  scope (Paperclip `scopeAllows` + `agentIsInSubtree`), persistent `allow-always` grants, Board-style
-  multi-party oversight.
+  individually-revocable row that never pattern-expands. The **`reports_to` org-lattice an agent-subtree
+  scope needs now exists** (see §18 — `relux_core::hierarchy::is_in_subtree`), but **no grant reads it
+  yet** (deferred). **Still missing**: budgets/spend enforcement (runs record `cost`/`usage` but nothing
+  enforces a ceiling), the agent-subtree / project / namespace **scope enforcement** itself (Paperclip
+  `scopeAllows` + `agentIsInSubtree` — the lattice is in place; the grant that consults it is not),
+  persistent `allow-always` grants, Board-style multi-party oversight.
 
 ### Priority & slices
 
 - **P1 — governed budgets** (`budget.rs` core type + kernel enforcement): per-namespace/agent soft
   warn + hard stop that pauses new runs and surfaces a Doctor/approval signal. Maps to Paperclip
   `budgets.ts`. *(backend, frontend, docs, tests.)*
-- **P1 — scoped permission grants (minimal plugin scope SHIPPED THIS ROUND, §17).** `Permission`
-  gained a strictly-validated `tool:<plugin-id>:*` scope + an `authorizes` enforcement comparison.
-  The remaining, larger half — an agent-subtree / namespace / project scope (Paperclip `scopeAllows`
-  + `agentIsInSubtree`, pairs with §3 `reports_to`) — is still open. *(backend, tests, docs.)*
+- **P1 — scoped permission grants (minimal plugin scope SHIPPED in §17; `reports_to` lattice SHIPPED
+  in §18).** `Permission` gained a strictly-validated `tool:<plugin-id>:*` scope + an `authorizes`
+  enforcement comparison (§17), and the org lattice the larger half needs — `reports_to` +
+  `is_in_subtree` — now exists (§18). The remaining open piece is the **agent-subtree grant
+  enforcement** itself: a permission scoped to a manager's Branch that authorization actually consults
+  (Paperclip `scopeAllows` + `agentIsInSubtree`). The helper is built and tested; wiring it into a
+  grant is the next slice. *(backend, tests, docs.)*
 - **P2 — persistent `allow-always` approval** (OpenClaw one-shot vs persistent): an approval that
   records a standing grant so the same safe action isn't re-prompted. Must stay revocable. *(backend,
   frontend, tests.)*
@@ -753,6 +765,73 @@ section for the full reference read + applied-change record. In brief:
 - **Still missing (honest).** Agent-subtree / namespace / project scope (the larger Paperclip
   `scopeAllows` + `agentIsInSubtree` half — needs the §3 `reports_to` graph), governed budgets (§5 P1
   #3), and persistent `allow-always` grants (§5 P2) all remain open.
+
+---
+
+## 18. Implemented this round — the `reports_to` org-lattice / chain-of-command model (§3 P2)
+
+- **Reference read (BINDING).** Paperclip's `reportsTo` org tree
+  (`packages/db/src/schema/agents.ts`, indexed `(companyId, reportsTo)`) + `authorization.ts`
+  `agentIsInSubtree` (a 50-depth upward walk) are the target, summarized in this audit's §3/§5 from
+  the original read; that source is **not vendored** under `reference/`, so only the bounded-walk
+  *shape* (not any scope enforcement) was taken. The **vendored** reads that ground the parent-pointer
+  + bounded-depth + fail-narrow discipline: OpenClaw `reference/openclaw-main/src/acp/session-lineage-meta.ts`
+  (`parentSessionId = parentSessionKey ?? spawnedBy`, a non-negative bounded `spawnDepth`,
+  `subagentControlScope: "children" | "none"` — a node's authority is its children subtree or nothing,
+  default narrow) and Hermes `reference/hermes-agent-main/tools/delegate_tool.py` (`MAX_DEPTH = 1`,
+  per-record `parent_id`/`depth`, default flat). Relux files read/mapped: `crates/relux-core/src/agent.rs`
+  (the `Agent` record), `crates/relux-kernel/src/agent_config.rs` (manual create/edit validation),
+  `crates/relux-kernel/src/state.rs` (`create_agent*`/`update_agent*`), `crates/relux-kernel/src/server.rs`
+  (`/v1/relux/agents` create/edit/list), `apps/dashboard/src/pages/Crew.tsx` (the Crew form + cards).
+
+- **Model.** `relux_core::Agent` gained an optional `reports_to: Option<AgentId>` (the **Lead** in the
+  lexicon; the internal id stays `reports_to` per the two-layer rule). `#[serde(default)]` makes every
+  pre-existing snapshot load as a top-level operative (backwards compatible; pinned by core tests).
+
+- **Pure helpers.** New `crates/relux-core/src/hierarchy.rs` — `chain_of_command` (the Line, nearest
+  Lead first), `is_in_subtree` (proper-descendant: a node is not in its own Branch), and
+  `would_create_cycle` (self OR target already in the child's Branch). Every walk is bounded by
+  `MAX_HIERARCHY_DEPTH = 50` (Paperclip's depth) and guards against repeats, so it is **total even on a
+  malformed/cyclic map**. These are the helpers a future manager-subtree scoped permission will read;
+  **nothing reads them for authorization today** — enforcement is unchanged.
+
+- **Validation (acyclic at the config boundary).** Create/edit resolve a requested Lead against the
+  live roster: it must exist and cannot be self (`agent_config::resolve_manager` →
+  `ReportsToUnknown`/`ReportsToSelf`). The kernel owns the graph invariants under its lock: a created
+  operative is a fresh leaf (existence + self is the whole check); an **edit additionally rejects a
+  cycle** via `hierarchy::would_create_cycle` (re-pointing a manager under its own report is refused).
+  All failures surface as honest `400`s.
+
+- **Behavior is display-only this round (safe).** The lattice is shown on the Crew card (each
+  operative's Lead + a compact direct-report count) and drives the create/edit **Reports to (Lead)**
+  picker (which excludes self + the operative's own Branch so an obvious cycle can't be chosen; the
+  backend re-validates regardless). It is **not** used to widen any permission, and orchestration /
+  assignment routing is deliberately untouched — keeping enforcement exactly as it was until a tightly
+  scoped, separately-tested slice wires `is_in_subtree` into a grant.
+
+- **UI.** `apps/dashboard/src/hierarchy.ts` (pure, mirrors the backend) — `descendantIds`,
+  `managerOptions` (self + Branch excluded), `leadLabel`, `directReportsSummary`. `Crew.tsx` adds the
+  Lead picker + the manager/direct-report card lines. `ReluxAgent`/`ReluxAgentConfig` gained
+  `reports_to` (+ list-only `reports_to_name`/`reports`).
+
+- **Honest disabled-target decision.** A Lead may be a `Paused`/`Disabled` operative — status and the
+  org lattice are orthogonal (you can reorganize under a temporarily-disabled manager), and since the
+  lattice grants no authority this round there is no safety reason to forbid it. The picker offers any
+  non-self, non-Branch operative regardless of status; if that ever feeds a scoped grant, the grant
+  (not the edge) is where a disabled-Lead check would live.
+
+- **Tests.** `relux-core`: `agent.rs` backcompat (missing `reports_to` → `None`) + round-trip;
+  `hierarchy.rs` chain order, subtree true/false/self, cycle (self/direct/transitive/idempotent),
+  totality under a cyclic map, depth cap. `relux-kernel`: `agent_config` create/edit resolve + reject
+  unknown/self; `state.rs` create stores/rejects, update set/clear, and **cycle rejection**.
+  `apps/dashboard/test/hierarchy.test.ts` for the pure UI helpers; the existing Crew render harness
+  exercises the new form/cards. Full `relux-core` (151) + `relux-kernel` (lib 628 / bin 109) suites
+  green; clippy clean on both crates; dashboard typecheck + tests (284) + bundle rebuild green.
+
+- **Still missing (honest).** The manager-subtree **scoped permission enforcement** (a grant that
+  consults `is_in_subtree` — Paperclip `scopeAllows` + `agentIsInSubtree`), subagent
+  spawn-depth/children caps, Codex/mid-run resume, governed budgets, and persistent `allow-always`
+  grants all remain open.
 
 ---
 

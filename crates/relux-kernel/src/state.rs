@@ -1303,12 +1303,23 @@ impl KernelState {
             persona,
             permissions,
             Vec::new(),
+            None,
         )
+    }
+
+    /// The current org lattice as a child→Lead (`reports_to`) map, for the pure
+    /// [`relux_core::hierarchy`] walks (cycle/subtree). Built fresh from the live roster.
+    fn reports_to_map(&self) -> relux_core::hierarchy::ReportsToMap {
+        self.agents
+            .values()
+            .filter_map(|a| a.reports_to.clone().map(|m| (a.id.clone(), m)))
+            .collect()
     }
 
     /// Create a configured agent actor carrying bounded specialty `skills`/tags (the
     /// manual Crew-config path). Skills must already be validated/sanitized by
     /// [`crate::agent_config::validate_skills`]; this method just stores them.
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn create_agent_with_skills(
         &mut self,
@@ -1320,6 +1331,7 @@ impl KernelState {
         persona: Option<String>,
         permissions: Vec<Permission>,
         skills: Vec<String>,
+        reports_to: Option<AgentId>,
     ) -> Result<AgentId, KernelError> {
         if !self.plugins.contains_key(adapter_plugin) {
             return Err(KernelError::UnknownPlugin(adapter_plugin.to_string()));
@@ -1327,6 +1339,20 @@ impl KernelState {
         let agent_id = AgentId::new(id);
         if self.agents.contains_key(&agent_id) {
             return Err(KernelError::AgentExists(agent_id.to_string()));
+        }
+        // The Lead must be an existing operative and cannot be self. A fresh operative is
+        // a leaf, so it can never close a cycle — existence + self is the whole check.
+        if let Some(ref lead) = reports_to {
+            if lead == &agent_id {
+                return Err(KernelError::InvalidAgentConfig(
+                    "an operative cannot report to itself".to_string(),
+                ));
+            }
+            if !self.agents.contains_key(lead) {
+                return Err(KernelError::InvalidAgentConfig(format!(
+                    "unknown manager '{lead}'; choose an existing crew member as the Lead"
+                )));
+            }
         }
         let agent = Agent {
             id: agent_id.clone(),
@@ -1339,6 +1365,7 @@ impl KernelState {
             owner: "founder".to_string(),
             permissions,
             skills,
+            reports_to,
             status: AgentStatus::Active,
             created_at: self.clock.tick(),
         };
@@ -1381,13 +1408,26 @@ impl KernelState {
         adapter_plugin: Option<PluginId>,
         status: Option<AgentStatus>,
     ) -> Result<(), KernelError> {
-        self.update_agent_with_skills(id, name, description, persona, adapter_plugin, status, None)
+        self.update_agent_with_skills(
+            id,
+            name,
+            description,
+            persona,
+            adapter_plugin,
+            status,
+            None,
+            None,
+        )
     }
 
-    /// Apply an operator edit including the optional specialty `skills`/tags: `None`
-    /// leaves the current skills unchanged, `Some(list)` REPLACES the whole list (an
-    /// empty list clears it). Skills must already be validated by
-    /// [`crate::agent_config::validate_skills`].
+    /// Apply an operator edit including the optional specialty `skills`/tags and the
+    /// optional Lead (`reports_to`): `None` leaves a field unchanged, `Some(list)`
+    /// REPLACES the whole skill list (an empty list clears it), and for the Lead
+    /// `Some(None)` clears it (top-level) while `Some(Some(lead))` sets it. Skills and
+    /// the Lead id must already be sanitized/resolved by
+    /// [`crate::agent_config::validate_agent_update`]; this method enforces the graph
+    /// invariants the kernel owns: a set Lead must be an existing operative, cannot be
+    /// self, and must not create a reporting cycle (a re-point under one's own Branch).
     #[allow(clippy::too_many_arguments)]
     pub fn update_agent_with_skills(
         &mut self,
@@ -1398,6 +1438,7 @@ impl KernelState {
         adapter_plugin: Option<PluginId>,
         status: Option<AgentStatus>,
         skills: Option<Vec<String>>,
+        reports_to: Option<Option<AgentId>>,
     ) -> Result<(), KernelError> {
         if !self.agents.contains_key(id) {
             return Err(KernelError::UnknownAgent(id.to_string()));
@@ -1405,6 +1446,27 @@ impl KernelState {
         if let Some(ref plugin) = adapter_plugin {
             if !self.plugins.contains_key(plugin) {
                 return Err(KernelError::UnknownPlugin(plugin.to_string()));
+            }
+        }
+        // Validate a SET Lead before mutating anything (a clear/unchanged needs no check).
+        if let Some(Some(ref lead)) = reports_to {
+            if lead == id {
+                return Err(KernelError::InvalidAgentConfig(
+                    "an operative cannot report to itself".to_string(),
+                ));
+            }
+            if !self.agents.contains_key(lead) {
+                return Err(KernelError::InvalidAgentConfig(format!(
+                    "unknown manager '{lead}'; choose an existing crew member as the Lead"
+                )));
+            }
+            // Pointing `id` → `lead` must not close a loop (e.g. making a manager report
+            // to one of its own reports). Checked against the live lattice via the pure
+            // helper, bounded-depth and total even on a malformed map.
+            if relux_core::hierarchy::would_create_cycle(id, lead, &self.reports_to_map()) {
+                return Err(KernelError::InvalidAgentConfig(format!(
+                    "setting Lead to '{lead}' would create a reporting cycle"
+                )));
             }
         }
 
@@ -1428,6 +1490,9 @@ impl KernelState {
             }
             if let Some(sk) = skills {
                 agent.skills = sk;
+            }
+            if let Some(lead) = reports_to {
+                agent.reports_to = lead;
             }
             (
                 agent.namespace_id.clone(),
@@ -12624,6 +12689,86 @@ mod tests {
             .update_agent(&prime, None, None, None, Some(bogus), None)
             .unwrap_err();
         assert!(matches!(err, KernelError::UnknownPlugin(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn create_agent_stores_lead_and_rejects_unknown_and_self() {
+        let (mut k, _prime, _task, _run, _echo) = primed_kernel();
+        let ns = NamespaceId::new("workspace");
+        let adapter = PluginId::new("relux-adapter-local-prime");
+        let lead = k
+            .create_agent("lead", "Lead", "the boss", &adapter, &ns, None, vec![])
+            .unwrap();
+
+        // A valid Lead is stored on the new operative.
+        let ic = k
+            .create_agent_with_skills(
+                "ic", "IC", "ic role", &adapter, &ns, None, vec![], vec![], Some(lead.clone()),
+            )
+            .unwrap();
+        assert_eq!(k.agent(&ic).unwrap().reports_to.as_ref(), Some(&lead));
+
+        // An unknown manager is rejected (and nothing is created).
+        let err = k
+            .create_agent_with_skills(
+                "ghosted", "G", "", &adapter, &ns, None, vec![], vec![],
+                Some(AgentId::new("nobody")),
+            )
+            .unwrap_err();
+        assert!(matches!(err, KernelError::InvalidAgentConfig(_)), "got {err:?}");
+        assert!(k.agent(&AgentId::new("ghosted")).is_none());
+
+        // Reporting to your own id at creation is a self-report.
+        let err = k
+            .create_agent_with_skills(
+                "selfie", "S", "", &adapter, &ns, None, vec![], vec![],
+                Some(AgentId::new("selfie")),
+            )
+            .unwrap_err();
+        assert!(matches!(err, KernelError::InvalidAgentConfig(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn update_agent_sets_clears_and_rejects_lead_cycles() {
+        let (mut k, _prime, _task, _run, _echo) = primed_kernel();
+        let ns = NamespaceId::new("workspace");
+        let adapter = PluginId::new("relux-adapter-local-prime");
+        let lead = k
+            .create_agent("lead", "Lead", "", &adapter, &ns, None, vec![])
+            .unwrap();
+        let ic = k
+            .create_agent("ic", "IC", "", &adapter, &ns, None, vec![])
+            .unwrap();
+
+        // Set ic's Lead to lead.
+        k.update_agent_with_skills(
+            &ic, None, None, None, None, None, None, Some(Some(lead.clone())),
+        )
+        .unwrap();
+        assert_eq!(k.agent(&ic).unwrap().reports_to.as_ref(), Some(&lead));
+
+        // Pointing lead -> ic now would close lead -> ic -> lead: rejected as a cycle.
+        let err = k
+            .update_agent_with_skills(
+                &lead, None, None, None, None, None, None, Some(Some(ic.clone())),
+            )
+            .unwrap_err();
+        assert!(matches!(err, KernelError::InvalidAgentConfig(_)), "got {err:?}");
+        // lead is unchanged (still top-level).
+        assert!(k.agent(&lead).unwrap().reports_to.is_none());
+
+        // A self-report is rejected too.
+        let err = k
+            .update_agent_with_skills(
+                &ic, None, None, None, None, None, None, Some(Some(ic.clone())),
+            )
+            .unwrap_err();
+        assert!(matches!(err, KernelError::InvalidAgentConfig(_)), "got {err:?}");
+
+        // Clearing the Lead (Some(None)) returns ic to top-level.
+        k.update_agent_with_skills(&ic, None, None, None, None, None, None, Some(None))
+            .unwrap();
+        assert!(k.agent(&ic).unwrap().reports_to.is_none());
     }
 
     // --- Adapter runtime tests --------------------------------------------

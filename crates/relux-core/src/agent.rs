@@ -54,6 +54,17 @@ pub struct Agent {
     /// stored before this field existed load with an empty list (backwards compatible).
     #[serde(default)]
     pub skills: Vec<String>,
+    /// Optional **Lead** (`reports_to`) — the id of this operative's manager in the org
+    /// lattice (the Paperclip-style chain-of-command). `None` = top-level (reports to no
+    /// one). The product term is "Lead"; the internal id stays `reports_to` per the
+    /// two-layer rule (`docs/relix-lexicon.md`). `#[serde(default)]` so agents stored
+    /// before this field existed load as top-level (backwards compatible). The graph is
+    /// validated acyclic at the config boundary (`relux-kernel` `agent_config` +
+    /// kernel `create`/`update`); the pure subtree/chain helpers live in
+    /// [`crate::hierarchy`]. It does NOT (yet) widen any permission — enforcement is
+    /// unchanged; the helpers exist for a future scoped-grant slice.
+    #[serde(default)]
+    pub reports_to: Option<AgentId>,
     pub status: AgentStatus,
     pub created_at: String,
 }
@@ -81,6 +92,56 @@ mod tests {
         });
         let agent: Agent = serde_json::from_value(legacy).expect("legacy agent deserializes");
         assert!(agent.skills.is_empty(), "missing skills => empty (backwards compatible)");
+        assert!(
+            agent.reports_to.is_none(),
+            "missing reports_to => top-level None (backwards compatible)"
+        );
+    }
+
+    /// An agent serialized BEFORE the `reports_to` field existed (no `reports_to` key)
+    /// must still deserialize — `#[serde(default)]` makes it a top-level operative.
+    #[test]
+    fn agent_without_reports_to_field_deserializes_to_none() {
+        let legacy = serde_json::json!({
+            "id": "ops",
+            "name": "Ops",
+            "description": "",
+            "adapter_plugin": "p",
+            "adapter_config": null,
+            "persona": null,
+            "namespace_id": "default",
+            "owner": "founder",
+            "permissions": [],
+            "skills": ["rust"],
+            "status": "active",
+            "created_at": "t0"
+        });
+        let agent: Agent = serde_json::from_value(legacy).expect("legacy agent deserializes");
+        assert!(agent.reports_to.is_none(), "missing reports_to => None");
+    }
+
+    /// A `reports_to` Lead pointer round-trips through serialization.
+    #[test]
+    fn agent_reports_to_round_trip() {
+        let with_lead = serde_json::json!({
+            "id": "ic",
+            "name": "IC",
+            "description": "",
+            "adapter_plugin": "p",
+            "adapter_config": null,
+            "persona": null,
+            "namespace_id": "default",
+            "owner": "founder",
+            "permissions": [],
+            "skills": [],
+            "reports_to": "lead-1",
+            "status": "active",
+            "created_at": "t0"
+        });
+        let agent: Agent = serde_json::from_value(with_lead).expect("deserializes");
+        assert_eq!(agent.reports_to, Some(AgentId::new("lead-1")));
+        let back = serde_json::to_value(&agent).expect("serializes");
+        assert_eq!(back["reports_to"], serde_json::json!("lead-1"));
     }
 
     /// A skills list round-trips through serialization.

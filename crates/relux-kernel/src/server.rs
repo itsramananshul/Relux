@@ -989,7 +989,33 @@ struct SetAiConfigReq {
 
 async fn list_agents(State(state): State<AppState>) -> Result<Json<Vec<AgentRecord>>, ApiError> {
     let records = locked_read(&state, |kernel| {
-        Ok(kernel.agents().into_iter().map(agent_record).collect())
+        let agents = kernel.agents();
+        // Index the roster once so each card can show its Lead's display name and its
+        // direct reports compactly (no per-agent roster scan, no big org-chart payload).
+        let name_by_id: std::collections::BTreeMap<&str, &str> =
+            agents.iter().map(|a| (a.id.as_str(), a.name.as_str())).collect();
+        let mut direct_reports: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for a in &agents {
+            if let Some(lead) = &a.reports_to {
+                direct_reports
+                    .entry(lead.as_str().to_string())
+                    .or_default()
+                    .push(a.id.as_str().to_string());
+            }
+        }
+        Ok(agents
+            .iter()
+            .map(|a| {
+                let mut rec = agent_record(a);
+                rec.reports_to_name = a
+                    .reports_to
+                    .as_ref()
+                    .and_then(|lead| name_by_id.get(lead.as_str()).map(|n| n.to_string()));
+                rec.reports = direct_reports.get(a.id.as_str()).cloned().unwrap_or_default();
+                rec
+            })
+            .collect())
     })?;
     Ok(Json(records))
 }
@@ -1564,6 +1590,10 @@ struct CreateAgentReq {
     /// Optional specialty tags/skills (each a short word/slug); validated and bounded
     /// server-side. Absent => no skills.
     skills: Option<Vec<String>>,
+    /// Optional Lead (`reports_to`) — an existing crew member's id this operative reports
+    /// to. Absent/blank => top-level. Validated against the live roster (must exist,
+    /// cannot be self) server-side.
+    reports_to: Option<String>,
     /// Optional role-preset id (`researcher`/`builder`/…). When present and recognised,
     /// it fills any role/persona/skills the request itself did NOT supply (the request's
     /// own value always wins), then the MERGED input flows through the same
@@ -1629,6 +1659,7 @@ async fn create_agent(
                 persona: merged_persona.as_deref(),
                 adapter_plugin: req.adapter_plugin.as_deref(),
                 skills: merged_skills.as_deref(),
+                reports_to: req.reports_to.as_deref(),
             },
             &known_adapters,
             &existing_ids,
@@ -1650,6 +1681,7 @@ async fn create_agent(
             resolved.persona,
             permissions,
             resolved.skills,
+            resolved.reports_to.map(relux_core::AgentId::new),
         )?;
         Ok(agent_record(kernel.agent(&id).unwrap()))
     })?;
@@ -1666,6 +1698,10 @@ struct UpdateAgentReq {
     /// Present => REPLACE the whole skill list (an empty list clears it); absent =>
     /// leave skills unchanged.
     skills: Option<Vec<String>>,
+    /// Present => set the Lead (`reports_to`); a blank string CLEARS it (top-level);
+    /// absent => leave the Lead unchanged. Validated against the live roster (exists, not
+    /// self, no cycle) server-side.
+    reports_to: Option<String>,
 }
 
 /// Edit an existing agent's configurable fields (name, role, persona, adapter,
@@ -1694,6 +1730,9 @@ async fn update_agent(
             .filter(|a| a.id != agent_id)
             .map(|a| a.name.clone())
             .collect();
+        // The full roster of ids (for resolving a requested Lead against existing crew).
+        let existing_ids: Vec<String> =
+            kernel.agents().into_iter().map(|a| a.id.as_str().to_string()).collect();
 
         let resolved = relux_kernel::validate_agent_update(
             relux_kernel::UpdateAgentInput {
@@ -1703,9 +1742,12 @@ async fn update_agent(
                 adapter_plugin: req.adapter_plugin.as_deref(),
                 status: req.status.as_deref(),
                 skills: req.skills.as_deref(),
+                reports_to: req.reports_to.as_deref(),
             },
             &known_adapters,
             &names_except_self,
+            &existing_ids,
+            agent_id.as_str(),
         )
         .map_err(|e| KernelError::InvalidAgentConfig(e.message()))?;
 
@@ -1717,6 +1759,9 @@ async fn update_agent(
             resolved.adapter_plugin.map(relux_core::PluginId::new),
             resolved.status,
             resolved.skills,
+            resolved
+                .reports_to
+                .map(|opt| opt.map(relux_core::AgentId::new)),
         )?;
         Ok(agent_record(kernel.agent(&agent_id).unwrap()))
     })?;
@@ -5514,10 +5559,24 @@ struct AgentRecord {
     /// The agent's specialty tags/skills (bounded slugs). Always present (possibly
     /// empty) so the Crew UI can render chips and the assignment matcher reads them.
     skills: Vec<String>,
+    /// This operative's Lead (`reports_to`) — the id of its manager in the org lattice,
+    /// when set. `None` = top-level. Self-derivable from the agent (no roster needed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reports_to: Option<String>,
+    /// The Lead's display name, resolved against the live roster (the list endpoint
+    /// enriches this; single-record responses leave it `None`). Display convenience only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reports_to_name: Option<String>,
+    /// Ids of this operative's DIRECT reports (the first level of its Branch), resolved
+    /// against the live roster (list endpoint only). Always present (possibly empty) so
+    /// the Crew card can show a compact count without a null check.
+    reports: Vec<String>,
     created_at: String,
 }
 
-/// Build a [`AgentRecord`] from an `Agent`.
+/// Build a [`AgentRecord`] from an `Agent`. The Lead id is self-derivable; the Lead's
+/// display name and the direct-report ids need the roster and are enriched only by the
+/// list endpoint (see [`list_agents`]), so they default to empty here.
 fn agent_record(agent: &relux_core::Agent) -> AgentRecord {
     AgentRecord {
         id: agent.id.as_str().to_string(),
@@ -5530,6 +5589,9 @@ fn agent_record(agent: &relux_core::Agent) -> AgentRecord {
         permissions: agent.permissions.iter().map(|p| p.to_string()).collect(),
         persona: agent.persona.clone(),
         skills: agent.skills.clone(),
+        reports_to: agent.reports_to.as_ref().map(|m| m.as_str().to_string()),
+        reports_to_name: None,
+        reports: Vec::new(),
         created_at: agent.created_at.clone(),
     }
 }

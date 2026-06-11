@@ -64,6 +64,10 @@ pub enum AgentConfigError {
     InvalidSkill(String),
     /// More than [`MAX_SKILLS`] distinct skills/tags were supplied.
     TooManySkills(usize),
+    /// The requested Lead (`reports_to`) is not an existing crew member.
+    ReportsToUnknown(String),
+    /// An operative was set to report to itself.
+    ReportsToSelf,
 }
 
 impl AgentConfigError {
@@ -90,6 +94,12 @@ impl AgentConfigError {
             AgentConfigError::TooManySkills(n) => {
                 format!("too many skills ({n}); at most {MAX_SKILLS} are allowed")
             }
+            AgentConfigError::ReportsToUnknown(m) => {
+                format!("unknown manager '{m}'; choose an existing crew member as the Lead")
+            }
+            AgentConfigError::ReportsToSelf => {
+                "an operative cannot report to itself".to_string()
+            }
         }
     }
 }
@@ -110,6 +120,11 @@ pub struct CreateAgentInput<'a> {
     /// Specialty tags/skills. Absent => no skills; present => validated to a bounded
     /// slug list (each invalid entry is rejected with a clear error).
     pub skills: Option<&'a [String]>,
+    /// Optional Lead (`reports_to`) — an existing crew member's id this operative
+    /// reports to. Absent/blank => top-level (reports to no one). Resolved against the
+    /// live roster (must exist, cannot be self); a new operative can never close a cycle
+    /// (it is a fresh leaf), so no graph walk is needed on create.
+    pub reports_to: Option<&'a str>,
 }
 
 /// A validated, ready-to-apply new agent config.
@@ -121,6 +136,9 @@ pub struct ResolvedNewAgent {
     pub persona: Option<String>,
     pub adapter_plugin: String,
     pub skills: Vec<String>,
+    /// The resolved Lead id (canonical roster casing), or `None` for a top-level
+    /// operative. Existence/self already enforced; the kernel stores it verbatim.
+    pub reports_to: Option<String>,
 }
 
 /// Raw operator input for editing an agent. A field left `None` means "leave
@@ -135,6 +153,11 @@ pub struct UpdateAgentInput<'a> {
     /// Present => REPLACE the whole skill list (an empty list clears all skills);
     /// absent => leave the current skills unchanged.
     pub skills: Option<&'a [String]>,
+    /// Present => set the Lead (`reports_to`); a blank value CLEARS it (back to
+    /// top-level). Absent => leave the current Lead unchanged. Resolved against the live
+    /// roster (must exist, cannot be self); the kernel additionally rejects a cycle,
+    /// which needs the live graph.
+    pub reports_to: Option<&'a str>,
 }
 
 /// A validated, ready-to-apply agent edit. Outer `None` = unchanged; for persona,
@@ -148,6 +171,10 @@ pub struct ResolvedAgentUpdate {
     pub adapter_plugin: Option<String>,
     pub status: Option<AgentStatus>,
     pub skills: Option<Vec<String>>,
+    /// Outer `None` = leave the Lead unchanged; `Some(None)` = clear it (top-level);
+    /// `Some(Some(id))` = set it to that resolved roster id (existence/self enforced;
+    /// the kernel still re-checks existence + rejects a cycle under the lock).
+    pub reports_to: Option<Option<String>>,
 }
 
 /// Normalize a display name (or an explicitly-typed id) into a strict agent id:
@@ -274,6 +301,29 @@ fn resolve_adapter(requested: &str, known_adapters: &[String]) -> Result<String,
         .ok_or_else(|| AgentConfigError::UnknownAdapter(requested.trim().to_string()))
 }
 
+/// Resolve a requested Lead (`reports_to`) against the live roster, returning the
+/// canonical roster id (exact case). The requested value is matched case-insensitively
+/// against `existing_ids`. Rejects a self-report (`requested` resolves to `self_id`)
+/// before existence, so pointing at your own id is the honest [`AgentConfigError::ReportsToSelf`]
+/// rather than a confusing "unknown". A value that matches no existing crew member is
+/// [`AgentConfigError::ReportsToUnknown`]. Cycle rejection is the kernel's job (it needs
+/// the live graph); this resolves only existence + self.
+fn resolve_manager(
+    requested: &str,
+    existing_ids: &[String],
+    self_id: &str,
+) -> Result<String, AgentConfigError> {
+    let lowered = requested.trim().to_lowercase();
+    if lowered == self_id.trim().to_lowercase() {
+        return Err(AgentConfigError::ReportsToSelf);
+    }
+    existing_ids
+        .iter()
+        .find(|x| x.trim().to_lowercase() == lowered)
+        .cloned()
+        .ok_or_else(|| AgentConfigError::ReportsToUnknown(requested.trim().to_string()))
+}
+
 /// Map an operator-supplied status string onto the allowlist of statuses an operator
 /// may set. Machine-driven statuses (`Error`) and unknown values are rejected.
 fn resolve_status(raw: &str) -> Result<AgentStatus, AgentConfigError> {
@@ -335,6 +385,13 @@ pub fn validate_new_agent(
         None => Vec::new(),
     };
 
+    // The Lead must be an existing crew member and cannot be self. A new operative is a
+    // fresh leaf, so it can never close a cycle — no graph walk is needed here.
+    let reports_to = match input.reports_to {
+        Some(raw) if !raw.trim().is_empty() => Some(resolve_manager(raw, existing_ids, &id)?),
+        _ => None,
+    };
+
     Ok(ResolvedNewAgent {
         id,
         name,
@@ -342,15 +399,21 @@ pub fn validate_new_agent(
         persona,
         adapter_plugin,
         skills,
+        reports_to,
     })
 }
 
 /// Validate and resolve an agent-edit request. `existing_names_except_self` excludes
-/// the agent being edited so renaming to its own name is not a false duplicate.
+/// the agent being edited so renaming to its own name is not a false duplicate;
+/// `existing_ids` is the full roster (for resolving a requested Lead) and `self_id` is
+/// the id of the agent being edited (so a self-report is caught here, not as a confusing
+/// "unknown"). Cycle rejection is left to the kernel, which holds the live graph.
 pub fn validate_agent_update(
     input: UpdateAgentInput<'_>,
     known_adapters: &[String],
     existing_names_except_self: &[String],
+    existing_ids: &[String],
+    self_id: &str,
 ) -> Result<ResolvedAgentUpdate, AgentConfigError> {
     let mut resolved = ResolvedAgentUpdate::default();
 
@@ -392,6 +455,17 @@ pub fn validate_agent_update(
         resolved.skills = Some(validate_skills(raw)?);
     }
 
+    // Present => set/clear the Lead. A blank value clears it (back to top-level); a
+    // non-blank value resolves against the roster (exists + not self). The kernel still
+    // re-checks existence and rejects a cycle under the lock (it owns the live graph).
+    if let Some(raw) = input.reports_to {
+        if raw.trim().is_empty() {
+            resolved.reports_to = Some(None);
+        } else {
+            resolved.reports_to = Some(Some(resolve_manager(raw, existing_ids, self_id)?));
+        }
+    }
+
     Ok(resolved)
 }
 
@@ -417,7 +491,7 @@ mod tests {
     #[test]
     fn create_requires_name() {
         let err = validate_new_agent(
-            CreateAgentInput { id: None, name: "   ", role: None, persona: None, adapter_plugin: None, skills: None },
+            CreateAgentInput { id: None, name: "   ", role: None, persona: None, adapter_plugin: None, skills: None, reports_to: None },
             &adapters(),
             &[],
             &[],
@@ -429,7 +503,7 @@ mod tests {
     #[test]
     fn create_derives_id_and_defaults_adapter() {
         let ok = validate_new_agent(
-            CreateAgentInput { id: None, name: "Research Bot", role: Some("does research"), persona: None, adapter_plugin: None, skills: None },
+            CreateAgentInput { id: None, name: "Research Bot", role: Some("does research"), persona: None, adapter_plugin: None, skills: None, reports_to: None },
             &adapters(),
             &[],
             &[],
@@ -445,7 +519,7 @@ mod tests {
     #[test]
     fn create_rejects_duplicate_id_and_name() {
         let dup_id = validate_new_agent(
-            CreateAgentInput { id: Some("research-bot"), name: "Other", role: None, persona: None, adapter_plugin: None, skills: None },
+            CreateAgentInput { id: Some("research-bot"), name: "Other", role: None, persona: None, adapter_plugin: None, skills: None, reports_to: None },
             &adapters(),
             &["research-bot".to_string()],
             &[],
@@ -454,7 +528,7 @@ mod tests {
         assert_eq!(dup_id, AgentConfigError::DuplicateId("research-bot".to_string()));
 
         let dup_name = validate_new_agent(
-            CreateAgentInput { id: None, name: "Research Bot", role: None, persona: None, adapter_plugin: None, skills: None },
+            CreateAgentInput { id: None, name: "Research Bot", role: None, persona: None, adapter_plugin: None, skills: None, reports_to: None },
             &adapters(),
             &[],
             &["research bot".to_string()],
@@ -466,7 +540,7 @@ mod tests {
     #[test]
     fn create_rejects_unknown_adapter() {
         let err = validate_new_agent(
-            CreateAgentInput { id: None, name: "Bot", role: None, persona: None, adapter_plugin: Some("relux-adapter-evil"), skills: None },
+            CreateAgentInput { id: None, name: "Bot", role: None, persona: None, adapter_plugin: Some("relux-adapter-evil"), skills: None, reports_to: None },
             &adapters(),
             &[],
             &[],
@@ -478,7 +552,7 @@ mod tests {
     #[test]
     fn create_resolves_adapter_canonical_case() {
         let ok = validate_new_agent(
-            CreateAgentInput { id: None, name: "Bot", role: None, persona: None, adapter_plugin: Some("RELUX-Adapter-Claude-CLI"), skills: None },
+            CreateAgentInput { id: None, name: "Bot", role: None, persona: None, adapter_plugin: Some("RELUX-Adapter-Claude-CLI"), skills: None, reports_to: None },
             &adapters(),
             &[],
             &[],
@@ -492,7 +566,7 @@ mod tests {
         // Overlong personas are clamped, not rejected.
         let long = "word ".repeat(400);
         let ok = validate_new_agent(
-            CreateAgentInput { id: None, name: "Bot", role: None, persona: Some(&long), adapter_plugin: None, skills: None },
+            CreateAgentInput { id: None, name: "Bot", role: None, persona: Some(&long), adapter_plugin: None, skills: None, reports_to: None },
             &adapters(),
             &[],
             &[],
@@ -505,7 +579,7 @@ mod tests {
         let secret = format!("{}{}", "sk-ant-", "0123456789abcdef0123456789");
         let with_secret = format!("Use my key {secret} when you run");
         let ok = validate_new_agent(
-            CreateAgentInput { id: None, name: "Bot2", role: None, persona: Some(&with_secret), adapter_plugin: None, skills: None },
+            CreateAgentInput { id: None, name: "Bot2", role: None, persona: Some(&with_secret), adapter_plugin: None, skills: None, reports_to: None },
             &adapters(),
             &[],
             &[],
@@ -519,9 +593,11 @@ mod tests {
     #[test]
     fn update_leaves_absent_fields_unchanged() {
         let resolved = validate_agent_update(
-            UpdateAgentInput { name: None, role: None, persona: None, adapter_plugin: None, status: None, skills: None },
+            UpdateAgentInput { name: None, role: None, persona: None, adapter_plugin: None, status: None, skills: None, reports_to: None },
             &adapters(),
             &[],
+            &[],
+            "self",
         )
         .unwrap();
         assert_eq!(resolved, ResolvedAgentUpdate::default());
@@ -530,9 +606,11 @@ mod tests {
     #[test]
     fn update_clears_persona_on_empty() {
         let resolved = validate_agent_update(
-            UpdateAgentInput { name: None, role: None, persona: Some("   "), adapter_plugin: None, status: None, skills: None },
+            UpdateAgentInput { name: None, role: None, persona: Some("   "), adapter_plugin: None, status: None, skills: None, reports_to: None },
             &adapters(),
             &[],
+            &[],
+            "self",
         )
         .unwrap();
         assert_eq!(resolved.persona, Some(None));
@@ -541,18 +619,22 @@ mod tests {
     #[test]
     fn update_validates_status_and_adapter() {
         let ok = validate_agent_update(
-            UpdateAgentInput { name: None, role: None, persona: None, adapter_plugin: Some("relux-adapter-claude-cli"), status: Some("Disabled"), skills: None },
+            UpdateAgentInput { name: None, role: None, persona: None, adapter_plugin: Some("relux-adapter-claude-cli"), status: Some("Disabled"), skills: None, reports_to: None },
             &adapters(),
             &[],
+            &[],
+            "self",
         )
         .unwrap();
         assert_eq!(ok.adapter_plugin.as_deref(), Some("relux-adapter-claude-cli"));
         assert_eq!(ok.status, Some(AgentStatus::Disabled));
 
         let bad_status = validate_agent_update(
-            UpdateAgentInput { name: None, role: None, persona: None, adapter_plugin: None, status: Some("error"), skills: None },
+            UpdateAgentInput { name: None, role: None, persona: None, adapter_plugin: None, status: Some("error"), skills: None, reports_to: None },
             &adapters(),
             &[],
+            &[],
+            "self",
         )
         .unwrap_err();
         assert_eq!(bad_status, AgentConfigError::InvalidStatus("error".to_string()));
@@ -561,18 +643,22 @@ mod tests {
     #[test]
     fn update_rejects_duplicate_name_but_allows_self() {
         let dup = validate_agent_update(
-            UpdateAgentInput { name: Some("Taken"), role: None, persona: None, adapter_plugin: None, status: None, skills: None },
+            UpdateAgentInput { name: Some("Taken"), role: None, persona: None, adapter_plugin: None, status: None, skills: None, reports_to: None },
             &adapters(),
             &["taken".to_string()],
+            &[],
+            "self",
         )
         .unwrap_err();
         assert_eq!(dup, AgentConfigError::DuplicateName("Taken".to_string()));
 
         // Renaming to a name not held by anyone else is fine.
         let ok = validate_agent_update(
-            UpdateAgentInput { name: Some("Fresh"), role: None, persona: None, adapter_plugin: None, status: None, skills: None },
+            UpdateAgentInput { name: Some("Fresh"), role: None, persona: None, adapter_plugin: None, status: None, skills: None, reports_to: None },
             &adapters(),
             &["taken".to_string()],
+            &[],
+            "self",
         )
         .unwrap();
         assert_eq!(ok.name.as_deref(), Some("Fresh"));
@@ -611,7 +697,7 @@ mod tests {
     fn create_accepts_and_validates_skills() {
         let provided = skills(&["Rust", "rust", "Backend"]);
         let ok = validate_new_agent(
-            CreateAgentInput { id: None, name: "Bot", role: None, persona: None, adapter_plugin: None, skills: Some(&provided) },
+            CreateAgentInput { id: None, name: "Bot", role: None, persona: None, adapter_plugin: None, skills: Some(&provided), reports_to: None },
             &adapters(),
             &[],
             &[],
@@ -620,7 +706,7 @@ mod tests {
         assert_eq!(ok.skills, vec!["rust", "backend"]);
         // No skills field => empty list (backwards compatible).
         let ok = validate_new_agent(
-            CreateAgentInput { id: None, name: "Bot", role: None, persona: None, adapter_plugin: None, skills: None },
+            CreateAgentInput { id: None, name: "Bot", role: None, persona: None, adapter_plugin: None, skills: None, reports_to: None },
             &adapters(),
             &[],
             &[],
@@ -634,27 +720,169 @@ mod tests {
         // A present list REPLACES the whole skill set.
         let provided = skills(&["design", "ux"]);
         let resolved = validate_agent_update(
-            UpdateAgentInput { name: None, role: None, persona: None, adapter_plugin: None, status: None, skills: Some(&provided) },
+            UpdateAgentInput { name: None, role: None, persona: None, adapter_plugin: None, status: None, skills: Some(&provided), reports_to: None },
             &adapters(),
             &[],
+            &[],
+            "self",
         )
         .unwrap();
         assert_eq!(resolved.skills, Some(vec!["design".to_string(), "ux".to_string()]));
         // An empty list CLEARS all skills.
         let resolved = validate_agent_update(
-            UpdateAgentInput { name: None, role: None, persona: None, adapter_plugin: None, status: None, skills: Some(&[]) },
+            UpdateAgentInput { name: None, role: None, persona: None, adapter_plugin: None, status: None, skills: Some(&[]), reports_to: None },
             &adapters(),
             &[],
+            &[],
+            "self",
         )
         .unwrap();
         assert_eq!(resolved.skills, Some(vec![]));
         // Absent => unchanged (None).
         let resolved = validate_agent_update(
-            UpdateAgentInput { name: None, role: None, persona: None, adapter_plugin: None, status: None, skills: None },
+            UpdateAgentInput { name: None, role: None, persona: None, adapter_plugin: None, status: None, skills: None, reports_to: None },
             &adapters(),
             &[],
+            &[],
+            "self",
         )
         .unwrap();
         assert_eq!(resolved.skills, None);
+    }
+
+    #[test]
+    fn create_resolves_lead_canonical_and_rejects_unknown_and_self() {
+        // A known manager resolves to its canonical roster id (case-insensitive input).
+        let ok = validate_new_agent(
+            CreateAgentInput {
+                id: Some("ic"),
+                name: "IC",
+                role: None,
+                persona: None,
+                adapter_plugin: None,
+                skills: None,
+                reports_to: Some("LEAD-1"),
+            },
+            &adapters(),
+            &["lead-1".to_string()],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(ok.reports_to.as_deref(), Some("lead-1"));
+
+        // An unknown manager is an honest error.
+        let unknown = validate_new_agent(
+            CreateAgentInput {
+                id: Some("ic"),
+                name: "IC",
+                role: None,
+                persona: None,
+                adapter_plugin: None,
+                skills: None,
+                reports_to: Some("nobody"),
+            },
+            &adapters(),
+            &["lead-1".to_string()],
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(unknown, AgentConfigError::ReportsToUnknown("nobody".to_string()));
+
+        // Pointing at your own (to-be-created) id is a self-report, not "unknown".
+        let me = validate_new_agent(
+            CreateAgentInput {
+                id: Some("ic"),
+                name: "IC",
+                role: None,
+                persona: None,
+                adapter_plugin: None,
+                skills: None,
+                reports_to: Some("ic"),
+            },
+            &adapters(),
+            &["lead-1".to_string()],
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(me, AgentConfigError::ReportsToSelf);
+
+        // Absent/blank => top-level (no Lead).
+        let none = validate_new_agent(
+            CreateAgentInput {
+                id: Some("ic"),
+                name: "IC",
+                role: None,
+                persona: None,
+                adapter_plugin: None,
+                skills: None,
+                reports_to: Some("  "),
+            },
+            &adapters(),
+            &["lead-1".to_string()],
+            &[],
+        )
+        .unwrap();
+        assert!(none.reports_to.is_none());
+    }
+
+    #[test]
+    fn update_sets_clears_and_validates_lead() {
+        let ids = ["lead-1".to_string(), "ic".to_string()];
+
+        // Set the Lead to an existing member.
+        let set = validate_agent_update(
+            UpdateAgentInput { name: None, role: None, persona: None, adapter_plugin: None, status: None, skills: None, reports_to: Some("lead-1") },
+            &adapters(),
+            &[],
+            &ids,
+            "ic",
+        )
+        .unwrap();
+        assert_eq!(set.reports_to, Some(Some("lead-1".to_string())));
+
+        // A blank value CLEARS the Lead (back to top-level).
+        let cleared = validate_agent_update(
+            UpdateAgentInput { name: None, role: None, persona: None, adapter_plugin: None, status: None, skills: None, reports_to: Some("") },
+            &adapters(),
+            &[],
+            &ids,
+            "ic",
+        )
+        .unwrap();
+        assert_eq!(cleared.reports_to, Some(None));
+
+        // Absent => leave the Lead unchanged.
+        let unchanged = validate_agent_update(
+            UpdateAgentInput { name: None, role: None, persona: None, adapter_plugin: None, status: None, skills: None, reports_to: None },
+            &adapters(),
+            &[],
+            &ids,
+            "ic",
+        )
+        .unwrap();
+        assert_eq!(unchanged.reports_to, None);
+
+        // Reporting to yourself is rejected here (cycles needing the graph are the
+        // kernel's job).
+        let me = validate_agent_update(
+            UpdateAgentInput { name: None, role: None, persona: None, adapter_plugin: None, status: None, skills: None, reports_to: Some("ic") },
+            &adapters(),
+            &[],
+            &ids,
+            "ic",
+        )
+        .unwrap_err();
+        assert_eq!(me, AgentConfigError::ReportsToSelf);
+
+        // An unknown manager is rejected.
+        let unknown = validate_agent_update(
+            UpdateAgentInput { name: None, role: None, persona: None, adapter_plugin: None, status: None, skills: None, reports_to: Some("ghost") },
+            &adapters(),
+            &[],
+            &ids,
+            "ic",
+        )
+        .unwrap_err();
+        assert_eq!(unknown, AgentConfigError::ReportsToUnknown("ghost".to_string()));
     }
 }

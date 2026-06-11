@@ -9,6 +9,7 @@ pub mod adapter_result;
 pub mod agent;
 pub mod artifact;
 pub mod approval;
+pub mod hierarchy;
 pub mod audit;
 pub mod namespace;
 pub mod orchestration;
@@ -35,6 +36,9 @@ pub use agent::{Agent, AgentId};
 pub use artifact::{capture_run_artifacts, ArtifactKind, RunArtifact, MAX_ARTIFACTS};
 pub use approval::{Approval, ApprovalId, ApprovalStatus};
 pub use audit::{AuditEvent, AuditResult};
+pub use hierarchy::{
+    chain_of_command, is_in_subtree, would_create_cycle, ReportsToMap, MAX_HIERARCHY_DEPTH,
+};
 pub use namespace::{Namespace, NamespaceId};
 pub use orchestration::{
     plan_orchestration, Orchestration, OrchestrationBatchResult, OrchestrationId,
