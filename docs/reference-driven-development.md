@@ -893,3 +893,64 @@ grounding, per the read-only-loop slice). So the disclosure shows a bounded one-
 per read, never the raw record — the same no-leak posture as the two CLI-output shaping seams. The
 chip is pure presentation: it renders only what the kernel returned, attributes no authority, and
 appears only on a turn that genuinely ran the (already governed, fail-closed, read-only) loop.
+
+---
+
+## Reference read — more read-only context tools: runs / plugins / approvals (this slice)
+
+The first read-only loop shipped six tools (`board_summary`/`list_tasks`/`get_task`/`list_agents`/
+`get_agent`/`list_runs`). The brain could enumerate runs but not drill into a single run, could not
+enumerate the installed plugins/adapters, and could not inspect the approval queue — exactly the
+"more read-only tools" rung the audit named as next (`docs/prime-processing-audit.md` "Next
+recommended slice"). This slice adds `get_run`, `list_plugins`, and `list_approvals` to the SAME
+governed, fail-closed, bounded loop — pure projections of the live control plane, no new authority.
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/agent/conversation_loop.py` `run_conversation(...)` — re-read for the
+  bounded tool/result behavior the new tools plug into unchanged: the loop is still bounded by the
+  `max_iterations` cap, each tool result is injected back and re-grounds the next round, and the
+  chosen tool name is still validated against `agent.valid_tool_names` BEFORE execution (an off-list
+  name is fed back, never run). **Pattern reused as-is:** a new read-only tool is just a new
+  allowlist member + a pure executor; the loop control flow (cap, allowlist gate, self-correction,
+  inject-and-re-call) does not change, so it is pinned ONCE in `prime_tools::ContextLoop` and the
+  three new tools inherit it for free.
+
+### Paperclip (openclaw) — files read
+
+- `reference/openclaw-main/src/agents/tool-mutation.ts` `READ_ONLY_ACTIONS` (L39-54) — the canonical
+  read-only verb set: `get`/`list`/`read`/`status`/`show`/`fetch`/`search`/`view`/`inspect`/`check`/…
+  Every new tool is one of these verbs (`get_run`, `list_plugins`, `list_approvals`), so all three
+  sit squarely in the read-only class `isMutatingToolCall` would classify as non-mutating. **Pattern:
+  a `get`/`list` action is read-only; we keep the new tools strictly to that shape and add no
+  mutating verb to the allowlist.**
+- `reference/openclaw-main/src/agents/tools/common.ts` `readStringParam(…, {required})` (L91-122) +
+  `ToolInputError` (L57-64) — typed, required-string extraction that fails on bad input rather than
+  coercing. Mirrored by `prime_tools::read_id_arg` for the new `get_run` `run_id` (required +
+  sanitized + clamped; a missing/empty id is an HONEST `ok:false` read, never a fabricated run).
+- `reference/openclaw-main/src/agents/tools/sessions-spawn-tool.ts`
+  (`UNSUPPORTED_SESSIONS_SPAWN_PARAM_KEYS`, rejected before any param is read) — reject unsupported
+  input. The new tools read ONLY their allowlisted arg key (`run_id`, or the optional `status`
+  filter); any extra key in the args object is simply ignored (never executed as authority), and an
+  unrecognized `status` filter is ignored rather than failing — the same tolerate-the-rest shape the
+  existing `list_tasks` filter uses.
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| Hermes: **bounded loop, allowlist-validated tool name, inject-and-re-call** (unchanged) | the three new tools are added to `READ_ONLY_TOOLS` and dispatched by `execute_context_tool`; `classify_tool` admits them as `ReadOnly`, and the existing `ContextLoop`/`MAX_TOOL_ROUNDS`/stop-on-repeat driver runs them with NO new control flow. |
+| openclaw: **`get`/`list` is the read-only verb class** (`READ_ONLY_ACTIONS`) | `get_run` / `list_plugins` / `list_approvals` are pure reads of the `ContextSnapshot`; there is still no mutating tool on the allowlist, so `classify_tool` stays fail-closed (anything off the list is `Refused`). |
+| openclaw: **required string fails on bad input** (`readStringParam`) | `get_run` requires a `run_id` via `read_id_arg`; a missing/empty/unknown id is an honest `ok:false` miss ("Run '…' does not exist."), never a fabricated record. |
+| openclaw: **bound the result, surface only the parsed/clamped body** (`cli-output`/`RESULT_PREVIEW_LIMIT`) | lists are `MAX_LIST_ITEMS`-bounded with an honest `(+N more)`, each result is `MAX_RESULT_CHARS`-clamped, and free-text fields (a run summary/error, an approval action/reason) are redacted + bounded at snapshot-build time (`state.rs` `redact_line`). |
+| openclaw: **never ship raw provider data** (the no-leak CLI-output seam) | the run projection deliberately OMITS the raw `usage`/`cost` provider envelope and the plugin projection omits the raw `source_label` (a local path / URL) — only the bounded, redacted human fields and the source-kind label are projected. |
+
+**What we deliberately do differently:** the new tools are still **read-only and gather-only** — pure
+reads of the owned `ContextSnapshot` taken once under the kernel lock, with no path to
+`prime_execute`, an approval, or any durable change. They extend the snapshot with a `plugins`
+projection (id/version/kind/enabled/protected/source-kind/tool-count, NO raw source path) and an
+`approvals` projection (id/status/risk/requester + a redacted action/reason), and enrich the existing
+run projection with the adapter, logical timing, and a redacted summary/error — while deliberately
+NOT projecting the raw provider `usage`/`cost` envelope. The loop, the allowlist gate, the bounds,
+and the action-free wall are all unchanged; this is the proven read-only rung widened to the rest of
+the local control plane, with the write-capable tool surface still deferred.

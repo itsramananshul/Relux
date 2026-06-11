@@ -153,6 +153,21 @@ pub const READ_ONLY_TOOLS: &[ContextTool] = &[
         summary: "Recent and active runs: run id, task, agent, status.",
         args_hint: "{}",
     },
+    ContextTool {
+        name: "get_run",
+        summary: "Full detail of one run by id (status, task, agent, adapter, timing, summary, error).",
+        args_hint: "{\"run_id\":\"<existing run id>\"}",
+    },
+    ContextTool {
+        name: "list_plugins",
+        summary: "Installed plugins/adapters: id, version, kind, enabled, protected, source, tool count.",
+        args_hint: "{}",
+    },
+    ContextTool {
+        name: "list_approvals",
+        summary: "Pending and recent approvals: id, status, risk, requester, action. Optional status filter.",
+        args_hint: "{\"status\":\"<optional: pending|approved|rejected>\"}",
+    },
 ];
 
 /// The fail-closed read-only classification of a requested tool name. The first slice has only
@@ -201,13 +216,61 @@ pub struct AgentView {
     pub persona: Option<String>,
 }
 
-/// A compact, owned projection of one run for the read-only tools.
+/// A compact, owned projection of one run for the read-only tools. `list_runs` renders only the
+/// first four fields; `get_run` additionally surfaces the adapter, logical timing, and the
+/// **redacted, bounded** `summary`/`error`. The raw provider usage/cost envelope is deliberately
+/// NOT projected here (never shipped to the brain or the UI).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunView {
     pub id: String,
     pub task_id: String,
     pub agent_id: String,
     pub status: String,
+    /// The adapter plugin id that executed (or would execute) this run.
+    pub adapter: String,
+    /// The kernel logical-clock start/end stamps (NOT wall-clock instants), when present.
+    pub started_at: Option<String>,
+    pub ended_at: Option<String>,
+    /// The real measured wall-clock duration of the adapter subprocess, in ms; only set for CLI
+    /// adapter runs.
+    pub duration_ms: Option<u64>,
+    /// A short, redacted one-line run summary lifted from the run record (never the raw envelope).
+    pub summary: Option<String>,
+    /// A short, redacted one-line error, when the run failed.
+    pub error: Option<String>,
+}
+
+/// A compact, owned projection of one installed plugin/adapter for the read-only tools.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginView {
+    pub id: String,
+    pub version: String,
+    /// The plugin kind label (`Adapter` / `ToolSet` / …).
+    pub kind: String,
+    pub enabled: bool,
+    /// Whether the plugin is a protected (bundled) fixture — it cannot be removed.
+    pub protected: bool,
+    /// How the plugin entered the index (`Bundled` / `LocalDir` / `Zip` / `Github`). The raw
+    /// `source_label` (a local path / URL) is deliberately NOT projected.
+    pub source_kind: String,
+    /// The number of tools the plugin's manifest declares.
+    pub tools: usize,
+}
+
+/// A compact, owned projection of one approval for the read-only tools. The `action`/`reason` are
+/// already human-readable renderings (no secret/token), and are further redacted + bounded here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalView {
+    pub id: String,
+    /// The approval lifecycle label (`pending` / `approved` / `rejected`).
+    pub status: String,
+    /// The risk label of the proposed action (`low` / `medium` / `high` / …).
+    pub risk: String,
+    pub requested_by: String,
+    /// A redacted, bounded one-line rendering of the proposed action.
+    pub action: String,
+    /// A redacted, bounded one-line reason the action needs approval.
+    pub reason: String,
 }
 
 /// An owned, bounded snapshot of the control-plane state the read-only tools read from. Taken
@@ -220,6 +283,8 @@ pub struct ContextSnapshot {
     pub tasks: Vec<TaskView>,
     pub agents: Vec<AgentView>,
     pub runs: Vec<RunView>,
+    pub plugins: Vec<PluginView>,
+    pub approvals: Vec<ApprovalView>,
 }
 
 /// A validated, allowlisted read-only tool call the brain requested.
@@ -355,6 +420,9 @@ pub fn execute_context_tool(snapshot: &ContextSnapshot, call: &ToolCall) -> Cont
         "list_agents" => list_agents_read(snapshot),
         "get_agent" => get_agent_read(snapshot, &call.args),
         "list_runs" => list_runs_read(snapshot),
+        "get_run" => get_run_read(snapshot, &call.args),
+        "list_plugins" => list_plugins_read(snapshot),
+        "list_approvals" => list_approvals_read(snapshot, &call.args),
         other => ContextRead {
             tool: other.to_string(),
             ok: false,
@@ -559,6 +627,114 @@ fn list_runs_read(snapshot: &ContextSnapshot) -> ContextRead {
         tool: "list_runs".to_string(),
         ok: true,
         summary: format!("{} run(s)", snapshot.runs.len()),
+        detail: clamp_detail(detail),
+    }
+}
+
+fn get_run_read(
+    snapshot: &ContextSnapshot,
+    args: &serde_json::Map<String, serde_json::Value>,
+) -> ContextRead {
+    let Some(id) = read_id_arg(args, "run_id") else {
+        return ContextRead {
+            tool: "get_run".to_string(),
+            ok: false,
+            summary: "get_run needs a run_id".to_string(),
+            detail: "Provide {\"run_id\":\"<existing run id>\"}.".to_string(),
+        };
+    };
+    match snapshot.runs.iter().find(|r| r.id == id) {
+        Some(r) => {
+            let mut detail = format!(
+                "id={}\nstatus={}\ntask={}\nagent={}\nadapter={}",
+                r.id, r.status, r.task_id, r.agent_id, r.adapter
+            );
+            if let Some(started) = &r.started_at {
+                detail.push_str(&format!("\nstarted_at={started}"));
+            }
+            if let Some(ended) = &r.ended_at {
+                detail.push_str(&format!("\nended_at={ended}"));
+            }
+            if let Some(ms) = r.duration_ms {
+                detail.push_str(&format!("\nduration_ms={ms}"));
+            }
+            if let Some(s) = &r.summary {
+                detail.push_str(&format!("\nsummary=\"{s}\""));
+            }
+            if let Some(e) = &r.error {
+                detail.push_str(&format!("\nerror=\"{e}\""));
+            }
+            ContextRead {
+                tool: "get_run".to_string(),
+                ok: true,
+                summary: format!("{}: task={} [{}]", r.id, r.task_id, r.status),
+                detail: clamp_detail(detail),
+            }
+        }
+        None => ContextRead {
+            tool: "get_run".to_string(),
+            ok: false,
+            summary: format!("no run {id}"),
+            detail: format!("Run '{id}' does not exist."),
+        },
+    }
+}
+
+fn list_plugins_read(snapshot: &ContextSnapshot) -> ContextRead {
+    let detail = if snapshot.plugins.is_empty() {
+        "(no plugins installed)".to_string()
+    } else {
+        bounded_lines(&snapshot.plugins, |p| {
+            format!(
+                "{}: v{} [{}] enabled={} protected={} source={} tools={}",
+                p.id, p.version, p.kind, p.enabled, p.protected, p.source_kind, p.tools
+            )
+        })
+    };
+    let enabled = snapshot.plugins.iter().filter(|p| p.enabled).count();
+    ContextRead {
+        tool: "list_plugins".to_string(),
+        ok: true,
+        summary: format!("{} plugin(s) ({} enabled)", snapshot.plugins.len(), enabled),
+        detail: clamp_detail(detail),
+    }
+}
+
+fn list_approvals_read(
+    snapshot: &ContextSnapshot,
+    args: &serde_json::Map<String, serde_json::Value>,
+) -> ContextRead {
+    // Optional status filter: honored only when it is a recognized lifecycle label; an
+    // unrecognized filter is ignored (all approvals listed) rather than failing.
+    let filter: Option<String> = args
+        .get("status")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| matches!(s.as_str(), "pending" | "approved" | "rejected"));
+    let matched: Vec<&ApprovalView> = snapshot
+        .approvals
+        .iter()
+        .filter(|a| filter.as_ref().is_none_or(|f| &a.status == f))
+        .collect();
+    let detail = if matched.is_empty() {
+        "(no matching approvals)".to_string()
+    } else {
+        bounded_lines(&matched, |a| {
+            format!(
+                "{}: [{}] risk={} by={} action=\"{}\"",
+                a.id, a.status, a.risk, a.requested_by, a.action
+            )
+        })
+    };
+    let pending = snapshot.approvals.iter().filter(|a| a.status == "pending").count();
+    let label = match &filter {
+        Some(f) => format!("{} {} approval(s)", matched.len(), f),
+        None => format!("{} approval(s) ({} pending)", snapshot.approvals.len(), pending),
+    };
+    ContextRead {
+        tool: "list_approvals".to_string(),
+        ok: true,
+        summary: label,
         detail: clamp_detail(detail),
     }
 }
@@ -812,6 +988,40 @@ mod tests {
                 task_id: "task_0001".to_string(),
                 agent_id: "researcher".to_string(),
                 status: "running".to_string(),
+                adapter: "relux-adapter-local-prime".to_string(),
+                started_at: Some("t0".to_string()),
+                ended_at: None,
+                duration_ms: None,
+                summary: Some("Surveying the login flow.".to_string()),
+                error: None,
+            }],
+            plugins: vec![
+                PluginView {
+                    id: "relux-adapter-local-prime".to_string(),
+                    version: "0.1.0".to_string(),
+                    kind: "Adapter".to_string(),
+                    enabled: true,
+                    protected: true,
+                    source_kind: "Bundled".to_string(),
+                    tools: 1,
+                },
+                PluginView {
+                    id: "relux-tools-github".to_string(),
+                    version: "0.2.0".to_string(),
+                    kind: "ToolSet".to_string(),
+                    enabled: false,
+                    protected: false,
+                    source_kind: "Github".to_string(),
+                    tools: 3,
+                },
+            ],
+            approvals: vec![ApprovalView {
+                id: "appr_0001".to_string(),
+                status: "pending".to_string(),
+                risk: "high".to_string(),
+                requested_by: "prime".to_string(),
+                action: "grant tool:relux-tools-github:create_pr to code-agent".to_string(),
+                reason: "Granting a permission widens what an actor can do.".to_string(),
             }],
         }
     }
@@ -820,6 +1030,9 @@ mod tests {
     fn classify_is_fail_closed_on_unknown_names() {
         assert_eq!(classify_tool("get_task"), ToolKind::ReadOnly);
         assert_eq!(classify_tool("board_summary"), ToolKind::ReadOnly);
+        assert_eq!(classify_tool("get_run"), ToolKind::ReadOnly);
+        assert_eq!(classify_tool("list_plugins"), ToolKind::ReadOnly);
+        assert_eq!(classify_tool("list_approvals"), ToolKind::ReadOnly);
         // Anything not on the allowlist is refused — including a plausible-sounding write.
         assert_eq!(classify_tool("delete_task"), ToolKind::Refused);
         assert_eq!(classify_tool("create_task"), ToolKind::Refused);
@@ -889,6 +1102,70 @@ mod tests {
         args.insert("status".into(), "wobbly".into());
         let r = execute_context_tool(&snap, &ToolCall { tool: "list_tasks".into(), args });
         assert!(r.detail.contains("task_0001") && r.detail.contains("task_0002"));
+    }
+
+    #[test]
+    fn get_run_reads_real_runs_and_is_honest_about_misses() {
+        let snap = snapshot();
+        // A real run id: the detail carries the redacted summary, adapter, and timing.
+        let mut args = serde_json::Map::new();
+        args.insert("run_id".into(), "run_0001".into());
+        let r = execute_context_tool(&snap, &ToolCall { tool: "get_run".into(), args });
+        assert!(r.ok);
+        assert!(r.detail.contains("task=task_0001") && r.detail.contains("status=running"));
+        assert!(r.detail.contains("adapter=relux-adapter-local-prime"));
+        assert!(r.detail.contains("Surveying the login flow"));
+        // Raw provider usage/cost is never projected, so it can never leak into the body.
+        assert!(!r.detail.contains("usage") && !r.detail.contains("cost"));
+        // An unknown run id -> honest miss, never fabricated.
+        let mut args = serde_json::Map::new();
+        args.insert("run_id".into(), "run_9999".into());
+        let r = execute_context_tool(&snap, &ToolCall { tool: "get_run".into(), args });
+        assert!(!r.ok && r.detail.contains("does not exist"));
+        // No run id -> honest prompt for the id.
+        let r = execute_context_tool(&snap, &ToolCall { tool: "get_run".into(), args: Default::default() });
+        assert!(!r.ok && r.summary.contains("needs a run_id"));
+    }
+
+    #[test]
+    fn list_plugins_reports_enabled_protected_and_tool_counts() {
+        let snap = snapshot();
+        let r = execute_context_tool(
+            &snap,
+            &ToolCall { tool: "list_plugins".into(), args: Default::default() },
+        );
+        assert!(r.ok);
+        assert!(r.summary.contains("2 plugin(s)") && r.summary.contains("1 enabled"));
+        assert!(r.detail.contains("relux-adapter-local-prime") && r.detail.contains("protected=true"));
+        assert!(r.detail.contains("relux-tools-github") && r.detail.contains("enabled=false"));
+        assert!(r.detail.contains("tools=3"));
+    }
+
+    #[test]
+    fn list_approvals_honors_an_optional_status_filter() {
+        let snap = snapshot();
+        // No filter: lists all, names the pending count.
+        let r = execute_context_tool(
+            &snap,
+            &ToolCall { tool: "list_approvals".into(), args: Default::default() },
+        );
+        assert!(r.ok && r.summary.contains("1 pending"));
+        assert!(r.detail.contains("appr_0001") && r.detail.contains("risk=high"));
+        // A 'pending' filter matches the one pending approval.
+        let mut args = serde_json::Map::new();
+        args.insert("status".into(), "pending".into());
+        let r = execute_context_tool(&snap, &ToolCall { tool: "list_approvals".into(), args });
+        assert!(r.detail.contains("appr_0001") && r.summary.contains("pending"));
+        // An 'approved' filter matches nothing (honest empty), never an error.
+        let mut args = serde_json::Map::new();
+        args.insert("status".into(), "approved".into());
+        let r = execute_context_tool(&snap, &ToolCall { tool: "list_approvals".into(), args });
+        assert!(r.ok && r.detail.contains("(no matching approvals)"));
+        // An unrecognized filter is ignored (all listed), never an error.
+        let mut args = serde_json::Map::new();
+        args.insert("status".into(), "bogus".into());
+        let r = execute_context_tool(&snap, &ToolCall { tool: "list_approvals".into(), args });
+        assert!(r.ok && r.detail.contains("appr_0001"));
     }
 
     #[test]

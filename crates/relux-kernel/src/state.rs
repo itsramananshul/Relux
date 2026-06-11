@@ -3466,6 +3466,59 @@ impl KernelState {
                 task_id: r.task_id.0.clone(),
                 agent_id: r.agent_id.0.clone(),
                 status: run_status_label(&r.status),
+                adapter: r.adapter_plugin.0.clone(),
+                started_at: r.started_at.clone(),
+                ended_at: r.ended_at.clone(),
+                duration_ms: r.duration_ms,
+                // Redacted + bounded; the raw provider usage/cost envelope is never projected.
+                summary: r.summary.as_deref().and_then(|s| redact_line(s, MAX_REDACTED_CHARS)),
+                error: r.error.as_deref().and_then(|s| redact_line(s, MAX_REDACTED_CHARS)),
+            })
+            .collect();
+
+        // Installed plugins/adapters, sorted by id (deterministic), with the tool count read from
+        // the live manifest. The raw `source_label` (a local path / URL) is deliberately NOT
+        // projected — only the source kind label.
+        let plugins: Vec<crate::prime_tools::PluginView> = self
+            .installed_plugins()
+            .into_iter()
+            .take(MAX_SNAPSHOT_ITEMS)
+            .map(|p| crate::prime_tools::PluginView {
+                id: p.id.0.clone(),
+                version: p.version.clone(),
+                kind: plugin_kind_label(&p.kind),
+                enabled: p.enabled,
+                protected: p.source_kind == PluginSourceKind::Bundled,
+                source_kind: format!("{:?}", p.source_kind),
+                tools: self
+                    .plugins
+                    .get(&p.id)
+                    .map(|m| m.capabilities.tools.len())
+                    .unwrap_or(0),
+            })
+            .collect();
+
+        // Approvals, pending first then most-recent (the same ordering the HTTP list endpoint
+        // uses), with the human-readable action/reason redacted + bounded. They carry no secret.
+        let mut approval_refs: Vec<&Approval> = self.approvals.values().collect();
+        approval_refs.sort_by(|a, b| {
+            let pending = |ap: &Approval| matches!(ap.status, ApprovalStatus::Pending);
+            pending(b)
+                .cmp(&pending(a))
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| a.id.as_str().cmp(b.id.as_str()))
+        });
+        let approvals: Vec<crate::prime_tools::ApprovalView> = approval_refs
+            .into_iter()
+            .take(MAX_SNAPSHOT_ITEMS)
+            .map(|a| crate::prime_tools::ApprovalView {
+                id: a.id.0.clone(),
+                status: approval_status_label(&a.status),
+                risk: risk_level_label(&a.risk),
+                requested_by: redact_line(&a.requested_by, MAX_ARG_REDACTED_CHARS)
+                    .unwrap_or_default(),
+                action: redact_line(&a.action, MAX_REDACTED_CHARS).unwrap_or_default(),
+                reason: redact_line(&a.reason, MAX_REDACTED_CHARS).unwrap_or_default(),
             })
             .collect();
 
@@ -3474,6 +3527,8 @@ impl KernelState {
             tasks,
             agents,
             runs,
+            plugins,
+            approvals,
         }
     }
 
@@ -6345,6 +6400,60 @@ fn run_status_label(status: &RunStatus) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// Max chars kept from a redacted free-text field (a run summary/error, an approval action/reason)
+/// projected into the read-only context snapshot. Keeps a large body bounded before the per-result
+/// clamp; the value is short so a verbose adapter summary cannot blow the snapshot.
+const MAX_REDACTED_CHARS: usize = 240;
+
+/// Max chars kept from a short redacted id-shaped field (an approval requester).
+const MAX_ARG_REDACTED_CHARS: usize = 80;
+
+/// Redact + bound a free-text string for the read-only context snapshot: strip control chars,
+/// collapse whitespace, and clamp to `max`. Returns `None` when nothing readable remains, so an
+/// empty/whitespace-only field is projected as absent rather than a blank. Pure. The fields this is
+/// applied to are already human-readable renderings (no secret/token), but redacting here keeps the
+/// snapshot bounded and control-char-free regardless of what an adapter emitted.
+fn redact_line(s: &str, max: usize) -> Option<String> {
+    let cleaned: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(max)
+        .collect();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+/// The label for a plugin kind, for the read-only `list_plugins` tool. Pure.
+fn plugin_kind_label(kind: &PluginKind) -> String {
+    format!("{kind:?}")
+}
+
+/// The `snake_case` wire label for an approval status (matching the serialized form), for the
+/// read-only `list_approvals` tool. Pure.
+fn approval_status_label(status: &ApprovalStatus) -> String {
+    serde_json::to_value(status)
+        .ok()
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The `snake_case` wire label for a risk level (matching the serialized form), for the read-only
+/// `list_approvals` tool. Pure.
+fn risk_level_label(risk: &RiskLevel) -> String {
+    serde_json::to_value(risk)
+        .ok()
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 /// Attach the one-click next-step buttons the chat surface renders for a turn
 /// (`docs/RELUX_MASTER_PLAN.md` §11.1 "Prime suggested next actions").
 ///
@@ -7582,6 +7691,28 @@ mod tests {
         args.insert("agent_id".to_string(), "researcher".into());
         let r = execute_context_tool(&snap, &ToolCall { tool: "get_agent".to_string(), args });
         assert!(r.ok && r.summary.contains("researcher"));
+
+        // list_plugins reflects the live install index (the bundled prime adapter is protected).
+        assert!(!snap.plugins.is_empty(), "the bundled prime adapter should be installed");
+        let r = execute_context_tool(
+            &snap,
+            &ToolCall { tool: "list_plugins".to_string(), args: Default::default() },
+        );
+        assert!(r.ok && r.detail.contains("protected=true"));
+
+        // list_approvals reads the (initially empty) approval set — an honest empty, never faked.
+        let r = execute_context_tool(
+            &snap,
+            &ToolCall { tool: "list_approvals".to_string(), args: Default::default() },
+        );
+        assert!(r.ok);
+        assert_eq!(snap.approvals.len(), 0);
+
+        // get_run by an unknown id is an HONEST miss end-to-end, never fabricated.
+        let mut args = serde_json::Map::new();
+        args.insert("run_id".to_string(), "run_9999".into());
+        let r = execute_context_tool(&snap, &ToolCall { tool: "get_run".to_string(), args });
+        assert!(!r.ok && r.detail.contains("does not exist"));
     }
 
     // --- Multi-turn clarification memory ----------------------------------------

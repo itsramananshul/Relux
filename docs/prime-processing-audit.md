@@ -991,6 +991,61 @@ bounded/null, `contextReadsHadMiss` honest-miss, `contextReadDetail` clamp + hon
 `boundedContextReads` cap + hidden-count). No backend change (the wire was already produced by the
 read-only loop slice); the dashboard bundle was rebuilt.
 
+## Applied change (more read-only context tools — runs / plugins / approvals)
+
+The first read-only loop shipped six tools (`board_summary`/`list_tasks`/`get_task`/`list_agents`/
+`get_agent`/`list_runs`). The brain could enumerate runs but not drill into a single run, could not
+enumerate the installed plugins/adapters, and could not inspect the approval queue — the "more
+read-only tools" rung this audit's "Next recommended slice" named. Per master plan §10.1 (Intent
+Layer), §10.2 (Action Layer), §17.1, and following the reference read recorded in
+`reference-driven-development.md` (Hermes `run_conversation` bounded loop + name-allowlist
+validation, unchanged; openclaw `tool-mutation` `READ_ONLY_ACTIONS` `get`/`list`/`inspect` verb set,
+`common.ts` `readStringParam` required, `sessions-spawn-tool` unsupported-key rejection, the no-leak
+CLI-output seam), three more **read-only** tools now ride the SAME governed loop.
+
+- **`get_run`** — full detail of one run by id: `status`, `task`, `agent`, `adapter`, the logical
+  start/end stamps, the real `duration_ms` (CLI runs only), and a **redacted, bounded** `summary`/
+  `error`. A missing/empty/unknown `run_id` is an HONEST `ok:false` miss ("Run '…' does not exist."),
+  never a fabricated run. The raw provider `usage`/`cost` envelope is **deliberately NOT projected**.
+- **`list_plugins`** — the installed plugins/adapters: `id`, `version`, `kind`, `enabled`,
+  `protected` (a bundled fixture), `source_kind`, and the manifest tool count. The raw `source_label`
+  (a local path / URL) is **deliberately NOT projected** — only the source-kind label.
+- **`list_approvals`** — the approval queue, pending-first then most-recent (the same ordering the
+  `/v1/relux/approvals` endpoint uses): `id`, `status`, `risk`, `requested_by`, and a **redacted,
+  bounded** `action`/`reason`. An optional `{"status":"pending|approved|rejected"}` filter is honored
+  only when recognized; an unrecognized filter is ignored (all listed), never an error.
+- **Snapshot, not faked.** `KernelState::context_snapshot` (`state.rs`) gains `plugins` (from the live
+  `installed_plugins()` + each manifest's tool count) and `approvals` (sorted like the HTTP endpoint),
+  and the existing run projection is enriched with the adapter/timing/redacted-summary/error — all
+  taken ONCE under the kernel lock, bounded by `MAX_SNAPSHOT_ITEMS`, with free-text fields run through
+  the new `redact_line` (control-strip, whitespace-collapse, clamp). If real data does not exist
+  (e.g. no runs/approvals yet), the tool returns an HONEST empty, never a placeholder.
+- **No write surface, no new authority.** All three are pure reads of the `ContextSnapshot`;
+  `classify_tool` stays fail-closed (anything off the read-only allowlist is `Refused`), the loop is
+  still bounded by `MAX_TOOL_ROUNDS`/stop-on-repeat, results are still length/list-bounded, and there
+  is no path from `prime_tools` to `prime_execute` or an approval. The async drivers (OpenRouter /
+  CLI) and the synchronous test twin are unchanged — a new tool is just an allowlist member + a pure
+  executor, so the loop control flow is pinned ONCE and the new tools inherit it.
+- **UI.** No dashboard change: the `PrimeTurn.context_reads` wire type is generic (tool + ok +
+  summary), so the provenance chip from the prior slice surfaces the new tool names automatically
+  (`🔎 used: get_run, list_plugins, …`) with the same no-leak, bounded rendering. The dashboard
+  bundle is unchanged.
+
+Safety invariants (binding): the new tools are **read-only and gather-only**, exactly like the first
+six. Every tool is a pure read of the snapshot; a missing id is an honest miss; the raw provider
+`usage`/`cost` envelope and the raw plugin `source_label` are never projected; the tool NAME is still
+fail-closed validated against the read-only allowlist; the loop is bounded; the gathered reads only
+GROUND the existing action-free reply. The brain authors no intent, slot, or action, and the
+write-capable tool surface stays deferred.
+
+Pinned by the new `prime_tools` unit tests (`get_run_reads_real_runs_and_is_honest_about_misses`,
+`list_plugins_reports_enabled_protected_and_tool_counts`,
+`list_approvals_honors_an_optional_status_filter`, plus the extended
+`classify_is_fail_closed_on_unknown_names`); the extended kernel integration test
+`context_snapshot_feeds_the_read_only_tools_end_to_end` (list_plugins shows the bundled prime adapter
+as protected, list_approvals reads the empty queue honestly, get_run on an unknown id is an honest
+miss). No test calls a real provider; no wire/dashboard change was needed.
+
 ## Current Prime brain stack
 
 The end-to-end shape of one Prime turn, with the brain strictly additive and the
@@ -1046,7 +1101,8 @@ unavailable:
 3b. **Read-only context loop** (a NON-actionful inspection/explanation/question turn only) — before
    the reply is shaped, a configured brain may run the GOVERNED READ-ONLY tool loop
    (`prime_tools`): it requests an allowlisted read-only tool (`board_summary`/`list_tasks`/
-   `get_task`/`list_agents`/`get_agent`/`list_runs`), the kernel validates the name (off-list ⇒
+   `get_task`/`list_agents`/`get_agent`/`list_runs`/`get_run`/`list_plugins`/`list_approvals`), the
+   kernel validates the name (off-list ⇒
    refused + self-corrected, never run), executes it deterministically against a pre-taken state
    snapshot, injects the result, and loops (bounded by `MAX_TOOL_ROUNDS`, stop-on-repeat). The reads
    change nothing and only GROUND the reply (folded into `grounded_facts`, surfaced as
@@ -1071,13 +1127,16 @@ unavailable:
 
 ## Next recommended slice
 
-The **first safe Prime tool loop** now ships (READ-ONLY context tools): on an inspection/explanation/
-question turn the brain inspects live state (a task, the crew, the runs) through a governed,
-fail-closed, bounded read-only loop before answering. The obvious next rungs build on it:
+The **read-only context tools** now cover the local control plane: on an inspection/explanation/
+question turn the brain inspects live state (a task, the crew, the runs, **a single run, the
+installed plugins, the approval queue**) through a governed, fail-closed, bounded read-only loop
+before answering. The obvious next rungs build on it:
 
-- **More read-only tools** — `get_run` (a single run's status/summary/error), `list_plugins` /
-  `get_plugin` (installed tools + executable status, reusing `discover_tools`), and `list_approvals`
-  are natural next reads, each a pure projection added to the snapshot + an allowlist entry.
+- **`get_plugin` / `get_approval` detail reads** — the list tools (`list_plugins`/`list_approvals`)
+  now exist; a by-id detail read for one plugin (its tools + executable status via `discover_tools`)
+  or one approval is the natural completion, each a pure projection + an allowlist entry. The
+  raw provider `usage`/`cost` on a run stays deliberately unexposed (redaction), so any richer run
+  read must keep that boundary.
 - **A WRITE-capable tool surface** — the read-only loop is the proving ground for the harder slice:
   letting the brain *request* a mutating tool that still flows through the existing fail-closed
   `decide` → `prime_execute` (safe `Act`) / human-approval (`Propose`) path, with `isMutatingToolCall`'s
