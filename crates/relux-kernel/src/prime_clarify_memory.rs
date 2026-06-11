@@ -122,16 +122,19 @@ pub fn is_cancellation(message: &str) -> bool {
 
 /// Whether a clarifying turn for `intent` is one this memory can later RESOLVE with a
 /// follow-up answer. Only the intents whose `decide` arm produces a concrete action when
-/// the missing field is supplied are eligible — assignment (needs a task id / agent) and
-/// task creation (needs a description). Intents whose clarify cannot yet be resolved into
-/// an action by more text (a run start has no by-id action wired; a task update has no
-/// `UpdateTask` action) are deliberately NOT recorded, so the memory never sets up a
-/// loop that cannot resolve and never fakes an unsupported action
+/// the missing field is supplied are eligible — assignment (needs a task id / agent), task
+/// creation (needs a description), and run start (needs a task id, now that the `StartRun`
+/// action is wired to honor an explicit, ready task id). A task update is still NOT
+/// recorded because no `UpdateTask` action is wired, so the memory never sets up a loop
+/// that cannot resolve and never fakes an unsupported action
 /// (`docs/reference-driven-development.md`: no faked capability).
 pub fn is_resolvable_clarify_intent(intent: &PrimeIntent) -> bool {
     matches!(
         intent,
-        PrimeIntent::AssignTask | PrimeIntent::TaskCreation | PrimeIntent::CreateAndRunTask
+        PrimeIntent::AssignTask
+            | PrimeIntent::TaskCreation
+            | PrimeIntent::CreateAndRunTask
+            | PrimeIntent::RunStart
     )
 }
 
@@ -266,9 +269,10 @@ mod tests {
         assert!(is_resolvable_clarify_intent(&PrimeIntent::AssignTask));
         assert!(is_resolvable_clarify_intent(&PrimeIntent::TaskCreation));
         assert!(is_resolvable_clarify_intent(&PrimeIntent::CreateAndRunTask));
-        // A run start / task update clarify has no by-id action wired, so it is not
+        // Run start is now resolvable by a task id (the `StartRun` by-id action is wired).
+        assert!(is_resolvable_clarify_intent(&PrimeIntent::RunStart));
+        // A task update clarify still has no `UpdateTask` action wired, so it is not
         // recorded (no faked, unresolvable continuation).
-        assert!(!is_resolvable_clarify_intent(&PrimeIntent::RunStart));
         assert!(!is_resolvable_clarify_intent(&PrimeIntent::TaskUpdate));
     }
 }

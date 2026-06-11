@@ -457,3 +457,37 @@ loop — it is the fallback the later brain-assisted assignment slot will reconc
 the safety shape (resolve only to an existing agent, ambiguity asked not guessed) holds whether
 or not a brain is configured. The `AssignTask` decide arm still produces a `PrimePlan::Act`
 through the unchanged `decide` → `prime_execute` path; only the assignee *resolution* got smarter.
+
+---
+
+## Reference read — by-id run start + a resolvable run-start clarification (this slice)
+
+The multi-turn memory above deliberately skipped a run-start clarify ("start it" → "which
+one?" → "task_0001") because no by-id `StartRun` was wired. This slice wires it, so that
+clarify becomes resolvable.
+
+### Paperclip (openclaw) — files read
+
+- `reference/openclaw-main/src/agents/subagent-control.ts` `resolveControlledSubagentTarget`
+  (L707-729) + `src/auto-reply/reply/subagents-utils.ts` `resolveSubagentTargetFromRuns`
+  (L80-145, the numeric-index/active-window filter at L80-92) — a control action lands on a
+  target only when it resolves to an EXISTING entry that is also *active/runnable*; an index
+  out of range or an unknown target is an error, never coerced. **Pattern: act only on a
+  target that both exists AND is in a runnable state.**
+- `reference/openclaw-main/src/agents/bash-tools.exec-approval-followup-state.ts`
+  (`consumeExecApprovalFollowupRuntimeHandoff`, L113-146) + `.exec-approval-followup.ts`
+  (`sendExecApprovalFollowup`) — the consume-and-continue shape the clarification memory
+  already mirrors; recording a run-start clarify is now legitimate because the continuation
+  has a real by-id action to resolve into (no faked capability).
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| openclaw: **act only on a target that EXISTS and is runnable** | `crates/relux-kernel/src/prime.rs` `RunStart` arm honors an explicit `extract_task_id` only when it is in `summary.queued` (exists AND ready) → `StartRun` `Act`; existing-but-not-ready → an honest "not ready" `Reply`; unknown → "does not exist" (fail closed). |
+| openclaw: **consume-and-continue only when a real action backs it** | `prime_clarify_memory::is_resolvable_clarify_intent` now includes `RunStart` (and `clarify_needs_label(RunStart) = "task id"`), so the multi-ready clarify is remembered and a bare task id continues it; `TaskUpdate` stays unrecorded (still no `UpdateTask` action). |
+
+**What we deliberately do differently:** purely deterministic, no brain — the by-id resolution is
+validated against the live `summary.queued`/`all_task_ids`, so a continuation can only start a task
+that genuinely exists and is ready. This supersedes the earlier slice's note that a run-start clarify
+is never recorded (that was true only while no by-id action existed).

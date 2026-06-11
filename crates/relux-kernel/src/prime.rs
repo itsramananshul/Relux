@@ -393,24 +393,50 @@ pub fn decide(message: &str, intent: &PrimeIntent, summary: &StateSummary) -> Pr
                 text: "What should I create and run?".to_string(),
             },
         },
-        PrimeIntent::RunStart => match summary.queued.as_slice() {
-            [] => PrimePlan::Clarify {
-                text: "There is no task ready to start. Create a task first, or assign an existing one to an agent."
-                    .to_string(),
-            },
-            [one] => PrimePlan::Act {
-                action: PrimeAction::StartRun {
-                    task_id: one.id.0.clone(),
+        PrimeIntent::RunStart => {
+            // Honor an explicit task id when the user (or a continued clarification) named
+            // one: it must exist AND be ready to start (queued). An existing-but-not-ready
+            // id is reported honestly; an unknown id fails closed. Only when no id is named
+            // do we fall back to the ready-queue heuristic.
+            match extract_task_id(message) {
+                Some(id) => {
+                    if let Some(b) = summary.queued.iter().find(|b| b.id.0 == id) {
+                        PrimePlan::Act {
+                            action: PrimeAction::StartRun { task_id: id.clone() },
+                            text: format!("Starting \"{}\" ({}).", b.title, b.id),
+                        }
+                    } else if summary.all_task_ids.contains(&id) {
+                        PrimePlan::Reply {
+                            text: format!(
+                                "Task {id} is not ready to start. Assign it to an agent first, or it may already be running or finished."
+                            ),
+                        }
+                    } else {
+                        PrimePlan::Reply {
+                            text: format!("Task with ID '{id}' does not exist. Please provide a valid task ID."),
+                        }
+                    }
+                }
+                None => match summary.queued.as_slice() {
+                    [] => PrimePlan::Clarify {
+                        text: "There is no task ready to start. Create a task first, or assign an existing one to an agent."
+                            .to_string(),
+                    },
+                    [one] => PrimePlan::Act {
+                        action: PrimeAction::StartRun {
+                            task_id: one.id.0.clone(),
+                        },
+                        text: format!("Starting \"{}\" ({}).", one.title, one.id),
+                    },
+                    many => PrimePlan::Clarify {
+                        text: format!(
+                            "More than one task is ready. Which should I start? {}",
+                            list_briefs(many)
+                        ),
+                    },
                 },
-                text: format!("Starting \"{}\" ({}).", one.title, one.id),
-            },
-            many => PrimePlan::Clarify {
-                text: format!(
-                    "More than one task is ready. Which should I start? {}",
-                    list_briefs(many)
-                ),
-            },
-        },
+            }
+        }
         PrimeIntent::RunRetry => {
             if summary.tasks_failed == 0 {
                 PrimePlan::Reply {
@@ -1775,6 +1801,7 @@ pub fn clarify_needs_label(intent: &PrimeIntent, message: &str) -> String {
             }
         }
         PrimeIntent::TaskCreation | PrimeIntent::CreateAndRunTask => "task description".to_string(),
+        PrimeIntent::RunStart => "task id".to_string(),
         _ => "more detail".to_string(),
     }
 }
@@ -2116,6 +2143,46 @@ mod tests {
                 ..
             } => assert_eq!(task_id, "task_0007"),
             other => panic!("expected Act/StartRun, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_start_honors_an_explicit_ready_task_id() {
+        // When the user (or a continued clarification) names a ready task id, that one is
+        // started even when several are ready — no guessing off the queue.
+        let mut s = empty_summary();
+        s.all_task_ids = roster(&["task_0007", "task_0008"]);
+        s.queued = vec![
+            brief("task_0007", "Run the tests", TaskStatus::Queued),
+            brief("task_0008", "Build the docs", TaskStatus::Queued),
+        ];
+        let plan = decide("start task_0008", &PrimeIntent::RunStart, &s);
+        match plan {
+            PrimePlan::Act {
+                action: PrimeAction::StartRun { task_id },
+                ..
+            } => assert_eq!(task_id, "task_0008"),
+            other => panic!("expected Act/StartRun for the named id, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_start_reports_an_unready_or_unknown_explicit_id() {
+        let mut s = empty_summary();
+        s.all_task_ids = roster(&["task_0007"]);
+        // Exists but not in the ready queue.
+        let plan = decide("start task_0007", &PrimeIntent::RunStart, &s);
+        match plan {
+            PrimePlan::Reply { text } => assert!(text.contains("not ready to start"), "got: {text}"),
+            other => panic!("expected a not-ready Reply, got {other:?}"),
+        }
+        // Does not exist at all.
+        let plan = decide("start task_9999", &PrimeIntent::RunStart, &s);
+        match plan {
+            PrimePlan::Reply { text } => {
+                assert!(text.contains("does not exist"), "got: {text}")
+            }
+            other => panic!("expected a does-not-exist Reply, got {other:?}"),
         }
     }
 

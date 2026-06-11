@@ -614,6 +614,34 @@ Pinned by the `prime` unit tests (`resolve_assignee_matches_exact_prefix_and_sub
 and the kernel integration test `a_fuzzy_assignee_continuation_resolves_against_the_roster`
 (the motivating dialogue end-to-end). No test calls a real provider.
 
+## Applied change (by-id run start + a resolvable run-start clarification)
+
+The multi-turn memory deliberately did NOT remember a run-start clarify because no by-id
+`StartRun` action was wired — "start it" → "which one?" → "task_0001" could not resolve. The
+`StartRun` action already existed (the decide arm just never read an explicit id), so this
+slice wires it: the `RunStart` arm now honors a named, ready task id, and the run-start
+clarify becomes resolvable. Per master plan §10.2/§10.5 and the same reference read
+(openclaw `resolveControlledSubagentTarget` — act only on a target that EXISTS *and* is
+runnable; the exec-approval-followup consume-and-continue shape for the memory).
+
+- **`relux-kernel/src/prime.rs` `RunStart` arm.** When `extract_task_id` finds an id, it is
+  honored only when it is in `summary.queued` (exists AND ready) → the existing `StartRun`
+  `Act`; an existing-but-not-ready id gets an honest "not ready to start" `Reply`; an unknown
+  id fails closed with "does not exist". With no id named, the prior ready-queue heuristic
+  (single ready → start, several → ask, none → clarify) is unchanged.
+- **`prime_clarify_memory::is_resolvable_clarify_intent`** now includes `RunStart`, and
+  `clarify_needs_label(RunStart)` is `"task id"`, so a multi-ready "which should I start?"
+  clarify is remembered and a bare task id continues it into a `StartRun`. A `TaskUpdate`
+  clarify is still NOT recorded (no `UpdateTask` action is wired — no faked capability).
+- **Safety (binding).** Deterministic; the continuation flows through the unchanged
+  `decide` → `prime_execute` path and starts a run only for a task that exists and is ready,
+  so a stale or fuzzy follow-up can never start the wrong task or an unrunnable one.
+
+Pinned by `run_start_honors_an_explicit_ready_task_id`,
+`run_start_reports_an_unready_or_unknown_explicit_id` (prime unit), the updated
+`only_resolvable_intents_are_recorded` (`prime_clarify_memory`), and
+`a_run_start_clarification_is_resolved_by_a_task_id_follow_up` (kernel integration).
+
 ## Current Prime brain stack
 
 The end-to-end shape of one Prime turn, with the brain strictly additive and the

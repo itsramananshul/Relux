@@ -7149,6 +7149,44 @@ mod tests {
     }
 
     #[test]
+    fn a_run_start_clarification_is_resolved_by_a_task_id_follow_up() {
+        // Two ready tasks -> "start it" asks which -> "task_xxxx" continues and starts that
+        // one by id (the StartRun-by-id action wired this slice).
+        let (mut k, ctx) = prime_chat_kernel();
+        let a = k
+            .prime_turn(&ctx, "create a task to run the tests")
+            .unwrap()
+            .created_task
+            .expect("task a created");
+        let b = k
+            .prime_turn(&ctx, "create a task to build the docs")
+            .unwrap()
+            .created_task
+            .expect("task b created");
+
+        // Ambiguous run start -> Clarify, recorded as a resolvable pending (needs a task id).
+        let turn1 = k.prime_turn(&ctx, "start it").unwrap();
+        assert_eq!(turn1.disposition, PrimeDisposition::NeedsClarification);
+        assert_eq!(turn1.intent, relux_core::PrimeIntent::RunStart);
+        let pending = k
+            .pending_clarification_for(&ctx)
+            .expect("a run-start clarification was recorded");
+        assert_eq!(pending.needs, "task id");
+
+        // The bare task id continues and starts exactly that task.
+        let turn2 = k.prime_turn(&ctx, b.as_str()).unwrap();
+        assert_eq!(turn2.disposition, PrimeDisposition::Executed);
+        match turn2.action {
+            Some(relux_core::PrimeAction::StartRun { task_id }) => assert_eq!(task_id, b.as_str()),
+            other => panic!("expected StartRun for the named id, got {other:?}"),
+        }
+        assert!(turn2.started_run.is_some());
+        // The other ready task was left alone.
+        assert_eq!(k.task(&a).unwrap().status, TaskStatus::Queued);
+        assert!(k.pending_clarification_for(&ctx).is_none());
+    }
+
+    #[test]
     fn an_explicit_cancellation_clears_the_pending_clarification() {
         let (mut k, ctx) = prime_chat_kernel();
         let turn1 = k.prime_turn(&ctx, "assign this to researcher").unwrap();
