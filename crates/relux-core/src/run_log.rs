@@ -182,6 +182,11 @@ impl RunLog {
 #[derive(Debug, Default)]
 pub struct RunLogBuilder {
     pending: Vec<(RunLogSource, String, bool)>,
+    /// How many of the OLDEST lines have already been dropped to keep `pending`
+    /// bounded to [`MAX_LOG_LINES`]. Accumulated continuously (so a long, LIVE
+    /// stream can never grow `pending` without bound), then carried into the
+    /// built [`RunLog`] as `dropped_lines`.
+    dropped: usize,
     stdout_truncated: bool,
     stderr_truncated: bool,
 }
@@ -235,6 +240,54 @@ impl RunLogBuilder {
             redacted
         };
         self.pending.push((source, text, truncated));
+        self.enforce_live_cap();
+    }
+
+    /// Keep `pending` bounded to [`MAX_LOG_LINES`] by dropping the OLDEST lines as
+    /// they accumulate (a live tail), counting each into `dropped`. Called after
+    /// every push so memory is bounded WHILE a long run streams — not only at
+    /// `build` time. The total `dropped` is identical to the finalize-time
+    /// `total - MAX_LOG_LINES`, so the built record is unchanged for batch callers.
+    fn enforce_live_cap(&mut self) {
+        while self.pending.len() > MAX_LOG_LINES {
+            self.pending.remove(0);
+            self.dropped += 1;
+        }
+    }
+
+    /// Assemble a bounded [`RunLog`] from the kept `pending` lines (already capped
+    /// to [`MAX_LOG_LINES`] by [`Self::enforce_live_cap`]). Sequence numbers are
+    /// assigned 1-based over the kept lines in order, so the pollable cursor is
+    /// dense and monotonic. Shared by [`Self::build`] (consuming) and
+    /// [`Self::snapshot`] (non-consuming, for a live tail).
+    fn assemble(&self, run_id: RunId) -> RunLog {
+        let lines: Vec<RunLogLine> = self
+            .pending
+            .iter()
+            .enumerate()
+            .map(|(i, (source, text, truncated))| RunLogLine {
+                seq: (i as u32) + 1,
+                source: *source,
+                text: text.clone(),
+                truncated: *truncated,
+            })
+            .collect();
+        RunLog {
+            run_id,
+            lines,
+            dropped_lines: self.dropped.min(u32::MAX as usize) as u32,
+            stdout_truncated: self.stdout_truncated,
+            stderr_truncated: self.stderr_truncated,
+        }
+    }
+
+    /// A non-consuming snapshot of the bounded log so far — the live-tail read used
+    /// while a run is still streaming (the in-progress poll). Reflects only the
+    /// COMPLETE lines accumulated to this point (a streamed partial line not yet
+    /// terminated by a newline is held in the [`StreamingRunLog`] carry and appears
+    /// once its newline arrives — honest tail behaviour).
+    pub fn snapshot(&self, run_id: RunId) -> RunLog {
+        self.assemble(run_id)
     }
 
     /// Finalize into a bounded [`RunLog`] for `run_id`. The total is clamped to
@@ -242,25 +295,120 @@ impl RunLogBuilder {
     /// is recorded. Sequence numbers are assigned 1-based over the KEPT lines in
     /// order, so the pollable cursor is dense and monotonic.
     pub fn build(self, run_id: RunId) -> RunLog {
-        let total = self.pending.len();
-        let dropped = total.saturating_sub(MAX_LOG_LINES);
-        let kept = self.pending.into_iter().skip(dropped);
-        let lines: Vec<RunLogLine> = kept
-            .enumerate()
-            .map(|(i, (source, text, truncated))| RunLogLine {
-                seq: (i as u32) + 1,
-                source,
-                text,
-                truncated,
-            })
-            .collect();
-        RunLog {
-            run_id,
-            lines,
-            dropped_lines: dropped.min(u32::MAX as usize) as u32,
-            stdout_truncated: self.stdout_truncated,
-            stderr_truncated: self.stderr_truncated,
+        self.assemble(run_id)
+    }
+}
+
+/// A line-buffering, bounded accumulator for **live** run-log streaming: the
+/// adapter spawn feeds raw stdout/stderr CHUNKS (which may split a line across a
+/// read boundary) as they are read, and this type emits only COMPLETE lines into
+/// an inner [`RunLogBuilder`] (each re-redacted + clamped), holding the trailing
+/// partial line per source until its newline arrives. A non-consuming
+/// [`Self::snapshot`] yields the bounded [`RunLog`] so far so the UI can poll a
+/// run BEFORE it finalizes.
+///
+/// Spec ref: `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §8/§10 (LIVE run-log streaming).
+/// Reference: Paperclip `runChildProcess(..., { onLog })` streams `(stream, chunk)`
+/// per read; Relux line-buffers the chunk into the same bounded, redacted, three-
+/// stream model rather than persisting raw NDJSON chunks. Pure and deterministic
+/// (no clock, no IO); the threading/registry around it lives in the kernel.
+#[derive(Debug, Default)]
+pub struct StreamingRunLog {
+    builder: RunLogBuilder,
+    /// The trailing partial (newline-less) stdout text awaiting more chunks.
+    stdout_carry: String,
+    /// The trailing partial (newline-less) stderr text awaiting more chunks.
+    stderr_carry: String,
+}
+
+impl StreamingRunLog {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Push one kernel-authored `system` line (spawn, exit, timeout). Whole-line
+    /// by construction (the kernel authors it), so it is emitted immediately.
+    pub fn push_system(&mut self, text: impl Into<String>) {
+        self.builder.push_system(text);
+    }
+
+    /// Record that the adapter's stdout/stderr were byte-capped upstream so the
+    /// run-level truncation markers are honest on the live tail too.
+    pub fn mark_stream_truncation(&mut self, stdout_truncated: bool, stderr_truncated: bool) {
+        self.builder
+            .mark_stream_truncation(stdout_truncated, stderr_truncated);
+    }
+
+    /// Mark the truncation flag for one stream (used when the spawn reader hits the
+    /// byte cap mid-stream and stops feeding further chunks).
+    pub fn mark_source_truncation(&mut self, source: RunLogSource) {
+        match source {
+            RunLogSource::Stdout => self.builder.mark_stream_truncation(true, false),
+            RunLogSource::Stderr => self.builder.mark_stream_truncation(false, true),
+            // A system line is kernel-authored and never byte-capped.
+            RunLogSource::System => {}
         }
+    }
+
+    /// Append a raw output chunk for `source`. Complete lines (terminated by `\n`)
+    /// are emitted into the bounded builder immediately; the trailing partial line
+    /// is carried until its newline arrives. A pathologically long carry with no
+    /// newline is force-emitted once it exceeds [`MAX_LOG_LINE_CHARS`] so neither
+    /// the carry nor memory can grow without bound. `system` chunks are treated as
+    /// whole lines (split on `\n`, no carry).
+    pub fn append_chunk(&mut self, source: RunLogSource, chunk: &str) {
+        if source == RunLogSource::System {
+            self.builder.push_output(RunLogSource::System, chunk);
+            return;
+        }
+        let carry = match source {
+            RunLogSource::Stdout => &mut self.stdout_carry,
+            RunLogSource::Stderr => &mut self.stderr_carry,
+            RunLogSource::System => unreachable!(),
+        };
+        carry.push_str(chunk);
+        // Emit every complete line (the carry may hold several after one chunk).
+        while let Some(idx) = carry.find('\n') {
+            let line: String = carry[..idx].to_string();
+            // Drop the consumed line + its newline from the carry.
+            let rest = carry[idx + 1..].to_string();
+            *carry = rest;
+            // `push_output` strips a trailing `\r`, skips an empty line, re-redacts
+            // and clamps — exactly the finalize-path treatment, per single line.
+            self.builder.push_output(source, &line);
+        }
+        // Bound the carry: a single line longer than the per-line cap is emitted
+        // now (clamped) rather than buffered indefinitely.
+        if carry.chars().count() > MAX_LOG_LINE_CHARS {
+            let pending = std::mem::take(carry);
+            self.builder.push_output(source, &pending);
+        }
+    }
+
+    /// Flush any held partial lines as final lines (called at run end, after the
+    /// last chunk). A process whose last line had no trailing newline still shows.
+    pub fn flush(&mut self) {
+        let stdout = std::mem::take(&mut self.stdout_carry);
+        if !stdout.trim().is_empty() {
+            self.builder.push_output(RunLogSource::Stdout, &stdout);
+        }
+        let stderr = std::mem::take(&mut self.stderr_carry);
+        if !stderr.trim().is_empty() {
+            self.builder.push_output(RunLogSource::Stderr, &stderr);
+        }
+    }
+
+    /// A non-consuming bounded [`RunLog`] of the COMPLETE lines so far — the live
+    /// poll read. Partial (carry) lines are not included until their newline
+    /// arrives.
+    pub fn snapshot(&self, run_id: RunId) -> RunLog {
+        self.builder.snapshot(run_id)
+    }
+
+    /// Flush held partials, then consume into the final bounded [`RunLog`].
+    pub fn into_log(mut self, run_id: RunId) -> RunLog {
+        self.flush();
+        self.builder.build(run_id)
     }
 }
 
@@ -416,5 +564,121 @@ mod tests {
         assert_eq!(line0["source"], "stdout");
         let back: RunLog = serde_json::from_value(json).unwrap();
         assert_eq!(back, log);
+    }
+
+    // --- StreamingRunLog (the LIVE per-chunk path) -------------------------
+
+    #[test]
+    fn streaming_emits_complete_lines_and_holds_the_partial_carry() {
+        let mut s = StreamingRunLog::new();
+        s.push_system("spawned adapter");
+        // A chunk that splits a line across a read boundary: "first\nsec" —
+        // "first" is complete, "sec" is a partial carry.
+        s.append_chunk(RunLogSource::Stdout, "first\nsec");
+        let snap = s.snapshot(rid());
+        // The system line + the one complete stdout line are visible; "sec" is NOT
+        // yet (it has no newline) — honest live-tail behaviour.
+        assert_eq!(snap.lines.len(), 2);
+        assert_eq!(snap.lines[0].source, RunLogSource::System);
+        assert_eq!(snap.lines[1].text, "first");
+        // The rest of the line arrives in the next chunk.
+        s.append_chunk(RunLogSource::Stdout, "ond\nthird\n");
+        let snap2 = s.snapshot(rid());
+        assert_eq!(
+            snap2.lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(),
+            vec!["spawned adapter", "first", "second", "third"]
+        );
+    }
+
+    #[test]
+    fn streaming_classifies_each_source_independently() {
+        let mut s = StreamingRunLog::new();
+        s.append_chunk(RunLogSource::Stdout, "out line\n");
+        s.append_chunk(RunLogSource::Stderr, "err line\n");
+        let snap = s.snapshot(rid());
+        assert_eq!(snap.lines[0].source, RunLogSource::Stdout);
+        assert_eq!(snap.lines[0].text, "out line");
+        assert_eq!(snap.lines[1].source, RunLogSource::Stderr);
+        assert_eq!(snap.lines[1].text, "err line");
+    }
+
+    #[test]
+    fn streaming_flush_emits_the_trailing_partial_line() {
+        let mut s = StreamingRunLog::new();
+        s.append_chunk(RunLogSource::Stdout, "no trailing newline");
+        // Before flush, the partial is held back.
+        assert!(s.snapshot(rid()).is_empty());
+        let log = s.into_log(rid());
+        assert_eq!(log.lines.len(), 1);
+        assert_eq!(log.lines[0].text, "no trailing newline");
+    }
+
+    #[test]
+    fn streaming_redacts_each_streamed_line() {
+        let mut s = StreamingRunLog::new();
+        s.append_chunk(
+            RunLogSource::Stdout,
+            "token sk-ant-abcdefghijklmnopqrstuvwxyz0123456789\n",
+        );
+        let snap = s.snapshot(rid());
+        assert_eq!(snap.lines.len(), 1);
+        assert!(
+            !snap.lines[0].text.contains("abcdefghijklmnopqrstuvwxyz"),
+            "secret must be redacted in the streamed line: {}",
+            snap.lines[0].text
+        );
+    }
+
+    #[test]
+    fn streaming_force_emits_a_carry_longer_than_the_line_cap() {
+        let mut s = StreamingRunLog::new();
+        // A long chunk with NO newline must not be buffered forever: it is
+        // force-emitted (clamped) once it exceeds the per-line cap.
+        let long = "y".repeat(MAX_LOG_LINE_CHARS + 100);
+        s.append_chunk(RunLogSource::Stdout, &long);
+        let snap = s.snapshot(rid());
+        assert_eq!(snap.lines.len(), 1);
+        assert_eq!(snap.lines[0].text.chars().count(), MAX_LOG_LINE_CHARS);
+        assert!(snap.lines[0].truncated);
+    }
+
+    #[test]
+    fn streaming_is_bounded_to_the_line_cap_oldest_dropped_live() {
+        let mut s = StreamingRunLog::new();
+        for i in 0..(MAX_LOG_LINES + 30) {
+            s.append_chunk(RunLogSource::Stdout, &format!("line {i}\n"));
+        }
+        // Even mid-stream (before finalize) the snapshot is already bounded — the
+        // builder caps `pending` continuously, so memory can't grow without bound.
+        let snap = s.snapshot(rid());
+        assert_eq!(snap.lines.len(), MAX_LOG_LINES);
+        assert_eq!(snap.dropped_lines, 30);
+        assert_eq!(snap.lines[0].text, "line 30");
+        assert_eq!(snap.lines[0].seq, 1);
+    }
+
+    #[test]
+    fn builder_live_cap_matches_batch_drop_semantics() {
+        // The continuous live-cap must produce the SAME dropped count + tail as the
+        // old build-time drop, so batch (finalize) callers are unaffected.
+        let mut b = RunLogBuilder::new();
+        for i in 0..(MAX_LOG_LINES + 25) {
+            b.push_output(RunLogSource::Stdout, &format!("line {i}"));
+        }
+        let log = b.build(rid());
+        assert_eq!(log.lines.len(), MAX_LOG_LINES);
+        assert_eq!(log.dropped_lines, 25);
+        assert_eq!(log.lines[0].text, "line 25");
+        assert_eq!(log.lines[0].seq, 1);
+    }
+
+    #[test]
+    fn streaming_snapshot_respects_the_since_cursor() {
+        let mut s = StreamingRunLog::new();
+        s.append_chunk(RunLogSource::Stdout, "a\nb\nc\n");
+        let full = s.snapshot(rid());
+        assert_eq!(full.lines.len(), 3);
+        let tail = full.since(Some(1));
+        assert_eq!(tail.lines.iter().map(|l| l.seq).collect::<Vec<_>>(), vec![2, 3]);
     }
 }

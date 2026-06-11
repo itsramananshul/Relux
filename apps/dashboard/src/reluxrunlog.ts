@@ -3,12 +3,15 @@
 // `reluxruntranscript.ts` for the bounded, redacted run-log model
 // (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §8/§10).
 //
-// A run log is the adapter's captured stdout/stderr split into per-line entries
+// A run log is the adapter's stdout/stderr split into per-line entries
 // (classified `stdout`/`stderr`) framed by kernel-authored `system` lines, each
-// carrying a 1-based `seq`. The cursor + merge work on `seq` (a dense numeric
-// sequence — no zero-pad parsing needed, unlike the `revent_NNNN` transcript
-// ids). Nothing here invents data: the helpers only order, de-duplicate, and
-// summarize the real lines the kernel already captured + redacted.
+// carrying a 1-based `seq`. For an in-flight off-lock (parallel) run the backend
+// streams lines into a live tail as the process produces them; once the run
+// finalizes the canonical persisted log is served. Either way the cursor + merge
+// work on `seq` (a dense numeric sequence — no zero-pad parsing needed, unlike
+// the `revent_NNNN` transcript ids). Nothing here invents data: the helpers only
+// order, de-duplicate, and summarize the real lines the kernel already captured +
+// redacted.
 
 import type { ReluxRunLog, ReluxRunLogLine, ReluxRunLogSource } from "./api";
 

@@ -7829,6 +7829,14 @@ impl KernelState {
         }
     }
 
+    /// Whether a CANONICAL (finalized, persisted) run-log tail exists for `run_id`.
+    /// The HTTP `get_run_logs` handler uses this to decide precedence: once the
+    /// durable log exists it wins; until then an in-flight run is served from the
+    /// in-memory live registry (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §8/§10).
+    pub fn has_run_log(&self, run_id: &RunId) -> bool {
+        self.run_logs.contains_key(run_id)
+    }
+
     /// The full append-only audit log, in emission order.
     pub fn audit_log(&self) -> &[AuditEvent] {
         &self.audit_log
@@ -7955,13 +7963,29 @@ impl PreparedBrief {
         &self.plan.task_id
     }
 
+    /// The run id this prepared brief executes under (already started + stamped in
+    /// `prepare_orchestration_round`). Used by the off-lock streaming driver to key
+    /// the live run-log buffer so a poll can find it WHILE the process runs.
+    pub fn run_id(&self) -> &RunId {
+        &self.plan.run_id
+    }
+
     /// Run the prepared adapter process. NO kernel access — pure blocking I/O on
     /// the already-resolved, redaction-ready spec, safe to call on a worker thread
     /// while the kernel lock is released. The returned [`FinishedBrief`] is merged
     /// back into the orchestration record under the lock by
     /// [`KernelState::finalize_prepared_brief`].
     pub fn run(self) -> FinishedBrief {
-        let outcome = crate::adapter::run_adapter_command(&self.plan.spec);
+        self.run_with_sink(None)
+    }
+
+    /// Like [`Self::run`] but additionally streams the adapter's stdout/stderr
+    /// chunks to an optional live [`crate::live_run_log::RunLogSink`] as they are
+    /// read, so a poll of the run's logs sees lines BEFORE it finalizes
+    /// (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §8/§10). The captured outcome is
+    /// unchanged — streaming is strictly additive.
+    pub fn run_with_sink(self, sink: Option<crate::live_run_log::RunLogSink>) -> FinishedBrief {
+        let outcome = crate::adapter::run_adapter_command_streaming(&self.plan.spec, sink);
         FinishedBrief {
             step_index: self.step_index,
             round_no: self.round_no,
@@ -8025,6 +8049,39 @@ pub fn run_briefs_in_parallel(prepared: Vec<PreparedBrief>) -> Vec<FinishedBrief
     let handles: Vec<_> = prepared
         .into_iter()
         .map(|p| std::thread::spawn(move || p.run()))
+        .collect();
+    handles.into_iter().filter_map(|h| h.join().ok()).collect()
+}
+
+/// Like [`run_briefs_in_parallel`] but each brief STREAMS its stdout/stderr lines
+/// to the shared [`crate::live_run_log::LiveRunLogs`] registry as they are read, so
+/// a poll of `GET /v1/relux/runs/:id/logs` shows lines while the briefs run
+/// (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §8/§10 — the LIVE run-log seam). This is
+/// the off-lock driver the HTTP server's non-blocking job uses (the kernel lock is
+/// released during this call, so the live reads are unblocked). A live buffer is
+/// opened per brief before its process starts; the caller drops it via
+/// [`crate::live_run_log::LiveRunLogs::finish`] after the brief's canonical log is
+/// finalized + persisted. The captured outcomes are identical to the non-streaming
+/// driver — streaming is strictly additive.
+pub fn run_briefs_in_parallel_streaming(
+    prepared: Vec<PreparedBrief>,
+    live: &crate::live_run_log::LiveRunLogs,
+) -> Vec<FinishedBrief> {
+    if prepared.len() <= 1 {
+        return prepared
+            .into_iter()
+            .map(|p| {
+                let sink = live.begin(p.run_id());
+                p.run_with_sink(Some(sink))
+            })
+            .collect();
+    }
+    let handles: Vec<_> = prepared
+        .into_iter()
+        .map(|p| {
+            let sink = live.begin(p.run_id());
+            std::thread::spawn(move || p.run_with_sink(Some(sink)))
+        })
         .collect();
     handles.into_iter().filter_map(|h| h.join().ok()).collect()
 }

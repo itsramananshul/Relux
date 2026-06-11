@@ -438,9 +438,13 @@ safe (adds no authority), bounded, feasible in one commit, and reuses existing v
   `--dangerously-skip-permissions`), bounded timeout + output cap, secret-redacted output, read-only
   PATH probe (`find_on_path`). Two CLI-stdout shaping seams both go through `parse_adapter_result`.
 - **Partial/missing**: serverless/sandboxed backends and mid-run cancellation are missing. A bounded,
-  redacted **run-log / tail** of the captured stdout/stderr/system output is now persisted + served +
-  shown (SHIPPED — see §24); LIVE per-chunk streaming during the run (Paperclip `onLog`) is still
-  missing — the synchronous spawn captures only the final output.
+  redacted **run-log / tail** of the captured stdout/stderr/system output is persisted + served + shown
+  (SHIPPED — see §24), and **LIVE per-chunk streaming during the run is now wired** for the off-lock
+  (parallel orchestration) path (SHIPPED THIS ROUND — see §25): `run_adapter_command_streaming` feeds an
+  optional `RunLogSink` as it reads, lines stream into an in-memory `LiveRunLogs` registry, and a poll of
+  `GET /v1/relux/runs/:id/logs` sees them BEFORE the run finalizes. The synchronous in-kernel driver still
+  captures only at finalize (it holds the kernel lock across the spawn, so a live read can't interleave
+  there by construction).
 
 ### Priority & slices
 
@@ -448,8 +452,12 @@ safe (adds no authority), bounded, feasible in one commit, and reuses existing v
   redacted, byte-capped) stdout/stderr split into classified per-line entries + kernel `system` lines,
   serve a pollable `GET /v1/relux/runs/:id/logs?since=<seq>`, and show a Logs/Tail section. Maps
   Paperclip `run-log-store.ts` (`stream: stdout|stderr|system`, offset-cursored bounded read).
-- **P2 — LIVE streaming run-log tails** (Paperclip `onLog` during the run): the synchronous spawn has no
-  per-chunk callback yet, so the tail is captured at finalize and POLLED, not streamed. *(backend, frontend, tests.)*
+- **P2 — LIVE streaming run-log tails (SHIPPED THIS ROUND, §25).** `run_adapter_command_streaming` +
+  `RunLogSink` feed each stdout/stderr chunk into a bounded, redacted `StreamingRunLog` as it is read; the
+  off-lock orchestration driver appends into a process-global `LiveRunLogs` registry, and `get_run_logs`
+  serves that live tail (without the kernel lock) until the canonical persisted log exists. Maps Paperclip
+  `runChildProcess(..., { onLog })`. Remaining: live tailing on the synchronous lock-holding path, an SSE/
+  WebSocket push (this is still POLLED), and a per-run live byte/retention budget beyond the line cap.
 - **P2 — mid-run cancellation** (`AbortSignal`-style) for a long adapter spawn. *(backend, tests.)*
 - **Deferred — serverless backends** (Hermes Modal/Daytona): the "execution workspaces" phase.
 
@@ -505,15 +513,18 @@ safe (adds no authority), bounded, feasible in one commit, and reuses existing v
   config + role presets, approvals view, runs/tasks views, plugins tab, **Doctor panel** (read-only
   health). Dashboard bundle is the git-tracked build output in
   `crates/relix-web-bridge/dashboard-dist`.
-- **Partial/missing**: a bounded, redacted **run-log / tail** (stdout/stderr/system) is now shown in the
-  Work run detail with truncation/redaction markers + a Refresh/poll (SHIPPED — see §24); LIVE-streamed
-  (vs polled) tailing, an org chart, and issue-as-conversation threading remain.
+- **Partial/missing**: a bounded, redacted **run-log / tail** (stdout/stderr/system) is shown in the Work
+  run detail with truncation/redaction markers + a Refresh/poll (SHIPPED — see §24), and it now shows
+  **LIVE lines for an in-flight parallel run** (the poll merges the `?since=<seq>` tail the off-lock spawn
+  streams, so lines appear before the run finalizes — SHIPPED THIS ROUND, see §25); a true SSE/WebSocket
+  push (vs the poll), an org chart, and issue-as-conversation threading remain.
 
 ### Priority & slices
 
-- **P2 — run-log / tail in the run detail (SHIPPED THIS ROUND, §24).** A compact Logs/Tail section with
-  stdout/stderr/system entries, honest truncation/redaction markers, an empty "No logs" state, and a
-  Refresh/poll. LIVE streaming (vs the current poll) pairs with §8. *(frontend, backend, tests.)*
+- **P2 — run-log / tail in the run detail (SHIPPED in §24; LIVE tail SHIPPED in §25).** A compact
+  Logs/Tail section with stdout/stderr/system entries, honest truncation/redaction markers, an empty
+  "No logs"/"No logs yet" state, and a Refresh/poll that now surfaces LIVE lines for an in-flight parallel
+  run before it finalizes. A true SSE/WebSocket push (vs the poll) pairs with §8. *(frontend, backend, tests.)*
 - **P2 — crew org-chart view** once `reports_to` (§3) lands. *(frontend.)*
 
 ---
@@ -1431,10 +1442,89 @@ section for the full reference read + applied-change record. In brief:
   bin/server (115) suites green; clippy clean on both crates; dashboard typecheck + tests (330) +
   bundle rebuild green.
 
-- **Still missing (honest).** LIVE per-chunk streaming during a run (Paperclip `onLog` / SSE/WebSocket —
-  the synchronous spawn captures only the final output, so the tail is captured at finalize and
-  POLLED), mid-run cancellation, a per-run log byte/retention budget beyond the line cap, and
-  cross-run log search all remain open.
+- **Still missing (honest).** At the time of §24, LIVE per-chunk streaming during a run was open; it is now
+  wired for the off-lock parallel path (see §25). Still open: live tailing on the synchronous lock-holding
+  path, a true SSE/WebSocket push (the live tail is still POLLED), mid-run cancellation, a per-run log
+  byte/retention budget beyond the line cap, and cross-run log search.
+
+---
+
+## 25. Implemented this round — LIVE run-log streaming during off-lock adapter execution (§8/§10 P2)
+
+- **Reference read (BINDING).** Paperclip (vendored) `references/paperclip/server/src/adapters/process/execute.ts`
+  + `references/paperclip/packages/adapter-utils/src/server-utils.ts` `runChildProcess(runId, …, { onLog })`:
+  each `child.stdout/stderr.on("data")` chunk is appended to a capped buffer AND streamed via
+  `onLog(stream, chunk)` (serialized through a `logChain` promise) to the per-run NDJSON store while the
+  process runs; the final `RunProcessResult` still carries the full captured `stdout`/`stderr`.
+  `references/paperclip/server/src/services/run-log-store.ts` `append({ ts, stream, chunk })` + offset-cursored
+  `read` is the during-run pollable read. OpenClaw (vendored) `reference/openclaw-main/src/process/exec.ts`
+  (`child.stdout?.on("data", d => chunks.push(...))` + `maxBuffer`) confirms the per-chunk read loop and the
+  always-bounded capture. Relux files read/mapped: `crates/relux-core/src/run_log.rs`,
+  `crates/relux-kernel/src/{adapter.rs,state.rs,server.rs,lib.rs}`,
+  `apps/dashboard/src/{pages/Work.tsx,reluxrunlog.ts}`.
+
+- **Model (bounded, redacted, deterministic).** New `relux_core::StreamingRunLog` (in `run_log.rs`) wraps the
+  existing `RunLogBuilder` plus a per-source carry buffer and **line-buffers** streamed chunks: it emits only
+  COMPLETE lines (split on `\n`, `\r`-stripped, empty-skipped, re-redacted via `redact_secrets`, clamped to
+  `MAX_LOG_LINE_CHARS`) and holds the trailing partial until its newline arrives; a carry that exceeds the
+  per-line cap with no newline is force-emitted so neither the carry nor memory grows without bound. The
+  builder now enforces the `MAX_LOG_LINES` cap **continuously** (`enforce_live_cap`, oldest dropped + counted)
+  so a long LIVE stream is bounded WHILE it runs, not only at finalize — the built record is byte-identical to
+  before for batch callers (a regression test pins this). A non-consuming `snapshot(run_id)` yields the bounded
+  `RunLog` of the complete lines so far; `into_log` flushes the carries then builds. Fully unit-tested in
+  `run_log.rs`.
+
+- **Adapter seam (strictly additive).** `relux_kernel::run_adapter_command_streaming(spec, sink: Option<RunLogSink>)`
+  is the new entry point; `run_adapter_command(spec)` delegates with `None`, so the non-streaming path is
+  unchanged. `spawn_capped_reader` now takes an optional `(RunLogSource, RunLogSink)` and feeds the sink exactly
+  the bytes it KEEPS (never beyond the byte cap; marks the source truncated when the cap is hit), so the live
+  tail and the finalized capture stay consistent. Each of the two reader threads (stdout, stderr) holds its own
+  `RunLogSink` clone and appends concurrently (serialized by the sink's inner mutex); a `system` "spawned
+  adapter" line frames the start and the held partials are flushed after both readers drain. The returned
+  `AdapterRunOutcome` is byte-for-byte the non-streaming result.
+
+- **State / concurrency (no kernel-lock coupling).** The live buffers live in a process-global
+  `relux_kernel::LiveRunLogs` registry (`live_run_log.rs`) — an `Arc<Mutex<HashMap<run_id, Arc<Mutex<StreamingRunLog>>>>>`
+  INDEPENDENT of the kernel store lock, held on the server `AppState`. The off-lock driver
+  `run_briefs_in_parallel_streaming(prepared, &live)` opens a buffer per brief (`live.begin(run_id)`) before its
+  process starts and streams into it with the kernel lock RELEASED (the existing parallel-orchestration window);
+  after the round finalizes and persists the canonical logs, the server drops the live buffers
+  (`live.finish(run_id)`). The registry is bounded by a `MAX_LIVE_RUNS` backstop (oldest evicted) so a leaked
+  entry can't grow unbounded. Because the spawn streams while the lock is free and `get_run_logs` reads the
+  registry WITHOUT the kernel lock, a poll is never blocked by (or blocks) a kernel operation. The synchronous
+  in-kernel driver holds the lock across its spawn, so it keeps capturing at finalize — honest, since no reader
+  can interleave there anyway.
+
+- **API (precedence: durable wins, else live).** `GET /v1/relux/runs/:id/logs?since=<seq>` still validates the
+  run (404 on unknown) and reads the durable log under the lock; a new `KernelState::has_run_log` decides
+  precedence — once the canonical persisted `RunLog` exists it is served, otherwise the handler falls to
+  `LiveRunLogs::snapshot(run_id, since)` (the in-flight tail), and with neither it returns the honest empty tail.
+  `since` works identically over the live tail (the dense `seq` cursor), so the existing incremental poll merges
+  live lines with no client change.
+
+- **UI.** No new endpoint or polling code — the existing 1.5s in-flight poll already fetches `?since=<seq>` and
+  merges via `mergeRunLog`, so it now surfaces live lines for an in-flight parallel run automatically. Only the
+  COPY changed to stop calling streaming a "future capability": the Work Logs/Tail header/notes now say the tail
+  is LIVE for an in-flight parallel run (lines appear before finalize), polled + merged incrementally, no
+  WebSocket; the empty state reads "No logs yet for this run." while in flight. The committed dashboard bundle
+  was rebuilt.
+
+- **Tests.** `run_log.rs`: streaming emits complete lines + holds the partial carry across a chunk boundary,
+  per-source classification, flush emits the trailing partial, per-line redaction, force-emit of an
+  over-cap carry, continuous live cap (oldest dropped mid-stream) + a regression that the live cap matches the
+  old batch drop semantics, and `since` over a streamed snapshot. `live_run_log.rs`: lines visible via snapshot
+  before `finish`, `since` over the live tail, `finish` drops the buffer, unknown run → `None`, the
+  `MAX_LIVE_RUNS` backstop, and two sink clones appending to one buffer. `adapter.rs`: a real fake-CLI streaming
+  run captures classified stdout/stderr + the system framing line into the live buffer, a **real slow process
+  (LINE_ONE → ~1s sleep → LINE_TWO) is observed via the live tail BEFORE the worker finalizes** (robust on
+  Windows via `ping -n 2`), and `None`-sink parity with `run_adapter_command`. `server.rs`: `get_run_logs`
+  serves the LIVE tail (full + `?since=` incremental) for a RUNNING run with no durable log, then the durable
+  log wins after `finish`. Full `relux-core` (178) + `relux-kernel` lib (671) + bin/server (116) suites green;
+  clippy clean on both crates; dashboard typecheck + tests (330) + bundle rebuild green.
+
+- **Still missing (honest).** Live tailing on the synchronous lock-holding driver, a true SSE/WebSocket push
+  (the live tail is still POLLED on the 1.5s cadence), mid-run cancellation, a per-run live byte/retention
+  budget beyond the line cap, and cross-run log search all remain open.
 
 ---
 

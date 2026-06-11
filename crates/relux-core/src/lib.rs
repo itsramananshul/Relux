@@ -70,7 +70,8 @@ pub use proposed_change::{
 pub use redact::redact_secrets;
 pub use run::{Run, RunId, RunStatus};
 pub use run_log::{
-    RunLog, RunLogBuilder, RunLogLine, RunLogSource, MAX_LOG_LINES, MAX_LOG_LINE_CHARS,
+    RunLog, RunLogBuilder, RunLogLine, RunLogSource, StreamingRunLog, MAX_LOG_LINES,
+    MAX_LOG_LINE_CHARS,
 };
 pub use run_failure::{
     classify_failure, retry_delay_secs, safe_public_message, RunFailureClass, RunRetryState,

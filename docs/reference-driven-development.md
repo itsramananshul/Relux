@@ -2746,3 +2746,61 @@ and the audit. A run with no captured log returns an EMPTY tail (not an error), 
   `apps/dashboard/src/pages/Work.tsx` (the Logs/Tail section + poll).
 
 See `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §24 for the applied-change record and the remaining streaming gap.
+
+## Reference read — LIVE run-log streaming during off-lock adapter execution (this slice)
+
+### Files read (reference)
+
+- `references/paperclip/server/src/adapters/process/execute.ts` — the process adapter passes an `onLog`
+  callback into `runChildProcess(runId, command, args, { …, onLog })`; the final result still carries
+  `resultJson.stdout`/`stderr`.
+- `references/paperclip/packages/adapter-utils/src/server-utils.ts` `runChildProcess` (~L2075) — the real
+  spawn: `child.stdout.on("data", chunk => { stdout = appendWithCap(stdout, text); logChain = logChain
+  .then(() => onLog("stdout", text)) … })` and the identical `stderr` handler. **Pattern learned:** each
+  read chunk is BOTH appended to a capped buffer AND streamed to the live store, serialized through a
+  `logChain` promise so appends never interleave; the captured final output is preserved alongside.
+- `references/paperclip/server/src/services/run-log-store.ts` — `append({ ts, stream, chunk })` to a per-run
+  NDJSON file + an offset-cursored bounded `read`, so a client polls the during-run tail.
+- `reference/openclaw-main/src/process/exec.ts` (~L444) — `child.stdout?.on("data", d => { stdoutChunks.push(…);
+  armNoOutputTimer(); })` + a `maxBuffer` bound. **Pattern learned:** the per-chunk read loop is the unit of
+  streaming, and captured output is ALWAYS bounded.
+
+### The exact logic learned
+
+Live streaming = feed each stdout/stderr READ CHUNK to a sink as it arrives (not at finalize), while still
+keeping the full final capture; serialize the appends; bound the buffer; classify by stream; read the
+during-run tail with an offset/seq cursor. Liveness needs the spawn to run where a reader can observe it —
+i.e. NOT behind the same lock the reader needs.
+
+### How Relux maps it
+
+| Paperclip/OpenClaw pattern | Relux adaptation |
+|---|---|
+| `onLog(stream, chunk)` per read chunk | `run_adapter_command_streaming(spec, Option<RunLogSink>)` + `spawn_capped_reader(reader, max, Option<(RunLogSource, RunLogSink)>)`; the sink is fed exactly the KEPT bytes (≤ byte cap), classified by source. `run_adapter_command` delegates with `None` (unchanged). |
+| Append chunk to capped buffer AND stream it; preserve final stdout/stderr | The capped reader still returns the final redacted/capped `stdout`/`stderr`; streaming is strictly additive (the `AdapterRunOutcome` is byte-for-byte identical). |
+| `logChain` serializes appends | `RunLogSink` wraps `Arc<Mutex<StreamingRunLog>>`; the two reader threads' appends serialize on the mutex. |
+| Per-run NDJSON store + offset `read` during the run | In-memory `LiveRunLogs` registry (`Arc<Mutex<HashMap<run_id, Arc<Mutex<StreamingRunLog>>>>>`) on `AppState`, INDEPENDENT of the kernel lock; `get_run_logs` reads `snapshot(run_id, since)` without the kernel lock. The durable per-run `RunLog` (built at finalize) is the canonical source once it exists (`has_run_log` precedence). |
+| Chunk may split a line | `StreamingRunLog` line-buffers per source (carry until `\n`), emits only complete lines (re-redacted + clamped), force-emits an over-cap carry; `flush` emits the trailing partial at end. |
+| `maxBuffer` (always bounded) | `RunLogBuilder` now enforces `MAX_LOG_LINES` continuously (`enforce_live_cap`, oldest dropped + counted) so a LIVE stream is bounded mid-run; `MAX_LIVE_RUNS` bounds the registry. |
+
+**What we deliberately do differently:** Paperclip persists raw NDJSON chunks to a file and pushes via the
+store; Relux keeps the live tail in an in-memory bounded `StreamingRunLog` (per-line, three-stream, redacted)
+and serves it by POLL (no SSE/WebSocket). Liveness is wired ONLY for the off-lock parallel-orchestration
+driver (the one path that releases the kernel lock during the spawn); the synchronous in-kernel driver holds
+the lock across its spawn, so it keeps capturing at finalize — stated plainly in the UI copy and the audit.
+
+### Files changed in Relux
+
+- `crates/relux-core/src/run_log.rs` — `StreamingRunLog` + the continuous `enforce_live_cap` + non-consuming
+  `snapshot`; exported from `crates/relux-core/src/lib.rs`. Pure unit tests.
+- `crates/relux-kernel/src/live_run_log.rs` (new) — `LiveRunLogs` registry + `RunLogSink`; exported from
+  `lib.rs`.
+- `crates/relux-kernel/src/adapter.rs` — `run_adapter_command_streaming` + the sink-fed `spawn_capped_reader`.
+- `crates/relux-kernel/src/state.rs` — `PreparedBrief::{run_id,run_with_sink}`,
+  `run_briefs_in_parallel_streaming`, `KernelState::has_run_log`.
+- `crates/relux-kernel/src/server.rs` — `AppState.live_run_logs`, `run_parallel_round` streams + finishes,
+  `get_run_logs` durable-vs-live precedence.
+- `apps/dashboard/src/pages/Work.tsx` + `reluxrunlog.ts` — copy now describes a LIVE (polled) tail; bundle
+  rebuilt.
+
+See `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §25 for the applied-change record and the remaining gaps.

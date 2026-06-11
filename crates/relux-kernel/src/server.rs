@@ -87,6 +87,14 @@ struct AppState {
     /// (the durable orchestration record still carries the real per-brief progress
     /// recorded round-by-round). See [`JobRegistry`].
     jobs: JobRegistry,
+    /// In-process registry of LIVE run-log buffers for in-flight adapter runs. The
+    /// off-lock orchestration spawn streams stdout/stderr lines here as they are
+    /// read, so `GET /v1/relux/runs/:id/logs` can show a tail BEFORE the run
+    /// finalizes; once the canonical log is persisted the durable log wins and the
+    /// live buffer is dropped. Independent of the kernel `lock`, so a live poll
+    /// never blocks on a kernel operation. See [`relux_kernel::LiveRunLogs`] and
+    /// `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §8/§10.
+    live_run_logs: relux_kernel::LiveRunLogs,
 }
 
 /// Resolve the effective AI config from the local secrets file (when present)
@@ -124,6 +132,7 @@ async fn serve() -> Result<(), KernelError> {
         auth_disabled: auth_disabled_from_env(),
         lock: Arc::new(Mutex::new(())),
         jobs: JobRegistry::default(),
+        live_run_logs: relux_kernel::LiveRunLogs::new(),
     };
 
     // Bootstrap + persist once so a fresh store already lists the bundled
@@ -1418,14 +1427,29 @@ async fn get_run_logs(
     // A `since=0` cursor degrades to a full tail (lines are 1-based, so nothing
     // is ever filtered by 0 anyway, but treat it as "no cursor" explicitly).
     let since = query.since.filter(|s| *s > 0);
-    let log = locked_read(&state, |kernel| {
+    // Read the durable log under the kernel lock (also the 404 validation). A run
+    // that has FINALIZED carries the canonical persisted log; an in-flight run does
+    // not yet, so we fall to the live registry below.
+    let (has_persisted, persisted) = locked_read(&state, |kernel| {
         // 404 only for an unknown run; a real run with no captured log returns
         // the empty tail.
         kernel
             .run(&run_id)
             .ok_or_else(|| KernelError::UnknownRun(run_id.to_string()))?;
-        Ok(kernel.run_log(&run_id, since))
+        Ok((kernel.has_run_log(&run_id), kernel.run_log(&run_id, since)))
     })?;
+    // Precedence: the finalized durable log wins once it exists. Until then, serve
+    // the LIVE tail streamed by an in-flight off-lock run (read WITHOUT the kernel
+    // lock, so it is unblocked while the run streams). With neither, the durable
+    // empty tail is the honest "No logs" state.
+    let log = if has_persisted {
+        persisted
+    } else {
+        state
+            .live_run_logs
+            .snapshot(&run_id, since)
+            .unwrap_or(persisted)
+    };
     Ok(Json(log))
 }
 
@@ -5067,9 +5091,18 @@ fn run_parallel_round(
         });
     }
 
+    // The run ids about to stream — captured before `prepared` is consumed so we can
+    // drop their live buffers once their canonical logs are finalized below.
+    let streamed_run_ids: Vec<relux_core::RunId> =
+        prepared.iter().map(|p| p.run_id().clone()).collect();
+
     // Phase 2: run the prepared adapter processes in parallel with the lock RELEASED,
-    // through the SAME shared spawn primitive the synchronous kernel driver uses.
-    let finished = relux_kernel::run_briefs_in_parallel(prepared);
+    // through the streaming spawn primitive — each brief's stdout/stderr lines are
+    // appended to the shared live run-log registry as they are read, so a poll of
+    // `GET /v1/relux/runs/:id/logs` sees the tail WHILE the briefs run (the lock is
+    // free during this window). The captured outcomes are identical to the
+    // non-streaming driver.
+    let finished = relux_kernel::run_briefs_in_parallel_streaming(prepared, &state.live_run_logs);
 
     // Phase 3: merge every finished brief back under the lock, then finalize.
     let snap = locked_save_persisting(state, move |kernel| {
@@ -5081,6 +5114,13 @@ fn run_parallel_round(
         let snap = kernel.orchestration(oid).cloned();
         Ok((result, snap))
     })?;
+
+    // The canonical, persisted run logs now exist (finalize captured them), so drop
+    // the in-memory live buffers — subsequent polls serve the durable log and the
+    // live registry stays bounded.
+    for rid in &streamed_run_ids {
+        state.live_run_logs.finish(rid);
+    }
     Ok(snap)
 }
 
@@ -7293,6 +7333,7 @@ mod tests {
             auth_disabled: false,
             lock: Arc::new(Mutex::new(())),
             jobs: JobRegistry::default(),
+            live_run_logs: relux_kernel::LiveRunLogs::new(),
         };
         (state, dir, oid)
     }
@@ -7460,6 +7501,7 @@ mod tests {
             auth_disabled: false,
             lock: Arc::new(Mutex::new(())),
             jobs: JobRegistry::default(),
+            live_run_logs: relux_kernel::LiveRunLogs::new(),
         }
     }
 
@@ -8443,6 +8485,7 @@ mod tests {
             auth_disabled,
             lock: Arc::new(Mutex::new(())),
             jobs: JobRegistry::default(),
+            live_run_logs: relux_kernel::LiveRunLogs::new(),
         };
         (state, dir)
     }
@@ -8593,6 +8636,95 @@ mod tests {
         let (status3, _c, _b) =
             call(&state, "GET", "/v1/relux/runs/run_does_not_exist/logs", None, None).await;
         assert_eq!(status3, StatusCode::BAD_REQUEST);
+    }
+
+    /// Seed a RUNNING run with NO finalized log (started, not executed) and return
+    /// its run id. Mirrors an in-flight off-lock orchestration brief whose process
+    /// is still streaming, so `get_run_logs` must serve the LIVE registry, not the
+    /// (absent) durable log.
+    fn seed_running_run_without_log(state: &AppState) -> String {
+        let mut store = SqliteStore::open(&state.db_path).expect("open");
+        let mut kernel = store.load().expect("load");
+        let ns = relux_core::NamespaceId::new("workspace");
+        let adapter = relux_core::PluginId::new("relux-adapter-local-prime");
+        let agent = kernel
+            .create_agent("coder", "Coder", "writes code", &adapter, &ns, None, vec![])
+            .expect("agent");
+        let task = kernel.create_task(
+            "Summarize",
+            serde_json::json!({ "path": "." }),
+            "founder",
+            &ns,
+            vec![],
+        );
+        kernel.assign_task(&task, &agent).expect("assign");
+        let run = kernel.start_run(&task).expect("start run");
+        store.save(&kernel).expect("save");
+        run.to_string()
+    }
+
+    #[tokio::test]
+    async fn run_logs_route_serves_the_live_tail_before_finalization() {
+        let (state, _dir) = auth_state(true);
+        // A real, RUNNING run that has not finalized — so the durable log is empty.
+        let run_id = seed_running_run_without_log(&state);
+        let rid = relux_core::RunId::new(run_id.clone());
+
+        // With no live buffer yet, the route returns the honest empty tail (200).
+        let (status0, _c, body0) =
+            call(&state, "GET", &format!("/v1/relux/runs/{run_id}/logs"), None, None).await;
+        assert_eq!(status0, StatusCode::OK, "body: {body0}");
+        let log0: serde_json::Value = serde_json::from_str(&body0).unwrap();
+        assert!(log0["lines"].as_array().unwrap().is_empty(), "no live + no durable ⇒ empty");
+
+        // Now stream some live lines (as an off-lock spawn would).
+        let sink = state.live_run_logs.begin(&rid);
+        sink.system("spawned adapter 'fake'");
+        sink.append(relux_core::RunLogSource::Stdout, "live out line\n");
+        sink.append(relux_core::RunLogSource::Stderr, "live err line\n");
+
+        // A poll DURING the run now sees the live tail — before any finalize.
+        let (status1, _c, body1) =
+            call(&state, "GET", &format!("/v1/relux/runs/{run_id}/logs"), None, None).await;
+        assert_eq!(status1, StatusCode::OK, "body: {body1}");
+        let log1: serde_json::Value = serde_json::from_str(&body1).unwrap();
+        let lines = log1["lines"].as_array().expect("lines");
+        assert!(
+            lines.iter().any(|l| l["source"] == "stdout"
+                && l["text"].as_str().unwrap_or_default().contains("live out line")),
+            "live stdout line must be served before finalization: {body1}"
+        );
+        assert!(
+            lines.iter().any(|l| l["source"] == "system"),
+            "the live system framing line must be present: {body1}"
+        );
+        let last_seq = lines.last().unwrap()["seq"].as_u64().unwrap();
+
+        // Incremental ?since=<seq> over the LIVE tail returns only newer lines.
+        sink.append(relux_core::RunLogSource::Stdout, "another live line\n");
+        let (status2, _c, body2) = call(
+            &state,
+            "GET",
+            &format!("/v1/relux/runs/{run_id}/logs?since={last_seq}"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status2, StatusCode::OK);
+        let log2: serde_json::Value = serde_json::from_str(&body2).unwrap();
+        let tail = log2["lines"].as_array().unwrap();
+        assert_eq!(tail.len(), 1, "only the line past the cursor: {body2}");
+        assert!(tail[0]["text"].as_str().unwrap().contains("another live line"));
+
+        // Once the run finalizes (durable log persisted) the live buffer is dropped
+        // and the canonical log wins — modelled by finishing the live entry.
+        state.live_run_logs.finish(&rid);
+        let (status3, _c, body3) =
+            call(&state, "GET", &format!("/v1/relux/runs/{run_id}/logs"), None, None).await;
+        assert_eq!(status3, StatusCode::OK);
+        let log3: serde_json::Value = serde_json::from_str(&body3).unwrap();
+        // The durable log for this never-executed run is empty (no fabricated lines).
+        assert!(log3["lines"].as_array().unwrap().is_empty(), "durable wins, honestly empty: {body3}");
     }
 
     #[tokio::test]
@@ -9558,6 +9690,7 @@ mod tests {
             auth_disabled: false,
             lock: Arc::new(Mutex::new(())),
             jobs: JobRegistry::default(),
+            live_run_logs: relux_kernel::LiveRunLogs::new(),
         };
 
         // Boot 1: first-run setup mints a session cookie.

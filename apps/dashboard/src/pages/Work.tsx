@@ -532,9 +532,11 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
   }, [runId]);
 
   // Manual Refresh / Poll for the log tail: fetch only the lines past our cursor
-  // and merge them on (a full re-fetch when we hold no cursor yet). Pollable, not
-  // streamed — live token streaming is a future backend seam (no `onLog` on the
-  // synchronous spawn). Never clears the last good tail on a transient error.
+  // and merge them on (a full re-fetch when we hold no cursor yet). For an
+  // in-flight off-lock (parallel) run the backend streams lines into a live tail
+  // as the process produces them, so this poll surfaces them before the run
+  // finalizes; a synchronous run still shows its tail at finalize. No WebSocket —
+  // pollable. Never clears the last good tail on a transient error.
   async function refreshLogs() {
     setLogsError(null);
     try {
@@ -940,11 +942,14 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
           ) : (
             <div className="empty sm">No events found for this run.</div>
           )}
-          {/* Bounded, redacted run-log / tail: the adapter's captured
-              stdout/stderr split into per-line entries, framed by kernel
-              `system` lines (spawn/exit/timeout). Pollable, not streamed — live
-              token streaming is a future backend seam. Shows truncation +
-              redaction markers honestly and never blanks when there are no logs
+          {/* Bounded, redacted run-log / tail: the adapter's stdout/stderr split
+              into per-line entries, framed by kernel `system` lines
+              (spawn/exit/timeout). LIVE for an off-lock (parallel) run — the
+              spawn streams each line as it is read and the in-flight poll merges
+              the `?since=<seq>` tail, so lines appear BEFORE the run finalizes;
+              once finalized the canonical persisted log is served. Polled (no
+              WebSocket). Shows truncation + redaction markers honestly and never
+              blanks when there are no logs
               (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §8/§10). */}
           <h5 style={{ marginTop: 16, marginBottom: 8 }}>
             Logs / Tail
@@ -953,7 +958,7 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
               className="btn xs ghost"
               style={{ marginLeft: 8, fontSize: 10, verticalAlign: "middle" }}
               onClick={() => { void refreshLogs(); }}
-              title="Re-fetch the bounded log tail (pollable; live streaming is a future backend capability)"
+              title="Re-fetch the bounded log tail (live for an in-flight parallel run; merged incrementally by the poll)"
             >
               ↻ Refresh
             </button>
@@ -971,8 +976,8 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
             })()}
           </h5>
           <div className="muted" style={{ fontSize: 10, marginBottom: 6 }}>
-            stdout/stderr/system lines — already secret-redacted and bounded. Pollable tail
-            (live streaming during a run is a future capability).
+            stdout/stderr/system lines — already secret-redacted and bounded. Live tail for an
+            in-flight parallel run (lines appear before it finalizes); polled, merged incrementally.
           </div>
           {logsLoading && !runLog ? (
             <div className="loading">Loading logs...</div>
@@ -1014,7 +1019,9 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
               </table>
             </div>
           ) : (
-            <div className="empty sm">No logs captured for this run.</div>
+            <div className="empty sm">
+              {inFlight ? "No logs yet for this run." : "No logs captured for this run."}
+            </div>
           )}
           {/* Read-only artifact references the adapter declared in its result
               envelope. References only (name/type/summary/source) — no diff, no

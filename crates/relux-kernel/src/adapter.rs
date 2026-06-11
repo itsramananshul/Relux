@@ -32,7 +32,9 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use relux_core::{redact_secrets, AdapterKind};
+use relux_core::{redact_secrets, AdapterKind, RunLogSource};
+
+use crate::live_run_log::RunLogSink;
 
 /// The safe, non-bypass permission mode Relux passes to the Claude CLI. This is
 /// deliberately NOT `bypassPermissions` and Relux never passes
@@ -255,6 +257,32 @@ fn path_extensions() -> Vec<String> {
 /// closed so it can never block on interactive input. On timeout the child is
 /// killed.
 pub fn run_adapter_command(spec: &AdapterCommandSpec) -> std::io::Result<AdapterRunOutcome> {
+    run_adapter_command_streaming(spec, None)
+}
+
+/// Like [`run_adapter_command`] but additionally **streams** each stdout/stderr
+/// chunk to an optional live [`RunLogSink`] as it is read, so a poll of
+/// `GET /v1/relux/runs/:id/logs` can show lines BEFORE the run finalizes
+/// (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §8/§10 — the LIVE run-log seam mirroring
+/// Paperclip's `runChildProcess(..., { onLog })`).
+///
+/// The sink is fed the SAME bytes that are kept for the final capture (up to the
+/// byte cap), classified by source and line-buffered + re-redacted + clamped inside
+/// the sink's [`relux_core::StreamingRunLog`]. The returned [`AdapterRunOutcome`]
+/// is byte-for-byte what the non-streaming path produces (the final, redacted,
+/// capped stdout/stderr) — streaming is strictly additive and never alters the
+/// captured result. With `sink: None` this is exactly the original behaviour.
+///
+/// The final, canonical `RunLog` is still built by the kernel at finalize from this
+/// outcome; the live sink is a DURING-run view that the kernel drops once the
+/// durable log exists, so a line is never double-counted within one log.
+pub fn run_adapter_command_streaming(
+    spec: &AdapterCommandSpec,
+    sink: Option<RunLogSink>,
+) -> std::io::Result<AdapterRunOutcome> {
+    if let Some(s) = &sink {
+        s.system(format!("spawned adapter '{}'", spec.program));
+    }
     let mut command = Command::new(&spec.program);
     command
         .args(&spec.args)
@@ -283,8 +311,19 @@ pub fn run_adapter_command(spec: &AdapterCommandSpec) -> std::io::Result<Adapter
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let max = spec.max_output_bytes;
-    let out_handle = spawn_capped_reader(stdout, max);
-    let err_handle = spawn_capped_reader(stderr, max);
+    // Each reader thread gets its OWN sink clone so it can append its stream's
+    // chunks concurrently (the sink serializes appends internally). The sink also
+    // carries the source so the two streams stay classified.
+    let out_handle = spawn_capped_reader(
+        stdout,
+        max,
+        sink.as_ref().map(|s| (RunLogSource::Stdout, s.clone())),
+    );
+    let err_handle = spawn_capped_reader(
+        stderr,
+        max,
+        sink.as_ref().map(|s| (RunLogSource::Stderr, s.clone())),
+    );
 
     // Poll for completion until the timeout, then kill. std has no wait-with-
     // timeout, so this is a short-sleep poll loop - cheap and deterministic.
@@ -310,6 +349,12 @@ pub fn run_adapter_command(spec: &AdapterCommandSpec) -> std::io::Result<Adapter
     let (stdout_bytes, stdout_truncated) = out_handle.join().unwrap_or_default();
     let (stderr_bytes, stderr_truncated) = err_handle.join().unwrap_or_default();
 
+    // Flush any held partial (newline-less) trailing line into the live tail so the
+    // last line of a process that didn't end in a newline still streams.
+    if let Some(s) = &sink {
+        s.flush();
+    }
+
     let exit_code = status.as_ref().and_then(|s| s.code());
     let success = !timed_out && status.map(|s| s.success()).unwrap_or(false);
 
@@ -329,7 +374,18 @@ pub fn run_adapter_command(spec: &AdapterCommandSpec) -> std::io::Result<Adapter
 /// Read a child pipe to EOF on its own thread, keeping at most `max` bytes and
 /// reporting whether more was produced (truncation). The reader always drains to
 /// EOF so the child never blocks on a full pipe.
-fn spawn_capped_reader<R>(reader: Option<R>, max: usize) -> std::thread::JoinHandle<(Vec<u8>, bool)>
+///
+/// When `stream_sink` is set, each chunk that is KEPT (i.e. within the byte cap) is
+/// also fed to the live [`RunLogSink`] under its source as it is read — the LIVE
+/// streaming seam. The sink is fed exactly the bytes that land in the final capture
+/// (never beyond the cap), so the live tail and the finalized log stay consistent.
+/// When the cap is first hit, the sink is marked truncated for that source so the
+/// in-flight UI shows an honest byte-capped marker.
+fn spawn_capped_reader<R>(
+    reader: Option<R>,
+    max: usize,
+    stream_sink: Option<(RunLogSource, RunLogSink)>,
+) -> std::thread::JoinHandle<(Vec<u8>, bool)>
 where
     R: Read + Send + 'static,
 {
@@ -345,8 +401,17 @@ where
                         if kept.len() < max {
                             let take = (max - kept.len()).min(n);
                             kept.extend_from_slice(&chunk[..take]);
+                            // Stream the kept slice live (lossy UTF-8 per chunk; the
+                            // sink line-buffers, so a line split across reads is
+                            // reassembled before it is emitted/redacted).
+                            if let Some((source, s)) = &stream_sink {
+                                s.append(*source, &String::from_utf8_lossy(&chunk[..take]));
+                            }
                             if take < n {
                                 truncated = true;
+                                if let Some((source, s)) = &stream_sink {
+                                    s.mark_source_truncation(*source);
+                                }
                             }
                         } else {
                             truncated = true;
@@ -560,5 +625,184 @@ mod tests {
             max_output_bytes: 1024,
         };
         assert!(run_adapter_command(&spec).is_err());
+    }
+
+    // --- LIVE streaming (the `onLog`-style sink) ---------------------------
+
+    /// Write a fake CLI that prints one stdout line, then one stderr line, then
+    /// exits 0 — so a streaming run produces both classified sources.
+    fn write_two_stream_cli(dir: &std::path::Path, name: &str) -> PathBuf {
+        #[cfg(windows)]
+        {
+            let path = dir.join(format!("{name}.cmd"));
+            std::fs::write(
+                &path,
+                "@echo off\r\necho OUT_LINE\r\necho ERR_LINE 1>&2\r\n",
+            )
+            .unwrap();
+            path
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.join(name);
+            std::fs::write(&path, "#!/bin/sh\necho OUT_LINE\necho ERR_LINE 1>&2\n").unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+            path
+        }
+    }
+
+    /// Write a fake CLI that prints LINE_ONE, sleeps ~1s, then prints LINE_TWO and
+    /// exits 0 — used to prove a poll sees LINE_ONE BEFORE the run finalizes.
+    fn write_slow_cli(dir: &std::path::Path, name: &str) -> PathBuf {
+        #[cfg(windows)]
+        {
+            let path = dir.join(format!("{name}.cmd"));
+            // `ping -n 2 localhost` waits ~1s with no extra deps; output is
+            // suppressed so only our two lines stream.
+            std::fs::write(
+                &path,
+                "@echo off\r\necho LINE_ONE\r\nping -n 2 127.0.0.1 >NUL\r\necho LINE_TWO\r\n",
+            )
+            .unwrap();
+            path
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.join(name);
+            std::fs::write(&path, "#!/bin/sh\necho LINE_ONE\nsleep 1\necho LINE_TWO\n").unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+            path
+        }
+    }
+
+    #[test]
+    fn streaming_sink_captures_classified_lines_and_system_framing() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_two_stream_cli(dir.path(), "stream-agent");
+        let spec = AdapterCommandSpec {
+            program: bin.to_string_lossy().to_string(),
+            args: vec![],
+            stdin: String::new(),
+            working_dir: None,
+            timeout: Duration::from_secs(10),
+            max_output_bytes: 4096,
+        };
+        let live = crate::live_run_log::LiveRunLogs::new();
+        let run_id = relux_core::RunId::new("run_stream_1");
+        let sink = live.begin(&run_id);
+        let outcome = run_adapter_command_streaming(&spec, Some(sink)).expect("spawn ok");
+        assert!(outcome.success, "stderr: {}", outcome.stderr);
+        // The final captured output is unchanged by streaming.
+        assert!(outcome.stdout.contains("OUT_LINE"));
+        assert!(outcome.stderr.contains("ERR_LINE"));
+        // The live buffer carries the system spawn line + both classified streams.
+        let snap = live.snapshot(&run_id, None).expect("live buffer");
+        assert!(
+            snap.lines.iter().any(|l| l.source == RunLogSource::System
+                && l.text.contains("spawned adapter")),
+            "system spawn line missing: {:?}",
+            snap.lines
+        );
+        assert!(
+            snap.lines
+                .iter()
+                .any(|l| l.source == RunLogSource::Stdout && l.text.contains("OUT_LINE")),
+            "stdout line missing: {:?}",
+            snap.lines
+        );
+        assert!(
+            snap.lines
+                .iter()
+                .any(|l| l.source == RunLogSource::Stderr && l.text.contains("ERR_LINE")),
+            "stderr line missing: {:?}",
+            snap.lines
+        );
+    }
+
+    #[test]
+    fn streaming_lines_are_visible_before_the_run_finalizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_slow_cli(dir.path(), "slow-agent");
+        let spec = AdapterCommandSpec {
+            program: bin.to_string_lossy().to_string(),
+            args: vec![],
+            stdin: String::new(),
+            working_dir: None,
+            timeout: Duration::from_secs(20),
+            max_output_bytes: 4096,
+        };
+        let live = crate::live_run_log::LiveRunLogs::new();
+        let run_id = relux_core::RunId::new("run_stream_slow");
+        let sink = live.begin(&run_id);
+
+        // Run the (slow) process on a worker thread; the main thread polls the live
+        // tail. The fake prints LINE_ONE, then sleeps ~1s, then LINE_TWO — so the
+        // poll observes LINE_ONE well before the worker returns.
+        let worker = std::thread::spawn(move || run_adapter_command_streaming(&spec, Some(sink)));
+
+        let mut saw_line_one_live = false;
+        // Poll up to ~6s; bail as soon as LINE_ONE appears while the worker runs.
+        for _ in 0..120 {
+            if worker.is_finished() {
+                break;
+            }
+            if let Some(snap) = live.snapshot(&run_id, None) {
+                if snap
+                    .lines
+                    .iter()
+                    .any(|l| l.source == RunLogSource::Stdout && l.text.contains("LINE_ONE"))
+                {
+                    // LINE_ONE is live AND the process hasn't finished (it is mid
+                    // sleep) — LINE_TWO must not be present yet.
+                    saw_line_one_live = !worker.is_finished();
+                    if saw_line_one_live {
+                        assert!(
+                            !snap.lines.iter().any(|l| l.text.contains("LINE_TWO")),
+                            "LINE_TWO appeared before the sleep elapsed: {:?}",
+                            snap.lines
+                        );
+                    }
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let outcome = worker.join().expect("worker joined").expect("spawn ok");
+        assert!(outcome.success, "stderr: {}", outcome.stderr);
+        assert!(
+            saw_line_one_live,
+            "LINE_ONE was not observed via the live tail before the run finalized"
+        );
+        // After completion the live buffer holds both lines (flush emitted any tail).
+        let snap = live.snapshot(&run_id, None).expect("live buffer");
+        assert!(snap.lines.iter().any(|l| l.text.contains("LINE_ONE")));
+        assert!(snap.lines.iter().any(|l| l.text.contains("LINE_TWO")));
+    }
+
+    #[test]
+    fn non_streaming_run_is_unchanged_with_no_sink() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_fake_cli(dir.path(), "plain-agent", "PLAIN_OUT");
+        let spec = AdapterCommandSpec {
+            program: bin.to_string_lossy().to_string(),
+            args: vec![],
+            stdin: String::new(),
+            working_dir: None,
+            timeout: Duration::from_secs(10),
+            max_output_bytes: 1024,
+        };
+        // `run_adapter_command` (no sink) and the streaming variant with `None`
+        // produce the same successful capture.
+        let a = run_adapter_command(&spec).expect("spawn ok");
+        let b = run_adapter_command_streaming(&spec, None).expect("spawn ok");
+        assert!(a.success && b.success);
+        assert!(a.stdout.contains("PLAIN_OUT") && b.stdout.contains("PLAIN_OUT"));
     }
 }

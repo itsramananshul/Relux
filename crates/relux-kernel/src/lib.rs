@@ -26,6 +26,7 @@ pub mod builtin;
 pub mod clock;
 pub mod doctor;
 pub mod event;
+pub mod live_run_log;
 pub mod loader;
 pub mod plugin_install;
 pub mod plugin_tool_config;
@@ -51,8 +52,9 @@ pub mod store;
 
 pub use adapter::{
     build_adapter_args, build_resume_adapter_args, compose_prompt, find_on_path,
-    run_adapter_command, AdapterCommandSpec, AdapterRunOutcome,
+    run_adapter_command, run_adapter_command_streaming, AdapterCommandSpec, AdapterRunOutcome,
 };
+pub use live_run_log::{LiveRunLogs, RunLogSink};
 pub use agent_config::{
     validate_agent_update, validate_new_agent, AgentConfigError, CreateAgentInput,
     ResolvedAgentUpdate, ResolvedNewAgent, UpdateAgentInput,
@@ -156,7 +158,8 @@ pub use prime_write_tools::{
 };
 pub use runtime::{invoke_http_loopback, RuntimeClientError};
 pub use state::{
-    run_briefs_in_parallel, AppliedProposedChange, AppliedProposedChangeSet, BrainSlotProposals,
+    run_briefs_in_parallel, run_briefs_in_parallel_streaming, AppliedProposedChange,
+    AppliedProposedChangeSet, BrainSlotProposals,
     BundledRefresh, BundledRefreshSummary,
     FinishedBrief, KernelCounters, KernelSnapshot, KernelState, PendingClarificationEntry,
     PendingToolInvocation, PreparedBrief, RoundPrep, MAX_PENDING_CLARIFICATIONS,
