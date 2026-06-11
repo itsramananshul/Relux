@@ -117,6 +117,9 @@ impl SqliteStore {
             pending_clarifications: self
                 .load_meta_json("pending_clarifications")?
                 .unwrap_or_default(),
+            pending_tool_invocations: self
+                .load_meta_json("pending_tool_invocations")?
+                .unwrap_or_default(),
             counters: self.load_counters()?,
         })
     }
@@ -177,6 +180,11 @@ impl SqliteStore {
             &tx,
             "pending_clarifications",
             &snapshot.pending_clarifications,
+        )?;
+        put_meta_json(
+            &tx,
+            "pending_tool_invocations",
+            &snapshot.pending_tool_invocations,
         )?;
         put_meta_json(&tx, "tool_runtime_configs", &snapshot.tool_runtime_configs)?;
         put_meta_json(

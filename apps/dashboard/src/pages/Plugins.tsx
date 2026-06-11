@@ -287,7 +287,11 @@ function ToolRow({ tool }: { tool: ReluxToolDescriptor }) {
       {open && (
         <tr>
           <td colSpan={4} style={{ background: "transparent" }}>
-            {ready ? <InvokeTool tool={tool} /> : <ToolNotRunnable readiness={readiness} />}
+            {ready ? (
+              <InvokeTool tool={tool} />
+            ) : (
+              <ToolNotRunnable tool={tool} readiness={readiness} />
+            )}
           </td>
         </tr>
       )}
@@ -299,7 +303,15 @@ function ToolRow({ tool }: { tool: ReluxToolDescriptor }) {
 // states WHY (the same refusal/disabled reason the kernel enforces in
 // `call_tool`/`invoke_tool`) and the concrete next step — so an operator is never
 // left at a dead-end or a blank page, and the UI never pretends a gated tool ran.
-function ToolNotRunnable({ readiness }: { readiness: ToolReadiness }) {
+// For a `needs_approval` tool it also offers a real Request-approval form (the
+// per-call approval flow), never a pretend run.
+function ToolNotRunnable({
+  tool,
+  readiness,
+}: {
+  tool: ReluxToolDescriptor;
+  readiness: ToolReadiness;
+}) {
   return (
     <div className="card" style={{ margin: "6px 0", padding: 12 }}>
       <div style={{ fontSize: 12, marginBottom: readiness.nextStep ? 6 : 0 }}>
@@ -310,6 +322,77 @@ function ToolNotRunnable({ readiness }: { readiness: ToolReadiness }) {
         <div className="muted" style={{ fontSize: 12 }}>
           <strong>Next step: </strong>
           {readiness.nextStep}
+        </div>
+      )}
+      {readiness.canRequestApproval && <RequestApproval tool={tool} />}
+    </div>
+  );
+}
+
+// The per-call approval request form for a gated (`needs_approval`) tool. The
+// operator supplies the exact JSON arguments for ONE invocation; the kernel binds
+// the approval to that snapshot (tool id + args hash + requester). Nothing runs
+// here — it creates a Pending approval an operator decides on the Approvals page,
+// where the approved call can be executed once. This never bypasses the gate.
+function RequestApproval({ tool }: { tool: ReluxToolDescriptor }) {
+  const [input, setInput] = useState('{\n  "example": "value"\n}');
+  const [busy, setBusy] = useState(false);
+  const [created, setCreated] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function request() {
+    setBusy(true);
+    setErr(null);
+    setCreated(null);
+    let parsed: unknown = {};
+    const trimmed = input.trim();
+    if (trimmed) {
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch {
+        setErr("Arguments must be valid JSON (or empty).");
+        setBusy(false);
+        return;
+      }
+    }
+    try {
+      const appr = await reluxTools.requestApproval({
+        plugin_id: tool.plugin_id,
+        tool_name: tool.tool_name,
+        input: parsed,
+      });
+      setCreated(appr.id);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Request failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div style={{ marginTop: 10, borderTop: "1px solid var(--line, #333)", paddingTop: 10 }}>
+      <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>
+        Request a per-call approval
+      </div>
+      <label className="field" style={{ margin: 0 }}>
+        <span style={{ fontSize: 12 }}>JSON arguments for this one invocation (as Prime)</span>
+        <textarea
+          className="input"
+          style={{ minHeight: 80, fontFamily: "monospace", fontSize: 12 }}
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+        />
+      </label>
+      <div className="row wrap" style={{ gap: 8, marginTop: 10 }}>
+        <button className="btn" disabled={busy} onClick={() => void request()}>
+          {busy ? "Requesting..." : "Request approval"}
+        </button>
+      </div>
+      {err && <div className="banner err" style={{ fontSize: 12, marginTop: 10 }}>{err}</div>}
+      {created && (
+        <div className="banner" style={{ fontSize: 12, marginTop: 10 }}>
+          Approval <span className="mono">{created}</span> created and pending. Decide and
+          execute it on the <Link to="/approvals">Approvals</Link> page.
         </div>
       )}
     </div>

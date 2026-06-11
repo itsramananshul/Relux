@@ -199,15 +199,35 @@ test("a ready tool is runnable, ok-toned, and offers no next step", () => {
   assert.equal(r.nextStep, undefined);
 });
 
-test("a needs_approval tool is NOT runnable and explains the approval refusal", () => {
+test("a needs_approval tool is NOT runnable but CAN request a per-call approval", () => {
   // The exact regression the mission pins: a higher-risk configured tool must be
   // refused on the direct invoke path and SAY so — never blank, never pretend-run.
+  // It is NOT directly runnable, but the per-call approval flow IS now available.
   const r = toolReadiness(tool({ executable: "needs_approval", risk: "high" }));
   assert.equal(r.runnable, false);
+  assert.equal(r.canRequestApproval, true);
   assert.equal(r.label, "needs approval");
   assert.match(r.reason, /requires approval|refused/i);
   assert.match(r.reason, /high-risk/);
+  // The next step points at the per-call approval flow (and still notes the
+  // lower-risk alternative).
+  assert.match(r.nextStep ?? "", /request a per-call approval/i);
   assert.match(r.nextStep ?? "", /lower its risk/i);
+});
+
+test("only needs_approval allows requesting a per-call approval", () => {
+  // Every other state — runnable or not — must NOT offer the request-approval
+  // form, so the gate is never bypassed and a ready tool just runs.
+  for (const executable of [
+    "ready",
+    "runtime_not_configured",
+    "runtime_disabled",
+    "missing_permission",
+    "not_implemented",
+  ]) {
+    const r = toolReadiness(tool({ executable }));
+    assert.equal(r.canRequestApproval, false, `${executable} must not request approval`);
+  }
 });
 
 test("a runtime_not_configured tool points at configuring a loopback runtime", () => {

@@ -287,6 +287,10 @@ export function installResultSummary(p: ReluxPlugin): InstallSummary {
 export interface ToolReadiness {
   // True ONLY when the kernel reports the tool ready to invoke directly.
   runnable: boolean;
+  // True ONLY for `needs_approval`: the tool is gated, but the operator can
+  // request a per-call approval for a specific invocation (and then execute it
+  // once from the Approvals page). The direct invoke path stays refused.
+  canRequestApproval: boolean;
   // Short badge label.
   label: string;
   // ok = runnable now; warn = an operator action would make it runnable; muted =
@@ -303,6 +307,7 @@ export function toolReadiness(t: ReluxToolDescriptor): ToolReadiness {
     case "ready":
       return {
         runnable: true,
+        canRequestApproval: false,
         label: "ready",
         tone: "ok",
         reason:
@@ -311,15 +316,17 @@ export function toolReadiness(t: ReluxToolDescriptor): ToolReadiness {
     case "needs_approval":
       return {
         runnable: false,
+        canRequestApproval: true,
         label: "needs approval",
         tone: "warn",
         reason: `Configured as ${t.risk}-risk, so it requires approval and is refused on the direct invoke path — it is never run just because a runtime is enabled.`,
         nextStep:
-          "Lower its risk to low (with auto-approve) on the plugin's Configure panel to make it directly callable. A per-call approval flow is not wired yet.",
+          "Request a per-call approval for a specific invocation below. Once an operator approves it on the Approvals page, that exact call can be executed once. (Or lower its risk to low with auto-approve to make it directly callable.)",
       };
     case "runtime_not_configured":
       return {
         runnable: false,
+        canRequestApproval: false,
         label: "runtime not configured",
         tone: "warn",
         reason:
@@ -330,6 +337,7 @@ export function toolReadiness(t: ReluxToolDescriptor): ToolReadiness {
     case "runtime_disabled":
       return {
         runnable: false,
+        canRequestApproval: false,
         label: "runtime disabled",
         tone: "warn",
         reason:
@@ -339,6 +347,7 @@ export function toolReadiness(t: ReluxToolDescriptor): ToolReadiness {
     case "missing_permission":
       return {
         runnable: false,
+        canRequestApproval: false,
         label: "missing permission",
         tone: "warn",
         reason: `The scoped agent does not hold this tool's permission (${t.permission}).`,
@@ -348,6 +357,7 @@ export function toolReadiness(t: ReluxToolDescriptor): ToolReadiness {
     default:
       return {
         runnable: false,
+        canRequestApproval: false,
         label: "runtime not implemented",
         tone: "muted",
         reason:

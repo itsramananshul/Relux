@@ -189,6 +189,8 @@ async fn serve() -> Result<(), KernelError> {
     println!("   POST   /v1/relux/tasks/:id/execute-assigned");
     println!("   GET    /v1/relux/tools                      (installed tools + executable status)");
     println!("   POST   /v1/relux/tools/invoke              {{ \"plugin_id\":\"...\", \"tool_name\":\"...\", \"input\":{{}} }}");
+    println!("   POST   /v1/relux/tools/request-approval    {{ \"plugin_id\":\"...\", \"tool_name\":\"...\", \"input\":{{}} }} (per-call approval for a gated tool)");
+    println!("   POST   /v1/relux/approvals/:id/execute     (run an approved per-call tool invocation once)");
     println!("   GET    /v1/relux/plugins");
     println!("   POST   /v1/relux/plugins/install-github   {{ \"url\": \"https://github.com/...\" }}");
     println!("   POST   /v1/relux/plugins/install-zip      (multipart field: file)");
@@ -429,6 +431,10 @@ fn protected_router() -> Router<AppState> {
         .route("/v1/relux/tasks/:id/assign", post(assign_task_to_agent))
         .route("/v1/relux/tools", get(list_tools))
         .route("/v1/relux/tools/invoke", post(invoke_tool))
+        .route(
+            "/v1/relux/tools/request-approval",
+            post(request_tool_invocation_approval),
+        )
         .route("/v1/relux/plugins", get(list_plugins))
         .route("/v1/relux/plugins/install-dir", post(install_dir))
         .route("/v1/relux/plugins/install-github", post(install_github))
@@ -463,6 +469,10 @@ fn protected_router() -> Router<AppState> {
         // Relux Approvals and Permissions
         .route("/v1/relux/approvals", get(list_approvals))
         .route("/v1/relux/approvals/:id/decide", post(decide_approval))
+        .route(
+            "/v1/relux/approvals/:id/execute",
+            post(execute_approved_tool_invocation),
+        )
         .route("/v1/relux/permissions", get(list_permissions))
         .route("/v1/relux/agents/:id/permissions", post(grant_agent_permission))
 }
@@ -1084,6 +1094,73 @@ async fn invoke_tool(
     Ok(Json(result))
 }
 
+/// POST `/v1/relux/tools/request-approval` — create a pending per-call approval to
+/// invoke ONE non-low-risk configured tool with specific arguments
+/// (`docs/RELUX_MASTER_PLAN.md` §7.4 per-call approval). Validates the tool exists,
+/// the subject agent holds its permission, the tool actually requires approval, and
+/// the args are bounded; binds the approval to the exact `(tool, args snapshot)`.
+/// Nothing runs here — the operator decides on the Approvals page, then executes.
+///
+/// A directly-runnable (low-risk) tool is refused with 400 — invoke it instead.
+async fn request_tool_invocation_approval(
+    State(state): State<AppState>,
+    Json(req): Json<InvokeToolReq>,
+) -> Result<Json<ReluxApprovalRecord>, ApiError> {
+    let plugin_id = req.plugin_id.trim().to_string();
+    if plugin_id.is_empty() {
+        return Err(ApiError::bad_request("plugin_id is required"));
+    }
+    let tool_name = req.tool_name.trim().to_string();
+    if tool_name.is_empty() {
+        return Err(ApiError::bad_request("tool_name is required"));
+    }
+    let input = req.input.unwrap_or_else(|| serde_json::json!({}));
+    let requested_agent = req
+        .agent_id
+        .as_ref()
+        .map(|a| a.trim())
+        .filter(|a| !a.is_empty())
+        .map(|a| a.to_string());
+
+    let record = locked_save(&state, |kernel| {
+        let agent_id = match requested_agent {
+            Some(a) => relux_core::AgentId::new(a),
+            None => kernel.prime_agent_id().ok_or_else(|| {
+                KernelError::UnknownAgent(
+                    "no agent_id supplied and Prime is not available".to_string(),
+                )
+            })?,
+        };
+        let id = kernel.request_tool_invocation_approval(
+            "dashboard_user",
+            &agent_id,
+            &relux_core::PluginId::new(plugin_id.clone()),
+            &tool_name,
+            input,
+        )?;
+        let approval = kernel.approval(&id).cloned().ok_or_else(|| {
+            KernelError::UnknownApproval(id.to_string())
+        })?;
+        Ok(approval_record(kernel, approval))
+    })?;
+    Ok(Json(record))
+}
+
+/// POST `/v1/relux/approvals/:id/execute` — execute the single invocation bound to
+/// an APPROVED per-call approval, exactly once (`docs/RELUX_MASTER_PLAN.md` §7.4).
+/// Returns the structured [`ToolInvocationResult`] on success; an undecided/consumed
+/// approval is a 409, a missing binding a 404, a permission/runtime failure honest.
+async fn execute_approved_tool_invocation(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<ToolInvocationResult>, ApiError> {
+    let approval_id = relux_core::ApprovalId::new(id);
+    let result = locked_save(&state, |kernel| {
+        kernel.execute_approved_tool_invocation(&approval_id, "dashboard_user")
+    })?;
+    Ok(Json(result))
+}
+
 async fn list_tasks(State(state): State<AppState>) -> Result<Json<Vec<TaskRecord>>, ApiError> {
     let records = locked_read(&state, |kernel| {
         let tasks = kernel.tasks();
@@ -1206,9 +1283,90 @@ async fn list_audit_events(
     Ok(Json(events))
 }
 
+/// The per-tool-call binding surfaced alongside a tool-invocation approval, so the
+/// Approvals page can render enough detail to decide and an Execute affordance.
+/// Never leaks the raw args — only the bounded, secret-redacted preview + hash.
+#[derive(Debug, Serialize)]
+struct ReluxToolInvocationView {
+    plugin_id: String,
+    tool_name: String,
+    agent_id: String,
+    permission: String,
+    risk: String,
+    args_preview: String,
+    args_sha256: String,
+    /// One-shot: true once the bound invocation has been executed.
+    consumed: bool,
+    /// Convenience for the UI: the bound call can be executed now (approved + not
+    /// yet consumed).
+    executable: bool,
+}
+
+/// A richer approval record: the generic [`relux_core::Approval`] fields plus, for a
+/// per-tool-call approval, its bound invocation detail. Replaces the bare
+/// `Approval` the Approvals page previously consumed so it can show the action /
+/// reason / risk and (for tool invocations) the args + Execute button.
+#[derive(Debug, Serialize)]
+struct ReluxApprovalRecord {
+    id: String,
+    requested_by: String,
+    action: String,
+    reason: String,
+    /// `snake_case` wire form (`low`/`medium`/`high`/`critical`).
+    risk: String,
+    /// `snake_case` wire form (`pending`/`approved`/`rejected`).
+    status: String,
+    approved_by: Option<String>,
+    created_at: String,
+    resolved_at: Option<String>,
+    note: Option<String>,
+    tool_invocation: Option<ReluxToolInvocationView>,
+}
+
+fn wire_label<T: Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Build a [`ReluxApprovalRecord`] for one approval, attaching its tool-invocation
+/// binding when present.
+fn approval_record(kernel: &KernelState, approval: relux_core::Approval) -> ReluxApprovalRecord {
+    let status = wire_label(&approval.status);
+    let tool_invocation = kernel.pending_tool_invocation(&approval.id).map(|b| {
+        let executable =
+            approval.status == relux_core::ApprovalStatus::Approved && !b.consumed;
+        ReluxToolInvocationView {
+            plugin_id: b.plugin_id.to_string(),
+            tool_name: b.tool_name.clone(),
+            agent_id: b.agent_id.to_string(),
+            permission: b.permission.clone(),
+            risk: wire_label(&b.risk),
+            args_preview: b.args_preview.clone(),
+            args_sha256: b.args_sha256.clone(),
+            consumed: b.consumed,
+            executable,
+        }
+    });
+    ReluxApprovalRecord {
+        id: approval.id.to_string(),
+        requested_by: approval.requested_by,
+        action: approval.action,
+        reason: approval.reason,
+        risk: wire_label(&approval.risk),
+        status,
+        approved_by: approval.approved_by,
+        created_at: approval.created_at,
+        resolved_at: approval.resolved_at,
+        note: approval.note,
+        tool_invocation,
+    }
+}
+
 async fn list_approvals(
     State(state): State<AppState>,
-) -> Result<Json<Vec<relux_core::Approval>>, ApiError> {
+) -> Result<Json<Vec<ReluxApprovalRecord>>, ApiError> {
     let approvals = locked_read(&state, |kernel| {
         let mut all_approvals: Vec<relux_core::Approval> =
             kernel.approvals.values().cloned().collect();
@@ -1229,7 +1387,10 @@ async fn list_approvals(
                 .cmp(&order_b)
                 .then_with(|| b.created_at.cmp(&a.created_at))
         });
-        Ok(all_approvals)
+        Ok(all_approvals
+            .into_iter()
+            .map(|a| approval_record(kernel, a))
+            .collect::<Vec<_>>())
     })?;
     Ok(Json(approvals))
 }
@@ -1244,7 +1405,7 @@ async fn decide_approval(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
     Json(req): Json<DecideApprovalReq>,
-) -> Result<Json<relux_core::Approval>, ApiError> {
+) -> Result<Json<ReluxApprovalRecord>, ApiError> {
     let approval_id = relux_core::ApprovalId::new(id);
     let approve = match req.decision.as_str() {
         "approved" => true,
@@ -1252,12 +1413,16 @@ async fn decide_approval(
         _ => return Err(ApiError::bad_request("decision must be 'approved' or 'rejected'")),
     };
 
-    let approval = locked_save(&state, |kernel| {
+    let record = locked_save(&state, |kernel| {
         // TODO: Pass actual user or Prime agent id for approver
         kernel.resolve_approval(&approval_id, approve, "dashboard_user", req.note)?;
-        Ok(kernel.approval(&approval_id).cloned().unwrap())
+        let approval = kernel
+            .approval(&approval_id)
+            .cloned()
+            .ok_or_else(|| KernelError::UnknownApproval(approval_id.to_string()))?;
+        Ok(approval_record(kernel, approval))
     })?;
-    Ok(Json(approval))
+    Ok(Json(record))
 }
 
 #[derive(Debug, Serialize)]
@@ -5068,8 +5233,20 @@ fn status_for(err: &KernelError) -> StatusCode {
         | KernelError::UnknownAgent(_)
         | KernelError::UnknownOrchestration(_) => StatusCode::NOT_FOUND,
         // A configured tool that requires approval cannot be invoked directly yet:
-        // a conflict the operator resolves by lowering risk / enabling auto-approve.
+        // a conflict the operator resolves by lowering risk / enabling auto-approve,
+        // or by requesting a per-call approval.
         KernelError::ToolRequiresApproval { .. } => StatusCode::CONFLICT,
+        // Per-tool-call approval flow honest 4xx mappings: requesting approval for a
+        // directly-runnable tool / oversized args is bad input (400); an
+        // approval id with no bound invocation is a 404; executing an
+        // undecided/consumed approval is a resolvable conflict (409); a tampered
+        // stored snapshot is unprocessable (422, fail closed).
+        KernelError::ToolDoesNotRequireApproval { .. }
+        | KernelError::ToolInvocationArgsTooLarge { .. } => StatusCode::BAD_REQUEST,
+        KernelError::NoBoundToolInvocation(_) => StatusCode::NOT_FOUND,
+        KernelError::ToolInvocationNotApproved { .. }
+        | KernelError::ToolInvocationConsumed(_) => StatusCode::CONFLICT,
+        KernelError::ToolInvocationArgsTampered(_) => StatusCode::UNPROCESSABLE_ENTITY,
         // Configuring a tool on a non-ToolSet / malformed definition: honest 400s.
         KernelError::PluginNotToolConfigurable { .. }
         | KernelError::InvalidToolDefinition { .. } => StatusCode::BAD_REQUEST,

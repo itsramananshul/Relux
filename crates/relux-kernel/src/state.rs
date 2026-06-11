@@ -82,6 +82,10 @@ pub struct KernelSnapshot {
     pub tasks: Vec<Task>,
     pub runs: Vec<Run>,
     pub approvals: Vec<Approval>,
+    /// Per-tool-call approval bindings, sorted by approval id. Defaulted so older
+    /// snapshots (which never wrote it) load cleanly.
+    #[serde(default)]
+    pub pending_tool_invocations: Vec<PendingToolInvocation>,
     /// Run transcripts, in emission order.
     pub run_events: Vec<RunEvent>,
     /// The append-only audit log, in emission order.
@@ -115,6 +119,55 @@ pub struct PendingClarificationEntry {
     pub pending: relux_core::PendingClarification,
 }
 
+/// The hard cap on the serialized size of a single tool invocation's arguments
+/// that a per-call approval may carry. Matches the loopback runtime's request
+/// body cap ([`crate::runtime::MAX_REQUEST_BODY_BYTES`]) so an approval can never
+/// bind args the runtime would itself refuse to send.
+pub const MAX_TOOL_INVOCATION_ARGS_BYTES: usize = crate::runtime::MAX_REQUEST_BODY_BYTES;
+
+/// A pending per-tool-call approval binding (`docs/RELUX_MASTER_PLAN.md` §7.4
+/// per-call approval, `docs/reference-driven-development.md` "per-tool-call
+/// approval"). One of these is created alongside a generic [`Approval`] when an
+/// operator requests approval to invoke a specific non-low-risk configured tool.
+///
+/// It binds the approval to the EXACT invocation — plugin id, tool name, the
+/// permission subject (agent), and a frozen snapshot of the arguments plus their
+/// SHA-256 — so an approved call can never be modified before it runs. It is
+/// consumed once: after a single execution attempt (success OR runtime failure)
+/// `consumed` is set and the bound call can never run again without a fresh
+/// approval. This mirrors openclaw's consume-once exec-approval handoff
+/// (`reference/openclaw-main/src/agents/bash-tools.exec-approval-followup-state.ts`
+/// `consumeExecApprovalFollowupRuntimeHandoff`: a record keyed by an approval id,
+/// matched on every bound field, deleted after a single use).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingToolInvocation {
+    /// The generic [`Approval`] this binding belongs to.
+    pub approval_id: ApprovalId,
+    pub plugin_id: PluginId,
+    pub tool_name: String,
+    /// The permission subject the invocation runs as (validated to hold the
+    /// tool's permission both when requested and again before execution).
+    pub agent_id: AgentId,
+    /// The permission checked for this invocation (`tool:<plugin>:<verb>`).
+    pub permission: String,
+    /// The frozen arguments snapshot. Executed verbatim — never re-supplied by
+    /// the client at execute time, so an approved call cannot be modified.
+    pub input: serde_json::Value,
+    /// Lowercase hex SHA-256 of the canonical args bytes, re-checked before
+    /// execution (defense in depth against a tampered persisted snapshot).
+    pub args_sha256: String,
+    /// A bounded, secret-redacted preview of the args for the Approvals page.
+    pub args_preview: String,
+    /// Who requested the approval (the operator actor).
+    pub requested_by: String,
+    /// The tool's declared risk level at request time.
+    pub risk: RiskLevel,
+    pub created_at: String,
+    /// Set once a single execution attempt has been made; a consumed binding can
+    /// never run again (one-shot).
+    pub consumed: bool,
+}
+
 /// The local, in-memory Relux control plane.
 #[derive(Debug, Default)]
 pub struct KernelState {
@@ -129,6 +182,11 @@ pub struct KernelState {
     tasks: HashMap<TaskId, Task>,
     runs: HashMap<RunId, Run>,
     pub approvals: HashMap<ApprovalId, Approval>,
+    /// Per-tool-call approval bindings, keyed by the approval id they belong to.
+    /// Created by [`request_tool_invocation_approval`](KernelState::request_tool_invocation_approval)
+    /// and consumed once by
+    /// [`execute_approved_tool_invocation`](KernelState::execute_approved_tool_invocation).
+    pending_tool_invocations: HashMap<ApprovalId, PendingToolInvocation>,
     /// Durable Prime orchestrations, keyed by id.
     orchestrations: HashMap<OrchestrationId, Orchestration>,
     /// Per-run transcripts, in emission order.
@@ -237,6 +295,9 @@ impl KernelState {
             tasks: sorted(&self.tasks, |t| t.id.as_str()),
             runs: sorted(&self.runs, |r| r.id.as_str()),
             approvals: sorted(&self.approvals, |a| a.id.as_str()),
+            pending_tool_invocations: sorted(&self.pending_tool_invocations, |p| {
+                p.approval_id.as_str()
+            }),
             run_events: self.run_events.clone(),
             audit_events: self.audit_log.clone(),
             prime_autonomy_config: self.prime_autonomy_config.clone(),
@@ -305,6 +366,11 @@ impl KernelState {
         }
         for approval in snapshot.approvals {
             state.approvals.insert(approval.id.clone(), approval);
+        }
+        for pending in snapshot.pending_tool_invocations {
+            state
+                .pending_tool_invocations
+                .insert(pending.approval_id.clone(), pending);
         }
         for orchestration in snapshot.orchestrations {
             state
@@ -3597,6 +3663,12 @@ impl KernelState {
             approval.note = note;
             approval.namespace_id.clone()
         };
+        // A rejected per-tool-call approval drops its bound invocation outright, so
+        // a rejected call can never be executed (the execute path also fails closed
+        // on a non-`Approved` status; this just frees the binding eagerly).
+        if !approve {
+            self.pending_tool_invocations.remove(id);
+        }
         self.record_audit(
             "user",
             approver,
@@ -3616,6 +3688,282 @@ impl KernelState {
 
     pub fn approval(&self, id: &ApprovalId) -> Option<&Approval> {
         self.approvals.get(id)
+    }
+
+    /// The per-tool-call binding for an approval, if it is a tool-invocation
+    /// approval (read-only; used to render the Approvals page detail + Execute
+    /// affordance).
+    pub fn pending_tool_invocation(&self, id: &ApprovalId) -> Option<&PendingToolInvocation> {
+        self.pending_tool_invocations.get(id)
+    }
+
+    // --- Per-tool-call approval flow --------------------------------------
+
+    /// Request a per-call approval to invoke ONE non-low-risk configured tool with
+    /// a specific set of arguments (`docs/RELUX_MASTER_PLAN.md` §7.4 per-call
+    /// approval, `docs/reference-driven-development.md` "per-tool-call approval").
+    ///
+    /// This is the two-phase "register the approval before anything can run" shape
+    /// from openclaw's `registerExecApprovalRequest`
+    /// (`reference/openclaw-main/src/agents/bash-tools.exec-approval-request.ts`):
+    /// a [`PendingToolInvocation`] is registered, bound to the exact `(plugin, tool,
+    /// agent, args snapshot + SHA-256)`, alongside a generic [`Approval`] the
+    /// operator decides on. Nothing is executed here.
+    ///
+    /// Fail-closed gates, in order: the tool must exist and the subject agent must
+    /// hold its permission; the tool must ACTUALLY require approval (a directly
+    /// runnable tool is refused — the caller should just invoke it); and the args
+    /// must be within [`MAX_TOOL_INVOCATION_ARGS_BYTES`]. The args are stored
+    /// verbatim for later execution, with a secret-redacted preview for display.
+    pub fn request_tool_invocation_approval(
+        &mut self,
+        requested_by: &str,
+        agent_id: &AgentId,
+        plugin_id: &PluginId,
+        tool_name: &str,
+        input: serde_json::Value,
+    ) -> Result<ApprovalId, KernelError> {
+        let (namespace, required) = self.resolve_tool_permission(agent_id, plugin_id, tool_name)?;
+
+        if !self.agent_holds_permission(agent_id, &required) {
+            self.record_audit(
+                "user",
+                requested_by,
+                required.as_str(),
+                Some("tool"),
+                Some(tool_name),
+                Some(&namespace),
+                AuditResult::Denied,
+                serde_json::json!({
+                    "via": "tool_invocation:request",
+                    "plugin": plugin_id.as_str(),
+                    "subject_agent": agent_id.as_str()
+                }),
+            );
+            return Err(KernelError::PermissionDenied {
+                agent: agent_id.to_string(),
+                permission: required.to_string(),
+            });
+        }
+
+        // Only a tool whose declared approval blocks a direct invocation is eligible
+        // for the per-call flow. A directly-runnable (low-risk auto-approve) tool is
+        // refused: the operator should invoke it, not gate it.
+        if !self.tool_needs_approval(plugin_id, tool_name) {
+            return Err(KernelError::ToolDoesNotRequireApproval {
+                plugin: plugin_id.to_string(),
+                tool: tool_name.to_string(),
+            });
+        }
+
+        // Bound the args to what the loopback runtime would itself accept.
+        let body =
+            serde_json::to_vec(&input).map_err(|e| KernelError::InvalidToolDefinition {
+                plugin: plugin_id.to_string(),
+                message: format!("arguments are not serializable JSON: {e}"),
+            })?;
+        if body.len() > MAX_TOOL_INVOCATION_ARGS_BYTES {
+            return Err(KernelError::ToolInvocationArgsTooLarge {
+                plugin: plugin_id.to_string(),
+                tool: tool_name.to_string(),
+                size: body.len(),
+                max: MAX_TOOL_INVOCATION_ARGS_BYTES,
+            });
+        }
+
+        let risk = self
+            .plugins
+            .get(plugin_id)
+            .and_then(|m| m.capabilities.tools.iter().find(|t| t.name == tool_name))
+            .map(|t| t.risk.clone())
+            .unwrap_or(RiskLevel::High);
+        let args_sha256 = sha256_hex(&body);
+        let args_preview = redact_args_for_preview(&input);
+
+        // Register the generic approval (Pending, audited) that the operator decides.
+        let action = format!("invoke tool {tool_name} on {plugin_id} (as {agent_id})");
+        let reason = format!(
+            "{risk:?}-risk per-call tool invocation requested by {requested_by}; args sha256 {short}…",
+            short = &args_sha256[..args_sha256.len().min(12)]
+        );
+        let id = self.request_approval(requested_by, &action, &reason, risk.clone(), Some(&namespace));
+        // Bind the invocation with the same timestamp the approval recorded, so the
+        // two read consistently on the Approvals page.
+        let created_at = self
+            .approvals
+            .get(&id)
+            .map(|a| a.created_at.clone())
+            .unwrap_or_default();
+
+        self.pending_tool_invocations.insert(
+            id.clone(),
+            PendingToolInvocation {
+                approval_id: id.clone(),
+                plugin_id: plugin_id.clone(),
+                tool_name: tool_name.to_string(),
+                agent_id: agent_id.clone(),
+                permission: required.to_string(),
+                input,
+                args_sha256: args_sha256.clone(),
+                args_preview,
+                requested_by: requested_by.to_string(),
+                risk,
+                created_at,
+                consumed: false,
+            },
+        );
+
+        self.record_audit(
+            "user",
+            requested_by,
+            "tool_invocation:request",
+            Some("approval"),
+            Some(id.as_str()),
+            Some(&namespace),
+            AuditResult::Success,
+            serde_json::json!({
+                "plugin": plugin_id.as_str(),
+                "tool": tool_name,
+                "subject_agent": agent_id.as_str(),
+                "args_sha256": args_sha256
+            }),
+        );
+        Ok(id)
+    }
+
+    /// Execute the single invocation bound to an APPROVED per-call approval, exactly
+    /// once (`docs/RELUX_MASTER_PLAN.md` §7.4 per-call approval). This is the
+    /// consume-once counterpart of openclaw's
+    /// `consumeExecApprovalFollowupRuntimeHandoff`: the binding is run only when the
+    /// approval is `Approved` and the binding has not been consumed, every bound
+    /// field is re-validated, and the binding is marked consumed on a single attempt.
+    ///
+    /// Defense in depth: the approval must be `Approved`; the binding must exist and
+    /// be unconsumed; the tool must still exist and the subject agent must still hold
+    /// its permission; the stored args must still hash to the recorded SHA-256. The
+    /// stored snapshot — never client-supplied args — is executed, so an approved
+    /// call cannot be modified before it runs. A single attempt (success OR runtime
+    /// failure) consumes the binding; it can never run again without a new approval.
+    pub fn execute_approved_tool_invocation(
+        &mut self,
+        id: &ApprovalId,
+        executed_by: &str,
+    ) -> Result<ToolInvocationResult, KernelError> {
+        // 1. The approval must exist and be Approved.
+        let approval = self
+            .approvals
+            .get(id)
+            .ok_or_else(|| KernelError::UnknownApproval(id.to_string()))?;
+        if approval.status != ApprovalStatus::Approved {
+            return Err(KernelError::ToolInvocationNotApproved {
+                id: id.to_string(),
+                status: approval_status_label(&approval.status),
+            });
+        }
+
+        // 2. The binding must exist and be unconsumed.
+        let binding = self
+            .pending_tool_invocations
+            .get(id)
+            .ok_or_else(|| KernelError::NoBoundToolInvocation(id.to_string()))?;
+        if binding.consumed {
+            return Err(KernelError::ToolInvocationConsumed(id.to_string()));
+        }
+        let plugin_id = binding.plugin_id.clone();
+        let tool_name = binding.tool_name.clone();
+        let agent_id = binding.agent_id.clone();
+        let input = binding.input.clone();
+        let stored_hash = binding.args_sha256.clone();
+
+        // 3. Integrity: the stored snapshot must still hash to the recorded digest
+        //    (defense in depth against a tampered persisted binding).
+        let body =
+            serde_json::to_vec(&input).map_err(|e| KernelError::InvalidToolDefinition {
+                plugin: plugin_id.to_string(),
+                message: format!("stored arguments are not serializable JSON: {e}"),
+            })?;
+        if sha256_hex(&body) != stored_hash {
+            return Err(KernelError::ToolInvocationArgsTampered(id.to_string()));
+        }
+
+        // 4. Re-validate the tool still exists and the subject still holds the
+        //    permission (a permission could have been revoked since approval).
+        let (namespace, required) =
+            self.resolve_tool_permission(&agent_id, &plugin_id, &tool_name)?;
+        if !self.agent_holds_permission(&agent_id, &required) {
+            self.record_audit(
+                "user",
+                executed_by,
+                required.as_str(),
+                Some("tool"),
+                Some(&tool_name),
+                Some(&namespace),
+                AuditResult::Denied,
+                serde_json::json!({
+                    "via": "tool_invocation:execute",
+                    "approval": id.as_str(),
+                    "plugin": plugin_id.as_str(),
+                    "subject_agent": agent_id.as_str()
+                }),
+            );
+            return Err(KernelError::PermissionDenied {
+                agent: agent_id.to_string(),
+                permission: required.to_string(),
+            });
+        }
+
+        // 5. Consume the binding on this single attempt — BEFORE dispatch — so that
+        //    even a runtime failure cannot be retried without a fresh approval.
+        if let Some(b) = self.pending_tool_invocations.get_mut(id) {
+            b.consumed = true;
+        }
+
+        // 6. Execute via the same runtime as a direct invoke, bypassing the
+        //    needs-approval gate (this IS the granted approval). Honest failures.
+        let output = match self.execute_tool_runtime(&plugin_id, &tool_name, &input) {
+            Ok(output) => output,
+            Err(e) => {
+                self.record_audit(
+                    "user",
+                    executed_by,
+                    required.as_str(),
+                    Some("tool"),
+                    Some(&tool_name),
+                    Some(&namespace),
+                    AuditResult::Failed,
+                    serde_json::json!({
+                        "via": "tool_invocation:execute",
+                        "approval": id.as_str(),
+                        "plugin": plugin_id.as_str(),
+                        "reason": e.to_string()
+                    }),
+                );
+                return Err(e);
+            }
+        };
+
+        self.record_audit(
+            "user",
+            executed_by,
+            required.as_str(),
+            Some("tool"),
+            Some(&tool_name),
+            Some(&namespace),
+            AuditResult::Success,
+            serde_json::json!({
+                "via": "tool_invocation:execute",
+                "approval": id.as_str(),
+                "plugin": plugin_id.as_str(),
+                "subject_agent": agent_id.as_str()
+            }),
+        );
+        Ok(ToolInvocationResult {
+            plugin_id: plugin_id.to_string(),
+            tool_name: tool_name.to_string(),
+            agent_id: agent_id.to_string(),
+            permission: required.to_string(),
+            output,
+        })
     }
 
     pub fn approval_count(&self) -> usize {
@@ -6903,6 +7251,86 @@ fn approval_status_label(status: &ApprovalStatus) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// Lowercase hex SHA-256 of `bytes`. Used to bind a per-tool-call approval to the
+/// exact arguments snapshot (and to re-check that snapshot before execution). Pure.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// The maximum characters kept in a per-tool-call approval's args preview. Bounds
+/// what the Approvals page renders regardless of the (already size-capped) args.
+const MAX_ARGS_PREVIEW_CHARS: usize = 1_000;
+
+/// Build a bounded, secret-redacted preview of a tool invocation's arguments for
+/// the Approvals page. The raw snapshot is stored for execution; this is the only
+/// thing the operator-facing surface renders, so any value under a secret-looking
+/// key (token/password/secret/api-key/authorization/…) is masked and the whole
+/// preview is length-clamped. Pure; mirrors Hermes's "sanitize + clamp every
+/// model/operator-facing string" discipline (`message_sanitization.py`).
+fn redact_args_for_preview(input: &serde_json::Value) -> String {
+    let redacted = redact_secret_values(input);
+    let rendered = serde_json::to_string_pretty(&redacted)
+        .unwrap_or_else(|_| "<unrenderable arguments>".to_string());
+    if rendered.chars().count() > MAX_ARGS_PREVIEW_CHARS {
+        let head: String = rendered.chars().take(MAX_ARGS_PREVIEW_CHARS).collect();
+        format!("{head}… (truncated)")
+    } else {
+        rendered
+    }
+}
+
+/// Whether an object key looks like it names a secret, so its value is masked in a
+/// preview. Conservative substring match on a lowercased key.
+fn key_looks_secret(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    const NEEDLES: &[&str] = &[
+        "token",
+        "password",
+        "passwd",
+        "secret",
+        "api_key",
+        "apikey",
+        "api-key",
+        "authorization",
+        "auth",
+        "credential",
+        "private_key",
+        "access_key",
+        "session",
+    ];
+    NEEDLES.iter().any(|n| k.contains(n))
+}
+
+/// Recursively mask the values of secret-looking keys in a JSON value, preserving
+/// structure so the operator can still see the shape of the arguments.
+fn redact_secret_values(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, v) in map {
+                if key_looks_secret(k) && !v.is_null() {
+                    out.insert(k.clone(), serde_json::Value::String("***redacted***".to_string()));
+                } else {
+                    out.insert(k.clone(), redact_secret_values(v));
+                }
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(redact_secret_values).collect())
+        }
+        other => other.clone(),
+    }
+}
+
 /// The `snake_case` wire label for a risk level (matching the serialized form), for the read-only
 /// `list_approvals` tool. Pure.
 fn risk_level_label(risk: &RiskLevel) -> String {
@@ -8111,6 +8539,202 @@ mod tests {
             .invoke_tool(&prime, &id, "deploy.run", serde_json::json!({}))
             .unwrap_err();
         assert!(matches!(err, KernelError::ToolRequiresApproval { .. }), "got {err:?}");
+    }
+
+    /// Configure a high-risk `deploy.run`, grant Prime its derived permission, and
+    /// return `(kernel, prime, plugin_id)` ready for the per-call approval flow.
+    fn primed_with_gated_tool() -> (KernelState, AgentId, PluginId) {
+        let (mut k, prime, id) = primed_with_wrapper();
+        let def = k
+            .configure_plugin_tool(&id, tool_input(r#"{"name":"deploy.run","risk":"high"}"#))
+            .unwrap();
+        k.grant_permission_to_agent(&prime, def.permission.clone()).unwrap();
+        (k, prime, id)
+    }
+
+    #[test]
+    fn per_call_approval_request_creates_a_bound_pending_approval() {
+        let (mut k, prime, id) = primed_with_gated_tool();
+        let appr_id = k
+            .request_tool_invocation_approval(
+                "operator",
+                &prime,
+                &id,
+                "deploy.run",
+                serde_json::json!({ "env": "prod" }),
+            )
+            .expect("request approval");
+
+        // The generic approval is Pending and carries the risk/action.
+        let appr = k.approval(&appr_id).unwrap();
+        assert_eq!(appr.status, ApprovalStatus::Pending);
+        assert_eq!(appr.risk, RiskLevel::High);
+        assert!(appr.action.contains("deploy.run"));
+
+        // The binding pins the exact invocation and is not yet consumed.
+        let binding = k.pending_tool_invocation(&appr_id).unwrap();
+        assert_eq!(binding.plugin_id.as_str(), id.as_str());
+        assert_eq!(binding.tool_name, "deploy.run");
+        assert_eq!(binding.agent_id.as_str(), "prime");
+        assert_eq!(binding.permission, "tool:relux-plugin-my-repo:run");
+        assert_eq!(binding.input, serde_json::json!({ "env": "prod" }));
+        assert!(!binding.consumed);
+        assert_eq!(binding.args_sha256.len(), 64);
+
+        // Audited as a request.
+        assert!(k.audit_log().iter().any(|e| e.action == "tool_invocation:request"
+            && e.result == AuditResult::Success
+            && e.metadata["tool"] == "deploy.run"));
+    }
+
+    #[test]
+    fn per_call_approval_executes_once_after_approval_then_is_consumed() {
+        let (mut k, prime, id) = primed_with_gated_tool();
+        // A runtime must back the tool for the approved call to actually run.
+        let base = one_shot_http(
+            "HTTP/1.1 200 OK\r\nContent-Length: 26\r\nConnection: close\r\n\r\n{\"output\":{\"deployed\":1}}\n\n",
+        );
+        k.configure_tool_runtime(&id, &base, true, Some(2_000)).unwrap();
+
+        let appr_id = k
+            .request_tool_invocation_approval(
+                "operator",
+                &prime,
+                &id,
+                "deploy.run",
+                serde_json::json!({ "env": "prod" }),
+            )
+            .unwrap();
+
+        // Cannot execute while still Pending.
+        let err = k
+            .execute_approved_tool_invocation(&appr_id, "operator")
+            .unwrap_err();
+        assert!(matches!(err, KernelError::ToolInvocationNotApproved { .. }), "got {err:?}");
+
+        // Approve, then execute once.
+        k.resolve_approval(&appr_id, true, "operator", None).unwrap();
+        let result = k
+            .execute_approved_tool_invocation(&appr_id, "operator")
+            .expect("approved invocation runs");
+        assert_eq!(result.output, serde_json::json!({ "deployed": 1 }));
+        assert_eq!(result.tool_name, "deploy.run");
+
+        // One-shot: the binding is consumed and a second execute is refused without
+        // dialing the (now closed) loopback server.
+        assert!(k.pending_tool_invocation(&appr_id).unwrap().consumed);
+        let err = k
+            .execute_approved_tool_invocation(&appr_id, "operator")
+            .unwrap_err();
+        assert!(matches!(err, KernelError::ToolInvocationConsumed(_)), "got {err:?}");
+
+        // Audited as an execution success bound to the approval.
+        assert!(k.audit_log().iter().any(|e| e.action == "tool:relux-plugin-my-repo:run"
+            && e.result == AuditResult::Success
+            && e.metadata["via"] == "tool_invocation:execute"
+            && e.metadata["approval"] == appr_id.as_str()));
+    }
+
+    #[test]
+    fn a_runtime_failure_still_consumes_the_approved_invocation() {
+        let (mut k, prime, id) = primed_with_gated_tool();
+        // Point at a dead loopback port so the runtime dial fails.
+        k.configure_tool_runtime(&id, "http://127.0.0.1:19999", true, Some(300)).unwrap();
+        let appr_id = k
+            .request_tool_invocation_approval("operator", &prime, &id, "deploy.run", serde_json::json!({}))
+            .unwrap();
+        k.resolve_approval(&appr_id, true, "operator", None).unwrap();
+
+        // The attempt fails at the runtime, but still consumes the binding.
+        let err = k
+            .execute_approved_tool_invocation(&appr_id, "operator")
+            .unwrap_err();
+        assert!(matches!(err, KernelError::ToolRuntimeInvocation { .. }), "got {err:?}");
+        assert!(k.pending_tool_invocation(&appr_id).unwrap().consumed);
+        // A retry needs a fresh approval; the consumed binding refuses.
+        let err = k
+            .execute_approved_tool_invocation(&appr_id, "operator")
+            .unwrap_err();
+        assert!(matches!(err, KernelError::ToolInvocationConsumed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn rejecting_a_per_call_approval_drops_the_binding() {
+        let (mut k, prime, id) = primed_with_gated_tool();
+        let appr_id = k
+            .request_tool_invocation_approval("operator", &prime, &id, "deploy.run", serde_json::json!({}))
+            .unwrap();
+        k.resolve_approval(&appr_id, false, "operator", None).unwrap();
+        // The binding is dropped and execution is refused (status is not Approved).
+        assert!(k.pending_tool_invocation(&appr_id).is_none());
+        let err = k
+            .execute_approved_tool_invocation(&appr_id, "operator")
+            .unwrap_err();
+        assert!(matches!(err, KernelError::ToolInvocationNotApproved { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn requesting_approval_for_a_directly_runnable_tool_is_refused() {
+        let (mut k, prime, id) = primed_with_wrapper();
+        // A low-risk tool is auto-approvable; the per-call flow is the wrong path.
+        let def = k
+            .configure_plugin_tool(&id, tool_input(r#"{"name":"report.fetch","risk":"low"}"#))
+            .unwrap();
+        k.grant_permission_to_agent(&prime, def.permission).unwrap();
+        let err = k
+            .request_tool_invocation_approval("operator", &prime, &id, "report.fetch", serde_json::json!({}))
+            .unwrap_err();
+        assert!(matches!(err, KernelError::ToolDoesNotRequireApproval { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn requesting_approval_without_the_permission_is_denied() {
+        let (mut k, _prime, id) = primed_with_wrapper();
+        k.configure_plugin_tool(&id, tool_input(r#"{"name":"deploy.run","risk":"high"}"#))
+            .unwrap();
+        let ns = NamespaceId::new("workspace");
+        let adapter = PluginId::new("relux-adapter-local-prime");
+        let weak = k
+            .create_agent("weak", "Weak", "no perms", &adapter, &ns, None, vec![])
+            .unwrap();
+        let err = k
+            .request_tool_invocation_approval("operator", &weak, &id, "deploy.run", serde_json::json!({}))
+            .unwrap_err();
+        assert!(matches!(err, KernelError::PermissionDenied { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn per_call_binding_survives_a_snapshot_roundtrip() {
+        let (mut k, prime, id) = primed_with_gated_tool();
+        let appr_id = k
+            .request_tool_invocation_approval("operator", &prime, &id, "deploy.run", serde_json::json!({ "env": "prod" }))
+            .unwrap();
+        let restored = KernelState::from_snapshot(k.snapshot());
+        let binding = restored.pending_tool_invocation(&appr_id).expect("binding persisted");
+        assert_eq!(binding.tool_name, "deploy.run");
+        assert_eq!(binding.input, serde_json::json!({ "env": "prod" }));
+        assert!(!binding.consumed);
+    }
+
+    #[test]
+    fn secret_args_are_redacted_in_preview_but_stored_verbatim() {
+        let (mut k, prime, id) = primed_with_gated_tool();
+        let appr_id = k
+            .request_tool_invocation_approval(
+                "operator",
+                &prime,
+                &id,
+                "deploy.run",
+                serde_json::json!({ "token": "s3cr3t", "env": "prod" }),
+            )
+            .unwrap();
+        let binding = k.pending_tool_invocation(&appr_id).unwrap();
+        // The preview masks the secret-looking value but keeps the rest visible.
+        assert!(binding.args_preview.contains("***redacted***"));
+        assert!(!binding.args_preview.contains("s3cr3t"));
+        assert!(binding.args_preview.contains("prod"));
+        // The stored snapshot keeps the real value so the approved call runs verbatim.
+        assert_eq!(binding.input["token"], "s3cr3t");
     }
 
     #[test]

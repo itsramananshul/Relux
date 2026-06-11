@@ -139,7 +139,8 @@ pub use state::{
     run_briefs_in_parallel, AppliedProposedChange, AppliedProposedChangeSet, BrainSlotProposals,
     BundledRefresh, BundledRefreshSummary,
     FinishedBrief, KernelCounters, KernelSnapshot, KernelState, PendingClarificationEntry,
-    PreparedBrief, RoundPrep, MAX_PENDING_CLARIFICATIONS,
+    PendingToolInvocation, PreparedBrief, RoundPrep, MAX_PENDING_CLARIFICATIONS,
+    MAX_TOOL_INVOCATION_ARGS_BYTES,
 };
 pub use store::SqliteStore;
 
@@ -265,6 +266,23 @@ pub enum KernelError {
     PluginToolNotFound { plugin: String, tool: String },
     #[error("tool {tool} on plugin {plugin} requires approval and cannot be invoked directly yet")]
     ToolRequiresApproval { plugin: String, tool: String },
+    #[error("tool {tool} on plugin {plugin} does not require approval; enable a loopback runtime and invoke it directly")]
+    ToolDoesNotRequireApproval { plugin: String, tool: String },
+    #[error("tool invocation arguments for {tool} on {plugin} are too large: {size} bytes (max {max})")]
+    ToolInvocationArgsTooLarge {
+        plugin: String,
+        tool: String,
+        size: usize,
+        max: usize,
+    },
+    #[error("approval {0} is not a tool-invocation approval (no bound invocation to execute)")]
+    NoBoundToolInvocation(String),
+    #[error("approval {id} is not approved (status {status}); decide it before executing")]
+    ToolInvocationNotApproved { id: String, status: String },
+    #[error("approval {0} has already been executed; request a new approval to run it again")]
+    ToolInvocationConsumed(String),
+    #[error("approval {0} is bound to a tool invocation whose stored arguments failed their integrity check")]
+    ToolInvocationArgsTampered(String),
     #[error("unsafe plugin path rejected: {0}")]
     UnsafePluginPath(String),
 }

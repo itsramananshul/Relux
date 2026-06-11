@@ -1528,3 +1528,61 @@ authoritative (it refuses the same states), and `toolReadiness` is a pure, React
 inline on the Plugins page (no separate route), so a non-ready tool never opens a blank page. The honest
 limit is recorded, not papered over: a `needs_approval` tool has no per-call approval flow yet, so it is
 shown as blocked with the only real next step (reconfigure as low-risk), never silently run.
+
+---
+
+## Reference read — per-tool-call approval flow (this slice)
+
+The honest-readiness slice above recorded the last real gap: a `needs_approval` tool
+was honestly blocked on the direct invoke path, but there was **no per-tool-call
+approval flow** — the only way to run a gated tool was to reconfigure it as
+low-risk. This slice closes that gap. An operator can now request approval for ONE
+specific invocation (tool id + exact arguments), an approver decides it on the
+Approvals page, and the approved call executes **exactly once** through the same
+runtime — without bypassing any gate (`docs/RELUX_MASTER_PLAN.md` §7.4 Plugin
+Kernel Layer, §8.2 ToolSet Plugins).
+
+### Paperclip (openclaw) — files read
+
+- `reference/openclaw-main/src/agents/bash-tools.exec-approval-request.ts` —
+  `registerExecApprovalRequest` (L116-135) / `requestExecApprovalDecision`
+  (L165-173): **two-phase registration**. The approval id is registered server-side
+  *before* exec returns `approval-pending`, "otherwise `/approve` can race and
+  orphan" (L119-120). The decision is then resolved and only afterwards does the
+  action run. **Pattern: register the approval binding first; the action runs only
+  after a decision resolves against that registered binding — never a privileged
+  shortcut.**
+- `reference/openclaw-main/src/agents/bash-tools.exec-approval-followup-state.ts` —
+  `registerExecApprovalFollowupRuntimeHandoff` (L84-111) stores a small record keyed
+  by an approval id with an explicit TTL; `consumeExecApprovalFollowupRuntimeHandoff`
+  (L113-146) looks it up on a LATER turn, **requires every bound field to match**
+  (`entry.approvalId !== approvalId || entry.idempotencyKey !== idempotencyKey ||
+  entry.sessionKey !== sessionKey` → `undefined`, L137-143), checks it has not
+  expired, and **`delete`s the entry after a single use** (L144). **Pattern: a
+  pending record bound to the exact approval, matched on every field, consumed and
+  cleared on a single use — it can never run twice.**
+- `reference/openclaw-main/src/acp/approval-classifier.ts` — `classifyAcpToolApproval`
+  (re-read): the gate decides auto vs. non-auto by class; a non-auto class is never
+  promoted to auto. Reused as the boundary: only a `needs_approval` tool is eligible
+  for the per-call request; a directly-runnable tool is refused (use invoke).
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| openclaw: **register the approval binding FIRST, before anything can run** (`registerExecApprovalRequest`, two-phase) | `crates/relux-kernel/src/state.rs` `request_tool_invocation_approval` creates the generic `Approval` (Pending, audited) AND a `PendingToolInvocation` binding `(plugin, tool, agent, args snapshot + SHA-256)` in one step; nothing executes. Endpoint `POST /v1/relux/tools/request-approval`. |
+| openclaw: **record bound to the exact call, matched on EVERY field, consumed-and-cleared once** (`consumeExecApprovalFollowupRuntimeHandoff`) | `execute_approved_tool_invocation` runs only when the approval is `Approved` AND the binding is unconsumed; it re-validates the tool still exists, the subject still holds the permission, and the stored args still hash to the recorded SHA-256; it marks the binding `consumed` on a single attempt (success OR runtime failure) so it can never run again. Endpoint `POST /v1/relux/approvals/:id/execute`. |
+| openclaw: **the action runs the stored context, not a fresh client-supplied one** | the stored args snapshot is executed verbatim — the execute endpoint takes only the approval id, never re-supplied args — so an approved call cannot be modified before it runs. |
+| openclaw: **a non-auto class is never promoted to auto** (`classifyAcpToolApproval`) | only a `tool_needs_approval` tool is eligible: a directly-runnable (low-risk) tool is refused with `ToolDoesNotRequireApproval` ("invoke it instead"); the execute path bypasses the needs-approval gate ONLY because that is the granted approval, and still runs the full permission gate + audited runtime. |
+| Hermes: **sanitize + clamp every operator-facing string** (`message_sanitization.py`) | the args snapshot is bounded to `MAX_TOOL_INVOCATION_ARGS_BYTES` (the loopback request cap), and the Approvals page renders only a bounded, secret-redacted preview (`redact_args_for_preview` masks `token`/`password`/`secret`/`authorization`/… values) — never the raw args; the raw snapshot is stored solely so the approved call runs verbatim. |
+
+**What we deliberately do differently:** the flow grants no blanket/reusable
+authority — one approval binds one invocation and is consumed by one execution
+attempt (no `session`/`always` grant; the master plan has no safe reusable-grant
+model, so we do not invent one). Every step is audited
+(`tool_invocation:request`/`execute`, success/denied/failed). The binding persists
+in the snapshot (meta-json seam, like `orchestrations`) so an approved call survives
+a restart, but a runtime failure still consumes it (one approved invocation = one
+attempt) and a rejected approval drops its binding outright. No remote/non-loopback
+execution is added — the approved call runs through the same bounded loopback
+runtime as a direct invoke, so all existing safety bounds hold.

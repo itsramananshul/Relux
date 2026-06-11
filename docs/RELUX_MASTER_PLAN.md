@@ -2701,16 +2701,62 @@ is the single classifier (mirroring openclaw `acp/approval-classifier.ts` — on
 function, a named class, only the safe class is runnable) that maps the kernel's
 `executable` status to what the operator sees. ONLY `ready` is runnable (an
 Invoke form); every other state renders a clear, non-blank **"Why not?"** panel
-with the honest reason + next step — `needs_approval` (refused on the direct path
-until the risk is lowered; a per-call approval flow is not wired yet),
+with the honest reason + next step — `needs_approval` (refused on the direct path;
+the operator may instead request a per-call approval, see below),
 `runtime_not_configured`, `runtime_disabled`, `missing_permission`,
 `not_implemented`. This is the same refusal the kernel enforces in
 `call_tool`/`invoke_tool`, just rendered honestly — a gated tool is never shown as
 runnable and the UI never pretends a refused tool ran. Pinned by
 `apps/dashboard/test/plugins.test.ts` (`toolReadiness` per-state assertions) and
-the kernel tests above. **Remaining gap:** there is no per-tool-call approval flow
-yet, so a `needs_approval` tool can only be made runnable by reconfiguring it as
-low-risk — it is honestly blocked, never silently run.
+the kernel tests above.
+
+#### Per-tool-call approval flow (gated tools)
+
+A `needs_approval` tool can be run for ONE specific invocation through a real
+per-call approval, without bypassing the gate (`docs/reference-driven-development.md`
+"per-tool-call approval", borrowing openclaw's two-phase
+`registerExecApprovalRequest` + consume-once `consumeExecApprovalFollowupRuntimeHandoff`):
+
+1. **Request** — `POST /v1/relux/tools/request-approval { plugin_id, tool_name,
+   input?, agent_id? }`. The kernel (`state.rs` `request_tool_invocation_approval`)
+   validates the tool exists, the subject agent holds its permission, and the tool
+   ACTUALLY requires approval (a directly-runnable tool is refused with
+   `ToolDoesNotRequireApproval` — invoke it instead); it bounds the args to
+   `MAX_TOOL_INVOCATION_ARGS_BYTES` (the loopback request cap), then creates a
+   Pending `Approval` **and** a `PendingToolInvocation` binding to the exact
+   `(plugin, tool, agent, args snapshot + SHA-256)`. Nothing runs. The needs_approval
+   tool row offers this as an inline **Request approval** form on the Plugins page.
+2. **Decide** — the Approvals page shows the request with its action, reason, risk,
+   bound tool, and a **secret-redacted args preview** (`redact_args_for_preview`
+   masks `token`/`password`/`secret`/`authorization`/… values; the raw snapshot is
+   never shown). The operator Approves or Rejects (`/v1/relux/approvals/:id/decide`);
+   a reject drops the binding outright.
+3. **Execute once** — for an Approved, not-yet-consumed binding the operator clicks
+   **Execute once** (`POST /v1/relux/approvals/:id/execute`). The kernel
+   (`execute_approved_tool_invocation`) re-validates the tool still exists, the
+   subject still holds the permission, and the stored args still hash to the recorded
+   SHA-256, then runs the **stored snapshot** (never client-resupplied args, so the
+   approved call cannot be modified) through the same loopback runtime as a direct
+   invoke. The binding is **consumed on a single attempt** (success OR runtime
+   failure) — it can never run again without a fresh approval. Every step is audited
+   (`tool_invocation:request`/`execute`, success/denied/failed). The binding persists
+   in the snapshot (meta-json seam, like `orchestrations`), so an approved call
+   survives a restart.
+
+This grants no blanket/reusable authority — one approval binds one invocation and is
+consumed by one execution attempt; there is no `session`/`always` grant (the model
+has no safe reusable-grant model, so none is invented). No remote/non-loopback
+execution is added: the approved call runs through the same bounded loopback runtime,
+so all existing safety bounds hold. Pinned by kernel tests
+`per_call_approval_request_creates_a_bound_pending_approval`,
+`per_call_approval_executes_once_after_approval_then_is_consumed`,
+`a_runtime_failure_still_consumes_the_approved_invocation`,
+`rejecting_a_per_call_approval_drops_the_binding`,
+`requesting_approval_for_a_directly_runnable_tool_is_refused`,
+`requesting_approval_without_the_permission_is_denied`,
+`per_call_binding_survives_a_snapshot_roundtrip`,
+`secret_args_are_redacted_in_preview_but_stored_verbatim`, and the dashboard
+`toolReadiness` `canRequestApproval` assertions.
 
 ### Adapter Runtime v1 (local coding-agent CLIs)
 

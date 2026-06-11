@@ -2424,18 +2424,51 @@ export const reluxTools = {
     input?: unknown;
     agent_id?: string;
   }) => api.post<ReluxToolInvocationResult>("/v1/relux/tools/invoke", body),
+  // Request a per-call approval to invoke ONE gated (non-low-risk) tool with
+  // specific arguments. Returns the created Pending approval record (with its
+  // bound tool_invocation detail). A directly-runnable tool is refused (HTTP 400)
+  // — invoke it instead. The operator then decides on the Approvals page.
+  requestApproval: (body: {
+    plugin_id: string;
+    tool_name: string;
+    input?: unknown;
+    agent_id?: string;
+  }) => api.post<ReluxApproval>("/v1/relux/tools/request-approval", body),
 };
 
 // -- Relux Approvals --------------------------------------------------------
 
+// The per-tool-call binding attached to a tool-invocation approval. Carries only
+// a bounded, secret-redacted args preview + hash — never the raw arguments.
+export interface ReluxToolInvocationView {
+  plugin_id: string;
+  tool_name: string;
+  agent_id: string;
+  permission: string;
+  risk: string;
+  args_preview: string;
+  args_sha256: string;
+  // One-shot: true once the bound invocation has been executed.
+  consumed: boolean;
+  // The bound call can be executed now (approved + not yet consumed).
+  executable: boolean;
+}
+
+// An approval record. `status` is the snake_case wire form
+// (`pending`/`approved`/`rejected`). `tool_invocation` is present only for a
+// per-tool-call approval.
 export interface ReluxApproval {
   id: string;
   requested_by: string;
-  status: "Pending" | "Approved" | "Rejected";
+  action: string;
+  reason: string;
+  risk: string;
+  status: "pending" | "approved" | "rejected";
+  approved_by?: string;
   created_at: string;
   resolved_at?: string;
-  approver?: string;
   note?: string;
+  tool_invocation?: ReluxToolInvocationView;
 }
 
 export const reluxApprovals = {
@@ -2447,6 +2480,14 @@ export const reluxApprovals = {
       decision,
       note,
     }),
+  // Execute the single invocation bound to an APPROVED per-call approval, once.
+  // Returns the structured tool result. An undecided/consumed approval is a
+  // conflict (HTTP 409); a missing binding a 404; a runtime failure honest.
+  execute: (id: string) =>
+    api.post<ReluxToolInvocationResult>(
+      `/v1/relux/approvals/${encodeURIComponent(id)}/execute`,
+      {},
+    ),
 };
 
 // -- Relux Permissions ------------------------------------------------------

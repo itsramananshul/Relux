@@ -21,6 +21,10 @@ const ReluxApprovals: React.FC = () => {
   const [permissionInput, setPermissionInput] = useState<string>("");
   const [grantPermissionError, setGrantPermissionError] = useState<string | null>(null);
   const [grantPermissionSuccess, setGrantPermissionSuccess] = useState<string | null>(null);
+  // Per-approval execution feedback for the per-call tool-invocation flow, keyed
+  // by approval id: a success line (the structured output) or an honest error.
+  const [execResult, setExecResult] = useState<Record<string, string>>({});
+  const [execError, setExecError] = useState<Record<string, string>>({});
 
   const fetchApprovals = async () => {
     try {
@@ -80,6 +84,25 @@ const ReluxApprovals: React.FC = () => {
     } catch (err) {
       console.error(`Failed to ${decision} approval ${approvalId}:`, err);
       setError(`Failed to ${decision} approval.`);
+    }
+  };
+
+  const handleExecuteApproval = async (approvalId: string) => {
+    setExecError((m) => ({ ...m, [approvalId]: "" }));
+    setExecResult((m) => ({ ...m, [approvalId]: "" }));
+    try {
+      const res = await reluxApprovals.execute(approvalId);
+      setExecResult((m) => ({
+        ...m,
+        [approvalId]: JSON.stringify(res.output),
+      }));
+      fetchApprovals(); // Refresh so the binding shows as consumed.
+    } catch (err: any) {
+      console.error(`Failed to execute approval ${approvalId}:`, err);
+      setExecError((m) => ({
+        ...m,
+        [approvalId]: err?.message || "Execution failed.",
+      }));
     }
   };
 
@@ -146,7 +169,13 @@ const ReluxApprovals: React.FC = () => {
                     scope="col"
                     className="px-6 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider"
                   >
-                    Requested By
+                    Action
+                  </th>
+                  <th
+                    scope="col"
+                    className="px-6 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider"
+                  >
+                    Risk
                   </th>
                   <th
                     scope="col"
@@ -158,33 +187,60 @@ const ReluxApprovals: React.FC = () => {
                     scope="col"
                     className="px-6 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider"
                   >
-                    Created At
-                  </th>
-                  <th
-                    scope="col"
-                    className="px-6 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider"
-                  >
                     Actions
                   </th>
                 </tr>
               </thead>
               <tbody className="bg-gray-800 divide-y divide-gray-700">
-                {approvals.map((approval) => (
+                {approvals.map((approval) => {
+                  const ti = approval.tool_invocation;
+                  return (
                   <tr key={approval.id}>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-300">
-                      {approval.id}
+                    <td className="px-6 py-4 align-top text-sm font-medium text-gray-300">
+                      <div>{approval.id}</div>
+                      <div className="text-xs text-gray-500">
+                        {approval.requested_by} ·{" "}
+                        {new Date(approval.created_at).toLocaleString()}
+                      </div>
                     </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-400">
-                      {approval.requested_by}
+                    <td className="px-6 py-4 align-top text-sm text-gray-400">
+                      <div>{approval.action}</div>
+                      <div className="text-xs text-gray-500 mt-1">{approval.reason}</div>
+                      {ti && (
+                        <div className="mt-2 text-xs text-gray-400">
+                          <div>
+                            tool <span className="font-mono">{ti.tool_name}</span> on{" "}
+                            <span className="font-mono">{ti.plugin_id}</span> as{" "}
+                            <span className="font-mono">{ti.agent_id}</span>
+                            {ti.consumed && (
+                              <span className="ml-2 text-gray-500">(executed)</span>
+                            )}
+                          </div>
+                          <pre className="mt-1 p-2 bg-gray-900 rounded text-xs overflow-x-auto whitespace-pre-wrap">
+                            {ti.args_preview}
+                          </pre>
+                          <div className="text-gray-600">
+                            args sha256 {ti.args_sha256.slice(0, 16)}…
+                          </div>
+                          {execResult[approval.id] && (
+                            <div className="mt-1 text-green-400">
+                              Output: <span className="font-mono">{execResult[approval.id]}</span>
+                            </div>
+                          )}
+                          {execError[approval.id] && (
+                            <div className="mt-1 text-red-400">{execError[approval.id]}</div>
+                          )}
+                        </div>
+                      )}
                     </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-400">
+                    <td className="px-6 py-4 align-top text-sm text-gray-400">
+                      {approval.risk}
+                    </td>
+                    <td className="px-6 py-4 align-top text-sm text-gray-400">
                       {approval.status}
                     </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-400">
-                      {new Date(approval.created_at).toLocaleString()}
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
-                      {approval.status === "Pending" && (
+                    <td className="px-6 py-4 align-top text-right text-sm font-medium">
+                      {approval.status === "pending" && (
                         <>
                           <button
                             onClick={() => handleDecideApproval(approval.id, "approved")}
@@ -200,9 +256,24 @@ const ReluxApprovals: React.FC = () => {
                           </button>
                         </>
                       )}
+                      {/* An approved, not-yet-executed per-call tool invocation can be
+                          run exactly once. The kernel enforces one-shot consumption;
+                          the button just drives it. */}
+                      {ti?.executable && (
+                        <button
+                          onClick={() => handleExecuteApproval(approval.id)}
+                          className="text-blue-400 hover:text-blue-600"
+                        >
+                          Execute once
+                        </button>
+                      )}
+                      {ti && ti.consumed && approval.status === "approved" && (
+                        <span className="text-gray-500">Executed</span>
+                      )}
                     </td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           </div>
