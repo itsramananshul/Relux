@@ -448,7 +448,27 @@ function PluginRow({ plugin, onChanged }: { plugin: ReluxPlugin; onChanged: () =
           )}
         </td>
         <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
-          {plugin.protected ? (
+          {next.kind === "configure-adapter" ? (
+            // Adapters — including the bundled, protected Claude/Codex CLIs — always
+            // expose a real Configure path (to the Crew page) so they never read as
+            // mysterious "locked" rows with no way to use them. A protected adapter
+            // is locked against REMOVAL only; it omits the Remove button.
+            <>
+              <Link className="btn ghost sm" to="/crew" title={next.detail}>
+                Configure
+              </Link>
+              {!plugin.protected && (
+                <button
+                  className="btn ghost sm"
+                  style={{ marginLeft: 6 }}
+                  disabled={busy}
+                  onClick={() => void remove()}
+                >
+                  {busy ? "..." : "Remove"}
+                </button>
+              )}
+            </>
+          ) : plugin.protected ? (
             <span className="muted" style={{ fontSize: 11 }} title="Bundled plugins are locked">
               locked
             </span>
@@ -463,10 +483,6 @@ function PluginRow({ plugin, onChanged }: { plugin: ReluxPlugin; onChanged: () =
                 >
                   {manifestOpen ? "Close" : "Set up"}
                 </button>
-              ) : next.kind === "configure-adapter" ? (
-                <Link className="btn ghost sm" to="/crew" title={next.detail}>
-                  Configure
-                </Link>
               ) : (
                 <button
                   className="btn ghost sm"

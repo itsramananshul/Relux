@@ -105,6 +105,17 @@ test("a non-bundled adapter points to the Crew page, not loopback runtime", () =
   assert.match(step.detail, /Crew/);
 });
 
+test("a bundled (protected) adapter is configurable, NOT a dead-end locked row", () => {
+  // The shipped Claude/Codex CLIs are protected (can't be removed) but must still
+  // expose a real Configure path — the mission's "mysterious protected rows with no
+  // path to use them" is the exact regression this pins.
+  const step = pluginNextStep(plugin({ kind: "Adapter", protected: true }));
+  assert.equal(step.kind, "configure-adapter");
+  assert.notEqual(step.kind, "none");
+  assert.match(step.detail, /Crew/);
+  assert.match(step.detail, /Prime's brain|Settings/);
+});
+
 test("tools list shows only runnable tools by default, with a hidden count", () => {
   const tools = [
     tool({ tool_name: "a", executable: "ready" }),

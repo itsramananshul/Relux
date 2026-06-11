@@ -102,15 +102,18 @@ export function pluginNextStep(p: ReluxPlugin): PluginNextStep {
   }
 
   // Adapters are enabled from the Crew page (local CLI runtimes), not via the
-  // loopback ToolSet runtime. Bundled adapters are locked here anyway.
+  // loopback ToolSet runtime. A bundled adapter (the shipped Claude/Codex CLIs) is
+  // protected — it cannot be REMOVED — but that is NOT the same as having no way to
+  // USE it: it still gets a real "Configure" path so it never reads as a mysterious
+  // locked row. Enable the local CLI runtime on the Crew page, then select it as
+  // Prime's brain in Settings.
   if (category === "adapter") {
-    if (p.protected) {
-      return { kind: "none", cta: "", detail: "Bundled adapter; configure it on the Crew page." };
-    }
     return {
       kind: "configure-adapter",
       cta: "Configure on Crew",
-      detail: "Enable this adapter's local CLI runtime from the Crew page.",
+      detail: p.protected
+        ? "Bundled CLI adapter (Claude/Codex). Enable its local CLI runtime on the Crew page, then select it as Prime's brain in Settings. Protected: it cannot be removed, but it is fully configurable."
+        : "Enable this adapter's local CLI runtime from the Crew page.",
     };
   }
 
