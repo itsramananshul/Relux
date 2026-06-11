@@ -269,8 +269,27 @@ real-work-adapter items now cover it, so Home stays compact and non-redundant.
 **Honest degradation on Health.** Health's reads are best-effort. If the core
 `/v1/relux/health` read fails the page shows its honest "could not reach the
 control plane" banner (never a faked-ready guide). If only a secondary read fails,
-the guide degrades through `buildReadiness` — a null tools probe → an `info` row,
-a null `state` → the guide's "Checking readiness…" — rather than asserting ready.
+the guide degrades through `buildReadiness` rather than asserting ready.
+
+The key distinction is **loading vs failed**. `buildReadiness` accepts a `failed`
+flag set (`ReadinessFailed`: `state`/`ai`/`adapters`/`plugins`/`tools`) recording
+which reads are null because the request **failed**, as opposed to null because it
+is still **in flight**. A null read with no flag stays loading — the page renders
+`report: null` → the guide's "Checking readiness…". A null read *with* its flag is
+surfaced as an explicit, retryable **"… unavailable"** row (e.g. *State
+unavailable* / *Tools unavailable* / *Plugins unavailable* / *Adapter status
+unavailable*) — never indefinite checking text. The callers learn the distinction
+from real page context: Health flags a read once its load has **settled**
+(`!loading`, since each secondary read is fetched with `.catch(() => null)`); Home
+flags a `useAsync` read once it has an `.error`. This fixes the prior gap where, if
+`/v1/relux/health` succeeded but the `state` read failed, the guide could sit on
+"Checking readiness…" forever instead of an explicit degraded row.
+
+A report with any failed read is **degraded**: `degraded === true`, and `ready`
+is forced false so the guide never paints a green "operational" badge or a faked
+summary from partial data. The guide renders a third mode — a "Showing what is
+available — retry to refresh" banner above the full checklist (the unavailable
+rows carry a **Retry** button wired to the page's Refresh) and a `degraded` badge.
 
 **What it derives (honest, live).** A pure, React-free module
 (`apps/dashboard/src/readiness.ts`, `buildReadiness(inputs)`) turns the four reads
@@ -292,17 +311,23 @@ that fixes it:
 - **Plugins & tools** — reuses `plugins.ts::pluginCategory`/`toolReadiness`. A
   metadata-only wrapper (generated, zero tools) or a tool needing a loopback
   runtime is **attention** (`warn`); ready tools are `done`; approval-gated tools
-  are noted, never counted as ready; an unreachable tools probe stays an honest
-  `info`, never "no tools configured". Action → `/plugins`.
+  are noted, never counted as ready; a tools probe still **loading** stays an
+  honest neutral `info` ("unavailable right now"), while a tools/plugin read that
+  **failed** becomes an explicit `warn` *Tools unavailable* / *Plugins unavailable*
+  row with a Retry — never "no tools configured". Action → `/plugins`.
 - **Pending approvals** — surfaced only when something actually waits on a decision.
   Action → `/approvals`.
 
-**Two modes (the no-nag rule).** `ready = blockers.length === 0`.
-- **Setup needed** (a blocker exists): the full checklist renders with per-item
-  action buttons so the operator finishes setup.
-- **Operational** (nothing blocks): a one-line, secret-free summary (`Brain: <label>.
-  N agents, M tools ready. K open tasks, J running.`), any `warn` attention items
-  shown quietly, and the full checks tucked behind a native `<details>` disclosure.
+**Three modes (the no-nag rule).** `ready = blockers.length === 0 && !degraded`.
+- **Degraded** (a read failed): the full checklist renders with the explicit
+  "… unavailable" Retry rows and a "Showing what is available" banner — honest
+  about the partial data, never a faked operational summary.
+- **Setup needed** (a blocker exists, no failed read): the full checklist renders
+  with per-item action buttons so the operator finishes setup.
+- **Operational** (nothing blocks, nothing failed): a one-line, secret-free summary
+  (`Brain: <label>. N agents, M tools ready. K open tasks, J running.`), any `warn`
+  attention items shown quietly, and the full checks tucked behind a native
+  `<details>` disclosure.
 
 **The first action.** `deriveFirstAction(state)` always returns one clear next step
 in priority order: review a pending approval → watch an active run → start/assign a
@@ -311,7 +336,13 @@ fresh state has a real action.
 
 **Tests.** `apps/dashboard/test/readiness.test.ts` pins the four required states
 (fresh/local-only, Claude available but disabled, metadata plugin needs config,
-fully ready) plus the blocker and first-action priority;
+fully ready) plus the blocker and first-action priority, and the read-failure
+honesty: a failed `state`/`tools`/`plugins`/`adapter` read produces an explicit
+retryable `warn` row and a `degraded` (not-ready) report, while a still-loading
+null read stays a neutral `info`/loading row with no Retry;
+`apps/dashboard/test/readiness-guide-render.test.mjs` renders the component's three
+modes (loading → "Checking readiness…", degraded → "… unavailable" + Retry +
+`degraded` badge, operational → the summary);
 `apps/dashboard/test/readiness-render.test.mjs` proves Home mounts under the
 declarative router, the redundant "Run real work" prose card is gone, and the
 committed bundle carries the copy; `apps/dashboard/test/health-render.test.mjs`

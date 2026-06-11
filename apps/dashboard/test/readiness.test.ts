@@ -5,6 +5,7 @@ import {
   adapterWorkItem,
   crewItem,
   pluginToolItem,
+  stateUnavailableItem,
   deriveFirstAction,
   brainLabel,
 } from "../src/readiness.ts";
@@ -251,6 +252,100 @@ test("first action prioritises a pending decision, then work in flight", () => {
   assert.equal(deriveFirstAction(state({ tasks: 5, open_tasks: 2 })).linkTo, "/work");
   assert.equal(deriveFirstAction(state({ tasks: 0 })).linkTo, "/prime");
   assert.equal(deriveFirstAction(null).linkTo, "/prime");
+});
+
+// ── Read-failure honesty: loading vs FAILED must read differently ────────────
+//
+// The trap this pins: a null read because the request is still in flight must
+// stay "Checking readiness…" (report null at the call site, or a neutral info
+// row), while a null read because the request FAILED (settled) must become an
+// explicit, retryable "… unavailable" row — never an indefinite checking text and
+// never a faked-ready green badge.
+
+test("a failed state read degrades the whole report honestly (not ready)", () => {
+  const r = buildReadiness({
+    state: null,
+    ai: ai({ brain: "local" }),
+    adapters: [],
+    plugins: [],
+    tools: [],
+    failed: { state: true },
+  });
+  assert.equal(r.degraded, true);
+  assert.equal(r.ready, false); // a partial report must not fake "operational"
+  const row = r.items.find((i) => i.id === "state-unavailable");
+  assert.ok(row, "an explicit State unavailable row is present");
+  assert.equal(row.status, "warn");
+  assert.equal(row.retry, true);
+  assert.equal(row.linkTo, "/health");
+  assert.match(row.description, /partial/i);
+});
+
+test("a null state WITHOUT a failed flag stays loading (no unavailable row)", () => {
+  // The caller has not yet learned the read failed — it is still in flight — so
+  // the report must not assert "State unavailable".
+  const r = buildReadiness({
+    state: null,
+    ai: ai({ brain: "local" }),
+    adapters: [],
+    plugins: [],
+    tools: [],
+  });
+  assert.equal(r.degraded, false);
+  assert.equal(r.items.find((i) => i.id === "state-unavailable"), undefined);
+});
+
+test("stateUnavailableItem is a retryable warn that points at Health", () => {
+  const item = stateUnavailableItem();
+  assert.equal(item.status, "warn");
+  assert.equal(item.retry, true);
+  assert.equal(item.linkTo, "/health");
+});
+
+test("a FAILED tools read is an explicit retryable row, not the loading text", () => {
+  const item = pluginToolItem([], null, { tools: true });
+  assert.equal(item.status, "warn");
+  assert.equal(item.retry, true);
+  assert.match(item.label, /Tools unavailable/i);
+  assert.match(item.description, /Could not read/i);
+});
+
+test("a still-loading tools probe stays a neutral info row (no retry, no failure)", () => {
+  const item = pluginToolItem([], null);
+  assert.equal(item.status, "info");
+  assert.notEqual(item.retry, true);
+});
+
+test("a FAILED plugin-list read says so instead of inferring 'no plugins'", () => {
+  const item = pluginToolItem(null, null, { plugins: true });
+  assert.equal(item.status, "warn");
+  assert.equal(item.retry, true);
+  assert.match(item.label, /Plugins unavailable/i);
+});
+
+test("a FAILED adapter read is honest, not a guessed 'install a CLI'", () => {
+  const item = adapterWorkItem(null, true);
+  assert.equal(item.status, "warn");
+  assert.equal(item.retry, true);
+  assert.match(item.label, /unavailable/i);
+  // A null adapter list WITHOUT the failed flag keeps the prior optional-link copy.
+  const loading = adapterWorkItem(null);
+  assert.equal(loading.status, "link");
+  assert.notEqual(loading.retry, true);
+});
+
+test("a degraded report is reported degraded even with no blockers", () => {
+  const r = buildReadiness({
+    state: state(),
+    ai: ai({ brain: "local" }),
+    adapters: [],
+    plugins: [],
+    tools: null,
+    failed: { tools: true },
+  });
+  assert.equal(r.blockers.length, 0);
+  assert.equal(r.degraded, true);
+  assert.equal(r.ready, false);
 });
 
 test("brainLabel renders each brain honestly", () => {

@@ -43,14 +43,23 @@ export function ReluxHome() {
   // reads — the brain, the real-work adapter, crew, plugins/tools and any
   // pending approvals — so the guide reflects HONEST readiness, never a faked
   // green check. Null state means the control plane was not reachable; we render
-  // the loading report and the honest error banner below.
+  // the loading report and the honest error banner below. A secondary read that
+  // ERRORED (settled, not loading) is flagged `failed` so the guide shows an
+  // explicit "… unavailable" row with a Retry instead of silently guessing from
+  // a null value.
   const report = state.data
     ? buildReadiness({
         state: state.data,
-        ai: ai.data,
-        adapters: adapters.data,
-        plugins: plugins.data,
+        ai: ai.error ? null : ai.data,
+        adapters: adapters.error ? null : adapters.data,
+        plugins: plugins.error ? null : plugins.data,
         tools: tools.error ? null : tools.data,
+        failed: {
+          ai: !!ai.error,
+          adapters: !!adapters.error,
+          plugins: !!plugins.error,
+          tools: !!tools.error,
+        },
       })
     : null;
 

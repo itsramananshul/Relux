@@ -133,12 +133,30 @@ export function Health() {
 
   // The same honest readiness derivation Home shows (no duplicated logic — it
   // reuses ./readiness), built from the local /v1/relux reads this page already
-  // makes. `state` is the grounding; when a best-effort read fails the report
-  // degrades honestly (a null tools probe → "info", a null state → the guide's
-  // "Checking readiness…"), never a faked-ready summary.
-  const report = stateData
-    ? buildReadiness({ state: stateData, ai, adapters, plugins, tools })
-    : null;
+  // makes. Every secondary read is fetched with `.catch(() => null)`, so once the
+  // load has SETTLED (`!loading`) a null read genuinely failed — we flag it so the
+  // guide shows an explicit "… unavailable" row with a Retry, rather than sitting
+  // forever on "Checking readiness…" when, e.g., health is OK but the state read
+  // failed. While still loading, a null read is simply not back yet (no flag), and
+  // with no state yet at all we keep the honest loading report (null).
+  const settled = !loading;
+  const report =
+    stateData || settled
+      ? buildReadiness({
+          state: stateData,
+          ai,
+          adapters,
+          plugins,
+          tools,
+          failed: {
+            state: settled && stateData === null,
+            ai: settled && ai === null,
+            adapters: settled && adapters === null,
+            plugins: settled && plugins === null,
+            tools: settled && tools === null,
+          },
+        })
+      : null;
 
   return (
     <div className="grid">

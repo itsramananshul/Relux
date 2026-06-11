@@ -22,7 +22,7 @@ const ICON: Record<ReadinessItem["status"], string> = {
   info: "ℹ",
 };
 
-function ItemRow({ item }: { item: ReadinessItem }) {
+function ItemRow({ item, onRetry }: { item: ReadinessItem; onRetry?: () => void }) {
   return (
     <li className="readiness-item">
       <span className={`readiness-icon ${item.status}`}>{ICON[item.status]}</span>
@@ -34,6 +34,13 @@ function ItemRow({ item }: { item: ReadinessItem }) {
             </Link>
           ) : (
             <span className="readiness-label">{item.label}</span>
+          )}
+          {/* A failed read's honest fix is to re-run it — wire the row's Retry to
+              the page's Refresh handler. */}
+          {item.retry && onRetry && (
+            <button className="btn ghost sm readiness-retry" onClick={onRetry}>
+              Retry
+            </button>
           )}
           {item.cta && item.linkTo && (
             <Link to={item.linkTo} className="readiness-cta">
@@ -63,10 +70,13 @@ export function ReadinessGuide({
       <h3 style={{ margin: 0 }}>Readiness</h3>
       {report && (
         <span
-          className={"badge " + (report.ready ? "done" : "todo")}
+          className={
+            "badge " +
+            (report.degraded ? "in_progress" : report.ready ? "done" : "todo")
+          }
           style={{ marginLeft: 8 }}
         >
-          {report.ready ? "operational" : "setup needed"}
+          {report.degraded ? "degraded" : report.ready ? "operational" : "setup needed"}
         </span>
       )}
       <div className="spacer" style={{ flex: 1 }} />
@@ -89,13 +99,28 @@ export function ReadinessGuide({
     );
   }
 
-  const { ready, items, attention, firstAction, summary } = report;
+  const { ready, degraded, items, attention, firstAction, summary } = report;
 
   return (
     <div className="card readiness">
       {header}
 
-      {ready ? (
+      {degraded ? (
+        // One or more reads failed: show the full checklist with the explicit
+        // "… unavailable" rows (each with a Retry) — never a faked operational
+        // summary built from partial data.
+        <>
+          <p className="muted" style={{ marginTop: 0, fontSize: 13 }}>
+            Some readiness data could not be read. Showing what is available —
+            retry to refresh.
+          </p>
+          <ul className="readiness-list">
+            {items.map((item) => (
+              <ItemRow key={item.id} item={item} onRetry={onRefresh} />
+            ))}
+          </ul>
+        </>
+      ) : ready ? (
         <>
           <p className="readiness-summary">
             <span className="readiness-icon done" style={{ marginRight: 8 }}>
@@ -107,7 +132,7 @@ export function ReadinessGuide({
           {attention.length > 0 && (
             <ul className="readiness-list">
               {attention.map((item) => (
-                <ItemRow key={item.id} item={item} />
+                <ItemRow key={item.id} item={item} onRetry={onRefresh} />
               ))}
             </ul>
           )}
@@ -116,7 +141,7 @@ export function ReadinessGuide({
             <summary>All checks ({items.length})</summary>
             <ul className="readiness-list">
               {items.map((item) => (
-                <ItemRow key={item.id} item={item} />
+                <ItemRow key={item.id} item={item} onRetry={onRefresh} />
               ))}
             </ul>
           </details>
@@ -128,7 +153,7 @@ export function ReadinessGuide({
           </p>
           <ul className="readiness-list">
             {items.map((item) => (
-              <ItemRow key={item.id} item={item} />
+              <ItemRow key={item.id} item={item} onRetry={onRefresh} />
             ))}
           </ul>
         </>
@@ -172,6 +197,7 @@ function ensureStyles() {
   .readiness-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .readiness-label { font-weight: 600; font-size: 13px; }
   .readiness-cta button { padding: 1px 8px; }
+  .readiness-retry { padding: 1px 8px; }
   .readiness-description { color: var(--text-muted, #666); font-size: 12px; line-height: 1.5; margin-top: 2px; }
   .readiness-details { margin-top: 4px; }
   .readiness-details > summary { cursor: pointer; font-size: 12px; color: var(--text-muted, #666); margin-bottom: 8px; }

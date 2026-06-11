@@ -51,6 +51,9 @@ export interface ReadinessItem {
   linkTo?: string;
   // A short button label for the action, when there is a concrete one.
   cta?: string;
+  // true when the honest fix is to re-run the failed read — the component wires
+  // this to its Refresh handler so an "… unavailable" row offers a Retry.
+  retry?: boolean;
 }
 
 export interface FirstAction {
@@ -64,11 +67,29 @@ export interface ReadinessReport {
   blockers: ReadinessItem[];
   // status === "warn": installed but not configured; surfaced, never blocking.
   attention: ReadinessItem[];
-  // true when there are no blockers — the caller shows the operational summary.
+  // true when there are no blockers AND no read failed — the caller shows the
+  // operational summary. A degraded report is never "ready" (it must not fake a
+  // green "operational" badge from partial data).
   ready: boolean;
+  // true when one or more secondary reads FAILED (settled to null), so some rows
+  // are explicit "… unavailable" placeholders rather than real readiness. The
+  // caller shows an honest "degraded" banner instead of the operational summary.
+  degraded: boolean;
   firstAction: FirstAction;
   // A one-line, secret-free operational summary for the "all set" state.
   summary: string;
+}
+
+// Which reads have SETTLED to null because the request FAILED, as opposed to
+// null because the request is still in flight. The caller can only set a flag
+// once it knows the read completed (not loading) — that is what lets the report
+// distinguish "Checking readiness…" (loading) from "State unavailable" (failed).
+export interface ReadinessFailed {
+  state?: boolean;
+  ai?: boolean;
+  adapters?: boolean;
+  plugins?: boolean;
+  tools?: boolean;
 }
 
 export interface ReadinessInputs {
@@ -79,6 +100,9 @@ export interface ReadinessInputs {
   // null when the tools probe failed/has not resolved (we then stay honest
   // rather than claim "no tools configured").
   tools: ReluxToolDescriptor[] | null;
+  // Which of the above are null because the read FAILED (not still loading).
+  // Omitted/empty means "treat every null as still-loading" — the prior contract.
+  failed?: ReadinessFailed;
 }
 
 function adapterFor(
@@ -135,8 +159,24 @@ function brainItem(
 // without it.
 export function adapterWorkItem(
   adapters: ReluxAdapterStatus[] | null,
+  failed = false,
 ): ReadinessItem {
   const base = { id: "run-real-work", linkTo: "/crew" } as const;
+
+  // The adapter list read failed — say so rather than claiming "no CLI detected,
+  // install one" (which would be a guess we cannot stand behind).
+  if (adapters === null && failed) {
+    return {
+      ...base,
+      label: "Adapter status unavailable",
+      status: "warn",
+      description:
+        "Could not read the real-work adapter status from the control plane, so whether a Claude/Codex CLI is runnable is unknown. Retry, or open Crew → Adapters.",
+      cta: "Open Crew",
+      retry: true,
+    };
+  }
+
   const claude = adapterFor(adapters, CLAUDE_ADAPTER_ID);
   const codex = adapterFor(adapters, CODEX_ADAPTER_ID);
   const cli = [claude, codex].filter(Boolean) as ReluxAdapterStatus[];
@@ -207,8 +247,23 @@ export function crewItem(state: ReluxState | null): ReadinessItem {
 export function pluginToolItem(
   plugins: ReluxPlugin[] | null,
   tools: ReluxToolDescriptor[] | null,
+  failed: { plugins?: boolean; tools?: boolean } = {},
 ): ReadinessItem {
   const base = { id: "plugins-tools", linkTo: "/plugins" } as const;
+
+  // The plugin list read failed — the whole capability surface (wrappers + tools)
+  // is unknown, so don't infer "no plugins / no config needed" from a null list.
+  if (plugins === null && failed.plugins) {
+    return {
+      ...base,
+      label: "Plugins unavailable",
+      status: "warn",
+      description:
+        "Could not read the installed plugin list from the control plane, so tool readiness is unknown. Retry, or open Plugins to review what is installed.",
+      cta: "Open Plugins",
+      retry: true,
+    };
+  }
 
   // Wrappers needing config are knowable from the plugin list ALONE — surface
   // them first even when the tools probe is unavailable.
@@ -225,8 +280,22 @@ export function pluginToolItem(
     };
   }
 
-  // The tools probe failed / has not resolved — stay honest rather than claim
-  // "no tools configured".
+  // The tools probe FAILED (settled to null) — an explicit, retryable row, not
+  // the indefinite "right now" loading text below.
+  if (tools === null && failed.tools) {
+    return {
+      ...base,
+      label: "Tools unavailable",
+      status: "warn",
+      description:
+        "Could not read tool readiness from the control plane. Retry, or open Plugins to review installed plugins and tool status.",
+      cta: "Open Plugins",
+      retry: true,
+    };
+  }
+
+  // The tools probe has not resolved yet — stay honest rather than claim "no
+  // tools configured", but do not assert failure either (it may still arrive).
   if (tools === null) {
     return {
       ...base,
@@ -274,6 +343,23 @@ export function pluginToolItem(
     description:
       "No extra tools configured yet — Prime's built-in capabilities are available. Install plugins on Plugins to add tools and adapters.",
     cta: "Browse plugins",
+  };
+}
+
+// "State unavailable" item — the primary control-plane read (counts, tasks,
+// approvals) failed, so crew/approvals/first-action are all guesses. Surface it
+// honestly and retryably at the top instead of leaving the guide stuck on
+// "Checking readiness…". A warn (not a todo): the kernel may simply be busy.
+export function stateUnavailableItem(): ReadinessItem {
+  return {
+    id: "state-unavailable",
+    label: "State unavailable",
+    status: "warn",
+    description:
+      "Could not read live state (task, run and approval counts) from the control plane, so the readiness below is partial. Retry, or open Health to diagnose the kernel.",
+    linkTo: "/health",
+    cta: "Open Health",
+    retry: true,
   };
 }
 
@@ -333,25 +419,41 @@ function operationalSummary(inputs: ReadinessInputs): string {
 // (approvals when pending). When `state` is null the control plane was not
 // reachable; the caller renders its own honest error and a loading report here.
 export function buildReadiness(inputs: ReadinessInputs): ReadinessReport {
-  const { state, ai, adapters, plugins, tools } = inputs;
+  const { state, ai, adapters, plugins, tools, failed = {} } = inputs;
 
-  const items: ReadinessItem[] = [
+  const items: ReadinessItem[] = [];
+
+  // A failed primary state read is surfaced explicitly (the counts that drive
+  // crew/approvals/first-action are unknown) instead of leaving the guide stuck
+  // on the indefinite "Checking readiness…" text.
+  if (state === null && failed.state) items.push(stateUnavailableItem());
+
+  items.push(
     brainItem(ai, adapters),
-    adapterWorkItem(adapters),
+    adapterWorkItem(adapters, !!failed.adapters),
     crewItem(state),
-    pluginToolItem(plugins, tools),
-  ];
+    pluginToolItem(plugins, tools, { plugins: failed.plugins, tools: failed.tools }),
+  );
   const approvals = approvalsItem(state);
   if (approvals) items.push(approvals);
 
   const blockers = items.filter((i) => i.status === "todo");
   const attention = items.filter((i) => i.status === "warn");
 
+  // A read genuinely failed (null AND flagged) → the report is degraded: some
+  // rows are placeholders, so it must not present a green "operational" summary.
+  const degraded =
+    (state === null && !!failed.state) ||
+    (adapters === null && !!failed.adapters) ||
+    (plugins === null && !!failed.plugins) ||
+    (tools === null && !!failed.tools);
+
   return {
     items,
     blockers,
     attention,
-    ready: blockers.length === 0,
+    ready: blockers.length === 0 && !degraded,
+    degraded,
     firstAction: deriveFirstAction(state),
     summary: operationalSummary(inputs),
   };
