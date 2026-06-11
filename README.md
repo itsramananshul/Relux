@@ -10,7 +10,19 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/itsramananshul/Relux/releases"><img src="https://img.shields.io/github/v/release/itsramananshul/Relux?include_prereleases&amp;style=for-the-badge" alt="Release"></a>
+  <!--
+    RELEASE INDICATOR — deterministic, NOT a live shields.io release-list query.
+    A static badge + a direct tag link both render from the URL string alone, so
+    they never show a stale/invalid version from the GitHub/Shields release-list
+    cache (which lagged a full version behind after v0.1.10 shipped).
+    On every release, bump the tag `relux-vX.Y.Z` in BOTH the href and the badge
+    `message` below (hyphens in the badge message are doubled: relux--vX.Y.Z),
+    then bump the matching `v0.1.10` / `relux-local-0.1.10-...` strings in the
+    "Run the packaged release" section. `scripts/relux-package-local.ps1` warns
+    if these drift from the crate version being packaged.
+  -->
+  <a href="https://github.com/itsramananshul/Relux/releases/tag/relux-v0.1.10"><img src="https://img.shields.io/badge/release-relux--v0.1.10-blue?style=for-the-badge" alt="Release relux-v0.1.10"></a>
+  <a href="https://github.com/itsramananshul/Relux/releases"><img src="https://img.shields.io/badge/all%20releases-list-lightgrey?style=for-the-badge" alt="All releases"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg?style=for-the-badge" alt="MIT OR Apache-2.0"></a>
 </p>
 
@@ -524,6 +536,27 @@ cd dist\relux-local-<version>-windows-x64
 powershell -NoProfile -ExecutionPolicy Bypass -File .\Start-Relux.ps1
 # then open http://127.0.0.1:19891/dashboard
 ```
+
+#### Cutting a tagged GitHub release (manual checklist)
+
+Relux local releases are cut by hand as GitHub **pre-releases** tagged
+`relux-vX.Y.Z` (the `v*` Actions workflow never matches `relux-` tags). The
+release indicator in this README is **deterministic** — a static badge plus a
+direct `releases/tag/relux-vX.Y.Z` link — so it never lags the GitHub/Shields
+release-list cache, but that means it is bumped by hand. When you cut a release:
+
+1. Bump `[workspace.package] version` (and the `relux-kernel` crate version) to
+   `X.Y.Z`, then build/verify and package with `scripts\relux-package-local.ps1`.
+   The package script **warns** if the README release indicator is stale for the
+   version it is packaging.
+2. In this README, update the **RELEASE INDICATOR** block at the top: bump the
+   tag in both the badge `href`
+   (`releases/tag/relux-vX.Y.Z`) and the badge `message`
+   (`release-relux--vX.Y.Z-blue` — note the doubled hyphen Shields requires).
+3. Update the "Run the packaged release (vX.Y.Z, …)" heading and the
+   `relux-local-X.Y.Z-windows-x64.zip` / folder strings in that section.
+4. Tag and publish the pre-release:
+   `gh release create relux-vX.Y.Z dist\relux-local-X.Y.Z-windows-x64.zip --prerelease --title "…" --notes-file …`
 
 ### Prime Autonomy
 

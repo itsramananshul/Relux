@@ -46,6 +46,33 @@ if (-not $Version) {
     }
 }
 
+# -- README release-indicator drift check (non-fatal) ----------------------
+# The README release badge/link is deterministic (a static badge + a direct tag
+# link, NOT a live shields.io release-list query), so it never lags the
+# GitHub/Shields cache. The flip side: it must be bumped by hand each release.
+# Warn loudly here if the README's pinned tag or packaged-release version does
+# not match the crate version we are about to package, so a stale badge cannot
+# ship silently. This never blocks packaging.
+$ReadmePath = Join-Path $Root "README.md"
+if (Test-Path -LiteralPath $ReadmePath) {
+    $readmeText = Get-Content -LiteralPath $ReadmePath -Raw
+    $expectedTag = "relux-v$Version"
+    $readmeDrift = @()
+    if ($readmeText -notmatch [regex]::Escape("releases/tag/$expectedTag")) {
+        $readmeDrift += "release badge/link tag is not '$expectedTag'"
+    }
+    if ($readmeText -notmatch [regex]::Escape("relux-local-$Version-windows-x64")) {
+        $readmeDrift += "packaged-release text does not mention 'relux-local-$Version-windows-x64'"
+    }
+    if ($readmeDrift.Count -gt 0) {
+        Write-Host ("WARN README release indicator may be stale for v{0}:" -f $Version) -ForegroundColor Yellow
+        foreach ($d in $readmeDrift) { Write-Host ("       - {0}" -f $d) -ForegroundColor Yellow }
+        Write-Host "       Update the RELEASE INDICATOR badge/link + packaged-release section in README.md." -ForegroundColor Yellow
+    } else {
+        Write-Host ("README release indicator matches v{0}." -f $Version) -ForegroundColor DarkGray
+    }
+}
+
 function Get-GitValue {
     param([string[]]$GitArgs, [string]$Fallback = "unknown")
     try {
