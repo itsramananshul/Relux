@@ -9,6 +9,22 @@ once a stable release is cut.
 
 ### Added
 
+- **Prime suggested next actions — one-click buttons replace "type this" copy.**
+  Implements `RELUX_MASTER_PLAN.md` §11.1 (Prime Chat shows *"Prime suggested next
+  actions"*), with §10.5 (Conversation Rules) and §17.1 (smart & grounded). Each
+  Prime turn can now carry `suggested_actions` — a list of `{label, message, send}`
+  buttons the chat surface renders under the reply. **(1) Task creation** offers a
+  **Start the run** button (sends `start it`) instead of the old awkward copy
+  *Say "start it" when you want me to run it* — that sentence is gone. **(2)
+  Brainstorming is useful, not a dead end:** the reply engages the idea and offers
+  a **Turn this into a task** button that *pre-fills* `create a task to <the work>`
+  (recovered from the message by stripping ideation lead-ins) for the user to
+  confirm or edit — `send: false`, so nothing is created until they hit Send. A
+  suggestion is never a privileged path: acting on one routes a pre-written user
+  message through the same grounded `prime_turn`, so a button can do nothing the
+  user could not type. New unit tests pin the candidate extraction and the §11.1
+  attach semantics; the empty list is omitted on the wire so existing clients are
+  unchanged. Dashboard bundle rebuilt into `crates/relix-web-bridge/dashboard-dist`.
 - **Relux local release v0.1.6 (Windows bundle).** The `relux-kernel` /
   `relux-core` crates move from `0.1.5` to `0.1.6` for a user-facing patch that
   keeps **Prime conversational on ideation** and records the post-v0.1.5 session

@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::clock::Clock;
 use crate::event::RunEvent;
-use crate::prime::{classify_intent, decide};
+use crate::prime::{brainstorm_task_candidate, classify_intent, decide};
 use crate::KernelError;
 
 /// The monotonic counters and logical-clock position that must be restored for a
@@ -3398,8 +3398,8 @@ impl KernelState {
             serde_json::json!({ "intent": format!("{:?}", intent) }),
         );
 
-        match plan {
-            PrimePlan::Reply { text } => Ok(PrimeTurn {
+        let mut turn = match plan {
+            PrimePlan::Reply { text } => PrimeTurn {
                 intent,
                 reply: text,
                 disposition: PrimeDisposition::Answered,
@@ -3411,8 +3411,9 @@ impl KernelState {
                 invoked_tool: None,
                 tool_output: None,
                 tool_error: None,
-            }),
-            PrimePlan::Clarify { text } => Ok(PrimeTurn {
+                suggested_actions: Vec::new(),
+            },
+            PrimePlan::Clarify { text } => PrimeTurn {
                 intent,
                 reply: text,
                 disposition: PrimeDisposition::NeedsClarification,
@@ -3424,8 +3425,9 @@ impl KernelState {
                 invoked_tool: None,
                 tool_output: None,
                 tool_error: None,
-            }),
-            PrimePlan::Act { action, text } => self.prime_execute(ctx, intent, action, text),
+                suggested_actions: Vec::new(),
+            },
+            PrimePlan::Act { action, text } => self.prime_execute(ctx, intent, action, text)?,
             PrimePlan::Propose {
                 action,
                 reason,
@@ -3443,7 +3445,7 @@ impl KernelState {
                 let reply = format!(
                     "{text} I will not do this without approval. I have logged {approval} ({risk:?} risk): {reason}"
                 );
-                Ok(PrimeTurn {
+                PrimeTurn {
                     intent,
                     reply,
                     disposition: PrimeDisposition::AwaitingApproval,
@@ -3455,9 +3457,16 @@ impl KernelState {
                     invoked_tool: None,
                     tool_output: None,
                     tool_error: None,
-                })
+                    suggested_actions: Vec::new(),
+                }
             }
-        }
+        };
+        // One central place to offer the next-step buttons the chat surface
+        // renders (`docs/RELUX_MASTER_PLAN.md` §11.1 "Prime suggested next
+        // actions"). Each is just a pre-written user message, so it can do
+        // nothing the user could not type.
+        attach_suggestions(&mut turn, message);
+        Ok(turn)
     }
 
     /// Execute the safe `Act` actions Prime is allowed to perform directly.
@@ -3485,7 +3494,7 @@ impl KernelState {
                 // user says "start it"; assigning to self is within Prime's scope.
                 self.assign_task(&task, &ctx.agent)?;
                 let reply = format!(
-                    "{text} Created {task} and assigned it to {}. Say \"start it\" when you want me to run it.",
+                    "{text} Created {task} and assigned it to {}. It is ready to run whenever you are.",
                     ctx.agent
                 );
                 Ok(PrimeTurn {
@@ -3500,6 +3509,7 @@ impl KernelState {
                     invoked_tool: None,
                     tool_output: None,
                     tool_error: None,
+                    suggested_actions: Vec::new(),
                 })
             }
             PrimeAction::CreateAndRunTask { title } => {
@@ -3528,6 +3538,7 @@ impl KernelState {
                     invoked_tool: None,
                     tool_output: None,
                     tool_error: None,
+                    suggested_actions: Vec::new(),
                 })
             }
             PrimeAction::StartRun { task_id } => {
@@ -3549,6 +3560,7 @@ impl KernelState {
                     invoked_tool: None,
                     tool_output: None,
                     tool_error: None,
+                    suggested_actions: Vec::new(),
                 })
             }
             PrimeAction::CreateAgent {
@@ -3579,6 +3591,7 @@ impl KernelState {
                     invoked_tool: None,
                     tool_output: None,
                     tool_error: None,
+                    suggested_actions: Vec::new(),
                 })
             }
             PrimeAction::AssignTask { task_id, agent_id } => {
@@ -3598,6 +3611,7 @@ impl KernelState {
                     invoked_tool: None,
                     tool_output: None,
                     tool_error: None,
+                    suggested_actions: Vec::new(),
                 })
             }
             PrimeAction::DiscoverTools => {
@@ -3621,6 +3635,7 @@ impl KernelState {
                     invoked_tool: None,
                     tool_output: None,
                     tool_error: None,
+                    suggested_actions: Vec::new(),
                 })
             }
             PrimeAction::InvokeTool {
@@ -3646,6 +3661,7 @@ impl KernelState {
                         invoked_tool: None,
                         tool_output: None,
                         tool_error: None,
+                        suggested_actions: Vec::new(),
                     })
                 }
                 Err(KernelError::OrchestrationNotMultiAgent) => Ok(PrimeTurn {
@@ -3660,6 +3676,7 @@ impl KernelState {
                     invoked_tool: None,
                     tool_output: None,
                     tool_error: None,
+                    suggested_actions: Vec::new(),
                 }),
                 Err(e) => Err(e),
             },
@@ -3678,6 +3695,7 @@ impl KernelState {
                 invoked_tool: None,
                 tool_output: None,
                 tool_error: None,
+                suggested_actions: Vec::new(),
             }),
         }
     }
@@ -3735,6 +3753,7 @@ impl KernelState {
                 invoked_tool,
                 tool_output,
                 tool_error,
+                suggested_actions: Vec::new(),
             }
         };
 
@@ -5366,6 +5385,48 @@ fn task_brief(t: &Task) -> TaskBrief {
     }
 }
 
+/// Attach the one-click next-step buttons the chat surface renders for a turn
+/// (`docs/RELUX_MASTER_PLAN.md` §11.1 "Prime suggested next actions").
+///
+/// Each suggestion is a pre-written user message routed through the normal
+/// `prime_turn`, so a button can do nothing the user could not type by hand.
+/// This is the single place suggestions are decided, keyed off the turn the
+/// kernel already produced.
+fn attach_suggestions(turn: &mut PrimeTurn, message: &str) {
+    use relux_core::{PrimeIntent, PrimeSuggestion};
+
+    // After Prime mints a task that is ready but not yet running, offer to start
+    // it as a button instead of telling the user what phrase to type.
+    if turn.intent == PrimeIntent::TaskCreation
+        && turn.created_task.is_some()
+        && turn.started_run.is_none()
+    {
+        turn.suggested_actions.push(PrimeSuggestion {
+            label: "Start the run".to_string(),
+            message: "start it".to_string(),
+            send: true,
+        });
+    }
+
+    // Brainstorming stays a conversation (§10.5), but give the user a one-click
+    // path to promote the idea into a task. The button pre-fills the command with
+    // the work the message gestured at (`send: false`) so the user confirms or
+    // edits the title - nothing is created until they send it.
+    if turn.intent == PrimeIntent::Brainstorming {
+        let candidate = brainstorm_task_candidate(message).unwrap_or_default();
+        let prefill = if candidate.is_empty() {
+            "create a task to ".to_string()
+        } else {
+            format!("create a task to {candidate}")
+        };
+        turn.suggested_actions.push(PrimeSuggestion {
+            label: "Turn this into a task".to_string(),
+            message: prefill,
+            send: false,
+        });
+    }
+}
+
 /// Render a `PrimeAction` as a one-line human-readable string for approvals and
 /// audit metadata.
 fn describe_action(action: &PrimeAction) -> String {
@@ -6367,6 +6428,43 @@ mod tests {
         // start it now only starts the run, does not complete it.
         assert_eq!(k.run(&run_id).unwrap().status, RunStatus::Running);
         assert_eq!(k.task(&task_id).unwrap().status, TaskStatus::Running);
+    }
+
+    #[test]
+    fn prime_suggests_next_actions_per_doc_11_1() {
+        // §11.1 "Prime suggested next actions": creating a task offers a one-click
+        // "Start the run" that sends the real command, and brainstorming offers a
+        // "Turn this into a task" that PRE-FILLS the command (send=false) so the
+        // user confirms the title. A suggestion is never a privileged path - it is
+        // just a pre-written user message.
+        let (mut k, ctx) = prime_chat_kernel();
+
+        let created = k
+            .prime_turn(&ctx, "create a task to summarize the README")
+            .unwrap();
+        let start = created
+            .suggested_actions
+            .iter()
+            .find(|s| s.label == "Start the run")
+            .expect("task creation offers a start button");
+        assert_eq!(start.message, "start it");
+        assert!(start.send, "starting the run sends immediately");
+
+        // Brainstorming stays a conversation (no work minted) but offers the
+        // promote-to-task button, pre-filled with the work it gestured at.
+        let before = k.task_count();
+        let muse = k
+            .prime_turn(&ctx, "I was thinking we could redo the onboarding flow")
+            .unwrap();
+        assert_eq!(muse.disposition, PrimeDisposition::Answered);
+        assert_eq!(k.task_count(), before, "brainstorming must not create work");
+        let promote = muse
+            .suggested_actions
+            .iter()
+            .find(|s| s.label == "Turn this into a task")
+            .expect("brainstorming offers a promote-to-task button");
+        assert_eq!(promote.message, "create a task to redo the onboarding flow");
+        assert!(!promote.send, "promoting an idea pre-fills, never auto-sends");
     }
 
     #[test]

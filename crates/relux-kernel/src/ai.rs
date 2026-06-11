@@ -778,6 +778,7 @@ mod tests {
             invoked_tool: None,
             tool_output: None,
             tool_error: None,
+            suggested_actions: Vec::new(),
         }
     }
 

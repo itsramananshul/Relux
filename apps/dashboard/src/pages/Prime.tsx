@@ -1,6 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { reluxAi, reluxPrime, type ReluxAiStatus, type ReluxPrimeTurn } from "../api";
+import {
+  reluxAi,
+  reluxPrime,
+  type ReluxAiStatus,
+  type ReluxPrimeSuggestion,
+  type ReluxPrimeTurn,
+} from "../api";
 import { workTaskHref, workRunHref } from "../routing";
 import { PrimeAutonomyPanel } from "../components/PrimeAutonomyPanel";
 import { OrchestrationPanel } from "../components/OrchestrationPanel";
@@ -105,6 +111,26 @@ export function Prime() {
     }
   }
 
+  // Act on a suggested next action (RELUX_MASTER_PLAN §11.1). A `send` suggestion
+  // is dispatched immediately; otherwise we pre-fill the input so the user
+  // completes or confirms the command (e.g. naming the task) before sending —
+  // nothing happens on the kernel until they hit Send.
+  function handleSuggestion(s: ReluxPrimeSuggestion) {
+    if (busy) return;
+    if (s.send) {
+      void send(s.message);
+      return;
+    }
+    setText(s.message);
+    requestAnimationFrame(() => {
+      const el = inputRef.current;
+      if (!el) return;
+      el.focus();
+      const len = el.value.length;
+      el.setSelectionRange(len, len);
+    });
+  }
+
   return (
     <div className="chat" style={{ height: "calc(100vh - 96px)" }}>
       <AiStatusBanner status={aiStatus} />
@@ -115,10 +141,10 @@ export function Prime() {
           autonomy/orchestration controls live in the Advanced section below the
           input, so they never push the chat down. */}
       <div className="prime-hint muted">
-        Brainstorming stays a conversation — say <span className="mono">"I was thinking…"</span> or
-        ask a question freely. Only an explicit command like{" "}
-        <span className="mono">"create a task to…"</span> or <span className="mono">"start it"</span>{" "}
-        creates or runs work.
+        Brainstorming stays a conversation — think out loud or ask anything freely, and Prime won't
+        create or run work. When an idea is worth pursuing, use the buttons under Prime's reply (like{" "}
+        <span className="mono">Turn this into a task</span> or <span className="mono">Start the run</span>)
+        to act on it.
       </div>
       <div className="chat-log" ref={logRef}>
         <div className="msg assistant">{GREETING}</div>
@@ -138,7 +164,9 @@ export function Prime() {
               </div>
             );
           }
-          return <PrimeTurnCard key={i} turn={m.turn} />;
+          return (
+            <PrimeTurnCard key={i} turn={m.turn} busy={busy} onSuggestion={handleSuggestion} />
+          );
         })}
         {busy && <div className="msg assistant muted">...thinking</div>}
       </div>
@@ -270,8 +298,17 @@ function AiStatusBanner({ status }: { status: ReluxAiStatus | null }) {
 // disposition chip, and any durable artifact (task created, run started, or an
 // approval that is now pending). All of it is read straight from the turn — the
 // UI never fabricates an outcome Prime did not report.
-function PrimeTurnCard({ turn }: { turn: ReluxPrimeTurn }) {
+function PrimeTurnCard({
+  turn,
+  busy,
+  onSuggestion,
+}: {
+  turn: ReluxPrimeTurn;
+  busy: boolean;
+  onSuggestion: (s: ReluxPrimeSuggestion) => void;
+}) {
   const tone = DISPOSITION_TONE[turn.disposition] ?? "todo";
+  const suggestions = turn.suggested_actions ?? [];
   return (
     <div className="msg assistant" style={{ maxWidth: 720 }}>
       <div className="row wrap" style={{ gap: 6, marginBottom: 6, alignItems: "center" }}>
@@ -321,6 +358,28 @@ function PrimeTurnCard({ turn }: { turn: ReluxPrimeTurn }) {
               approval <span className="mono">{turn.approval}</span>
             </span>
           )}
+        </div>
+      )}
+
+      {/* Prime suggested next actions (RELUX_MASTER_PLAN §11.1): one-click
+          buttons that replace telling the user what to type. Each just routes a
+          pre-written message through the normal turn, so a button can do nothing
+          the user could not type. A non-`send` suggestion pre-fills the input. */}
+      {suggestions.length > 0 && (
+        <div className="row wrap" style={{ gap: 8, marginTop: 12 }}>
+          {suggestions.map((s, i) => (
+            <button
+              key={i}
+              className="btn"
+              style={{ fontSize: 12, padding: "4px 12px" }}
+              disabled={busy}
+              onClick={() => onSuggestion(s)}
+              title={s.send ? `Send: ${s.message}` : `Fill the message box: ${s.message}`}
+            >
+              {s.label}
+              {!s.send && <span style={{ opacity: 0.6 }}> …</span>}
+            </button>
+          ))}
         </div>
       )}
     </div>

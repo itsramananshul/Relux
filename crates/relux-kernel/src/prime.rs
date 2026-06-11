@@ -487,8 +487,12 @@ pub fn decide(message: &str, intent: &PrimeIntent, summary: &StateSummary) -> Pr
             text: "The board, runs, approvals, and audit log are the operating surfaces. The dashboard UI is a later slice; for now I can summarize any of them."
                 .to_string(),
         },
+        // Brainstorming stays a conversation (section 10.5): Prime engages the
+        // idea and helps shape it, but creates nothing until the user confirms.
+        // The kernel attaches a one-click "turn this into a task" suggestion
+        // (section 11.1) so musing flows into work without retyping a command.
         PrimeIntent::Brainstorming => PrimePlan::Reply {
-            text: "Tell me the goal and the constraints and I will outline options. I will not create tasks or agents until you confirm."
+            text: "Good - let's think it through. Tell me the goal you're after and any constraints, and I'll lay out a few approaches with their trade-offs. Nothing gets created or run while we're talking; when an idea is worth pursuing, I can turn it into a task in one step."
                 .to_string(),
         },
         // Orchestration: decompose the goal across agents. The pure planner decides
@@ -773,6 +777,122 @@ fn task_title(message: &str) -> Option<String> {
         }
     }
     Some(title.to_string())
+}
+
+/// Recover the candidate work a brainstorm message gestures at, for the
+/// "turn this into a task" suggestion (section 11.1).
+///
+/// Best effort and conservative: it strips ideation lead-ins and the connective
+/// fillers that usually follow them ("I was thinking we could ...") from the
+/// front, leaving the noun phrase that names the work. The result only ever
+/// pre-fills the chat input for the user to confirm or edit (the suggestion is
+/// `send: false`), so an imperfect strip is harmless - the user still names the
+/// task. Returns `None` when nothing nameable remains.
+pub fn brainstorm_task_candidate(message: &str) -> Option<String> {
+    let trimmed = message.trim();
+    let lower = trimmed.to_lowercase();
+    // Stripped from the front, longest first so "i was thinking" wins over
+    // "thinking". Each is matched only as a leading token run (trailing space),
+    // so "we" never bites into "weather". Punctuation/commas between strips are
+    // trimmed each pass.
+    const STRIPS: &[&str] = &[
+        "i have been thinking that",
+        "i've been thinking that",
+        "ive been thinking that",
+        "i was thinking that",
+        "i was thinking maybe",
+        "i was thinking we should",
+        "i was thinking we could",
+        "i was thinking we might",
+        "i was thinking",
+        "i'm thinking",
+        "im thinking",
+        "i am thinking",
+        "i've been thinking",
+        "ive been thinking",
+        "i have been thinking",
+        "i was wondering whether",
+        "i was wondering if",
+        "i was wondering",
+        "i wonder whether",
+        "i wonder if",
+        "i'd like to discuss",
+        "i would like to discuss",
+        "i want to discuss",
+        "i want to talk about",
+        "i want to brainstorm",
+        "can we talk about",
+        "could we talk about",
+        "let's talk about",
+        "lets talk about",
+        "let's discuss",
+        "lets discuss",
+        "talk about",
+        "thinking about",
+        "thinking of",
+        "playing with the idea of",
+        "playing with the idea",
+        "kicking around",
+        "toying with",
+        "what if we",
+        "what if i",
+        "what if you",
+        "what if",
+        "i think we should",
+        "i think we could",
+        "i think",
+        "maybe we should",
+        "maybe we could",
+        "we should",
+        "we could",
+        "we might",
+        "should we",
+        "could we",
+        "can we",
+        "the idea of",
+        "an idea to",
+        "an idea for",
+        "the idea",
+        "maybe",
+        "perhaps",
+        "just",
+        "we",
+        "to",
+        "about",
+    ];
+    let mut start = 0usize;
+    loop {
+        // Trim leading whitespace and connective punctuation between strips.
+        while let Some(c) = lower[start..].chars().next() {
+            if c.is_whitespace() || c == ',' || c == ':' || c == '-' {
+                start += c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let cur = &lower[start..];
+        let mut matched = false;
+        for p in STRIPS {
+            // Match the strip as a leading token: it must be followed by a
+            // space (or end), so a standalone "we"/"to" never eats a word.
+            if let Some(after) = cur.strip_prefix(p) {
+                if after.is_empty() || after.starts_with(|c: char| c.is_whitespace() || c == ',') {
+                    start += p.len();
+                    matched = true;
+                    break;
+                }
+            }
+        }
+        if !matched {
+            break;
+        }
+    }
+    let candidate: String = trimmed[start..].trim().chars().take(120).collect();
+    let candidate = candidate.trim_end_matches(['.', '?', '!']).trim();
+    if candidate.is_empty() {
+        return None;
+    }
+    Some(candidate.to_string())
 }
 
 /// Map a tool-invocation message onto `(plugin_id, tool_name, input_json)`, or
@@ -1417,6 +1537,31 @@ mod tests {
             matches!(plan, PrimePlan::Reply { .. }),
             "ideation must be a Reply, got {plan:?}"
         );
+    }
+
+    #[test]
+    fn brainstorm_candidate_strips_lead_ins_to_the_work() {
+        // The "turn this into a task" suggestion recovers the noun phrase that
+        // names the work (section 11.1). Best-effort; it only pre-fills the input.
+        assert_eq!(
+            brainstorm_task_candidate("I was thinking we could redo the onboarding flow"),
+            Some("redo the onboarding flow".to_string())
+        );
+        assert_eq!(
+            brainstorm_task_candidate("what if we build a graph editor for agents"),
+            Some("build a graph editor for agents".to_string())
+        );
+        assert_eq!(
+            brainstorm_task_candidate("let's discuss the auth flow."),
+            Some("the auth flow".to_string())
+        );
+        // A leading token like "we" must never bite into a real word.
+        assert_eq!(
+            brainstorm_task_candidate("weather alerts for the dashboard"),
+            Some("weather alerts for the dashboard".to_string())
+        );
+        // Pure connective musing with nothing nameable left yields None.
+        assert_eq!(brainstorm_task_candidate("maybe we could"), None);
     }
 
     #[test]

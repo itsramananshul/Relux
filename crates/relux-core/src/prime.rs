@@ -259,6 +259,26 @@ pub enum PrimeDisposition {
     NeedsClarification,
 }
 
+/// A suggested next action Prime offers as a one-click button in the chat
+/// surface (`docs/RELUX_MASTER_PLAN.md` §11.1 "Prime suggested next actions").
+///
+/// A suggestion is never a privileged path: it is just a pre-written user
+/// message. Acting on it sends `message` through the SAME grounded `prime_turn`,
+/// so a button can do nothing the user could not type. When `send` is `true` the
+/// dashboard sends `message` immediately; when `false` it pre-fills the input
+/// with `message` for the user to complete or edit before sending (used when
+/// Prime can only offer the start of a command — e.g. promoting a half-formed
+/// idea into a task, where the user still names the work).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrimeSuggestion {
+    /// The button label shown to the user.
+    pub label: String,
+    /// The message routed through `prime_turn` when the user acts on it.
+    pub message: String,
+    /// `true` to send immediately; `false` to pre-fill the input for editing.
+    pub send: bool,
+}
+
 /// The full result of Prime handling one user message.
 ///
 /// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 10 (Prime Behavior Specification).
@@ -286,6 +306,11 @@ pub struct PrimeTurn {
     /// but runtime not implemented, missing permission, or unknown tool).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_error: Option<String>,
+    /// Suggested next actions the chat surface renders as one-click buttons
+    /// (`docs/RELUX_MASTER_PLAN.md` §11.1). Each is a pre-written user message
+    /// routed through the normal turn path — never a privileged shortcut.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggested_actions: Vec<PrimeSuggestion>,
 }
 
 /// The scope a Prime turn runs in: which namespace work lands in, which agent
@@ -359,6 +384,39 @@ mod tests {
             let back: PrimeIntent = serde_json::from_str(&json).unwrap();
             assert_eq!(back, intent);
         }
+    }
+
+    #[test]
+    fn prime_suggestion_round_trips_and_is_omitted_when_empty() {
+        // A turn with no suggestions must not carry the field on the wire, so
+        // existing clients see exactly the JSON they did before (§11.1).
+        let turn = PrimeTurn {
+            intent: PrimeIntent::Greeting,
+            reply: "hi".to_string(),
+            disposition: PrimeDisposition::Answered,
+            action: None,
+            created_task: None,
+            started_run: None,
+            created_agent: None,
+            approval: None,
+            invoked_tool: None,
+            tool_output: None,
+            tool_error: None,
+            suggested_actions: vec![],
+        };
+        let json = serde_json::to_string(&turn).unwrap();
+        assert!(
+            !json.contains("suggested_actions"),
+            "empty suggestions must be omitted: {json}"
+        );
+
+        let s = PrimeSuggestion {
+            label: "Start the run".to_string(),
+            message: "start it".to_string(),
+            send: true,
+        };
+        let back: PrimeSuggestion = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back, s);
     }
 
     #[test]

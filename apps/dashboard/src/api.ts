@@ -1364,6 +1364,17 @@ export interface ReluxPrimeAction {
   type: string;
   [k: string]: unknown;
 }
+// One next-step button Prime offers in chat (RELUX_MASTER_PLAN §11.1 "Prime
+// suggested next actions"). Acting on it routes `message` through the SAME
+// /v1/relux/prime turn, so a button can do nothing the user could not type.
+// `send: true` sends immediately; `send: false` pre-fills the input for the user
+// to confirm or edit before sending.
+export interface ReluxPrimeSuggestion {
+  label: string;
+  message: string;
+  send: boolean;
+}
+
 export interface ReluxPrimeTurn {
   intent: string;
   reply: string;
@@ -1373,6 +1384,9 @@ export interface ReluxPrimeTurn {
   started_run: string | null;
   created_agent: string | null;
   approval: string | null;
+  // One-click next actions Prime suggests for this turn (§11.1). Omitted when
+  // there are none.
+  suggested_actions?: ReluxPrimeSuggestion[];
   // Tool fields: present only when Prime ran (or honestly refused) a tool this
   // turn. `invoked_tool` is "<plugin_id>/<tool_name>"; `tool_output` carries the
   // real kernel output; `tool_error` is an honest reason a tool did NOT run.
