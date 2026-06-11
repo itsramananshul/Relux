@@ -859,14 +859,20 @@ pub async fn polish_after_action_via_openrouter(
 /// kernel still reconciles intent + slots against the live state behind the fail-closed gate.
 /// On `None` the caller falls back to the specialized paths and the deterministic rails, so
 /// the brain stays strictly additive (§10.1, §10.2, §17.1).
+///
+/// `observations` carries the rendered read-only reads the kernel already gathered earlier in this
+/// turn's bounded observe-then-act loop ([`crate::prime_decision::DecisionLoop`]); it is empty on
+/// the first round (so that prompt is byte-for-byte the prior single-shot prompt) and grounds the
+/// brain's subsequent rounds in live state it asked to inspect.
 pub async fn decide_prime_via_openrouter(
     cfg: &AiConfig,
     message: &str,
     summary: &relux_core::StateSummary,
+    observations: &str,
 ) -> Option<crate::prime_decision::PrimeBrainDecision> {
     let text = complete_json_only(
         cfg,
-        crate::prime_decision::build_decision_prompt(message, summary),
+        crate::prime_decision::build_decision_prompt(message, summary, observations),
     )
     .await?;
     crate::prime_decision::parse_decision(&text).ok()

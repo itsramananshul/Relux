@@ -1704,24 +1704,29 @@ async fn run_prime(
         None => message.clone(),
     };
 
-    // 0c. UNIFIED brain decision (OUTSIDE the lock — ONE slow network/process call). When a
-    // brain is configured it answers the WHOLE turn at once: the proposed intent + whichever
-    // slots apply + optional clarifying wording, in ONE validated envelope — the Hermes/Codex
-    // "one response carries the answer and the structured actions" shape, replacing the prior
-    // serial intent → slot → wording calls. The model only *proposes*; the kernel reconciles
-    // intent + every slot against the live state behind the fail-closed gate. ANY failure →
-    // `None`, and the specialized per-section stack below runs as the fallback (§10.1, §10.2,
-    // §17.1).
-    let decision = match brain {
-        relux_kernel::PrimeBrain::Openrouter => {
-            relux_kernel::decide_prime_via_openrouter(&ai_config, &decision_message, &board_summary)
-                .await
-        }
-        relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli => {
-            decide_prime_via_cli(brain, cli_status.clone(), &decision_message, &board_summary).await
-        }
-        relux_kernel::PrimeBrain::Local => None,
-    };
+    // 0c. UNIFIED brain decision via the bounded OBSERVE-THEN-ACT loop (OUTSIDE the lock). When a
+    // brain is configured it answers the WHOLE turn at once: the proposed intent + whichever slots
+    // apply + optional clarifying wording + at most one governed write tool, in ONE validated
+    // envelope — the Hermes/Codex "one response carries the answer and the structured actions"
+    // shape. The loop lets the brain inspect a LITTLE live state through the governed READ-ONLY
+    // tools before it commits: each round it may either request read-only tools (the kernel runs
+    // them deterministically against the pre-taken snapshot and re-asks, grounded in the results)
+    // or commit its decision, bounded by `MAX_DECISION_ROUNDS`. So a single actionful turn can
+    // observe live state, choose its one action grounded in what it saw, and the action then flows
+    // through the UNCHANGED fail-closed gate + `decide` → `prime_execute` / approval — the loop adds
+    // no new authority and has no mutation path. The reads it gathered (`observed_reads`) are
+    // surfaced as provenance and ground the reply. ANY failure → `None`, and the specialized
+    // per-section stack below runs as the fallback (§10.1, §10.2, §17.1;
+    // `docs/prime-processing-audit.md` "observe-then-act decision loop").
+    let (decision, observed_reads) = decide_prime_with_observation(
+        brain,
+        &ai_config,
+        cli_status.clone(),
+        &context_snapshot,
+        &decision_message,
+        &board_summary,
+    )
+    .await;
 
     // 0d. Derive the intent proposal + the slot bundle. PREFERRED: the one unified decision
     // (no further brain calls this turn). FALLBACK: when the unified call produced nothing
@@ -1938,9 +1943,11 @@ async fn run_prime(
     // So those turns skip the free-form shaper and go through `run_clarify_polish`,
     // which falls back to the grounded deterministic wording on any failure (§10.5,
     // §17.1). The wall is intact: this only ever runs on a non-actionful turn.
-    // The READ-ONLY context tools the governed loop gathered this turn (empty unless a brain
-    // ran the loop on an inspection turn), surfaced as provenance on the response.
-    let mut gathered_reads: Vec<relux_kernel::ContextRead> = Vec::new();
+    // The READ-ONLY context tools the governed observe-then-act loop gathered this turn (empty
+    // unless the brain requested read-only tools before committing), surfaced as provenance on the
+    // response and used to ground a conversational reply. Seeded from the decision loop above so an
+    // ACTIONFUL turn that observed first also shows its reads.
+    let mut gathered_reads: Vec<relux_kernel::ContextRead> = observed_reads;
     // Set when the brain shaped this turn's POST-EXECUTION (after-action) reply — provenance for
     // the small chip; the action already ran through the unchanged path, so this is wording only.
     let mut after_action_source: Option<String> = None;
@@ -1969,33 +1976,24 @@ async fn run_prime(
         && !matches!(brain, relux_kernel::PrimeBrain::Local)
     {
         // An inspection / explanation / conversational-QUESTION turn: the brain may inspect live
-        // state before answering. UNIFIED-FIRST: when the ONE decision envelope already requested
-        // read-only context tools (`tool_requests`, validated against the read-only allowlist at
-        // parse time), execute THOSE deterministically against the pre-taken snapshot — no second
-        // multi-round brain loop and no DUPLICATE execution. FALLBACK: when the envelope requested
-        // none (or there was no usable unified decision), run the sidecar `ContextLoop` exactly as
-        // before. Either path THEN shapes the reply grounded in what was actually observed — the
-        // one bounded follow-up brain response. The reads change nothing and never reach an action
-        // (`docs/prime-processing-audit.md` "Read context on the unified decision"); on a miss the
-        // observations are empty and the shaper behaves byte-for-byte as before. We deliberately
-        // prefer the live reads over the unified decision's precomputed `reply` for these turns,
-        // because that reply was composed off the STATIC board summary — the live reads supersede it.
-        let requested = decision
-            .as_ref()
-            .map(|d| d.context_requests.clone())
-            .unwrap_or_default();
-        gathered_reads = if requested.is_empty() {
-            gather_read_only_context(
+        // state before answering. The OBSERVE-THEN-ACT decision loop above already ran the brain's
+        // read-only `tool_requests` between its decision rounds and accumulated the observations
+        // (`gathered_reads`). Prefer those — no second gather, no duplicate execution. FALLBACK:
+        // only when the loop gathered nothing (the unified decision requested no tools, or there was
+        // no usable decision) run the sidecar `ContextLoop` exactly as before, so an inspection turn
+        // still inspects live state before answering — byte-for-byte the prior behavior. Either way
+        // the reply is shaped grounded in what was actually observed; the reads change nothing and
+        // never reach an action (`docs/prime-processing-audit.md` "observe-then-act decision loop").
+        if gathered_reads.is_empty() {
+            gathered_reads = gather_read_only_context(
                 brain,
                 &ai_config,
                 cli_status.clone(),
                 &context_snapshot,
                 &message,
             )
-            .await
-        } else {
-            relux_kernel::execute_requested_reads(&context_snapshot, &requested)
-        };
+            .await;
+        }
         let observations = relux_kernel::render_observations(&gathered_reads);
         let outcome = match brain {
             relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli => {
@@ -2736,14 +2734,62 @@ async fn decide_prime_via_cli(
     status: Option<relux_core::AdapterRuntimeStatus>,
     message: &str,
     summary: &relux_core::StateSummary,
+    observations: &str,
 ) -> Option<relux_kernel::PrimeBrainDecision> {
     let (stdout, kind) = cli_brain_json(
         brain,
         status,
-        relux_kernel::build_decision_prompt(message, summary),
+        relux_kernel::build_decision_prompt(message, summary, observations),
     )
     .await?;
     parse_cli_decision(&stdout, kind)
+}
+
+/// Drive the bounded **observe-then-act** decision loop for one turn and return the terminal
+/// decision plus every read-only context read gathered along the way.
+///
+/// This is the multi-round upgrade of the single unified decision call: each round the configured
+/// brain may either request READ-ONLY context tools (observe) or commit its decision (act / answer).
+/// The kernel executes ONLY the validated read-only requests deterministically against the pre-taken
+/// `snapshot` between rounds (the brain runs nothing) and re-calls the decision brain grounded in the
+/// results, bounded by [`relux_kernel::MAX_DECISION_ROUNDS`]. The eventual ACTION (the terminal
+/// decision's `action_request` / classification / slots) still flows through the UNCHANGED fail-closed
+/// gate and `decide` → `prime_execute` / approval at the kernel chokepoint — this loop adds NO new
+/// authority and has no mutation path. All three brains share the SAME
+/// [`relux_kernel::DecisionLoop`] stepper (the per-round "prompt → decision" primitive is the only
+/// per-brain difference), so the loop's control flow — round cap, read-only execution,
+/// stop-on-progress — is pinned once and never drifts. `Local` (no brain) makes no decision and
+/// gathers nothing.
+async fn decide_prime_with_observation(
+    brain: relux_kernel::PrimeBrain,
+    ai_config: &relux_kernel::AiConfig,
+    cli_status: Option<relux_core::AdapterRuntimeStatus>,
+    snapshot: &relux_kernel::ContextSnapshot,
+    message: &str,
+    summary: &relux_core::StateSummary,
+) -> (Option<relux_kernel::PrimeBrainDecision>, Vec<relux_kernel::ContextRead>) {
+    if matches!(brain, relux_kernel::PrimeBrain::Local) {
+        return (None, Vec::new());
+    }
+    let mut lp = relux_kernel::DecisionLoop::new(snapshot);
+    let mut observations = String::new();
+    loop {
+        let decision = match brain {
+            relux_kernel::PrimeBrain::Openrouter => {
+                relux_kernel::decide_prime_via_openrouter(ai_config, message, summary, &observations)
+                    .await
+            }
+            relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli => {
+                decide_prime_via_cli(brain, cli_status.clone(), message, summary, &observations).await
+            }
+            relux_kernel::PrimeBrain::Local => None,
+        };
+        match lp.step(decision) {
+            relux_kernel::DecisionStep::Continue(obs) => observations = obs,
+            relux_kernel::DecisionStep::Stop => break,
+        }
+    }
+    lp.into_parts()
 }
 
 /// Lift a validated unified decision out of a CLI brain's captured `stdout`, or `None`. The

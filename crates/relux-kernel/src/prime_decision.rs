@@ -84,6 +84,14 @@ const BARE_REPLY_CONFIDENCE: f32 = 0.7;
 const MAX_PROMPT_TASKS: usize = 12;
 const MAX_PROMPT_AGENTS: usize = 12;
 
+/// The bounded observe-then-act decision budget: how many unified decision calls ONE Prime turn
+/// may make. Each round the brain either requests read-only context tools (observe) or commits its
+/// decision (act / answer). Kept small because each round is a FULL decision call — the loop exists
+/// to let the brain inspect a *little* live state before choosing its one action, not to run an
+/// open-ended agent. This is the Hermes `run_conversation` max-iterations cap
+/// (`reference/hermes-agent-main/agent/conversation_loop.py` ~L598) applied to the decision call.
+pub const MAX_DECISION_ROUNDS: usize = 3;
+
 /// The only top-level keys a unified decision envelope may carry. Any other top-level key
 /// fails the WHOLE envelope closed (openclaw's `additionalProperties: false` discipline):
 /// the brain may not smuggle an un-modeled authority key past the parser. Nested-section
@@ -285,12 +293,18 @@ impl PrimeBrainDecision {
 /// questions stay chat; only an explicit instruction is work; never invent ids; never claim
 /// an action), and JSON-only output is demanded so nothing un-validated leaks downstream.
 /// Kept ASCII and self-contained so it works as a one-shot CLI stdin prompt.
-pub fn build_decision_prompt(message: &str, summary: &StateSummary) -> String {
+///
+/// `observations` is the rendered result of any read-only context tools the brain already
+/// requested earlier in this turn's bounded observe-then-act loop (empty on the FIRST round, so a
+/// single-round turn's prompt is byte-for-byte the prior unparameterized prompt). When non-empty it
+/// is injected with a steer to commit (omit `tool_requests`) once the brain has observed enough —
+/// the Hermes "the model gives its final answer when it stops requesting tools" shape.
+pub fn build_decision_prompt(message: &str, summary: &StateSummary, observations: &str) -> String {
     let labels = intent_labels().join(", ");
     let tools = crate::prime_tools::read_only_tool_names();
     let write_tools = crate::prime_write_tools::write_tool_names();
     let (tasks, agents) = board_catalog(summary);
-    format!(
+    let mut prompt = format!(
         "You are the single decision stage for Prime, the operator of a local Relux control \
 plane (tasks, runs, agents, plugins, permissions, approvals, an audit log). For the user's \
 message, return ONE JSON object describing your decision. You perform NO action and create \
@@ -343,7 +357,21 @@ summary and at most a few advisory questions/risks. Do NOT change the number, or
 of steps.\n\
 - Do NOT add any key other than those shown above.\n\n\
 Tasks on the board:\n{tasks}\n\nAgents:\n{agents}\n\nUser message:\n{message}"
-    )
+    );
+    // Inject the live reads gathered earlier this turn (the observe-then-act loop). On the first
+    // round this is empty and the prompt is unchanged; once the kernel has run the brain's
+    // read-only tools it re-asks with the results and a steer to commit.
+    let observations = observations.trim();
+    if !observations.is_empty() {
+        prompt.push_str(&format!(
+            "\n\nYou have ALREADY inspected live state this turn through read-only tools (these \
+reads changed nothing):\n{observations}\n\n\
+If this is enough to answer the user or to choose your one action, return your full decision now \
+and OMIT \"tool_requests\". Include \"tool_requests\" again ONLY if you still must inspect more \
+state before deciding."
+        ));
+    }
+    prompt
 }
 
 /// The wire labels offered to the brain (the snake_case `PrimeIntent` serialization).
@@ -591,6 +619,144 @@ pub fn parse_decision(raw: &str) -> Result<PrimeBrainDecision, String> {
     Ok(decision)
 }
 
+/// What the bounded observe-then-act loop should do after one decision round.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecisionStep {
+    /// The brain requested read-only context and the kernel executed it; re-call the decision brain
+    /// with these rendered observations injected so it can act / answer grounded in live state.
+    Continue(String),
+    /// The decision is terminal — committed (no more reads requested), made no progress (re-asked
+    /// for what it already saw), or hit the round cap. Use whatever the loop last produced.
+    Stop,
+}
+
+/// The bounded **observe-then-act** decision driver: the unified decision call made to LOOP, so one
+/// Prime turn can inspect a little live state through the governed READ-ONLY tools before the brain
+/// commits its single action / answer.
+///
+/// ## Why this exists
+///
+/// The unified [`PrimeBrainDecision`] is otherwise a SINGLE call: the brain must choose its action
+/// from the static board snapshot baked into the prompt, with no chance to drill into a specific
+/// task / run / the crew first. The read-only context loop ([`crate::prime_tools::ContextLoop`])
+/// could observe, but only on a NON-actionful inspection turn and only to ground a reply — never to
+/// inform the action. This driver closes that gap: each round the brain may request read-only tools
+/// (observe) OR commit (act / answer); the kernel executes only the read-only requests
+/// deterministically between rounds and re-calls the brain grounded in the results, bounded by
+/// [`MAX_DECISION_ROUNDS`].
+///
+/// ## Safety (binding)
+///
+/// The loop is **observe-then-act, read-only between rounds**. Between decision calls it executes
+/// ONLY the validated read-only [`PrimeBrainDecision::context_requests`]
+/// (via [`crate::prime_tools::execute_requested_reads`] against the pre-taken snapshot) — there is
+/// no mutation, no approval, and no path to `prime_execute` here. The eventual ACTION (the terminal
+/// decision's `action_request` / classification / slots) still flows through the UNCHANGED
+/// fail-closed [`crate::prime_intent::reconcile_intent`] gate and `decide` → `prime_execute` /
+/// approval at the kernel chokepoint — this driver adds NO new authority. It is bounded
+/// ([`MAX_DECISION_ROUNDS`]) and stops on no progress (a brain that re-requests what it already
+/// observed), exactly like the read-only loop's stop-on-repeat. The synchronous test twin
+/// [`run_decision_loop`] and the async provider drivers share this SAME stepper, so the control
+/// flow (cap, read-only execution, stop-on-progress) is pinned once.
+///
+/// Mirrors Hermes `run_conversation` (`reference/hermes-agent-main/agent/conversation_loop.py`): a
+/// bounded loop where each round the model either requests tools (the loop continues, injecting the
+/// results) or returns its final answer (the loop ends) — but the Relux brain executes NOTHING; the
+/// kernel runs the (read-only) tools and, later, the one governed action.
+pub struct DecisionLoop {
+    snapshot: crate::prime_tools::ContextSnapshot,
+    reads: Vec<crate::prime_tools::ContextRead>,
+    decision: Option<PrimeBrainDecision>,
+    round: usize,
+}
+
+impl DecisionLoop {
+    /// Start a loop over an owned, bounded read-only state snapshot (cloned in, exactly like
+    /// [`crate::prime_tools::ContextLoop::new`], so the executors stay pure over it and the
+    /// provider rounds run lock-free).
+    pub fn new(snapshot: &crate::prime_tools::ContextSnapshot) -> Self {
+        Self {
+            snapshot: snapshot.clone(),
+            reads: Vec::new(),
+            decision: None,
+            round: 0,
+        }
+    }
+
+    /// Step the loop with the brain's parsed decision for this round (`None` on a provider failure).
+    ///
+    /// A decision with NO read-only requests is **committed** (terminal); at the round cap we
+    /// likewise stop and use whatever the brain last produced. Otherwise the brain wants to OBSERVE
+    /// first: the kernel executes its validated read-only requests against the snapshot, accumulates
+    /// only the NEW reads, keeps the decision as an interim fallback, and asks the caller to re-call
+    /// the brain with the rendered observations. A brain that re-requests what it already saw makes
+    /// no progress and the loop stops (stop-on-repeat), so it can never spin.
+    pub fn step(&mut self, decision: Option<PrimeBrainDecision>) -> DecisionStep {
+        self.round += 1;
+        let Some(d) = decision else {
+            // A provider failure ends the loop; keep any interim decision already gathered.
+            return DecisionStep::Stop;
+        };
+        if d.context_requests.is_empty() || self.round >= MAX_DECISION_ROUNDS {
+            self.decision = Some(d);
+            return DecisionStep::Stop;
+        }
+        let before = self.reads.len();
+        for read in
+            crate::prime_tools::execute_requested_reads(&self.snapshot, &d.context_requests)
+        {
+            if self
+                .reads
+                .iter()
+                .any(|r| r.tool == read.tool && r.detail == read.detail)
+            {
+                continue;
+            }
+            self.reads.push(read);
+        }
+        // Keep this decision as the interim fallback (used if the next round's provider call fails),
+        // grounded in everything observed up to and including this round.
+        self.decision = Some(d);
+        if self.reads.len() == before {
+            // No NEW observation gained: the brain re-asked for what it already saw — stop.
+            DecisionStep::Stop
+        } else {
+            DecisionStep::Continue(crate::prime_tools::render_observations(&self.reads))
+        }
+    }
+
+    /// Consume the loop, returning the terminal decision (if any) and every read gathered along the
+    /// way (provenance for the turn's `context_reads`, and grounding for the reply).
+    pub fn into_parts(self) -> (Option<PrimeBrainDecision>, Vec<crate::prime_tools::ContextRead>) {
+        (self.decision, self.reads)
+    }
+}
+
+/// Drive the bounded observe-then-act decision loop with a SYNCHRONOUS brain closure — the testable
+/// twin that pins the loop's control flow with a scripted brain and NO provider. The closure
+/// receives the rendered observations gathered so far (empty on the first round) and returns the
+/// brain's parsed decision, or `None` to abort (a provider failure) — exactly what the async
+/// drivers do. The async provider drivers share the SAME [`DecisionLoop`] stepper, so this twin
+/// pins their behavior.
+pub fn run_decision_loop<F>(
+    snapshot: &crate::prime_tools::ContextSnapshot,
+    mut brain: F,
+) -> (Option<PrimeBrainDecision>, Vec<crate::prime_tools::ContextRead>)
+where
+    F: FnMut(&str) -> Option<PrimeBrainDecision>,
+{
+    let mut lp = DecisionLoop::new(snapshot);
+    let mut observations = String::new();
+    loop {
+        let decision = brain(&observations);
+        match lp.step(decision) {
+            DecisionStep::Continue(obs) => observations = obs,
+            DecisionStep::Stop => break,
+        }
+    }
+    lp.into_parts()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -619,7 +785,7 @@ mod tests {
     #[test]
     fn build_prompt_carries_schema_safety_rules_and_board_grounding() {
         let summary = summary_with_agents(&["researcher"]);
-        let prompt = build_decision_prompt("assign the readme task to research", &summary);
+        let prompt = build_decision_prompt("assign the readme task to research", &summary, "");
         assert!(prompt.contains("\"classification\""));
         assert!(prompt.contains("\"task\""));
         assert!(prompt.contains("\"wording\""));
@@ -628,6 +794,23 @@ mod tests {
         // The allowed labels and the live roster are both grounded into the prompt.
         assert!(prompt.contains("task_creation"));
         assert!(prompt.contains("researcher"));
+        // With no observations the prompt carries no observe-then-act injection (round 0).
+        assert!(!prompt.contains("ALREADY inspected live state"));
+    }
+
+    #[test]
+    fn build_prompt_injects_observations_and_a_commit_steer() {
+        let summary = summary_with_agents(&["researcher"]);
+        let base = build_decision_prompt("start the ready task", &summary, "");
+        let observed =
+            build_decision_prompt("start the ready task", &summary, "[list_tasks] 1 task\ntask_0001: Fix login");
+        // The base prompt is a strict prefix of the observed one (the injection is appended, so a
+        // single-round turn is byte-for-byte the prior unparameterized prompt).
+        assert!(observed.starts_with(&base));
+        assert!(observed.contains("ALREADY inspected live state"));
+        assert!(observed.contains("task_0001: Fix login"));
+        // The steer tells the brain to commit once it has observed enough.
+        assert!(observed.contains("OMIT \"tool_requests\""));
     }
 
     #[test]
@@ -995,5 +1178,144 @@ mod tests {
         assert_eq!(d.section_count(), 1);
         // A non-object reply (number) is dropped, leaving no usable section -> error.
         assert!(parse_decision(r#"{"reply":42}"#).is_err());
+    }
+
+    // ---- the bounded observe-then-act decision loop -------------------------------------------
+
+    use crate::prime_tools::{AgentView, ContextSnapshot, RunView, TaskView};
+    use relux_core::TaskStatus;
+
+    /// A snapshot with one READY (queued) task so an observe round can find it and a `task.start`
+    /// action can be chosen against it.
+    fn loop_snapshot() -> ContextSnapshot {
+        let mut summary = summary_with_agents(&["researcher"]);
+        summary.tasks_total = 1;
+        summary.tasks_open = 1;
+        summary.all_task_ids = vec!["task_0001".to_string()];
+        summary.queued = vec![relux_core::TaskBrief {
+            id: relux_core::TaskId("task_0001".to_string()),
+            title: "Fix the login redirect".to_string(),
+            status: TaskStatus::Queued,
+            assigned_agent: None,
+        }];
+        ContextSnapshot {
+            summary,
+            tasks: vec![TaskView {
+                id: "task_0001".to_string(),
+                title: "Fix the login redirect".to_string(),
+                status: TaskStatus::Queued,
+                assignee: None,
+                priority: 5,
+                detail: None,
+            }],
+            agents: vec![AgentView {
+                id: "researcher".to_string(),
+                name: "Research Agent".to_string(),
+                role: "Surveys options".to_string(),
+                adapter: "relux-adapter-local-prime".to_string(),
+                persona: None,
+            }],
+            runs: Vec::<RunView>::new(),
+            plugins: Vec::new(),
+            approvals: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn loop_observes_then_acts_grounded_in_the_reads() {
+        let snapshot = loop_snapshot();
+        let mut rounds = 0usize;
+        let mut saw_observations_on_act = false;
+        let (decision, reads) = run_decision_loop(&snapshot, |observations| {
+            rounds += 1;
+            if observations.is_empty() {
+                // Round 1: inspect the board first (observe), commit nothing yet.
+                parse_decision(r#"{"tool_requests":[{"tool":"list_tasks","args":{}}]}"#).ok()
+            } else {
+                // Round 2: the brain was re-called WITH the observations and now acts grounded in
+                // them — exactly the observe-then-act shape.
+                saw_observations_on_act = observations.contains("task_0001");
+                parse_decision(
+                    r#"{"action_request":{"tool":"task.start","args":{"task_id":"task_0001"}}}"#,
+                )
+                .ok()
+            }
+        });
+        assert_eq!(rounds, 2, "one observe round, then one commit round");
+        assert!(saw_observations_on_act, "the act round saw the gathered reads");
+        let wt = decision.expect("a terminal decision").action_request.expect("a write tool");
+        assert_eq!(wt.tool, "task.start");
+        // The reads the loop executed between rounds are returned for grounding / provenance.
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0].tool, "list_tasks");
+    }
+
+    #[test]
+    fn loop_is_byte_for_byte_single_shot_when_the_brain_commits_immediately() {
+        let snapshot = loop_snapshot();
+        let mut rounds = 0usize;
+        let (decision, reads) = run_decision_loop(&snapshot, |_observations| {
+            rounds += 1;
+            // The brain commits on the first round (no tool_requests): the loop runs exactly once
+            // and gathers nothing, identical to the prior single decision call.
+            parse_decision(r#"{"reply":{"text":"Hi there.","confidence":0.9}}"#).ok()
+        });
+        assert_eq!(rounds, 1);
+        assert!(reads.is_empty());
+        assert!(decision.unwrap().reply.is_some());
+    }
+
+    #[test]
+    fn loop_is_bounded_by_the_round_cap() {
+        let snapshot = loop_snapshot();
+        let mut rounds = 0usize;
+        // A brain that keeps observing with a DIFFERENT tool every round (so it always makes
+        // progress and never repeats) is still bounded by MAX_DECISION_ROUNDS.
+        let tools = ["board_summary", "list_tasks", "list_agents", "get_task"];
+        let (_decision, _reads) = run_decision_loop(&snapshot, |_observations| {
+            let tool = tools[rounds.min(tools.len() - 1)];
+            rounds += 1;
+            let args = if tool == "get_task" { r#"{"task_id":"task_0001"}"# } else { "{}" };
+            parse_decision(&format!(r#"{{"tool_requests":[{{"tool":"{tool}","args":{args}}}]}}"#))
+                .ok()
+        });
+        assert_eq!(rounds, MAX_DECISION_ROUNDS, "the loop never exceeds the round cap");
+    }
+
+    #[test]
+    fn loop_stops_on_no_progress_when_the_brain_re_requests_the_same_read() {
+        let snapshot = loop_snapshot();
+        let mut rounds = 0usize;
+        // The brain requests the SAME read every round: round 1 gathers it, round 2 gains no new
+        // observation and the loop stops (stop-on-repeat) well before the cap.
+        let (_decision, reads) = run_decision_loop(&snapshot, |_observations| {
+            rounds += 1;
+            parse_decision(r#"{"tool_requests":[{"tool":"list_tasks","args":{}}]}"#).ok()
+        });
+        assert_eq!(rounds, 2);
+        assert_eq!(reads.len(), 1, "the repeated read is gathered once, not twice");
+    }
+
+    #[test]
+    fn loop_keeps_the_interim_decision_when_a_later_round_fails() {
+        let snapshot = loop_snapshot();
+        let mut rounds = 0usize;
+        // Round 1 observes AND carries a classification; round 2 the provider fails (None). The loop
+        // keeps the interim decision (grounded in the round-1 read) rather than discarding the turn.
+        let (decision, reads) = run_decision_loop(&snapshot, |observations| {
+            rounds += 1;
+            if observations.is_empty() {
+                parse_decision(
+                    r#"{"classification":{"intent":"status_question","confidence":0.8},
+                        "tool_requests":[{"tool":"list_tasks","args":{}}]}"#,
+                )
+                .ok()
+            } else {
+                None
+            }
+        });
+        assert_eq!(rounds, 2);
+        assert_eq!(reads.len(), 1);
+        assert!(decision.expect("interim decision kept").classification.is_some());
     }
 }

@@ -95,7 +95,10 @@ pub use prime_clarify_memory::{
     is_cancellation, is_resolvable_clarify_intent, resolve_pending, ClarifyResolution,
     CLARIFY_TTL_SECS,
 };
-pub use prime_decision::{build_decision_prompt, parse_decision, PrimeBrainDecision};
+pub use prime_decision::{
+    build_decision_prompt, parse_decision, run_decision_loop, DecisionLoop, DecisionStep,
+    PrimeBrainDecision, MAX_DECISION_ROUNDS,
+};
 pub use prime_intent::{
     build_intent_prompt, parse_intent_proposal, reconcile_intent, BrainIntentProposal,
     IntentSource,

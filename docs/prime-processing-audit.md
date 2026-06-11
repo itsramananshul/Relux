@@ -1230,13 +1230,72 @@ state`, `after_action_falls_back_when_the_brain_claims_unexecuted_work`,
 `cli_after_action_proposal_rejects_installed_claim`); and the dashboard `afterActionLabel` test. No
 test calls a real provider; the dashboard bundle was rebuilt.
 
+## Applied change (the bounded observe-then-act decision loop)
+
+The unified decision was still a SINGLE provider call: the brain chose its one governed action
+(`action_request`) from the STATIC board snapshot, and the read-only context loop could observe only
+on a NON-actionful inspection turn (and only to ground a reply). So a single user turn could not
+safely do **inspect live state → choose one governed action → execute/propose → narrate result** —
+the audit's named "multi-round write loop (act → observe → act INSIDE the one envelope flow), which
+needs the decision call itself to loop". Per master plan §10.1/§10.2/§17.1, and following the
+reference read recorded in `reference-driven-development.md` (Hermes `run_conversation` bounded
+`max_iterations` loop + name-allowlist validation + bounded result injection + re-call;
+`tool_executor` inject-the-bounded-result-then-answer; openclaw `tool-mutation` fail-closed
+read-only gate), the unified decision call now LOOPS, bounded, with the observe phase strictly
+read-only and the act phase still through the unchanged gate.
+
+- **New `DecisionLoop` / `DecisionStep` / `run_decision_loop` + `MAX_DECISION_ROUNDS`**
+  (`relux-kernel/src/prime_decision.rs`). Each round the brain returns a `PrimeBrainDecision`; one
+  carrying read-only `context_requests` is an OBSERVE round — `DecisionLoop::step` runs the validated
+  reads via `prime_tools::execute_requested_reads` against the pre-taken snapshot, accumulates the
+  NEW reads, and asks the caller to re-call the brain grounded in them — while one WITHOUT
+  `context_requests` is the COMMITTED terminal decision. The loop is bounded by `MAX_DECISION_ROUNDS`
+  (=3) and stops on no progress (a brain re-requesting what it already saw); a provider failure
+  mid-loop keeps the interim decision. The synchronous test twin `run_decision_loop` and the async
+  provider driver share the SAME stepper, so the control flow is pinned once.
+- **`build_decision_prompt` gains an `observations` parameter.** Empty on the first round (so that
+  prompt is byte-for-byte the prior single-shot prompt); when non-empty it injects the rendered reads
+  + a steer to commit (omit `tool_requests`) once the brain has observed enough — the Hermes "the
+  model gives its final answer when it stops requesting tools" shape.
+- **Async driver `decide_prime_with_observation`** (`relux-kernel/src/server.rs`) mirrors the sidecar
+  `gather_read_only_context` exactly: it drives `DecisionLoop`, calling `decide_prime_via_openrouter`
+  / `decide_prime_via_cli` (each now threaded with the accumulated observations) per round. Wired in
+  `run_prime` in place of the single decision call; the gathered reads seed `gathered_reads` so an
+  ACTIONFUL turn that observed first also surfaces its `🔎 used: …` provenance. The non-actionful
+  reply path prefers the loop's reads and falls back to the dedicated sidecar `ContextLoop` only when
+  the loop gathered nothing (no duplicate execution).
+- **Safety invariants (binding).** The loop **observes read-only between rounds and acts ONCE at the
+  end through the unchanged kernel gate**. The kernel — never the brain — runs the read-only tools
+  (pure reads of the owned snapshot; there is no path from the loop to `prime_execute`, an approval,
+  or any mutation), and the eventual durable change still flows through the UNCHANGED fail-closed
+  `reconcile_intent` gate + `decide` → `prime_execute` (safe `Act`) / human approval (risky
+  `Propose`). So a mutating action on guarded chat is still vetoed, every id is still validated
+  against the live state, the terminal-state / readiness guards hold, and `plugin.install` /
+  `permission.grant` stay approval-gated. `Local` and a brain that commits on the first round are
+  byte-for-byte the prior behavior.
+- **UI.** No dashboard change: the loop's reads ride the SAME `PrimeTurn.context_reads` wire type and
+  the existing provenance chip (`🔎 used: …`) surfaces them; no new wire field. The dashboard bundle
+  is unchanged.
+
+Pinned by the `prime_decision` unit tests (`build_prompt_injects_observations_and_a_commit_steer`,
+`loop_observes_then_acts_grounded_in_the_reads`,
+`loop_is_byte_for_byte_single_shot_when_the_brain_commits_immediately`,
+`loop_is_bounded_by_the_round_cap`, `loop_stops_on_no_progress_when_the_brain_re_requests_the_same_read`,
+`loop_keeps_the_interim_decision_when_a_later_round_fails`, and the extended
+`build_prompt_carries_schema_safety_rules_and_board_grounding` asserting the empty-observation prompt
+carries no injection). No test calls a real provider; no wire/dashboard change was needed.
+
 ## Current Prime brain stack
 
 The end-to-end shape of one Prime turn, with the brain strictly additive and the
 deterministic kernel always the authority. **A configured brain now answers the structured
 turn in ONE unified decision call** (`prime_decision`: intent + applicable slots + optional
-wording + read-only tool requests + an optional single governed write tool), with the
-per-section specialized calls below as the fallback when that envelope is unavailable:
+wording + read-only tool requests + an optional single governed write tool), made through a
+**bounded observe-then-act loop** (`DecisionLoop`, `MAX_DECISION_ROUNDS`): each round the brain may
+either request READ-ONLY context tools (the kernel runs them deterministically and re-asks, grounded
+in the results) or commit its decision — so a single turn can inspect a little live state, choose its
+one governed action grounded in what it saw, act, and narrate. The per-section specialized calls
+below are the fallback when that envelope is unavailable:
 
 0. **Clarification context** — BEFORE classifying, `prime_turn_with_brain` checks for a
    bounded pending clarification from the prior turn (`prime_clarify_memory::resolve_pending`,
@@ -1357,24 +1416,28 @@ before answering. The obvious next rungs build on it:
   desugared into the EXISTING intent + slot mechanism so it flows through the unchanged fail-closed
   `decide` → `prime_execute` (safe `Act`) / human-approval (`Propose`) path. `classify_write_tool` is
   the fail-closed gate (unknown ⇒ refused), and the SAME `reconcile_intent` gate keeps a mutating
-  tool off guarded chat. The next rungs build on it: a **multi-round write loop** (request → observe
-  → act INSIDE the one envelope flow, which needs the decision call itself to loop) and **richer
-  write tools** (e.g. `run.retry`, an `orchestration` tool) as each proves out.
+  tool off guarded chat. The first half of the next rung — a **bounded observe-then-act loop**
+  (observe read-only → act INSIDE the one envelope flow, the decision call itself looping) — is now
+  DONE (see below). **Richer write tools** (e.g. `run.retry`, an `orchestration` tool) remain.
 - **~~After-action narration~~ (DONE)** — a brain reply on an ACTIONFUL turn, the post-execution
   re-shaping pass that preserves the action-free wall (`prime_after_action`). After the kernel has
   ALREADY executed (or proposed) the action, the brain re-words the confirmation grounded ONLY in a
   sanitized `ActionEnvelope` and validated against it (a completion claim is honored only when its
   fact is confirmed; a success-on-failure, installed/granted-on-a-proposal, or invented id is
-  rejected; secrets/paths redacted), falling back to the deterministic reply on any failure. The
-  remaining deferral here is a **multi-round write loop** (act → observe the result → act again
-  INSIDE the one envelope flow), which needs the decision call itself to loop.
+  rejected; secrets/paths redacted), falling back to the deterministic reply on any failure.
 - **~~Read context on the unified decision~~ (DONE)** — the unified `PrimeBrainDecision` now carries
   the brain's read-only `tool_requests` alongside intent+slots+wording; Relux executes the validated
   reads deterministically (`execute_requested_reads`, no second brain loop, no duplicate execution)
-  and grounds the reply in them, with the sidecar `ContextLoop` as the fallback. The next coherence
-  win is a **multi-round** read on the unified call (request → observe → request again INSIDE the one
-  envelope flow before emitting the final intent/slots/reply), which needs the decision call itself
-  to loop; the single-pass up-front request shipped first.
+  and grounds the reply in them, with the sidecar `ContextLoop` as the fallback.
+- **~~Bounded observe-then-act decision loop~~ (DONE)** — the unified decision call now LOOPS
+  (`DecisionLoop`, `MAX_DECISION_ROUNDS`): each round the brain may request READ-ONLY context tools
+  (the kernel runs them deterministically against the pre-taken snapshot and re-asks, grounded in the
+  results) or commit its decision. So a single turn can inspect live state → choose its one governed
+  action grounded in what it saw → execute/propose (through the UNCHANGED fail-closed gate + `decide`
+  → `prime_execute` / approval) → narrate (`prime_after_action`). The observe phase is read-only with
+  no mutation path; the act phase adds no new authority. The next rung is a **richer multi-action
+  loop** (act → observe the real result → act again), which needs the action itself to feed back into
+  the loop, plus richer write tools.
 
 Multi-turn clarification continuation is now smart on four fronts: a **fuzzy assignee** resolves
 against the live roster (deterministic), a **by-id run start** is wired and its clarify is

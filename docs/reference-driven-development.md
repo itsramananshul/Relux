@@ -1204,3 +1204,72 @@ says installed/granted. This is the post-execution counterpart of the pre-execut
 (`prime_clarify`): the same allowlist/sanitize/clamp discipline, but the claim validation is the
 INVERSE — a claim grounded in the real result is honored, a claim that contradicts it is refused.
 A multi-round write loop and richer tools stay deferred.
+
+---
+
+## Reference read — the bounded observe-then-act decision loop (this slice)
+
+The unified decision was still a SINGLE provider call: the brain had to choose its one governed
+action (`action_request`) from the STATIC board snapshot baked into the prompt, with no chance to
+drill into a specific task / run / the crew first. The read-only context loop could observe, but
+only on a NON-actionful inspection turn and only to ground a reply — never to inform the action. So
+a single user turn could not safely do: **inspect live state → choose one governed action →
+execute/propose → narrate result**. That is the audit's named "multi-round write loop (act →
+observe → act INSIDE the one envelope flow), which needs the decision call itself to loop"
+(`docs/prime-processing-audit.md`). This slice makes the decision call LOOP, bounded, with the
+observe phase strictly read-only and the act phase still through the unchanged gate.
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/agent/conversation_loop.py` `run_conversation(...)`
+  - The per-turn agentic loop is bounded by a **max-iterations cap**: `while (api_call_count <
+    agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:`
+    (L598). Each pass re-calls the model after tool execution and ends when the model stops
+    requesting tools (returns its final answer). **Pattern: a bounded loop where each round the
+    model either requests tools (loop continues) or gives its final answer (loop ends).**
+  - **Tool-call detection** `if assistant_message.tool_calls:` (L3106) branches "the model wants a
+    tool" vs. "the model gave a final answer".
+  - **Name-allowlist validation BEFORE execution + self-correction** (L3114-3162): a name not in
+    `agent.valid_tool_names` is repaired or fed back as a `role:tool` "Tool '…' does not exist.
+    Available tools: …" message; it is NEVER executed. **Pattern: the chosen tool is validated
+    against an explicit allowlist before it runs; an off-list name is fed back, not executed.**
+- `reference/hermes-agent-main/agent/tool_executor.py` (L348-452) — the executed tool's result is
+  appended back as a `{"role":"tool","name":..,"tool_call_id":..,"content":..}` message
+  (`messages.append(tool_msg)`, ~L450) with an `is_error` flag and a BOUNDED preview
+  (`result_preview = _err_text[:200]`, L372), and the loop continues so the model answers grounded in
+  the real result. **Pattern: inject the bounded tool result back, then re-call the model.**
+
+### Paperclip (openclaw) — files read
+
+- `reference/openclaw-main/src/agents/tool-mutation.ts` `isMutatingToolCall(toolName, args)`
+  (L140-181) + `READ_ONLY_ACTIONS` (L39-54: `get`/`list`/`read`/`status`/`show`/`fetch`/`search`/
+  `view`/`inspect`/`check`/…) — a single FAIL-CLOSED classifier whose `default` branch treats an
+  unknown/missing action as *mutating* (`action == null || !READ_ONLY_ACTIONS.has(action)`).
+  **Pattern: a single fail-closed read-only-vs-mutating gate where the unsafe default wins.** The
+  observe phase of the loop executes ONLY the read-only `context_requests` (already validated by
+  `prime_tools::validate_tool_request` → `classify_tool`, the same fail-closed gate); the one
+  mutating action is never run during observation — it is committed only once, at the end, through
+  the kernel's existing gate.
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| Hermes: **bounded loop; each round requests tools OR gives a final answer** | `crates/relux-kernel/src/prime_decision.rs` `DecisionLoop` + `MAX_DECISION_ROUNDS` (=3): each round the brain returns a `PrimeBrainDecision`; one carrying read-only `context_requests` is an OBSERVE round (the kernel runs the reads and re-calls), one without is the COMMITTED terminal decision. The synchronous test twin `run_decision_loop` and the async provider driver (`server.rs` `decide_prime_with_observation`) share the SAME stepper, so the control flow is pinned once. |
+| Hermes: **validate the chosen tool against an allowlist before running; off-list fed back, never executed** | the observe phase runs ONLY `context_requests`, each already validated at parse time against the READ-ONLY allowlist (`validate_tool_request` → `classify_tool`); a mutating/unknown name was dropped in `parse_decision` and can never be a `context_request`. |
+| Hermes: **inject the bounded tool result, then re-call** | `DecisionLoop::step` executes the round's requests via `prime_tools::execute_requested_reads` (bounded, deduped, read-only), accumulates the NEW reads, and `build_decision_prompt(message, summary, observations)` re-grounds the next round with the rendered reads + a "commit (omit tool_requests) once you have observed enough" steer. |
+| openclaw: **single fail-closed read-only gate, unsafe default wins** | the observe phase is read-only by construction (no path from the loop to `prime_execute`); the lone mutating `action_request` is desugared into the EXISTING intent + slot and flows through the UNCHANGED fail-closed `reconcile_intent` gate + `decide` → `prime_execute` / approval — the loop adds no new authority. |
+| Hermes: **bounded; deterministic fallback always exists** | the loop is capped at `MAX_DECISION_ROUNDS` and stops on no progress (a brain re-requesting what it already observed); a provider failure mid-loop keeps the interim decision; ANY failure / `Local` falls back to the specialized per-section stack and the deterministic rails, byte-for-byte. |
+
+**What we deliberately do differently:** unlike Hermes (where the model runs the tools AND the
+mutating action and the loop produces the final answer), the Relux loop **observes read-only between
+rounds and acts ONCE at the end through the unchanged kernel gate**. The kernel — never the brain —
+executes the read-only tools (pure reads of an owned, bounded snapshot taken once under the lock),
+and the eventual durable change still flows through `decide` → `prime_execute` (safe `Act`) or a
+human approval (risky `Propose`). So a single turn can now inspect live state, choose its one
+governed action grounded in what it saw, execute/propose it, and narrate the result (the existing
+`prime_after_action` pass), with the fail-closed intent gate still vetoing a mutating action on
+guarded chat, every id still validated against the live state, and every approval gate intact. The
+first round's prompt is byte-for-byte the prior single-shot prompt (empty observations), so a turn
+where the brain commits immediately is unchanged. The loop is intentionally short (a *little*
+inspection before one action, not an open-ended agent); a richer multi-action loop stays deferred.
