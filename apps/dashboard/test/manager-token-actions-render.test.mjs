@@ -98,11 +98,34 @@ test("the target picker lists the manager's Branch operatives", () => {
   assert.match(html, /ic-2/);
 });
 
+test("the panel offers BOTH token test forms (assign-task and manager-grant)", () => {
+  const html = render();
+  // Each action has its own collapsible test form summary + submit button.
+  assert.match(html, /Test <[^>]*>assign-task<\/[^>]*> with a token/);
+  assert.match(html, /Test <[^>]*>manager-grant<\/[^>]*> with a token/);
+  assert.match(html, /Assign as manager \(token\)/);
+  assert.match(html, /Grant as manager \(token\)/);
+});
+
+test("the manager-grant form has a permission field and an honest token-subject trust-boundary note", () => {
+  const html = render();
+  // A dedicated permission input (with the example placeholder) drives the grant action.
+  assert.match(html, /Permission to grant:/);
+  assert.match(html, /placeholder="e\.g\. tool:relux-tools-echo:say"/);
+  // The trust boundary is spelled out: the token subject is the acting manager, the kernel
+  // re-checks the grant_permission scope, and the operator cookie cannot stand in.
+  assert.match(html, /token subject/);
+  assert.match(html, /agent:lead-1:subtree:grant_permission/);
+  // The grant form has its own paste-once password token field (id suffixed -grant-token).
+  assert.match(html, /id="mta-lead-1-grant-token"/);
+});
+
 test("the committed dashboard bundle carries the manager-actions panel copy (no stale dist)", () => {
   const assetsDir = join(distDir, "assets");
   const jsFiles = readdirSync(assetsDir).filter((f) => f.endsWith(".js"));
   const bundle = jsFiles.map((f) => readFileSync(join(assetsDir, f), "utf8")).join("\n");
   assert.match(bundle, /Manager actions \(token-authenticated\)/);
   assert.match(bundle, /Assign as manager \(token\)/);
+  assert.match(bundle, /Grant as manager \(token\)/);
   assert.match(bundle, /RELUX_AGENT_TOKEN/);
 });

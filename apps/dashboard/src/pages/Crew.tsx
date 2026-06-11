@@ -4,8 +4,10 @@ import {
   reluxWork,
   reluxAdapters,
   agentSelfAssignTask,
+  agentSelfManagerGrant,
   type ReluxAgent,
   type ReluxAgentConfig,
+  type ReluxAgentPermissions,
   type ReluxAgentPreset,
   type ReluxAgentTokenMeta,
   type ReluxMintedAgentToken,
@@ -22,6 +24,7 @@ import {
   managerGrantAvailability,
   parseTokenTtlSecs,
   assignTaskFormReason,
+  managerGrantFormReason,
   assignTaskCurlSnippet,
   managerGrantCurlSnippet,
   AGENT_SELF_ASSIGN_TASK_ROUTE,
@@ -936,13 +939,15 @@ function AgentTokenPanel({ agentId }: { agentId: string }) {
 // A compact, HONEST manager-actions panel for the per-agent token path. It documents the
 // two agent-self routes a token unlocks (`manager-grant` / `assign-task`), shows copy-paste
 // curl snippets that embed NO secret (the token is the `$RELUX_AGENT_TOKEN` shell var), and
-// offers a local test form for `assign-task`. The form requires the operator to PASTE the
-// raw token deliberately — the dashboard cannot reuse a minted token (only its hash is
-// stored, copy-once), so it never fakes the credential, and it drives the bearer path
-// (`agentSelfAssignTask`, `credentials: "omit"`) so the operator session is NOT used to
-// bypass the token. The acting manager is always the token subject; the kernel re-checks
-// own-Branch + Active + the `agent:<id>:subtree:assign_task` scope.
-// docs/HERMES_OPENCLAW_DEEP_AUDIT.md §20 / §21.
+// offers a local test form for EACH action (`assign-task` and `manager-grant`). Both forms
+// require the operator to PASTE the raw token deliberately — the dashboard cannot reuse a
+// minted token (only its hash is stored, copy-once), so it never fakes the credential, and
+// each drives the bearer path (`agentSelfAssignTask` / `agentSelfManagerGrant`,
+// `credentials: "omit"`) so the operator session is NOT used to bypass the token. The acting
+// manager is always the token subject; the kernel re-checks own-Branch + Active + the
+// matching `agent:<id>:subtree:<action>` scope. Each form keeps its OWN pasted token and
+// clears it the moment the request returns.
+// docs/HERMES_OPENCLAW_DEEP_AUDIT.md §19 / §20 / §21.
 export function ManagerTokenActionsPanel({
   agentId,
   targets,
@@ -950,6 +955,7 @@ export function ManagerTokenActionsPanel({
   agentId: string;
   targets: string[];
 }) {
+  // assign-task form state.
   const [open, setOpen] = useState(false);
   const [token, setToken] = useState("");
   const [taskId, setTaskId] = useState("");
@@ -959,8 +965,22 @@ export function ManagerTokenActionsPanel({
   const [result, setResult] = useState<ReluxTask | null>(null);
   const [snippetCopied, setSnippetCopied] = useState(false);
 
+  // manager-grant form state (its own token + fields, so each form is self-contained and
+  // the operator pastes the credential deliberately into the action it is testing).
+  const [grantOpen, setGrantOpen] = useState(false);
+  const [grantToken, setGrantToken] = useState("");
+  const [grantTarget, setGrantTarget] = useState("");
+  const [permission, setPermission] = useState("");
+  const [grantBusy, setGrantBusy] = useState(false);
+  const [grantError, setGrantError] = useState<string | null>(null);
+  const [grantResult, setGrantResult] = useState<ReluxAgentPermissions | null>(null);
+  const [grantSnippetCopied, setGrantSnippetCopied] = useState(false);
+
   const notReady = assignTaskFormReason(token, taskId, target);
   const snippet = assignTaskCurlSnippet(taskId, target);
+
+  const grantNotReady = managerGrantFormReason(grantToken, grantTarget, permission);
+  const grantSnippet = managerGrantCurlSnippet(grantTarget, permission);
 
   async function copySnippet() {
     try {
@@ -968,6 +988,15 @@ export function ManagerTokenActionsPanel({
       setSnippetCopied(true);
     } catch {
       setSnippetCopied(false);
+    }
+  }
+
+  async function copyGrantSnippet() {
+    try {
+      await navigator.clipboard.writeText(grantSnippet);
+      setGrantSnippetCopied(true);
+    } catch {
+      setGrantSnippetCopied(false);
     }
   }
 
@@ -990,6 +1019,31 @@ export function ManagerTokenActionsPanel({
       setError(e instanceof Error ? e.message : "Assignment failed.");
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function runGrant() {
+    const reason = managerGrantFormReason(grantToken, grantTarget, permission);
+    if (reason) {
+      setGrantError(reason);
+      return;
+    }
+    setGrantBusy(true);
+    setGrantError(null);
+    setGrantResult(null);
+    try {
+      const updated = await agentSelfManagerGrant(
+        grantToken.trim(),
+        grantTarget.trim(),
+        permission.trim(),
+      );
+      setGrantResult(updated);
+      // Same copy-once discipline as the assign form — clear the pasted token immediately.
+      setGrantToken("");
+    } catch (e) {
+      setGrantError(e instanceof Error ? e.message : "Grant failed.");
+    } finally {
+      setGrantBusy(false);
     }
   }
 
@@ -1131,8 +1185,112 @@ export function ManagerTokenActionsPanel({
           </pre>
           <p className="muted" style={{ fontSize: 11, marginTop: 2 }}>
             Set <span className="mono">RELUX_AGENT_TOKEN</span> to the raw token, then run the
-            above. The sibling grant call:
+            above.
           </p>
+        </div>
+      </details>
+
+      <details
+        open={grantOpen}
+        onToggle={(e) => setGrantOpen((e.currentTarget as HTMLDetailsElement).open)}
+        style={{ marginTop: 6 }}
+      >
+        <summary style={{ cursor: "pointer", fontSize: 12 }}>
+          Test <span className="mono">manager-grant</span> with a token
+        </summary>
+
+        <div className="form-group" style={{ marginTop: 8 }}>
+          <label htmlFor={`mta-${agentId}-grant-token`}>Raw agent token (paste once):</label>
+          <input
+            id={`mta-${agentId}-grant-token`}
+            type="password"
+            autoComplete="off"
+            value={grantToken}
+            onChange={(e) => setGrantToken(e.target.value)}
+            placeholder="relux_agt_…"
+            style={{ width: "100%" }}
+          />
+        </div>
+        <div className="form-group" style={{ marginTop: 6 }}>
+          <label htmlFor={`mta-${agentId}-grant-target`}>Target subordinate id:</label>
+          {targets.length > 0 ? (
+            <select
+              id={`mta-${agentId}-grant-target`}
+              value={grantTarget}
+              onChange={(e) => setGrantTarget(e.target.value)}
+              style={{ width: "100%" }}
+            >
+              <option value="">— choose a Branch operative —</option>
+              {targets.map((id) => (
+                <option key={id} value={id}>{id}</option>
+              ))}
+            </select>
+          ) : (
+            <input
+              id={`mta-${agentId}-grant-target`}
+              type="text"
+              className="mono"
+              value={grantTarget}
+              onChange={(e) => setGrantTarget(e.target.value)}
+              placeholder="a subordinate in this agent's Branch"
+              style={{ width: "100%" }}
+            />
+          )}
+        </div>
+        <div className="form-group" style={{ marginTop: 6 }}>
+          <label htmlFor={`mta-${agentId}-grant-permission`}>Permission to grant:</label>
+          <input
+            id={`mta-${agentId}-grant-permission`}
+            type="text"
+            className="mono"
+            value={permission}
+            onChange={(e) => setPermission(e.target.value)}
+            placeholder="e.g. tool:relux-tools-echo:say"
+            style={{ width: "100%" }}
+          />
+        </div>
+
+        {grantError && <div className="error-message">{grantError}</div>}
+        {grantResult && (
+          <div
+            className="grant-result"
+            style={{ margin: "6px 0", fontSize: 12, color: "var(--ok, #2aa198)" }}
+          >
+            Granted to <span className="mono">{grantResult.agent_id}</span> · now holds{" "}
+            <span className="mono">{grantResult.permissions.length}</span> explicit permission
+            {grantResult.permissions.length === 1 ? "" : "s"}.
+          </div>
+        )}
+
+        <button
+          type="button"
+          className="btn sm"
+          onClick={() => void runGrant()}
+          disabled={grantBusy || !!grantNotReady}
+          style={{ marginTop: 4 }}
+        >
+          {grantBusy ? "…" : "Grant as manager (token)"}
+        </button>
+        {grantNotReady && (
+          <p className="muted" style={{ fontSize: 11, marginTop: 2 }}>{grantNotReady}</p>
+        )}
+
+        <p className="muted" style={{ fontSize: 11, marginTop: 8 }}>
+          The <strong>token subject</strong> is the acting manager — the kernel reads it from
+          the bearer token, never the form — and re-checks own Branch · live ·{" "}
+          <span className="mono">agent:{agentId}:subtree:grant_permission</span>. The operator
+          cookie cannot stand in: this form sends only the bearer.
+        </p>
+
+        <div style={{ marginTop: 6 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span className="muted" style={{ fontSize: 11 }}>
+              Or call it yourself (no secret in this snippet):
+            </span>
+            <button type="button" className="btn ghost sm" onClick={() => void copyGrantSnippet()}>
+              {grantSnippetCopied ? "Copied" : "Copy curl"}
+            </button>
+          </div>
           <pre
             className="mono"
             style={{
@@ -1145,7 +1303,7 @@ export function ManagerTokenActionsPanel({
               marginTop: 4,
             }}
           >
-            {managerGrantCurlSnippet(target, "tool:relux-tools-echo:say")}
+            {grantSnippet}
           </pre>
         </div>
       </details>

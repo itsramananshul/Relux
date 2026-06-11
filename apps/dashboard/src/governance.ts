@@ -274,6 +274,30 @@ export function assignTaskFormReason(
 }
 
 /**
+ * Honest reason the token-authenticated manager-grant test form is not ready to submit,
+ * or null when every field is present and well-shaped. The sibling of
+ * `assignTaskFormReason` for the `grant_permission` action: same token-shape + target
+ * checks, but the third field is a CAPABILITY string validated against the very grammar
+ * the add-permission form uses (`permissionInvalidReason`), so a malformed permission is
+ * caught before the API 400s. A UI gate only — the kernel re-checks own-Branch + Active +
+ * the `agent:<id>:subtree:grant_permission` scope and never widens anything.
+ */
+export function managerGrantFormReason(
+  token: string,
+  targetAgentId: string,
+  permission: string,
+): string | null {
+  if (!token.trim()) return "Paste the agent's raw token (shown once at mint).";
+  if (!agentTokenLooksValid(token)) {
+    return "That does not look like a per-agent token (expected `relux_agt_…`).";
+  }
+  if (!targetAgentId.trim()) return "Enter the target subordinate's id.";
+  // The permission is validated against the same backend grammar the add form uses
+  // (empty string → "Enter a permission string.").
+  return permissionInvalidReason(permission);
+}
+
+/**
  * A copy-paste curl snippet for the token-authenticated assign-task call. The token is
  * referenced as the `$RELUX_AGENT_TOKEN` shell variable and is NEVER embedded, so the
  * snippet carries no secret and is safe to display/copy. Blank ids fall back to angle-

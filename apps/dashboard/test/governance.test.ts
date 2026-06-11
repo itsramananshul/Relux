@@ -21,6 +21,7 @@ import {
   parseTokenTtlSecs,
   agentTokenLooksValid,
   assignTaskFormReason,
+  managerGrantFormReason,
   assignTaskCurlSnippet,
   managerGrantCurlSnippet,
   AGENT_SELF_ASSIGN_TASK_ROUTE,
@@ -223,6 +224,20 @@ test("assignTaskFormReason gates the token test form, null when ready", () => {
   assert.match(assignTaskFormReason("relux_agt_abc", "task_1", "")!, /target/);
   // All present + well-shaped → ready.
   assert.equal(assignTaskFormReason("relux_agt_abc", "task_1", "ic"), null);
+});
+
+test("managerGrantFormReason gates the token grant form, validating the permission grammar, null when ready", () => {
+  // Missing/!shaped token, missing target each get an honest reason (same as the assign form).
+  assert.match(managerGrantFormReason("", "ic", "tool:relux-tools-echo:say")!, /raw token/);
+  assert.match(managerGrantFormReason("not-a-token", "ic", "tool:relux-tools-echo:say")!, /relux_agt_/);
+  assert.match(managerGrantFormReason("relux_agt_abc", "", "tool:relux-tools-echo:say")!, /target/);
+  // The permission is validated against the backend grammar BEFORE the API: blank and
+  // malformed strings are rejected with the add-permission form's own reasons.
+  assert.match(managerGrantFormReason("relux_agt_abc", "ic", "")!, /Enter a permission/);
+  assert.match(managerGrantFormReason("relux_agt_abc", "ic", "not-a-prefix")!, /Must start with/);
+  assert.match(managerGrantFormReason("relux_agt_abc", "ic", "tool:*")!, /wildcard/);
+  // All present + a well-formed capability → ready.
+  assert.equal(managerGrantFormReason("relux_agt_abc", "ic", "tool:relux-tools-echo:say"), null);
 });
 
 test("the curl snippets embed NO secret (token is the $RELUX_AGENT_TOKEN var) and hit the real routes", () => {

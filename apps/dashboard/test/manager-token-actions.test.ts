@@ -11,7 +11,12 @@
 
 import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { agentSelfAssignTask, ApiError, onSessionExpired } from "../src/api.ts";
+import {
+  agentSelfAssignTask,
+  agentSelfManagerGrant,
+  ApiError,
+  onSessionExpired,
+} from "../src/api.ts";
 
 const realFetch = globalThis.fetch;
 afterEach(() => {
@@ -55,6 +60,69 @@ test("agentSelfAssignTask sends a bearer token, omits the operator cookie, and p
   // The updated task record flows back to the caller.
   assert.equal(task.status, "Queued");
   assert.equal(task.assigned_agent, "ic");
+});
+
+test("agentSelfManagerGrant sends a bearer token, omits the operator cookie, and posts only target+permission", async () => {
+  let captured: { url: string; init: RequestInit } | null = null;
+  globalThis.fetch = (async (url: string, init: RequestInit) => {
+    captured = { url, init };
+    return fakeResponse(200, {
+      agent_id: "ic",
+      permissions: ["tool:relux-tools-echo:say"],
+    });
+  }) as typeof fetch;
+
+  const perms = await agentSelfManagerGrant(
+    "relux_agt_secret123",
+    "ic",
+    "tool:relux-tools-echo:say",
+  );
+
+  assert.ok(captured, "fetch was called");
+  const { url, init } = captured!;
+  // The real agent-self route — never an operator route.
+  assert.equal(url, "/v1/relux/agents/me/manager-grant");
+  assert.equal(init.method, "POST");
+  // The operator session must NOT be used: credentials are omitted.
+  assert.equal(init.credentials, "omit");
+  // The bearer token is the credential; the cookie path is not used.
+  const headers = init.headers as Record<string, string>;
+  assert.equal(headers.authorization, "Bearer relux_agt_secret123");
+  assert.equal(headers["content-type"], "application/json");
+  // The body carries ONLY target + permission — the acting manager is the token subject,
+  // never a body field, so a token can only ever grant as itself.
+  assert.deepEqual(JSON.parse(init.body as string), {
+    target_id: "ic",
+    permission: "tool:relux-tools-echo:say",
+  });
+  // The target's updated explicit permission list flows back to the caller.
+  assert.deepEqual(perms.permissions, ["tool:relux-tools-echo:say"]);
+  assert.equal(perms.agent_id, "ic");
+});
+
+test("a non-OK manager-grant response throws an honest ApiError and does NOT fire the session-expired signal", async () => {
+  globalThis.fetch = (async () =>
+    fakeResponse(403, { error: "manager lacks grant_permission scope" })) as typeof fetch;
+
+  let sessionExpiredFired = false;
+  const off = onSessionExpired(() => {
+    sessionExpiredFired = true;
+  });
+  try {
+    await assert.rejects(
+      () => agentSelfManagerGrant("relux_agt_x", "outsider", "tool:relux-tools-echo:say"),
+      (e: unknown) => {
+        assert.ok(e instanceof ApiError);
+        assert.equal((e as ApiError).status, 403);
+        assert.match((e as ApiError).message, /grant_permission scope/);
+        return true;
+      },
+    );
+  } finally {
+    off();
+  }
+  // A 401/403 on the BEARER path means a bad/expired token, not an operator-session lapse.
+  assert.equal(sessionExpiredFired, false);
 });
 
 test("a non-OK response throws an honest ApiError and does NOT fire the session-expired signal", async () => {
