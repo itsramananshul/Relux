@@ -35,9 +35,9 @@ pub use adapter::{
     AdapterRunOutcome,
 };
 pub use ai::{
-    clear_stored_config, compose_chat_prompt, is_actionful, polish_proposal, read_stored_config,
-    shape_reply, write_stored_config, AiConfig, AiMode, AiOutcome, AiStatus, PrimeBrain,
-    StoredAiConfig,
+    clear_stored_config, compose_chat_prompt, compose_polish_prompt, is_actionful,
+    polish_from_cli_text, polish_proposal, proposal_wants_polish, read_stored_config, shape_reply,
+    write_stored_config, AiConfig, AiMode, AiOutcome, AiStatus, PrimeBrain, StoredAiConfig,
 };
 pub use auth::{
     admin_path_for_db, clear_session_cookie, read_admin_username, reset_admin_credential,

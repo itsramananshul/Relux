@@ -1637,7 +1637,7 @@ async fn run_prime(
             brain,
             relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli
         ) {
-        run_cli_brain(brain, cli_status, &message, &turn).await
+        run_cli_brain(brain, cli_status.clone(), &message, &turn).await
     } else {
         // Local / OpenRouter (and actionful turns) go through shape_reply, which
         // keeps actionful turns deterministic and only augments via OpenRouter
@@ -1649,16 +1649,29 @@ async fn run_prime(
     let mut final_turn = turn;
     final_turn.reply = outcome.reply;
 
-    // 4. OPTIONAL advisory polish of a plan-preview card. When the OpenRouter brain
-    // is enabled, let the model refine only the WORDING of the proposal (summary,
-    // step titles, clarifying questions, risk notes). This is presentation-only and
-    // happens OUTSIDE the lock: the authoritative steps/agents/goal — and therefore
-    // the "Create these tasks" commit — are never changed by it, and a skip/error
-    // simply leaves the deterministic preview in place (§10 planning layer, §17.1).
-    if let Some(proposal) = final_turn.proposal.clone() {
-        if let Some(polish) = relux_kernel::polish_proposal(&ai_config, &proposal).await {
-            if let Some(p) = final_turn.proposal.as_mut() {
-                p.polish = Some(polish);
+    // 4. OPTIONAL advisory polish of a plan-preview card. Whichever brain is live
+    // may refine only the WORDING of the proposal (summary, step titles, clarifying
+    // questions, risk notes) — OpenRouter over HTTP, the Claude/Codex CLI brains via
+    // a bounded adapter spawn. Both feed the SAME `validate_polish` chokepoint, so
+    // neither can change step count, order, or agent ids. This is presentation-only
+    // and happens OUTSIDE the lock. It is gated on a NON-actionful turn: only a
+    // PlanRequest carries a proposal (the commit path is a separate Orchestration
+    // turn with no proposal), so the authoritative steps/agents/goal — and the
+    // "Create these tasks" commit — are never touched, and a skip/error/invalid
+    // reply simply leaves the deterministic preview in place (§10 planning layer,
+    // §11.1, §17.1).
+    if !relux_kernel::is_actionful(&final_turn) {
+        if let Some(proposal) = final_turn.proposal.clone() {
+            let polish = match brain {
+                relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli => {
+                    polish_proposal_via_cli(brain, cli_status.clone(), &proposal).await
+                }
+                _ => relux_kernel::polish_proposal(&ai_config, &proposal).await,
+            };
+            if let Some(polish) = polish {
+                if let Some(p) = final_turn.proposal.as_mut() {
+                    p.polish = Some(polish);
+                }
             }
         }
     }
@@ -1894,6 +1907,98 @@ async fn run_cli_brain(
         Err(_) => fallback(format!(
             "{label} run was interrupted; showing the grounded reply. Please try again."
         )),
+    }
+}
+
+/// Validate a CLI brain's captured `stdout` into an advisory proposal polish, or
+/// `None`. The shape seam mirrors [`shape_cli_brain_reply`]: [`parse_adapter_result`]
+/// lifts the human text out of a JSON result envelope (degrading to raw prose
+/// otherwise, exactly as the conversational path does), and the lifted text is then
+/// run through the SAME validation chokepoint ([`relux_kernel::polish_from_cli_text`]
+/// -> `validate_polish`) as every other polish. An error envelope, prose with no
+/// JSON object, or a suggestion that fails validation (changed count/order/agents)
+/// all yield `None` and the deterministic preview stands. Pure: the no-action /
+/// validation contract is pinned by unit tests without spawning a process.
+fn shape_cli_brain_polish(
+    stdout: &str,
+    kind: relux_core::AdapterKind,
+    label: &str,
+    proposal: &relux_core::PrimeProposal,
+) -> Option<relux_core::PrimeProposalPolish> {
+    let parsed = relux_core::parse_adapter_result(stdout, kind);
+    // An envelope can report an error even on a clean exit; a polish is purely
+    // advisory, so just keep the deterministic preview rather than surfacing it.
+    if parsed.is_error == Some(true) {
+        return None;
+    }
+    relux_kernel::polish_from_cli_text(proposal, &parsed.text, label)
+}
+
+/// Attempt an advisory presentation polish of a plan preview via a local CLI brain
+/// (Claude / Codex), mirroring [`run_cli_brain`] but producing a validated overlay
+/// instead of a conversational reply.
+///
+/// Safety contract (`docs/RELUX_MASTER_PLAN.md` section 8.1, section 17.1): identical
+/// to the OpenRouter polish path ([`relux_kernel::polish_proposal`]). The CLI may
+/// refine ONLY wording; its reply is run through the SAME validation chokepoint
+/// (count/order/agent ids are immutable — only titles/questions/risks/provenance can
+/// change). It spawns the adapter in the same bounded, non-bypass mode the
+/// assigned-run path uses (argv-only, prompt on stdin, wall-clock timeout, output
+/// cap, secret redaction) and performs NO durable action: nothing in the commit path
+/// ever reads the overlay. On ANY failure — adapter missing/disabled/off-PATH, spawn
+/// error, timeout, error envelope, prose, or a suggestion that fails validation — it
+/// returns `None` and the deterministic preview stands, with no user-facing error
+/// (the card is simply not polished).
+async fn polish_proposal_via_cli(
+    brain: relux_kernel::PrimeBrain,
+    status: Option<relux_core::AdapterRuntimeStatus>,
+    proposal: &relux_core::PrimeProposal,
+) -> Option<relux_core::PrimeProposalPolish> {
+    // Only a genuine multi-step plan carries anything to refine (single-step /
+    // empty proposals skip for every brain, exactly like the OpenRouter path).
+    if !relux_kernel::proposal_wants_polish(proposal) {
+        return None;
+    }
+    let (label, kind) = match brain {
+        relux_kernel::PrimeBrain::ClaudeCli => ("Claude CLI", relux_core::AdapterKind::ClaudeCli),
+        relux_kernel::PrimeBrain::CodexCli => ("Codex CLI", relux_core::AdapterKind::CodexCli),
+        // Not a CLI brain — caller never routes these here.
+        _ => return None,
+    };
+
+    // The adapter must be installed, enabled, and resolved on PATH. Any gap simply
+    // leaves the preview unpolished (a polish is advisory; no note is warranted).
+    let st = status?;
+    if st.state != relux_core::AdapterRuntimeState::Available {
+        return None;
+    }
+    let program = st.resolved_path.clone()?;
+
+    let prompt = relux_kernel::compose_polish_prompt(proposal);
+    let spec = relux_kernel::AdapterCommandSpec {
+        program,
+        args: relux_kernel::build_adapter_args(&kind),
+        stdin: prompt,
+        working_dir: st.working_dir.clone(),
+        timeout: std::time::Duration::from_secs(
+            st.timeout_seconds
+                .unwrap_or(relux_core::DEFAULT_ADAPTER_TIMEOUT_SECONDS),
+        ),
+        max_output_bytes: st
+            .max_output_bytes
+            .unwrap_or(relux_core::DEFAULT_ADAPTER_MAX_OUTPUT_BYTES) as usize,
+    };
+
+    // The spawn is blocking (poll loop); keep it off the async reactor.
+    let run = tokio::task::spawn_blocking(move || relux_kernel::run_adapter_command(&spec)).await;
+    match run {
+        Ok(Ok(outcome)) if outcome.success && !outcome.stdout.trim().is_empty() => {
+            shape_cli_brain_polish(&outcome.stdout, kind, label, proposal)
+        }
+        // Timeout / non-zero exit / spawn error / interruption: silently keep the
+        // deterministic preview. The conversational reply already carried any
+        // actionable note about the adapter on this same turn.
+        _ => None,
     }
 }
 
@@ -4934,6 +5039,122 @@ mod tests {
         assert!(
             brain_envelope_advisory("just a friendly reply", relux_core::AdapterKind::CodexCli, "Codex CLI").is_none(),
             "plain prose must not produce an advisory"
+        );
+    }
+
+    // --- CLI-brain proposal polish (shape seam) ----------------------------
+
+    fn polish_proposal_fixture() -> relux_core::PrimeProposal {
+        relux_core::PrimeProposal {
+            goal: "ship the beta".to_string(),
+            multi_step: true,
+            steps: vec![
+                relux_core::PrimeProposalStep {
+                    index: 1,
+                    title: "research the options".to_string(),
+                    role: "research".to_string(),
+                    agent: "research-agent".to_string(),
+                },
+                relux_core::PrimeProposalStep {
+                    index: 2,
+                    title: "build a prototype".to_string(),
+                    role: "implementation".to_string(),
+                    agent: "prime".to_string(),
+                },
+            ],
+            agents: vec!["research-agent".to_string(), "prime".to_string()],
+            polish: None,
+        }
+    }
+
+    #[test]
+    fn cli_polish_accepts_valid_json_lifted_from_a_result_envelope() {
+        // The Claude CLI wraps the polish JSON inside its `--output-format json`
+        // result envelope; parse_adapter_result lifts the inner JSON string, then the
+        // validation chokepoint accepts an exact 1:1 step match.
+        let inner = r#"{\"summary\":\"A clear two-stage path.\",\"steps\":[{\"index\":1,\"title\":\"Survey the options\"},{\"index\":2,\"title\":\"Build a prototype\"}],\"questions\":[\"Which platform first?\"],\"risks\":[\"Scope creep.\"]}"#;
+        let stdout = format!(r#"{{"type":"result","is_error":false,"result":"{inner}"}}"#);
+        let p = polish_proposal_fixture();
+        let overlay = shape_cli_brain_polish(&stdout, relux_core::AdapterKind::ClaudeCli, "Claude CLI", &p)
+            .expect("a valid envelope yields a polish overlay");
+        assert_eq!(overlay.model.as_deref(), Some("Claude CLI"));
+        assert_eq!(overlay.step_titles.len(), 2);
+        assert_eq!(overlay.step_titles[0].title, "Survey the options");
+        assert_eq!(overlay.summary.as_deref(), Some("A clear two-stage path."));
+    }
+
+    #[test]
+    fn cli_polish_accepts_plain_json_from_codex_text_mode() {
+        // Codex `exec` / text mode emits the JSON object as raw prose (no envelope).
+        let stdout = r#"{"summary":"tidy plan","steps":[{"index":1,"title":"Look into options"},{"index":2,"title":"Prototype it"}]}"#;
+        let p = polish_proposal_fixture();
+        let overlay = shape_cli_brain_polish(stdout, relux_core::AdapterKind::CodexCli, "Codex CLI", &p)
+            .expect("raw JSON prose still validates");
+        assert_eq!(overlay.model.as_deref(), Some("Codex CLI"));
+        assert_eq!(overlay.step_titles.len(), 2);
+    }
+
+    #[test]
+    fn cli_polish_ignores_prose_with_no_json() {
+        // A chatty CLI that ignored the JSON instruction -> no overlay, the
+        // deterministic preview stands (no user-facing failure).
+        let stdout = r#"{"type":"result","is_error":false,"result":"This plan looks solid to me!"}"#;
+        let p = polish_proposal_fixture();
+        assert!(
+            shape_cli_brain_polish(stdout, relux_core::AdapterKind::ClaudeCli, "Claude CLI", &p).is_none(),
+            "prose with no JSON object must not polish the card"
+        );
+    }
+
+    #[test]
+    fn cli_polish_rejects_error_envelope() {
+        // An envelope reporting an error is never used as a polish, even though it
+        // might contain JSON-looking text.
+        let stdout = r#"{"type":"result","is_error":true,"result":"rate limited"}"#;
+        let p = polish_proposal_fixture();
+        assert!(
+            shape_cli_brain_polish(stdout, relux_core::AdapterKind::ClaudeCli, "Claude CLI", &p).is_none(),
+            "an error envelope must fall back to the deterministic preview"
+        );
+    }
+
+    #[test]
+    fn cli_polish_rejects_structural_drift_at_the_seam() {
+        let p = polish_proposal_fixture();
+        // Added step -> dropped; no other usable content -> None.
+        let added = r#"{"steps":[{"index":1,"title":"a"},{"index":2,"title":"b"},{"index":3,"title":"c"}]}"#;
+        assert!(shape_cli_brain_polish(added, relux_core::AdapterKind::CodexCli, "Codex CLI", &p).is_none());
+        // Reorder/rename of an index -> titles dropped, but a valid summary survives.
+        let reordered = r#"{"summary":"nice","steps":[{"index":1,"title":"a"},{"index":3,"title":"b"}]}"#;
+        let overlay = shape_cli_brain_polish(reordered, relux_core::AdapterKind::CodexCli, "Codex CLI", &p)
+            .expect("the summary is still usable");
+        assert!(overlay.step_titles.is_empty(), "drifted indexes drop the titles");
+        assert_eq!(overlay.summary.as_deref(), Some("nice"));
+        // The authoritative proposal is never mutated by validation.
+        assert_eq!(p.steps.len(), 2);
+        assert_eq!(p.steps[1].agent, "prime");
+    }
+
+    #[tokio::test]
+    async fn cli_polish_via_cli_returns_none_when_adapter_not_installed() {
+        // No adapter status -> no spawn, no overlay; the deterministic preview stands.
+        let p = polish_proposal_fixture();
+        assert!(
+            polish_proposal_via_cli(relux_kernel::PrimeBrain::ClaudeCli, None, &p)
+                .await
+                .is_none()
+        );
+        // A single-step proposal carries nothing to refine -> None even with a brain.
+        let single = relux_core::PrimeProposal {
+            multi_step: false,
+            steps: vec![],
+            agents: vec![],
+            ..polish_proposal_fixture()
+        };
+        assert!(
+            polish_proposal_via_cli(relux_kernel::PrimeBrain::ClaudeCli, None, &single)
+                .await
+                .is_none()
         );
     }
 

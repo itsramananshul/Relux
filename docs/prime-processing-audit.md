@@ -212,11 +212,25 @@ intact: the LLM gets ZERO action authority.
   accepted ONLY when the model's indexes match the real steps exactly (same count,
   same set, no duplicates, no extras) — any merge/split/reorder/add/rename drops the
   titles entirely and the deterministic titles stand; `questions`/`risks` are trimmed
-  and count/length-bounded; a failed or unusable call attaches nothing. Restricted to
-  the OpenRouter brain (the clean JSON path); CLI brains keep the deterministic card.
+  and count/length-bounded; a failed or unusable call attaches nothing. `polish_proposal`
+  is the OpenRouter HTTP path.
+- **CLI brains (Claude / Codex) now polish through the SAME chokepoint.**
+  `compose_polish_prompt` folds the strict-JSON polish instruction + the authoritative
+  steps into one stdin prompt (mirroring `compose_chat_prompt`); the kernel spawns the
+  adapter in the same bounded, non-bypass mode as the conversational path
+  (`polish_proposal_via_cli` in `server.rs`), lifts the reply out of the result
+  envelope with `parse_adapter_result` (the same shape seam), and runs it through
+  `polish_from_cli_text` → **the same `validate_polish`**. So the CLI can only ever
+  change titles/questions/risks/provenance — never step count, order, or agent ids —
+  and an error envelope / prose / timeout / missing adapter / invalid suggestion all
+  leave the deterministic card in place with no user-facing failure. The shared
+  `proposal_wants_polish` predicate skips single-step proposals for every brain.
 - **Wired in `run_prime`** (`relux-kernel/src/server.rs`) OUTSIDE the lock, after the
-  reply is shaped — so the slow model call never holds the kernel lock, and a
-  skip/error simply leaves the deterministic preview in place.
+  reply is shaped — so the slow model/process call never holds the kernel lock — and
+  **gated on a non-actionful turn** (only a `PlanRequest` carries a proposal; the
+  "Create these tasks" commit is a separate `Orchestration` turn with no proposal), so
+  the commit path never invokes polish. A skip/error simply leaves the deterministic
+  preview in place.
 - **Dashboard** (`apps/dashboard`) — the `ProposalCard` shows the polished summary /
   step titles when present (falling back to the authoritative values via the pure
   `stepDisplayTitle` / `proposalDisplaySummary` helpers), an **"AI-refined wording"**
@@ -233,7 +247,14 @@ Pinned by `proposal_polish_is_advisory_and_omitted_when_absent` (core wire guard
 `validate_polish_rejects_titles_that_change_count_order_or_agents`,
 `validate_polish_bounds_questions_and_risks`,
 `finalize_polish_attaches_model_on_success_and_none_on_error`,
-`polish_proposal_skips_with_no_network_when_brain_is_not_live` (kernel), and the
+`polish_proposal_skips_with_no_network_when_brain_is_not_live` (kernel), the CLI-brain
+guards `compose_polish_prompt_carries_steps_and_no_structural_change_rule`,
+`polish_from_cli_text_accepts_valid_json_and_stamps_label`,
+`polish_from_cli_text_tolerates_prose_around_the_json`,
+`polish_from_cli_text_ignores_malformed_or_objectless_text`,
+`polish_from_cli_text_rejects_structural_drift_via_the_same_chokepoint` (ai.rs) and the
+`cli_polish_*` seam tests (`server.rs`: valid envelope/plain JSON accepted, prose / error
+envelope ignored, structural drift rejected, no-adapter → `None`), and the
 `stepDisplayTitle` / `proposalDisplaySummary` tests in
 `apps/dashboard/test/prime.test.ts`. No test calls a real provider.
 
@@ -243,5 +264,7 @@ When the optional LLM brain is enabled, let it *propose* the clarifying question
 across the remaining reflect-and-clarify arms (brainstorm, orchestration, task
 update) — the same "model suggests wording, deterministic classifier owns the
 action" seam now used for the plan proposal — while keeping the action-free wall
-intact. Also consider extending the advisory polish to the CLI brains (claude/codex)
-by parsing their JSON envelope through the same `validate_polish` chokepoint.
+intact. (Extending the advisory polish to the CLI brains (claude/codex) through the
+same `validate_polish` chokepoint is now done — see above.) A further refinement
+would be to surface the CLI brain's `model`/session provenance on the polished card
+the way the OpenRouter model id already is.

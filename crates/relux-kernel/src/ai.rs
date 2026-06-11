@@ -638,6 +638,14 @@ fn outcome_for_augment(
 // against the authoritative proposal before it is attached; anything that does not
 // line up exactly is dropped and the deterministic preview stands. Nothing in the
 // commit path ever reads the overlay (§10 planning layer, §11.1, §17.1).
+//
+// Two brains feed this validation chokepoint. OpenRouter goes through the HTTP
+// path here ([`polish_proposal`]); the CLI brains (Claude / Codex) are spawned by
+// the kernel with [`compose_polish_prompt`] on stdin and their reply is run
+// through [`polish_from_cli_text`] — which lifts the JSON out of the adapter
+// envelope and calls the SAME [`validate_polish`]. Whatever the prompt asks for,
+// only titles/questions/risks/provenance can ever change; step count, order, and
+// agent ids are immutable.
 
 /// What to do with a proposal before any network call. Pure and testable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -650,12 +658,21 @@ pub enum PolishPlan {
     Augment,
 }
 
-/// Decide whether to polish a proposal, given the config. Pure: no env, no
-/// network. Restricted to the OpenRouter brain (the clean JSON-returning path);
-/// the CLI brains keep the deterministic preview. Single-step proposals carry
-/// nothing to refine and always skip.
+/// Whether a proposal carries anything worth polishing: a genuine multi-step plan
+/// with at least one step. Single-step (or empty) proposals carry nothing to
+/// refine and always skip, for every brain. Pure.
+pub fn proposal_wants_polish(proposal: &PrimeProposal) -> bool {
+    proposal.multi_step && !proposal.steps.is_empty()
+}
+
+/// Decide whether to polish a proposal over the OpenRouter HTTP path, given the
+/// config. Pure: no env, no network. Restricted to the OpenRouter brain (the clean
+/// JSON-returning path); the CLI brains get an equivalent polish via the kernel's
+/// adapter spawn (see [`compose_polish_prompt`] / [`polish_from_cli_text`]), which
+/// runs through the SAME [`validate_polish`] chokepoint. Single-step proposals
+/// carry nothing to refine and always skip.
 pub fn plan_polish(cfg: &AiConfig, proposal: &PrimeProposal) -> PolishPlan {
-    if !proposal.multi_step || proposal.steps.is_empty() {
+    if !proposal_wants_polish(proposal) {
         return PolishPlan::Skip;
     }
     match cfg.effective_brain() {
@@ -780,6 +797,29 @@ fn finalize_polish(
     Some(polish)
 }
 
+/// Validate a CLI brain's already-extracted reply text into an advisory polish
+/// overlay, or `None`. This is the CLI counterpart of [`finalize_polish`]: it runs
+/// the SAME chokepoint — [`parse_polish_json`] to lift the JSON object out of any
+/// surrounding prose, then [`validate_polish`] to enforce that the suggestion can
+/// never change the step count, order, or agent ids (only titles/questions/risks
+/// survive) — and stamps `model` with the CLI's label for provenance on the card.
+///
+/// `text` is the human reply already lifted out of the adapter envelope by
+/// [`relux_core::parse_adapter_result`] (the same shape seam the conversational
+/// path uses). Malformed or prose-only text with no JSON object, or a suggestion
+/// that fails validation, yields `None` and the deterministic preview stands.
+/// Pure: never spawns, never mutates the proposal.
+pub fn polish_from_cli_text(
+    proposal: &PrimeProposal,
+    text: &str,
+    model_label: &str,
+) -> Option<PrimeProposalPolish> {
+    let suggestion = parse_polish_json(text).ok()?;
+    let mut polish = validate_polish(proposal, suggestion)?;
+    polish.model = Some(model_label.to_string());
+    Some(polish)
+}
+
 /// Produce an advisory presentation overlay for a plan proposal, or `None`.
 ///
 /// This NEVER mutates kernel state and NEVER changes what the plan does: it reads
@@ -863,6 +903,52 @@ the JSON object described above.",
             content: user,
         },
     ]
+}
+
+/// Compose the single strict-JSON polish prompt handed to a CLI brain on stdin
+/// (`claude -p` / `codex exec`). It mirrors [`build_polish_messages`] but folds the
+/// system + user channels into one self-contained one-shot prompt (as
+/// [`compose_chat_prompt`] does for the conversational path): it pins the "you may
+/// refine WORDING only, never the plan" rule, supplies the authoritative steps (by
+/// index) the model must mirror exactly, and pins the JSON-only output schema.
+/// Kept ASCII so it works with no system-message channel.
+///
+/// The prompt is advisory, not load-bearing: whatever the CLI returns is still run
+/// through [`polish_from_cli_text`] -> [`validate_polish`], so any structural drift
+/// (added/dropped/reordered steps, a changed agent) is rejected regardless of what
+/// the prompt asked for.
+pub fn compose_polish_prompt(proposal: &PrimeProposal) -> String {
+    let steps_json: Vec<serde_json::Value> = proposal
+        .steps
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "index": s.index,
+                "title": s.title,
+                "role": s.role,
+                "agent": s.agent,
+            })
+        })
+        .collect();
+    let grounding = serde_json::json!({
+        "goal": proposal.goal,
+        "steps": steps_json,
+    });
+
+    format!(
+        "You are Prime, refining the WORDING of an already-decided plan preview for a local \
+Relux control plane. You have NO authority to change the plan. You MUST NOT add, remove, reorder, \
+merge, or split steps; you MUST keep exactly one entry per given step, keyed by its index; you \
+MUST NOT change which agent a step is assigned to; and you MUST NOT claim any work was created or \
+run (a preview commits nothing). Improve only the wording: a clearer one-line summary, clearer \
+step titles, a few clarifying questions, and advisory risk notes. Reply with a SINGLE JSON object \
+and NOTHING else (no prose, no markdown, no code fences), using this schema: \
+{{\"summary\": string, \"steps\": [{{\"index\": number, \"title\": string}}], \"questions\": [string], \
+\"risks\": [string]}}. Use plain ASCII.\n\nAuthoritative plan to refine (mirror its steps EXACTLY \
+- same indexes, same count, same order, same agents; only improve the wording):\n{}\n\nReturn the \
+JSON object now.",
+        serde_json::to_string_pretty(&grounding).unwrap_or_else(|_| "{}".to_string())
+    )
 }
 
 // --- Prompt construction ---------------------------------------------------
@@ -1532,5 +1618,85 @@ mod tests {
         assert_eq!(parsed.questions, vec!["q".to_string()]);
         // No object at all -> a stable, secret-free error (caller falls back).
         assert!(parse_polish_json("no json here").is_err());
+    }
+
+    // --- CLI-brain proposal polish (advisory, presentation-only) -----------
+
+    #[test]
+    fn compose_polish_prompt_carries_steps_and_no_structural_change_rule() {
+        let p = multi_proposal();
+        let prompt = compose_polish_prompt(&p);
+        // Pins the wording-only / no-structural-change contract.
+        assert!(prompt.contains("refining the WORDING"));
+        assert!(prompt.contains("MUST NOT add, remove, reorder"));
+        assert!(prompt.contains("MUST NOT change which agent"));
+        // Demands a single JSON object (no prose / code fences).
+        assert!(prompt.contains("SINGLE JSON object"));
+        assert!(prompt.contains("\"summary\""));
+        // Grounds the model in the authoritative steps and agents.
+        assert!(prompt.contains("research the options"));
+        assert!(prompt.contains("research-agent"));
+        assert!(prompt.contains("ship the beta"));
+    }
+
+    #[test]
+    fn polish_from_cli_text_accepts_valid_json_and_stamps_label() {
+        let p = multi_proposal();
+        // A clean JSON object (already lifted out of the adapter envelope) with an
+        // exact 1:1 step match is accepted; the CLI label rides along as provenance.
+        let text = r#"{"summary":"A clear two-stage path.",
+            "steps":[{"index":1,"title":"Survey the options"},{"index":2,"title":"Build a prototype"}],
+            "questions":["Which platform first?"],"risks":["Scope creep."]}"#;
+        let overlay = polish_from_cli_text(&p, text, "Claude CLI")
+            .expect("a valid suggestion produces an overlay");
+        assert_eq!(overlay.model.as_deref(), Some("Claude CLI"));
+        assert_eq!(overlay.step_titles.len(), 2);
+        assert_eq!(overlay.step_titles[0].index, 1);
+        assert_eq!(overlay.step_titles[0].title, "Survey the options");
+        assert_eq!(overlay.summary.as_deref(), Some("A clear two-stage path."));
+    }
+
+    #[test]
+    fn polish_from_cli_text_tolerates_prose_around_the_json() {
+        let p = multi_proposal();
+        // A CLI that wraps its JSON in chatter still validates: parse_polish_json
+        // lifts the object, then validate_polish enforces the invariants.
+        let text = "Sure, here you go:\n{\"summary\":\"tidy plan\"}\nLet me know!";
+        let overlay = polish_from_cli_text(&p, text, "Codex CLI").expect("the object is lifted");
+        assert_eq!(overlay.summary.as_deref(), Some("tidy plan"));
+        assert!(overlay.step_titles.is_empty(), "no steps offered -> none applied");
+        assert_eq!(overlay.model.as_deref(), Some("Codex CLI"));
+    }
+
+    #[test]
+    fn polish_from_cli_text_ignores_malformed_or_objectless_text() {
+        let p = multi_proposal();
+        // Pure prose with no JSON object at all -> None (deterministic preview stands).
+        assert!(polish_from_cli_text(&p, "I think this plan looks great!", "Claude CLI").is_none());
+        // A non-object JSON value is not a usable polish.
+        assert!(polish_from_cli_text(&p, "[1,2,3]", "Claude CLI").is_none());
+        // An empty object carries nothing usable.
+        assert!(polish_from_cli_text(&p, "{}", "Claude CLI").is_none());
+    }
+
+    #[test]
+    fn polish_from_cli_text_rejects_structural_drift_via_the_same_chokepoint() {
+        let p = multi_proposal();
+        // The CLI tried to ADD a step -> the whole step set is dropped. With no other
+        // usable content the overlay is None: the deterministic titles stand.
+        let added = r#"{"steps":[{"index":1,"title":"a"},{"index":2,"title":"b"},{"index":3,"title":"c"}]}"#;
+        assert!(polish_from_cli_text(&p, added, "Claude CLI").is_none());
+        // The CLI tried to DROP a step -> same.
+        let dropped = r#"{"steps":[{"index":1,"title":"only one"}]}"#;
+        assert!(polish_from_cli_text(&p, dropped, "Claude CLI").is_none());
+        // Reordered/renamed indexes (1,3 instead of 1,2) -> titles dropped, but a
+        // valid summary still survives (and the titles are empty).
+        let reordered = r#"{"summary":"nice","steps":[{"index":1,"title":"a"},{"index":3,"title":"b"}]}"#;
+        let overlay = polish_from_cli_text(&p, reordered, "Codex CLI").expect("summary survives");
+        assert!(overlay.step_titles.is_empty(), "mismatched indexes drop the titles");
+        assert_eq!(overlay.summary.as_deref(), Some("nice"));
+        // The authoritative proposal is never mutated by validation.
+        assert_eq!(p.steps.len(), 2);
+        assert_eq!(p.steps[1].agent, "prime");
     }
 }

@@ -9,6 +9,31 @@ once a stable release is cut.
 
 ### Added
 
+- **Advisory plan-preview polish now works with the CLI brains too (Claude / Codex),
+  through the same validation chokepoint.** Implements `RELUX_MASTER_PLAN.md` §10
+  (planning layer), §11.1, §17.1. The OpenRouter brain could already refine only the
+  *wording* of a `PlanRequest` proposal card (summary, per-step titles, clarifying
+  questions, risk notes) while the deterministic planner stayed the sole authority on
+  step count/order/agent grounding/`goal`/commit. That advisory polish now extends to
+  the local Claude/Codex CLI brains: `compose_polish_prompt` hands the adapter a
+  strict-JSON polish instruction plus the authoritative steps on stdin (mirroring
+  `compose_chat_prompt`), the kernel spawns it in the same bounded, non-bypass mode as
+  the conversational path (`polish_proposal_via_cli`), lifts the reply out of the
+  result envelope with `parse_adapter_result` (the same shape seam), and runs it
+  through `polish_from_cli_text` → **the same `validate_polish`** the OpenRouter path
+  uses. So a CLI brain can only ever change titles/questions/risks/provenance — never
+  the step count, order, or agent ids — and an error envelope, prose with no JSON, a
+  timeout, a missing/disabled adapter, or any suggestion that fails validation simply
+  leaves the deterministic card in place with **no user-facing failure**. Polish is
+  gated on a **non-actionful** turn (only a `PlanRequest` carries a proposal; the
+  "Create these tasks" commit is a separate `Orchestration` turn), so the commit path
+  never invokes it. New `ai.rs` tests pin the prompt contract and the
+  `polish_from_cli_text` chokepoint (valid JSON accepted, prose-wrapped JSON tolerated,
+  malformed/objectless ignored, added/dropped/reordered steps rejected), and new
+  `server.rs` `cli_polish_*` tests pin the envelope seam (result-envelope and plain
+  JSON accepted, prose / error envelope ignored, structural drift rejected, no-adapter
+  → unpolished). No test calls a paid provider. Dashboard unchanged (the card already
+  renders `polish` when present).
 - **Prime plan previews render as a proposal card, not just prose.** Implements
   `RELUX_MASTER_PLAN.md` §11.1 (Prime Chat shows *"plugin/action results"* and
   *"suggested next actions"*) and §10 (planning layer). A `PlanRequest` turn now
