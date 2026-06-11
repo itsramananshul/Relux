@@ -16,10 +16,17 @@
 //!   serve auth middleware admits any request carrying a valid session cookie, so
 //!   every dashboard `fetch` authenticates automatically — no token paste.
 //!
-//! Sessions live in memory (a single-process kernel); they reset on restart,
-//! which simply re-prompts the operator to log in. The admin credential is
-//! durable on disk. There is no network/unauthenticated reset path — recovery is
-//! the local `relux-kernel reset-admin` CLI ([`reset_admin_credential`]).
+//! Sessions are **persisted locally** so they survive a `serve` restart: the
+//! session table is mirrored to a gitignored JSON file next to the admin
+//! credential (`dashboard-sessions.json`; `RELUX_SESSION_FILE` overrides). What
+//! is stored is a **SHA-256 hash of the opaque session id** plus its metadata
+//! (username, idle deadline, absolute deadline) — never the raw id, so a leaked
+//! file cannot be replayed as a cookie. The cookie still carries the raw id; the
+//! middleware hashes the incoming id to look it up. Expired records are pruned on
+//! load and on use. There is no network/unauthenticated reset path — recovery is
+//! the local `relux-kernel reset-admin` CLI ([`reset_admin_credential`]), which
+//! also clears the persisted session file so a recovery invalidates old sessions
+//! on the next restart.
 //!
 //! **Honest scope:** this is a local-first single-admin console guard, not an
 //! internet auth system. The cookie omits `Secure` because the operator console
@@ -95,6 +102,18 @@ fn now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Hash an opaque session id to the value stored on disk and used as the in-memory
+/// table key. SHA-256 is correct here (not Argon2): the session id is a 256-bit
+/// CSPRNG token, so plain preimage resistance already makes the hash unforgeable —
+/// there is no low-entropy secret to slow-hash. Storing only this hash means a
+/// leaked session file cannot be replayed as a cookie.
+fn hash_sid(sid: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(sid.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 // ── Admin credential (durable) ──────────────────────────────────
@@ -221,17 +240,27 @@ fn write_admin_record(path: &Path, username: &str, password: &str) -> Result<Adm
         created_at: now_secs(),
     };
     let body = serde_json::to_vec_pretty(&rec).map_err(|e| format!("encode: {e}"))?;
+    atomic_write_restricted(path, &body)?;
+    Ok(rec)
+}
+
+/// Atomically write `body` to `path` (tmp file + rename) and restrict it to the
+/// current user. Shared by the admin credential write and the session-file
+/// persistence so both secret-bearing local files use the identical durable,
+/// permission-restricted path. The temp file is hardened before the rename so the
+/// final path is never momentarily world-readable.
+fn atomic_write_restricted(path: &Path, body: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
         }
     }
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, &body).map_err(|e| format!("write: {e}"))?;
+    std::fs::write(&tmp, body).map_err(|e| format!("write: {e}"))?;
     let _ = restrict_to_current_user(&tmp);
     std::fs::rename(&tmp, path).map_err(|e| format!("rename: {e}"))?;
     let _ = restrict_to_current_user(path);
-    Ok(rec)
+    Ok(())
 }
 
 /// The current admin username at `admin_path`, or `None` if no admin exists yet.
@@ -250,10 +279,16 @@ pub fn read_admin_username(admin_path: &Path) -> Option<String> {
 ///
 /// There is deliberately NO network path to this — it is a CLI / filesystem
 /// operation an operator runs locally (it requires write access to the admin
-/// file). It does NOT print or read the existing password/hash, does NOT weaken
-/// session auth, and does NOT touch any other state. Existing in-memory sessions
-/// are not invalidated here; restart `relux-kernel serve` to drop them (a
-/// restart also reloads this new credential).
+/// file). It does NOT print or read the existing password/hash and does NOT
+/// weaken session auth.
+///
+/// Because sessions are now restart-persistent, recovery also **clears the
+/// persisted session file** next to the admin file (`dashboard-sessions.json`),
+/// so the next `serve` start comes up with zero sessions and every previously
+/// minted cookie is dead. (A `serve` already running keeps its in-memory
+/// sessions until restarted — the longstanding "restart serve to finish
+/// recovery" step is unchanged; clearing the file just ensures the restart drops
+/// them for good instead of reloading them.)
 pub fn reset_admin_credential(
     admin_path: &Path,
     username: &str,
@@ -266,10 +301,52 @@ pub fn reset_admin_credential(
     if password.len() < MIN_PASSWORD_LEN {
         return Err(format!("password too short (min {MIN_PASSWORD_LEN} chars)"));
     }
-    write_admin_record(admin_path, username, password).map(|_| ())
+    write_admin_record(admin_path, username, password)?;
+    // Best-effort: drop the persisted session file so old sessions cannot reload.
+    let session_path = session_path_for_admin(admin_path);
+    if let Err(e) = std::fs::remove_file(&session_path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(format!("clear sessions: {e}"));
+        }
+    }
+    Ok(())
 }
 
-// ── Sessions (in-memory) ────────────────────────────────────────
+/// Where the persisted session table lives, given the admin-credential path:
+/// `dashboard-sessions.json` in the SAME directory (so it sits with the operator's
+/// other Relux state and inherits the gitignored `dev-data/` root by default).
+pub fn session_path_for_admin(admin_path: &Path) -> PathBuf {
+    admin_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.join("dashboard-sessions.json"))
+        .unwrap_or_else(|| PathBuf::from("dashboard-sessions.json"))
+}
+
+// ── Sessions (restart-persistent) ───────────────────────────────
+
+/// One persisted session row. Holds the SHA-256 **hash** of the opaque session id
+/// (never the raw id) plus the same deadlines the in-memory table tracks. A
+/// reader of this file learns who is logged in and until when, but cannot mint a
+/// cookie: forging one would require inverting SHA-256 of a 256-bit token.
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedSession {
+    sid_hash: String,
+    username: String,
+    expires_at: i64,
+    absolute_deadline: i64,
+}
+
+/// On-disk shape of the session table: a small versioned envelope around the
+/// rows, so the format can evolve without a silent misparse. An unknown/garbled
+/// file simply fails to deserialize and is treated as "no sessions".
+#[derive(Serialize, Deserialize)]
+struct SessionFile {
+    version: u32,
+    sessions: Vec<PersistedSession>,
+}
+
+const SESSION_FILE_VERSION: u32 = 1;
 
 /// Safe, secret-free snapshot of a live session for the dashboard Account
 /// control. Carries only the operator name and the two deadlines — **never** the
@@ -304,16 +381,85 @@ struct Session {
     absolute_deadline: i64,
 }
 
-/// In-memory session table, keyed by a random opaque session id.
+/// Session table keyed by `hash_sid(raw id)`, mirrored to a durable file so it
+/// survives a `serve` restart. Every method takes the **raw** session id (the
+/// cookie value) and hashes it internally; the raw id is never stored in memory
+/// or on disk.
 #[derive(Clone)]
 struct SessionStore {
     inner: Arc<RwLock<HashMap<String, Session>>>,
+    /// Durable backing file. `None` keeps the table purely in-memory (used by the
+    /// `new()` seam); `Some` mirrors every mutation to disk atomically.
+    path: Option<Arc<PathBuf>>,
 }
 
 impl SessionStore {
-    fn new() -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(HashMap::new())),
+    /// Build a table backed by `path` (when `Some`), loading any still-live
+    /// sessions from it and pruning expired rows. A missing or unparseable file
+    /// yields an empty table — never an error — so a corrupt file just re-prompts
+    /// login rather than bricking serve. If anything was pruned on load, the
+    /// pruned set is rewritten so the file does not accumulate dead rows.
+    fn load(path: Option<PathBuf>) -> Self {
+        let mut map = HashMap::new();
+        let mut pruned = false;
+        if let Some(p) = path.as_ref() {
+            if let Ok(bytes) = std::fs::read(p) {
+                if let Ok(file) = serde_json::from_slice::<SessionFile>(&bytes) {
+                    let now = now_secs();
+                    for rec in file.sessions {
+                        let s = Session {
+                            username: rec.username,
+                            expires_at: rec.expires_at,
+                            absolute_deadline: rec.absolute_deadline,
+                        };
+                        if Self::is_live(&s, now) {
+                            map.insert(rec.sid_hash, s);
+                        } else {
+                            pruned = true;
+                        }
+                    }
+                }
+            }
+        }
+        let store = Self {
+            inner: Arc::new(RwLock::new(map)),
+            path: path.map(Arc::new),
+        };
+        if pruned {
+            if let Ok(m) = store.inner.read() {
+                store.persist_locked(&m);
+            }
+        }
+        store
+    }
+
+    /// Atomically mirror the live rows of `map` to the backing file. Called while
+    /// the caller holds the table lock so the on-disk image always matches a
+    /// consistent in-memory snapshot. Only live rows are written (persistence
+    /// doubles as pruning). Best-effort: a write failure is swallowed — it only
+    /// costs durability across the next restart, never correctness of the running
+    /// process. No-op when the table is in-memory only.
+    fn persist_locked(&self, map: &HashMap<String, Session>) {
+        let Some(path) = self.path.as_deref() else {
+            return;
+        };
+        let now = now_secs();
+        let sessions: Vec<PersistedSession> = map
+            .iter()
+            .filter(|(_, s)| Self::is_live(s, now))
+            .map(|(sid_hash, s)| PersistedSession {
+                sid_hash: sid_hash.clone(),
+                username: s.username.clone(),
+                expires_at: s.expires_at,
+                absolute_deadline: s.absolute_deadline,
+            })
+            .collect();
+        let file = SessionFile {
+            version: SESSION_FILE_VERSION,
+            sessions,
+        };
+        if let Ok(body) = serde_json::to_vec_pretty(&file) {
+            let _ = atomic_write_restricted(path, &body);
         }
     }
 
@@ -324,13 +470,14 @@ impl SessionStore {
         let now = now_secs();
         if let Ok(mut m) = self.inner.write() {
             m.insert(
-                sid.clone(),
+                hash_sid(&sid),
                 Session {
                     username: username.to_string(),
                     expires_at: now + SESSION_TTL_SECS,
                     absolute_deadline: now + SESSION_ABSOLUTE_MAX_SECS,
                 },
             );
+            self.persist_locked(&m);
         }
         sid
     }
@@ -349,16 +496,19 @@ impl SessionStore {
     /// reads (`/v1/auth/status`, `/v1/auth/me`) so polling never slides the idle
     /// window; only real control-plane activity refreshes it (see [`Self::refresh`]).
     fn validate(&self, sid: &str) -> Option<String> {
+        let key = hash_sid(sid);
         let now = now_secs();
         if let Ok(m) = self.inner.read() {
-            match m.get(sid) {
+            match m.get(&key) {
                 Some(s) if Self::is_live(s, now) => return Some(s.username.clone()),
                 Some(_) => {} // expired → fall through to prune
                 None => return None,
             }
         }
         if let Ok(mut m) = self.inner.write() {
-            m.remove(sid);
+            if m.remove(&key).is_some() {
+                self.persist_locked(&m);
+            }
         }
         None
     }
@@ -369,9 +519,10 @@ impl SessionStore {
     /// session, so the Account modal can poll it without keeping an idle console
     /// alive. The deadlines returned are the current pre-refresh values.
     fn meta(&self, sid: &str) -> Option<SessionMeta> {
+        let key = hash_sid(sid);
         let now = now_secs();
         if let Ok(m) = self.inner.read() {
-            match m.get(sid) {
+            match m.get(&key) {
                 Some(s) if Self::is_live(s, now) => {
                     return Some(SessionMeta {
                         username: s.username.clone(),
@@ -384,7 +535,9 @@ impl SessionStore {
             }
         }
         if let Ok(mut m) = self.inner.write() {
-            m.remove(sid);
+            if m.remove(&key).is_some() {
+                self.persist_locked(&m);
+            }
         }
         None
     }
@@ -397,16 +550,21 @@ impl SessionStore {
     /// that case no cookie should be sent. The session id itself is unchanged
     /// (the window slides; the opaque id is not rotated).
     fn refresh(&self, sid: &str) -> Option<i64> {
+        let key = hash_sid(sid);
         let now = now_secs();
         if let Ok(mut m) = self.inner.write() {
-            match m.get_mut(sid) {
+            match m.get_mut(&key) {
                 Some(s) if Self::is_live(s, now) => {
                     let new_exp = (now + SESSION_TTL_SECS).min(s.absolute_deadline);
                     s.expires_at = new_exp;
-                    return Some(new_exp - now);
+                    let max_age = new_exp - now;
+                    // The `s` borrow ends here (NLL), so the persist re-borrow is fine.
+                    self.persist_locked(&m);
+                    return Some(max_age);
                 }
                 Some(_) => {
-                    m.remove(sid);
+                    m.remove(&key);
+                    self.persist_locked(&m);
                 }
                 None => {}
             }
@@ -415,8 +573,11 @@ impl SessionStore {
     }
 
     fn remove(&self, sid: &str) {
+        let key = hash_sid(sid);
         if let Ok(mut m) = self.inner.write() {
-            m.remove(sid);
+            if m.remove(&key).is_some() {
+                self.persist_locked(&m);
+            }
         }
     }
 
@@ -424,34 +585,42 @@ impl SessionStore {
     /// password change so any OTHER live session is invalidated immediately while
     /// the operator who just changed their password stays signed in.
     fn retain_only(&self, keep: &str) {
+        let keep_key = hash_sid(keep);
         if let Ok(mut m) = self.inner.write() {
-            m.retain(|sid, _| sid == keep);
+            let before = m.len();
+            m.retain(|sid_hash, _| sid_hash == &keep_key);
+            if m.len() != before {
+                self.persist_locked(&m);
+            }
         }
     }
 
     /// Test seam: insert a session with explicit deadlines so the sliding/absolute
-    /// behavior can be exercised without sleeping for real-time hours.
+    /// behavior can be exercised without sleeping for real-time hours. Takes the
+    /// raw id (hashed internally) and persists, so it also exercises the durable
+    /// path.
     #[cfg(test)]
     fn insert_raw(&self, sid: &str, username: &str, expires_at: i64, absolute_deadline: i64) {
         if let Ok(mut m) = self.inner.write() {
             m.insert(
-                sid.to_string(),
+                hash_sid(sid),
                 Session {
                     username: username.to_string(),
                     expires_at,
                     absolute_deadline,
                 },
             );
+            self.persist_locked(&m);
         }
     }
 
-    /// Test seam: read back a session's `(expires_at, absolute_deadline)`.
+    /// Test seam: read back a session's `(expires_at, absolute_deadline)` by raw id.
     #[cfg(test)]
     fn peek(&self, sid: &str) -> Option<(i64, i64)> {
         self.inner
             .read()
             .ok()?
-            .get(sid)
+            .get(&hash_sid(sid))
             .map(|s| (s.expires_at, s.absolute_deadline))
     }
 }
@@ -467,20 +636,31 @@ pub struct DashboardAuth {
 }
 
 impl DashboardAuth {
-    /// Build from the local DB path: the admin record lives in the same
-    /// directory (`dashboard-admin.json`) so it sits with the operator's other
-    /// Relux state.
+    /// Build from the local DB path: the admin record and the persisted session
+    /// file both live in the same directory (`dashboard-admin.json` /
+    /// `dashboard-sessions.json`) so they sit with the operator's other Relux
+    /// state.
     pub fn from_db_path(db_path: &Path) -> Self {
         let admin_path = admin_path_for_db(db_path);
         Self::from_admin_path(&admin_path)
     }
 
-    /// Build directly from an explicit admin-file path (used by tests and any
-    /// caller that resolves the file itself).
+    /// Build from an explicit admin-file path, deriving the session file next to
+    /// it ([`session_path_for_admin`]). Used by tests and any caller that resolves
+    /// the admin file itself and is happy with the default session-file location.
     pub fn from_admin_path(admin_path: &Path) -> Self {
+        let session_path = session_path_for_admin(admin_path);
+        Self::from_paths(admin_path, &session_path)
+    }
+
+    /// Build from explicit admin- and session-file paths. The serving binary uses
+    /// this so `RELUX_SESSION_FILE` can relocate the session table independently of
+    /// the admin credential. Any still-live sessions in `session_path` are loaded
+    /// (surviving a restart); expired rows are pruned.
+    pub fn from_paths(admin_path: &Path, session_path: &Path) -> Self {
         Self {
             admin: AdminStore::load(admin_path),
-            sessions: SessionStore::new(),
+            sessions: SessionStore::load(Some(session_path.to_path_buf())),
         }
     }
 
@@ -865,6 +1045,188 @@ mod tests {
             assert_eq!(abs2, abs, "the absolute ceiling is immutable across refreshes");
             assert!(expires_at <= abs2, "idle deadline stays under the ceiling");
         }
+    }
+
+    // ── Restart-persistent sessions ─────────────────────────────
+
+    fn auth_with_session_file() -> (DashboardAuth, PathBuf, PathBuf, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let admin = tmp.path().join("dashboard-admin.json");
+        let sessions = tmp.path().join("dashboard-sessions.json");
+        let auth = DashboardAuth::from_paths(&admin, &sessions);
+        (auth, admin, sessions, tmp)
+    }
+
+    #[test]
+    fn sessions_survive_a_simulated_restart() {
+        let (a1, admin, sessions, _tmp) = auth_with_session_file();
+        a1.create_admin("ops", "hunter2pass").unwrap();
+        let sid = a1.create_session("ops");
+        assert_eq!(a1.validate_session(&sid).as_deref(), Some("ops"));
+        // A fresh handle on the same files (a serve restart) recreates the auth
+        // state from disk and still honors the same cookie value.
+        let a2 = DashboardAuth::from_paths(&admin, &sessions);
+        assert_eq!(
+            a2.validate_session(&sid).as_deref(),
+            Some("ops"),
+            "a minted session must survive a restart"
+        );
+        // An unknown cookie is still rejected after the reload.
+        assert!(a2.validate_session("deadbeef").is_none());
+    }
+
+    #[test]
+    fn expired_sessions_are_not_persisted_or_reloaded() {
+        let (a1, admin, sessions, _tmp) = auth_with_session_file();
+        let now = now_secs();
+        // One live session, one already idle-expired.
+        a1.sessions
+            .insert_raw("live", "ops", now + 1000, now + SESSION_ABSOLUTE_MAX_SECS);
+        a1.sessions
+            .insert_raw("dead", "ops", now - 1, now + SESSION_ABSOLUTE_MAX_SECS);
+        let a2 = DashboardAuth::from_paths(&admin, &sessions);
+        assert_eq!(a2.validate_session("live").as_deref(), Some("ops"));
+        assert!(
+            a2.validate_session("dead").is_none(),
+            "an idle-expired session must not be reloaded"
+        );
+    }
+
+    #[test]
+    fn load_prunes_an_already_expired_row_on_disk_and_rewrites_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("dashboard-sessions.json");
+        let now = now_secs();
+        // Hand-write a file with one live and one stale row (simulating a session
+        // that expired while serve was stopped).
+        let file = SessionFile {
+            version: SESSION_FILE_VERSION,
+            sessions: vec![
+                PersistedSession {
+                    sid_hash: hash_sid("good"),
+                    username: "ops".into(),
+                    expires_at: now + 1000,
+                    absolute_deadline: now + SESSION_ABSOLUTE_MAX_SECS,
+                },
+                PersistedSession {
+                    sid_hash: hash_sid("stale"),
+                    username: "ops".into(),
+                    expires_at: now - 5,
+                    absolute_deadline: now + SESSION_ABSOLUTE_MAX_SECS,
+                },
+            ],
+        };
+        std::fs::write(&sessions, serde_json::to_vec_pretty(&file).unwrap()).unwrap();
+        let store = SessionStore::load(Some(sessions.clone()));
+        assert_eq!(store.validate("good").as_deref(), Some("ops"));
+        assert!(
+            store.validate("stale").is_none(),
+            "load must prune a row that expired on disk"
+        );
+        // The pruned set was rewritten so the file does not accumulate dead rows.
+        let reread: SessionFile =
+            serde_json::from_slice(&std::fs::read(&sessions).unwrap()).unwrap();
+        assert_eq!(reread.sessions.len(), 1);
+        assert_eq!(reread.sessions[0].sid_hash, hash_sid("good"));
+    }
+
+    #[test]
+    fn raw_session_id_is_never_written_to_disk_only_its_hash() {
+        let (auth, _admin, sessions, _tmp) = auth_with_session_file();
+        let sid = auth.create_session("ops");
+        let raw = std::fs::read_to_string(&sessions).unwrap();
+        assert!(
+            !raw.contains(&sid),
+            "the raw session id (the cookie value) must never hit disk"
+        );
+        assert!(
+            raw.contains(&hash_sid(&sid)),
+            "only the SHA-256 hash of the id is persisted"
+        );
+    }
+
+    #[test]
+    fn logout_persists_removal_across_restart() {
+        let (a1, admin, sessions, _tmp) = auth_with_session_file();
+        let sid = a1.create_session("ops");
+        a1.remove_session(&sid);
+        // A restart must not resurrect a logged-out session.
+        let a2 = DashboardAuth::from_paths(&admin, &sessions);
+        assert!(
+            a2.validate_session(&sid).is_none(),
+            "logout must persist the removal"
+        );
+    }
+
+    #[test]
+    fn change_password_invalidates_other_sessions_durably() {
+        let (a1, admin, sessions, _tmp) = auth_with_session_file();
+        a1.create_admin("ops", "oldpassword").unwrap();
+        let current = a1.create_session("ops");
+        let other = a1.create_session("ops");
+        a1.change_password(&current, "oldpassword", "newpassword1")
+            .unwrap();
+        // After a restart, ONLY the caller's own session survives on disk.
+        let a2 = DashboardAuth::from_paths(&admin, &sessions);
+        assert_eq!(a2.validate_session(&current).as_deref(), Some("ops"));
+        assert!(
+            a2.validate_session(&other).is_none(),
+            "a password change must invalidate other sessions durably, not just in memory"
+        );
+    }
+
+    #[test]
+    fn refresh_persists_the_slid_deadline_across_restart() {
+        let (a1, admin, sessions, _tmp) = auth_with_session_file();
+        let now = now_secs();
+        // A session about to time out; a refresh slides it far forward.
+        a1.sessions
+            .insert_raw("sid", "ops", now + 5, now + SESSION_ABSOLUTE_MAX_SECS);
+        a1.refresh_session("sid").expect("a live session refreshes");
+        // The slid idle deadline is durable: a restart loads the refreshed window,
+        // so a session kept alive right before a restart is not lost.
+        let a2 = DashboardAuth::from_paths(&admin, &sessions);
+        let (expires_at, _abs) = a2.sessions.peek("sid").expect("session reloaded");
+        assert!(
+            expires_at >= now + SESSION_TTL_SECS - 2,
+            "the refreshed idle deadline must persist; got {expires_at}"
+        );
+        assert_eq!(a2.validate_session("sid").as_deref(), Some("ops"));
+    }
+
+    #[test]
+    fn reset_admin_clears_persisted_sessions() {
+        let (a1, admin, sessions, _tmp) = auth_with_session_file();
+        a1.create_admin("ops", "oldpassword").unwrap();
+        let sid = a1.create_session("ops");
+        assert!(sessions.exists(), "a minted session writes the file");
+        // Local recovery rewrites the credential AND drops the session file.
+        reset_admin_credential(&admin, "ops", "newpassword1").unwrap();
+        assert!(
+            !sessions.exists(),
+            "reset-admin must clear the persisted session file"
+        );
+        // A restart comes up with zero sessions: the old cookie is dead.
+        let a2 = DashboardAuth::from_paths(&admin, &sessions);
+        assert!(
+            a2.validate_session(&sid).is_none(),
+            "sessions minted before recovery must not survive it"
+        );
+        // The new credential is what verifies after the restart.
+        assert_eq!(
+            a2.verify_login("ops", "newpassword1").as_deref(),
+            Some("ops")
+        );
+    }
+
+    #[test]
+    fn session_default_path_sits_next_to_the_admin_file() {
+        let p = session_path_for_admin(Path::new("/x/y/dashboard-admin.json"));
+        assert!(p.ends_with("dashboard-sessions.json"));
+        assert_eq!(p.parent().unwrap(), Path::new("/x/y"));
+        // A bare filename (no parent) still resolves to a sane relative path.
+        let p2 = session_path_for_admin(Path::new("dashboard-admin.json"));
+        assert!(p2.ends_with("dashboard-sessions.json"));
     }
 
     #[test]

@@ -107,7 +107,10 @@ async fn serve() -> Result<(), KernelError> {
         uploads_root: crate::uploads_root(),
         dashboard_dir: crate::dashboard::resolve_dist_dir(),
         ai_config_path: crate::ai_config_path(),
-        dashboard_auth: relux_kernel::DashboardAuth::from_admin_path(&crate::admin_path()),
+        dashboard_auth: relux_kernel::DashboardAuth::from_paths(
+            &crate::admin_path(),
+            &crate::session_path(),
+        ),
         auth_disabled: auth_disabled_from_env(),
         lock: Arc::new(Mutex::new(())),
         jobs: JobRegistry::default(),
@@ -5069,6 +5072,70 @@ mod tests {
         let (relocked, _, _) =
             call(&state, "GET", "/v1/relux/state", Some(&cookie), None).await;
         assert_eq!(relocked, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_session_survives_a_serve_restart_and_logout_persists() {
+        // Simulate stop/restart of `serve`: rebuild a brand-new AppState over the
+        // SAME on-disk db/admin/session files. A cookie minted against the first
+        // boot must still authenticate against the second — no re-login — because
+        // the session table is now restart-persistent. Logout must likewise persist.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("local.db");
+        let admin = dir.path().join("dashboard-admin.json");
+        let sessions = dir.path().join("dashboard-sessions.json");
+        {
+            let mut store = SqliteStore::open(&db_path).expect("open");
+            let mut kernel = store.load().expect("load");
+            crate::ensure_bootstrapped(&mut kernel).expect("bootstrap");
+            store.save(&kernel).expect("save");
+        }
+        let make_state = || AppState {
+            db_path: db_path.clone(),
+            plugins_root: dir.path().join("plugins"),
+            uploads_root: dir.path().join("uploads"),
+            dashboard_dir: None,
+            ai_config_path: dir.path().join("ai.json"),
+            dashboard_auth: relux_kernel::DashboardAuth::from_paths(&admin, &sessions),
+            auth_disabled: false,
+            lock: Arc::new(Mutex::new(())),
+            jobs: JobRegistry::default(),
+        };
+
+        // Boot 1: first-run setup mints a session cookie.
+        let boot1 = make_state();
+        let (s, set_cookie, _) = call(
+            &boot1,
+            "POST",
+            "/v1/auth/setup",
+            None,
+            Some(r#"{"username":"ops","password":"hunter2pass"}"#),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let cookie = session_pair(&set_cookie.expect("setup sets a cookie"));
+
+        // Boot 2: a brand-new AppState recreated from the same files (the restart).
+        // The cookie still unlocks a protected route with no re-login.
+        let boot2 = make_state();
+        let (ok, _, _) = call(&boot2, "GET", "/v1/relux/state", Some(&cookie), None).await;
+        assert_eq!(
+            ok,
+            StatusCode::OK,
+            "the same cookie must authenticate after a restart"
+        );
+
+        // Logout on boot 2 persists the removal: a third boot rejects the cookie.
+        let (lo, _, _) = call(&boot2, "POST", "/v1/auth/logout", Some(&cookie), None).await;
+        assert_eq!(lo, StatusCode::OK);
+        let boot3 = make_state();
+        let (relocked, _, _) =
+            call(&boot3, "GET", "/v1/relux/state", Some(&cookie), None).await;
+        assert_eq!(
+            relocked,
+            StatusCode::UNAUTHORIZED,
+            "logout must persist across a restart"
+        );
     }
 
     #[tokio::test]

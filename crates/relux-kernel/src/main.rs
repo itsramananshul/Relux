@@ -674,6 +674,17 @@ fn admin_path() -> PathBuf {
     }
 }
 
+/// The restart-persistent session file: `dashboard-sessions.json` next to the
+/// admin credential by default (so it inherits the gitignored `dev-data/` root).
+/// `RELUX_SESSION_FILE` overrides it. Stores only SHA-256 hashes of session ids
+/// plus their deadlines — never the raw cookie value. See `auth.rs`.
+fn session_path() -> PathBuf {
+    match std::env::var("RELUX_SESSION_FILE") {
+        Ok(p) if !p.trim().is_empty() => PathBuf::from(p),
+        _ => relux_kernel::session_path_for_admin(&admin_path()),
+    }
+}
+
 /// Whether the dev/test auth bypass (`RELUX_AUTH_DISABLED`) is requested. Mirrors
 /// the same parse the `serve` middleware uses so `doctor` reports it honestly.
 fn auth_disabled_env() -> bool {
@@ -900,6 +911,21 @@ fn run_reset_admin(args: &[String]) -> Result<(), KernelError> {
     relux_kernel::reset_admin_credential(&path, &username, &password)
         .map_err(|e| KernelError::Storage(format!("reset-admin failed: {e}")))?;
 
+    // `reset_admin_credential` already clears the session file next to the admin
+    // credential. If `RELUX_SESSION_FILE` relocates it elsewhere, clear that too so
+    // recovery never leaves a persisted session behind for the next restart to load.
+    let session_file = session_path();
+    if session_file != relux_kernel::session_path_for_admin(&path) {
+        if let Err(e) = std::fs::remove_file(&session_file) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(KernelError::Storage(format!(
+                    "reset-admin: failed to clear sessions at {}: {e}",
+                    session_file.display()
+                )));
+            }
+        }
+    }
+
     println!("reset-admin: local operator credential rewritten.");
     println!("   file:     {}", path.display());
     println!("   username: {username}");
@@ -910,8 +936,9 @@ fn run_reset_admin(args: &[String]) -> Result<(), KernelError> {
         println!("   password: (set from the value you provided)");
     }
     println!();
-    println!("Restart `relux-kernel serve` to drop any live sessions and load this");
-    println!("credential, then sign in to the dashboard with the new password.");
+    println!("Persisted sessions were cleared. Restart `relux-kernel serve` to drop any");
+    println!("still-running in-memory sessions and load this credential, then sign in to");
+    println!("the dashboard with the new password.");
     Ok(())
 }
 

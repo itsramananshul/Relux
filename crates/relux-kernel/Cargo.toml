@@ -40,6 +40,12 @@ reqwest = { workspace = true }
 argon2 = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
+# Restart-persistent sessions: the durable session file stores a SHA-256 hash of
+# each opaque session id (never the raw id), so a leaked file cannot mint a
+# cookie. SHA-256 is the right primitive for a 256-bit random token-at-rest (no
+# salt/KDF needed — argon2 above stays the password KDF). Workspace-pinned,
+# already in the tree.
+sha2 = { workspace = true }
 
 [dev-dependencies]
 # Temp directories for the SqliteStore round-trip tests.

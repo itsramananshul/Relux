@@ -1808,7 +1808,9 @@ What remains intentionally local-first (out of scope for this RC):
   cross-OS bundles are produced here.
 - The standalone API binds loopback and is now gated by a single-admin local
   operator login (post-v0.1.4); it is still not a multi-user or production
-  surface (one admin, in-memory sessions, http loopback with no transport TLS).
+  surface (one admin, http loopback with no transport TLS). Sessions are now
+  persisted locally (a hash of the sid + deadlines, gitignored) so they survive a
+  `serve` restart, but the surface is still single-operator local-first.
 - GitHub Actions stay disabled; releases are cut by hand with this script.
 
 ### Release history (local Windows bundles)
@@ -1818,6 +1820,27 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **post-v0.1.5 (unreleased)** — **restart-persistent operator sessions.** The
+  v0.1.5 caveat that sessions were in-memory (a `serve` restart forced everyone to
+  re-sign-in) is closed: the session table is now mirrored to a gitignored local
+  file (`dev-data/relux/dashboard-sessions.json`; `RELUX_SESSION_FILE` overrides)
+  next to the admin credential, with the same atomic, OS-permission-restricted write
+  as `dashboard-admin.json`. What persists is a **SHA-256 hash of each opaque session
+  id** plus its metadata (username, idle deadline, absolute deadline) — **never the
+  raw id**, so a leaked file cannot be replayed as a cookie; the cookie still carries
+  the raw id and the middleware hashes it to look it up. Expired rows are pruned on
+  load and on use. Every existing safety property is preserved end-to-end across a
+  restart: logout removes the row from disk, a password change invalidates every
+  *other* session on disk (keeping the caller's), the sliding-refresh/absolute-cap
+  deadlines are the ones persisted, `RELUX_AUTH_DISABLED` still bypasses, and
+  `reset-admin` now also **clears the session file** so recovery invalidates old
+  sessions on the next restart. Proven by `relux-kernel` unit tests (restart
+  survives, expired not loaded, no raw sid on disk, logout/password-change/reset
+  persist) + an in-process HTTP test (login → rebuild the server state from the same
+  files → same cookie still authenticates → logout persists removal). *Remaining
+  caveat:* a `serve` process already running keeps its in-memory sessions until
+  restarted, so out-of-band `reset-admin` still needs the documented restart to fully
+  take effect.
 - **v0.1.5** (2026-06-10) — first build on top of v0.1.4 that puts a **single-admin
   local operator login** in front of the standalone dashboard/API; the surface is no
   longer open by default. **First-run admin setup + login:** on first launch the
@@ -2682,9 +2705,12 @@ The API never returns the key. The dashboard shows the current AI provider/mode.
   blank page), the public auth endpoints (`/v1/auth/status`/`setup`/`login`/
   `logout`/`me`), and `/v1/relux/health` (liveness probe). `POST
   /v1/auth/change-password` is the one auth endpoint that is **protected** (it
-  requires a session, so it sits behind the same guard as `/v1/relux/*`). Sessions are in-memory (a single-process
-  kernel): a restart drops them and re-prompts login while the admin credential
-  stays durable. A signed-in operator can **change the password in-product** via
+  requires a session, so it sits behind the same guard as `/v1/relux/*`). Sessions are
+  **restart-persistent**: the session table is mirrored to a gitignored local file
+  (`dev-data/relux/dashboard-sessions.json`; `RELUX_SESSION_FILE` overrides) next to the
+  admin credential, storing a **SHA-256 hash of the sid** plus its deadlines (never the
+  raw cookie value), so a restart reloads still-live sessions instead of re-prompting,
+  while the admin credential stays durable. Expired rows are pruned on load and on use. A signed-in operator can **change the password in-product** via
   `POST /v1/auth/change-password` (`{ current_password, new_password }`, behind the
   session guard; surfaced by the dashboard's **Account** control): it verifies the
   current password, enforces the same 8-char minimum, and rewrites the credential
@@ -2693,16 +2719,18 @@ The API never returns the key. The dashboard shows the current AI provider/mode.
   session and invalidates every OTHER live session** (a change boots other
   browsers/devices but not the current tab). Password recovery when the current
   password is *unknown* stays the **local** `relux-kernel reset-admin`
-  CLI (filesystem-only, no network/unauthenticated reset; restart `serve` to drop
-  live sessions). A dev/test-only escape hatch `RELUX_AUTH_DISABLED` leaves the API
+  CLI (filesystem-only, no network/unauthenticated reset; it also clears the persisted
+  session file, so restart `serve` to drop any still-running live sessions and come up
+  with none). A dev/test-only escape hatch `RELUX_AUTH_DISABLED` leaves the API
   open (OFF by default, flagged loudly by `serve` and `doctor`). The CLI
   (`prime`, `task run-assigned`, `tools`, autonomy, …) talks to the durable store
   directly and is unaffected by HTTP auth.
 - The standalone API is local-first and binds **loopback only**; it is now gated
   by the single-admin local operator login above (not the earlier
   "unauthenticated by design"). It remains a single-operator local console, not a
-  multi-tenant or internet production surface: one admin account, in-memory
-  sessions, and a loopback bind with no transport TLS (http).
+  multi-tenant or internet production surface: one admin account, locally-persisted
+  sessions (a hash of the sid + deadlines, gitignored — surviving a restart), and a
+  loopback bind with no transport TLS (http).
 
 ### Status after v0.1.1 — next unfinished pieces
 
