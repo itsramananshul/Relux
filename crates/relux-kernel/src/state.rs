@@ -3772,6 +3772,38 @@ impl KernelState {
             plan
         };
 
+        // Brain-assisted run-start resolution (the `task.start` write tool): when the intent is
+        // `RunStart` but the deterministic plan did NOT produce a `StartRun` Act (the message named
+        // no ready task id), a validated brain run slot — the task existence- AND readiness-checked
+        // against the live ready queue — promotes the turn to the SAME safe `StartRun` action. The
+        // id is taken verbatim from `summary.queued`, so a run can start only for a task that
+        // genuinely exists and is ready; on no/unvalidated proposal the deterministic outcome (a
+        // clarify or an honest "not ready"/"does not exist" reply) stands. Durable state still flows
+        // through `decide` → `prime_execute`.
+        let plan = if intent == relux_core::PrimeIntent::RunStart
+            && !matches!(
+                &plan,
+                PrimePlan::Act {
+                    action: PrimeAction::StartRun { .. },
+                    ..
+                }
+            ) {
+            match slots
+                .run
+                .and_then(|proposal| crate::prime_write_tools::reconcile_run_start(proposal, &summary))
+            {
+                Some(task_id) => PrimePlan::Act {
+                    action: PrimeAction::StartRun {
+                        task_id: task_id.clone(),
+                    },
+                    text: format!("Starting {task_id}."),
+                },
+                None => plan,
+            }
+        } else {
+            plan
+        };
+
         self.record_audit(
             "agent",
             ctx.agent.as_str(),
@@ -6600,6 +6632,10 @@ pub struct BrainSlotProposals<'a> {
     /// Resolved by-id update slots for a `TaskUpdate` turn the deterministic rail could
     /// not resolve (validated against the live state before promoting to an Act).
     pub update: Option<&'a crate::prime_update_slots::BrainUpdateSlots>,
+    /// A `task.start` write-tool reference for a `RunStart` turn the deterministic path could
+    /// not complete (the message named no ready task id). Validated against the live ready
+    /// queue before promoting to the SAME safe `StartRun` action.
+    pub run: Option<&'a crate::prime_write_tools::BrainRunStart>,
     /// Whether this bundle was computed by the caller on the COMBINED message of a
     /// multi-turn *continuation* (vs. the raw message of a fresh turn). The kernel keeps
     /// the bundle only when this matches the turn it actually produced — continuation
@@ -7868,6 +7904,348 @@ mod tests {
         // The other ready task was left alone.
         assert_eq!(k.task(&a).unwrap().status, TaskStatus::Queued);
         assert!(k.pending_clarification_for(&ctx).is_none());
+    }
+
+    // --- Write-capable Prime tool surface --------------------------------------
+    //
+    // (`docs/prime-processing-audit.md` "A write-capable tool surface"). The brain may REQUEST a
+    // governed write tool; the kernel maps it to an EXISTING action via the synthesized intent +
+    // the validated slot, and routes it through the UNCHANGED `decide` → `prime_execute` / approval
+    // path. The brain writes nothing directly; the fail-closed gate and every approval gate hold.
+
+    #[test]
+    fn write_tool_task_create_maps_to_the_existing_create_path() {
+        use crate::prime_write_tools::{parse_write_tool_request, WriteToolSlot};
+        let (mut k, ctx) = prime_chat_kernel();
+        let req = parse_write_tool_request(&serde_json::json!({
+            "tool": "task.create",
+            "args": {"title": "Fix the login redirect", "priority": 7}
+        }))
+        .unwrap();
+        let intent = req.intent_proposal();
+        let WriteToolSlot::Task(task) = &req.slot else {
+            panic!("expected a task slot");
+        };
+        let (turn, source) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "create a task to fix the login bug",
+                Some(&intent),
+                BrainSlotProposals {
+                    task: Some(task),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::TaskCreation);
+        assert_eq!(source, crate::prime_intent::IntentSource::Brain);
+        let created = turn.created_task.expect("the write tool created a task");
+        // The validated slot title was applied through the existing create path.
+        assert_eq!(k.task(&created).unwrap().title, "Fix the login redirect");
+        assert!(turn.slots.is_some(), "the sharpened create carries a slot card");
+    }
+
+    #[test]
+    fn write_tool_task_update_maps_to_the_existing_update_path() {
+        use crate::prime_write_tools::{parse_write_tool_request, WriteToolSlot};
+        let (mut k, ctx) = prime_chat_kernel();
+        let id = make_task(&mut k, &ctx);
+        let tid = id.as_str().to_string();
+        let req = parse_write_tool_request(&serde_json::json!({
+            "tool": "task.update",
+            "args": {"task_id": tid, "priority": 8}
+        }))
+        .unwrap();
+        let intent = req.intent_proposal();
+        let WriteToolSlot::Update(update) = &req.slot else {
+            panic!("expected an update slot");
+        };
+        let (turn, _) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "update a task",
+                Some(&intent),
+                BrainSlotProposals {
+                    update: Some(update),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(turn.disposition, PrimeDisposition::Executed);
+        assert_eq!(k.task(&id).unwrap().priority, 8);
+    }
+
+    #[test]
+    fn write_tool_task_assign_maps_to_the_existing_assign_path() {
+        use crate::prime_write_tools::{parse_write_tool_request, WriteToolSlot};
+        let (mut k, ctx) = prime_chat_kernel();
+        add_agent(&mut k, &ctx, "researcher");
+        let id = make_task(&mut k, &ctx);
+        let tid = id.as_str().to_string();
+        let req = parse_write_tool_request(&serde_json::json!({
+            "tool": "task.assign",
+            "args": {"task_id": tid, "agent_id": "researcher"}
+        }))
+        .unwrap();
+        let intent = req.intent_proposal();
+        let WriteToolSlot::Assign(assign) = &req.slot else {
+            panic!("expected an assign slot");
+        };
+        let (turn, _) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "assign a task",
+                Some(&intent),
+                BrainSlotProposals {
+                    assign: Some(assign),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(turn.disposition, PrimeDisposition::Executed);
+        assert_eq!(
+            k.task(&id).unwrap().assigned_agent.as_ref(),
+            Some(&AgentId::new("researcher"))
+        );
+    }
+
+    #[test]
+    fn write_tool_task_start_maps_to_the_existing_start_path() {
+        use crate::prime_write_tools::{parse_write_tool_request, WriteToolSlot};
+        let (mut k, ctx) = prime_chat_kernel();
+        // Two ready tasks, so the deterministic plan can only ask which — the brain run slot
+        // names exactly one (existence- AND readiness-checked against the live ready queue).
+        let _a = k
+            .prime_turn(&ctx, "create a task to run the tests")
+            .unwrap()
+            .created_task
+            .unwrap();
+        let b = k
+            .prime_turn(&ctx, "create a task to build the docs")
+            .unwrap()
+            .created_task
+            .unwrap();
+        let req = parse_write_tool_request(&serde_json::json!({
+            "tool": "task.start",
+            "args": {"task_id": b.as_str()}
+        }))
+        .unwrap();
+        let intent = req.intent_proposal();
+        let WriteToolSlot::RunStart(run) = &req.slot else {
+            panic!("expected a run-start slot");
+        };
+        let (turn, _) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "start a task",
+                Some(&intent),
+                BrainSlotProposals {
+                    run: Some(run),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(turn.disposition, PrimeDisposition::Executed);
+        match turn.action {
+            Some(PrimeAction::StartRun { task_id }) => assert_eq!(task_id, b.as_str()),
+            other => panic!("expected StartRun for the named id, got {other:?}"),
+        }
+        assert!(turn.started_run.is_some());
+    }
+
+    #[test]
+    fn write_tool_task_start_rejects_an_unknown_or_unready_task() {
+        use crate::prime_write_tools::{parse_write_tool_request, WriteToolSlot};
+        let (mut k, ctx) = prime_chat_kernel();
+        let _a = k.prime_turn(&ctx, "create a task to run the tests").unwrap();
+        let _b = k.prime_turn(&ctx, "create a task to build the docs").unwrap();
+        let req = parse_write_tool_request(&serde_json::json!({
+            "tool": "task.start",
+            "args": {"task_id": "task_9999"}
+        }))
+        .unwrap();
+        let intent = req.intent_proposal();
+        let WriteToolSlot::RunStart(run) = &req.slot else {
+            panic!("expected a run-start slot");
+        };
+        let (turn, _) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "start a task",
+                Some(&intent),
+                BrainSlotProposals {
+                    run: Some(run),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // An unknown id never resolves — the deterministic clarify stands, nothing starts.
+        assert_eq!(turn.disposition, PrimeDisposition::NeedsClarification);
+        assert!(turn.started_run.is_none());
+    }
+
+    #[test]
+    fn write_tool_agent_create_maps_to_the_existing_agent_path() {
+        use crate::prime_write_tools::{parse_write_tool_request, WriteToolSlot};
+        let (mut k, ctx) = prime_chat_kernel();
+        let req = parse_write_tool_request(&serde_json::json!({
+            "tool": "agent.create",
+            "args": {"name": "Research Agent"}
+        }))
+        .unwrap();
+        let intent = req.intent_proposal();
+        let WriteToolSlot::Agent(agent) = &req.slot else {
+            panic!("expected an agent slot");
+        };
+        let (turn, _) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "create an agent",
+                Some(&intent),
+                BrainSlotProposals {
+                    agent: Some(agent),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::AgentCreation);
+        // The validated name normalized to an id through the existing create path.
+        assert_eq!(turn.created_agent.unwrap().as_str(), "research-agent");
+    }
+
+    #[test]
+    fn write_tool_plugin_install_stays_approval_gated() {
+        use crate::prime_write_tools::{parse_write_tool_request, WriteToolSlot};
+        let (mut k, ctx) = prime_chat_kernel();
+        let before = k.installed_plugins().len();
+        let req = parse_write_tool_request(&serde_json::json!({
+            "tool": "plugin.install",
+            "args": {"plugin_id": "relux-tools-github"}
+        }))
+        .unwrap();
+        assert!(req.gated, "plugin.install is approval-gated");
+        let intent = req.intent_proposal();
+        let WriteToolSlot::Plugin(plugin) = &req.slot else {
+            panic!("expected a plugin slot");
+        };
+        let (turn, _) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "install the github plugin",
+                Some(&intent),
+                BrainSlotProposals {
+                    plugin: Some(plugin),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(turn.disposition, PrimeDisposition::AwaitingApproval);
+        assert!(turn.approval.is_some(), "an install is proposed behind approval");
+        // SAFETY: nothing was installed — a write tool cannot execute a protected install.
+        assert_eq!(
+            k.installed_plugins().len(),
+            before,
+            "a write tool must never install a plugin by itself"
+        );
+    }
+
+    #[test]
+    fn write_tool_permission_grant_stays_approval_gated() {
+        use crate::prime_write_tools::{parse_write_tool_request, WriteToolSlot};
+        let (mut k, ctx) = prime_chat_kernel();
+        let researcher = add_agent(&mut k, &ctx, "researcher");
+        let req = parse_write_tool_request(&serde_json::json!({
+            "tool": "permission.grant",
+            "args": {"subject_kind": "agent", "subject_id": "researcher",
+                     "permission": "tool:relux-tools-github:access"}
+        }))
+        .unwrap();
+        assert!(req.gated, "permission.grant is approval-gated");
+        let intent = req.intent_proposal();
+        let WriteToolSlot::Permission(perm) = &req.slot else {
+            panic!("expected a permission slot");
+        };
+        let (turn, _) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "grant a permission",
+                Some(&intent),
+                BrainSlotProposals {
+                    permission: Some(perm),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(turn.disposition, PrimeDisposition::AwaitingApproval);
+        assert!(turn.approval.is_some());
+        // SAFETY: nothing was granted — a write tool cannot execute a protected grant.
+        assert!(
+            k.agent(&researcher).unwrap().permissions.is_empty(),
+            "a write tool must never grant a permission by itself"
+        );
+    }
+
+    #[test]
+    fn casual_chat_never_triggers_a_write_tool() {
+        use crate::prime_write_tools::{parse_write_tool_request, WriteToolSlot};
+        let (mut k, ctx) = prime_chat_kernel();
+        let req = parse_write_tool_request(&serde_json::json!({
+            "tool": "task.create",
+            "args": {"title": "Fix the login redirect"}
+        }))
+        .unwrap();
+        let intent = req.intent_proposal();
+        let WriteToolSlot::Task(task) = &req.slot else {
+            panic!("expected a task slot");
+        };
+        // Guarded chat (musing) + a sensitive write-tool intent → the fail-closed gate vetoes it.
+        let (turn, source) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "we should maybe fix the login someday",
+                Some(&intent),
+                BrainSlotProposals {
+                    task: Some(task),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::Brainstorming);
+        assert_eq!(source, crate::prime_intent::IntentSource::Deterministic);
+        assert!(
+            turn.created_task.is_none(),
+            "casual chat must never mint work via a write tool"
+        );
+    }
+
+    #[test]
+    fn write_tool_assign_fails_closed_on_an_unknown_task() {
+        use crate::prime_write_tools::{parse_write_tool_request, WriteToolSlot};
+        let (mut k, ctx) = prime_chat_kernel();
+        add_agent(&mut k, &ctx, "researcher");
+        let req = parse_write_tool_request(&serde_json::json!({
+            "tool": "task.assign",
+            "args": {"task_id": "task_9999", "agent_id": "researcher"}
+        }))
+        .unwrap();
+        let intent = req.intent_proposal();
+        let WriteToolSlot::Assign(assign) = &req.slot else {
+            panic!("expected an assign slot");
+        };
+        let (turn, _) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "assign a task",
+                Some(&intent),
+                BrainSlotProposals {
+                    assign: Some(assign),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // An unknown task never validates — the deterministic clarify stands, nothing changes.
+        assert_eq!(turn.disposition, PrimeDisposition::NeedsClarification);
+        assert!(turn.assign_slots.is_none());
     }
 
     /// Create one task assigned to Prime and return its id, for the update tests.

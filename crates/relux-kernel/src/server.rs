@@ -1603,6 +1603,15 @@ struct PrimeResponse {
     /// the per-section chips still attribute each piece. Provenance only; never affects state.
     #[serde(skip_serializing_if = "Option::is_none")]
     decision_source: Option<String>,
+    /// Present ONLY when the brain requested a governed WRITE-capable tool that genuinely drove
+    /// this turn (the turn is actionful and its intent matches the tool). The value is the tool
+    /// name (e.g. `task.update`). The chat renders a small "requested tool: <name>" provenance
+    /// chip. The mutation still flowed through the unchanged fail-closed `decide` → `prime_execute`
+    /// (safe `Act`) / human-approval (`Propose`) path; the brain wrote nothing directly. Absent on
+    /// every turn with no honored write tool (including a vetoed one), so existing clients are
+    /// unaffected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_tool: Option<String>,
 }
 
 /// Provenance for a brain-polished clarify / brainstorm reply: which KIND of wording
@@ -1719,14 +1728,34 @@ async fn run_prime(
     let mut permission_slots: Option<relux_kernel::BrainPermissionSlots> = None;
     let mut assign_slots: Option<relux_kernel::BrainAssignSlots> = None;
     let mut update_slots: Option<relux_kernel::BrainUpdateSlots> = None;
+    let mut run_slots: Option<relux_kernel::BrainRunStart> = None;
     if let Some(d) = decision.as_ref() {
-        intent_proposal = d.classification.clone();
-        task_slots = d.task.clone();
-        agent_slots = d.agent.clone();
-        plugin_ref = d.plugin.clone();
-        permission_slots = d.permission.clone();
-        assign_slots = d.assign.clone();
-        update_slots = d.update.clone();
+        if let Some(wt) = d.action_request.as_ref() {
+            // A WRITE tool request is the authority for this turn's intent + its one slot. Its
+            // synthesized intent flows through the UNCHANGED fail-closed gate (so guarded chat
+            // still vetoes a mutating tool), and only the matching validated slot is fed to the
+            // kernel chokepoint — the loose classification / slot sections are ignored in favor
+            // of the explicitly named tool. The kernel still validates every id and gates a
+            // risky action behind a human approval (§10.1, §10.2, §17.1).
+            intent_proposal = Some(wt.intent_proposal());
+            match &wt.slot {
+                relux_kernel::WriteToolSlot::Task(s) => task_slots = Some(s.clone()),
+                relux_kernel::WriteToolSlot::Update(s) => update_slots = Some(s.clone()),
+                relux_kernel::WriteToolSlot::Assign(s) => assign_slots = Some(s.clone()),
+                relux_kernel::WriteToolSlot::Agent(s) => agent_slots = Some(s.clone()),
+                relux_kernel::WriteToolSlot::Plugin(s) => plugin_ref = Some(s.clone()),
+                relux_kernel::WriteToolSlot::Permission(s) => permission_slots = Some(s.clone()),
+                relux_kernel::WriteToolSlot::RunStart(s) => run_slots = Some(s.clone()),
+            }
+        } else {
+            intent_proposal = d.classification.clone();
+            task_slots = d.task.clone();
+            agent_slots = d.agent.clone();
+            plugin_ref = d.plugin.clone();
+            permission_slots = d.permission.clone();
+            assign_slots = d.assign.clone();
+            update_slots = d.update.clone();
+        }
     } else {
         // Specialized fallback (the prior multi-call stack), reached only when the unified
         // decision was unavailable. A dedicated intent proposal, then a dedicated slot call for
@@ -1875,6 +1904,7 @@ async fn run_prime(
                 permission: permission_slots.as_ref(),
                 assign: assign_slots.as_ref(),
                 update: update_slots.as_ref(),
+                run: run_slots.as_ref(),
                 continuation: is_continuation,
             },
         )?;
@@ -2086,6 +2116,18 @@ async fn run_prime(
         .filter(|d| d.section_count() >= 2)
         .map(|_| slot_source_label(brain, &ai_config));
 
+    // The governed WRITE-tool provenance: present ONLY when the brain requested a write tool AND
+    // that request genuinely drove this turn — the turn is actionful (a real `Act` / approval) and
+    // its intent matches the tool's mapped intent. So a write tool the fail-closed gate vetoed (a
+    // mutating request on guarded chat) attributes NOTHING, keeping the chip honest. The chat
+    // renders a small "requested tool: task.update" chip; the action still flowed through the
+    // unchanged validation/approval path.
+    let requested_tool = decision
+        .as_ref()
+        .and_then(|d| d.action_request.as_ref())
+        .filter(|wt| relux_kernel::is_actionful(&final_turn) && wt.intent == final_turn.intent)
+        .map(|wt| wt.tool.clone());
+
     Ok(Json(PrimeResponse {
         turn: final_turn,
         state: summary,
@@ -2096,6 +2138,7 @@ async fn run_prime(
         reply_polish,
         pending_clarification,
         decision_source,
+        requested_tool,
     }))
 }
 
@@ -6506,6 +6549,33 @@ mod tests {
         );
         // No envelope scaffolding leaks into the validated request.
         assert!(!d.context_requests[0].tool.contains("session_id"));
+    }
+
+    #[test]
+    fn cli_decision_carries_a_write_tool_request_through_the_no_leak_seam() {
+        // An explicitly-commanded turn answered in ONE envelope: the brain requests a governed
+        // WRITE tool, lifted out of the CLI result envelope with no scaffolding leak and validated
+        // against the write allowlist + the existing task validator.
+        let inner = r#"{\"classification\":{\"intent\":\"task_creation\",\"confidence\":0.9},\"action_request\":{\"tool\":\"task.create\",\"args\":{\"title\":\"Fix the login redirect\"}}}"#;
+        let stdout = format!(r#"{{"type":"result","is_error":false,"result":"{inner}","session_id":"abc"}}"#);
+        let d = parse_cli_decision(&stdout, relux_core::AdapterKind::ClaudeCli)
+            .expect("an action_request envelope validates");
+        let wt = d.action_request.expect("a validated write tool");
+        assert_eq!(wt.tool, "task.create");
+        assert_eq!(wt.intent, relux_core::PrimeIntent::TaskCreation);
+        match wt.slot {
+            relux_kernel::WriteToolSlot::Task(s) => assert_eq!(s.title, "Fix the login redirect"),
+            other => panic!("expected a task slot, got {other:?}"),
+        }
+
+        // A mutating-sounding / off-allowlist write tool is dropped at the seam (never mapped to an
+        // action); with no other usable section the whole envelope falls back to the specialized path.
+        let bogus = r#"{\"action_request\":{\"tool\":\"task.delete\",\"args\":{\"task_id\":\"task_0001\"}}}"#;
+        let stdout = format!(r#"{{"type":"result","is_error":false,"result":"{bogus}"}}"#);
+        assert!(
+            parse_cli_decision(&stdout, relux_core::AdapterKind::ClaudeCli).is_none(),
+            "an off-allowlist write tool with no other section must fail closed"
+        );
     }
 
     #[test]

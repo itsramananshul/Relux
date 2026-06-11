@@ -1610,6 +1610,12 @@ export interface ReluxPrimeTurn {
   /// / CLI brain label. The chat renders one concise "one brain decision · <source>" chip; the
   /// per-section chips still attribute each piece. Provenance only; never affects state.
   decision_source?: string;
+  /// Present ONLY when the brain requested a governed WRITE-capable tool that genuinely drove
+  /// this turn (the turn is actionful and its intent matches the tool). The value is the tool
+  /// name (e.g. `task.update`). The chat renders a small "requested tool: <name>" provenance
+  /// chip. The mutation still flowed through the unchanged fail-closed decide → execute / approval
+  /// path; the brain wrote nothing directly. Absent on every turn with no honored write tool.
+  requested_tool?: string;
 }
 
 export const reluxPrime = {

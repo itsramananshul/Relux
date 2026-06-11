@@ -101,6 +101,10 @@ const ALLOWED_TOP_LEVEL_KEYS: &[&str] = &[
     // counterpart of the standalone read-only loop. `context_reads` is accepted as an alias.
     "tool_requests",
     "context_reads",
+    // The single WRITE-capable tool the brain requests this turn (a mutating action mapped to an
+    // existing safe `Act` / approval-gated `Propose`). At most one per turn. `tool_call` alias.
+    "action_request",
+    "tool_call",
     // The free-form conversational reply for a non-clarify chat turn (greeting / direct
     // answer / explanation). `assistant_message` is accepted as an alias for the same field.
     "reply",
@@ -148,6 +152,15 @@ pub struct PrimeBrainDecision {
     /// brain requested no context tools (the sidecar [`crate::prime_tools::ContextLoop`] is then the
     /// fallback). Bounded by the loop's round cap at parse time.
     pub context_requests: Vec<crate::prime_tools::ToolCall>,
+    /// The single WRITE-capable tool the brain requested this turn, already validated against the
+    /// write allowlist + mapped to an EXISTING action's slot
+    /// ([`crate::prime_write_tools::parse_write_tool_request`]): a mutating / unknown / made-up tool
+    /// name (`task.delete`, `shell.run`) is dropped at parse time and can NEVER act, and a batched
+    /// multi-tool request is refused (at most ONE mutating tool per turn). On an explicitly-commanded
+    /// turn the kernel feeds this tool's synthesized intent through the fail-closed gate and its
+    /// validated slot through the unchanged chokepoint, so casual chat can never trigger it and every
+    /// existence/approval gate still applies. `None` when the brain requested no write tool.
+    pub action_request: Option<crate::prime_write_tools::ParsedWriteTool>,
     /// The raw wording sub-object (`{text, confidence, rationale?}`) re-serialized to JSON,
     /// NOT yet validated against a `ClarifyKind`. It is validated and reconciled later via
     /// [`Self::validated_wording`] against the turn's actual kind + deterministic text
@@ -195,6 +208,7 @@ impl PrimeBrainDecision {
             self.update.is_some(),
             self.wording.is_some(),
             !self.context_requests.is_empty(),
+            self.action_request.is_some(),
             self.reply.is_some(),
             self.plan_polish.is_some(),
         ]
@@ -274,6 +288,7 @@ impl PrimeBrainDecision {
 pub fn build_decision_prompt(message: &str, summary: &StateSummary) -> String {
     let labels = intent_labels().join(", ");
     let tools = crate::prime_tools::read_only_tool_names();
+    let write_tools = crate::prime_write_tools::write_tool_names();
     let (tasks, agents) = board_catalog(summary);
     format!(
         "You are the single decision stage for Prime, the operator of a local Relux control \
@@ -294,6 +309,7 @@ the rest. The shape is:\n\
   \"update\": {{\"task_id\":\"<existing task id>\",\"title\":\"<optional>\",\"details\":\"<optional>\",\"priority\":<optional 1-9>,\"status\":\"<optional blocked|cancelled>\",\"assignee\":\"<optional existing agent id>\",\"confidence\":0.0-1.0}},\n\
   \"wording\": {{\"text\":\"<one clarifying question, or a short brainstorm reply>\",\"confidence\":0.0-1.0}},\n\
   \"tool_requests\": [{{\"tool\":\"<read-only tool>\",\"args\":{{...}}}}],\n\
+  \"action_request\": {{\"tool\":\"<one write tool>\",\"args\":{{...}}}},\n\
   \"reply\": {{\"text\":\"<a short, natural conversational answer>\",\"confidence\":0.0-1.0}},\n\
   \"plan_polish\": {{\"summary\":\"<clearer one-line plan summary>\",\"questions\":[\"<optional>\"],\"risks\":[\"<optional>\"]}},\n\
   \"confidence\": 0.0-1.0\n\
@@ -314,6 +330,10 @@ clarify it MUST be EXACTLY ONE concrete question ending in '?'. Never assert a c
 specific task's detail, a run, the full crew). Each entry MUST name a READ-ONLY tool from: \
 {tools}. These tools ONLY read; they change nothing. The kernel runs them and you answer grounded \
 in the results. Never request a tool that writes, deletes, or runs anything.\n\
+- Include \"action_request\" ONLY when the user EXPLICITLY instructs Prime to DO one thing. It \
+names exactly ONE write tool from: {write_tools}. Casual chat, musing, or a question is NEVER an \
+action_request. At most ONE per turn (do not batch). The kernel still validates every id and gates \
+plugin.install / permission.grant behind a human approval — you only request; you change nothing.\n\
 - Include \"reply\" with a short, natural conversational answer when the turn is plain \
 conversation (a greeting, a direct factual answer, an explanation) rather than a clarifying \
 question. Keep it brief; never claim you created, started, installed, granted, or changed \
@@ -501,6 +521,15 @@ pub fn parse_decision(raw: &str) -> Result<PrimeBrainDecision, String> {
         })
         .unwrap_or_default();
 
+    // The single WRITE-capable tool request: validated against the write allowlist and mapped to
+    // an EXISTING action's slot via `prime_write_tools::parse_write_tool_request`. A mutating /
+    // unknown / made-up name is DROPPED here (fail closed) and can never act; a batched multi-tool
+    // request is refused. `tool_call` is accepted as an alias.
+    let action_request = obj
+        .get("action_request")
+        .or_else(|| obj.get("tool_call"))
+        .and_then(crate::prime_write_tools::parse_write_tool_request);
+
     // Carry the free-form reply raw (re-serialized), validated later via `validated_reply`. A
     // brain may emit `reply` as a bare string ("Hello!") or as a `{text, confidence}` object;
     // normalize a bare string to `{text:...}` so the existing brainstorm validator sees the
@@ -545,6 +574,7 @@ pub fn parse_decision(raw: &str) -> Result<PrimeBrainDecision, String> {
         assign,
         update,
         context_requests,
+        action_request,
         wording,
         reply,
         plan_polish,
@@ -902,6 +932,60 @@ mod tests {
         let raw = format!(r#"{{"tool_requests":[{}]}}"#, many.join(","));
         let d = parse_decision(&raw).unwrap();
         assert!(d.context_requests.len() <= crate::prime_tools::MAX_TOOL_ROUNDS);
+    }
+
+    #[test]
+    fn carries_a_write_tool_request_validated_against_the_allowlist() {
+        // The unified envelope may request ONE write-capable tool; it is validated through the
+        // write allowlist + the existing per-action validator, and mapped to an intent + slot.
+        let d = parse_decision(
+            r#"{
+                "classification":{"intent":"task_creation","confidence":0.9},
+                "action_request":{"tool":"task.create","args":{"title":"Fix the login redirect"}}
+            }"#,
+        )
+        .unwrap();
+        let wt = d.action_request.as_ref().expect("a validated write tool");
+        assert_eq!(wt.tool, "task.create");
+        assert_eq!(wt.intent, PrimeIntent::TaskCreation);
+        assert!(!wt.gated);
+        // The section counts toward the usable total alongside the classification.
+        assert_eq!(d.section_count(), 2);
+    }
+
+    #[test]
+    fn a_mutating_or_unknown_write_tool_is_dropped_at_parse_time() {
+        // An off-allowlist (mutating-sounding / made-up) write tool name is DROPPED — never mapped
+        // to an action — so an envelope whose only mutating section is bogus has no usable section
+        // and the caller falls back to the deterministic path (the brain is strictly additive).
+        assert!(parse_decision(
+            r#"{"action_request":{"tool":"task.delete","args":{"task_id":"task_0001"}}}"#
+        )
+        .is_err());
+        assert!(parse_decision(r#"{"action_request":{"tool":"shell.run","args":{}}}"#).is_err());
+
+        // A valid read-only request alongside a bogus write tool keeps the read-only one; the
+        // write tool is simply absent.
+        let d = parse_decision(
+            r#"{
+                "tool_requests":[{"tool":"board_summary"}],
+                "action_request":{"tool":"task.delete","args":{}}
+            }"#,
+        )
+        .unwrap();
+        assert!(d.action_request.is_none());
+        assert_eq!(d.context_requests.len(), 1);
+    }
+
+    #[test]
+    fn tool_call_is_accepted_as_an_alias_and_gated_tools_are_marked() {
+        // `tool_call` is an alias for `action_request`.
+        let d =
+            parse_decision(r#"{"tool_call":{"tool":"permission.grant","args":{"subject_kind":"agent","subject_id":"researcher"}}}"#)
+                .unwrap();
+        let wt = d.action_request.unwrap();
+        assert_eq!(wt.intent, PrimeIntent::PermissionChange);
+        assert!(wt.gated, "permission.grant maps to an approval-gated Propose");
     }
 
     #[test]

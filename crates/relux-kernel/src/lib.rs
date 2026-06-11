@@ -35,6 +35,7 @@ pub mod prime_intent;
 pub mod prime_slots;
 pub mod prime_tools;
 pub mod prime_update_slots;
+pub mod prime_write_tools;
 pub mod runtime;
 pub mod state;
 pub mod store;
@@ -112,6 +113,10 @@ pub use prime_update_slots::{
     build_update_slots_prompt, deterministic_update, parse_settable_status, parse_update_slots,
     reconcile_update_slots, BrainUpdateSlots, DeterministicUpdate, ResolvedTaskUpdate,
     TaskUpdatePatch,
+};
+pub use prime_write_tools::{
+    classify_write_tool, parse_write_tool_request, reconcile_run_start, write_tool_names,
+    BrainRunStart, ParsedWriteTool, WriteTool, WriteToolSlot, WRITE_TOOLS, WRITE_TOOL_CONFIDENCE,
 };
 pub use runtime::{invoke_http_loopback, RuntimeClientError};
 pub use state::{

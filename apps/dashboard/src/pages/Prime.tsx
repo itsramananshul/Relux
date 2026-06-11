@@ -8,7 +8,7 @@ import {
   type ReluxPrimeSuggestion,
   type ReluxPrimeTurn,
 } from "../api";
-import { boundedContextReads, brainSourceLabel, contextReadDetail, contextReadsHadMiss, contextReadsUsedLabel, decisionSourceLabel, hasSteps, intentProvenance, pendingClarificationLabel, polishProvenance, proposalDisplaySummary, replyPolishLabel, slotProvenance, stepDisplayTitle, updateProvenance } from "../prime";
+import { boundedContextReads, brainSourceLabel, contextReadDetail, contextReadsHadMiss, contextReadsUsedLabel, decisionSourceLabel, hasSteps, intentProvenance, pendingClarificationLabel, polishProvenance, proposalDisplaySummary, replyPolishLabel, requestedToolLabel, slotProvenance, stepDisplayTitle, updateProvenance } from "../prime";
 import { workTaskHref, workRunHref } from "../routing";
 import { PrimeAutonomyPanel } from "../components/PrimeAutonomyPanel";
 import { OrchestrationPanel } from "../components/OrchestrationPanel";
@@ -351,6 +351,18 @@ function PrimeTurnCard({
             title="Intent, slots, and wording came from one validated brain decision"
           >
             🧠 {decisionSourceLabel(turn.decision_source)}
+          </span>
+        )}
+        {/* A small governed-tool chip when the brain REQUESTED a write-capable tool that
+            genuinely drove this turn (a real action / approval). The mutation still flowed
+            through the unchanged decide → execute / approval path; the brain wrote nothing. */}
+        {requestedToolLabel(turn.requested_tool) && (
+          <span
+            className="badge done"
+            style={{ fontSize: 9 }}
+            title="The brain requested this governed write tool; Prime routed it through the normal validation/approval path"
+          >
+            🛠 {requestedToolLabel(turn.requested_tool)}
           </span>
         )}
         <span className="muted" style={{ fontSize: 9, marginLeft: "auto" }} title="Which provider produced this reply">

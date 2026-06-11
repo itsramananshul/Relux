@@ -12,6 +12,7 @@ import {
   brainSourceLabel,
   replyPolishLabel,
   decisionSourceLabel,
+  requestedToolLabel,
   pendingClarificationLabel,
   updateChangeSummary,
   updateProvenance,
@@ -179,6 +180,15 @@ test("decisionSourceLabel names the one unified decision, and is null when absen
   // No unified decision (serial calls / no brain) -> nothing to attribute.
   assert.equal(decisionSourceLabel(undefined), null);
   assert.equal(decisionSourceLabel("   "), null);
+});
+
+test("requestedToolLabel names the governed write tool, and is null when absent", () => {
+  // The server attaches `requested_tool` only when a write tool genuinely drove the turn.
+  assert.equal(requestedToolLabel("task.update"), "requested tool: task.update");
+  assert.equal(requestedToolLabel("plugin.install"), "requested tool: plugin.install");
+  // No honored write tool (a vetoed request, or a normal turn) -> nothing to attribute.
+  assert.equal(requestedToolLabel(undefined), null);
+  assert.equal(requestedToolLabel("   "), null);
 });
 
 test("polishProvenance is null without a polish overlay and generic when the source is unrecorded", () => {

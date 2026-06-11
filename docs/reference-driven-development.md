@@ -1039,3 +1039,93 @@ requested no tools — or any failure / `Local` — the sidecar `ContextLoop` ru
 (no duplicate execution: the loop runs ONLY when the unified envelope requested nothing). The
 write-capable tool surface stays deferred; this slice only unifies the *read-before-you-speak*
 gather into the one decision call.
+
+---
+
+## Reference read — the first safe WRITE-capable Prime tool surface (this slice)
+
+The read-only tool loop above proved the governed-tool shape — the brain *requests* an allowlisted
+tool, the kernel validates the name fail-closed and executes it deterministically — but every tool
+there is a pure READ. The brain still could not ask Prime to *do* anything through a tool contract.
+This slice ships the first safe WRITE-capable surface, the audit's named "A WRITE-capable tool
+surface" rung (`docs/prime-processing-audit.md`): the brain may request a known mutating tool, but
+Relux converts it into an EXISTING Prime action/proposal and enforces every current
+validation/approval gate. The brain never writes state directly.
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/agent/conversation_loop.py` `run_conversation(...)` (L3106-3162) —
+  a SINGLE assistant message carries BOTH `content` and the structured `tool_calls`, and the chosen
+  tool name is **validated against `agent.valid_tool_names` BEFORE execution** (L3114-3162); an
+  off-list name is fed back for self-correction, never run. **Pattern: one response carries the
+  answer AND the structured action requests; each requested tool name is allowlist-validated before
+  it is used.** We mirror it: the unified `PrimeBrainDecision` now also carries a single
+  `action_request` alongside intent/slots/wording, and `prime_write_tools::classify_write_tool` is
+  the name-allowlist gate — a name not in `WRITE_TOOLS` is refused at parse time. We deliberately
+  differ in that the Relux brain executes NOTHING: a write tool is converted into a
+  `BrainIntentProposal` + a validated slot that flow through the UNCHANGED `decide` →
+  `prime_execute` / approval path.
+- `reference/hermes-agent-main/model_tools.py` `coerce_tool_args` (L535-616) — each tool argument is
+  coerced/validated against its registered schema before dispatch; a non-coercible value is dropped,
+  not fatal. Mirrored by REUSING the existing per-action slot validators on the write tool's `args`
+  (no weaker duplicate parsing): an args object that fails its validator fails the whole request
+  closed.
+
+### Paperclip (openclaw) — files read
+
+- `reference/openclaw-main/src/agents/tool-mutation.ts` `isMutatingToolCall(toolName, args)`
+  (L140-181) — a single FAIL-CLOSED classifier where an UNKNOWN/missing action defaults to
+  *mutating*. **Pattern: a single fail-closed gate where the unsafe default wins, and minting work
+  is never inferred from chat.** `classify_write_tool` is the inverse-polarity twin: the write
+  allowlist is explicit and tiny, and a write tool is honored ONLY when the deterministic intent gate
+  (`reconcile_intent`) agrees the user asked for action — so a mutating tool the brain requests on
+  guarded chat is vetoed (a sensitive intent + guarded chat is always kept deterministic).
+- `reference/openclaw-main/src/agents/tool-policy.ts`
+  `applyOwnerOnlyToolPolicy` / `wrapOwnerOnlyToolExecution` — work / control-plane capabilities
+  (spawn, gateway) are ONE explicit, GATED capability, replaced with a hard refusal otherwise.
+  **Pattern: a mutating control-plane capability stays explicitly gated, never auto-run.** Mirrored:
+  `plugin.install` / `permission.grant` map to the SAME approval-gated `Propose` the deterministic
+  path produces — `sharpen_admin_action` reshapes only the *subject the human reviews*; the kernel
+  logs an approval and executes nothing.
+- `reference/openclaw-main/src/agents/tools/update-plan-tool.ts` `readPlanSteps` (L39-74),
+  `src/agents/tools/common.ts` `readStringParam(required)` / `ToolInputError` (L57-122),
+  `src/agents/tools/sessions-spawn-tool.ts` `UNSUPPORTED_SESSIONS_SPAWN_PARAM_KEYS` (rejected before
+  any param is read) — validate a structured payload field-by-field against an explicit
+  schema/allowlist, require the mandatory string, reject unsupported keys. **Pattern: validate the
+  mutating payload hard; reject junk.** Adopted by REUSING the EXISTING validators
+  (`parse_task_slots`, `parse_update_slots`, `parse_assign_slots`, `parse_agent_slots`,
+  `parse_plugin_ref`/`parse_permission_slots`) on the tool's args — so a write tool inherits the same
+  allowlist, sanitization, clamping, and existing-target validation, plus the `task.start` `task_id`
+  required-string read.
+- `reference/openclaw-main/src/agents/cli-output.ts` `parseCliOutput` +
+  `src/shared/balanced-json.ts` `extractBalancedJsonPrefix` — lift the parsed object out of a noisy
+  CLI reply, never the raw stdout. The `action_request` rides inside the same envelope, lifted by
+  `parse_adapter_result` FIRST on the CLI path (`parse_cli_decision`), so the raw envelope never
+  reaches the request validation.
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| Hermes: **one response carries the answer AND the structured action**, each allowlist-validated | `prime_decision::PrimeBrainDecision` gains `action_request: Option<ParsedWriteTool>`, parsed from a single `action_request` (`tool_call` alias) object in the SAME envelope; `prime_write_tools::parse_write_tool_request` validates the name via `classify_write_tool` and the args via the existing per-action validator. |
+| openclaw: **single fail-closed gate, unsafe default wins** (`isMutatingToolCall`) | `classify_write_tool` admits ONLY a name in `WRITE_TOOLS`; an off-list / mutating-sounding name (`task.delete`, `shell.run`) is dropped at parse time. A write tool acts ONLY when `reconcile_intent` (the unchanged fail-closed gate) accepts its sensitive intent — guarded chat keeps the deterministic non-work intent. |
+| openclaw: **a mutating control-plane capability stays GATED** (`tool-policy`) | `plugin.install` / `permission.grant` map to the SAME approval-gated `Propose`; the brain only sharpens the subject the human reviews (`sharpen_admin_action`), and the kernel changes nothing. |
+| openclaw/Hermes: **validate the mutating payload hard; no weaker duplicate logic** | each write tool's args are validated by REUSING the existing slot validator; the result feeds the UNCHANGED `prime_turn_with_brain` chokepoint, which still reconciles every id against the live state (an unknown task/agent fails closed) and enforces the terminal-state / readiness guards. |
+| openclaw: **balanced-JSON extraction, no raw-envelope leak** | the CLI path lifts the reply via `parse_adapter_result` FIRST; only the validated, bounded provenance (`requested_tool`) ever ships. |
+| openclaw: **one explicit, gated capability — never batch** | at most ONE `action_request` per turn; a batched multi-tool request is refused (the turn falls back to the deterministic path, which clarifies), not batch-executed. |
+
+**What we deliberately do differently:** unlike Hermes (where the model runs the mutating tool), the
+Relux brain runs NOTHING — a write tool is *desugared* into the EXISTING intent + slot mechanism, so
+every durable change still flows through `decide` → `prime_execute` (safe `Act`) or a human approval
+(risky `Propose`). The named write tool adds three things over a bare intent+slots proposal: an
+explicit, governed allowlist distinct from the read-only set; a one-mutating-tool-per-turn cap; and a
+`requested tool: <name>` provenance chip. The safety property "casual chat can never trigger a
+mutation" is enforced by the SAME `reconcile_intent` gate the brain-mediated intent already uses (a
+write tool's intent is `is_sensitive_intent`, so guarded chat vetoes it), and the `task.create`
+sharpen-only invariant holds — a write tool sharpens a create the deterministic path already
+produced; only `task.update` / `task.assign` / `task.start` PROMOTE an under-specified clarify, and
+only because each is a SAFE, fully-id-validated action (the run-start promotion mirrors the existing
+assign/update promotions, honoring only a task that EXISTS and is READY). The mutating-tool surface
+is intentionally tiny (`task.create`/`task.update`/`task.assign`/`task.start`/`agent.create` safe;
+`plugin.install`/`permission.grant` approval-only); a multi-round write loop, after-action narration,
+and richer tools stay deferred.

@@ -139,6 +139,17 @@ export function decisionSourceLabel(source: string | undefined): string | null {
   return trimmed ? `one brain decision · ${trimmed}` : null;
 }
 
+// The label for the small governed WRITE-tool provenance chip. The server attaches
+// `requested_tool` ONLY when the brain requested a write-capable tool that genuinely drove
+// this turn (the turn is actionful and its intent matches the tool), so the chip honestly
+// names the governed tool behind a real action/approval — a write tool the fail-closed gate
+// vetoed attributes nothing. Returns null otherwise. Provenance only: the mutation still
+// flowed through the unchanged decide → execute / approval path; the brain wrote nothing.
+export function requestedToolLabel(tool: string | undefined): string | null {
+  const trimmed = tool?.trim();
+  return trimmed ? `requested tool: ${trimmed}` : null;
+}
+
 // Compact provenance for the READ-ONLY context tools Prime consulted before answering
 // this turn (the governed read-only tool loop). Returns a short "used: get_task,
 // list_agents" label naming the DISTINCT tools in look order, bounded so a long loop

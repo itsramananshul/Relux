@@ -1109,13 +1109,71 @@ against the live board, mutating request dropped, no mutation); and the server s
 `cli_decision_carries_read_only_tool_requests_through_the_no_leak_seam`. No test calls a real
 provider; no wire/dashboard change was needed.
 
+## Applied change (the first safe WRITE-capable Prime tool surface)
+
+Every brain stage and the read-only tool loop above are *propose-only* or *read-only*: the brain
+could classify, sharpen slots, and inspect live state, but it could not ask Prime to *do* anything
+through a governed tool contract. That is the audit's named next rung ("A WRITE-capable tool
+surface"). Per master plan §10.1 (Intent Layer), §10.2 (Action Layer), §17.1, and following the
+reference read recorded in `reference-driven-development.md` (Hermes `run_conversation`
+one-response-carries-the-action + name-allowlist validation; openclaw `tool-mutation`
+fail-closed-unsafe-default, `tool-policy` gated-capability, `update-plan-tool`/`common.ts`/
+`sessions-spawn-tool` validate-the-payload-hard, the no-leak CLI-output seam), a configured brain may
+now *request* a known mutating tool that Relux converts into an EXISTING action and routes through
+every current validation/approval gate. The brain writes nothing directly.
+
+- **New module `relux-kernel/src/prime_write_tools.rs`.** `WRITE_TOOLS` is the explicit, tiny
+  allowlist: `task.create` → CreateTask, `task.update` → UpdateTask, `task.assign` → AssignTask,
+  `task.start` → StartRun, `agent.create` → CreateAgent (all safe `Act`s), plus `plugin.install` →
+  InstallPlugin and `permission.grant` → GrantPermission (both APPROVAL-GATED `Propose`s).
+  `classify_write_tool` is the FAIL-CLOSED name gate (anything off the list — `task.delete`,
+  `shell.run` — is refused). `parse_write_tool_request` maps the tool to its existing intent and
+  validates the `args` by REUSING the existing per-action validator (`parse_task_slots`,
+  `parse_update_slots`, `parse_assign_slots`, `parse_agent_slots`, `parse_plugin_ref`/
+  `parse_permission_slots`; `task.start` reads a required `task_id`) — no weaker duplicate parsing;
+  an unsupported field / missing required field fails the whole request closed. A committed
+  confidence is stamped so the slot validators honor an explicit tool request. `reconcile_run_start`
+  validates `task.start` against the live ready queue (EXISTS and is READY).
+- **Carried on the unified decision.** `PrimeBrainDecision` gains `action_request: Option<…>` (parsed
+  from a single `action_request` / `tool_call` object); a mutating/unknown name is dropped at parse
+  time, a batched multi-tool request is refused (at most ONE per turn). The server desugars it into a
+  synthesized `BrainIntentProposal` + the matching slot in the `BrainSlotProposals` bundle, fed to
+  the UNCHANGED `prime_turn_with_brain` chokepoint; a new `run` bundle field + a `RunStart` promotion
+  arm (mirroring the existing assign/update promotions) lets `task.start` start a named ready task.
+- **Safety invariants (binding).** The brain runs NOTHING — a write tool is *desugared* into the
+  existing intent+slot mechanism. The fail-closed `reconcile_intent` gate still decides: a write
+  tool's intent is sensitive, so **casual chat/ideation can never trigger it** (guarded chat keeps
+  the deterministic non-work intent). Every id is validated against the live state (an unknown
+  task/agent fails closed); the terminal-state guard (update) and readiness guard (start) hold;
+  `plugin.install` / `permission.grant` stay behind a human approval (the install/grant is never
+  executed — pinned by unchanged plugin-count / permission-set assertions). Every durable change
+  still flows through `decide` → `prime_execute` (safe `Act`) or approval (`Propose`).
+- **UI.** A small `🛠 requested tool: <name>` provenance chip (`PrimeResponse.requested_tool` + the
+  pure `requestedToolLabel` helper), present ONLY when a write tool genuinely drove an actionful
+  turn (the turn is actionful AND its intent matches the tool) — a vetoed request attributes nothing,
+  keeping the chip honest. No panel.
+
+Pinned by the `prime_write_tools` unit tests (fail-closed classify, each tool → intent/slot,
+unknown-name refused, unsupported-args fail-closed, batched-request refused, run-start readiness,
+confident intent proposal); the `prime_decision` unit tests (`carries_a_write_tool_request_…`,
+`a_mutating_or_unknown_write_tool_is_dropped_at_parse_time`,
+`tool_call_is_accepted_as_an_alias_and_gated_tools_are_marked`); the kernel integration tests
+(`write_tool_task_{create,update,assign,start}_maps_to_the_existing_*_path`,
+`write_tool_task_start_rejects_an_unknown_or_unready_task`,
+`write_tool_agent_create_maps_to_the_existing_agent_path`,
+`write_tool_{plugin_install,permission_grant}_stays_approval_gated` + the unchanged-count/permission
+safety assertions, `casual_chat_never_triggers_a_write_tool`,
+`write_tool_assign_fails_closed_on_an_unknown_task`); the server seam test
+(`cli_decision_carries_a_write_tool_request_through_the_no_leak_seam`); and the dashboard
+`requestedToolLabel` test. No test calls a real provider; the dashboard bundle was rebuilt.
+
 ## Current Prime brain stack
 
 The end-to-end shape of one Prime turn, with the brain strictly additive and the
 deterministic kernel always the authority. **A configured brain now answers the structured
 turn in ONE unified decision call** (`prime_decision`: intent + applicable slots + optional
-wording), with the per-section specialized calls below as the fallback when that envelope is
-unavailable:
+wording + read-only tool requests + an optional single governed write tool), with the
+per-section specialized calls below as the fallback when that envelope is unavailable:
 
 0. **Clarification context** — BEFORE classifying, `prime_turn_with_brain` checks for a
    bounded pending clarification from the prior turn (`prime_clarify_memory::resolve_pending`,
@@ -1174,6 +1232,18 @@ unavailable:
    `MAX_TOOL_ROUNDS`, stop-on-repeat) — so there is never duplicate execution. Either way the reads
    change nothing and only GROUND the reply (folded into `grounded_facts`, surfaced as
    `context_reads` provenance). `Local` / an actionful turn gathers nothing.
+3c. **Governed WRITE tool** (an explicitly-commanded turn only) — the ONE unified decision may carry
+   a single `action_request` naming an allowlisted WRITE tool (`prime_write_tools`): `task.create` /
+   `task.update` / `task.assign` / `task.start` / `agent.create` (safe `Act`s) or `plugin.install` /
+   `permission.grant` (approval-gated `Propose`s). The name is fail-closed validated
+   (`classify_write_tool`); the args are validated by REUSING the existing per-action slot validator;
+   the tool is *desugared* into a synthesized intent proposal + the matching slot fed to the
+   UNCHANGED `prime_turn_with_brain` chokepoint (step 2/3). So the fail-closed intent gate still
+   vetoes a mutating tool on guarded chat, every id is validated against the live state, the
+   terminal-state/readiness guards hold, and a risky tool stays behind a human approval — the brain
+   requests; `decide` → `prime_execute` / approval is still the SOLE path that changes durable state.
+   At most ONE write tool per turn; the chip `🛠 requested tool: <name>` appears only when it
+   genuinely drove an actionful turn. `Local` / a vetoed request changes nothing.
 4. **UI response** — the reply text may be brain-shaped on a conversational turn. A
    **clarify / brainstorm / single-step plan** turn goes through the VALIDATED wording
    path (`prime_clarify`: one schema-checked question / short summary, action claims
@@ -1204,11 +1274,18 @@ before answering. The obvious next rungs build on it:
   or one approval is the natural completion, each a pure projection + an allowlist entry. The
   raw provider `usage`/`cost` on a run stays deliberately unexposed (redaction), so any richer run
   read must keep that boundary.
-- **A WRITE-capable tool surface** — the read-only loop is the proving ground for the harder slice:
-  letting the brain *request* a mutating tool that still flows through the existing fail-closed
-  `decide` → `prime_execute` (safe `Act`) / human-approval (`Propose`) path, with `isMutatingToolCall`'s
-  unknown-⇒-mutating default as the gate. This must NOT bypass the action-free wall — it is a real
-  design slice, not a flag flip, and stays deferred until the read-only loop is proven in use.
+- **~~A WRITE-capable tool surface~~ (DONE)** — the unified decision now carries a single governed
+  `action_request` naming an allowlisted WRITE tool (`prime_write_tools`: `task.create`/`task.update`/
+  `task.assign`/`task.start`/`agent.create` safe; `plugin.install`/`permission.grant` approval-only),
+  desugared into the EXISTING intent + slot mechanism so it flows through the unchanged fail-closed
+  `decide` → `prime_execute` (safe `Act`) / human-approval (`Propose`) path. `classify_write_tool` is
+  the fail-closed gate (unknown ⇒ refused), and the SAME `reconcile_intent` gate keeps a mutating
+  tool off guarded chat. The next rungs build on it: a **multi-round write loop** (request → observe
+  → act INSIDE the one envelope flow, which needs the decision call itself to loop), an **after-action
+  narration** (a brain reply on an actionful turn — deferred since the brain composes its reply
+  before the kernel executes, so it needs a post-execution re-shaping pass that preserves the
+  action-free wall), and **richer write tools** (e.g. `run.retry`, an `orchestration` tool) as each
+  proves out.
 - **~~Read context on the unified decision~~ (DONE)** — the unified `PrimeBrainDecision` now carries
   the brain's read-only `tool_requests` alongside intent+slots+wording; Relux executes the validated
   reads deterministically (`execute_requested_reads`, no second brain loop, no duplicate execution)
