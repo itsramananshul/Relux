@@ -827,6 +827,69 @@ integration tests (`unified_decision_creates_a_task_with_title_and_details_in_on
 valid envelope, plain JSON, error envelope/prose, unknown-top-level fail-closed); and the
 dashboard `decisionSourceLabel` test. No test calls a real provider.
 
+## Applied change (folding the conversational reply + plan-polish into the unified envelope)
+
+The unified envelope (above) answered intent + slots + clarify wording in one call, but TWO brain
+calls still ran separately AFTER it: the free-form conversational reply (`shape_reply` /
+`run_cli_brain`) for a non-clarify chat turn, and the advisory multi-step plan-card polish
+(`polish_proposal`). So a greeting still cost a decision call plus a reply call, and a multi-step
+plan turn a decision call plus a reply call plus a polish call — slower and less coherent than how
+Hermes/Codex answer (ONE response carries the natural text AND the structured actions). Per master
+plan §10.1/§10.2/§11.1/§17.1 and following the reference read recorded in
+`reference-driven-development.md` (Hermes `run_conversation` one-message-carries-content-and-
+tool_calls + the exhaustion fallback; openclaw `update-plan-tool` schema validation, `cli-output`/
+`balanced-json` parse-only-the-object, `sessions-spawn-tool` unsupported-key rejection), this slice
+folds both — where safe — into the one decision envelope, with the deterministic/policy authority
+unchanged.
+
+- **Two new optional sections on `PrimeBrainDecision`** (`relux-kernel/src/prime_decision.rs`):
+  `reply` (the free-form conversational answer; `assistant_message` accepted as an alias) and
+  `plan_polish` (the advisory plan-card overlay). Both are added to the top-level allowlist; any
+  OTHER unknown top-level key still fails the WHOLE envelope closed. `build_decision_prompt` now
+  describes both sections and their safety rules (reply = a short natural answer for a
+  conversational turn, never an action claim; plan_polish = wording only, never the step
+  count/order/owners).
+- **Carried raw, validated LATER** (the same shape `wording` already uses, because eligibility /
+  grounding is known only after the kernel produces the turn):
+  - `validated_reply(deterministic_text)` reuses the EXACT brainstorm chokepoint a clarify reply
+    uses (`prime_clarify::parse_clarify` with `ClarifyKind::Brainstorm` → `reconcile_clarify`):
+    control chars stripped, length clamped (600), an action-claim (`ACTION_CLAIM_MARKERS`) rejected
+    wholesale, low-confidence / pure-echo dropped. A bare-string `reply` is normalized to
+    `{text, confidence}` (stamped just above the honor floor so a deliberately-simple committed
+    reply is honored).
+  - `validated_polish(proposal, label)` reuses the EXACT `validate_polish` chokepoint (via
+    `ai::polish_from_cli_text`): a step title is honored ONLY on an exact authoritative-index
+    match (any merge/split/reorder/add/rename drops the titles entirely), summary/questions/risks
+    are trimmed and bounded, and `label` stamps provenance.
+- **Wired in `run_prime` (server.rs), unified-first with the dedicated calls as the fallback.**
+  A non-actionful, non-clarify conversational turn PREFERS `decision.validated_reply(&turn.reply)`
+  (no extra call); on a miss it falls back to the dedicated `run_cli_brain`/`shape_reply`. A
+  non-actionful plan turn PREFERS `decision.validated_polish(&proposal, …)`; on a miss it falls
+  back to the dedicated `polish_proposal`/`polish_proposal_via_cli`. So behavior is byte-for-byte
+  the prior path whenever the fold is unavailable (`Local` always takes the fallback, exactly as
+  before). The new `unified_reply_outcome` helper stamps the mode/model provenance exactly as the
+  clarify-polish path does.
+- **Flows now on the unified call:** intent + task/agent/plugin/permission/assign/update slots +
+  clarify/brainstorm wording + **the free-form conversational reply** + **the advisory plan-card
+  polish**, all in one round-trip. Nothing in the intent/slots/wording decision is left for a
+  second brain call on the common chat / plan-preview turns.
+- **Safety invariants (binding).** The fold changes only HOW the brain is asked (one call) and HOW
+  its reply is parsed (one allowlisted object), NOT authority. The action-free wall is intact: the
+  reply is applied ONLY on a NON-actionful turn, so the brain still never narrates a real state
+  change — an actionful turn keeps the grounded deterministic reply. We deliberately do NOT
+  implement the permitted "after-action explanation" variant: the brain composes its reply before
+  the kernel executes, so it cannot honestly narrate the actual result, and folding it would breach
+  the wall — it stays a deferred future slice, not a faked capability. The plan-polish runs through
+  the identical `validate_polish` index-match invariant, so it can never change what "Create these
+  tasks" creates. Any failure leaves the dedicated specialized call, then the deterministic outcome.
+
+Pinned by the `prime_decision` unit tests (`carries_a_free_form_reply_and_validates_it_via_the_
+brainstorm_chokepoint`, `a_reply_that_claims_a_completed_action_is_rejected`,
+`carries_plan_polish_and_validates_it_against_the_authoritative_proposal`,
+`reply_and_plan_polish_count_toward_the_section_total`) and the server seam test
+(`cli_decision_carries_reply_and_plan_polish_through_the_no_leak_seam`). No test calls a real
+provider.
+
 ## Current Prime brain stack
 
 The end-to-end shape of one Prime turn, with the brain strictly additive and the
@@ -882,8 +945,12 @@ unavailable:
 4. **UI response** — the reply text may be brain-shaped on a conversational turn. A
    **clarify / brainstorm / single-step plan** turn goes through the VALIDATED wording
    path (`prime_clarify`: one schema-checked question / short summary, action claims
-   rejected); other conversational turns go through the free-form `shape_reply` / CLI
-   brain. A plan card may carry an advisory polish overlay, a sharpened create carries a
+   rejected); other non-actionful conversational turns PREFER the `reply` the SAME unified
+   decision already carried (`validated_reply`, the brainstorm chokepoint), falling back to
+   the free-form `shape_reply` / CLI brain only when the envelope omitted it. A plan card may
+   carry an advisory polish overlay — likewise PREFERRED from the unified decision's
+   `plan_polish` (`validated_polish`, the same `validate_polish` index-match chokepoint) with
+   the dedicated `polish_proposal` call as the fallback. A sharpened create carries a
    `slots` card, a sharpened agent an `agent_slots` card (incl. a seeded **persona**),
    and a sharpened risky `Propose` an advisory `admin_slots` card. Every brain
    contribution is labeled (intent → `brain-classified`; re-worded reply → `🧠
@@ -912,3 +979,9 @@ are narrower:
 - **A persona for the manual Crew create form** — today persona is brain-seeded only; a
   small optional persona input on the Crew form (validated/clamped the same way) would let an
   operator set one without the brain.
+- **The free-form reply + plan-polish are now folded into the unified decision** (one call on the
+  common chat / plan-preview turns), so the only remaining separate brain call is the dedicated
+  fallback when the envelope omits a section. The deliberately-deferred piece is a brain reply on
+  an **actionful** turn (a short after-action explanation): the brain composes its reply before the
+  kernel executes, so an honest after-action narration needs a post-execution re-shaping pass — a
+  future slice that must preserve the action-free wall (no claim of work that did not happen).

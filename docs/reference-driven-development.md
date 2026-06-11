@@ -698,3 +698,73 @@ applies it — exactly as before, now in one round-trip. The remaining brain cal
 conversational reply via `shape_reply`/`run_cli_brain` for non-clarify chat, and the advisory
 multi-step plan-card polish) stay specialized: they are not part of the intent+slots+wording
 decision, and folding them in is a future slice.
+
+---
+
+## Reference read — folding the conversational reply + plan-polish into the unified envelope (this slice)
+
+The unified envelope above still left TWO brain calls outside it: the free-form conversational
+reply (`shape_reply` / `run_cli_brain`) for a non-clarify chat turn, and the advisory multi-step
+plan-card polish (`polish_proposal`). So a plain greeting could still cost a decision call **plus**
+a reply call, and a multi-step plan turn a decision call **plus** a reply call **plus** a polish
+call — slower and less coherent than how Hermes / Codex answer (ONE response carries the natural
+text AND the structured actions). This slice folds both, where safe, into the one decision
+envelope, preserving the deterministic/policy authority unchanged.
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/agent/conversation_loop.py` `run_conversation(...)` — a SINGLE
+  assistant message carries BOTH the natural `content` (the reply the user reads) AND the
+  structured `tool_calls` in one turn (`_m.get("role") == "assistant" and _m.get("tool_calls")`,
+  L630; `final_response` is set from that same message's content, L528/L967). **Pattern: the one
+  model response carries the conversational answer alongside the structured actions — they are not
+  two separate calls.** We mirror it: the unified decision now also carries the optional `reply`
+  (the conversational answer) next to the intent/slots/wording, so a chat turn is answered in the
+  SAME envelope. We still deliberately differ in that the Relux brain executes NOTHING.
+- `reference/hermes-agent-main/agent/conversation_loop.py` (the truncation/exhaustion fallback,
+  ~L1370-1425) — when the model returns no usable tool_calls / is exhausted, reuse the last real
+  content rather than blanking. **Pattern: a deterministic fallback always exists.** Mirrored:
+  when the envelope omits `reply`/`plan_polish` or they fail validation, the prior dedicated
+  `shape_reply`/`run_cli_brain` and `polish_proposal` calls run as the fallback, byte-for-byte.
+
+### Paperclip (openclaw) — files read
+
+- `reference/openclaw-main/src/agents/tools/update-plan-tool.ts` `readPlanSteps` (L39-74) — a
+  structured UPDATE payload is validated field-by-field against an explicit schema + the
+  `PLAN_STEP_STATUSES` allowlist, and clamped. **Pattern: validate a structured payload against a
+  fixed schema before honoring it.** The folded `plan_polish` reuses the EXACT existing
+  `validate_polish` chokepoint (via `polish_from_cli_text`): a step title is honored ONLY on an
+  exact authoritative-index match, so the overlay can change wording but never the step count,
+  order, or agent ids.
+- `reference/openclaw-main/src/agents/cli-output.ts` `parseCliOutput` +
+  `reference/openclaw-main/src/shared/balanced-json.ts` `extractBalancedJsonPrefix` (L21-69) —
+  lift the parsed object out of a noisy CLI reply and surface only it, never the raw stdout. The
+  folded reply/polish ride inside the same envelope, lifted by `parse_adapter_result` FIRST on the
+  CLI path (`parse_cli_decision`), so the raw `--output-format json` envelope never reaches the
+  validators or the chat bubble.
+- `reference/openclaw-main/src/agents/tools/sessions-spawn-tool.ts`
+  (`UNSUPPORTED_SESSIONS_SPAWN_PARAM_KEYS`, rejected before any param is read) — reject unsupported
+  keys. `reply`/`assistant_message`/`plan_polish` are added to the envelope's top-level allowlist;
+  any OTHER unknown key still fails the WHOLE envelope closed exactly as before.
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| Hermes: **one response carries the conversational answer AND the structured actions** | `prime_decision::PrimeBrainDecision` gains an optional `reply` (free-form conversational answer) and `plan_polish` (advisory plan-card overlay), carried alongside intent/slots/wording in ONE envelope; `build_decision_prompt` describes both sections and their safety rules. |
+| openclaw: **surface only the parsed object** | both new sections are carried RAW (re-serialized) and validated LATER — `reply` only after the kernel proves the turn is a non-actionful, non-clarify conversational turn; `plan_polish` only against the post-turn AUTHORITATIVE proposal — because eligibility/grounding is known only after the kernel produces the turn (the same late-validation shape `wording` already uses). |
+| Hermes/openclaw: **validate against a fixed schema/allowlist; no weaker duplicate logic** | `validated_reply` reuses the SAME brainstorm chokepoint a clarify reply uses (`prime_clarify::parse_clarify` with `ClarifyKind::Brainstorm` → `reconcile_clarify`): control chars stripped, length clamped (600), an action-claim (`ACTION_CLAIM_MARKERS`) rejected wholesale, low-confidence / pure-echo dropped. `validated_polish` reuses the SAME `validate_polish` chokepoint (`ai::polish_from_cli_text`): titles only on exact index match; summary/questions/risks trimmed + bounded. |
+| openclaw: **reject unsupported keys (`additionalProperties:false`)** | `reply`/`assistant_message`/`plan_polish` join the top-level allowlist; any other unknown key still fails the whole envelope closed. A bare-string `reply` is normalized to `{text, confidence}` (stamped just above the honor floor so a deliberately-simple committed reply is honored). |
+| Hermes/openclaw: **deterministic fallback always exists** | `run_prime` PREFERS the envelope's `reply`/`plan_polish` (no extra call); on any miss it falls back to the dedicated `shape_reply`/`run_cli_brain` and `polish_proposal`/`polish_proposal_via_cli`, so behavior is byte-for-byte the prior path whenever the fold is unavailable. |
+
+**What we deliberately do differently:** the action-free wall is unchanged — `validated_reply` is
+applied ONLY on a NON-actionful, non-clarify conversational turn (the actionful-turn deterministic
+reply still never reaches the brain), so the brain can never narrate (or overclaim) a real state
+change. We do **not** implement the "after-action explanation" variant the prompt permits: the
+brain composes its reply *before* the kernel executes the turn, so it cannot honestly narrate the
+actual result, and letting it would breach the long-standing action-free wall — it stays a
+deferred future slice rather than a faked capability. `plan_polish` is advisory/presentation only
+and runs through the identical `validate_polish` index-match invariant, so it can never change what
+"Create these tasks" creates. Both are strictly additive: the envelope changes only HOW the brain
+is asked (one call) and HOW its reply is parsed (one allowlisted object) — never authority. The
+dedicated specialized calls remain as the fallback; `Local` (no brain) is byte-for-byte unchanged.

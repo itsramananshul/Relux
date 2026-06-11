@@ -1915,16 +1915,33 @@ async fn run_prime(
             precomputed,
         )
         .await
-    } else if !relux_kernel::is_actionful(&turn)
-        && matches!(
-            brain,
-            relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli
-        ) {
-        (run_cli_brain(brain, cli_status.clone(), &message, &turn).await, None)
+    } else if !relux_kernel::is_actionful(&turn) {
+        // A non-actionful, non-clarify conversational turn (a greeting / direct answer /
+        // explanation / plan prose). PREFER the free-form reply the UNIFIED decision already
+        // carried — no extra brain call — validated through the SAME block-sanitize +
+        // action-claim chokepoint a brainstorm reply uses (`validated_reply`). On any miss (the
+        // envelope omitted a reply, it failed validation, or no unified decision ran) fall back
+        // to the dedicated free-form shaper, so behavior is byte-for-byte the prior path. The
+        // action-free wall is intact: this only runs on a non-actionful turn.
+        let precomputed_reply = decision.as_ref().and_then(|d| d.validated_reply(&turn.reply));
+        match precomputed_reply {
+            Some(text) => (unified_reply_outcome(brain, &ai_config, text), None),
+            None if matches!(
+                brain,
+                relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli
+            ) =>
+            {
+                (run_cli_brain(brain, cli_status.clone(), &message, &turn).await, None)
+            }
+            None => {
+                // Local / OpenRouter go through shape_reply, which only augments via OpenRouter
+                // when that brain is selected and a key is configured.
+                (relux_kernel::shape_reply(&ai_config, &message, &turn).await, None)
+            }
+        }
     } else {
-        // Local / OpenRouter (and actionful turns) go through shape_reply, which
-        // keeps actionful turns deterministic and only augments via OpenRouter
-        // when that brain is selected and a key is configured.
+        // Actionful turns go through shape_reply, which keeps them deterministic so the brain
+        // never narrates (and possibly overclaims) a real state change.
         (relux_kernel::shape_reply(&ai_config, &message, &turn).await, None)
     };
 
@@ -1945,11 +1962,27 @@ async fn run_prime(
     // §11.1, §17.1).
     if !relux_kernel::is_actionful(&final_turn) {
         if let Some(proposal) = final_turn.proposal.clone() {
-            let polish = match brain {
-                relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli => {
-                    polish_proposal_via_cli(brain, cli_status.clone(), &proposal).await
-                }
-                _ => relux_kernel::polish_proposal(&ai_config, &proposal).await,
+            // PREFER the polish the UNIFIED decision already carried — no extra brain call —
+            // validated against the AUTHORITATIVE proposal through the SAME `validate_polish`
+            // chokepoint (step count / order / agent ids immutable; a step title applies only on
+            // an exact index match). Fall back to a dedicated polish call when the unified
+            // envelope omitted it or it yielded nothing usable, so behavior is byte-for-byte the
+            // prior path. Single-step proposals carry nothing to refine and skip for every brain.
+            let precomputed = if relux_kernel::proposal_wants_polish(&proposal) {
+                decision.as_ref().and_then(|d| {
+                    d.validated_polish(&proposal, &slot_source_label(brain, &ai_config))
+                })
+            } else {
+                None
+            };
+            let polish = match precomputed {
+                Some(p) => Some(p),
+                None => match brain {
+                    relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli => {
+                        polish_proposal_via_cli(brain, cli_status.clone(), &proposal).await
+                    }
+                    _ => relux_kernel::polish_proposal(&ai_config, &proposal).await,
+                },
             };
             if let Some(polish) = polish {
                 if let Some(p) = final_turn.proposal.as_mut() {
@@ -2598,6 +2631,31 @@ fn slot_source_label(brain: relux_kernel::PrimeBrain, cfg: &relux_kernel::AiConf
         relux_kernel::PrimeBrain::ClaudeCli => "Claude CLI".to_string(),
         relux_kernel::PrimeBrain::CodexCli => "Codex CLI".to_string(),
         relux_kernel::PrimeBrain::Local => "AI brain".to_string(),
+    }
+}
+
+/// Build the [`AiOutcome`] for a conversational reply the UNIFIED decision already produced,
+/// so a plain chat turn needs no extra brain call. The reply was validated through the same
+/// block-sanitize + action-claim chokepoint a brainstorm reply uses
+/// ([`relux_kernel::PrimeBrainDecision::validated_reply`]); here we only stamp the mode + model
+/// provenance exactly as the clarify-polish path does. `Local` never produces a unified
+/// decision, so it never reaches here.
+fn unified_reply_outcome(
+    brain: relux_kernel::PrimeBrain,
+    cfg: &relux_kernel::AiConfig,
+    reply: String,
+) -> AiOutcome {
+    let mode = match brain {
+        relux_kernel::PrimeBrain::Openrouter => AiMode::Openrouter,
+        relux_kernel::PrimeBrain::ClaudeCli => AiMode::ClaudeCli,
+        relux_kernel::PrimeBrain::CodexCli => AiMode::CodexCli,
+        relux_kernel::PrimeBrain::Local => AiMode::Deterministic,
+    };
+    AiOutcome {
+        mode,
+        reply,
+        model: Some(slot_source_label(brain, cfg)),
+        note: None,
     }
 }
 
@@ -6284,6 +6342,24 @@ mod tests {
             parse_cli_decision(prose, relux_core::AdapterKind::ClaudeCli).is_none(),
             "prose with no JSON object must not produce a decision"
         );
+    }
+
+    #[test]
+    fn cli_decision_carries_reply_and_plan_polish_through_the_no_leak_seam() {
+        // A conversational + plan turn answered in ONE envelope: a free-form reply and an
+        // advisory plan-polish ride alongside the intent, all lifted out of the CLI result
+        // envelope with no scaffolding leak. The reply/polish are carried raw here; the kernel
+        // validates each later against the turn (validated_reply / validated_polish).
+        let inner = r#"{\"classification\":{\"intent\":\"greeting\",\"confidence\":0.9},\"reply\":{\"text\":\"Hey - what can I help with?\",\"confidence\":0.9},\"plan_polish\":{\"summary\":\"Two phases.\"}}"#;
+        let stdout = format!(r#"{{"type":"result","is_error":false,"result":"{inner}","session_id":"abc"}}"#);
+        let d = parse_cli_decision(&stdout, relux_core::AdapterKind::ClaudeCli)
+            .expect("a reply + plan_polish envelope validates");
+        assert!(d.reply.is_some());
+        assert!(d.plan_polish.is_some());
+        // The validated reply is honored and carries no envelope scaffolding.
+        let reply = d.validated_reply("Hi.").expect("a confident, distinct reply is honored");
+        assert_eq!(reply, "Hey - what can I help with?");
+        assert!(!reply.contains("session_id") && !reply.contains("\"type\""));
     }
 
     #[test]
