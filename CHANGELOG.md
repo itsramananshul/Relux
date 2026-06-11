@@ -9,6 +9,46 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.10 (Windows bundle).** The `relux-kernel` /
+  `relux-core` crates move from `0.1.9` to `0.1.10`, bundling the post-v0.1.9 **Prime
+  observe-then-act + governed orchestration** slice into a fresh Windows release. v0.1.9
+  gave the brain a single-shot governed tool surface; this line lets one turn *inspect
+  then act* and extends the safe write surface to orchestration, while every master-plan
+  safety property holds and the brain still changes no state directly. Headlines: a
+  **bounded observe-then-act decision loop** — the unified `PrimeBrainDecision` call now
+  loops (`DecisionLoop` / `MAX_DECISION_ROUNDS`), so each round the brain may request
+  read-only context tools (run deterministically against the pre-taken snapshot and
+  re-asked, grounded in the results) or commit one decision; the observe phase has no
+  mutation path, the eventual action still flows through the unchanged fail-closed
+  `reconcile_intent` gate + `decide → prime_execute` (safe Act) / human approval (risky
+  Propose), and the loop is bounded, stops on no-progress, and yields an interim decision
+  on failure (the first round's prompt is byte-for-byte the prior single-shot). A
+  **governed `orchestration.create` write tool** maps to the EXISTING deterministic
+  `plan_orchestration → prime_orchestrate` (OrchestrateGoal) path — the brain proposes
+  only the goal text (advisory step hints); the deterministic planner keeps full
+  authority over briefs, role classification, live-roster agent grounding, the step cap,
+  the dependency DAG, and the multi-agent gate it can never bypass, and the
+  sensitive-intent gate keeps guarded chat from ever triggering a create. A governed
+  **`orchestration.start` write tool** (new `PrimeIntent::OrchestrationRun` /
+  `PrimeAction::RunOrchestration`) runs an EXISTING governed batch: `prime_execute`
+  validates the `orch_` id against live records (unknown → honest reply, fail closed)
+  then runs the existing `run_orchestration` batch (max 25, concurrency 2), with
+  multi-turn clarify memory ("run the orchestration" → "which one?" → "orch_0001") and a
+  deterministic run reply. On the dashboard, the **Plugins page now shows live adapter
+  runtime state inline** (read from the same `GET /v1/relux/adapters` probe the Crew
+  section uses: `local_deterministic` / `available` / `missing_binary` / `disabled` /
+  `needs_configuration`, fail-closed to an honest "status unavailable" on an errored
+  probe), and **protected Claude/Codex adapter rows now expose a real "Configure" path**
+  to `/crew` instead of a dead-end "locked" action (protected = locked against removal
+  only, not against use). Built reference-first per
+  `docs/reference-driven-development.md` (Hermes `run_conversation` bounded loop +
+  allowlist validation + bounded result injection; Paperclip/openclaw fail-closed
+  read-only mutation gate, `update-plan`/`sessions-spawn` per-entry validation, and
+  manifest tool-availability surfaced honestly) and audited in
+  `docs/prime-processing-audit.md`. Build the bundle with
+  `scripts\relux-package-local.ps1 -FullE2E`. This version line is the `relux-kernel`
+  crate version (separate from the legacy Relix workspace versions in the dated sections
+  below). See `docs/RELUX_MASTER_PLAN.md` → *Release history*.
 - **Relux local release v0.1.9 (Windows bundle).** The `relux-kernel` /
   `relux-core` crates move from `0.1.8` to `0.1.9`, bundling the post-v0.1.8 **Prime
   tool-use loop** into a fresh Windows release. v0.1.8 made Prime brain-mediated for
@@ -1692,7 +1732,7 @@ First public alpha. Everything below is real and ships.
   versions; they were never cut as individual GitHub releases in this repo, so they
   point at the Releases list rather than non-existent `vX.Y.Z` tags (which 404).
 -->
-[Unreleased]: https://github.com/itsramananshul/Relix/compare/relux-v0.1.9...HEAD
+[Unreleased]: https://github.com/itsramananshul/Relix/compare/relux-v0.1.10...HEAD
 [0.4.3-beta.1]: https://github.com/itsramananshul/Relix/releases
 [0.4.2]: https://github.com/itsramananshul/Relix/releases
 [0.4.1]: https://github.com/itsramananshul/Relix/releases

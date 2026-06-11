@@ -1836,6 +1836,38 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.10** (2026-06-11) — a **Prime observe-then-act + governed orchestration** slice
+  on top of v0.1.9. Where v0.1.9 gave the brain a single-shot governed tool surface, this
+  line lets one turn *inspect then act* and extends the safe write surface to
+  orchestration, while every safety property holds and the brain changes no state
+  directly. **Bounded observe-then-act loop:** the unified `PrimeBrainDecision` call now
+  loops (`DecisionLoop` / `MAX_DECISION_ROUNDS`) — each round the brain may request
+  read-only context tools (run deterministically against the pre-taken snapshot and
+  re-asked, grounded in the results) or commit one decision, so one turn can inspect live
+  state → choose one governed action grounded in what it saw → execute/propose → narrate;
+  the observe phase has no mutation path, the action still flows through the unchanged
+  fail-closed `reconcile_intent` gate + `decide → prime_execute` / approval, and the loop
+  is bounded, stops on no-progress, and yields an interim decision on failure (round one's
+  prompt is byte-for-byte the prior single-shot). **Governed `orchestration.create`:**
+  maps to the existing deterministic `plan_orchestration → prime_orchestrate`
+  (OrchestrateGoal) path — the brain proposes only the goal text (advisory step hints);
+  the deterministic planner keeps full authority over briefs, role classification,
+  live-roster agent grounding, the step cap, the dependency DAG, and the multi-agent gate,
+  and the sensitive-intent gate keeps guarded chat from ever triggering a create.
+  **Governed `orchestration.start`:** a new `PrimeIntent::OrchestrationRun` /
+  `PrimeAction::RunOrchestration` runs an existing governed batch — `prime_execute`
+  validates the `orch_` id against live records (unknown → honest reply, fail closed) then
+  runs the existing `run_orchestration` batch (max 25, concurrency 2), with multi-turn
+  clarify memory ("run the orchestration" → "which one?" → "orch_0001") and a
+  deterministic run reply. **Dashboard:** the Plugins page now shows live adapter runtime
+  state inline (same `GET /v1/relux/adapters` probe as Crew: `local_deterministic` /
+  `available` / `missing_binary` / `disabled` / `needs_configuration`, fail-closed to an
+  honest "status unavailable"), and protected Claude/Codex adapter rows now expose a real
+  "Configure" path to `/crew` instead of a dead-end "locked" (protected = locked against
+  removal only). Built reference-first per `docs/reference-driven-development.md` (Hermes
+  + Paperclip/openclaw) and audited in `docs/prime-processing-audit.md`. Proven by
+  `relux-kernel` / `relux-core` unit and integration tests; every safety property from
+  v0.1.9 still holds.
 - **v0.1.9** (2026-06-11) — a **Prime tool-use loop** slice on top of v0.1.8. Where
   v0.1.8 made Prime brain-mediated for intent/slots/wording, this line gives the brain a
   *governed tool surface* — first to read live control-plane state, then to request a
