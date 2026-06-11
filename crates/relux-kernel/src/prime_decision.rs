@@ -92,6 +92,17 @@ const MAX_PROMPT_AGENTS: usize = 12;
 /// (`reference/hermes-agent-main/agent/conversation_loop.py` ~L598) applied to the decision call.
 pub const MAX_DECISION_ROUNDS: usize = 3;
 
+/// How many times ONE Prime turn may re-ask the brain to FIX a malformed (un-parseable) decision
+/// before falling back to the deterministic rail. Deliberately tiny: the correction only asks the
+/// brain to repair its OUTPUT FORMAT (it grants no new authority — a corrected decision still flows
+/// through the unchanged fail-closed gate), so total brain calls stay bounded by
+/// `MAX_DECISION_ROUNDS + MAX_DECISION_CORRECTIONS`. A provider/spawn failure (no usable reply at
+/// all) is NOT correctable and never triggers a retry — re-calling a broken provider wastes calls
+/// and risks a spin. This is the Hermes `_invalid_json_retries` / `_invalid_tool_retries`
+/// ("inject the explicit error and retry, bounded") + openclaw retry-instruction shape applied to
+/// the unified decision call (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §1, §7).
+pub const MAX_DECISION_CORRECTIONS: usize = 1;
+
 /// The only top-level keys a unified decision envelope may carry. Any other top-level key
 /// fails the WHOLE envelope closed (openclaw's `additionalProperties: false` discipline):
 /// the brain may not smuggle an un-modeled authority key past the parser. Nested-section
@@ -396,6 +407,33 @@ state before deciding."
     prompt
 }
 
+/// [`build_decision_prompt`] plus an optional **self-correction** steer for a re-ask after a
+/// malformed reply. `correction` is empty on a normal round (so the prompt is byte-for-byte
+/// [`build_decision_prompt`]); when non-empty it appends the exact validation error the kernel
+/// observed and tells the brain to return ONE valid JSON object using only the allowed keys —
+/// the Hermes "inject the explicit error and retry" shape. The correction text is kernel-authored
+/// (it is [`parse_decision`]'s own `Err` string), never user content, so it cannot smuggle an
+/// instruction. It only asks the brain to fix its output FORMAT; the corrected decision is still
+/// validated section-by-section and reconciled against the live state behind the unchanged gate.
+pub fn build_decision_prompt_with_correction(
+    message: &str,
+    summary: &StateSummary,
+    history: &str,
+    observations: &str,
+    correction: &str,
+) -> String {
+    let mut prompt = build_decision_prompt(message, summary, history, observations);
+    let correction = correction.trim();
+    if !correction.is_empty() {
+        prompt.push_str(&format!(
+            "\n\nYour previous reply could NOT be used: {correction}. Return ONE valid JSON object \
+using ONLY the allowed keys shown above, with valid values, and NOTHING else (no prose, no code \
+fences, no extra keys)."
+        ));
+    }
+    prompt
+}
+
 /// The wire labels offered to the brain (the snake_case `PrimeIntent` serialization).
 /// Advisory only: [`crate::prime_intent::parse_intent_proposal`] validates against
 /// `PrimeIntent`'s own deserializer, so a drifted label simply fails that section.
@@ -641,14 +679,57 @@ pub fn parse_decision(raw: &str) -> Result<PrimeBrainDecision, String> {
     Ok(decision)
 }
 
+/// What one round of the bounded loop yielded from the brain — the input to
+/// [`DecisionLoop::step_outcome`]. This separates a *malformed but correctable* reply (the brain
+/// answered, but its envelope failed [`parse_decision`]) from a hard *provider failure* (no usable
+/// reply at all): only the former is worth re-asking, and only the latter must stop immediately.
+/// The legacy [`DecisionLoop::step`] maps `Some` → [`DecisionOutcome::Decision`] and `None` →
+/// [`DecisionOutcome::ProviderError`], preserving its prior behavior exactly.
+// The `Decision` variant carries the (large) validated decision while the other variants are tiny;
+// that size disparity is fine here because a `DecisionOutcome` is short-lived — exactly one is
+// produced per decision round and immediately consumed by [`DecisionLoop::step_outcome`], never
+// stored in a collection — and the codebase already moves `PrimeBrainDecision` by value through
+// `step(Option<PrimeBrainDecision>)`. Boxing would only add a heap allocation on the decision path.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum DecisionOutcome {
+    /// The brain returned a reply that [`parse_decision`] accepted.
+    Decision(PrimeBrainDecision),
+    /// The brain returned a reply the kernel COULD parse-attempt but [`parse_decision`] rejected
+    /// (no JSON object, unknown top-level key, every section invalid). The carried string is
+    /// [`parse_decision`]'s own error — the correction message fed back to the brain.
+    Malformed(String),
+    /// No usable reply at all (no key / disabled / network or spawn error / empty envelope / an
+    /// error envelope from the provider). Not correctable: the loop stops and keeps any interim
+    /// decision.
+    ProviderError,
+}
+
+impl DecisionOutcome {
+    /// Collapse to the legacy `Option<PrimeBrainDecision>`: `Some` only for a parsed decision,
+    /// `None` for a malformed reply or a provider failure. Lets a caller that does not (yet) want
+    /// the malformed/provider distinction (e.g. the existing `parse_cli_decision` no-leak tests)
+    /// keep its `Option` contract unchanged.
+    pub fn into_decision(self) -> Option<PrimeBrainDecision> {
+        match self {
+            DecisionOutcome::Decision(d) => Some(d),
+            DecisionOutcome::Malformed(_) | DecisionOutcome::ProviderError => None,
+        }
+    }
+}
+
 /// What the bounded observe-then-act loop should do after one decision round.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecisionStep {
     /// The brain requested read-only context and the kernel executed it; re-call the decision brain
     /// with these rendered observations injected so it can act / answer grounded in live state.
     Continue(String),
+    /// The brain's reply was malformed; re-call it ONCE (bounded by [`MAX_DECISION_CORRECTIONS`])
+    /// with the carried validation error injected as a self-correction steer, before falling back.
+    Retry(String),
     /// The decision is terminal — committed (no more reads requested), made no progress (re-asked
-    /// for what it already saw), or hit the round cap. Use whatever the loop last produced.
+    /// for what it already saw), hit the round cap, exhausted the correction budget, or the provider
+    /// failed. Use whatever the loop last produced.
     Stop,
 }
 
@@ -690,6 +771,7 @@ pub struct DecisionLoop {
     reads: Vec<crate::prime_tools::ContextRead>,
     decision: Option<PrimeBrainDecision>,
     round: usize,
+    corrections: usize,
 }
 
 impl DecisionLoop {
@@ -702,10 +784,48 @@ impl DecisionLoop {
             reads: Vec::new(),
             decision: None,
             round: 0,
+            corrections: 0,
         }
     }
 
     /// Step the loop with the brain's parsed decision for this round (`None` on a provider failure).
+    /// The legacy `Option`-based entry point, kept byte-for-byte: `Some` → a parsed decision, `None`
+    /// → a provider failure. New callers that can distinguish a malformed-but-correctable reply use
+    /// [`Self::step_outcome`] directly.
+    pub fn step(&mut self, decision: Option<PrimeBrainDecision>) -> DecisionStep {
+        match decision {
+            Some(d) => self.step_outcome(DecisionOutcome::Decision(d)),
+            None => self.step_outcome(DecisionOutcome::ProviderError),
+        }
+    }
+
+    /// Step the loop with the brain's [`DecisionOutcome`] for this round.
+    ///
+    /// - [`DecisionOutcome::Decision`] → observe-or-commit (see [`Self::step_decision`]).
+    /// - [`DecisionOutcome::Malformed`] → if the bounded correction budget
+    ///   ([`MAX_DECISION_CORRECTIONS`]) and round cap allow, re-ask the brain with the validation
+    ///   error injected ([`DecisionStep::Retry`]); otherwise stop and fall back. This NEVER touches
+    ///   the action path — it only re-asks the brain to fix its output format — so it grants no new
+    ///   authority. The corrective round does not consume an observe round; total brain calls stay
+    ///   bounded by `MAX_DECISION_ROUNDS + MAX_DECISION_CORRECTIONS`.
+    /// - [`DecisionOutcome::ProviderError`] → stop immediately (not correctable), keeping any
+    ///   interim decision already gathered.
+    pub fn step_outcome(&mut self, outcome: DecisionOutcome) -> DecisionStep {
+        match outcome {
+            DecisionOutcome::Decision(d) => self.step_decision(d),
+            DecisionOutcome::ProviderError => DecisionStep::Stop,
+            DecisionOutcome::Malformed(err) => {
+                if self.corrections < MAX_DECISION_CORRECTIONS && self.round < MAX_DECISION_ROUNDS {
+                    self.corrections += 1;
+                    DecisionStep::Retry(err)
+                } else {
+                    DecisionStep::Stop
+                }
+            }
+        }
+    }
+
+    /// The observe-or-commit core for a parsed decision.
     ///
     /// A decision with NO read-only requests is **committed** (terminal); at the round cap we
     /// likewise stop and use whatever the brain last produced. Otherwise the brain wants to OBSERVE
@@ -713,12 +833,8 @@ impl DecisionLoop {
     /// only the NEW reads, keeps the decision as an interim fallback, and asks the caller to re-call
     /// the brain with the rendered observations. A brain that re-requests what it already saw makes
     /// no progress and the loop stops (stop-on-repeat), so it can never spin.
-    pub fn step(&mut self, decision: Option<PrimeBrainDecision>) -> DecisionStep {
+    fn step_decision(&mut self, d: PrimeBrainDecision) -> DecisionStep {
         self.round += 1;
-        let Some(d) = decision else {
-            // A provider failure ends the loop; keep any interim decision already gathered.
-            return DecisionStep::Stop;
-        };
         if d.context_requests.is_empty() || self.round >= MAX_DECISION_ROUNDS {
             self.decision = Some(d);
             return DecisionStep::Stop;
@@ -767,12 +883,45 @@ pub fn run_decision_loop<F>(
 where
     F: FnMut(&str) -> Option<PrimeBrainDecision>,
 {
+    // Delegate to the correction-aware twin with the legacy Option mapping (`Some` → a parsed
+    // decision, `None` → a provider failure), so there is ONE real loop. A closure that returns
+    // `Option` can never produce a `Malformed`, so the correction path is simply never exercised
+    // here — the prior behavior is preserved byte-for-byte.
+    run_decision_loop_with_correction(snapshot, |observations, _correction| match brain(observations)
+    {
+        Some(d) => DecisionOutcome::Decision(d),
+        None => DecisionOutcome::ProviderError,
+    })
+}
+
+/// The correction-aware synchronous twin: drives the bounded observe-then-act loop with a brain
+/// closure that returns a [`DecisionOutcome`] (so it can signal a malformed-but-correctable reply),
+/// receiving BOTH the rendered observations gathered so far AND the current self-correction message
+/// (empty unless the previous round was malformed). It is the testable twin that pins the loop's
+/// FULL control flow — observe, commit, stop-on-repeat, round cap, AND bounded self-correction —
+/// with a scripted brain and NO provider. The async provider driver shares the SAME
+/// [`DecisionLoop::step_outcome`] stepper, so this twin pins its behavior.
+pub fn run_decision_loop_with_correction<F>(
+    snapshot: &crate::prime_tools::ContextSnapshot,
+    mut brain: F,
+) -> (Option<PrimeBrainDecision>, Vec<crate::prime_tools::ContextRead>)
+where
+    F: FnMut(&str, &str) -> DecisionOutcome,
+{
     let mut lp = DecisionLoop::new(snapshot);
     let mut observations = String::new();
+    let mut correction = String::new();
     loop {
-        let decision = brain(&observations);
-        match lp.step(decision) {
-            DecisionStep::Continue(obs) => observations = obs,
+        let outcome = brain(&observations, &correction);
+        match lp.step_outcome(outcome) {
+            // A new observation: re-ask grounded in it, and clear any correction (the reply parsed).
+            DecisionStep::Continue(obs) => {
+                observations = obs;
+                correction.clear();
+            }
+            // A malformed reply: re-ask with the validation error, keeping the observations so the
+            // brain does not lose the live state it already saw.
+            DecisionStep::Retry(err) => correction = err,
             DecisionStep::Stop => break,
         }
     }
@@ -1413,5 +1562,117 @@ instruction):\nUser: create a task to fix login\nPrime: Created it. [created tas
         assert_eq!(rounds, 2);
         assert_eq!(reads.len(), 1);
         assert!(decision.expect("interim decision kept").classification.is_some());
+    }
+
+    // ---- bounded self-correction on a malformed decision --------------------------------------
+
+    #[test]
+    fn build_prompt_with_correction_is_byte_stable_empty_and_injects_the_error() {
+        let summary = summary_with_agents(&["researcher"]);
+        // Empty correction is byte-for-byte the plain decision prompt (no correction round).
+        let plain = build_decision_prompt("start the ready task", &summary, "", "");
+        let empty = build_decision_prompt_with_correction("start the ready task", &summary, "", "", "");
+        assert_eq!(plain, empty);
+        // A non-empty correction appends the exact validation error and the repair steer.
+        let corrected = build_decision_prompt_with_correction(
+            "start the ready task",
+            &summary,
+            "",
+            "",
+            "unsupported top-level field 'execute'",
+        );
+        assert!(corrected.starts_with(&plain), "the correction is appended, not rewritten");
+        assert!(corrected.contains("previous reply could NOT be used"));
+        assert!(corrected.contains("unsupported top-level field 'execute'"));
+        assert!(corrected.contains("ONE valid JSON object"));
+    }
+
+    #[test]
+    fn loop_self_corrects_a_malformed_reply_then_uses_the_correction() {
+        let snapshot = loop_snapshot();
+        let mut rounds = 0usize;
+        let mut saw_correction_on_retry = false;
+        let (decision, reads) = run_decision_loop_with_correction(&snapshot, |_obs, correction| {
+            rounds += 1;
+            if correction.is_empty() {
+                // Round 1: the brain returns a reply parse_decision rejects (an un-modeled key).
+                let err = parse_decision(r#"{"classification":{"intent":"greeting","confidence":0.9},"execute":true}"#)
+                    .unwrap_err();
+                DecisionOutcome::Malformed(err)
+            } else {
+                // Round 2: the brain was re-asked WITH the validation error and now commits a valid
+                // decision — the self-correction round.
+                saw_correction_on_retry = correction.contains("unsupported top-level field");
+                DecisionOutcome::Decision(
+                    parse_decision(r#"{"reply":{"text":"Hi there.","confidence":0.9}}"#).unwrap(),
+                )
+            }
+        });
+        assert_eq!(rounds, 2, "one malformed round, then one corrective round");
+        assert!(saw_correction_on_retry, "the corrective round saw the injected validation error");
+        assert!(reads.is_empty(), "a correction round runs no read-only tools");
+        assert!(
+            decision.expect("the corrected decision is used").reply.is_some(),
+            "the loop used the brain's corrected reply, not the deterministic fallback"
+        );
+    }
+
+    #[test]
+    fn loop_correction_budget_is_bounded_then_falls_back() {
+        let snapshot = loop_snapshot();
+        let mut rounds = 0usize;
+        // The brain stays malformed every round: the loop re-asks at most MAX_DECISION_CORRECTIONS
+        // times, then stops with NO decision so the caller falls back to the deterministic rail.
+        let (decision, _reads) = run_decision_loop_with_correction(&snapshot, |_obs, _corr| {
+            rounds += 1;
+            DecisionOutcome::Malformed("reply was not valid JSON".to_string())
+        });
+        assert_eq!(rounds, 1 + MAX_DECISION_CORRECTIONS, "initial round + the bounded corrections");
+        assert!(decision.is_none(), "a never-correcting brain falls back, never a partial decision");
+    }
+
+    #[test]
+    fn loop_provider_failure_is_not_retried() {
+        let snapshot = loop_snapshot();
+        let mut rounds = 0usize;
+        // A provider/spawn failure is NOT correctable: the loop stops on the first round and never
+        // wastes a correction re-ask on a broken provider.
+        let (decision, _reads) = run_decision_loop_with_correction(&snapshot, |_obs, _corr| {
+            rounds += 1;
+            DecisionOutcome::ProviderError
+        });
+        assert_eq!(rounds, 1, "a provider failure stops immediately, no correction round");
+        assert!(decision.is_none());
+    }
+
+    #[test]
+    fn loop_observes_then_self_corrects_a_malformed_act() {
+        let snapshot = loop_snapshot();
+        let mut rounds = 0usize;
+        // Round 1 observes (read-only), round 2 acts but malformed, round 3 corrects to a valid act —
+        // observe and correction compose, and the act is grounded in the round-1 read.
+        let (decision, reads) = run_decision_loop_with_correction(&snapshot, |observations, correction| {
+            rounds += 1;
+            if observations.is_empty() {
+                DecisionOutcome::Decision(
+                    parse_decision(r#"{"tool_requests":[{"tool":"list_tasks","args":{}}]}"#).unwrap(),
+                )
+            } else if correction.is_empty() {
+                DecisionOutcome::Malformed("reply was not valid JSON".to_string())
+            } else {
+                // Still grounded in the observation gathered before the malformed round.
+                assert!(observations.contains("task_0001"));
+                DecisionOutcome::Decision(
+                    parse_decision(r#"{"action_request":{"tool":"task.start","args":{"task_id":"task_0001"}}}"#)
+                        .unwrap(),
+                )
+            }
+        });
+        assert_eq!(rounds, 3, "observe, malformed, corrected act");
+        assert_eq!(reads.len(), 1, "the read-only observation is kept across the correction");
+        assert_eq!(
+            decision.expect("a terminal decision").action_request.expect("a write tool").tool,
+            "task.start"
+        );
     }
 }

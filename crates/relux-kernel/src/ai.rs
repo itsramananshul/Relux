@@ -848,8 +848,12 @@ pub async fn polish_after_action_via_openrouter(
 }
 
 /// Produce ONE UNIFIED Prime decision (intent + every applicable slot + optional wording) in
-/// a single OpenRouter call, as a VALIDATED [`crate::prime_decision::PrimeBrainDecision`], or
-/// `None` on ANY failure (no key, disabled, network error, unparseable/empty envelope).
+/// a single OpenRouter call, as a [`crate::prime_decision::DecisionOutcome`]: a VALIDATED
+/// [`crate::prime_decision::PrimeBrainDecision`], a `Malformed` reply (the provider answered but
+/// [`crate::prime_decision::parse_decision`] rejected it — re-askable via the bounded
+/// self-correction loop), or a `ProviderError` (no usable reply: no key / disabled / network /
+/// empty envelope — NOT correctable). `correction` is empty on a normal round and carries the prior
+/// round's validation error on a self-correction re-ask.
 ///
 /// This is the one-shot counterpart to the separate `classify_intent_via_openrouter` +
 /// `extract_*_slots_via_openrouter` + `polish_clarify_via_openrouter` calls: a configured
@@ -870,13 +874,31 @@ pub async fn decide_prime_via_openrouter(
     summary: &relux_core::StateSummary,
     history: &str,
     observations: &str,
-) -> Option<crate::prime_decision::PrimeBrainDecision> {
-    let text = complete_json_only(
+    correction: &str,
+) -> crate::prime_decision::DecisionOutcome {
+    use crate::prime_decision::DecisionOutcome;
+    let Some(text) = complete_json_only(
         cfg,
-        crate::prime_decision::build_decision_prompt(message, summary, history, observations),
+        crate::prime_decision::build_decision_prompt_with_correction(
+            message,
+            summary,
+            history,
+            observations,
+            correction,
+        ),
     )
-    .await?;
-    crate::prime_decision::parse_decision(&text).ok()
+    .await
+    else {
+        // No usable reply at all (no key / disabled / network error / empty envelope): not
+        // correctable.
+        return DecisionOutcome::ProviderError;
+    };
+    // The provider answered: a parse failure here is a malformed-but-correctable reply (re-askable),
+    // distinct from the provider failure above. The error string IS the correction fed back.
+    match crate::prime_decision::parse_decision(&text) {
+        Ok(d) => DecisionOutcome::Decision(d),
+        Err(e) => DecisionOutcome::Malformed(e),
+    }
 }
 
 /// Combine an LLM result with the deterministic fallback into a final outcome.

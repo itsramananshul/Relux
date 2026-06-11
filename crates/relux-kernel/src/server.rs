@@ -3170,14 +3170,26 @@ async fn decide_prime_via_cli(
     summary: &relux_core::StateSummary,
     history: &str,
     observations: &str,
-) -> Option<relux_kernel::PrimeBrainDecision> {
-    let (stdout, kind) = cli_brain_json(
+    correction: &str,
+) -> relux_kernel::DecisionOutcome {
+    let Some((stdout, kind)) = cli_brain_json(
         brain,
         status,
-        relux_kernel::build_decision_prompt(message, summary, history, observations),
+        relux_kernel::build_decision_prompt_with_correction(
+            message,
+            summary,
+            history,
+            observations,
+            correction,
+        ),
     )
-    .await?;
-    parse_cli_decision(&stdout, kind)
+    .await
+    else {
+        // The spawn produced no usable stdout (disabled / not found / timeout / empty): not
+        // correctable.
+        return relux_kernel::DecisionOutcome::ProviderError;
+    };
+    classify_cli_decision(&stdout, kind)
 }
 
 /// Drive the bounded **observe-then-act** decision loop for one turn and return the terminal
@@ -3209,8 +3221,9 @@ async fn decide_prime_with_observation(
     }
     let mut lp = relux_kernel::DecisionLoop::new(snapshot);
     let mut observations = String::new();
+    let mut correction = String::new();
     loop {
-        let decision = match brain {
+        let outcome = match brain {
             relux_kernel::PrimeBrain::Openrouter => {
                 relux_kernel::decide_prime_via_openrouter(
                     ai_config,
@@ -3218,6 +3231,7 @@ async fn decide_prime_with_observation(
                     summary,
                     history,
                     &observations,
+                    &correction,
                 )
                 .await
             }
@@ -3229,13 +3243,23 @@ async fn decide_prime_with_observation(
                     summary,
                     history,
                     &observations,
+                    &correction,
                 )
                 .await
             }
-            relux_kernel::PrimeBrain::Local => None,
+            // Unreachable (Local short-circuits above); treated as a non-correctable failure.
+            relux_kernel::PrimeBrain::Local => relux_kernel::DecisionOutcome::ProviderError,
         };
-        match lp.step(decision) {
-            relux_kernel::DecisionStep::Continue(obs) => observations = obs,
+        match lp.step_outcome(outcome) {
+            // A new read-only observation: re-ask grounded in it; the reply parsed, so clear any
+            // correction.
+            relux_kernel::DecisionStep::Continue(obs) => {
+                observations = obs;
+                correction.clear();
+            }
+            // A malformed reply: re-ask ONCE with the validation error injected, keeping the
+            // observations so the brain does not lose the live state it already inspected.
+            relux_kernel::DecisionStep::Retry(err) => correction = err,
             relux_kernel::DecisionStep::Stop => break,
         }
     }
@@ -3249,15 +3273,37 @@ async fn decide_prime_with_observation(
 /// reported an error is dropped, and the lifted text is validated by
 /// [`relux_kernel::parse_decision`] (which itself rejects unknown top-level keys and validates
 /// each section through its existing allowlist). The raw envelope never escapes this function.
+#[cfg(test)]
 fn parse_cli_decision(
     stdout: &str,
     kind: relux_core::AdapterKind,
 ) -> Option<relux_kernel::PrimeBrainDecision> {
+    classify_cli_decision(stdout, kind).into_decision()
+}
+
+/// The correction-aware variant of [`parse_cli_decision`]: lift the CLI brain's `stdout` into a
+/// [`relux_kernel::DecisionOutcome`] through the SAME no-leak boundary, distinguishing a
+/// malformed-but-correctable reply from a provider failure so the bounded self-correction loop can
+/// re-ask only the former.
+///
+/// - An error envelope (`is_error == true`, e.g. the CLI reported a rate limit) is a
+///   `ProviderError` — re-asking will not change the format, and the failure is the provider's.
+/// - A reply the [`parse_adapter_result`]-lifted text fails [`relux_kernel::parse_decision`] on is
+///   `Malformed` (the brain answered but the envelope was unusable — re-askable), carrying the exact
+///   validation error as the correction message.
+/// - A valid envelope is a `Decision`. The raw provider envelope never escapes this function.
+fn classify_cli_decision(
+    stdout: &str,
+    kind: relux_core::AdapterKind,
+) -> relux_kernel::DecisionOutcome {
     let parsed = relux_core::parse_adapter_result(stdout, kind);
     if parsed.is_error == Some(true) {
-        return None;
+        return relux_kernel::DecisionOutcome::ProviderError;
     }
-    relux_kernel::parse_decision(&parsed.text).ok()
+    match relux_kernel::parse_decision(&parsed.text) {
+        Ok(d) => relux_kernel::DecisionOutcome::Decision(d),
+        Err(e) => relux_kernel::DecisionOutcome::Malformed(e),
+    }
 }
 
 /// Run ONE round of the read-only context loop through a CLI brain (Claude / Codex), returning
@@ -7382,6 +7428,37 @@ mod tests {
             parse_cli_decision(prose, relux_core::AdapterKind::ClaudeCli).is_none(),
             "prose with no JSON object must not produce a decision"
         );
+    }
+
+    #[test]
+    fn classify_cli_decision_distinguishes_malformed_from_provider_failure() {
+        use relux_kernel::DecisionOutcome;
+        // A valid envelope is a Decision.
+        let ok = r#"{"type":"result","is_error":false,"result":"{\"classification\":{\"intent\":\"greeting\",\"confidence\":0.9}}"}"#;
+        assert!(matches!(
+            classify_cli_decision(ok, relux_core::AdapterKind::ClaudeCli),
+            DecisionOutcome::Decision(_)
+        ));
+        // The brain answered but the envelope failed parse_decision (prose with no JSON object):
+        // Malformed -> re-askable via the bounded self-correction loop, carrying the error string.
+        let prose = r#"{"type":"result","is_error":false,"result":"Sure, here is what I think."}"#;
+        assert!(matches!(
+            classify_cli_decision(prose, relux_core::AdapterKind::ClaudeCli),
+            DecisionOutcome::Malformed(_)
+        ));
+        // A smuggled un-modeled key also yields a Malformed (the whole envelope fails closed), so
+        // the brain gets one corrective re-ask rather than a silent fallback.
+        let bad_key = r#"{"type":"result","is_error":false,"result":"{\"classification\":{\"intent\":\"greeting\",\"confidence\":0.9},\"execute\":true}"}"#;
+        assert!(matches!(
+            classify_cli_decision(bad_key, relux_core::AdapterKind::ClaudeCli),
+            DecisionOutcome::Malformed(_)
+        ));
+        // An error envelope is the provider's failure: ProviderError, never re-asked for format.
+        let err = r#"{"type":"result","is_error":true,"result":"rate limited"}"#;
+        assert!(matches!(
+            classify_cli_decision(err, relux_core::AdapterKind::ClaudeCli),
+            DecisionOutcome::ProviderError
+        ));
     }
 
     #[test]

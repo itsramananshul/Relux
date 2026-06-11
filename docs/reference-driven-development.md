@@ -2007,3 +2007,42 @@ readiness guide (which derives status in the browser): the guide stays the first
 Doctor is the deeper "what's broken, how to fix it" the operator runs on demand. It never executes a
 remediation — every `action_link` is a navigation to the page that fixes it, behind the existing
 session gate; nothing here mutates state or runs a tool.
+
+## Reference read — bounded self-correction on a malformed brain decision (this slice)
+
+Chosen from the deep audit (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §1/§7) as the highest-impact safe
+agentic-loop gap: the unified decision discarded a malformed-but-correctable brain reply exactly like a
+hard provider failure (`parse_decision(&text).ok()` → `None` → fall back), with no re-ask.
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/agent/conversation_loop.py` — the ReAct loop's invalid-output recovery:
+  `_invalid_tool_retries` / `_invalid_json_retries` counters inject an explicit recovery tool-result
+  message describing what was wrong and re-call the model up to 3× before giving up (the loop does NOT
+  silently drop a fixable reply); fuzzy tool-name repair runs BEFORE erroring. The error is fed back as
+  context so the model corrects itself rather than the harness crashing.
+- `reference/hermes-agent-main/model_tools.py` — `coerce_tool_args` + `_sanitize_tool_error`: the
+  recovery message is sanitized/bounded so the framing tokens never leak.
+
+### openclaw — files read
+
+- `reference/openclaw-main/src/agents/pi-embedded-runner/run.ts` — `resolvePlanningOnlyRetryInstruction`,
+  `reasoningOnlyRetryAttempts`, `emptyResponseRetryAttempts`, `COMPACTION_CONTINUATION_RETRY_INSTRUCTION`:
+  the loop re-prompts with a corrective *instruction* (bounded attempt counters) instead of aborting on
+  a degenerate response. A malformed/empty round becomes a bounded corrective re-ask.
+
+### How Relux maps it
+
+- The kernel now distinguishes the two failure modes (`relux-kernel/src/prime_decision.rs`
+  `DecisionOutcome::{Malformed(err), ProviderError}`): a reply `parse_decision` rejected is correctable;
+  no usable reply at all is not. `DecisionLoop::step_outcome` + `DecisionStep::Retry` re-ask ONCE
+  (`MAX_DECISION_CORRECTIONS = 1`), injecting `parse_decision`'s OWN error via
+  `build_decision_prompt_with_correction`, before falling back. Both transports surface the distinction
+  (`ai::decide_prime_via_openrouter`, kernel `classify_cli_decision`); the async driver
+  `decide_prime_with_observation` threads the correction string.
+- **Deliberate difference from Hermes:** the Relux brain executes NOTHING. The correction asks only for a
+  valid output format; the corrected decision still flows through the unchanged fail-closed gate
+  (`reconcile_intent` → slot validators → `decide` → `prime_execute` / approval). The correction message
+  is kernel-authored (not user content), so it cannot carry an instruction. Total brain calls stay bounded
+  (`MAX_DECISION_ROUNDS + MAX_DECISION_CORRECTIONS`); a provider failure is never retried. Worst case is
+  byte-for-byte today's behavior. See the applied-change record in `docs/prime-processing-audit.md`.

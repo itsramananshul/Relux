@@ -1663,3 +1663,45 @@ Two refinements closed the gaps the first cut of this section noted:
 **Remaining gap:** none specific to the stored reply or read summaries. Richer continuity would need a
 larger history window or per-turn compaction (a token-bounded summary of older turns), not more fields —
 the current window is a fixed last-N transcript, deliberately small.
+
+## Applied change (bounded self-correction on a malformed brain decision)
+
+The deep audit (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §1, §7) found the highest-impact safe agentic gap:
+when the configured brain returned an envelope `parse_decision` rejected (no JSON object, an unknown
+top-level key, every section invalid, or a near-miss like prose-with-no-JSON), the kernel did
+`parse_decision(&text).ok()` → `None`, which the observe-then-act `DecisionLoop` treated **identically
+to a hard provider failure** → `Stop` → silent fallback to the deterministic rail. Both reference
+systems instead re-ask the model to fix its output: Hermes `_invalid_json_retries` / `_invalid_tool_retries`
+inject the explicit error and retry (bounded); openclaw applies a corrective retry *instruction*. Relux
+had the loop infrastructure but not this rung.
+
+This slice adds it, strictly additive and adding NO authority:
+
+- **`DecisionOutcome`** (`relux-kernel/src/prime_decision.rs`) separates a *malformed but correctable*
+  reply (`Malformed(err)` — the brain answered, but `parse_decision` rejected it) from a hard
+  *provider failure* (`ProviderError` — no usable reply at all). `into_decision()` collapses to the
+  legacy `Option` so the existing no-leak `parse_cli_decision` tests are unchanged.
+- **`DecisionLoop::step_outcome`** + **`DecisionStep::Retry`** + **`MAX_DECISION_CORRECTIONS = 1`** — on
+  a `Malformed` reply, if the bounded correction budget AND the round cap allow, the loop re-asks the
+  brain ONCE with the exact validation error injected (`build_decision_prompt_with_correction`); a
+  `ProviderError` stops immediately (re-calling a broken provider wastes calls and risks a spin). The
+  legacy `step(Option)` and `run_decision_loop` are preserved byte-for-byte (they delegate to the new
+  stepper / twin), so all prior loop behavior — observe, commit, stop-on-repeat, round cap — is
+  unchanged. The new sync twin `run_decision_loop_with_correction` pins the full control flow.
+- **Both brain transports** surface the distinction: `ai::decide_prime_via_openrouter` and the kernel's
+  `classify_cli_decision` (via `decide_prime_via_cli`) now return a `DecisionOutcome`; the async driver
+  `decide_prime_with_observation` threads the correction string between rounds.
+
+**Safety invariants (binding).** The correction only asks the brain to fix its OUTPUT FORMAT — the
+message is `parse_decision`'s own kernel-authored `Err` string (never user content, so it cannot smuggle
+an instruction). A corrected decision is still validated section-by-section and flows through the
+UNCHANGED fail-closed gate (`reconcile_intent` → the per-action slot validators → `decide` →
+`prime_execute` / human approval). Total brain calls stay bounded by
+`MAX_DECISION_ROUNDS + MAX_DECISION_CORRECTIONS`. Worst case is byte-for-byte today's behavior (malformed
+→ the bounded correction also fails → fall back to the deterministic rail). No wire/dashboard change.
+
+Pinned by the `prime_decision` unit tests (`build_prompt_with_correction_is_byte_stable_empty_and_injects_the_error`,
+`loop_self_corrects_a_malformed_reply_then_uses_the_correction`, `loop_correction_budget_is_bounded_then_falls_back`,
+`loop_provider_failure_is_not_retried`, `loop_observes_then_self_corrects_a_malformed_act`) and the kernel
+`classify_cli_decision_distinguishes_malformed_from_provider_failure` test (the existing `cli_decision_*`
+no-leak tests are unchanged). No test calls a real provider.
