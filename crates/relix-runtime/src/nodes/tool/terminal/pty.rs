@@ -757,6 +757,8 @@ mod tests {
             max_timeout_secs: 15,
             inherit_env: false,
             working_dir: None,
+            allowed_dirs: vec![],
+            env_allowlist: vec![],
             pty: true,
         }
     }
