@@ -1458,6 +1458,11 @@ export interface ReluxPrimeTurn {
   ai_model?: string;
   /// A safe, non-secret note (e.g. why a CLI brain fell back, with the next step).
   ai_note?: string;
+  /// Present (as "brain") only when a configured brain genuinely shaped this
+  /// turn's INTENT (not just the reply wording). Absent for deterministic turns —
+  /// including a brain proposal the safety gate vetoed — so the UI attributes the
+  /// brain only when it actually decided. Provenance only; never affects state.
+  intent_source?: string;
 }
 
 export const reluxPrime = {

@@ -61,3 +61,14 @@ export function polishProvenance(p: ReluxPrimeProposal): string | null {
   const model = p.polish.model?.trim();
   return model ? model : "AI brain";
 }
+
+// Honest provenance for HOW Prime classified the turn's INTENT. Returns a short
+// label only when a configured brain genuinely decided the intent
+// (`intent_source === "brain"`) — i.e. the brain understood a request keyword
+// rules would have missed. Deterministic turns (no brain, a low-confidence or
+// safety-gate-vetoed proposal) return null, so the card shows nothing extra and
+// never overclaims a brain decision. The kernel only stamps "brain" when the
+// fail-closed gate accepted the proposal (§10.1, §17.1).
+export function intentProvenance(source: string | undefined): string | null {
+  return source === "brain" ? "brain-classified" : null;
+}

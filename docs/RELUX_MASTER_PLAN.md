@@ -827,6 +827,22 @@ Prime needs an intent layer, a planning layer, and an action layer.
 
 Prime should classify user messages before acting.
 
+**Brain-mediated classification (implemented, post-v0.1.7).** The deterministic
+keyword classifier (`crates/relux-kernel/src/prime.rs` `classify_intent`) is now a
+*fallback safety rail*, not the primary brain. When a real brain is configured
+(OpenRouter or a local Claude/Codex CLI) it *proposes* the intent through a
+structured, JSON-only decision stage (`crates/relux-kernel/src/prime_intent.rs`):
+the proposed label is validated against the `PrimeIntent` allowlist, then
+reconciled through a **fail-closed gate** (`reconcile_intent`) that preserves the
+Conversation Rules (§10.5) and §17.1 — guarded chat (ideation/questions without an
+explicit command) can **never** be promoted to a work intent, a low-confidence
+proposal keeps the deterministic intent, and a `create_and_run` without explicit
+run language is downgraded to `create`. The brain decides *intent only*; slots and
+durable actions still flow through `decide` → `prime_execute`. Any brain failure
+falls back to the deterministic classifier. This is the rule in
+`docs/reference-driven-development.md` applied: the shape is taken from Hermes'
+allowlist-validated tool loop and Paperclip/openclaw's fail-closed mutation gate.
+
 Intent categories:
 
 - greeting

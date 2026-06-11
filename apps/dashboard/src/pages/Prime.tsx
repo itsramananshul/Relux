@@ -8,7 +8,7 @@ import {
   type ReluxPrimeSuggestion,
   type ReluxPrimeTurn,
 } from "../api";
-import { hasSteps, polishProvenance, proposalDisplaySummary, stepDisplayTitle } from "../prime";
+import { hasSteps, intentProvenance, polishProvenance, proposalDisplaySummary, stepDisplayTitle } from "../prime";
 import { workTaskHref, workRunHref } from "../routing";
 import { PrimeAutonomyPanel } from "../components/PrimeAutonomyPanel";
 import { OrchestrationPanel } from "../components/OrchestrationPanel";
@@ -317,6 +317,15 @@ function PrimeTurnCard({
         <span className="badge todo" style={{ fontSize: 9 }} title="What Prime understood">
           {turn.intent.replace(/_/g, " ")}
         </span>
+        {intentProvenance(turn.intent_source) && (
+          <span
+            className="badge done"
+            style={{ fontSize: 9 }}
+            title="Prime's brain understood this intent — not keyword rules"
+          >
+            🧠 {intentProvenance(turn.intent_source)}
+          </span>
+        )}
         <span className={"badge " + tone} style={{ fontSize: 9 }} title="How the turn resolved">
           {turn.disposition.replace(/_/g, " ")}
         </span>

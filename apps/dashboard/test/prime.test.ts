@@ -7,6 +7,7 @@ import {
   stepDisplayTitle,
   proposalDisplaySummary,
   polishProvenance,
+  intentProvenance,
 } from "../src/prime.ts";
 import type { ReluxPrimeProposal } from "../src/api.ts";
 
@@ -97,6 +98,18 @@ test("polishProvenance shows the OpenRouter model id", () => {
 test("polishProvenance shows the CLI brain label", () => {
   assert.equal(polishProvenance(proposal({ polish: { summary: "x", model: "Claude CLI" } })), "Claude CLI");
   assert.equal(polishProvenance(proposal({ polish: { summary: "x", model: "Codex CLI" } })), "Codex CLI");
+});
+
+// Intent provenance must read HONESTLY: the brain chip shows ONLY when a configured
+// brain genuinely classified the intent (`intent_source === "brain"`); a deterministic
+// turn — no brain, or a proposal the safety gate vetoed — attributes nothing, so the
+// card never overclaims a brain decision (§10.1, §17.1).
+test("intentProvenance shows a label only when the brain decided the intent", () => {
+  assert.equal(intentProvenance("brain"), "brain-classified");
+  // Deterministic / absent / unknown sources attribute nothing.
+  assert.equal(intentProvenance("deterministic"), null);
+  assert.equal(intentProvenance(undefined), null);
+  assert.equal(intentProvenance(""), null);
 });
 
 test("polishProvenance is null without a polish overlay and generic when the source is unrecorded", () => {

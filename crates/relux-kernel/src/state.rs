@@ -3378,13 +3378,45 @@ impl KernelState {
     /// request and are never performed here; everything else is a grounded reply
     /// or a clarifying question. Prime routes only through existing kernel
     /// actions - it never mutates state behind their back (section 7.1, section 10.2).
+    /// Run one Prime turn with the deterministic intent classifier.
+    ///
+    /// Convenience wrapper over [`Self::prime_turn_with_intent`] with no brain
+    /// proposal, so the many call sites (CLI, autonomy, tests) keep the simple
+    /// two-argument form and get exactly the deterministic behavior.
     pub fn prime_turn(
         &mut self,
         ctx: &PrimeContext,
         message: &str,
     ) -> Result<PrimeTurn, KernelError> {
+        Ok(self.prime_turn_with_intent(ctx, message, None)?.0)
+    }
+
+    /// Run one Prime turn, optionally reconciling the deterministic intent with a
+    /// brain-proposed intent.
+    ///
+    /// `intent_proposal` is a structured intent a configured brain proposed for
+    /// this message (see [`crate::prime_intent`]). It is reconciled through the
+    /// fail-closed [`crate::prime_intent::reconcile_intent`] gate: the brain can
+    /// sharpen a misread intent, but can NEVER mint or run work from guarded chat,
+    /// and can never silently auto-run a task. With `None` (no brain configured, or
+    /// the brain failed/timed out) this is exactly the deterministic turn. Returns
+    /// the turn plus where the final intent came from, for honest provenance and
+    /// the audit log. Durable state changes still flow only through `decide` →
+    /// [`Self::prime_execute`]; the brain authors no slots and runs no action.
+    pub fn prime_turn_with_intent(
+        &mut self,
+        ctx: &PrimeContext,
+        message: &str,
+        intent_proposal: Option<&crate::prime_intent::BrainIntentProposal>,
+    ) -> Result<(PrimeTurn, crate::prime_intent::IntentSource), KernelError> {
         let summary = self.inspect_state();
-        let intent = classify_intent(message);
+        let deterministic = classify_intent(message);
+        let (intent, intent_source) = match intent_proposal {
+            Some(proposal) => {
+                crate::prime_intent::reconcile_intent(deterministic, proposal, message)
+            }
+            None => (deterministic, crate::prime_intent::IntentSource::Deterministic),
+        };
         let plan = decide(message, &intent, &summary);
 
         self.record_audit(
@@ -3395,7 +3427,12 @@ impl KernelState {
             None,
             Some(&ctx.namespace),
             AuditResult::Success,
-            serde_json::json!({ "intent": format!("{:?}", intent) }),
+            serde_json::json!({
+                "intent": format!("{:?}", intent),
+                "intent_source": intent_source.as_str(),
+                "brain_intent": intent_proposal.map(|p| format!("{:?}", p.intent)),
+                "brain_confidence": intent_proposal.map(|p| p.confidence),
+            }),
         );
 
         let mut turn = match plan {
@@ -3469,7 +3506,7 @@ impl KernelState {
         // actions"). Each is just a pre-written user message, so it can do
         // nothing the user could not type.
         attach_suggestions(&mut turn, message, &summary);
-        Ok(turn)
+        Ok((turn, intent_source))
     }
 
     /// Execute the safe `Act` actions Prime is allowed to perform directly.

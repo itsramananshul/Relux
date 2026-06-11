@@ -824,6 +824,20 @@ fn is_question(m: &str) -> bool {
     opener || m.ends_with('?')
 }
 
+/// True when a message is guarded as conversation — ideation/musing
+/// ([`is_ideation`]) or a question ([`is_question`]) with no explicit command
+/// ([`is_explicit_command`]) — so it must NOT be minted into work.
+///
+/// This is the same guard `classify_intent` applies inline (sections 10.5, 17.1);
+/// it is exposed so the brain-mediated reconciliation gate
+/// ([`crate::prime_intent::reconcile_intent`]) can enforce the SAME rail — a brain
+/// may never promote a guarded turn to a work intent, no matter how confident it
+/// is. Operates on the raw message; the lowercasing matches `classify_intent`.
+pub fn is_chat_guarded(message: &str) -> bool {
+    let m = message.trim().to_lowercase();
+    (is_ideation(&m) || is_question(&m)) && !is_explicit_command(&m)
+}
+
 /// True when `word` appears in `haystack` as a WHOLE WORD - delimited by a
 /// non-alphanumeric boundary (or string edge) on both sides - rather than as a
 /// substring. Lets the task-creation catch fire on "please fix the bug" while NOT

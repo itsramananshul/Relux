@@ -25,6 +25,7 @@ pub mod event;
 pub mod loader;
 pub mod plugin_install;
 pub mod prime;
+pub mod prime_intent;
 pub mod runtime;
 pub mod state;
 pub mod store;
@@ -35,9 +36,10 @@ pub use adapter::{
     AdapterRunOutcome,
 };
 pub use ai::{
-    clear_stored_config, compose_chat_prompt, compose_polish_prompt, is_actionful,
-    polish_from_cli_text, polish_proposal, proposal_wants_polish, read_stored_config, shape_reply,
-    write_stored_config, AiConfig, AiMode, AiOutcome, AiStatus, PrimeBrain, StoredAiConfig,
+    classify_intent_via_openrouter, clear_stored_config, compose_chat_prompt, compose_polish_prompt,
+    is_actionful, polish_from_cli_text, polish_proposal, proposal_wants_polish, read_stored_config,
+    shape_reply, write_stored_config, AiConfig, AiMode, AiOutcome, AiStatus, PrimeBrain,
+    StoredAiConfig,
 };
 pub use auth::{
     admin_path_for_db, clear_session_cookie, read_admin_username, reset_admin_credential,
@@ -53,7 +55,11 @@ pub use plugin_install::{
     install_from_dir, install_from_github, install_from_zip, is_generated_manifest, list_installed,
     refresh_bundled_plugins, remove_plugin, GENERATED_MANIFEST_AUTHOR,
 };
-pub use prime::{classify_intent, decide};
+pub use prime::{classify_intent, decide, is_chat_guarded};
+pub use prime_intent::{
+    build_intent_prompt, parse_intent_proposal, reconcile_intent, BrainIntentProposal,
+    IntentSource,
+};
 pub use runtime::{invoke_http_loopback, RuntimeClientError};
 pub use state::{
     run_briefs_in_parallel, AppliedProposedChange, AppliedProposedChangeSet, BundledRefresh,

@@ -603,6 +603,39 @@ pub async fn shape_reply(cfg: &AiConfig, message: &str, turn: &PrimeTurn) -> AiO
     }
 }
 
+/// Classify one user message into a structured intent via the OpenRouter brain.
+///
+/// Returns a validated [`crate::prime_intent::BrainIntentProposal`], or `None` on
+/// ANY failure (no key, disabled, network error, or an unparseable reply) — every
+/// failure path lands on the deterministic classifier, so the brain is strictly
+/// additive. This is the structured LLM-mediated intent stage the master plan asks
+/// for (§10.1, §17.1): the model only *proposes* the intent; the kernel still
+/// validates it against the allowlist and reconciles it behind the fail-closed
+/// safety gate. The raw model text is parsed by
+/// [`crate::prime_intent::parse_intent_proposal`]; nothing un-validated escapes.
+pub async fn classify_intent_via_openrouter(
+    cfg: &AiConfig,
+    message: &str,
+) -> Option<crate::prime_intent::BrainIntentProposal> {
+    if !cfg.enabled() || cfg.api_key.is_none() {
+        return None;
+    }
+    let messages = vec![
+        ChatMessage {
+            role: "system",
+            content: "You output only compact JSON. No prose, no code fences.".to_string(),
+        },
+        ChatMessage {
+            role: "user",
+            content: crate::prime_intent::build_intent_prompt(message),
+        },
+    ];
+    match request_completion(cfg, messages).await {
+        Ok(text) => crate::prime_intent::parse_intent_proposal(&text).ok(),
+        Err(_) => None,
+    }
+}
+
 /// Combine an LLM result with the deterministic fallback into a final outcome.
 /// Pure, so both the success and failure (fallback + note) paths are testable
 /// without a network.

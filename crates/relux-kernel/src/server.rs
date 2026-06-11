@@ -1579,6 +1579,12 @@ struct PrimeResponse {
     /// A safe, non-secret note (e.g. why LLM was skipped or fell back).
     #[serde(skip_serializing_if = "Option::is_none")]
     ai_note: Option<String>,
+    /// Present only when a configured brain genuinely shaped this turn's intent
+    /// (the value is `brain`). Absent for deterministic turns — including a brain
+    /// proposal that the safety gate vetoed — so the UI attributes the brain only
+    /// when it actually decided. Provenance only; never affects execution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    intent_source: Option<String>,
 }
 
 /// Run exactly one durable Prime turn (`docs/RELUX_MASTER_PLAN.md` section 10) over
@@ -1607,24 +1613,52 @@ async fn run_prime(
         _ => None,
     };
 
-    // 1. Run the deterministic kernel turn (must happen under the lock). While we
-    // hold the lock, also snapshot the runtime status of the brain's CLI adapter
-    // (if any), so the spawn below can happen outside the lock.
-    let (turn, summary, cli_status) = {
+    // 0. Snapshot the brain's CLI adapter status (if any) under a short read-only
+    // lock. A CLI brain needs this BEFORE the turn so it can classify intent (and
+    // it is reused below for the reply/polish spawns), all OUTSIDE the main lock.
+    let cli_status = if cli_adapter_id.is_some() {
         let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut store = SqliteStore::open(&state.db_path)?;
-        let mut kernel = store.load()?;
-        let ctx = crate::ensure_bootstrapped(&mut kernel)?;
-        let turn = kernel.prime_turn(&ctx, &message)?;
-        let summary = state_response(&kernel, &state.db_path);
-        let cli_status = cli_adapter_id.and_then(|id| {
+        let store = SqliteStore::open(&state.db_path)?;
+        let kernel = store.load()?;
+        cli_adapter_id.and_then(|id| {
             kernel
                 .adapter_runtime_status()
                 .into_iter()
                 .find(|a| a.plugin_id == id)
-        });
+        })
+    } else {
+        None
+    };
+
+    // 0b. Brain-mediated intent proposal (OUTSIDE the lock — it can involve a slow
+    // network/process call). When a real brain is configured it *proposes* the
+    // intent of this message; the kernel then validates and reconciles it behind
+    // the fail-closed gate. ANY failure (no key, disabled, timeout, off-allowlist
+    // reply) yields `None`, and the kernel falls back to the deterministic keyword
+    // classifier — the brain is strictly additive (§10.1, §17.1).
+    let intent_proposal = match brain {
+        relux_kernel::PrimeBrain::Openrouter => {
+            relux_kernel::classify_intent_via_openrouter(&ai_config, &message).await
+        }
+        relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli => {
+            classify_intent_via_cli(brain, cli_status.clone(), &message).await
+        }
+        relux_kernel::PrimeBrain::Local => None,
+    };
+
+    // 1. Run the deterministic kernel turn (must happen under the lock), passing
+    // the optional brain proposal so the kernel reconciles + audits the final
+    // intent at its single chokepoint. `intent_source` records who decided.
+    let (turn, summary, intent_source) = {
+        let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut store = SqliteStore::open(&state.db_path)?;
+        let mut kernel = store.load()?;
+        let ctx = crate::ensure_bootstrapped(&mut kernel)?;
+        let (turn, intent_source) =
+            kernel.prime_turn_with_intent(&ctx, &message, intent_proposal.as_ref())?;
+        let summary = state_response(&kernel, &state.db_path);
         store.save(&kernel)?;
-        (turn, summary, cli_status)
+        (turn, summary, intent_source)
     };
 
     // 2. Produce the conversational reply through the selected brain. Actions are
@@ -1676,12 +1710,20 @@ async fn run_prime(
         }
     }
 
+    // Surface intent provenance only when the brain genuinely drove the intent (a
+    // vetoed or low-confidence proposal stays deterministic and shows nothing).
+    let intent_source_label = match intent_source {
+        relux_kernel::IntentSource::Brain => Some("brain".to_string()),
+        relux_kernel::IntentSource::Deterministic => None,
+    };
+
     Ok(Json(PrimeResponse {
         turn: final_turn,
         state: summary,
         ai_mode: outcome.mode,
         ai_model: outcome.model,
         ai_note: outcome.note,
+        intent_source: intent_source_label,
     }))
 }
 
@@ -1908,6 +1950,86 @@ async fn run_cli_brain(
             "{label} run was interrupted; showing the grounded reply. Please try again."
         )),
     }
+}
+
+/// Classify one user message into a structured intent via a local CLI brain
+/// (Claude / Codex). Returns a validated [`relux_kernel::BrainIntentProposal`] or
+/// `None` on ANY failure (adapter missing/disabled/off-PATH, spawn error,
+/// timeout, error envelope, or an unparseable reply) — every failure path lands
+/// on the deterministic classifier, so the brain is strictly additive (§10.1,
+/// §17.1).
+///
+/// No-leak seam: the spawn uses the same bounded, non-bypass mode the assigned-run
+/// path uses (argv-only, prompt on stdin, wall-clock timeout, output cap, secret
+/// redaction), and the captured stdout is lifted by [`parse_adapter_result`] FIRST
+/// — so the raw `--output-format json` envelope never reaches the classifier or
+/// the UI — and only the lifted human text is handed to
+/// [`relux_kernel::parse_intent_proposal`], which validates it against the intent
+/// allowlist. It performs NO durable action: it only proposes an intent the kernel
+/// then reconciles behind the fail-closed gate.
+async fn classify_intent_via_cli(
+    brain: relux_kernel::PrimeBrain,
+    status: Option<relux_core::AdapterRuntimeStatus>,
+    message: &str,
+) -> Option<relux_kernel::BrainIntentProposal> {
+    let kind = match brain {
+        relux_kernel::PrimeBrain::ClaudeCli => relux_core::AdapterKind::ClaudeCli,
+        relux_kernel::PrimeBrain::CodexCli => relux_core::AdapterKind::CodexCli,
+        // Not a CLI brain — caller never routes these here.
+        _ => return None,
+    };
+    // Missing / disabled / off-PATH adapter: no classification, just fall back to
+    // the deterministic classifier (the conversational reply path carries any
+    // actionable note about the adapter on this same turn).
+    let st = status?;
+    if st.state != relux_core::AdapterRuntimeState::Available {
+        return None;
+    }
+    let program = st.resolved_path.clone()?;
+
+    let prompt = relux_kernel::build_intent_prompt(message);
+    let spec = relux_kernel::AdapterCommandSpec {
+        program,
+        args: relux_kernel::build_adapter_args(&kind),
+        stdin: prompt,
+        working_dir: st.working_dir.clone(),
+        timeout: std::time::Duration::from_secs(
+            st.timeout_seconds
+                .unwrap_or(relux_core::DEFAULT_ADAPTER_TIMEOUT_SECONDS),
+        ),
+        max_output_bytes: st
+            .max_output_bytes
+            .unwrap_or(relux_core::DEFAULT_ADAPTER_MAX_OUTPUT_BYTES) as usize,
+    };
+
+    // The spawn is blocking (poll loop); keep it off the async reactor.
+    let run = tokio::task::spawn_blocking(move || relux_kernel::run_adapter_command(&spec)).await;
+    let outcome = match run {
+        Ok(Ok(outcome)) if outcome.success && !outcome.stdout.trim().is_empty() => outcome,
+        // Timeout / non-zero exit / spawn error / interruption: fall back silently.
+        _ => return None,
+    };
+
+    parse_cli_intent(&outcome.stdout, kind)
+}
+
+/// Lift a validated intent proposal out of a CLI brain's captured `stdout`, or
+/// `None`. This is the no-leak parse boundary, kept pure so it is pinned by unit
+/// tests WITHOUT spawning a process: [`parse_adapter_result`] lifts the human text
+/// out of the `--output-format json` envelope (degrading to raw prose otherwise,
+/// exactly as the conversational/polish paths do), an envelope that reported an
+/// error is dropped, and the lifted text is validated against the intent allowlist
+/// by [`relux_kernel::parse_intent_proposal`]. The raw envelope never escapes this
+/// function.
+fn parse_cli_intent(
+    stdout: &str,
+    kind: relux_core::AdapterKind,
+) -> Option<relux_kernel::BrainIntentProposal> {
+    let parsed = relux_core::parse_adapter_result(stdout, kind);
+    if parsed.is_error == Some(true) {
+        return None;
+    }
+    relux_kernel::parse_intent_proposal(&parsed.text).ok()
 }
 
 /// Validate a CLI brain's captured `stdout` into an advisory proposal polish, or
@@ -5103,6 +5225,73 @@ mod tests {
         assert!(
             shape_cli_brain_polish(stdout, relux_core::AdapterKind::ClaudeCli, "Claude CLI", &p).is_none(),
             "prose with no JSON object must not polish the card"
+        );
+    }
+
+    // --- Brain-mediated intent classification: the no-leak parse boundary ------
+    //
+    // These pin `parse_cli_intent` — the exact composition `classify_intent_via_cli`
+    // runs after the spawn — WITHOUT spawning a real CLI (the task's honest bar:
+    // test the parser/adapter boundary, never let `echo` pretend to be intelligence).
+    // The raw `--output-format json` envelope must never reach the validated
+    // proposal, and only an allowlisted intent label survives.
+
+    #[test]
+    fn cli_intent_classification_lifted_from_a_result_envelope() {
+        // The Claude CLI wraps the classifier's JSON inside its result envelope;
+        // parse_adapter_result lifts the inner string, then parse_intent_proposal
+        // validates the label against the PrimeIntent allowlist.
+        let inner = r#"{\"intent\":\"task_creation\",\"confidence\":0.92,\"rationale\":\"explicit ask to fix a bug\"}"#;
+        let stdout = format!(r#"{{"type":"result","is_error":false,"result":"{inner}","session_id":"abc","duration_ms":12}}"#);
+        let p = parse_cli_intent(&stdout, relux_core::AdapterKind::ClaudeCli)
+            .expect("a valid envelope yields a validated intent proposal");
+        assert_eq!(p.intent, relux_core::PrimeIntent::TaskCreation);
+        assert_eq!(p.confidence, 0.92);
+        // No envelope scaffolding leaks into the validated proposal.
+        assert!(!p.rationale.contains("session_id"), "no metadata leak: {}", p.rationale);
+        assert!(!p.rationale.contains("duration_ms"), "no metadata leak: {}", p.rationale);
+        assert!(!p.rationale.contains("\"type\""), "no envelope type leak: {}", p.rationale);
+    }
+
+    #[test]
+    fn cli_intent_plain_json_from_codex_text_mode() {
+        // Codex `exec` / text mode emits the JSON object as raw prose (no envelope).
+        let stdout = r#"{"intent":"brainstorming","confidence":0.7,"rationale":"musing"}"#;
+        let p = parse_cli_intent(stdout, relux_core::AdapterKind::CodexCli)
+            .expect("raw JSON prose still validates");
+        assert_eq!(p.intent, relux_core::PrimeIntent::Brainstorming);
+    }
+
+    #[test]
+    fn cli_intent_error_envelope_yields_no_classification() {
+        // An envelope reporting an error is dropped — the turn falls back to the
+        // deterministic classifier, and the raw error text never leaks.
+        let stdout = r#"{"type":"result","is_error":true,"result":"rate limited","session_id":"x"}"#;
+        assert!(
+            parse_cli_intent(stdout, relux_core::AdapterKind::ClaudeCli).is_none(),
+            "an error envelope must yield no brain classification"
+        );
+    }
+
+    #[test]
+    fn cli_intent_prose_with_no_json_yields_no_classification() {
+        // A chatty CLI that ignored the JSON instruction -> no proposal, the
+        // deterministic classifier decides.
+        let stdout = r#"{"type":"result","is_error":false,"result":"I think you want to create a task."}"#;
+        assert!(
+            parse_cli_intent(stdout, relux_core::AdapterKind::ClaudeCli).is_none(),
+            "prose with no JSON object must not produce a brain intent"
+        );
+    }
+
+    #[test]
+    fn cli_intent_off_allowlist_label_yields_no_classification() {
+        // A hallucinated intent the enum does not define is refused at the seam.
+        let inner = r#"{\"intent\":\"delete_everything\",\"confidence\":1.0}"#;
+        let stdout = format!(r#"{{"type":"result","is_error":false,"result":"{inner}"}}"#);
+        assert!(
+            parse_cli_intent(&stdout, relux_core::AdapterKind::ClaudeCli).is_none(),
+            "an off-allowlist label must be rejected, never acted on"
         );
     }
 

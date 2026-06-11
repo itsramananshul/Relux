@@ -9,6 +9,27 @@ once a stable release is cut.
 
 ### Added
 
+- **Brain-mediated Prime intent classification (post-v0.1.7).** Prime's intent is
+  no longer decided by the keyword cascade alone. When a real brain is configured
+  (OpenRouter, or the local Claude / Codex CLI) it now *proposes* the intent of a
+  message through a structured, JSON-only decision stage
+  (`crates/relux-kernel/src/prime_intent.rs`): the proposed label is validated
+  against the `PrimeIntent` allowlist (an off-list label is rejected), and a
+  **fail-closed reconciliation gate** keeps the master-plan safety semantics — a
+  brain may sharpen a misread intent (e.g. "could you take care of the login bug"
+  now becomes a task instead of a generic chat reply), but it can **never** mint or
+  run work from guarded chat (ideation/questions without an explicit command),
+  low-confidence proposals keep the deterministic intent, and a
+  create-and-run without explicit run language is downgraded to create (no silent
+  auto-run). Any brain failure (no key, disabled, timeout, error envelope,
+  unparseable reply) falls back to the deterministic classifier, so the brain is
+  strictly additive. The CLI path lifts the human text out of the `--output-format
+  json` envelope **before** validating, so the raw envelope never reaches the UI.
+  The chat card shows a small **🧠 brain-classified** chip only when the brain
+  genuinely decided the intent. Built reference-first per the new
+  `docs/reference-driven-development.md` rule (read: Hermes' allowlist-validated
+  tool loop, Paperclip/openclaw's fail-closed mutation gate and balanced-JSON
+  output parsing). (`docs/RELUX_MASTER_PLAN.md` §10.1 Intent Layer, §17.1.)
 - **Relux local release v0.1.7 (Windows bundle).** The `relux-kernel` /
   `relux-core` crates move from `0.1.6` to `0.1.7`, bundling the post-v0.1.6
   product work into a fresh Windows release. Headlines: a **first-class idea →

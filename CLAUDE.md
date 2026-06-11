@@ -12,6 +12,7 @@ The authoritative product/design docs are:
 - `docs/relix-hermes-integration.md` + `docs/relix-agent-adapters.md` — the universal Rig adapter system, governance model, subscription CLIs, bridge-back token, Hermes seam, Tether plugin-hook system, and the Pillar-1 transplants (Keeper/Macro/Bench).
 - `docs/product-spine-roadmap.md` — the phased roadmap.
 - `docs/product-spine-implementation.md` — the implementation map + the **audited divergence ledger** (what currently differs from the docs; keep it honest).
+- `docs/reference-driven-development.md` — **BINDING.** Before changing Prime, plugins, agents/crew, orchestration, adapter execution, approvals, or task/workflow behavior, you MUST first read the corresponding Hermes (`reference/hermes-agent-main/`) and Paperclip/openclaw (`reference/openclaw-main/`) code paths, and record which files were read, the exact logic learned, and how Relux maps it. No feature work justified by vibes or two hard-coded examples. Keyword rules are fallback safety rails only — never the primary brain.
 
 ### Before writing ANY code
 
