@@ -1396,6 +1396,48 @@ impl KernelState {
         Ok(())
     }
 
+    /// Revoke an explicit permission from an existing agent (the inverse of
+    /// [`grant_permission_to_agent`]). The operator console is the human approval —
+    /// the action is audited like the grant. Revoking a permission the agent does not
+    /// hold is an honest [`KernelError::PermissionNotGranted`] (fail closed: we never
+    /// silently report success for a no-op). A revoke only removes an EXPLICIT grant;
+    /// it cannot reach implicit/built-in capabilities (there are none — least
+    /// privilege, section 17.5), so the agent's effective powers shrink to exactly the
+    /// remaining explicit list.
+    pub fn revoke_permission_from_agent(
+        &mut self,
+        agent_id: &AgentId,
+        permission: &Permission,
+    ) -> Result<(), KernelError> {
+        let agent = self
+            .agents
+            .get_mut(agent_id)
+            .ok_or_else(|| KernelError::UnknownAgent(agent_id.to_string()))?;
+
+        let before = agent.permissions.len();
+        agent.permissions.retain(|p| !p.matches_exact(permission));
+        if agent.permissions.len() == before {
+            return Err(KernelError::PermissionNotGranted(
+                agent_id.to_string(),
+                permission.to_string(),
+            ));
+        }
+        let namespace_id = agent.namespace_id.clone();
+
+        self.record_audit(
+            "kernel",
+            "kernel",
+            "agent:revoke_permission",
+            Some("agent"),
+            Some(agent_id.as_str()),
+            Some(&namespace_id),
+            AuditResult::Success,
+            serde_json::json!({ "permission": permission.as_str() }),
+        );
+
+        Ok(())
+    }
+
     // --- Tasks -------------------------------------------------------------
 
     /// Create a durable unit of work (`docs/RELUX_MASTER_PLAN.md` section 9.5).
@@ -11788,6 +11830,33 @@ mod tests {
             matches!(err, KernelError::PermissionAlreadyGranted(..)),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn revoke_permission_from_agent_works_audits_and_fails_closed() {
+        let (mut k, prime, _task, _run, _echo) = primed_kernel();
+        let perm = Permission::new("tool:relux-tools-github:read").unwrap();
+
+        // Revoking a permission the agent does not hold is an honest error, never a
+        // silent no-op success.
+        let err = k.revoke_permission_from_agent(&prime, &perm).unwrap_err();
+        assert!(matches!(err, KernelError::PermissionNotGranted(..)), "got {err:?}");
+
+        // Grant then revoke: the explicit list shrinks and the revoke is audited.
+        k.grant_permission_to_agent(&prime, perm.clone()).unwrap();
+        assert!(k.agent(&prime).unwrap().permissions.contains(&perm));
+        k.revoke_permission_from_agent(&prime, &perm)
+            .expect("should revoke a held permission");
+        assert!(!k.agent(&prime).unwrap().permissions.contains(&perm));
+        assert!(k
+            .audit_log()
+            .iter()
+            .any(|e| e.action == "agent:revoke_permission" && e.result == AuditResult::Success));
+
+        // Revoking a missing agent fails closed too.
+        let ghost = AgentId::new("no-such-agent");
+        let err = k.revoke_permission_from_agent(&ghost, &perm).unwrap_err();
+        assert!(matches!(err, KernelError::UnknownAgent(_)), "got {err:?}");
     }
 
     #[test]

@@ -86,7 +86,7 @@ export const api = {
   post: <T = unknown>(path: string, body?: unknown) => request("POST", path, body) as Promise<T>,
   put: <T = unknown>(path: string, body?: unknown) => request("PUT", path, body) as Promise<T>,
   patch: <T = unknown>(path: string, body?: unknown) => request("PATCH", path, body) as Promise<T>,
-  del: <T = unknown>(path: string) => request("DELETE", path) as Promise<T>,
+  del: <T = unknown>(path: string, body?: unknown) => request("DELETE", path, body) as Promise<T>,
 };
 
 // ── Current session metadata (`GET /v1/auth/me`) ──────────────────────────
@@ -1959,10 +1959,20 @@ export interface ReluxAgent {
   namespace: string;
   status: string;
   permissions_summary: string;
+  // The agent's EXPLICIT permission strings (`<prefix>:<resource>:<action>`). Least
+  // privilege: there are no implicit/built-in capabilities, so this is the agent's
+  // full effective power. The Crew governance surface reads/edits these directly.
+  permissions: string[];
   // The agent's starter persona / operating style, when one was set (today via the
   // brain-assisted agent-creation path). Omitted when none.
   persona?: string;
   created_at: string;
+}
+
+// The updated explicit permission list returned by a grant/revoke.
+export interface ReluxAgentPermissions {
+  agent_id: string;
+  permissions: string[];
 }
 
 // Operator-supplied fields for creating/editing a crew member (agent). Every field
@@ -2158,6 +2168,21 @@ export const reluxWork = {
   // an empty `persona` clears it. Returns the updated agent record.
   updateAgent: (id: string, body: ReluxAgentConfig) =>
     api.patch<ReluxAgent>(`/v1/relux/agents/${encodeURIComponent(id)}`, body),
+  // Grant an EXPLICIT permission to an agent. The operator console is the human
+  // approval (the same gate as clicking the button); the kernel audits the grant.
+  // A malformed permission string is an honest 400. Returns the new explicit list.
+  grantPermission: (id: string, permission: string) =>
+    api.post<ReluxAgentPermissions>(
+      `/v1/relux/agents/${encodeURIComponent(id)}/permissions`,
+      { permission },
+    ),
+  // Revoke an explicit permission from an agent (the inverse of grantPermission).
+  // Revoking one the agent does not hold is an honest 404. Returns the remaining list.
+  revokePermission: (id: string, permission: string) =>
+    api.del<ReluxAgentPermissions>(
+      `/v1/relux/agents/${encodeURIComponent(id)}/permissions`,
+      { permission },
+    ),
   // Create a new task and assign it to Prime.
   createTask: (title: string) => api.post<ReluxTask>("/v1/relux/tasks", { title }),
   // Start an execution attempt for a task.

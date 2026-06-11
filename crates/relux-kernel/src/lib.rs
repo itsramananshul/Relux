@@ -257,6 +257,8 @@ pub enum KernelError {
     PermissionDenied { agent: String, permission: String },
     #[error("permission '{1}' already granted to agent {0}")]
     PermissionAlreadyGranted(String, String),
+    #[error("agent {0} does not hold permission '{1}'")]
+    PermissionNotGranted(String, String),
     #[error("storage error: {0}")]
     Storage(String),
     /// `serve` could not bind its listen address (e.g. a port conflict). The

@@ -1792,3 +1792,55 @@ with its own already-validated slots). Edit is field-granular ("absent ⇒ uncha
 non-existent agent or point one at a non-adapter plugin. The persona is the only free-text durable
 field and it is bounded + secret-redacted; nothing here grants new capability (permission grants
 stay on the explicit, approval-gated path).
+
+---
+
+## Reference read — Crew governance: explicit-permission view + safe revoke (this slice)
+
+The manual Crew create/edit slice above deliberately stopped at identity/role/persona/adapter/
+status and recorded permission/budget/skills governance as future work. This slice takes the
+smallest safe next step of the §9 Permissions panel: **surface each crew member's explicit
+permissions and let the operator revoke one.** A *grant* path already existed
+(`KernelState::grant_permission_to_agent` + `POST /v1/relux/agents/:id/permissions`); the gap was
+that the card showed only a count and there was **no revoke** — so a capability, once granted,
+could never be taken back from the console. Skills/tags and budget stay future work (the core
+`Agent` has neither field; adding one is more than a minimal slice and §9.1 already defers them).
+
+### Paperclip (openclaw) — files read
+
+- `reference/openclaw-main/src/acp/approval-classifier.ts` — `EXEC_CAPABLE_TOOL_IDS` /
+  `CONTROL_PLANE_TOOL_IDS` (L15-23) are explicit allowlists that map a subject to a risk **class**
+  (`exec_capable` / `control_plane`), and an elevated class forces `autoApprove = false`;
+  `normalizeToolName` (L57-63) lowercases, length-bounds, and accepts only a strict
+  `^[a-z0-9._-]+$` subject (else `undefined`). **Pattern: classify a capability against an explicit
+  control-plane/exec allowlist and never auto-approve an elevated one; normalize the subject to a
+  strict id shape first.**
+- `reference/openclaw-main/src/agents/tool-policy.ts` — `applyOwnerOnlyToolPolicy` /
+  `resolveOwnerOnlyToolApprovalClass` (L18-59): a control-plane capability is one explicit, gated
+  thing, added or refused deliberately — never inferred. **Pattern: granting/removing a
+  control-plane capability is an explicit, deliberate act.**
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/agent/agent_runtime_helpers.py` `repair_tool_call` (L1566-1636) —
+  a model-chosen name is normalized then matched against the KNOWN set, and only a member of that
+  set is honored. Mirrors validating a permission string against the canonical prefix allowlist
+  before it is sent (client) and again in the kernel (server) — a value off the allowlist is
+  refused, never coerced.
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| openclaw: **classify a capability against an explicit control-plane/exec allowlist; never auto-approve an elevated one** | `apps/dashboard/src/governance.ts` `ELEVATED_PREFIXES` (`adapter:`/`provider:`/`exec:`/`plugin:`/`agent:`/`approval:`) → `permissionRisk` returns `"elevated"`, and the Crew form requires an explicit `window.confirm` before granting one; `tool:`/`task:`/`audit:` are `"standard"`. This is a UI caution, not an enforcement boundary (the kernel still audits and enforces least privilege). |
+| openclaw: **normalize a subject to a strict id shape before acting** (`normalizeToolName`) | `governance.ts` `isValidPermission` / `permissionInvalidReason` reject a permission that does not start with a canonical prefix (mirrored from `relux-core` `VALID_PREFIXES`) BEFORE the API call; `relux_core::Permission::new` re-validates server-side (honest 400 on a bad string). |
+| openclaw: **granting/removing a control-plane capability is an explicit, deliberate, audited act** | `KernelState::revoke_permission_from_agent` is the inverse of the existing grant: it removes only an EXPLICIT permission, records an `agent:revoke_permission` audit, and fails closed (`PermissionNotGranted` → 404) when the agent does not hold it — never a silent no-op. `DELETE /v1/relux/agents/:id/permissions` exposes it; the operator console is the human approval (the same gate as clicking the button). |
+| Hermes: **honor only a value in the known set** (`repair_tool_call`) | the create/edit form never auto-grants — `create_agent` still grants only the minimal `tool:relux-tools-echo:say`; every other capability is an explicit, warned operator grant. |
+
+**What we deliberately do differently:** revoke is a direct, audited **operator** action (the
+human at the console is the approval), not a Prime `Propose` — Prime's own `GrantPermission` stays
+approval-gated as before; this is the operator governing their own crew. Revoke can only remove an
+explicit grant (least privilege means there are no implicit capabilities to reach), so an agent's
+effective power always equals exactly its listed permissions. Skills/tags and per-agent budget
+remain future work: the `Agent` model has neither field, and inventing unenforced budget UI or a
+core-struct skills field is outside a minimal, safe slice.

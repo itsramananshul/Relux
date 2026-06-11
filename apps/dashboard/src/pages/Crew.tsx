@@ -10,6 +10,10 @@ import {
 } from "../api";
 import { useAsync } from "../components/common";
 import { ADAPTER_STATE_LABEL } from "../plugins";
+import {
+  isElevatedPermission,
+  permissionInvalidReason,
+} from "../governance";
 
 type Agent = ReluxAgent;
 
@@ -122,6 +126,11 @@ export function Crew() {
                     }}
                     onCancel={() => setEditingId(null)}
                   />
+                  <GovernanceSection
+                    agentId={agent.id}
+                    permissions={agent.permissions ?? []}
+                    onChanged={afterChange}
+                  />
                 </div>
               ) : (
                 <div key={agent.id} className="agent-card">
@@ -134,7 +143,7 @@ export function Crew() {
                   )}
                   <p><strong>Status:</strong> {agent.status || "—"}</p>
                   <p><strong>Adapter:</strong> {agent.adapter_plugin || "—"}</p>
-                  <p><strong>Permissions:</strong> {agent.permissions_summary || "N/A"}</p>
+                  <PermissionsList permissions={agent.permissions ?? []} />
                   <p>
                     <strong>Queued Tasks:</strong>{" "}
                     <Link to={`/work?agentId=${agent.id}&status=queued`} className="link">
@@ -319,6 +328,174 @@ function CrewMemberForm({
         )}
       </div>
     </form>
+  );
+}
+
+// Compact, read-only explicit-permission display for a crew card. Least privilege:
+// this is the agent's full effective power (there are no implicit capabilities), so a
+// short list reads honestly. An elevated (control-plane) grant is flagged so the
+// operator can see it at a glance.
+function PermissionsList({ permissions }: { permissions: string[] }) {
+  if (permissions.length === 0) {
+    return (
+      <p>
+        <strong>Permissions:</strong> none (least privilege)
+      </p>
+    );
+  }
+  return (
+    <div>
+      <p style={{ marginBottom: 4 }}>
+        <strong>Permissions ({permissions.length}):</strong>
+      </p>
+      <ul className="perm-list" style={{ margin: 0, paddingLeft: 16, fontSize: 12 }}>
+        {permissions.map((p) => (
+          <li key={p} className="mono" style={{ listStyle: "disc" }}>
+            {p}
+            {isElevatedPermission(p) && (
+              <span className="badge warn" style={{ marginLeft: 6 }}>
+                elevated
+              </span>
+            )}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+// The compact Governance section on the edit card: view/grant/revoke an agent's
+// EXPLICIT permissions. The operator console is the human approval (the same gate as
+// clicking the button), so grant/revoke act immediately and are audited by the kernel
+// — this is made explicit in the copy. Dangerous (control-plane) grants require a
+// deliberate confirm; nothing dangerous is ever auto-granted (the create form grants
+// only the minimal echo tool). docs/relix-dashboard-design.md §9 / §9.1.
+function GovernanceSection({
+  agentId,
+  permissions,
+  onChanged,
+}: {
+  agentId: string;
+  permissions: string[];
+  onChanged: () => void;
+}) {
+  const [newPerm, setNewPerm] = useState("");
+  const [busy, setBusy] = useState<string | null>(null); // the permission currently mutating
+  const [error, setError] = useState<string | null>(null);
+
+  const invalidReason = newPerm.trim() ? permissionInvalidReason(newPerm) : null;
+
+  async function grant() {
+    const perm = newPerm.trim();
+    const reason = permissionInvalidReason(perm);
+    if (reason) {
+      setError(reason);
+      return;
+    }
+    if (
+      isElevatedPermission(perm) &&
+      !window.confirm(
+        `"${perm}" is an elevated (control-plane) capability. Grant it to this agent now? ` +
+          `This acts immediately as you and is audited.`,
+      )
+    ) {
+      return;
+    }
+    setBusy(perm);
+    setError(null);
+    try {
+      await reluxWork.grantPermission(agentId, perm);
+      setNewPerm("");
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Grant failed.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function revoke(perm: string) {
+    if (
+      !window.confirm(
+        `Revoke "${perm}" from this agent? It loses that capability immediately (you can re-grant it).`,
+      )
+    ) {
+      return;
+    }
+    setBusy(perm);
+    setError(null);
+    try {
+      await reluxWork.revokePermission(agentId, perm);
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Revoke failed.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <div className="governance-section" style={{ marginTop: 12, borderTop: "1px solid var(--border, #2a2a2a)", paddingTop: 10 }}>
+      <h4 style={{ margin: "0 0 4px" }}>Governance — permissions</h4>
+      <p className="muted" style={{ fontSize: 12, marginTop: 0 }}>
+        Grant/revoke acts immediately as you and is audited. Elevated (control-plane)
+        capabilities ask for confirmation. Least privilege: an agent has only what is
+        listed here.
+      </p>
+      {error && <div className="error-message">{error}</div>}
+      {permissions.length === 0 ? (
+        <p className="muted" style={{ fontSize: 12 }}>No explicit permissions.</p>
+      ) : (
+        <ul className="perm-list" style={{ margin: "4px 0", paddingLeft: 0, listStyle: "none" }}>
+          {permissions.map((p) => (
+            <li
+              key={p}
+              style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}
+            >
+              <span className="mono" style={{ fontSize: 12, flex: 1 }}>
+                {p}
+                {isElevatedPermission(p) && (
+                  <span className="badge warn" style={{ marginLeft: 6 }}>elevated</span>
+                )}
+              </span>
+              <button
+                type="button"
+                className="btn ghost sm"
+                onClick={() => void revoke(p)}
+                disabled={busy !== null}
+              >
+                {busy === p ? "…" : "Remove"}
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      <div className="form-group" style={{ marginTop: 6 }}>
+        <label htmlFor={`gov-${agentId}-add`}>Add permission:</label>
+        <div style={{ display: "flex", gap: 8 }}>
+          <input
+            id={`gov-${agentId}-add`}
+            type="text"
+            className="mono"
+            value={newPerm}
+            onChange={(e) => setNewPerm(e.target.value)}
+            placeholder="e.g. tool:relux-tools-github:read"
+            style={{ flex: 1 }}
+          />
+          <button
+            type="button"
+            className="btn sm"
+            onClick={() => void grant()}
+            disabled={busy !== null || !!invalidReason || !newPerm.trim()}
+          >
+            {busy === newPerm.trim() ? "…" : "Add"}
+          </button>
+        </div>
+        {invalidReason && (
+          <p className="muted" style={{ fontSize: 11, marginTop: 2 }}>{invalidReason}</p>
+        )}
+      </div>
+    </div>
   );
 }
 

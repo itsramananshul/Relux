@@ -480,7 +480,10 @@ fn protected_router() -> Router<AppState> {
             post(execute_approved_tool_invocation),
         )
         .route("/v1/relux/permissions", get(list_permissions))
-        .route("/v1/relux/agents/:id/permissions", post(grant_agent_permission))
+        .route(
+            "/v1/relux/agents/:id/permissions",
+            post(grant_agent_permission).delete(revoke_agent_permission),
+        )
 }
 
 /// Whether the dev/test auth bypass is requested via `RELUX_AUTH_DISABLED`.
@@ -1479,6 +1482,33 @@ async fn grant_agent_permission(
         })
     })?;
     Ok(Json(updated_agent_permissions))
+}
+
+/// Revoke an EXPLICIT permission from an agent. The operator console is the human
+/// approval (the same gate as if they'd clicked the button), so this is a direct,
+/// audited operator action — the inverse of [`grant_agent_permission`]. Revoking a
+/// permission the agent does not hold is an honest 404 (`PermissionNotGranted`), not a
+/// silent no-op. Returns the agent's remaining explicit permissions.
+async fn revoke_agent_permission(
+    State(state): State<AppState>,
+    AxumPath(agent_id_str): AxumPath<String>,
+    Json(req): Json<GrantPermissionReq>,
+) -> Result<Json<AgentPermissionsRecord>, ApiError> {
+    let agent_id = relux_core::AgentId::new(agent_id_str.clone());
+    let permission = relux_core::Permission::new(&req.permission)
+        .map_err(|e| ApiError::bad_request(format!("invalid permission string: {e}")))?;
+
+    let updated = locked_save(&state, |kernel| {
+        kernel.revoke_permission_from_agent(&agent_id, &permission)?;
+        let agent = kernel
+            .agent(&agent_id)
+            .ok_or_else(|| KernelError::UnknownAgent(agent_id.to_string()))?;
+        Ok(AgentPermissionsRecord {
+            agent_id: agent.id.to_string(),
+            permissions: agent.permissions.iter().map(|p| p.to_string()).collect(),
+        })
+    })?;
+    Ok(Json(updated))
 }
 
 #[derive(Debug, Deserialize)]
@@ -5246,6 +5276,10 @@ struct AgentRecord {
     namespace: String,
     status: String,
     permissions_summary: String,
+    /// The agent's EXPLICIT permission strings (the governance surface on the Crew
+    /// page reads/edits these directly). Least privilege: there are no implicit/
+    /// built-in capabilities, so this list is the agent's full effective power.
+    permissions: Vec<String>,
     /// The agent's starter persona / operating style, when one was set (today via the
     /// brain-assisted agent-slot path). Omitted when none, so the wire stays compact.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5263,6 +5297,7 @@ fn agent_record(agent: &relux_core::Agent) -> AgentRecord {
         namespace: agent.namespace_id.as_str().to_string(),
         status: format!("{:?}", agent.status),
         permissions_summary: format!("{} permissions", agent.permissions.len()),
+        permissions: agent.permissions.iter().map(|p| p.to_string()).collect(),
         persona: agent.persona.clone(),
         created_at: agent.created_at.clone(),
     }
@@ -5388,6 +5423,9 @@ fn status_for(err: &KernelError) -> StatusCode {
         | KernelError::PluginToolNotFound { .. }
         | KernelError::UnknownPlugin(_)
         | KernelError::UnknownAgent(_)
+        // Revoking a permission the agent never held: the target capability is not
+        // present, so a 404 (not a 400) is the honest shape.
+        | KernelError::PermissionNotGranted(..)
         | KernelError::UnknownOrchestration(_) => StatusCode::NOT_FOUND,
         // A configured tool that requires approval cannot be invoked directly yet:
         // a conflict the operator resolves by lowering risk / enabling auto-approve,
@@ -7555,6 +7593,58 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // The agent record now carries its EXPLICIT permission list (the create
+        // granted only the minimal echo tool — never a dangerous capability).
+        let (status, _, body) = call(&state, "GET", "/v1/relux/agents", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("tool:relux-tools-echo:say"), "explicit perms expected: {body}");
+
+        // Grant a permission through the explicit, audited operator path.
+        let (status, _, body) = call(
+            &state,
+            "POST",
+            "/v1/relux/agents/research-bot/permissions",
+            None,
+            Some(r#"{"permission":"tool:relux-tools-github:read"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "grant failed: {body}");
+        assert!(body.contains("tool:relux-tools-github:read"), "got: {body}");
+
+        // Revoke it again; the explicit list shrinks.
+        let (status, _, body) = call(
+            &state,
+            "DELETE",
+            "/v1/relux/agents/research-bot/permissions",
+            None,
+            Some(r#"{"permission":"tool:relux-tools-github:read"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "revoke failed: {body}");
+        assert!(!body.contains("tool:relux-tools-github:read"), "should be revoked: {body}");
+
+        // Revoking a permission the agent does not hold is an honest 404.
+        let (status, _, _) = call(
+            &state,
+            "DELETE",
+            "/v1/relux/agents/research-bot/permissions",
+            None,
+            Some(r#"{"permission":"tool:relux-tools-github:read"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // A malformed permission string is rejected before anything is mutated.
+        let (status, _, _) = call(
+            &state,
+            "POST",
+            "/v1/relux/agents/research-bot/permissions",
+            None,
+            Some(r#"{"permission":"not-a-valid-prefix"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
