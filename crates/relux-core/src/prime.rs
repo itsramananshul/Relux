@@ -609,6 +609,46 @@ pub struct PrimeContext {
     pub actor: String,
 }
 
+/// A small, bounded record of an actionable request Prime asked a clarifying
+/// question about, so the NEXT user message can be read as the answer and the
+/// original request continued — instead of the follow-up being treated as a fresh,
+/// context-free message (`docs/prime-processing-audit.md` "Multi-turn clarify
+/// memory", `docs/RELUX_MASTER_PLAN.md` §10.1 Intent Layer, §10.5 Conversation
+/// Rules, §17.1 "Prime must understand conversational intent").
+///
+/// ## The safety contract (binding)
+///
+/// This record carries ONLY bounded, non-secret user text and a deterministic
+/// intent label — never a provider envelope, a secret, or an executable action. It
+/// is advisory grounding, not authority: when the next turn resolves it, the
+/// combined message flows through the SAME deterministic
+/// `classify_intent` → `decide` → `prime_execute` pipeline (and a risky action still
+/// becomes an approval-gated `Propose`). The record EXPIRES (`expires_at_secs`); a
+/// stale, cancelled, or superseded clarification is dropped and the follow-up is
+/// handled fresh, so a pending question can never silently steer a much later,
+/// unrelated message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingClarification {
+    /// The original (or accumulated) user message that produced the clarifying
+    /// question. Bounded in length by the kernel before storage; plain user text,
+    /// never a raw envelope or secret.
+    pub original_message: String,
+    /// The deterministic intent that was awaiting clarification (e.g. `assign_task`,
+    /// `task_creation`). Used to decide whether a follow-up can resolve it.
+    pub intent: PrimeIntent,
+    /// A short, human label for what is still missing (e.g. `"task id"`, `"agent"`,
+    /// `"task description"`), shown on the small "waiting for: …" chip.
+    pub needs: String,
+    /// The clarifying question Prime asked, kept (bounded) for context display.
+    pub question: String,
+    /// The logical-clock second at which this record was created.
+    pub created_at_secs: u64,
+    /// The logical-clock second after which this record is stale and ignored.
+    pub expires_at_secs: u64,
+    /// Provenance for how the record was produced (today always `"deterministic"`).
+    pub source: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

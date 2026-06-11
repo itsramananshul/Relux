@@ -114,6 +114,9 @@ impl SqliteStore {
                 .load_meta_json("adapter_runtime_configs")?
                 .unwrap_or_default(),
             orchestrations: self.load_meta_json("orchestrations")?.unwrap_or_default(),
+            pending_clarifications: self
+                .load_meta_json("pending_clarifications")?
+                .unwrap_or_default(),
             counters: self.load_counters()?,
         })
     }
@@ -170,6 +173,11 @@ impl SqliteStore {
         put_counter(&tx, "next_orchestration", c.next_orchestration)?;
         put_meta_json(&tx, "prime_autonomy_config", &snapshot.prime_autonomy_config)?;
         put_meta_json(&tx, "orchestrations", &snapshot.orchestrations)?;
+        put_meta_json(
+            &tx,
+            "pending_clarifications",
+            &snapshot.pending_clarifications,
+        )?;
         put_meta_json(&tx, "tool_runtime_configs", &snapshot.tool_runtime_configs)?;
         put_meta_json(
             &tx,

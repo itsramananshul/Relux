@@ -91,7 +91,28 @@ pub struct KernelSnapshot {
     /// id. Defaulted so older snapshots load cleanly.
     #[serde(default)]
     pub orchestrations: Vec<Orchestration>,
+    /// Multi-turn clarification memory, one entry per conversation key, sorted by
+    /// key. Defaulted so older snapshots (which never wrote it) load cleanly.
+    #[serde(default)]
+    pub pending_clarifications: Vec<PendingClarificationEntry>,
     pub counters: KernelCounters,
+}
+
+/// The hard cap on how many distinct conversations' pending clarifications are kept at
+/// once, so the multi-turn memory stays small regardless of how many actors talk to
+/// Prime. When full, inserting a new conversation's record evicts the oldest one.
+pub const MAX_PENDING_CLARIFICATIONS: usize = 32;
+
+/// One persisted multi-turn clarification record, paired with the conversation key it
+/// belongs to (`namespace::actor`). A flat, serializable export of one entry of the
+/// kernel's `pending_clarifications` map (`docs/prime-processing-audit.md`
+/// "Multi-turn clarify memory").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingClarificationEntry {
+    /// The conversation key (`namespace::actor`) this pending clarification belongs to.
+    pub key: String,
+    /// The bounded pending-clarification record.
+    pub pending: relux_core::PendingClarification,
 }
 
 /// The local, in-memory Relux control plane.
@@ -115,6 +136,13 @@ pub struct KernelState {
     /// The append-only audit log, in emission order.
     audit_log: Vec<AuditEvent>,
     pub prime_autonomy_config: PrimeAutonomyConfig,
+    /// Multi-turn clarification memory: the small, bounded pending-clarification
+    /// record per conversation (keyed by namespace + actor), so a follow-up answer
+    /// can resolve the clarifying question Prime asked last turn instead of being
+    /// read as a fresh, context-free message (`docs/prime-processing-audit.md`
+    /// "Multi-turn clarify memory"; see [`crate::prime_clarify_memory`]). Bounded:
+    /// the latest record per conversation, with a hard cap on total entries.
+    pending_clarifications: HashMap<String, relux_core::PendingClarification>,
     clock: Clock,
     next_task: u64,
     next_run: u64,
@@ -213,6 +241,18 @@ impl KernelState {
             audit_events: self.audit_log.clone(),
             prime_autonomy_config: self.prime_autonomy_config.clone(),
             orchestrations: sorted(&self.orchestrations, |o| o.id.as_str()),
+            pending_clarifications: {
+                let mut out: Vec<PendingClarificationEntry> = self
+                    .pending_clarifications
+                    .iter()
+                    .map(|(key, pending)| PendingClarificationEntry {
+                        key: key.clone(),
+                        pending: pending.clone(),
+                    })
+                    .collect();
+                out.sort_by(|a, b| a.key.cmp(&b.key));
+                out
+            },
             counters: KernelCounters {
                 clock_secs: self.clock.secs(),
                 next_task: self.next_task,
@@ -270,6 +310,9 @@ impl KernelState {
             state
                 .orchestrations
                 .insert(orchestration.id.clone(), orchestration);
+        }
+        for entry in snapshot.pending_clarifications {
+            state.pending_clarifications.insert(entry.key, entry.pending);
         }
         state.run_events = snapshot.run_events;
         state.audit_log = snapshot.audit_events;
@@ -3460,6 +3503,45 @@ impl KernelState {
         intent_proposal: Option<&crate::prime_intent::BrainIntentProposal>,
         slots: BrainSlotProposals<'_>,
     ) -> Result<(PrimeTurn, crate::prime_intent::IntentSource), KernelError> {
+        // --- Multi-turn clarification memory (`docs/prime-processing-audit.md`) ----
+        // Before classifying, see whether this message answers a clarifying question
+        // Prime asked last turn. The deterministic resolver decides: a bare answer is
+        // COMBINED with the stored original message (so the original request continues
+        // through the same pipeline); a fresh standalone command/question supersedes the
+        // pending context; an explicit cancellation drops it; a stale (expired) record is
+        // ignored. When continuing, the brain proposals (computed on the raw answer, not
+        // the combined message) are dropped and the deterministic combined classification
+        // stands — the safe fallback that always exists.
+        let key = Self::conversation_key(ctx);
+        let now_secs = self.clock.secs();
+        let mut effective_message: String = message.to_string();
+        let mut continued = false;
+        let mut intent_proposal = intent_proposal;
+        let mut slots = slots;
+        if let Some(pending) = self.pending_clarifications.get(&key).cloned() {
+            match crate::prime_clarify_memory::resolve_pending(&pending, message, now_secs) {
+                crate::prime_clarify_memory::ClarifyResolution::Cancelled => {
+                    self.pending_clarifications.remove(&key);
+                    let turn = self.clarification_cancelled_turn(ctx, &pending);
+                    return Ok((turn, crate::prime_intent::IntentSource::Deterministic));
+                }
+                crate::prime_clarify_memory::ClarifyResolution::Expired
+                | crate::prime_clarify_memory::ClarifyResolution::FreshRequest => {
+                    // Drop the superseded/stale context; handle this message fresh.
+                    self.pending_clarifications.remove(&key);
+                }
+                crate::prime_clarify_memory::ClarifyResolution::Continue { combined } => {
+                    effective_message = combined;
+                    continued = true;
+                    // The brain proposals were computed on the raw answer; ignore them so
+                    // the combined message is classified/extracted deterministically.
+                    intent_proposal = None;
+                    slots = BrainSlotProposals::default();
+                }
+            }
+        }
+        let message: &str = &effective_message;
+
         let summary = self.inspect_state();
         // The live adapter roster, so a brain-proposed agent adapter is honored only
         // when it names one that actually exists (fail closed).
@@ -3490,6 +3572,7 @@ impl KernelState {
                 "intent_source": intent_source.as_str(),
                 "brain_intent": intent_proposal.map(|p| format!("{:?}", p.intent)),
                 "brain_confidence": intent_proposal.map(|p| p.confidence),
+                "clarify_continued": continued,
             }),
         );
 
@@ -3609,12 +3692,134 @@ impl KernelState {
                 }
             }
         };
+        // Multi-turn clarification memory: record a NEW pending clarification when this
+        // turn asked an actionable, resolvable clarifying question, or clear any existing
+        // one when the turn resolved/changed it. The combined message is stored as the new
+        // original so a further follow-up keeps accumulating context.
+        self.update_pending_clarification(&key, &turn, message, now_secs);
+
         // One central place to offer the next-step buttons the chat surface
         // renders (`docs/RELUX_MASTER_PLAN.md` §11.1 "Prime suggested next
         // actions"). Each is just a pre-written user message, so it can do
         // nothing the user could not type.
         attach_suggestions(&mut turn, message, &summary);
         Ok((turn, intent_source))
+    }
+
+    /// The conversation key a pending clarification is stored under: the namespace and
+    /// the human actor talking, so two different operators (or namespaces) never share a
+    /// pending question. Stable and deterministic.
+    fn conversation_key(ctx: &PrimeContext) -> String {
+        format!("{}::{}", ctx.namespace.as_str(), ctx.actor)
+    }
+
+    /// The current, NON-expired pending clarification for a conversation, if any. Used by
+    /// the server to surface the small "waiting for: …" chip; an expired record returns
+    /// `None` (and is left to be cleared on the next turn).
+    pub fn pending_clarification_for(
+        &self,
+        ctx: &PrimeContext,
+    ) -> Option<relux_core::PendingClarification> {
+        let key = Self::conversation_key(ctx);
+        let now = self.clock.secs();
+        self.pending_clarifications
+            .get(&key)
+            .filter(|p| now < p.expires_at_secs)
+            .cloned()
+    }
+
+    /// Build the natural reply turn when the user explicitly cancels a pending
+    /// clarification ("never mind"). Action-free: nothing is created or run, and the
+    /// intent is `DirectAnswer` so the validated wording path leaves it alone.
+    fn clarification_cancelled_turn(
+        &mut self,
+        ctx: &PrimeContext,
+        pending: &relux_core::PendingClarification,
+    ) -> PrimeTurn {
+        self.record_audit(
+            "agent",
+            ctx.agent.as_str(),
+            "prime:clarify_cancelled",
+            Some("message"),
+            None,
+            Some(&ctx.namespace),
+            AuditResult::Success,
+            serde_json::json!({ "intent": format!("{:?}", pending.intent) }),
+        );
+        PrimeTurn {
+            intent: relux_core::PrimeIntent::DirectAnswer,
+            reply: "Okay, I've set that aside. What would you like to do instead?".to_string(),
+            disposition: PrimeDisposition::Answered,
+            action: None,
+            created_task: None,
+            started_run: None,
+            created_agent: None,
+            approval: None,
+            invoked_tool: None,
+            tool_output: None,
+            tool_error: None,
+            suggested_actions: Vec::new(),
+            proposal: None,
+            slots: None,
+            agent_slots: None,
+            admin_slots: None,
+        }
+    }
+
+    /// Record or clear the pending clarification for a conversation after a turn.
+    ///
+    /// Records a NEW record only when the turn is an actionable, *resolvable* `Clarify`
+    /// (assignment / task creation — the intents whose clarify a follow-up can actually
+    /// turn into an action); any other turn (a resolved action, a plain reply, an
+    /// unresolvable clarify) clears any existing record. The map is bounded: at most
+    /// [`MAX_PENDING_CLARIFICATIONS`] entries, evicting the oldest by creation time.
+    fn update_pending_clarification(
+        &mut self,
+        key: &str,
+        turn: &PrimeTurn,
+        effective_message: &str,
+        now_secs: u64,
+    ) {
+        let resolvable = turn.disposition == PrimeDisposition::NeedsClarification
+            && crate::prime_clarify_memory::is_resolvable_clarify_intent(&turn.intent);
+        if !resolvable {
+            self.pending_clarifications.remove(key);
+            return;
+        }
+        let pending = relux_core::PendingClarification {
+            original_message: crate::prime_clarify_memory::clamp(
+                effective_message,
+                crate::prime_clarify_memory::MAX_ORIGINAL_CHARS,
+            ),
+            intent: turn.intent.clone(),
+            needs: crate::prime::clarify_needs_label(&turn.intent, effective_message),
+            question: crate::prime_clarify_memory::clamp(
+                &turn.reply,
+                crate::prime_clarify_memory::MAX_QUESTION_CHARS,
+            ),
+            created_at_secs: now_secs,
+            expires_at_secs: now_secs.saturating_add(crate::prime_clarify_memory::CLARIFY_TTL_SECS),
+            source: "deterministic".to_string(),
+        };
+        // Bound the map: if inserting a new key would exceed the cap, evict the oldest
+        // record (smallest creation time) so memory stays small and deterministic.
+        if !self.pending_clarifications.contains_key(key)
+            && self.pending_clarifications.len() >= MAX_PENDING_CLARIFICATIONS
+        {
+            if let Some(oldest) = self
+                .pending_clarifications
+                .iter()
+                .min_by(|a, b| {
+                    a.1.created_at_secs
+                        .cmp(&b.1.created_at_secs)
+                        .then_with(|| a.0.cmp(b.0))
+                })
+                .map(|(k, _)| k.clone())
+            {
+                self.pending_clarifications.remove(&oldest);
+            }
+        }
+        self.pending_clarifications.insert(key.to_string(), pending);
     }
 
     /// Apply a brain-suggested, already-clamped priority to a freshly created task.
@@ -6865,6 +7070,157 @@ mod tests {
             format!("examples/relux-plugins/{id}"),
             true,
         );
+    }
+
+    // --- Multi-turn clarification memory ----------------------------------------
+    //
+    // (`docs/prime-processing-audit.md` "Multi-turn clarify memory"). A clarifying
+    // question Prime asks for an actionable request is remembered so the NEXT message
+    // can resolve it, while a fresh request / cancel / expiry never lets a stale
+    // question silently steer a later message, and a risky action stays approval-gated.
+
+    #[test]
+    fn clarification_is_recorded_and_resolved_by_a_follow_up_answer() {
+        let (mut k, ctx) = prime_chat_kernel();
+        add_agent(&mut k, &ctx, "researcher");
+        // Something to assign.
+        let created = k
+            .prime_turn(&ctx, "create a task to summarize the README")
+            .unwrap();
+        let task_id = created.created_task.expect("a task was created");
+
+        // Turn 1: an ambiguous assignment names the agent but not the task -> Clarify.
+        let turn1 = k.prime_turn(&ctx, "assign this to researcher").unwrap();
+        assert_eq!(turn1.disposition, PrimeDisposition::NeedsClarification);
+        assert_eq!(turn1.intent, relux_core::PrimeIntent::AssignTask);
+        let pending = k
+            .pending_clarification_for(&ctx)
+            .expect("a pending clarification was recorded");
+        assert_eq!(pending.needs, "task id");
+        assert_eq!(pending.intent, relux_core::PrimeIntent::AssignTask);
+
+        // Turn 2: a bare answer (just the task id) resolves the ORIGINAL request, not a
+        // generic chat reply. The combined message flows through the normal pipeline.
+        let turn2 = k.prime_turn(&ctx, task_id.as_str()).unwrap();
+        assert_eq!(turn2.disposition, PrimeDisposition::Executed);
+        assert!(
+            matches!(turn2.action, Some(relux_core::PrimeAction::AssignTask { .. })),
+            "the follow-up answer continued the assignment: {:?}",
+            turn2.action
+        );
+        assert!(
+            k.pending_clarification_for(&ctx).is_none(),
+            "the pending clarification is cleared once resolved"
+        );
+    }
+
+    #[test]
+    fn an_explicit_cancellation_clears_the_pending_clarification() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let turn1 = k.prime_turn(&ctx, "assign this to researcher").unwrap();
+        assert_eq!(turn1.disposition, PrimeDisposition::NeedsClarification);
+        assert!(k.pending_clarification_for(&ctx).is_some());
+
+        // "never mind" drops the context and answers naturally — no action taken.
+        let turn2 = k.prime_turn(&ctx, "never mind").unwrap();
+        assert_eq!(turn2.disposition, PrimeDisposition::Answered);
+        assert!(turn2.action.is_none());
+        assert!(
+            k.pending_clarification_for(&ctx).is_none(),
+            "cancellation clears the pending clarification"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_follow_up_supersedes_and_does_not_action_the_pending_request() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let _ = k.prime_turn(&ctx, "assign this to researcher").unwrap();
+        assert!(k.pending_clarification_for(&ctx).is_some());
+
+        // A fresh question is not an answer to "which task?": it supersedes the pending
+        // context and is handled on its own (a status report), never an assignment.
+        let turn = k.prime_turn(&ctx, "what is the status?").unwrap();
+        assert_ne!(turn.intent, relux_core::PrimeIntent::AssignTask);
+        assert!(!matches!(
+            turn.action,
+            Some(relux_core::PrimeAction::AssignTask { .. })
+        ));
+        assert!(
+            k.pending_clarification_for(&ctx).is_none(),
+            "the stale pending context was dropped, not actioned"
+        );
+    }
+
+    #[test]
+    fn an_expired_clarification_is_ignored_and_does_not_continue() {
+        let (mut k, ctx) = prime_chat_kernel();
+        add_agent(&mut k, &ctx, "researcher");
+        let created = k
+            .prime_turn(&ctx, "create a task to summarize the README")
+            .unwrap();
+        let task_id = created.created_task.unwrap();
+
+        // Plant an ALREADY-expired pending clarification directly.
+        let key = KernelState::conversation_key(&ctx);
+        k.pending_clarifications.insert(
+            key,
+            relux_core::PendingClarification {
+                original_message: "assign this to researcher".to_string(),
+                intent: relux_core::PrimeIntent::AssignTask,
+                needs: "task id".to_string(),
+                question: "Which task should I assign?".to_string(),
+                created_at_secs: 0,
+                expires_at_secs: 0, // the clock has already advanced past 0
+                source: "deterministic".to_string(),
+            },
+        );
+        // It is not surfaced (expired).
+        assert!(k.pending_clarification_for(&ctx).is_none());
+
+        // And the bare answer is treated FRESH (no continuation), so it does NOT assign.
+        let turn = k.prime_turn(&ctx, task_id.as_str()).unwrap();
+        assert!(!matches!(
+            turn.action,
+            Some(relux_core::PrimeAction::AssignTask { .. })
+        ));
+    }
+
+    #[test]
+    fn a_risky_follow_up_still_requires_approval_through_the_memory_path() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let _ = k.prime_turn(&ctx, "assign this to researcher").unwrap();
+        assert!(k.pending_clarification_for(&ctx).is_some());
+        let plugins_before = k.plugin_count();
+
+        // A risky install request supersedes the pending clarification AND stays gated:
+        // a brain/continuation can never execute a protected install by itself.
+        let turn = k
+            .prime_turn(&ctx, "install the relux-tools-github plugin")
+            .unwrap();
+        assert_eq!(turn.disposition, PrimeDisposition::AwaitingApproval);
+        assert!(turn.approval.is_some());
+        assert_eq!(
+            k.plugin_count(),
+            plugins_before,
+            "nothing was installed without an approval"
+        );
+        assert!(k.pending_clarification_for(&ctx).is_none());
+    }
+
+    #[test]
+    fn pending_clarification_survives_a_snapshot_round_trip() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let _ = k.prime_turn(&ctx, "assign this to researcher").unwrap();
+        assert!(k.pending_clarification_for(&ctx).is_some());
+
+        // The bounded record is persisted in the snapshot and restored on reload.
+        let snapshot = k.snapshot();
+        let restored = KernelState::from_snapshot(snapshot);
+        let pending = restored
+            .pending_clarification_for(&ctx)
+            .expect("the pending clarification survived the snapshot round trip");
+        assert_eq!(pending.intent, relux_core::PrimeIntent::AssignTask);
+        assert_eq!(pending.needs, "task id");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-import type { ReluxPrimeProposal, ReluxPrimeProposalStep, ReluxPrimeTaskSlots, ReluxReplyPolish } from "./api";
+import type { ReluxPendingClarification, ReluxPrimeProposal, ReluxPrimeProposalStep, ReluxPrimeTaskSlots, ReluxReplyPolish } from "./api";
 
 // Pure helpers for rendering Prime's reviewable plan proposal as a card
 // (RELUX_MASTER_PLAN §10 planning layer, §11.1 "Prime Chat"). The proposal is a
@@ -108,4 +108,17 @@ export function replyPolishLabel(rp: ReluxReplyPolish | undefined): string | nul
   if (!rp) return null;
   const noun = rp.kind === "clarification" ? "question" : "reply";
   return `brain-worded ${noun} · ${brainSourceLabel(rp.source)}`;
+}
+
+// The label for the small "waiting for: …" chip shown while Prime is still expecting an
+// answer to a clarifying question (multi-turn clarify memory). The kernel attaches
+// `pending_clarification` ONLY when an actionable request is awaiting a missing field, and
+// already named what is needed ("task id" / "agent" / "task description"). Returns
+// "waiting for: <needs>", or null when nothing is pending — so the chip only ever appears
+// when the NEXT message will actually be read as the answer. The next message continues the
+// original request through the same grounded pipeline; this is just a context hint.
+export function pendingClarificationLabel(pc: ReluxPendingClarification | undefined): string | null {
+  if (!pc) return null;
+  const needs = pc.needs?.trim();
+  return needs ? `waiting for: ${needs}` : "waiting for your answer";
 }

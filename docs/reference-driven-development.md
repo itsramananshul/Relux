@@ -344,3 +344,58 @@ wording path is never near an action). A polished reply that asserts a completed
 change that did not happen. The persona is the only *durable* contribution here, and it flows
 only through the already-validated `AgentCreation` → `create_agent(persona)` seam; the
 deterministic path still creates a personaless agent.
+
+---
+
+## Reference read — multi-turn clarification memory (this slice)
+
+The audit's last "Next recommended slice": a `Clarify` turn asked one good question, but the
+next user message did not *carry* the prior question's context — "assign this to the researcher"
+→ "which task?" → "task_0001" was reclassified from scratch as a bare `DirectAnswer`, so the
+original request was lost and Prime felt keyword-shaped rather than like Hermes/Codex. This slice
+stores a small, bounded pending-clarification record when Prime asks, and on the next turn decides
+— deterministically — whether the follow-up *resolves* it.
+
+### Paperclip (openclaw) — files read
+
+- `reference/openclaw-main/src/agents/bash-tools.exec-approval-followup-state.ts`
+  - `registerExecApprovalFollowupRuntimeHandoff(...)` (L84-111) stores a small *pending handoff*
+    in an in-memory `Map<handoffId, {approvalId, sessionKey, idempotencyKey, expiresAtMs}>`;
+    `consumeExecApprovalFollowupRuntimeHandoff(...)` (L113-146) looks it up on a LATER turn, checks
+    `expiresAtMs <= nowMs` (TTL) and that the keys match, and **deletes the entry after use**.
+    `EXEC_APPROVAL_FOLLOWUP_RUNTIME_HANDOFF_TTL_MS = 5 * 60 * 1000` (L7). **Pattern: one small
+    pending record keyed by a session/approval id, with an explicit TTL, consumed-and-cleared on
+    the next turn — never a record that lingers to steer an unrelated later message.**
+- `reference/openclaw-main/src/agents/bash-tools.exec-approval-followup.ts`
+  - `sendExecApprovalFollowup(...)` (L271-351) consumes the registration and runs a NEW turn in the
+    same session with `buildExecApprovalFollowupPrompt(resultText)` (the stored context injected
+    into the prompt). **Pattern: a resolved pending record is continued by running a fresh,
+    fully-validated turn with the stored context injected — not by a privileged shortcut.**
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/agent/conversation_loop.py`
+  - `run_conversation(...)` builds `messages = list(conversation_history)` then appends the new user
+    message (`messages.append(user_msg)`, ~L330-400). A follow-up turn appends the new message to the
+    SAME prior history, so the model answers the earlier question *in context* rather than from
+    scratch. **Pattern: a follow-up is interpreted against the prior turn's context, not classified
+    blind.** We carry only the single pending question's grounding (one bounded record), which is the
+    minimal slice of that idea a deterministic kernel needs — not a full transcript.
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| openclaw: **small pending record keyed by session id, explicit TTL, consumed-and-cleared** | `KernelState.pending_clarifications: HashMap<conversation_key, PendingClarification>` (`namespace::actor` key), each with `created_at_secs` / `expires_at_secs` (`CLARIFY_TTL_SECS`); persisted via the `meta` JSON seam like `orchestrations`. `resolve_pending` (`crates/relux-kernel/src/prime_clarify_memory.rs`) returns `Expired` past TTL, and a resolved/changed turn clears the record. Bounded: `MAX_PENDING_CLARIFICATIONS` (oldest evicted). |
+| openclaw: **continue a resolved pending record by running a fresh, validated turn with the stored context injected** | a bare answer → `combine(original_message, answer)` (length-bounded), and the combined text re-runs the SAME `classify_intent` → `decide` → `prime_execute` pipeline. No privileged shortcut: a risky resolution is still a `Propose` behind a human approval, and an unknown task/agent still fails closed. |
+| Hermes: **a follow-up is interpreted against prior context, not classified blind** | when a pending record exists, the kernel reads the next message *through* it: a bare value (`task_0001`, `researcher`) continues the original request; a standalone command/question (`is_standalone_request`) supersedes it; "never mind" cancels it. |
+| Hermes / openclaw: **deterministic fallback always exists** | the whole resolver is pure and deterministic; the brain intent/slot proposals (computed on the raw answer) are dropped on a `Continue`, so the combined classification stands. Brain-assisted *extraction* applies only on the `FreshRequest` path (the self-sufficient answer the server already ran slots on) — advisory, never required. |
+
+**What we deliberately do differently:** the memory only decides *how to read* the follow-up; it
+executes nothing itself and grants no authority. The combined message flows through the unchanged
+`decide` → `prime_execute` (safe `Act`) or human-approval (`Propose`) path, so a continuation can
+never run a protected install/grant by itself. Only the intents whose clarify a follow-up can
+actually turn into an action are recorded (`AssignTask` / `TaskCreation` / `CreateAndRunTask`) —
+a run-start or task-update clarify is NOT recorded, because no by-id action is wired for them and
+we never set up a loop that cannot resolve (no faked capability). The record holds only bounded,
+non-secret user text and a deterministic intent label — never a provider envelope or a secret.

@@ -28,6 +28,7 @@ pub mod prime;
 pub mod prime_admin_slots;
 pub mod prime_agent_slots;
 pub mod prime_clarify;
+pub mod prime_clarify_memory;
 pub mod prime_intent;
 pub mod prime_slots;
 pub mod runtime;
@@ -61,7 +62,9 @@ pub use plugin_install::{
     install_from_dir, install_from_github, install_from_zip, is_generated_manifest, list_installed,
     refresh_bundled_plugins, remove_plugin, GENERATED_MANIFEST_AUTHOR,
 };
-pub use prime::{classify_intent, decide, is_chat_guarded};
+pub use prime::{
+    clarify_needs_label, classify_intent, decide, is_chat_guarded, is_standalone_request,
+};
 pub use prime_admin_slots::{
     build_permission_slots_prompt, build_plugin_ref_prompt, parse_permission_slots,
     parse_plugin_ref, reconcile_permission_slots, reconcile_plugin_ref, BrainPermissionSlots,
@@ -75,6 +78,10 @@ pub use prime_clarify::{
     build_clarify_prompt, clarify_polish_kind, parse_clarify, reconcile_clarify, BrainClarify,
     ClarifyKind,
 };
+pub use prime_clarify_memory::{
+    is_cancellation, is_resolvable_clarify_intent, resolve_pending, ClarifyResolution,
+    CLARIFY_TTL_SECS,
+};
 pub use prime_intent::{
     build_intent_prompt, parse_intent_proposal, reconcile_intent, BrainIntentProposal,
     IntentSource,
@@ -87,7 +94,8 @@ pub use runtime::{invoke_http_loopback, RuntimeClientError};
 pub use state::{
     run_briefs_in_parallel, AppliedProposedChange, AppliedProposedChangeSet, BrainSlotProposals,
     BundledRefresh, BundledRefreshSummary,
-    FinishedBrief, KernelCounters, KernelSnapshot, KernelState, PreparedBrief, RoundPrep,
+    FinishedBrief, KernelCounters, KernelSnapshot, KernelState, PendingClarificationEntry,
+    PreparedBrief, RoundPrep, MAX_PENDING_CLARIFICATIONS,
 };
 pub use store::SqliteStore;
 

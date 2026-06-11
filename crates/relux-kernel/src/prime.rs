@@ -1580,6 +1580,63 @@ fn extract_agent_id_from_assignment(message: &str) -> Option<String> {
     None
 }
 
+/// True when a message stands on its OWN as a fresh request — a complete actionable
+/// command, an explicit command phrase, or a question — rather than reading as a bare
+/// answer to an earlier clarifying question (e.g. a lone `task_0001` or `researcher`).
+///
+/// This is the gate the multi-turn clarification memory uses to decide whether a
+/// follow-up message should *resolve* a pending clarification (a bare answer → combine
+/// with the original) or *supersede* it (a fresh request → drop the pending context and
+/// handle the new message on its own). It deliberately reuses the SAME deterministic
+/// classifier + command/question rails the turn would use, so the decision matches how
+/// the message would actually be handled (sections 10.5, 17.1). A bare value the
+/// classifier reads as `DirectAnswer`/`Greeting` (and that is neither an explicit command
+/// nor a question) is NOT standalone, so it continues the pending request.
+pub fn is_standalone_request(message: &str) -> bool {
+    let lower = message.trim().to_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    use PrimeIntent as I;
+    let actionable = matches!(
+        classify_intent(message),
+        I::TaskCreation
+            | I::CreateAndRunTask
+            | I::AssignTask
+            | I::RunStart
+            | I::RunRetry
+            | I::AgentCreation
+            | I::PluginInstallation
+            | I::PermissionChange
+            | I::Orchestration
+            | I::PlanRequest
+            | I::ToolInvocation
+            | I::StatusQuestion
+            | I::ApprovalResponse
+    );
+    actionable || is_explicit_command(&lower) || is_question(&lower)
+}
+
+/// A short, human label for what an actionable `Clarify` turn is still missing, shown on
+/// the "waiting for: …" chip and stored on the [`relux_core::PendingClarification`]
+/// record. Grounded in the same deterministic extractors `decide` used, so the label
+/// names the field that is actually absent.
+pub fn clarify_needs_label(intent: &PrimeIntent, message: &str) -> String {
+    match intent {
+        PrimeIntent::AssignTask => {
+            let has_task = extract_task_id(message).is_some();
+            let has_agent = extract_agent_id_from_assignment(message).is_some();
+            match (has_task, has_agent) {
+                (false, true) => "task id".to_string(),
+                (true, false) => "agent".to_string(),
+                _ => "task id and agent".to_string(),
+            }
+        }
+        PrimeIntent::TaskCreation | PrimeIntent::CreateAndRunTask => "task description".to_string(),
+        _ => "more detail".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

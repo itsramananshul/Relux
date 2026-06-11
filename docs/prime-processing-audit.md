@@ -517,11 +517,76 @@ tests (`clarify_polish_targets_only_nonactionful_clarify_and_brainstorm`,
 `cli_clarify_brainstorm_rejects_an_action_claim`); and the dashboard `replyPolishLabel` test +
 the extended `PrimeAgentSlots` persona round-trip. No test calls a real provider.
 
+## Applied change (multi-turn clarification memory)
+
+The biggest remaining intelligence gap: a `Clarify` turn asked one good question, but the
+NEXT user message did not *carry* the prior question's context. "assign this to the
+researcher" → "which task?" → "task_0001" reclassified the bare id from scratch as a
+`DirectAnswer`, so the original request was lost and Prime read as keyword-shaped, not like
+Hermes/Codex. Per master plan §10.1 (Intent Layer), §10.5 (Conversation Rules), §17.1
+("Prime must understand conversational intent"), and following the reference read recorded
+in `reference-driven-development.md` (openclaw's `exec-approval-followup-state` pending-record
++ TTL + consume-and-clear, and its `exec-approval-followup` continue-by-running-a-fresh-turn;
+Hermes's `run_conversation` follow-up-interpreted-against-prior-context), Prime now remembers a
+small, bounded pending clarification and resolves it safely on the next turn.
+
+- **New module `relux-kernel/src/prime_clarify_memory.rs`.** `resolve_pending(pending,
+  new_message, now_secs)` is the pure, deterministic decision: `Expired` past TTL,
+  `Cancelled` on an explicit "never mind", `FreshRequest` when the follow-up stands on its
+  own (`prime::is_standalone_request` — a complete command/question supersedes the pending
+  context), else `Continue { combined }` where `combine` concatenates the stored original
+  message with the bare answer (length-bounded). `is_resolvable_clarify_intent` limits the
+  memory to the intents whose clarify a follow-up can actually turn into an action
+  (`AssignTask` / `TaskCreation` / `CreateAndRunTask`) — a run-start / task-update clarify is
+  NOT recorded (no by-id action is wired; we never set up an unresolvable loop or fake a
+  capability).
+- **New wire type `relux_core::PendingClarification`** — bounded, non-secret user text + a
+  deterministic intent label + `needs` (e.g. `"task id"`) + `created_at_secs` /
+  `expires_at_secs` + provenance. Persisted in `KernelState.pending_clarifications`
+  (keyed `namespace::actor`) through the `meta` JSON snapshot seam, exactly like
+  `orchestrations`; bounded by `MAX_PENDING_CLARIFICATIONS` (oldest evicted).
+- **One kernel chokepoint.** `prime_turn_with_brain` resolves any pending record BEFORE
+  classifying: a `Continue` swaps in the combined message (and drops the raw-answer brain
+  proposals so the deterministic combined classification stands), a `FreshRequest`/`Expired`
+  clears the record and handles the message fresh, a `Cancelled` returns a natural
+  action-free reply. After the turn, `update_pending_clarification` records a NEW pending
+  clarification only for a resolvable, unresolved `Clarify`, or clears it otherwise — so a
+  follow-up can keep accumulating context, and a resolved request leaves nothing behind.
+- **Safety invariants (binding).** The memory only decides *how to read* the follow-up; it
+  executes nothing and grants no authority. The combined message flows through the unchanged
+  `decide` → `prime_execute` (safe `Act`) / human-approval (`Propose`) path, so a continuation
+  can never run a protected install or grant by itself, and an unknown task/agent still fails
+  closed. An expired, cancelled, or superseded record is dropped, so a pending question can
+  never silently steer a much later, unrelated message.
+- **UI.** The server surfaces the still-pending record on `PrimeResponse.pending_clarification`
+  (read back under the lock after the turn). The Prime chat shows a compact `⏳ waiting for:
+  <needs>` chip (the pure `pendingClarificationLabel` helper) with a **Cancel** button that
+  just sends "never mind" — a normal user message, never a privileged path. Chat stays the
+  primary surface; no panel.
+
+Pinned by the `prime_clarify_memory` unit tests (bare-answer continue, expiry ignored,
+explicit cancel, fresh-command supersede, cancel-plus-command still acts, bounded combine,
+only-resolvable-intents); the kernel integration tests
+(`clarification_is_recorded_and_resolved_by_a_follow_up_answer`,
+`an_explicit_cancellation_clears_the_pending_clarification`,
+`an_unrelated_follow_up_supersedes_and_does_not_action_the_pending_request`,
+`an_expired_clarification_is_ignored_and_does_not_continue`,
+`a_risky_follow_up_still_requires_approval_through_the_memory_path`,
+`pending_clarification_survives_a_snapshot_round_trip`); and the dashboard
+`pendingClarificationLabel` test. No test calls a real provider.
+
 ## Current Prime brain stack
 
 The end-to-end shape of one Prime turn, with the brain strictly additive and the
 deterministic kernel always the authority:
 
+0. **Clarification context** — BEFORE classifying, `prime_turn_with_brain` checks for a
+   bounded pending clarification from the prior turn (`prime_clarify_memory::resolve_pending`,
+   keyed `namespace::actor`, TTL-bounded). A bare answer is *combined* with the stored original
+   message and the combined text drives the rest of the turn (deterministic only — the
+   raw-answer brain proposals are dropped); a standalone command/question supersedes the pending
+   context; "never mind" cancels it; an expired record is ignored. The follow-up therefore
+   continues the original request through the same pipeline instead of being classified blind.
 1. **Intent** — the brain *proposes* a label (`prime_intent::build_intent_prompt` →
    `parse_intent_proposal`); `reconcile_intent` is the fail-closed gate (guarded
    chat can never become work; low confidence keeps the deterministic intent;
@@ -555,14 +620,16 @@ deterministic kernel always the authority:
    and a sharpened risky `Propose` an advisory `admin_slots` card. Every brain
    contribution is labeled (intent → `brain-classified`; re-worded reply → `🧠
    brain-worded question/reply`; polish/slots → the model id or CLI label via the shared
-   `brainSourceLabel`) and is presentation/provenance only — never a fresh authority.
+   `brainSourceLabel`) and is presentation/provenance only — never a fresh authority. When
+   the turn leaves a clarification pending, the response carries `pending_clarification` and
+   the chat shows a `⏳ waiting for: <needs>` chip with a Cancel action, so the user knows the
+   next message will be read as the answer.
 
 ## Next recommended slice
 
-The reflect-and-clarify wording and the agent persona seed are now behind the
-validated brain layer (see the applied change above), so Prime's ambiguous/clarifying
-turns and its created operatives no longer read as fixed templates. The remaining
-keyword surfaces are narrower:
+Multi-turn clarification memory now carries the prior question's context into the next turn
+(see the applied change above), so a follow-up answer resolves the original request without
+re-stating it. The remaining keyword surfaces are narrower:
 
 - **The slot field-extractors themselves** (`extract_task_id`,
   `extract_agent_id_from_assignment`, `update_change_phrase`, `orchestration_goal`,
@@ -570,11 +637,18 @@ keyword surfaces are narrower:
   reconciles against and the fallback when no brain is live, so they should stay — but the
   `AssignTask` arm (today pure `extract_task_id` + `extract_agent_id_from_assignment`) is a
   candidate for the same validated-slot treatment (a brain proposes `{task_id, agent_id}`,
-  reconciled against `summary.all_task_ids` / `all_agent_ids`).
+  reconciled against `summary.all_task_ids` / `all_agent_ids`). This would also let the
+  *continuation* path resolve a fuzzy assignee ("the researcher") the deterministic extractor
+  misses today.
+- **Brain-assisted resolution of a bare follow-up answer** — the continuation path is
+  deterministic-only on a `Continue` (the bare answer is combined and re-classified); a
+  validated brain extractor proposing `{task_id, agent_id}` from the combined message
+  (reconciled against the live roster) would let a brain sharpen an answer the extractors miss,
+  while the deterministic combine stays the fallback.
+- **By-id run-start / task-update actions** — a run-start / task-update clarify is deliberately
+  NOT remembered today because no `StartRun { task_id }` / `UpdateTask` action is wired for
+  Prime to resolve it into. Wiring those actions would let the same memory resolve "start it"
+  → "task_0001" and "raise the priority" → "task_0001 to 8".
 - **A persona for the manual Crew create form** — today persona is brain-seeded only; a
   small optional persona input on the Crew form (validated/clamped the same way) would let an
   operator set one without the brain.
-- **Multi-turn clarify memory** — a `Clarify` turn asks one question, but the next turn does
-  not yet *carry* the prior question's context; Hermes's per-turn transcript memory
-  (`docs/relix-hermes-integration.md`) is the transplant that would let a follow-up answer
-  resolve the original ambiguous request without the user re-stating it.

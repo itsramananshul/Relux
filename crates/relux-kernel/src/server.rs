@@ -1590,6 +1590,13 @@ struct PrimeResponse {
     /// turn stays action-free and the wording was schema-validated. Absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     reply_polish: Option<ReplyPolishProvenance>,
+    /// Present only when, AFTER this turn, Prime is still waiting on the user to answer a
+    /// clarifying question for an actionable request (`docs/prime-processing-audit.md`
+    /// "Multi-turn clarify memory"). The dashboard renders a small "waiting for: …" chip
+    /// with a cancel action; the next message will be read as the answer. Bounded,
+    /// non-secret user text only. Absent when no clarification is pending.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending_clarification: Option<relux_core::PendingClarification>,
 }
 
 /// Provenance for a brain-polished clarify / brainstorm reply: which KIND of wording
@@ -1739,7 +1746,7 @@ async fn run_prime(
     // the optional brain intent proposal AND the slot bundle so the kernel reconciles
     // + audits the final intent and validates every slot at its single chokepoint.
     // `intent_source` records who decided.
-    let (turn, summary, intent_source) = {
+    let (turn, summary, intent_source, pending_clarification) = {
         let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut store = SqliteStore::open(&state.db_path)?;
         let mut kernel = store.load()?;
@@ -1755,9 +1762,12 @@ async fn run_prime(
                 permission: permission_slots.as_ref(),
             },
         )?;
+        // Read back any pending clarification this turn LEFT active, so the chat can
+        // show the "waiting for: …" chip. Read under the same lock, after the turn.
+        let pending_clarification = kernel.pending_clarification_for(&ctx);
         let summary = state_response(&kernel, &state.db_path);
         store.save(&kernel)?;
-        (turn, summary, intent_source)
+        (turn, summary, intent_source, pending_clarification)
     };
 
     // 2. Produce the conversational reply through the selected brain. Actions are
@@ -1852,6 +1862,7 @@ async fn run_prime(
         ai_note: outcome.note,
         intent_source: intent_source_label,
         reply_polish,
+        pending_clarification,
     }))
 }
 

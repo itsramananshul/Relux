@@ -11,8 +11,9 @@ import {
   slotProvenance,
   brainSourceLabel,
   replyPolishLabel,
+  pendingClarificationLabel,
 } from "../src/prime.ts";
-import type { ReluxPrimeProposal, ReluxPrimeTaskSlots } from "../src/api.ts";
+import type { ReluxPendingClarification, ReluxPrimeProposal, ReluxPrimeTaskSlots } from "../src/api.ts";
 
 // The plan proposal card must read HONESTLY: the summary reflects the actual step
 // and agent counts, a single-step proposal is steered to the one-task path (not
@@ -168,4 +169,29 @@ test("polishProvenance is null without a polish overlay and generic when the sou
   // not a blank or a crash.
   assert.equal(polishProvenance(proposal({ polish: { summary: "x" } })), "AI brain");
   assert.equal(polishProvenance(proposal({ polish: { summary: "x", model: "   " } })), "AI brain");
+});
+
+// Multi-turn clarify memory: the "waiting for: …" chip only appears while Prime is
+// actually expecting an answer, and it names what is still needed so the user knows
+// what to type next. Pins that the chip never appears without a pending clarification.
+function pending(extra: Partial<ReluxPendingClarification> = {}): ReluxPendingClarification {
+  return {
+    original_message: "assign this to researcher",
+    intent: "assign_task",
+    needs: "task id",
+    question: "Which task should I assign?",
+    created_at_secs: 1,
+    expires_at_secs: 901,
+    source: "deterministic",
+    ...extra,
+  };
+}
+
+test("pendingClarificationLabel names the missing field while a clarification is pending", () => {
+  assert.equal(pendingClarificationLabel(pending()), "waiting for: task id");
+  assert.equal(pendingClarificationLabel(pending({ needs: "agent" })), "waiting for: agent");
+  // No pending clarification -> no chip.
+  assert.equal(pendingClarificationLabel(undefined), null);
+  // A pending record with an empty `needs` still reads sensibly, never blank.
+  assert.equal(pendingClarificationLabel(pending({ needs: "   " })), "waiting for your answer");
 });

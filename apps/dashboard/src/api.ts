@@ -1476,6 +1476,22 @@ export interface ReluxPrimeAdminSlots {
   source?: string;
 }
 
+// A small, bounded record of a clarifying question Prime is still waiting on the user
+// to answer for an actionable request (multi-turn clarify memory). Present on the
+// response ONLY while a clarification is pending; the chat shows a "waiting for: <needs>"
+// chip with a cancel action, and the next message is read as the answer. Plain,
+// non-secret user text only.
+export interface ReluxPendingClarification {
+  original_message: string;
+  intent: string;
+  // A short label for what is still missing, e.g. "task id" / "agent" / "task description".
+  needs: string;
+  question: string;
+  created_at_secs: number;
+  expires_at_secs: number;
+  source: string;
+}
+
 export interface ReluxPrimeTurn {
   intent: string;
   reply: string;
@@ -1529,6 +1545,11 @@ export interface ReluxPrimeTurn {
   /// including a brain proposal the safety gate vetoed — so the UI attributes the
   /// brain only when it actually decided. Provenance only; never affects state.
   intent_source?: string;
+  /// Present ONLY while Prime is still waiting on the user to answer a clarifying
+  /// question for an actionable request (multi-turn clarify memory). The chat renders a
+  /// small "waiting for: …" chip with a cancel action; the next message is read as the
+  /// answer and continues the original request. Absent when nothing is pending.
+  pending_clarification?: ReluxPendingClarification;
 }
 
 export const reluxPrime = {

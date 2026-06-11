@@ -8,7 +8,7 @@ import {
   type ReluxPrimeSuggestion,
   type ReluxPrimeTurn,
 } from "../api";
-import { brainSourceLabel, hasSteps, intentProvenance, polishProvenance, proposalDisplaySummary, replyPolishLabel, slotProvenance, stepDisplayTitle } from "../prime";
+import { brainSourceLabel, hasSteps, intentProvenance, pendingClarificationLabel, polishProvenance, proposalDisplaySummary, replyPolishLabel, slotProvenance, stepDisplayTitle } from "../prime";
 import { workTaskHref, workRunHref } from "../routing";
 import { PrimeAutonomyPanel } from "../components/PrimeAutonomyPanel";
 import { OrchestrationPanel } from "../components/OrchestrationPanel";
@@ -346,6 +346,32 @@ function PrimeTurnCard({
         </span>
       </div>
       <div style={{ whiteSpace: "pre-wrap" }}>{turn.reply}</div>
+
+      {/* Multi-turn clarify memory: a small "waiting for: …" chip while Prime is still
+          expecting an answer to this clarifying question. The NEXT message is read as the
+          answer and continues the original request through the same grounded pipeline;
+          the cancel button just sends "never mind" (a normal user message) to drop the
+          pending context. Present only when the kernel left a clarification pending. */}
+      {pendingClarificationLabel(turn.pending_clarification) && (
+        <div className="row wrap" style={{ gap: 6, marginTop: 8, alignItems: "center", fontSize: 11 }}>
+          <span
+            className="badge todo"
+            style={{ fontSize: 9 }}
+            title="Prime is waiting for your answer — your next message continues this request"
+          >
+            ⏳ {pendingClarificationLabel(turn.pending_clarification)}
+          </span>
+          <button
+            className="chip"
+            disabled={busy}
+            style={{ fontSize: 10, padding: "1px 8px" }}
+            title="Drop this pending request"
+            onClick={() => onSuggestion({ label: "Cancel", message: "never mind", send: true })}
+          >
+            Cancel
+          </button>
+        </div>
+      )}
 
       {/* An actionable note — e.g. a CLI brain that was unavailable and fell back,
           with the exact next step. Surfaced so the user is never left guessing. */}
