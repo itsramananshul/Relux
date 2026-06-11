@@ -122,6 +122,22 @@ pub enum PrimeIntent {
     /// kernel's permission/audit path; an installed-but-unimplemented tool is
     /// reported honestly, never faked.
     ToolInvocation,
+    /// Throwaway, casual conversation with no work and no negative affect — a
+    /// "lol" / "haha" / "nice" / "thanks" / "ok cool" / "makes sense". A deliberate
+    /// non-action category (Hermes-first): such turns are represented as exactly
+    /// what they are — chitchat — instead of being misfiled as pseudo-brainstorming
+    /// or a generic direct answer. The reply is light and conversational and NEVER
+    /// carries a task/plan/run CTA (`docs/prime-processing-audit.md` "Hermes-first
+    /// general agent"; §10.5, §17.1).
+    SmallTalk,
+    /// Venting, frustration, an insult aimed at Prime, or an emotional message
+    /// ("ugh this is so frustrating", "fuck you", "I give up", "I'm exhausted"). A
+    /// deliberate non-action category (Hermes-first): Prime answers with a normal,
+    /// human acknowledgement — never a work prompt, and never a task/plan/run CTA.
+    /// Distinct from [`SmallTalk`](PrimeIntent::SmallTalk) (neutral chitchat) so the
+    /// reply and any contextual chips can be tuned to the affect
+    /// (`docs/prime-processing-audit.md` "Hermes-first general agent"; §10.5, §17.1).
+    EmotionalSupport,
     DirectAnswer,
 }
 
@@ -989,6 +1005,8 @@ mod tests {
             PrimeIntent::OrchestrationRun,
             PrimeIntent::ToolDiscovery,
             PrimeIntent::ToolInvocation,
+            PrimeIntent::SmallTalk,
+            PrimeIntent::EmotionalSupport,
             PrimeIntent::DirectAnswer,
         ];
         for intent in intents {

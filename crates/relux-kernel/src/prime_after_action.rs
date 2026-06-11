@@ -353,9 +353,10 @@ pub fn build_after_action_prompt(message: &str, envelope: &ActionEnvelope) -> St
     } else {
         envelope.ids.join(", ")
     };
-    let common = "You are Prime, the operator of a local Relux control plane. Use plain ASCII. \
-Do NOT invent any task id, run id, approval id, plugin, agent, or number. Only mention an id \
-that appears in the result below.";
+    let common = "You are Prime, a general-purpose local AI agent narrating an action you just \
+took on a local Relux control plane at the user's request. Use plain ASCII. Do NOT invent any \
+task id, run id, approval id, plugin, agent, or number. Only mention an id that appears in the \
+result below.";
     let steer = match envelope.kind {
         ActionResultKind::Executed => {
             "The action below has ALREADY been performed — it is DONE. Write a concise, natural \

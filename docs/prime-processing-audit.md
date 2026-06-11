@@ -1874,3 +1874,81 @@ Backend: `greeting_is_conversational_and_never_a_work_board_prompt`,
 - The `after_action` / `clarify` / read-only-tool sub-prompts still carry the older "operator"
   identity line; they run only on already-actionful/clarify turns (not casual chat), so they were
   left for a follow-up coherence pass.
+
+## Applied change (Hermes-first coherence pass — explicit conversational intents + contextual chips + prompt identity)
+
+This closes the three "Remaining agent-behavior gaps" above. The earlier slice fixed the
+*behavior* (no board steering on a hello, no work buttons on an insult) but represented
+casual/emotional turns implicitly — they fell through to `DirectAnswer`/`Brainstorming` and relied
+on the CTA gate. This slice makes them **deliberate** and replaces suppression with **contextual,
+non-action** chips.
+
+### Reference reading (re-read first — `docs/reference-driven-development.md`)
+
+Re-read the same Hermes files cited above: `agent/prompt_builder.py` (identity opens conversational,
+tools secondary), `agent/system_prompt.py` (tool guidance injected only when a tool is registered;
+base prompt is general), `agent/conversation_loop.py` (chat-vs-tool bifurcation, no
+`tool_choice="required"`), `agent/message_sanitization.py` (no profanity/sentiment special-casing —
+the model just replies). The lesson reaffirmed: a general agent represents conversation as a
+first-class outcome, not as the absence of a tool call. Relux now names that outcome explicitly with
+two non-action intents while keeping the fail-closed work gate exactly as Hermes keeps tools
+optional.
+
+### What changed
+
+- **Two explicit non-action intents (`relux-core::PrimeIntent`):** added `SmallTalk` (throwaway
+  chitchat / affirmations — "lol", "thanks", "nice", "makes sense") and `EmotionalSupport` (venting
+  / insults / frustration — "ugh", "fuck you", "I give up", "I'm exhausted"). These serialize as
+  `small_talk` / `emotional_support`. **Wire-compatible:** the dashboard types `intent` as a plain
+  string and renders `intent.replace(/_/g, " ")`, so no frontend type/test change was required; the
+  brain allowlists (`intent_labels()` in both `prime_intent.rs` and `prime_decision.rs`) gained the
+  two labels so a brain can name them.
+- **Deterministic classification (`prime.rs classify_intent`):** a final, conservative pass after
+  every action/status/explanation/question/greeting rail routes venting → `EmotionalSupport` and
+  chitchat → `SmallTalk`. The old `is_frustration_or_emotional` was split into
+  `is_emotional_distress` and `is_casual_chat` (its union preserves the CTA-suppression gate
+  unchanged). `decide` answers each with a plain `Reply` (`small_talk_text` / `emotional_support_text`)
+  that names no board/queue/crew state.
+- **Contextual non-action chips (`state.rs attach_suggestions`):** instead of just *suppressing*
+  work CTAs, conversational turns now get tailored read-only/conversational chips — `EmotionalSupport`
+  → **Tell me what broke** (`what went wrong?`) + **Show me the last run** (`what is going on?`);
+  `Greeting` / `SmallTalk` → at most **What can you do?** (`what tools can you use?`). Every chip's
+  `message` is an ordinary conversational or read-only ask — never a task/plan/run command — so a
+  click can do nothing the user could not type in chat.
+- **Prompt identity coherence:** the `after_action`, `clarify`, and read-only-tool sub-prompts no
+  longer open "You are Prime, the operator of a local Relux control plane." They now open with the
+  same Hermes-first identity ("a general-purpose local AI agent … that can also drive/inspect a local
+  Relux control plane"). All the safety steer in those prompts (perform NO action, invent no ids,
+  read-only, proposed-vs-done wording) is preserved verbatim. `clarify_polish_kind` now also lets a
+  brain warm the wording of `SmallTalk` / `EmotionalSupport` replies (still a plain `Reply`, no
+  action).
+
+### The safety wall that did NOT change
+
+`reconcile_intent` is unchanged in policy, but its guard `is_chat_guarded` was **strengthened**: it
+now treats emotional-distress and casual-chat messages as guarded chat too, so a brain can never
+reconcile an insult or a vent up to a work intent — the same rail that already protected musing and
+questions. `SmallTalk` / `EmotionalSupport` are NOT in `is_sensitive_intent`, so a brain may steer a
+turn onto them (they create and run nothing). Existence/approval checks, `decide` → `prime_execute`,
+and per-call tool approval are untouched. An explicit work request still acts and still offers its
+real CTAs (e.g. "Start the run").
+
+### Files changed
+
+- `crates/relux-core/src/prime.rs` — `PrimeIntent::SmallTalk` + `EmotionalSupport`; roundtrip test.
+- `crates/relux-kernel/src/prime.rs` — `is_emotional_distress` / `is_casual_chat` (+ `word_tokens`),
+  `is_frustration_or_emotional` as their union, `classify_intent` routing, `decide` arms,
+  `small_talk_text` / `emotional_support_text`, `is_chat_guarded` strengthening; new tests
+  `casual_and_emotional_messages_get_dedicated_conversational_intents`,
+  `explicit_work_and_questions_beat_casual_and_emotional_detection`.
+- `crates/relux-kernel/src/state.rs` — contextual non-action chips in `attach_suggestions`; test
+  renamed/expanded to `emotional_chat_gets_contextual_non_action_chips_not_work_ctas`.
+- `crates/relux-kernel/src/prime_intent.rs` — `small_talk` / `emotional_support` in the allowlist +
+  classifier rules; tests `venting_and_chitchat_can_never_be_promoted_to_work`,
+  `small_talk_and_emotional_support_are_accepted_as_non_sensitive`.
+- `crates/relux-kernel/src/prime_decision.rs` — labels + conversational classification rule.
+- `crates/relux-kernel/src/prime_clarify.rs`, `prime_after_action.rs`, `prime_tools.rs` — Hermes-first
+  identity line (safety steer preserved); `clarify_polish_kind` covers the two new intents.
+
+No frontend change: the contextual chips are backend-driven and render through the existing
+`suggested_actions` path; `dashboard-dist` was not rebuilt.

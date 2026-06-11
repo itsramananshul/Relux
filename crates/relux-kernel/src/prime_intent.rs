@@ -115,8 +115,11 @@ user's message into EXACTLY ONE of these intent labels:\n{labels}\n\n\
 Rules:\n\
 - Casual chat, small talk, greetings, jokes, venting, insults, frustration, emotional messages, \
 musing, or thinking out loud (\"I was thinking we could...\", \"we should...\") is conversation \
-(greeting / brainstorming / direct_answer), NOT work. Never pick a work or creation intent for \
-it.\n\
+(greeting / small_talk / emotional_support / brainstorming / direct_answer), NOT work. Never pick \
+a work or creation intent for it.\n\
+- small_talk for throwaway chitchat or an affirmation (\"lol\", \"haha\", \"nice\", \"thanks\", \
+\"makes sense\"); emotional_support for venting, frustration, or an insult (\"ugh this is so \
+frustrating\", \"fuck you\", \"I give up\").\n\
 - A QUESTION the user is asking or deliberating (\"how does X work?\", \"should we refactor?\") \
 is brainstorming or direct_answer, NOT work.\n\
 - Only an explicit instruction to DO something (\"create a task to...\", \"run it\", \
@@ -157,6 +160,8 @@ fn intent_labels() -> Vec<&'static str> {
         "plan_request",
         "tool_discovery",
         "tool_invocation",
+        "small_talk",
+        "emotional_support",
         "direct_answer",
     ]
 }
@@ -416,6 +421,36 @@ mod tests {
         );
         assert_eq!(intent, PrimeIntent::Brainstorming);
         assert_eq!(source, IntentSource::Deterministic);
+    }
+
+    #[test]
+    fn venting_and_chitchat_can_never_be_promoted_to_work() {
+        // Hermes-first safety rail: an emotional vent or throwaway chitchat is guarded
+        // chat, so even a confident brain cannot reconcile it up to a work intent
+        // (`docs/prime-processing-audit.md` "Hermes-first general agent"; §10.5, §17.1).
+        for (msg, det) in [
+            ("fuck you", PrimeIntent::EmotionalSupport),
+            ("ugh this is so frustrating", PrimeIntent::EmotionalSupport),
+            ("lol", PrimeIntent::SmallTalk),
+        ] {
+            let (intent, source) =
+                reconcile_intent(det.clone(), &prop(PrimeIntent::TaskCreation, 0.99), msg);
+            assert_eq!(intent, det, "{msg:?} must stay conversational");
+            assert_eq!(source, IntentSource::Deterministic, "{msg:?} brain vetoed");
+        }
+    }
+
+    #[test]
+    fn small_talk_and_emotional_support_are_accepted_as_non_sensitive() {
+        // A brain may steer a turn onto either conversational intent — they are not
+        // sensitive, so the gate accepts them (they create and run nothing).
+        for intent in [PrimeIntent::SmallTalk, PrimeIntent::EmotionalSupport] {
+            assert!(!is_sensitive_intent(&intent), "{intent:?} is not sensitive");
+            let (resolved, source) =
+                reconcile_intent(PrimeIntent::DirectAnswer, &prop(intent.clone(), 0.9), "lol ok");
+            assert_eq!(resolved, intent);
+            assert_eq!(source, IntentSource::Brain);
+        }
     }
 
     #[test]

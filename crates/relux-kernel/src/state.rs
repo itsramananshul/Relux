@@ -8949,6 +8949,38 @@ fn attach_suggestions(
         });
     }
 
+    // Hermes-first contextual conversation chips. The work CTAs are SUPPRESSED on
+    // casual / emotional turns (below); here we replace them with NON-action chips
+    // that route ordinary read-only / conversational messages — never a task, plan,
+    // or run. Each chip's `message` is something the user could type by hand and is
+    // itself a conversational or read-only ask, so clicking it can do nothing the
+    // user could not do in chat (`docs/prime-processing-audit.md` "Hermes-first
+    // general agent"; §10.5, §11.1, §17.1).
+    //
+    // Venting / frustration: offer to dig into what actually went wrong (an
+    // explanation) or surface the live state (a read-only status) — not a work CTA.
+    if turn.intent == PrimeIntent::EmotionalSupport {
+        turn.suggested_actions.push(PrimeSuggestion {
+            label: "Tell me what broke".to_string(),
+            message: "what went wrong?".to_string(),
+            send: false,
+        });
+        turn.suggested_actions.push(PrimeSuggestion {
+            label: "Show me the last run".to_string(),
+            message: "what is going on?".to_string(),
+            send: true,
+        });
+    }
+    // A greeting or light chitchat: at most a single discovery chip so the user can
+    // learn what Prime can do — no work prompt, nothing created.
+    if turn.intent == PrimeIntent::Greeting || turn.intent == PrimeIntent::SmallTalk {
+        turn.suggested_actions.push(PrimeSuggestion {
+            label: "What can you do?".to_string(),
+            message: "what tools can you use?".to_string(),
+            send: true,
+        });
+    }
+
     // Brainstorming stays a conversation (§10.5), but give the user a one-click
     // path to promote the idea into a task. The button pre-fills the command with
     // the work the message gestured at (`send: false`) so the user confirms or
@@ -12961,40 +12993,77 @@ mod tests {
         assert!(!promote.send, "promoting an idea pre-fills, never auto-sends");
     }
 
+    /// The work-creation CTA labels that must NEVER appear on a casual / emotional /
+    /// musing turn (Hermes-first suppression). A conversational turn may carry only
+    /// contextual NON-action chips, never one of these.
+    const WORK_CTA_LABELS: &[&str] = &[
+        "Turn this into a task",
+        "Plan this out",
+        "Start the run",
+        "Create these tasks",
+    ];
+
     #[test]
-    fn emotional_chat_gets_no_work_ctas() {
+    fn emotional_chat_gets_contextual_non_action_chips_not_work_ctas() {
         // Hermes-first suggestion policy (`docs/prime-processing-audit.md` "Hermes-first
-        // general agent"): a vent, an insult, or empty small talk is a normal
-        // conversation — Prime answers and offers NO "Turn this into a task" / "Plan
-        // this out" buttons, even if the brain (or the deterministic rail) lands the
-        // turn on a conversational intent. Nothing is created or run.
+        // general agent"): a vent, an insult, or frustration is `EmotionalSupport` — a
+        // normal conversation. Prime answers and offers NO work CTA; instead it offers
+        // CONTEXTUAL non-action chips ("Tell me what broke" / "Show me the last run")
+        // that route ordinary read-only / conversational messages. Nothing is created.
         let (mut k, ctx) = prime_chat_kernel();
         let before = k.task_count();
-        for msg in ["fuck you", "ugh this is so frustrating", "lol", "i give up"] {
+        for msg in ["fuck you", "ugh this is so frustrating", "i give up", "i'm exhausted"] {
             let turn = k.prime_turn(&ctx, msg).unwrap();
             assert_eq!(
-                turn.disposition,
-                PrimeDisposition::Answered,
-                "{msg:?} must stay a plain answer"
+                turn.intent,
+                relux_core::PrimeIntent::EmotionalSupport,
+                "{msg:?} must classify as emotional support"
             );
+            assert_eq!(turn.disposition, PrimeDisposition::Answered);
+            for s in &turn.suggested_actions {
+                assert!(
+                    !WORK_CTA_LABELS.contains(&s.label.as_str()),
+                    "{msg:?} must offer no work CTA, got {s:?}"
+                );
+            }
             assert!(
-                turn.suggested_actions.is_empty(),
-                "{msg:?} must offer no work CTAs, got {:?}",
+                turn.suggested_actions
+                    .iter()
+                    .any(|s| s.label == "Tell me what broke"),
+                "{msg:?} offers a contextual non-action chip, got {:?}",
                 turn.suggested_actions
             );
         }
-        assert_eq!(k.task_count(), before, "emotional chat must create no work");
+
+        // Throwaway chitchat is `SmallTalk`: at most a single discovery chip, and
+        // never a work CTA.
+        for msg in ["lol", "haha nice", "thanks"] {
+            let turn = k.prime_turn(&ctx, msg).unwrap();
+            assert_eq!(
+                turn.intent,
+                relux_core::PrimeIntent::SmallTalk,
+                "{msg:?} must classify as small talk"
+            );
+            for s in &turn.suggested_actions {
+                assert!(
+                    !WORK_CTA_LABELS.contains(&s.label.as_str()),
+                    "{msg:?} must offer no work CTA, got {s:?}"
+                );
+            }
+        }
+        assert_eq!(k.task_count(), before, "emotional/casual chat must create no work");
 
         // A musing with no nameable work ("i was thinking about the weather")
         // classifies as Brainstorming deterministically, but carries no work verb, so
         // the gate still suppresses the CTAs — exercising the gate on the brainstorm path.
         let idle = k.prime_turn(&ctx, "i was thinking about the weather today").unwrap();
         assert_eq!(idle.intent, relux_core::PrimeIntent::Brainstorming);
-        assert!(
-            idle.suggested_actions.is_empty(),
-            "a contentless musing offers no work CTA, got {:?}",
-            idle.suggested_actions
-        );
+        for s in &idle.suggested_actions {
+            assert!(
+                !WORK_CTA_LABELS.contains(&s.label.as_str()),
+                "a contentless musing offers no work CTA, got {s:?}"
+            );
+        }
     }
 
     #[test]

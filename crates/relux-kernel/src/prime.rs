@@ -366,6 +366,20 @@ pub fn classify_intent(message: &str) -> PrimeIntent {
     {
         return PrimeIntent::Greeting;
     }
+    // Emotional / casual conversation — the Hermes-first non-action categories.
+    // Checked LAST, after every action / status / explanation / question /
+    // brainstorm-keyword / greeting rail, so an explicit command or a real question
+    // always wins and only genuine chitchat or venting reaches here. Venting /
+    // insults / frustration are `EmotionalSupport`; throwaway affirmations and light
+    // chitchat are `SmallTalk`. Neither ever mints or runs work — they are deliberate
+    // conversational intents, not pseudo-brainstorming (`docs/prime-processing-audit.md`
+    // "Hermes-first general agent"; §10.5, §17.1).
+    if is_emotional_distress(&m) {
+        return PrimeIntent::EmotionalSupport;
+    }
+    if is_casual_chat(&m) {
+        return PrimeIntent::SmallTalk;
+    }
 
     PrimeIntent::DirectAnswer
 }
@@ -744,6 +758,23 @@ pub fn decide(message: &str, intent: &PrimeIntent, summary: &StateSummary) -> Pr
                     .to_string(),
             },
         },
+        // Throwaway, casual chitchat. Prime answers lightly and stays in the
+        // conversation — a plain non-action reply with no board/queue/crew mention
+        // and (via `attach_suggestions`) no work CTA. Hermes-first: chitchat is
+        // chitchat (`docs/prime-processing-audit.md` "Hermes-first general agent";
+        // §10.5, §17.1).
+        PrimeIntent::SmallTalk => PrimePlan::Reply {
+            text: small_talk_text().to_string(),
+        },
+        // Venting / frustration / an insult. Prime answers like a normal person —
+        // a brief, human acknowledgement — and offers, at most, contextual NON-action
+        // chips (`attach_suggestions`: "Tell me what broke" / "Show me the last run"),
+        // never a task/plan/run CTA. Hermes-first: emotional chat is chat, never a
+        // work prompt (`docs/prime-processing-audit.md` "Hermes-first general agent";
+        // §10.5, §17.1).
+        PrimeIntent::EmotionalSupport => PrimePlan::Reply {
+            text: emotional_support_text().to_string(),
+        },
         // The general catch-all. Prime answers as a broad assistant FIRST: when a
         // brain is configured it writes the real answer; this deterministic fallback
         // keeps a Hermes-like, general framing and mentions the control plane only as
@@ -981,7 +1012,16 @@ fn is_question(m: &str) -> bool {
 /// is. Operates on the raw message; the lowercasing matches `classify_intent`.
 pub fn is_chat_guarded(message: &str) -> bool {
     let m = message.trim().to_lowercase();
-    (is_ideation(&m) || is_question(&m)) && !is_explicit_command(&m)
+    // Ideation, a question, venting, or casual chitchat are all conversation: a
+    // brain may never promote any of them to a work intent. Emotional / small-talk
+    // turns are included so an insult or a vent ("fuck you", "ugh") can never be
+    // reconciled up to task creation or a run, exactly like musing and questions
+    // (`docs/prime-processing-audit.md` "Hermes-first general agent"; §10.5, §17.1).
+    (is_ideation(&m)
+        || is_question(&m)
+        || is_emotional_distress(&m)
+        || is_casual_chat(&m))
+        && !is_explicit_command(&m)
 }
 
 /// True when `word` appears in `haystack` as a WHOLE WORD - delimited by a
@@ -1325,6 +1365,23 @@ fn greeting_text() -> &'static str {
     "Hey - Prime here. What's on your mind? Happy to just talk, think something through, or answer a question - and when you actually want work done, I can drive your local Relux control plane."
 }
 
+/// The light, conversational reply Prime gives to throwaway chitchat
+/// ([`PrimeIntent::SmallTalk`]). Hermes-first: it stays in the moment and does NOT
+/// pivot to the board or "what do you want to set up" — chitchat is chitchat
+/// (`docs/prime-processing-audit.md` "Hermes-first general agent"; §10.5, §17.1).
+fn small_talk_text() -> &'static str {
+    "Anytime. I'm around if you want to talk something through or need a hand with anything."
+}
+
+/// The brief, human acknowledgement Prime gives to venting / frustration / an insult
+/// ([`PrimeIntent::EmotionalSupport`]). Hermes-first: it meets the user where they
+/// are and never turns the moment into a work prompt; the kernel may attach contextual
+/// NON-action chips ("Tell me what broke" / "Show me the last run") but no task/plan/run
+/// CTA (`docs/prime-processing-audit.md` "Hermes-first general agent"; §10.5, §17.1).
+fn emotional_support_text() -> &'static str {
+    "That sounds frustrating - I hear you. If something broke or a run went sideways, tell me what happened and I'll dig in; otherwise I'm happy to just talk it through."
+}
+
 /// Verbs that mark a brainstorm candidate as REAL, nameable work (a superset of
 /// [`CREATION_VERBS`] with the common improvement/delivery verbs). Used ONLY by
 /// [`brainstorm_offers_actionable_work`] to decide whether an idea is concrete
@@ -1366,21 +1423,28 @@ const WORK_INDICATORS: &[&str] = &[
     "plan",
 ];
 
-/// True when a message reads as venting, an insult, profanity-as-affect, or pure
-/// emotional/throwaway small talk with no work in it — frustration ("ugh, this is
-/// broken"), an insult aimed at Prime ("fuck you", "you're useless"), or a
-/// throwaway ("lol", "meh"). These get a normal conversational reply and,
-/// crucially, NO task/plan CTAs: turning "fuck you" into a "Turn this into a task"
-/// button is absurd (Hermes-first: emotional chat is chat, never a work prompt;
+/// Split a normalized message into its whole alphanumeric tokens. Shared by the
+/// emotional / small-talk detectors so "ugh"/"lol"/"damn" match as WHOLE words and
+/// never as a substring ("damn" never bites "damnation").
+fn word_tokens(m: &str) -> Vec<&str> {
+    m.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+/// True when a message reads as venting, an insult aimed at Prime, frustration, or
+/// an emotional message with no work in it — "ugh this is so frustrating", "fuck
+/// you", "you're useless", "I give up", "I'm exhausted". This is the
+/// [`PrimeIntent::EmotionalSupport`] detector and the CTA-suppression rail: such a
+/// turn gets a normal, human acknowledgement and, crucially, NO task/plan/run CTA
+/// (Hermes-first: emotional chat is chat, never a work prompt;
 /// `docs/prime-processing-audit.md` "Hermes-first general agent"; §10.5, §17.1).
 ///
-/// Conservative and used ONLY to SUPPRESS work CTAs / steer wording — it never
-/// promotes anything to an action, so a false positive only means a friendlier,
-/// button-free reply. A genuine work command that merely contains a charged word
-/// ("fix the damn login bug") is unaffected: it classifies as `TaskCreation`, not
-/// `Brainstorming`, so this gate (only consulted on the brainstorm CTA path) never
-/// sees it. Matched against the lowercased message.
-pub fn is_frustration_or_emotional(message: &str) -> bool {
+/// Conservative: a genuine work command that merely contains a charged word ("fix
+/// the damn login bug") is NOT flagged — the bare-word arm is bounded to short
+/// messages and matches whole tokens, and a real command anyway classifies as work
+/// before this is consulted. Matched against the lowercased message.
+pub fn is_emotional_distress(message: &str) -> bool {
     let m = message.trim().to_lowercase();
     if m.is_empty() {
         return false;
@@ -1427,22 +1491,75 @@ pub fn is_frustration_or_emotional(message: &str) -> bool {
     if PHRASES.iter().any(|p| m.contains(p)) {
         return true;
     }
-    // A short message that is essentially just a charged or throwaway word counts as
-    // emotional/small talk (so "ugh", "lol", "meh", a bare expletive get no CTAs).
-    // Bounded to short messages so a longer sentence that merely contains the word is
-    // unaffected; whole-token match so "damn" never bites "damnation".
+    // A short message that is essentially just a charged/expletive word ("ugh",
+    // "wtf", a bare expletive). Bounded to short messages so a longer sentence that
+    // merely contains the word is unaffected; whole-token match.
     const WORDS: &[&str] = &[
         "fuck", "shit", "bitch", "asshole", "bastard", "idiot", "moron", "dumbass", "wtf", "ugh",
-        "ughhh", "meh", "lol", "lmao", "bruh", "damn", "crap", "whatever", "nevermind", "nvm",
+        "ughhh", "ughh", "damn", "crap", "argh", "grr", "fml",
     ];
-    let tokens: Vec<&str> = m
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .collect();
-    if tokens.len() <= 4 && tokens.iter().any(|w| WORDS.contains(w)) {
+    let tokens = word_tokens(&m);
+    tokens.len() <= 4 && tokens.iter().any(|w| WORDS.contains(w))
+}
+
+/// True when a message reads as throwaway, neutral/positive casual chitchat with no
+/// work and no negative affect — "lol", "haha", "nice", "cool", "thanks", "ok cool",
+/// "makes sense". This is the [`PrimeIntent::SmallTalk`] detector: Prime answers
+/// lightly and, crucially, attaches NO task/plan/run CTA (Hermes-first: chitchat is
+/// chitchat; `docs/prime-processing-audit.md` "Hermes-first general agent"; §10.5).
+///
+/// Conservative and consulted only AFTER every action/question/greeting rail in
+/// [`classify_intent`] has been tried, so by the time it runs nothing actionable
+/// remains. The bare-word arm is bounded to short messages and matches whole tokens,
+/// so a real sentence that merely contains "nice"/"cool"/"ok" is unaffected.
+pub fn is_casual_chat(message: &str) -> bool {
+    let m = message.trim().to_lowercase();
+    if m.is_empty() {
+        return false;
+    }
+    const PHRASES: &[&str] = &[
+        "sounds good",
+        "sounds great",
+        "makes sense",
+        "got it",
+        "fair enough",
+        "good point",
+        "nice one",
+        "thank you",
+        "much appreciated",
+        "no worries",
+        "no problem",
+        "good to know",
+        "cool cool",
+        "ok cool",
+        "oh ok",
+        "haha",
+        "lmao",
+    ];
+    if PHRASES.iter().any(|p| m.contains(p)) {
         return true;
     }
-    false
+    // A short message that is essentially just a throwaway/affirmation token.
+    const WORDS: &[&str] = &[
+        "lol", "lmao", "lmfao", "haha", "hehe", "meh", "bruh", "nice", "cool", "ok", "okay", "k",
+        "kk", "thanks", "thx", "ty", "yw", "np", "yay", "woohoo", "whatever", "nevermind", "nvm",
+        "sure", "yep", "yup", "nope", "huh", "hmm", "wow", "dope", "sweet", "awesome", "fine",
+        "gotcha", "word", "neat",
+    ];
+    let tokens = word_tokens(&m);
+    tokens.len() <= 4 && tokens.iter().any(|w| WORDS.contains(w))
+}
+
+/// True when a message reads as venting, an insult, profanity-as-affect, or pure
+/// throwaway small talk with no work in it. The union of [`is_emotional_distress`]
+/// and [`is_casual_chat`]; used ONLY to SUPPRESS work CTAs / steer wording on the
+/// brainstorm path — it never promotes anything to an action, so a false positive
+/// only means a friendlier, button-free reply. A genuine work command that merely
+/// contains a charged word ("fix the damn login bug") is unaffected: it classifies
+/// as `TaskCreation`, not `Brainstorming`, so this gate (only consulted on the
+/// brainstorm CTA path) never sees it. Matched against the lowercased message.
+pub fn is_frustration_or_emotional(message: &str) -> bool {
+    is_emotional_distress(message) || is_casual_chat(message)
 }
 
 /// True when a `Brainstorming` turn gestured at REAL, nameable work worth offering a
@@ -2561,6 +2678,73 @@ mod tests {
                 "{m:?} must NOT offer a work CTA"
             );
         }
+    }
+
+    #[test]
+    fn casual_and_emotional_messages_get_dedicated_conversational_intents() {
+        // Hermes-first: throwaway chitchat is its own SmallTalk intent and venting /
+        // insults / frustration is EmotionalSupport — represented deliberately, NOT
+        // misfiled as pseudo-brainstorming or a generic direct answer
+        // (`docs/prime-processing-audit.md` "Hermes-first general agent"; §10.5, §17.1).
+        for m in [
+            "lol", "haha", "nice", "cool", "thanks", "ok cool", "makes sense", "meh", "gotcha",
+        ] {
+            assert_eq!(classify_intent(m), PrimeIntent::SmallTalk, "{m:?} is small talk");
+        }
+        for m in [
+            "ugh",
+            "fuck you",
+            "this is so frustrating",
+            "i give up",
+            "i'm exhausted",
+            "you're useless",
+        ] {
+            assert_eq!(
+                classify_intent(m),
+                PrimeIntent::EmotionalSupport,
+                "{m:?} is emotional support"
+            );
+        }
+        // Both decide to a plain conversational Reply that never steers to the board.
+        for intent in [PrimeIntent::SmallTalk, PrimeIntent::EmotionalSupport] {
+            match decide("ugh", &intent, &empty_summary()) {
+                PrimePlan::Reply { text } => {
+                    let lower = text.to_lowercase();
+                    for banned in
+                        ["the board", "queue", "crew", "set up", "what do you want to work on"]
+                    {
+                        assert!(
+                            !lower.contains(banned),
+                            "{intent:?} reply must not mention {banned:?}: {text:?}"
+                        );
+                    }
+                }
+                other => panic!("{intent:?} must be a Reply, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_work_and_questions_beat_casual_and_emotional_detection() {
+        // The conversational catch is LAST and conservative: a genuine command or a
+        // real question that merely contains a charged or casual word still routes to
+        // its true intent and is never swallowed as chitchat (do not weaken action).
+        assert_eq!(
+            classify_intent("fix the damn login bug"),
+            PrimeIntent::TaskCreation
+        );
+        assert_eq!(
+            classify_intent("create a task to clean up the logs"),
+            PrimeIntent::TaskCreation
+        );
+        // A longer sentence that merely contains a casual token is not chitchat.
+        assert_eq!(
+            classify_intent("summarize the nice clean readme"),
+            PrimeIntent::TaskCreation
+        );
+        // And the boundary predicates do not bite full sentences.
+        assert!(!is_casual_chat("nice work on the build today, can you continue it"));
+        assert!(!is_emotional_distress("fix the damn login bug"));
     }
 
     #[test]

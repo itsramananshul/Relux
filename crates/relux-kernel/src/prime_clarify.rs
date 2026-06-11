@@ -137,6 +137,11 @@ pub fn clarify_polish_kind(turn: &relux_core::PrimeTurn) -> Option<ClarifyKind> 
     }
     match turn.intent {
         I::Brainstorming => Some(ClarifyKind::Brainstorm),
+        // Casual chitchat and venting are conversation too: a brain may warm up the
+        // wording the same way it does a brainstorm reply (it never adds an action;
+        // the turn stays a plain `Reply`). Hermes-first general-agent conversation
+        // (`docs/prime-processing-audit.md` "Hermes-first general agent"; §10.5).
+        I::SmallTalk | I::EmotionalSupport => Some(ClarifyKind::Brainstorm),
         // A single-step plan steer is a short conversational reply (no multi-step card);
         // a multi-step plan has its own proposal-polish path, so skip it here.
         I::PlanRequest => {
@@ -152,8 +157,9 @@ pub fn clarify_polish_kind(turn: &relux_core::PrimeTurn) -> Option<ClarifyKind> 
 /// preserve, forbids any action claim, and demands JSON-only output. Kept ASCII and
 /// self-contained so it works as a one-shot CLI prompt with no system-message channel.
 pub fn build_clarify_prompt(kind: ClarifyKind, message: &str, deterministic_text: &str) -> String {
-    let common = "You are Prime, the operator of a local Relux control plane. You perform NO action \
-this turn and create nothing: never claim you created a task, started a run, installed a plugin, \
+    let common = "You are Prime, a general-purpose local AI agent — a helpful assistant and chat \
+companion that can also drive a local Relux control plane when asked. You perform NO action this \
+turn and create nothing: never claim you created a task, started a run, installed a plugin, \
 granted a permission, assigned work, or changed any state. Do not invent runs, tasks, plugins, or \
 numbers. Use plain ASCII.";
     match kind {
@@ -172,9 +178,10 @@ The current question (keep its meaning):\n{deterministic_text}\n\n\
 User message:\n{message}"
         ),
         ClarifyKind::Brainstorm => format!(
-            "{common}\n\nThe user is thinking out loud / brainstorming. Produce a concise, helpful \
-reply that engages the idea like a capable operator — a brief sanity-check and, if useful, AT MOST \
-ONE clarifying question. This is a conversation; nothing is created or run.\n\n\
+            "{common}\n\nThe user is making conversation — thinking out loud, chatting, or venting. \
+Produce a concise, natural, human reply that meets them where they are — a brief sanity-check or \
+acknowledgement and, if useful, AT MOST ONE clarifying question. This is a conversation; nothing \
+is created or run, and you do not push the user toward work.\n\n\
 Respond with JSON ONLY (no prose, no code fences) in EXACTLY this shape:\n\
 {{\"text\":\"<a concise, helpful reply>\",\"confidence\":<0.0-1.0>}}\n\n\
 Rules:\n\
@@ -322,7 +329,7 @@ mod tests {
 
         let brainstorm =
             build_clarify_prompt(ClarifyKind::Brainstorm, "what about a queue", "Good - let's think.");
-        assert!(brainstorm.contains("brainstorming"));
+        assert!(brainstorm.contains("conversation"));
         assert!(brainstorm.contains("AT MOST ONE"));
     }
 

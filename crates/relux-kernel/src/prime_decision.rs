@@ -368,9 +368,11 @@ the rest. The shape is:\n\
 Rules:\n\
 - classification.intent MUST be exactly one of: {labels}. Casual chat, small talk, greetings, \
 jokes, venting, insults, frustration, emotional messages, musing, or a question (\"how does X \
-work?\", \"we should...\") is CONVERSATION (greeting / brainstorming / direct_answer), NOT work. \
-Only an explicit instruction to DO something is a work intent. If genuinely ambiguous, prefer a \
-conversational intent so Prime just talks.\n\
+work?\", \"we should...\") is CONVERSATION (greeting / small_talk / emotional_support / \
+brainstorming / direct_answer), NOT work. Use small_talk for throwaway chitchat or an affirmation \
+(\"lol\", \"thanks\", \"nice\") and emotional_support for venting, frustration, or an insult \
+(\"ugh\", \"fuck you\", \"I give up\"). Only an explicit instruction to DO something is a work \
+intent. If genuinely ambiguous, prefer a conversational intent so Prime just talks.\n\
 - Include a slot section ONLY when its action clearly applies to this message: \"task\" for a \
 create, \"agent\" for creating an operative, \"plugin\"/\"permission\" for an install/grant \
 request, \"assign\" to assign an existing task to an existing agent, \"update\" to change an \
@@ -467,6 +469,8 @@ fn intent_labels() -> Vec<&'static str> {
         "plan_request",
         "tool_discovery",
         "tool_invocation",
+        "small_talk",
+        "emotional_support",
         "direct_answer",
     ]
 }
