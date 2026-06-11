@@ -1836,6 +1836,37 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.21** (2026-06-11) — the **first persistent allow-always grant** plus a **Hermes-first
+  Prime** re-grounding on top of v0.1.20, driven by `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` (§23 / §5
+  P2) and `docs/prime-processing-audit.md`. No master-plan safety property is weakened. **Persistent
+  allow-always grant (§23 / §5 P2):** a standing, explicit, revocable, audited
+  `relux_core::PersistentGrant` bound to one exact `(subject, plugin, tool, permission, risk)` lets a
+  future matching configured-tool invocation bypass the per-call approval prompt — and ONLY that
+  prompt; the subject permission check and the runtime/loopback gate still apply, and the pure
+  fail-closed `authorizes_invocation` matcher requires an exact match, so a changed permission or
+  escalated risk does not match and the prompt returns. The kernel adds grant/revoke/list +
+  `allow_always_from_approval`, the gate in `call_tool` / `invoke_tool` consults a matching grant
+  before refusing, `grant:create`/`grant:use`/`grant:revoke` are audited, and grants persist via
+  snapshot + SQLite (`next_grant` counter). **HTTP:** `POST /approvals/:id/allow-always`,
+  `GET`/`POST /grants`, `DELETE /grants/:id`. **Dashboard:** Approve once vs Allow always on a gated
+  tool approval, plus an Allow-always grants panel with revoke. Reference-first against openclaw
+  (permission-relay allow-once|allow-always|deny, exec-host-gateway persist-only-when-safe,
+  exec-approvals `hasDurableExecApproval` exact-match + `recordAllowlistUse`) and Hermes
+  (`approval.py` frozen-trust). **Hermes-first Prime:** reference-read against Hermes
+  (`reference/hermes-agent-main/agent/{prompt_builder,system_prompt,conversation_loop,
+  chat_completion_helpers,message_sanitization}.py`), Prime is re-grounded as a general-purpose
+  local AI agent / chat companion that drives the control plane only when the user asks for work.
+  Greetings, small talk, venting, insults, emotional support, and general Q&A are first-class
+  conversation, never work: two new wire-compatible `PrimeIntent` variants (`SmallTalk`,
+  `EmotionalSupport`), a final conservative `classify_intent` pass that routes chitchat → `SmallTalk`
+  and venting → `EmotionalSupport` only after every action/status/question/greeting rail (explicit
+  work and real questions always win first), contextual non-action chips in place of bare CTA
+  suppression, and general-agent prompt identity across the brain and sub-prompts; `is_chat_guarded`
+  is strengthened so a brain can never reconcile an insult or vent up to a work intent, and
+  brainstorm work CTAs attach only when a real work verb is present. Built reference-first per
+  `docs/reference-driven-development.md`; `cargo test` + `clippy` clean on `relux-core`/`relux-kernel`,
+  dashboard tests + typecheck + build green, the tracked `dashboard-dist` bundle rebuilt and committed
+  in sync. Every safety property from v0.1.20 still holds.
 - **v0.1.20** (2026-06-11) — a **third token-authenticated manager-subtree action** slice on
   top of v0.1.19, driven by `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` (§22). After `grant_permission`
   (§19/§20) and `assign_task` (§21), a manager that authenticated its OWN request with a per-agent

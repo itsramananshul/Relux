@@ -9,6 +9,60 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.21 (Windows bundle).** The `relux-kernel` /
+  `relux-core` crates move from `0.1.20` to `0.1.21`, bundling the post-v0.1.20
+  work into a fresh Windows release: the **first persistent allow-always grant**
+  for gated tool invocations (driven by `docs/HERMES_OPENCLAW_DEEP_AUDIT.md`
+  §23 / §5 P2) plus a **Hermes-first Prime** re-grounding that makes Prime a
+  general-purpose conversational agent that drives the control plane only when
+  asked (`docs/prime-processing-audit.md`). No master-plan safety property is
+  weakened: the persistent grant bypasses ONLY the per-call approval prompt
+  (the subject permission check and the runtime/loopback gate still apply, and a
+  changed permission or escalated risk fails closed), and every Prime safety rail
+  — `reconcile_intent` (fail-closed), existence/approval checks, `decide` →
+  `prime_execute`, and per-call tool approval — is untouched. Headlines:
+  - **Persistent allow-always grant (`HERMES_OPENCLAW_DEEP_AUDIT.md` §23 / §5
+    P2).** A standing, explicit, revocable, audited `relux_core::PersistentGrant`
+    bound to one exact `(subject, plugin, tool, permission, risk)` lets a future
+    matching configured-tool invocation bypass the per-call approval prompt. The
+    pure fail-closed `authorizes_invocation` matcher requires an exact match; a
+    changed permission or escalated risk does not match and the prompt returns.
+    The kernel adds grant/revoke/list + `allow_always_from_approval`, and the gate
+    in `call_tool` / `invoke_tool` consults a matching grant before refusing;
+    `grant:create` / `grant:use` / `grant:revoke` are audited, with snapshot +
+    SQLite persistence (`next_grant` counter). HTTP: `POST
+    /approvals/:id/allow-always`, `GET`/`POST /grants`, `DELETE /grants/:id`. The
+    dashboard offers **Approve once** vs **Allow always** on a gated tool approval,
+    plus an Allow-always grants panel with revoke. Built reference-first (openclaw
+    permission-relay allow-once|allow-always|deny, exec-host-gateway
+    persist-only-when-safe, exec-approvals `hasDurableExecApproval` exact-match +
+    `recordAllowlistUse`; Hermes `approval.py` frozen-trust), mapping recorded in
+    `docs/reference-driven-development.md`.
+  - **Hermes-first Prime — general agent, optional work powers
+    (`docs/prime-processing-audit.md`).** Reference-read against Hermes
+    (`reference/hermes-agent-main/agent/{prompt_builder,system_prompt,
+    conversation_loop,chat_completion_helpers,message_sanitization}.py`), Prime is
+    re-grounded as "a general-purpose local AI agent / chat companion" that drives
+    the control plane only when the user asks for work. Greetings, small talk,
+    venting, insults, emotional support, and general Q&A are now first-class
+    conversation, never work: two new `PrimeIntent` variants (`SmallTalk`,
+    `EmotionalSupport`, wire-compatible — the dashboard types intent as a generic
+    string), a final conservative `classify_intent` pass that routes chitchat →
+    `SmallTalk` and venting → `EmotionalSupport` only after every action / status /
+    question / greeting rail (so explicit work and real questions always win),
+    contextual non-action chips in place of bare CTA suppression, and
+    general-agent prompt identity across the brain and sub-prompts. `is_chat_guarded`
+    is strengthened so a brain can never reconcile an insult or vent up to a work
+    intent; brainstorm work CTAs attach only when a real work verb is present. The
+    dashboard greeting/hint/placeholder/suggestions lead with general chat
+    (`dashboard-dist` rebuilt and committed in sync).
+
+  Built reference-first per `docs/reference-driven-development.md`. `cargo test`
+  + `clippy` clean on `relux-core` / `relux-kernel`; dashboard tests + typecheck +
+  build green. Build the bundle with `scripts\relux-package-local.ps1 -FullE2E`.
+  This version line is the `relux-kernel` crate version (separate from the legacy
+  Relix workspace versions in the dated sections below). See
+  `docs/RELUX_MASTER_PLAN.md` → *Release history*.
 - **Relux local release v0.1.20 (Windows bundle).** The `relux-kernel` /
   `relux-core` crates move from `0.1.19` to `0.1.20`, bundling the post-v0.1.19
   **third token-authenticated manager-subtree action** slice (driven by
