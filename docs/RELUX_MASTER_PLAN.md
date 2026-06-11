@@ -1836,6 +1836,34 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.9** (2026-06-11) — a **Prime tool-use loop** slice on top of v0.1.8. Where
+  v0.1.8 made Prime brain-mediated for intent/slots/wording, this line gives the brain a
+  *governed tool surface* — first to read live control-plane state, then to request a
+  single mutating action — while every safety property holds and the brain changes no
+  state directly. **Safe read-only context loop:** Prime inspects live state through a
+  fail-closed, bounded allowlist (`get_run`, `list_plugins`, `list_approvals`, and the
+  state views) before answering; the brain proposes tool names, the allowlist gate drops
+  any mutating/unknown name at parse time, the loop is capped by `MAX_TOOL_ROUNDS`, and
+  the reply is grounded only in redacted observations — no raw provider envelope, no path
+  to `prime_execute`. These reads now also ride the **unified decision envelope** and are
+  validated through the same allowlist, with **dashboard provenance** (a `used: <tool>`
+  chip plus a bounded, collapsed per-read detail). **First safe WRITE-capable tool
+  surface:** a brain may request ONE governed mutating tool per turn (`task.create`,
+  `task.update`, `task.assign`, `task.start`, `agent.create` as safe Acts; `plugin.install`
+  and `permission.grant` as approval-gated Proposes), which Relux desugars into an existing
+  Prime action/proposal and routes through every current slot/intent/approval gate — the
+  fail-closed intent gate still vetoes a mutating tool on guarded chat, every id is
+  validated against live state, batched mutating requests are refused, and
+  `decide → prime_execute / approval` stays the sole path that changes durable state.
+  **Safe post-execution after-action narration:** after the kernel has already executed
+  (or proposed) an action through the unchanged path, a brain may re-word the final
+  confirmation grounded only in a sanitized, bounded result envelope and validated against
+  it (completion claims honored only when the fact is confirmed; success-on-failure,
+  installed/granted-on-proposal, and invented ids rejected; secrets/paths redacted),
+  changing no state. Built reference-first per `docs/reference-driven-development.md`
+  (Hermes + Paperclip/openclaw + open-webui) and audited in
+  `docs/prime-processing-audit.md`. Proven by `relux-kernel` / `relux-core` unit and
+  integration tests; every safety property from v0.1.8 still holds.
 - **v0.1.8** (2026-06-11) — a **Prime intelligence** slice on top of v0.1.7 that makes
   Prime brain-mediated end to end while keeping every safety property. The deterministic
   keyword cascade is now only the **fallback rail**: a configured brain (OpenRouter or

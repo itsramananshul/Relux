@@ -9,6 +9,41 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.9 (Windows bundle).** The `relux-kernel` /
+  `relux-core` crates move from `0.1.8` to `0.1.9`, bundling the post-v0.1.8 **Prime
+  tool-use loop** into a fresh Windows release. v0.1.8 made Prime brain-mediated for
+  intent/slots/wording; this line gives the brain a *governed tool surface* — first to
+  read live control-plane state, then to request a single mutating action — while every
+  master-plan safety property holds and the brain still changes no state directly.
+  Headlines: a **safe read-only context/tool loop** so Prime inspects live state through
+  a fail-closed, bounded allowlist (`get_run`, `list_plugins`, `list_approvals`, and the
+  state views) before answering — the brain proposes tool names, an allowlist gate drops
+  any mutating/unknown name at parse time, the loop is capped by `MAX_TOOL_ROUNDS`, and
+  the reply is grounded only in the redacted observations (no raw provider envelope, no
+  path to `prime_execute`); these read requests now also ride the **unified decision
+  envelope** (validated through the same allowlist the sidecar loop uses), with
+  **dashboard provenance** surfacing a compact `used: <tool>` chip plus a bounded,
+  collapsed per-read detail. The capstone is the **first safe WRITE-capable tool
+  surface**: a configured brain may request ONE governed mutating tool per turn
+  (`task.create`, `task.update`, `task.assign`, `task.start`, `agent.create` as safe
+  Acts; `plugin.install` and `permission.grant` as approval-gated Proposes), which Relux
+  desugars into an EXISTING Prime action/proposal and routes through every current
+  slot/intent/approval gate — the fail-closed intent gate still vetoes a mutating tool on
+  guarded chat, every id is validated against live state, batched mutating requests are
+  refused, and `decide → prime_execute / approval` stays the sole path that changes
+  durable state. Finally, **safe post-execution after-action narration**: after the
+  kernel has already executed (or proposed) an action through the unchanged path, a brain
+  may re-word the FINAL confirmation grounded ONLY in a sanitized, bounded result
+  envelope and validated against it (completion claims honored only when the fact is
+  confirmed; success-on-failure, installed/granted-on-proposal, and invented ids
+  rejected; secrets/paths redacted), changing no state. Built reference-first per
+  `docs/reference-driven-development.md` (Hermes' allowlist-validated tool loop +
+  inject-the-real-bounded-result grounding; Paperclip/openclaw's fail-closed mutation
+  gate and exec-approval followup; open-webui's collapsed tool-call display) and audited
+  in `docs/prime-processing-audit.md`. Build the bundle with
+  `scripts\relux-package-local.ps1 -FullE2E`. This version line is the `relux-kernel`
+  crate version (separate from the legacy Relix workspace versions in the dated sections
+  below). See `docs/RELUX_MASTER_PLAN.md` → *Release history*.
 - **Relux local release v0.1.8 (Windows bundle).** The `relux-kernel` /
   `relux-core` crates move from `0.1.7` to `0.1.8`, bundling the post-v0.1.7
   **Prime intelligence** slice into a fresh Windows release. This line makes Prime
@@ -1657,7 +1692,7 @@ First public alpha. Everything below is real and ships.
   versions; they were never cut as individual GitHub releases in this repo, so they
   point at the Releases list rather than non-existent `vX.Y.Z` tags (which 404).
 -->
-[Unreleased]: https://github.com/itsramananshul/Relix/compare/relux-v0.1.8...HEAD
+[Unreleased]: https://github.com/itsramananshul/Relix/compare/relux-v0.1.9...HEAD
 [0.4.3-beta.1]: https://github.com/itsramananshul/Relix/releases
 [0.4.2]: https://github.com/itsramananshul/Relix/releases
 [0.4.1]: https://github.com/itsramananshul/Relix/releases
