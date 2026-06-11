@@ -8,7 +8,7 @@ import {
   type ReluxPrimeSuggestion,
   type ReluxPrimeTurn,
 } from "../api";
-import { hasSteps, proposalDisplaySummary, stepDisplayTitle } from "../prime";
+import { hasSteps, polishProvenance, proposalDisplaySummary, stepDisplayTitle } from "../prime";
 import { workTaskHref, workRunHref } from "../routing";
 import { PrimeAutonomyPanel } from "../components/PrimeAutonomyPanel";
 import { OrchestrationPanel } from "../components/OrchestrationPanel";
@@ -419,13 +419,9 @@ function ProposalCard({ proposal }: { proposal: ReluxPrimeProposal }) {
           <span
             className="badge backlog"
             style={{ fontSize: 9 }}
-            title={
-              proposal.polish.model
-                ? `Wording refined by ${proposal.polish.model}. The steps, order, and assignees are unchanged.`
-                : "Wording refined by the AI brain. The steps, order, and assignees are unchanged."
-            }
+            title={`Wording refined by ${polishProvenance(proposal)}. The steps, order, and assignees are unchanged.`}
           >
-            AI-refined wording
+            AI-refined wording · {polishProvenance(proposal)}
           </span>
         )}
         <span className="mono" style={{ fontSize: 13, fontWeight: 600 }}>

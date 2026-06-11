@@ -6,6 +6,7 @@ import {
   hasSteps,
   stepDisplayTitle,
   proposalDisplaySummary,
+  polishProvenance,
 } from "../src/prime.ts";
 import type { ReluxPrimeProposal } from "../src/api.ts";
 
@@ -83,4 +84,26 @@ test("proposalDisplaySummary prefers the polished summary, else the deterministi
   assert.equal(proposalDisplaySummary(polished), "A clear two-stage path to a beta.");
   // No polish -> the authoritative count line is shown unchanged.
   assert.equal(proposalDisplaySummary(proposal()), "2 steps across 2 agents.");
+});
+
+// Provenance must read HONESTLY for both brains: the OpenRouter HTTP path stamps a
+// model id, the local CLI path stamps a friendly label, and an unpolished plan has
+// nothing to attribute (§10 planning layer, §11.1, §17.1).
+test("polishProvenance shows the OpenRouter model id", () => {
+  const p = proposal({ polish: { summary: "x", model: "anthropic/claude-3.5-haiku" } });
+  assert.equal(polishProvenance(p), "anthropic/claude-3.5-haiku");
+});
+
+test("polishProvenance shows the CLI brain label", () => {
+  assert.equal(polishProvenance(proposal({ polish: { summary: "x", model: "Claude CLI" } })), "Claude CLI");
+  assert.equal(polishProvenance(proposal({ polish: { summary: "x", model: "Codex CLI" } })), "Codex CLI");
+});
+
+test("polishProvenance is null without a polish overlay and generic when the source is unrecorded", () => {
+  // No overlay -> nothing to attribute, so the card renders no provenance.
+  assert.equal(polishProvenance(proposal()), null);
+  // An overlay from an older kernel that did not stamp `model` -> a generic label,
+  // not a blank or a crash.
+  assert.equal(polishProvenance(proposal({ polish: { summary: "x" } })), "AI brain");
+  assert.equal(polishProvenance(proposal({ polish: { summary: "x", model: "   " } })), "AI brain");
 });

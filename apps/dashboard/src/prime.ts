@@ -46,3 +46,18 @@ export function proposalDisplaySummary(p: ReluxPrimeProposal): string {
   const polished = p.polish?.summary?.trim();
   return polished ? polished : proposalSummary(p);
 }
+
+// The provenance to DISPLAY for an AI-refined plan: which brain refined the wording,
+// so the operator sees the source at a glance rather than only on hover. The kernel
+// stamps `polish.model` through the same `validate_polish` chokepoint for every
+// brain — the OpenRouter model id (e.g. "anthropic/claude-3.5-haiku") on the HTTP
+// path, or the local CLI brain's label ("Claude CLI" / "Codex CLI") on the adapter
+// path. Returns null when there is no polish overlay (nothing to attribute), and a
+// generic "AI brain" when an overlay carries no recorded source (older kernels that
+// predate the `model` stamp). Presentation only — provenance never alters the plan
+// (§10 planning layer, §11.1, §17.1).
+export function polishProvenance(p: ReluxPrimeProposal): string | null {
+  if (!p.polish) return null;
+  const model = p.polish.model?.trim();
+  return model ? model : "AI brain";
+}

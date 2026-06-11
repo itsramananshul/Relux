@@ -233,9 +233,16 @@ intact: the LLM gets ZERO action authority.
   preview in place.
 - **Dashboard** (`apps/dashboard`) — the `ProposalCard` shows the polished summary /
   step titles when present (falling back to the authoritative values via the pure
-  `stepDisplayTitle` / `proposalDisplaySummary` helpers), an **"AI-refined wording"**
-  provenance badge (with the model on hover), and advisory question/risk lists. The
-  authoritative steps/agents/order are unchanged; the commit button is untouched.
+  `stepDisplayTitle` / `proposalDisplaySummary` helpers), an **"AI-refined wording ·
+  <source>"** provenance badge, and advisory question/risk lists. The provenance is
+  now **visible on the badge itself** (no longer hover-only) via the pure
+  `polishProvenance` helper, which reads the SAME `polish.model` field stamped by the
+  one `validate_polish` chokepoint: the **OpenRouter model id** (e.g.
+  `anthropic/claude-3.5-haiku`) on the HTTP path, or the **CLI brain label**
+  (`Claude CLI` / `Codex CLI`) on the adapter path — so a CLI polish now reads as
+  cleanly as the OpenRouter one. An overlay from an older kernel that did not stamp
+  `model` degrades to a generic "AI brain" label. The authoritative steps/agents/order
+  are unchanged; the commit button is untouched.
 
 Invariant (binding): the polish overlay is **advisory/presentation only**. It can
 never change what "Create these tasks" creates (that re-runs `plan_orchestration` on
@@ -255,8 +262,10 @@ guards `compose_polish_prompt_carries_steps_and_no_structural_change_rule`,
 `polish_from_cli_text_rejects_structural_drift_via_the_same_chokepoint` (ai.rs) and the
 `cli_polish_*` seam tests (`server.rs`: valid envelope/plain JSON accepted, prose / error
 envelope ignored, structural drift rejected, no-adapter → `None`), and the
-`stepDisplayTitle` / `proposalDisplaySummary` tests in
-`apps/dashboard/test/prime.test.ts`. No test calls a real provider.
+`stepDisplayTitle` / `proposalDisplaySummary` / `polishProvenance` tests in
+`apps/dashboard/test/prime.test.ts` (the last pins the OpenRouter model id, the
+`Claude CLI`/`Codex CLI` labels, the no-overlay `null`, and the generic fallback when
+`model` is unstamped). No test calls a real provider.
 
 ## Next recommended slice
 
@@ -265,6 +274,6 @@ across the remaining reflect-and-clarify arms (brainstorm, orchestration, task
 update) — the same "model suggests wording, deterministic classifier owns the
 action" seam now used for the plan proposal — while keeping the action-free wall
 intact. (Extending the advisory polish to the CLI brains (claude/codex) through the
-same `validate_polish` chokepoint is now done — see above.) A further refinement
-would be to surface the CLI brain's `model`/session provenance on the polished card
-the way the OpenRouter model id already is.
+same `validate_polish` chokepoint is now done — see above; surfacing the CLI brain's
+provenance label on the card the way the OpenRouter model id already is, is now done
+too — the `polishProvenance` helper renders either visibly on the badge.)

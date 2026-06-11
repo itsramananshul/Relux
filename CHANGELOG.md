@@ -9,6 +9,22 @@ once a stable release is cut.
 
 ### Added
 
+- **The plan-preview card now shows *which* brain refined the wording, visibly.**
+  Implements `RELUX_MASTER_PLAN.md` §10 (planning layer), §11.1, §17.1, and closes the
+  documented "surface the CLI brain's provenance on the card the way the OpenRouter
+  model id already is" follow-up (`docs/prime-processing-audit.md`). When an advisory
+  polish overlay is present, the proposal card's **"AI-refined wording"** badge now
+  reads **"AI-refined wording · `<source>`"** with the source shown inline (no longer
+  hover-only): the **OpenRouter model id** (e.g. `anthropic/claude-3.5-haiku`) on the
+  HTTP path, or the **CLI brain label** (`Claude CLI` / `Codex CLI`) on the local
+  adapter path — both come from the same `polish.model` field stamped by the one
+  `validate_polish` chokepoint, so a CLI polish reads as cleanly as an OpenRouter one.
+  No wire change: the field already carried this for both brains; this is the dashboard
+  catching up. A new pure `polishProvenance` helper centralizes the display (model id /
+  CLI label / generic "AI brain" when an older kernel left `model` unstamped / `null`
+  when there is no overlay), pinned by new `apps/dashboard/test/prime.test.ts` cases.
+  The authoritative steps/order/agents and the commit button are untouched. Dashboard
+  bundle rebuilt into `crates/relix-web-bridge/dashboard-dist`.
 - **Advisory plan-preview polish now works with the CLI brains too (Claude / Codex),
   through the same validation chokepoint.** Implements `RELUX_MASTER_PLAN.md` §10
   (planning layer), §11.1, §17.1. The OpenRouter brain could already refine only the
