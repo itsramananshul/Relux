@@ -43,6 +43,29 @@ It serves on `http://127.0.0.1:19891` by default. If that port is already taken
 the exact command to pick another port — set `RELUX_HTTP_ADDR=127.0.0.1:<port>`
 for a source checkout, or use `.\Start-Relux.ps1 -Port <port>` with the bundle.
 
+#### Run from a source checkout (Windows, one command)
+
+From the **root of a cloned repo**, the `Start-Relux.ps1` launcher does the
+source-checkout boot for you: it builds (or reuses) the `relux-kernel` binary,
+points it at the committed dashboard bundle and the gitignored `dev-data\` store,
+preflights the port, prints the dashboard URL, and runs the server in the
+foreground (Ctrl+C to stop):
+
+```powershell
+# from the repo root
+powershell -NoProfile -ExecutionPolicy Bypass -File .\Start-Relux.ps1
+# override the port if 19891 is taken:  .\Start-Relux.ps1 -Port 20000
+```
+
+Flags: `-Release` (build/use the optimized binary), `-DryRun` (check
+prereqs/port/paths and print the plan without building or starting anything),
+`-Doctor` (run the kernel health check and exit), and `-Help`. The first build
+can take a few minutes; later runs reuse the built binary. If `cargo` is missing
+the launcher prints the Rust install step and stops. This is the **source**
+launcher; the same-named `Start-Relux.ps1` inside an extracted release bundle is a
+**different**, prebuilt launcher (see "Run the packaged release" below) — run that
+one from inside the extracted folder, this one from the repo root.
+
 #### Run the packaged release (v0.1.11, no build needed)
 
 Prefer a prebuilt Windows bundle over building from source? Grab the latest
