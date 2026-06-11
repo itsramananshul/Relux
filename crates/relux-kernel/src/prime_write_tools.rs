@@ -148,6 +148,13 @@ pub const WRITE_TOOLS: &[WriteTool] = &[
         args_hint: "{\"name\":\"<agent name>\",\"role\":\"<optional>\",\"adapter\":\"<optional existing adapter id>\",\"persona\":\"<optional>\"}",
     },
     WriteTool {
+        name: "orchestration.create",
+        intent: PrimeIntent::Orchestration,
+        gated: false,
+        summary: "Decompose a multi-step goal into briefs across agents. Maps to the existing OrchestrateGoal action; the deterministic planner owns the step/agent decomposition and the multi-agent gate.",
+        args_hint: "{\"goal\":\"<the multi-step goal>\",\"steps\":[\"<optional distinct step>\", ...]}",
+    },
+    WriteTool {
         name: "plugin.install",
         intent: PrimeIntent::PluginInstallation,
         gated: true,
@@ -197,6 +204,10 @@ pub enum WriteToolSlot {
     Permission(crate::prime_admin_slots::BrainPermissionSlots),
     /// `task.start` → [`BrainRunStart`] (StartRun).
     RunStart(BrainRunStart),
+    /// `orchestration.create` → [`crate::prime_orchestration_slots::BrainOrchestrationSlots`]
+    /// (OrchestrateGoal). The validated goal flows into the EXISTING deterministic planner +
+    /// orchestration-creation path; the brain proposes only the goal text.
+    Orchestration(crate::prime_orchestration_slots::BrainOrchestrationSlots),
 }
 
 /// A validated write tool request: the allowlisted tool name, the existing intent it maps
@@ -304,6 +315,9 @@ pub fn parse_write_tool_request(value: &serde_json::Value) -> Option<ParsedWrite
             crate::prime_admin_slots::parse_permission_slots(&args_json).ok()?,
         ),
         PrimeIntent::RunStart => WriteToolSlot::RunStart(parse_run_start(&args)?),
+        PrimeIntent::Orchestration => WriteToolSlot::Orchestration(
+            crate::prime_orchestration_slots::parse_orchestration_slots(&args_json).ok()?,
+        ),
         // The allowlist above never maps to any other intent; defensive fail-closed.
         _ => return None,
     };
@@ -390,6 +404,7 @@ mod tests {
         assert!(classify_write_tool("task.assign").is_some());
         assert!(classify_write_tool("task.start").is_some());
         assert!(classify_write_tool("agent.create").is_some());
+        assert!(classify_write_tool("orchestration.create").is_some());
         assert!(classify_write_tool("plugin.install").is_some());
         assert!(classify_write_tool("permission.grant").is_some());
         // Anything off the allowlist is refused — including a plausible-sounding write.
@@ -450,6 +465,10 @@ mod tests {
                 PrimeIntent::AgentCreation,
             ),
             (
+                serde_json::json!({"tool":"orchestration.create","args":{"goal":"research, implement, and document the feature"}}),
+                PrimeIntent::Orchestration,
+            ),
+            (
                 serde_json::json!({"tool":"plugin.install","args":{"plugin_id":"relux-tools-github"}}),
                 PrimeIntent::PluginInstallation,
             ),
@@ -463,6 +482,39 @@ mod tests {
                 .unwrap_or_else(|| panic!("expected {intent:?} to parse"));
             assert_eq!(parsed.intent, intent);
         }
+    }
+
+    #[test]
+    fn parses_orchestration_create_through_the_existing_orchestration_validator() {
+        let v = serde_json::json!({
+            "tool": "orchestration.create",
+            "args": {"goal": "ship the launch", "steps": ["research the market", "build the page"]}
+        });
+        let parsed = parse_write_tool_request(&v).expect("a valid orchestration.create");
+        assert_eq!(parsed.tool, "orchestration.create");
+        assert_eq!(parsed.intent, PrimeIntent::Orchestration);
+        assert!(!parsed.gated);
+        match parsed.slot {
+            WriteToolSlot::Orchestration(s) => {
+                assert_eq!(s.goal, "ship the launch");
+                assert_eq!(s.steps.len(), 2);
+                // The committed-request confidence cleared the validator's floor.
+                assert!(s.confidence >= 0.6);
+            }
+            other => panic!("expected an orchestration slot, got {other:?}"),
+        }
+        // A missing required goal fails closed through the reused validator.
+        assert!(parse_write_tool_request(&serde_json::json!({
+            "tool": "orchestration.create",
+            "args": {"steps": ["a", "b"]}
+        }))
+        .is_none());
+        // A smuggled unsupported field (an agent reference) fails closed.
+        assert!(parse_write_tool_request(&serde_json::json!({
+            "tool": "orchestration.create",
+            "args": {"goal": "do it", "agent_id": "researcher"}
+        }))
+        .is_none());
     }
 
     #[test]

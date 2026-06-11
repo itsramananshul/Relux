@@ -3804,6 +3804,48 @@ impl KernelState {
             plan
         };
 
+        // Brain-assisted orchestration goal (the `orchestration.create` write tool): when the
+        // intent is `Orchestration`, a VALIDATED brain goal slot REPLACES the keyword-sliced goal
+        // that flows into the EXISTING `OrchestrateGoal` action. This both sharpens a goal the
+        // deterministic path already accepted and PROMOTES a single-clause clarify whose distinct
+        // steps the brain named — but ONLY through the deterministic planner: `reconcile_
+        // orchestration_slots` runs `plan_orchestration` and returns `None` unless the composed
+        // goal genuinely splits multi-agent, so the planner still owns the role classification,
+        // the agent grounding (an agent is matched only against the live roster), the step cap,
+        // and the DAG. `prime_execute` re-checks `is_multi_agent` at apply time, so the brain can
+        // never fan out a goal the planner would not.
+        //
+        // CASUAL-CHAT SAFETY: the promotion is gated on `!is_chat_guarded`, the SAME boundary
+        // `reconcile_intent` uses to veto a sensitive intent on guarded chat. This is load-bearing
+        // here (unlike the assign/update/run-start promotions, where the gate's veto suffices)
+        // because the deterministic classifier itself reads a guarded coordination question
+        // ("should we split this across a few agents?") as `Orchestration`, so `reconcile_intent`'s
+        // veto is a no-op (deterministic == proposal). Without this guard the brain's goal would
+        // mint an orchestration from a question. With it, a guarded turn keeps the deterministic
+        // clarify and creates nothing — only an EXPLICIT orchestrate/build/do-it request promotes.
+        let plan = if intent == relux_core::PrimeIntent::Orchestration
+            && !crate::prime::is_chat_guarded(message)
+        {
+            match slots.orchestration.and_then(|proposal| {
+                crate::prime_orchestration_slots::reconcile_orchestration_slots(proposal, &summary)
+            }) {
+                Some(resolved) => PrimePlan::Act {
+                    action: PrimeAction::OrchestrateGoal {
+                        goal: resolved.goal.clone(),
+                    },
+                    text: format!(
+                        "Planning an orchestration for \"{}\": {} across {}.",
+                        resolved.goal,
+                        crate::prime::count_phrase(resolved.plan.steps.len(), "brief"),
+                        crate::prime::count_phrase(resolved.plan.agent_labels().len(), "agent"),
+                    ),
+                },
+                None => plan,
+            }
+        } else {
+            plan
+        };
+
         self.record_audit(
             "agent",
             ctx.agent.as_str(),
@@ -6636,6 +6678,11 @@ pub struct BrainSlotProposals<'a> {
     /// not complete (the message named no ready task id). Validated against the live ready
     /// queue before promoting to the SAME safe `StartRun` action.
     pub run: Option<&'a crate::prime_write_tools::BrainRunStart>,
+    /// An `orchestration.create` write-tool goal for an `Orchestration` turn. The validated
+    /// goal REPLACES the keyword-sliced goal that flows into the EXISTING `OrchestrateGoal`
+    /// action; the deterministic planner still owns the decomposition, agent grounding, the
+    /// step cap, the DAG, and the multi-agent gate (a goal that does not split is dropped).
+    pub orchestration: Option<&'a crate::prime_orchestration_slots::BrainOrchestrationSlots>,
     /// Whether this bundle was computed by the caller on the COMBINED message of a
     /// multi-turn *continuation* (vs. the raw message of a fresh turn). The kernel keeps
     /// the bundle only when this matches the turn it actually produced — continuation
@@ -8111,6 +8158,156 @@ mod tests {
         assert_eq!(turn.intent, relux_core::PrimeIntent::AgentCreation);
         // The validated name normalized to an id through the existing create path.
         assert_eq!(turn.created_agent.unwrap().as_str(), "research-agent");
+    }
+
+    #[test]
+    fn write_tool_orchestration_create_maps_to_the_existing_orchestrate_path() {
+        use crate::prime_write_tools::{parse_write_tool_request, WriteToolSlot};
+        let (mut k, ctx) = prime_chat_kernel();
+        let before = k.orchestration_count();
+        let req = parse_write_tool_request(&serde_json::json!({
+            "tool": "orchestration.create",
+            "args": {"goal": "research the market, build the landing page, and test it"}
+        }))
+        .unwrap();
+        assert!(!req.gated, "orchestration.create is a safe Act, not approval-gated");
+        let intent = req.intent_proposal();
+        let WriteToolSlot::Orchestration(orch) = &req.slot else {
+            panic!("expected an orchestration slot");
+        };
+        let (turn, source) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "orchestrate the launch",
+                Some(&intent),
+                BrainSlotProposals {
+                    orchestration: Some(orch),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::Orchestration);
+        assert_eq!(source, crate::prime_intent::IntentSource::Brain);
+        assert_eq!(turn.disposition, PrimeDisposition::Executed);
+        // The validated goal flowed through the EXISTING deterministic orchestration creation
+        // path, producing a real multi-brief orchestration.
+        assert_eq!(
+            k.orchestration_count(),
+            before + 1,
+            "the write tool created an orchestration through the existing path"
+        );
+        assert!(turn.created_task.is_some(), "the first brief is surfaced as the created task");
+    }
+
+    #[test]
+    fn write_tool_orchestration_promotes_brain_named_steps() {
+        // A single-clause message the deterministic planner would only CLARIFY is PROMOTED to a
+        // real orchestration when the brain names the distinct steps — but only through the
+        // deterministic planner (which still owns the briefs/agents/cap/DAG).
+        use crate::prime_write_tools::{parse_write_tool_request, WriteToolSlot};
+        let (mut k, ctx) = prime_chat_kernel();
+        let before = k.orchestration_count();
+        let req = parse_write_tool_request(&serde_json::json!({
+            "tool": "orchestration.create",
+            "args": {"goal": "ship the launch",
+                     "steps": ["research the market", "build the landing page", "test it"]}
+        }))
+        .unwrap();
+        let intent = req.intent_proposal();
+        let WriteToolSlot::Orchestration(orch) = &req.slot else {
+            panic!("expected an orchestration slot");
+        };
+        let (turn, _) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "orchestrate the launch",
+                Some(&intent),
+                BrainSlotProposals {
+                    orchestration: Some(orch),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(turn.disposition, PrimeDisposition::Executed);
+        assert_eq!(k.orchestration_count(), before + 1);
+    }
+
+    #[test]
+    fn write_tool_orchestration_drops_a_single_clause_goal() {
+        // A goal that does not genuinely split is NOT orchestratable: the deterministic planner's
+        // multi-agent constraint stands, so the deterministic clarify is kept and nothing is created.
+        use crate::prime_write_tools::{parse_write_tool_request, WriteToolSlot};
+        let (mut k, ctx) = prime_chat_kernel();
+        let before = k.orchestration_count();
+        let req = parse_write_tool_request(&serde_json::json!({
+            "tool": "orchestration.create",
+            "args": {"goal": "summarize the README"}
+        }))
+        .unwrap();
+        let intent = req.intent_proposal();
+        let WriteToolSlot::Orchestration(orch) = &req.slot else {
+            panic!("expected an orchestration slot");
+        };
+        let (turn, _) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "orchestrate this",
+                Some(&intent),
+                BrainSlotProposals {
+                    orchestration: Some(orch),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(turn.disposition, PrimeDisposition::NeedsClarification);
+        assert_eq!(
+            k.orchestration_count(),
+            before,
+            "a non-splittable goal must never fan out"
+        );
+    }
+
+    #[test]
+    fn casual_chat_never_triggers_orchestration() {
+        // A guarded coordination QUESTION must never mint an orchestration via the write tool,
+        // even with a valid multi-step goal slot. The deterministic classifier itself reads this
+        // as `Orchestration` (so the intent gate's veto is a no-op), which is exactly why the
+        // promotion is additionally gated on `!is_chat_guarded`: the guarded question keeps the
+        // deterministic CLARIFY and creates nothing — only an explicit ask promotes.
+        use crate::prime_write_tools::{parse_write_tool_request, WriteToolSlot};
+        let (mut k, ctx) = prime_chat_kernel();
+        let before = k.orchestration_count();
+        let req = parse_write_tool_request(&serde_json::json!({
+            "tool": "orchestration.create",
+            "args": {"goal": "research the options, build it, and test it"}
+        }))
+        .unwrap();
+        let intent = req.intent_proposal();
+        let WriteToolSlot::Orchestration(orch) = &req.slot else {
+            panic!("expected an orchestration slot");
+        };
+        let (turn, _) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "should we split this across a few agents?",
+                Some(&intent),
+                BrainSlotProposals {
+                    orchestration: Some(orch),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // SAFETY: the guarded question is answered with a clarification, not a fan-out of work.
+        assert_ne!(
+            turn.disposition,
+            PrimeDisposition::Executed,
+            "a guarded question must not execute an orchestration"
+        );
+        assert_eq!(
+            k.orchestration_count(),
+            before,
+            "casual chat must never orchestrate via a write tool"
+        );
     }
 
     #[test]

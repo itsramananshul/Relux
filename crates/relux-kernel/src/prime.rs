@@ -780,7 +780,7 @@ fn list_briefs(briefs: &[TaskBrief]) -> String {
 }
 
 /// `"1 active run"` / `"3 active runs"` (naive pluralization, ASCII English).
-fn count_phrase(n: usize, noun: &str) -> String {
+pub(crate) fn count_phrase(n: usize, noun: &str) -> String {
     format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
 }
 

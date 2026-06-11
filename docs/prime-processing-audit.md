@@ -1356,16 +1356,22 @@ below are the fallback when that envelope is unavailable:
    `context_reads` provenance). `Local` / an actionful turn gathers nothing.
 3c. **Governed WRITE tool** (an explicitly-commanded turn only) — the ONE unified decision may carry
    a single `action_request` naming an allowlisted WRITE tool (`prime_write_tools`): `task.create` /
-   `task.update` / `task.assign` / `task.start` / `agent.create` (safe `Act`s) or `plugin.install` /
-   `permission.grant` (approval-gated `Propose`s). The name is fail-closed validated
-   (`classify_write_tool`); the args are validated by REUSING the existing per-action slot validator;
-   the tool is *desugared* into a synthesized intent proposal + the matching slot fed to the
-   UNCHANGED `prime_turn_with_brain` chokepoint (step 2/3). So the fail-closed intent gate still
-   vetoes a mutating tool on guarded chat, every id is validated against the live state, the
-   terminal-state/readiness guards hold, and a risky tool stays behind a human approval — the brain
-   requests; `decide` → `prime_execute` / approval is still the SOLE path that changes durable state.
-   At most ONE write tool per turn; the chip `🛠 requested tool: <name>` appears only when it
-   genuinely drove an actionful turn. `Local` / a vetoed request changes nothing.
+   `task.update` / `task.assign` / `task.start` / `agent.create` / `orchestration.create` (safe
+   `Act`s) or `plugin.install` / `permission.grant` (approval-gated `Propose`s). The name is
+   fail-closed validated (`classify_write_tool`); the args are validated by REUSING the existing
+   per-action slot validator; the tool is *desugared* into a synthesized intent proposal + the
+   matching slot fed to the UNCHANGED `prime_turn_with_brain` chokepoint (step 2/3). So the
+   fail-closed intent gate still vetoes a mutating tool on guarded chat, every id is validated against
+   the live state, the terminal-state/readiness guards hold, and a risky tool stays behind a human
+   approval — the brain requests; `decide` → `prime_execute` / approval is still the SOLE path that
+   changes durable state. `orchestration.create` maps to the EXISTING `OrchestrateGoal` path: the
+   brain proposes only the goal text (with advisory step hints), and the deterministic
+   `plan_orchestration` still owns the briefs/agents/cap/DAG and the multi-agent gate
+   (`reconcile_orchestration_slots` drops a goal that does not split); its promotion of a single-clause
+   clarify is additionally gated on `!is_chat_guarded`, because the deterministic classifier itself
+   reads a guarded coordination question as `Orchestration`. At most ONE write tool per turn; the chip
+   `🛠 requested tool: <name>` appears only when it genuinely drove an actionful turn. `Local` / a
+   vetoed request changes nothing.
 4. **UI response** — the reply text may be brain-shaped on a conversational turn. A
    **clarify / brainstorm / single-step plan** turn goes through the VALIDATED wording
    path (`prime_clarify`: one schema-checked question / short summary, action claims
@@ -1397,6 +1403,56 @@ below are the fallback when that envelope is unavailable:
    already ran; this changes only the wording. The chip `🧠 after-action wording · <source>` appears
    only when the brain genuinely shaped an actionful confirmation. A TOOL turn (real kernel output)
    keeps the deterministic reply, and `Local` always falls back.
+
+## Applied change (a governed orchestration write tool)
+
+The write-capable tool surface shipped seven tools but none reached Prime's richest write path —
+**orchestration** (one goal fanned into several role-typed briefs across the crew). Prime already
+had the deterministic planner (`relux_core::plan_orchestration`) and the executable `OrchestrateGoal`
+action, but the only way in was the keyword `Orchestration` intent whose goal was string-sliced from
+the raw message. Per master plan §10.1/§10.2/§10.4 and the reference read recorded in
+`reference-driven-development.md` (Hermes name-allowlist-before-execute + `coerce_tool_args`; openclaw
+`update-plan-tool` per-entry validation + status/key allowlist, `sessions-spawn-tool`/`common.ts`
+required string + unsupported-key rejection, `tool-policy` work-is-a-gated-capability), this slice
+adds `orchestration.create` to the SAME governed write allowlist, mapping it to the EXISTING path.
+
+- **New module `relux-kernel/src/prime_orchestration_slots.rs`.** `parse_orchestration_slots` accepts
+  ONLY `goal`/`steps`/`confidence`/`rationale` (any other key fails closed), requires a non-empty
+  sanitized+clamped `goal`, validates the optional `steps` STRICTLY (present ⇒ an array; EVERY element
+  a string, else the whole proposal fails closed — a smuggled `{"agent":...}` step is refused), each
+  step sanitized+clamped and the count clamped to the planner's `MAX_STEPS`. `reconcile_orchestration_
+  slots` composes the goal (steps joined with the planner's own connector, else the goal verbatim),
+  runs the deterministic `plan_orchestration`, and returns `None` unless it genuinely splits
+  MULTI-AGENT — so the planner keeps full authority over briefs, role classification, agent grounding
+  (matched ONLY against the live roster), the step cap, and the DAG; `prime_orchestrate` re-checks
+  `is_multi_agent` at apply time.
+- **`orchestration.create` joins `prime_write_tools::WRITE_TOOLS`** (intent `Orchestration`,
+  `gated:false`, slot `WriteToolSlot::Orchestration`). `classify_write_tool` admits ONLY allowlisted
+  names; `parse_write_tool_request` validates the args via the new validator (the committed-request
+  confidence clears its floor). The kernel chokepoint (`BrainSlotProposals.orchestration`) REPLACES the
+  keyword-sliced goal in the `OrchestrateGoal` action with the validated brain goal and routes it
+  through the UNCHANGED `decide` → `prime_execute` orchestration-creation path.
+- **Safety invariants (binding).** The brain writes nothing — it proposes only the goal text (advisory
+  step hints); every brief/task/assignment is still minted by the deterministic planner. The mapped
+  intent is sensitive, so `reconcile_intent` keeps guarded chat deterministic; and because the
+  deterministic classifier itself reads a guarded coordination question ("should we split this across
+  a few agents?") as `Orchestration`, the kernel promotion of a single-clause clarify is ADDITIONALLY
+  gated on `!is_chat_guarded` — so a question keeps the deterministic clarify and fans out nothing;
+  only an EXPLICIT orchestrate/build/do-it request promotes. Risky work inside an orchestration is
+  unchanged: each brief is RUN only by the separate governed `run_orchestration` batch, so a protected
+  adapter/permission still gates at run time. Any failure (no brain, low confidence, unsplittable goal,
+  unsupported field, off-allowlist name) leaves the deterministic outcome in place. Provenance is the
+  existing generic `🛠 requested tool: orchestration.create` chip (no new wire field, no dashboard
+  change).
+
+Pinned by the `prime_orchestration_slots` unit tests (clean parse with/without steps, noisy-reply
+extraction, unsupported-field / non-array-steps / non-string-step fail-closed, empty-goal reject,
+overlong-goal clamp, step sanitize + count clamp, confidence coerce, reconcile honors-a-multi-agent-
+goal / composes-steps / drops-single-clause / drops-low-confidence); the `prime_write_tools` parse
+test; the `prime_decision` unified-envelope test (`carries_an_orchestration_write_tool_request`); and
+the kernel integration tests (`write_tool_orchestration_create_maps_to_the_existing_orchestrate_path`,
+`write_tool_orchestration_promotes_brain_named_steps`, `write_tool_orchestration_drops_a_single_
+clause_goal`, `casual_chat_never_triggers_orchestration`). No test calls a real provider.
 
 ## Next recommended slice
 

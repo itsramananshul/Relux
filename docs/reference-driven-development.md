@@ -1273,3 +1273,90 @@ guarded chat, every id still validated against the live state, and every approva
 first round's prompt is byte-for-byte the prior single-shot prompt (empty observations), so a turn
 where the brain commits immediately is unchanged. The loop is intentionally short (a *little*
 inspection before one action, not an open-ended agent); a richer multi-action loop stays deferred.
+
+---
+
+## Reference read — a governed ORCHESTRATION write tool (this slice)
+
+The write-capable tool surface ([the first-write slice](#reference-read--the-first-safe-write-capable-prime-tool-surface-this-slice))
+shipped seven tools — task create/update/assign/start, agent.create, plugin.install, permission.grant —
+but none reached Prime's richest write path: **orchestration** (one goal fanned into several
+role-typed briefs assigned across the crew). Prime already has a deterministic multi-agent planner
+([`relux_core::plan_orchestration`]) and an executable `OrchestrateGoal` action, but the only way to
+invoke them was the keyword `Orchestration` intent whose goal was string-sliced from the raw message
+— so a user who explicitly asked Prime to coordinate work but phrased the goal as a single clause got
+a clarifying question, not a plan. This slice adds `orchestration.create` to the same governed write
+allowlist, mapping it to the EXISTING `OrchestrateGoal` path, with the deterministic planner kept as
+the sole authority on the decomposition.
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/agent/conversation_loop.py` `run_conversation(...)` (L3114-3162) — a
+  SINGLE assistant message carries both `content` and the structured `tool_calls`, and the chosen
+  tool name is **validated against `agent.valid_tool_names` BEFORE execution**; an off-list name is
+  fed back, never run. **Pattern: one response carries the answer AND the structured action; each
+  requested tool name is allowlist-validated before it is used.** Mirrored: `orchestration.create`
+  joins [`crate::prime_write_tools`] `WRITE_TOOLS`, and `classify_write_tool` is the name-allowlist
+  gate — the brain executes nothing; the tool desugars into the existing `Orchestration` intent + a
+  validated goal slot that flows through the UNCHANGED `decide` → `prime_execute` path.
+- `reference/hermes-agent-main/model_tools.py` `coerce_tool_args` (L535-616) + `agent/
+  message_sanitization.py` — coerce each argument to its schema type (a non-coercible value is
+  dropped, not fatal) and sanitize control chars + clamp length on every model-produced string.
+  Mirrored in `prime_orchestration_slots`: the goal/steps sanitizers (control-strip + clamp) and the
+  `coerce_confidence` (number-or-numeric-string → clamped, neutral default otherwise).
+
+### Paperclip (openclaw) — files read
+
+- `reference/openclaw-main/src/agents/tools/update-plan-tool.ts` `readPlanSteps` (L39-74) — a
+  structured plan payload is validated FIELD-BY-FIELD / per-entry against its schema + the
+  `PLAN_STEP_STATUSES` allowlist, and clamped (at most one `in_progress`). **Pattern: validate a
+  composite payload's list section per-entry against an explicit schema, and clamp it.** Mirrored:
+  `parse_orchestration_slots` validates the optional `steps` array STRICTLY — present ⇒ it must be an
+  array, and EVERY element must be a string (a non-array, or any non-string element such as a
+  smuggled `{"agent":...}` object, fails the WHOLE proposal closed); each step is sanitized + clamped
+  and the count is clamped to the planner's own `MAX_STEPS` cap.
+- `reference/openclaw-main/src/agents/tools/sessions-spawn-tool.ts`
+  `UNSUPPORTED_SESSIONS_SPAWN_PARAM_KEYS` (rejected before any param is read) + `src/agents/tools/
+  common.ts` `readStringParam(required)` / `ToolInputError` (L57-122) — reject unsupported keys
+  outright; require/trim the mandatory string. Mirrored: `parse_orchestration_slots` accepts ONLY
+  `ALLOWED_KEYS` (`goal`/`steps`/`confidence`/`rationale`) — any other key (a smuggled `agent_id` /
+  `role` / `run`) fails closed — and requires a non-empty `goal`.
+- `reference/openclaw-main/src/agents/tool-policy.ts`
+  `applyOwnerOnlyToolPolicy` / `wrapOwnerOnlyToolExecution` — a work / control-plane capability is
+  ONE explicit, GATED capability, never inferred from chat. **Pattern: minting work is an explicit
+  capability, never auto-run from casual chat.** Mirrored: `orchestration.create`'s intent
+  (`Orchestration`) is `is_sensitive_intent`, so `reconcile_intent` keeps guarded chat deterministic
+  — and, because the deterministic classifier itself reads a guarded coordination question ("should
+  we split this across agents?") as `Orchestration` (so the gate's veto is a no-op there), the kernel
+  promotion is ADDITIONALLY gated on `!is_chat_guarded`, the same boundary, so a question can never
+  fan out work; only an explicit orchestrate/build/do-it request promotes.
+- `reference/openclaw-main/src/shared/balanced-json.ts` `extractBalancedJsonPrefix` +
+  `src/agents/cli-output.ts` `parseCliOutput` — lift the parsed object out of a noisy reply, never
+  the raw stdout. The `orchestration.create` args ride inside the unified `action_request`, lifted by
+  `parse_adapter_result` FIRST on the CLI path (`parse_cli_decision`), and the goal JSON via the
+  shared `extract_json_object` scanner.
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| Hermes: **one response carries the action; the tool name is allowlist-validated** | `orchestration.create` joins `prime_write_tools::WRITE_TOOLS` (intent `Orchestration`, `gated:false`); `classify_write_tool` admits ONLY allowlisted names, so a made-up `orchestration.run`/`orchestration.delete` is refused at parse time. The validated slot is `WriteToolSlot::Orchestration(BrainOrchestrationSlots)`. |
+| openclaw: **validate the list section per-entry; reject unsupported keys; require the mandatory string** (`readPlanSteps`, `UNSUPPORTED_*`, `readStringParam`) | `prime_orchestration_slots::parse_orchestration_slots` allowlist = `goal`/`steps`/`confidence`/`rationale` (any other key fails closed); `goal` required non-empty + sanitized + clamped; `steps` must be an array of strings (non-array / non-string element fails closed), each sanitized + clamped, count clamped to the planner's `MAX_STEPS`. |
+| openclaw: **the deterministic planner owns the dangerous decision** (validate against what exists) | `reconcile_orchestration_slots` composes the goal (steps joined with the planner's own connector, else the goal verbatim) and runs the deterministic `relux_core::plan_orchestration` — returning `None` unless it genuinely splits MULTI-AGENT. The planner still owns role classification, agent grounding (matched ONLY against the live roster), the step cap, and the dependency DAG; `prime_orchestrate` re-checks `is_multi_agent` at apply time. The brain proposes only the goal TEXT — it can never name an agent/role or fan out a goal the planner would not. |
+| openclaw: **minting work is an explicit, gated capability — never from chat** (`tool-policy`) | the mapped intent is sensitive, so `reconcile_intent` keeps guarded chat deterministic; the kernel promotion is additionally gated on `!is_chat_guarded` (the deterministic classifier reads a guarded coordination question as `Orchestration`, so that extra guard is load-bearing here). A guarded turn keeps the deterministic clarify and creates nothing. |
+| openclaw/Hermes: **balanced-JSON extraction, no raw-envelope leak; deterministic fallback always exists** | the args ride the unified `action_request`, lifted by `parse_adapter_result` FIRST; ANY failure (no brain, low confidence, unsplittable goal, unsupported field, off-allowlist name) leaves the deterministic outcome — a clarify or the keyword-sliced orchestration — in place. The provenance is the existing generic `requested tool: orchestration.create` chip (no new wire field). |
+
+**What we deliberately do differently:** unlike Hermes (where the model runs the mutating tool), the
+Relux brain runs NOTHING — `orchestration.create` is *desugared* into the existing `Orchestration`
+intent + a validated goal slot, so every brief/task/assignment is still minted by the SAME
+deterministic `plan_orchestration` → `prime_orchestrate` path behind the unchanged fail-closed gate.
+The brain proposes only the goal text (with advisory step hints); it never authors a brief, names an
+agent, picks a role, sets the order, or exceeds the cap — the deterministic planner owns all of that
+and the multi-agent gate it can never bypass. Unlike the `task.create` write tool (sharpen-only),
+`orchestration.create` may PROMOTE a single-clause clarify whose distinct steps the brain named into
+a real orchestration — but ONLY on an explicit (`!is_chat_guarded`) request and ONLY when the
+composed goal genuinely decomposes multi-agent through the deterministic planner. Risky work inside
+an orchestration is unchanged: each brief is a normal task assigned to an agent and is RUN only by the
+separate governed `run_orchestration` batch (no paid CLI is spawned at create time), so a protected
+adapter/permission still gates at run time exactly as before. The mutating-tool surface stays small;
+a multi-action orchestration loop and richer per-brief tools stay deferred.

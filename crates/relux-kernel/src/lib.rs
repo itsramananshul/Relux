@@ -33,6 +33,7 @@ pub mod prime_clarify;
 pub mod prime_clarify_memory;
 pub mod prime_decision;
 pub mod prime_intent;
+pub mod prime_orchestration_slots;
 pub mod prime_slots;
 pub mod prime_tools;
 pub mod prime_update_slots;
@@ -106,6 +107,10 @@ pub use prime_intent::{
 pub use prime_assign_slots::{
     build_assign_slots_prompt, parse_assign_slots, reconcile_assign_slots, BrainAssignSlots,
     ResolvedAssignSlots,
+};
+pub use prime_orchestration_slots::{
+    build_orchestration_slots_prompt, parse_orchestration_slots, reconcile_orchestration_slots,
+    BrainOrchestrationSlots, ResolvedOrchestration,
 };
 pub use prime_slots::{
     build_task_slots_prompt, parse_task_slots, reconcile_task_slots, BrainTaskSlots,
