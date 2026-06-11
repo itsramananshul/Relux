@@ -44,22 +44,48 @@ export function permissionPrefix(permission: string): string {
   return i >= 0 ? permission.slice(0, i + 1) : "";
 }
 
-/** Whether a permission string is well-formed (non-empty + a canonical prefix). */
+// A permission segment (plugin id / action) the backend accepts: `[A-Za-z0-9][A-Za-z0-9_-]*`.
+// Mirrors `relux_core::permission::is_valid_segment` so the form rejects the same shapes.
+const SEGMENT_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+// The ONLY scoped wildcard the backend recognizes: `tool:<plugin-id>:*`.
+const TOOL_WILDCARD_RE = /^tool:[A-Za-z0-9][A-Za-z0-9_-]*:\*$/;
+
+/** Whether a permission is the one accepted scoped wildcard (`tool:<plugin-id>:*`). */
+export function isScopedWildcard(permission: string): boolean {
+  return TOOL_WILDCARD_RE.test(permission.trim());
+}
+
+/** Build the scoped grant that authorizes every tool in `pluginId` (or null if the id is malformed). */
+export function pluginWildcardPermission(pluginId: string): string | null {
+  const id = pluginId.trim();
+  return SEGMENT_RE.test(id) ? `tool:${id}:*` : null;
+}
+
+/** Whether a permission string is well-formed (non-empty + a canonical prefix + no bad wildcard/injection). */
 export function isValidPermission(permission: string): boolean {
-  const s = permission.trim();
-  if (!s) return false;
-  return VALID_PERMISSION_PREFIXES.some((p) => s.startsWith(p));
+  return permissionInvalidReason(permission) === null;
 }
 
 /**
  * Honest reason a permission string is rejected, or null if it is valid. Used to
- * disable the Add button and explain why, rather than letting the API 400.
+ * disable the Add button and explain why, rather than letting the API 400. Mirrors the
+ * backend grammar in `relux_core::permission` (prefix allowlist + the single
+ * `tool:<plugin-id>:*` scoped wildcard; everything broader/partial is rejected).
  */
 export function permissionInvalidReason(permission: string): string | null {
   const s = permission.trim();
   if (!s) return "Enter a permission string.";
-  if (!isValidPermission(s)) {
+  // Path-like / injection characters are never part of a capability string.
+  if (/[\s/\\]/.test(s) || s.includes("..")) {
+    return "Remove spaces, slashes, or `..` — a permission is a flat prefix:resource:action.";
+  }
+  if (!VALID_PERMISSION_PREFIXES.some((p) => s.startsWith(p))) {
     return `Must start with one of: ${VALID_PERMISSION_PREFIXES.join(" ")}`;
+  }
+  // A `*` is only legal as a tool-plugin scope; reject `*`, `tool:*`, `tool:*:*`,
+  // `agent:x:*`, partial globs like `tool:p:re*`, etc.
+  if (s.includes("*") && !isScopedWildcard(s)) {
+    return "Only `tool:<plugin-id>:*` is allowed as a scope — no global or partial wildcards.";
   }
   return null;
 }

@@ -2598,8 +2598,11 @@ impl KernelState {
             .ok_or_else(|| KernelError::UnknownAgent(agent_id.to_string()))?;
 
         // --- Permission check: Agent must have all permissions required by the task ---
+        // Enforcement uses `authorizes` (not `matches_exact`) so a scoped grant
+        // (`tool:<plugin>:*`) covers the concrete tool perms in that plugin; exact
+        // grants still match exactly. See `relux_core::Permission::authorizes`.
         for required_perm in &required_permissions {
-            if !agent.permissions.iter().any(|p| p.matches_exact(required_perm)) {
+            if !agent.permissions.iter().any(|p| p.authorizes(required_perm)) {
                 self.record_audit(
                     "agent",
                     agent_id.as_str(),
@@ -3008,11 +3011,15 @@ impl KernelState {
             .unwrap_or(false)
     }
 
-    /// True when `agent_id` exists and holds `permission` exactly.
+    /// True when `agent_id` exists and holds a grant that AUTHORIZES `permission` — an
+    /// exact grant, or a scoped tool-plugin wildcard (`tool:<plugin>:*`) covering it.
+    /// This is the single chokepoint every tool-invocation permission check routes
+    /// through (`relux_core::Permission::authorizes`). Revoke/grant bookkeeping still
+    /// uses exact match, so a scoped grant is one explicit, individually-revocable row.
     fn agent_holds_permission(&self, agent_id: &AgentId, permission: &Permission) -> bool {
         self.agents
             .get(agent_id)
-            .map(|a| a.permissions.iter().any(|p| p.matches_exact(permission)))
+            .map(|a| a.permissions.iter().any(|p| p.authorizes(permission)))
             .unwrap_or(false)
     }
 
@@ -12524,6 +12531,44 @@ mod tests {
         let ghost = AgentId::new("no-such-agent");
         let err = k.revoke_permission_from_agent(&ghost, &perm).unwrap_err();
         assert!(matches!(err, KernelError::UnknownAgent(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn scoped_wildcard_grant_authorizes_plugin_tools_and_revokes_exactly() {
+        // A single scoped grant (`tool:<plugin>:*`) authorizes every concrete tool in
+        // that plugin through the same `agent_holds_permission` chokepoint every
+        // tool-invocation check routes through — without over-reaching to other plugins.
+        let (mut k, prime, _task, _run, _echo) = primed_kernel();
+        let scope = Permission::new("tool:relux-tools-github:*").unwrap();
+        k.grant_permission_to_agent(&prime, scope.clone()).unwrap();
+
+        let create_pr = Permission::new("tool:relux-tools-github:create_pr").unwrap();
+        let merge_pr = Permission::new("tool:relux-tools-github:merge_pr").unwrap();
+        let other_plugin = Permission::new("tool:relux-tools-gitlab:create_pr").unwrap();
+        assert!(k.agent_holds_permission(&prime, &create_pr));
+        assert!(k.agent_holds_permission(&prime, &merge_pr));
+        assert!(
+            !k.agent_holds_permission(&prime, &other_plugin),
+            "a scoped grant must not authorize a different plugin"
+        );
+
+        // Revoke removes EXACTLY the stored scoped row (matches_exact bookkeeping); it
+        // does not pattern-expand into the concrete tool perms, and once gone the
+        // wildcard no longer authorizes anything.
+        let err = k
+            .revoke_permission_from_agent(&prime, &create_pr)
+            .unwrap_err();
+        assert!(
+            matches!(err, KernelError::PermissionNotGranted(..)),
+            "revoking a concrete tool the agent only holds via a scope must fail closed: {err:?}"
+        );
+        k.revoke_permission_from_agent(&prime, &scope)
+            .expect("revoking the exact scoped grant succeeds");
+        assert!(!k.agent(&prime).unwrap().permissions.contains(&scope));
+        assert!(
+            !k.agent_holds_permission(&prime, &create_pr),
+            "after revoking the scope the agent holds nothing"
+        );
     }
 
     #[test]

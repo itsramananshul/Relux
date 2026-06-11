@@ -43,7 +43,7 @@ Relux roots audited: `crates/relux-core/src/`, `crates/relux-kernel/src/`, `apps
 | 1 | **Self-correction on a malformed brain decision** — a correctable reply is collapsed into the same `None` as a hard provider failure and silently falls back; no bounded re-prompt with the validation error. Hermes (`_invalid_json_retries`/`_invalid_tool_retries`) and OpenClaw (retry instructions) both do this. | 1, 7 | **P0** *(shipped — see §1)* | backend, tests, docs |
 | 2 | **Structured error/liveness classifier + bounded transient retry** — Relux retry is a fresh run with no error taxonomy and no backoff; Paperclip classifies (`run-liveness.ts`) and retries transient upstream failures on a bounded `[2m,10m,30m,2h]` schedule. | 7 | **P1** *(shipped — see §14)* | backend, frontend, docs, tests |
 | 3 | **Governed budgets (soft/hard, auto-pause)** — Paperclip enforces per-company/agent/project spend with warn + hard-stop + cancel-work. Relux records run `cost`/`usage` but enforces nothing. | 5 | P1 | backend, frontend, docs, tests |
-| 4 | **Scoped permission grants (subtree / project)** — Relux permissions are exact-string match only; Paperclip has fine-grained grants scoped to manager-subtrees/projects. | 5 | P1 | backend, tests |
+| 4 | **Scoped permission grants (subtree / project)** — Relux permissions are exact-string match only; Paperclip has fine-grained grants scoped to manager-subtrees/projects. *(minimal plugin-scope `tool:<plugin>:*` SHIPPED — see §17; subtree/project scope still missing.)* | 5 | P1 | backend, tests |
 | 5 | **Memory compaction / cross-session recall** — Relux kept a bounded 12-turn ring with no summarization; Hermes/OpenClaw compact + summarize + (Hermes) FTS5 cross-session search. *(in-session compaction beyond the ring SHIPPED — see §16; cross-session FTS recall still missing.)* | 6 | P1/P2 | backend, tests |
 | 6 | **`execute_code` (RPC-from-script deterministic glue)** — the cheapest multi-step primitive; routes back through the same tool gate. Big, but high-leverage. | 2, 4 | P1 | backend, tests, docs |
 | 7 | **Goal/issue hierarchy + monitor/recovery** — Relux orchestration is a flat ≤6-step DAG; Paperclip has Goal→Project→Issue→Run with monitor scheduling + stranded-issue recovery. | 4 | P2 | backend, frontend, docs, tests |
@@ -262,18 +262,26 @@ safe (adds no authority), bounded, feasible in one commit, and reuses existing v
   approval; safe → `Act`. Per-tool-call binding approval (executes once) vs generic approval
   (executes nothing) — two distinct surfaces. Permission check at `start_run` (agent must hold all
   `required_permissions`).
-- **One-shot approval + fail-closed gate + per-tool approval are implemented.** **Missing**:
-  budgets/spend enforcement (runs record `cost`/`usage` but nothing enforces a ceiling), scoped/subtree
-  grants (permissions are **exact-string match only** — no project/subtree scope), persistent
-  `allow-always` grants, Board-style multi-party oversight.
+- **One-shot approval + fail-closed gate + per-tool approval are implemented.** **Scoped grants —
+  minimal plugin scope SHIPPED THIS ROUND (see §17).** `relux_core::Permission` now also accepts the
+  single scoped wildcard `tool:<plugin-id>:*` (strict grammar; every broader/partial/non-tool glob and
+  any path-like string is rejected fail-closed), and enforcement compares grant-vs-required through
+  `Permission::authorizes` (exact OR same-plugin scope) at the one `agent_holds_permission` chokepoint
+  + the `start_run` task check. Grant/revoke bookkeeping stays exact-match, so a scope is one explicit,
+  individually-revocable row that never pattern-expands. **Still missing**: budgets/spend enforcement
+  (runs record `cost`/`usage` but nothing enforces a ceiling), agent-subtree / project / namespace
+  scope (Paperclip `scopeAllows` + `agentIsInSubtree`), persistent `allow-always` grants, Board-style
+  multi-party oversight.
 
 ### Priority & slices
 
 - **P1 — governed budgets** (`budget.rs` core type + kernel enforcement): per-namespace/agent soft
   warn + hard stop that pauses new runs and surfaces a Doctor/approval signal. Maps to Paperclip
   `budgets.ts`. *(backend, frontend, docs, tests.)*
-- **P1 — scoped permission grants**: extend `Permission`/grant model with a scope (agent-subtree /
-  namespace) instead of exact-match only. Pairs with §3 `reports_to`. *(backend, tests, docs.)*
+- **P1 — scoped permission grants (minimal plugin scope SHIPPED THIS ROUND, §17).** `Permission`
+  gained a strictly-validated `tool:<plugin-id>:*` scope + an `authorizes` enforcement comparison.
+  The remaining, larger half — an agent-subtree / namespace / project scope (Paperclip `scopeAllows`
+  + `agentIsInSubtree`, pairs with §3 `reports_to`) — is still open. *(backend, tests, docs.)*
 - **P2 — persistent `allow-always` approval** (OpenClaw one-shot vs persistent): an approval that
   records a standing grant so the same safe action isn't re-prompted. Must stay revocable. *(backend,
   frontend, tests.)*
@@ -689,6 +697,62 @@ section for the full reference read + applied-change record. In brief:
   strictly-additive, strictly-validated, off-lock overlay with a deterministic fallback and no
   unbounded calls — and cross-session recall (no FTS/search over prior conversations); both remain
   §6 P2.
+
+## 17. Implemented this round — minimal scoped permission grants (§5 P1)
+
+- **Reference read (BINDING).** OpenClaw `src/acp/permission-relay.ts`
+  (`GatewayExecApprovalDecision = allow-once | allow-always | deny`, `buildAcpPermissionOptions` /
+  `resolveGatewayDecisionFromPermissionOutcome` — the governance vocabulary of widening a grant from
+  one-shot to standing, and the deny default) and OpenClaw `extensions/tlon/src/monitor/authorization.ts`
+  (`resolveChannelAuthorization` → `{ mode: "restricted" | "open", allowedShips }`: a rule resolves an
+  **allowlist**, membership decides, and the default is **restricted** — fail-closed scope matching).
+  Paperclip's richer `(principal, permissionKey, scope)` model with `scopeAllows` + `agentIsInSubtree`
+  is summarized in §5 from the original audit read; that source is **not vendored** under `reference/`,
+  so only the minimal, self-containable half (a per-plugin tool scope, no subtree graph) was taken this
+  round. Relux files read/mapped: `crates/relux-core/src/permission.rs`,
+  `crates/relux-kernel/src/state.rs` (the `agent_holds_permission` chokepoint + `start_run` check +
+  grant/revoke), `crates/relux-kernel/src/server.rs` (`/v1/relux/agents/:id/permissions`),
+  `apps/dashboard/src/governance.ts` + `apps/dashboard/src/pages/Crew.tsx` (the Crew Governance panel).
+
+- **Scoped syntax.** Exactly one new grant shape is accepted: `tool:<plugin-id>:*` — a scope that
+  authorizes every concrete tool in that one plugin. `<plugin-id>` is `[A-Za-z0-9][A-Za-z0-9_-]*`. A
+  `*` in any other position is rejected fail-closed (`*`, `tool:*`, `tool:*:*`, `agent:<id>:*`, partial
+  globs like `tool:p:cre*`, a glob inside the plugin id), as is any path-like / injection string
+  (whitespace, `/`, `\`, `..`). All existing exact capability strings are byte-for-byte unaffected.
+
+- **Enforcement.** Grant-vs-required authorization moved from `matches_exact` to
+  `relux_core::Permission::authorizes` at the two enforcement reads: `agent_holds_permission` (the one
+  chokepoint every tool-invocation check — invoke, approve, per-tool-call binding, Prime turn — routes
+  through) and the `start_run` task `required_permissions` loop. `authorizes` returns true iff the grant
+  equals the required string OR the grant is a `tool:<plugin>:*` scope and the required is a concrete
+  `tool:<plugin>:<tool>` in the **same** plugin. A scope never authorizes another scope, never crosses
+  plugins (a plugin id that is a *prefix* of another does not match), and never matches a non-`tool:`
+  capability. Plugin install / permission grants remain approval-gated exactly as before — `authorizes`
+  is read-only and changes nothing about who may *issue* a grant.
+
+- **Grant / revoke stay exact.** Grant dedup (`PermissionAlreadyGranted`) and revoke
+  (`revoke_permission_from_agent`) still use `matches_exact`, so a scope is stored, displayed, and
+  revoked as one explicit row and a revoke never pattern-expands into the concrete tools it covered
+  (revoking a concrete tool an agent only holds *via* a scope is an honest `PermissionNotGranted`).
+
+- **UI.** `governance.ts` mirrors the backend grammar (accepts `tool:<plugin>:*`, rejects every broader
+  glob + path-like string with a scope-specific reason) and adds `isScopedWildcard` /
+  `pluginWildcardPermission(pluginId)`. The Crew Governance panel explains the exact-vs-scope rule,
+  shows a `scope: all tools in plugin` badge on scoped rows, and accepts the scope in the add field.
+  No fake budget controls were added.
+
+- **Tests.** `permission.rs`: grammar (accept the scope, reject broad/partial/non-tool globs +
+  path-like strings) and authorization (exact authorizes only itself; scope authorizes every tool in
+  its plugin; no overmatch across plugins / prefixes / kinds / wildcard-vs-wildcard).
+  `state.rs::scoped_wildcard_grant_authorizes_plugin_tools_and_revokes_exactly`: a scoped grant
+  authorizes the plugin's tools through `agent_holds_permission`, not a different plugin, and revoke
+  removes exactly the scoped row. `governance.test.ts`: client-side validation + helper parity. Full
+  `relux-kernel` `state::` suite (229) + `relux-core` permission suite green; clippy clean on both
+  crates; dashboard typecheck + governance tests + bundle rebuild green.
+
+- **Still missing (honest).** Agent-subtree / namespace / project scope (the larger Paperclip
+  `scopeAllows` + `agentIsInSubtree` half — needs the §3 `reports_to` graph), governed budgets (§5 P1
+  #3), and persistent `allow-always` grants (§5 P2) all remain open.
 
 ---
 

@@ -13,6 +13,7 @@ import { useAsync } from "../components/common";
 import { ADAPTER_STATE_LABEL } from "../plugins";
 import {
   isElevatedPermission,
+  isScopedWildcard,
   permissionInvalidReason,
 } from "../governance";
 import { parseSkillsInput, formatSkillsInput } from "../skills";
@@ -465,6 +466,11 @@ function PermissionsList({ permissions }: { permissions: string[] }) {
         {permissions.map((p) => (
           <li key={p} className="mono" style={{ listStyle: "disc" }}>
             {p}
+            {isScopedWildcard(p) && (
+              <span className="badge" style={{ marginLeft: 6 }}>
+                scope: all tools in plugin
+              </span>
+            )}
             {isElevatedPermission(p) && (
               <span className="badge warn" style={{ marginLeft: 6 }}>
                 elevated
@@ -553,7 +559,11 @@ function GovernanceSection({
       <p className="muted" style={{ fontSize: 12, marginTop: 0 }}>
         Grant/revoke acts immediately as you and is audited. Elevated (control-plane)
         capabilities ask for confirmation. Least privilege: an agent has only what is
-        listed here.
+        listed here. A grant is an exact capability (e.g.{" "}
+        <span className="mono">tool:relux-tools-github:create_pr</span>) or a single
+        plugin scope (<span className="mono">tool:&lt;plugin-id&gt;:*</span>) that
+        authorizes every tool in that plugin. No global or partial wildcards. Revoke
+        removes exactly the row you grant — a scope and its tools are separate rows.
       </p>
       {error && <div className="error-message">{error}</div>}
       {permissions.length === 0 ? (
@@ -567,6 +577,9 @@ function GovernanceSection({
             >
               <span className="mono" style={{ fontSize: 12, flex: 1 }}>
                 {p}
+                {isScopedWildcard(p) && (
+                  <span className="badge" style={{ marginLeft: 6 }}>scope: all tools in plugin</span>
+                )}
                 {isElevatedPermission(p) && (
                   <span className="badge warn" style={{ marginLeft: 6 }}>elevated</span>
                 )}
@@ -592,7 +605,7 @@ function GovernanceSection({
             className="mono"
             value={newPerm}
             onChange={(e) => setNewPerm(e.target.value)}
-            placeholder="e.g. tool:relux-tools-github:read"
+            placeholder="e.g. tool:relux-tools-github:read or tool:relux-tools-github:*"
             style={{ flex: 1 }}
           />
           <button

@@ -12,6 +12,8 @@ import {
   permissionInvalidReason,
   permissionRisk,
   isElevatedPermission,
+  isScopedWildcard,
+  pluginWildcardPermission,
 } from "../src/governance.ts";
 
 test("permissionPrefix extracts the prefix incl. the colon", () => {
@@ -34,6 +36,40 @@ test("permissionInvalidReason explains an empty or malformed string, null when v
   assert.match(permissionInvalidReason("")!, /Enter a permission/);
   assert.match(permissionInvalidReason("nope")!, /Must start with/);
   assert.equal(permissionInvalidReason("tool:relux-tools-echo:say"), null);
+});
+
+test("the scoped tool-plugin wildcard is accepted; broader/partial globs are rejected", () => {
+  // The one accepted scope.
+  assert.equal(permissionInvalidReason("tool:relux-tools-github:*"), null);
+  assert.ok(isValidPermission("tool:relux-tools-github:*"));
+  assert.ok(isScopedWildcard("tool:relux-tools-github:*"));
+  assert.ok(!isScopedWildcard("tool:relux-tools-github:create_pr"));
+
+  // Broad / partial / non-tool wildcards are rejected with a scope-specific reason.
+  for (const bad of ["*", "tool:*", "tool:*:*", "tool:relux-tools-github:cre*", "agent:bot:*"]) {
+    const reason = permissionInvalidReason(bad);
+    assert.ok(reason, `${bad} must be rejected`);
+    assert.equal(isValidPermission(bad), false);
+  }
+  assert.match(permissionInvalidReason("tool:relux-tools-github:cre*")!, /Only `tool:<plugin-id>:\*`/);
+});
+
+test("path-like / injection strings are rejected", () => {
+  for (const bad of [
+    "tool:relux-tools-github:../etc",
+    "tool:relux-tools-github:read write",
+    "tool:relux/tools:read",
+  ]) {
+    assert.match(permissionInvalidReason(bad)!, /Remove spaces, slashes/);
+  }
+});
+
+test("pluginWildcardPermission builds the scope from a plugin id, null when malformed", () => {
+  assert.equal(pluginWildcardPermission("relux-tools-github"), "tool:relux-tools-github:*");
+  assert.equal(pluginWildcardPermission("  relux-tools-github  "), "tool:relux-tools-github:*");
+  assert.equal(pluginWildcardPermission("bad id"), null);
+  assert.equal(pluginWildcardPermission("relux/tools"), null);
+  assert.equal(pluginWildcardPermission(""), null);
 });
 
 test("control-plane prefixes are elevated; tool/task/audit are standard", () => {
