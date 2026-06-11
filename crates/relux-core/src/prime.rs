@@ -828,6 +828,53 @@ pub struct ConversationTurn {
     pub created_at_secs: u64,
 }
 
+/// A bounded, secret-redacted, **deterministic** rolling summary of the turns that have aged
+/// OUT of a conversation's recent-turn ring ([`ConversationTurn`]).
+///
+/// The recent ring is a short window (the last few turns kept verbatim); once a turn is evicted
+/// from the front of that ring it is folded here so a long-running Prime thread keeps a compact
+/// memory of what already happened, instead of forgetting it entirely. This mirrors the
+/// compaction "summary + first-kept-entry boundary" shape of openclaw's `CompactResult`
+/// (`reference/openclaw-main/src/context-engine/types.ts`) and the char-bounded, deterministic,
+/// truncation-marked digest of Paperclip's `issue-continuation-summary.ts` — the ring is the
+/// kept entries; this is the summary of everything older.
+///
+/// ## Safety shape (binding, identical to [`ConversationTurn`])
+///
+/// It is **advisory context, never authority**. Like the ring, it is rendered into the brain's
+/// prompt as clearly-labelled BACKGROUND and is NEVER read by the deterministic classifier, the
+/// fail-closed intent gate, or any existence / approval check — those run on the CURRENT message
+/// only, so a summary can never promote casual chat into work or invent an id. It carries ONLY
+/// bounded, already-redacted derivatives of turns that themselves stored no raw envelope: the ids
+/// a turn created (`highlights`, e.g. `"created task_0001"`), a count of the purely conversational
+/// turns folded, and the conversation's opening message — never a raw provider envelope, tool
+/// body, or secret. Every field is bounded in count + size.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationSummary {
+    /// The conversation's opening user message (the first turn to age out), kept as a single
+    /// bounded, redacted anchor so a long thread still recalls how it began. Set once, then
+    /// stable. `None` until the first turn is evicted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened_with: Option<String>,
+    /// Bounded, redacted digest lines for the evicted turns that did durable work — each the
+    /// turn's `action_summary` (`"created task_0001"`, `"started run_0002"`), oldest first,
+    /// newest last. The durable facts a follow-up may reference ("the task you made earlier").
+    /// Never a tool body; the kernel bounds the count (oldest dropped).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub highlights: Vec<String>,
+    /// How many evicted turns were purely conversational (no durable action) — folded as a count,
+    /// not as text, so casual chat contributes size-free continuity ("we talked a few more times").
+    #[serde(default)]
+    pub chat_turns_folded: u32,
+    /// Total turns folded into this summary (durable + conversational). Honest provenance for the
+    /// rendered "<N> earlier turns summarized" label.
+    #[serde(default)]
+    pub turns_folded: u32,
+    /// The logical-clock second of the most recent fold.
+    #[serde(default)]
+    pub updated_at_secs: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingClarification {
     /// The original (or accumulated) user message that produced the clarifying

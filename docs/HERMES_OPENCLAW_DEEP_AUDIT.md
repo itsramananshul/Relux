@@ -44,7 +44,7 @@ Relux roots audited: `crates/relux-core/src/`, `crates/relux-kernel/src/`, `apps
 | 2 | **Structured error/liveness classifier + bounded transient retry** — Relux retry is a fresh run with no error taxonomy and no backoff; Paperclip classifies (`run-liveness.ts`) and retries transient upstream failures on a bounded `[2m,10m,30m,2h]` schedule. | 7 | **P1** *(shipped — see §14)* | backend, frontend, docs, tests |
 | 3 | **Governed budgets (soft/hard, auto-pause)** — Paperclip enforces per-company/agent/project spend with warn + hard-stop + cancel-work. Relux records run `cost`/`usage` but enforces nothing. | 5 | P1 | backend, frontend, docs, tests |
 | 4 | **Scoped permission grants (subtree / project)** — Relux permissions are exact-string match only; Paperclip has fine-grained grants scoped to manager-subtrees/projects. | 5 | P1 | backend, tests |
-| 5 | **Memory compaction / cross-session recall** — Relux keeps a bounded 12-turn ring with no summarization; Hermes/OpenClaw compact + summarize + (Hermes) FTS5 cross-session search. Low urgency at current turn volume but blocks long-running Prime sessions. | 6 | P1/P2 | backend, tests |
+| 5 | **Memory compaction / cross-session recall** — Relux kept a bounded 12-turn ring with no summarization; Hermes/OpenClaw compact + summarize + (Hermes) FTS5 cross-session search. *(in-session compaction beyond the ring SHIPPED — see §16; cross-session FTS recall still missing.)* | 6 | P1/P2 | backend, tests |
 | 6 | **`execute_code` (RPC-from-script deterministic glue)** — the cheapest multi-step primitive; routes back through the same tool gate. Big, but high-leverage. | 2, 4 | P1 | backend, tests, docs |
 | 7 | **Goal/issue hierarchy + monitor/recovery** — Relux orchestration is a flat ≤6-step DAG; Paperclip has Goal→Project→Issue→Run with monitor scheduling + stranded-issue recovery. | 4 | P2 | backend, frontend, docs, tests |
 | 8 | **Session identity / handoff + safe resume** — Relux threw away the provider session id, so a run had no handoff record and could only be re-run cold; OpenClaw captures a per-provider CLI session binding and resumes it (`resumeSessionId` / `runCliWithSession`). | 3 | **P1** *(shipped — see §15)* | backend, frontend, docs, tests |
@@ -304,14 +304,26 @@ safe (adds no authority), bounded, feasible in one commit, and reuses existing v
 - `crates/relux-kernel/src/prime_clarify_memory.rs` — single TTL-bounded pending clarification per
   conversation key (`resolve_pending`: Cancelled/Expired/FreshRequest/Continue).
 - `crates/relux-core/src/redact.rs` — secret redaction applied to transcripts + history.
-- **Implemented**: bounded, redacted, advisory history + clarify memory. **Missing**: any
-  summarization/compaction past the 12-turn eviction, and cross-session recall (no FTS/search).
+- **Compaction beyond the ring (SHIPPED THIS ROUND — see §16).** When a turn ages OUT of the
+  12-turn ring it is folded into a rolling, bounded, secret-redacted, **deterministic**
+  per-conversation `relux_core::ConversationSummary` (ids the turn created + a chat-turn count +
+  the opening message), rendered at the TOP of the same BACKGROUND block before the recent turns
+  (`crates/relux-kernel/src/prime_history.rs` `fold_evicted_turn` / `render_context_with_summary`;
+  `KernelState.conversation_summaries`). No provider call; advisory only; `clear_conversation`
+  drops it too.
+- **Implemented**: bounded, redacted, advisory history + clarify memory + in-session compaction.
+  **Missing**: cross-session recall (no FTS/search), and a brain-generated (vs deterministic)
+  summary.
 
 ### Priority & slices
 
-- **P1/P2 — compaction/summarization beyond the ring**: when a conversation exceeds the ring, fold the
-  evicted turns into a bounded redacted summary (OpenClaw `compact()` / Hermes 12-section). Low
-  urgency now; blocks long-running Prime threads. *(backend, tests.)*
+- **P1/P2 — compaction/summarization beyond the ring (SHIPPED THIS ROUND, §16).** Deterministic
+  fold of evicted turns into a bounded redacted summary (OpenClaw `CompactResult` summary +
+  kept-entries / Hermes `context_compressor` head-protect + bounded digest / Paperclip
+  `issue-continuation-summary` deterministic char-bounded extraction).
+- **P2 — brain-generated summary** as a strictly-additive, strictly-validated, off-lock overlay
+  over the deterministic one (Hermes 12-section LLM summary), with a deterministic fallback and no
+  unbounded calls. *(backend, tests.)*
 - **P2 — cross-session recall** (Hermes FTS5 "bookends"): deterministic, LLM-free lookup of a prior
   resolution. *(backend, tests.)*
 
@@ -624,6 +636,59 @@ mapping. In brief:
 - **Still missing (honest).** Codex-session resume and mid-run *partial* resume (the Codex `exec`
   plain-text path emits no session id we capture); no cross-session search over stored session ids
   (pairs with §6 cross-session recall).
+
+---
+
+## 16. Implemented this round — bounded conversation-memory compaction beyond the ring (§6 P1)
+
+See the matching "Reference read — bounded conversation-memory compaction beyond the ring" entry in
+[`reference-driven-development.md`](reference-driven-development.md) and the
+[`prime-processing-audit.md`](prime-processing-audit.md) "Bounded conversation-memory compaction"
+section for the full reference read + applied-change record. In brief:
+
+- **Reference read (BINDING).** Hermes `agent/context_compressor.py` (head/tail-protected pruning +
+  bounded redacted summary of the older middle, anti-thrash) and `agent/memory_manager.py`
+  (`build_memory_context_block` background fence). OpenClaw
+  `src/context-engine/types.ts` (`CompactResult.result = { summary, firstKeptEntryId, ... }` — a
+  summary stands in for everything before the kept-entries boundary, prepended via
+  `AssembleResult.systemPromptAddition`). Paperclip
+  `server/src/services/issue-continuation-summary.ts` (deterministic, char-bounded
+  (`ISSUE_CONTINUATION_SUMMARY_MAX_BODY_CHARS = 8_000`), `truncateText` honest `[truncated]`
+  marker, salient-fact extraction without a model call). Relux files read/mapped:
+  `crates/relux-kernel/src/{prime_history.rs,state.rs,store.rs}`,
+  `crates/relux-core/src/{prime.rs,lib.rs}`.
+
+- **What.** The recent ring (`MAX_HISTORY_TURNS = 12`) is unchanged, but `push_bounded` now returns
+  the turns evicted from the front, and `record_conversation_turn` folds each into the
+  conversation's `relux_core::ConversationSummary` via the pure, deterministic
+  `prime_history::fold_evicted_turn`: an *acting* turn contributes a redacted highlight (the ids it
+  created, bounded to `MAX_SUMMARY_HIGHLIGHTS = 16`, oldest dropped), a purely conversational turn
+  contributes only to a count, and the first evicted turn seeds a single `opened_with` anchor. The
+  summary is persisted per conversation (`KernelState.conversation_summaries`, the same `meta`
+  snapshot seam, evicted alongside the ring under the conversation cap and survives a snapshot
+  round-trip).
+
+- **Where it surfaces.** `recent_conversation_context` renders the summary at the TOP of the SAME
+  fenced BACKGROUND block, before the verbatim recent turns (`render_context_with_summary`), capped
+  at `MAX_SUMMARY_RENDER_CHARS = 600` with a `[summary truncated]` marker — OpenClaw's summary +
+  kept-entries shape. The empty-memory decision prompt is byte-for-byte unchanged (no summary + no
+  ring → `""`), so the deterministic path is untouched. No new wire/dashboard field: the existing
+  Prime **Clear** (`POST /v1/relux/prime/reset` → `clear_conversation`) now also drops the rolling
+  summary.
+
+- **Why it is safe / honest.** The summary is advisory prompt context with ZERO authority, exactly
+  like the ring it compacts — never read by `classify_intent`, the fail-closed `reconcile_intent`
+  gate, or any existence/approval check (those run on the CURRENT message alone), so even a summary
+  full of "created task_XXXX" highlights can never promote casual chat into work
+  (`a_summary_full_of_actions_still_never_promotes_casual_chat_into_work`). It is built ENTIRELY
+  deterministically (no provider call — folding runs under the kernel lock) from data already
+  redacted on the `ConversationTurn`: only ids + counts + the opening message, never a raw
+  envelope, tool body, or secret; every field re-runs through `sanitize_text` defensively.
+
+- **Still missing (honest).** A brain-generated (vs deterministic) summary — deferred as a
+  strictly-additive, strictly-validated, off-lock overlay with a deterministic fallback and no
+  unbounded calls — and cross-session recall (no FTS/search over prior conversations); both remain
+  §6 P2.
 
 ---
 

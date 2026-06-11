@@ -105,6 +105,11 @@ pub struct KernelSnapshot {
     /// (`docs/prime-processing-audit.md` "Bounded conversation memory").
     #[serde(default)]
     pub conversation_histories: Vec<ConversationHistoryEntry>,
+    /// Rolling compacted conversation summaries, one entry per conversation key, sorted by key.
+    /// Defaulted so older snapshots (which never wrote it) load cleanly
+    /// (`docs/prime-processing-audit.md` "Bounded conversation-memory compaction").
+    #[serde(default)]
+    pub conversation_summaries: Vec<ConversationSummaryEntry>,
     pub counters: KernelCounters,
 }
 
@@ -135,6 +140,18 @@ pub struct ConversationHistoryEntry {
     pub key: String,
     /// The bounded, most-recent-first-evicted list of recorded turns.
     pub turns: Vec<relux_core::ConversationTurn>,
+}
+
+/// One persisted conversation's rolling compacted summary, paired with the conversation key it
+/// belongs to (`namespace::actor`). A flat, serializable export of one entry of the kernel's
+/// `conversation_summaries` map (`docs/prime-processing-audit.md` "Bounded conversation-memory
+/// compaction"; see [`crate::prime_history`]). The summary is already bounded + secret-redacted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationSummaryEntry {
+    /// The conversation key (`namespace::actor`) this summary belongs to.
+    pub key: String,
+    /// The bounded, deterministic rolling summary of older (evicted) turns.
+    pub summary: relux_core::ConversationSummary,
 }
 
 /// The hard cap on the serialized size of a single tool invocation's arguments
@@ -228,6 +245,15 @@ pub struct KernelState {
     /// [`crate::prime_history::MAX_HISTORY_TURNS`] per conversation,
     /// [`crate::prime_history::MAX_HISTORY_CONVERSATIONS`] overall, every field secret-redacted.
     conversation_histories: HashMap<String, Vec<relux_core::ConversationTurn>>,
+    /// Rolling, bounded, deterministic per-conversation summary of the turns that have aged OUT
+    /// of [`conversation_histories`](Self::conversation_histories) (keyed the same
+    /// `namespace::actor`), so a long-running Prime thread keeps a compact memory of older turns
+    /// instead of forgetting them when the ring evicts (`docs/prime-processing-audit.md`
+    /// "Bounded conversation-memory compaction"; see [`crate::prime_history::fold_evicted_turn`]).
+    /// Advisory grounding ONLY — like the ring it is rendered into the brain's prompt as
+    /// background and is never consulted by the deterministic classifier, the fail-closed intent
+    /// gate, or any existence/approval check. Every field is bounded + secret-redacted.
+    conversation_summaries: HashMap<String, relux_core::ConversationSummary>,
     clock: Clock,
     next_task: u64,
     next_run: u64,
@@ -353,6 +379,18 @@ impl KernelState {
                 out.sort_by(|a, b| a.key.cmp(&b.key));
                 out
             },
+            conversation_summaries: {
+                let mut out: Vec<ConversationSummaryEntry> = self
+                    .conversation_summaries
+                    .iter()
+                    .map(|(key, summary)| ConversationSummaryEntry {
+                        key: key.clone(),
+                        summary: summary.clone(),
+                    })
+                    .collect();
+                out.sort_by(|a, b| a.key.cmp(&b.key));
+                out
+            },
             counters: KernelCounters {
                 clock_secs: self.clock.secs(),
                 next_task: self.next_task,
@@ -421,6 +459,9 @@ impl KernelState {
         }
         for entry in snapshot.conversation_histories {
             state.conversation_histories.insert(entry.key, entry.turns);
+        }
+        for entry in snapshot.conversation_summaries {
+            state.conversation_summaries.insert(entry.key, entry.summary);
         }
         state.run_events = snapshot.run_events;
         state.audit_log = snapshot.audit_events;
@@ -5269,10 +5310,23 @@ impl KernelState {
                 .map(|(k, _)| k.clone())
             {
                 self.conversation_histories.remove(&stalest);
+                // Drop the evicted conversation's rolling summary too, so the two maps stay in
+                // sync and the summary memory is bounded by the same conversation cap.
+                self.conversation_summaries.remove(&stalest);
             }
         }
-        let history = self.conversation_histories.entry(key).or_default();
-        crate::prime_history::push_bounded(history, record);
+        let history = self.conversation_histories.entry(key.clone()).or_default();
+        // Push the new turn, keeping the ring bounded; any turn aged OUT of the front is folded
+        // into the conversation's rolling, deterministic, bounded summary so a long thread keeps a
+        // compact memory of older turns instead of dropping them on the floor. Folding is pure +
+        // off-network (it runs under the kernel lock).
+        let evicted = crate::prime_history::push_bounded(history, record);
+        if !evicted.is_empty() {
+            let summary = self.conversation_summaries.entry(key).or_default();
+            for turn in &evicted {
+                crate::prime_history::fold_evicted_turn(summary, turn, now_secs);
+            }
+        }
     }
 
     /// Render the conversation's recent history into a bounded, clearly-labelled BACKGROUND
@@ -5281,21 +5335,30 @@ impl KernelState {
     /// (see [`crate::prime_history::render_context`]). Advisory context only — never an instruction.
     pub fn recent_conversation_context(&self, ctx: &PrimeContext) -> String {
         let key = Self::conversation_key(ctx);
-        match self.conversation_histories.get(&key) {
-            Some(history) => crate::prime_history::render_context(history),
-            None => String::new(),
+        let summary = self.conversation_summaries.get(&key);
+        let history = self.conversation_histories.get(&key);
+        match (summary, history) {
+            // The common path: render the compacted summary of older turns (when any) at the top
+            // of the same BACKGROUND block, followed by the verbatim recent ring. Both empty ->
+            // "" (the empty-history prompt identity is preserved exactly).
+            (None, None) => String::new(),
+            (s, h) => crate::prime_history::render_context_with_summary(
+                s,
+                h.map(Vec::as_slice).unwrap_or(&[]),
+            ),
         }
     }
 
-    /// Clear a conversation's memory — both its bounded turn history and any pending
-    /// clarification — for the "clear conversation" / reset action. Returns `true` when anything
-    /// was actually cleared. Drops only advisory memory; no durable entity (task/run/agent) is
-    /// touched, so a reset can never lose real work.
+    /// Clear a conversation's memory — its bounded turn history, its rolling compacted summary of
+    /// older turns, AND any pending clarification — for the "clear conversation" / reset action.
+    /// Returns `true` when anything was actually cleared. Drops only advisory memory; no durable
+    /// entity (task/run/agent) is touched, so a reset can never lose real work.
     pub fn clear_conversation(&mut self, ctx: &PrimeContext) -> bool {
         let key = Self::conversation_key(ctx);
         let had_history = self.conversation_histories.remove(&key).is_some();
+        let had_summary = self.conversation_summaries.remove(&key).is_some();
         let had_pending = self.pending_clarifications.remove(&key).is_some();
-        had_history || had_pending
+        had_history || had_summary || had_pending
     }
 
     /// Apply a brain-suggested, already-clamped priority to a freshly created task.
@@ -10766,6 +10829,106 @@ mod tests {
     }
 
     #[test]
+    fn conversation_summary_accumulates_on_eviction_and_renders_in_context() {
+        // A turn that did durable work, then enough later turns to evict it from the recent ring:
+        // the evicted turn is folded into a rolling summary so the long thread still remembers it,
+        // even though it is no longer rendered verbatim.
+        let (mut k, ctx) = prime_chat_kernel();
+        let mut acted = k.prime_turn(&ctx, "what is going on?").unwrap();
+        acted.reply = "Done — I created that.".to_string();
+        acted.created_task = Some(relux_core::TaskId::new("task_0042"));
+        k.record_conversation_turn(&ctx, "the very first request", &acted, &[]);
+        // Push enough chat turns to evict the acting turn out of the front of the ring.
+        let chat = k.prime_turn(&ctx, "what is going on?").unwrap();
+        for i in 0..crate::prime_history::MAX_HISTORY_TURNS {
+            k.record_conversation_turn(&ctx, &format!("later message {i}"), &chat, &[]);
+        }
+        // The acting turn is no longer in the verbatim ring...
+        let snap = k.snapshot();
+        let hist = snap
+            .conversation_histories
+            .iter()
+            .find(|e| e.key == KernelState::conversation_key(&ctx))
+            .expect("a history entry");
+        assert!(!hist.turns.iter().any(|t| t.user_message == "the very first request"));
+        // ...but it survives in the rolling summary, which renders inside the BACKGROUND block.
+        let summary = snap
+            .conversation_summaries
+            .iter()
+            .find(|e| e.key == KernelState::conversation_key(&ctx))
+            .expect("a summary entry");
+        assert!(summary.summary.highlights.iter().any(|h| h.contains("created task_0042")));
+        assert_eq!(summary.summary.opened_with.as_deref(), Some("the very first request"));
+        let context = k.recent_conversation_context(&ctx);
+        assert!(context.contains("Summary of earlier turns"));
+        assert!(context.contains("created task_0042"));
+        assert!(context.contains("started with \"the very first request\""));
+        // The summary sits ABOVE the verbatim recent turns in one block.
+        assert!(context.find("Summary of earlier turns").unwrap() < context.find("User: later message").unwrap());
+    }
+
+    #[test]
+    fn conversation_summary_survives_a_snapshot_round_trip() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let mut acted = k.prime_turn(&ctx, "what is going on?").unwrap();
+        acted.created_task = Some(relux_core::TaskId::new("task_0007"));
+        k.record_conversation_turn(&ctx, "the opening ask", &acted, &[]);
+        let chat = k.prime_turn(&ctx, "what is going on?").unwrap();
+        for i in 0..crate::prime_history::MAX_HISTORY_TURNS {
+            k.record_conversation_turn(&ctx, &format!("m{i}"), &chat, &[]);
+        }
+        let before = k.recent_conversation_context(&ctx);
+        assert!(before.contains("Summary of earlier turns"));
+        let restored = KernelState::from_snapshot(k.snapshot());
+        assert_eq!(restored.recent_conversation_context(&ctx), before);
+    }
+
+    #[test]
+    fn conversation_summary_redacts_secrets_and_stores_no_raw_envelope() {
+        // A secret in the opening message is masked before it reaches the rolling summary anchor,
+        // and no tool body is ever folded in (the summary carries only ids + counts).
+        let (mut k, ctx) = prime_chat_kernel();
+        let mut acted = k.prime_turn(&ctx, "what is going on?").unwrap();
+        acted.created_task = Some(relux_core::TaskId::new("task_0001"));
+        acted.tool_output = Some(serde_json::json!({ "leak": "sk-SUMMARYBODYLEAK00001" }));
+        k.record_conversation_turn(&ctx, "open with token=sk-OPENINGLEAK000111222333", &acted, &[]);
+        let chat = k.prime_turn(&ctx, "what is going on?").unwrap();
+        for i in 0..crate::prime_history::MAX_HISTORY_TURNS {
+            k.record_conversation_turn(&ctx, &format!("m{i}"), &chat, &[]);
+        }
+        let serialized = serde_json::to_string(&k.snapshot().conversation_summaries).unwrap();
+        assert!(!serialized.contains("sk-OPENINGLEAK000111222333"));
+        assert!(!serialized.contains("SUMMARYBODYLEAK"));
+        assert!(serialized.contains("created task_0001"));
+    }
+
+    #[test]
+    fn a_summary_full_of_actions_still_never_promotes_casual_chat_into_work() {
+        // CURRENT-TURN SAFETY WINS OVER THE SUMMARY: even after many earlier turns created work
+        // (all now compacted into the rolling summary), a casual musing on the next turn stays a
+        // conversation and creates nothing. The summary is advisory prompt context only; the
+        // deterministic classifier + fail-closed gate run on the CURRENT message alone.
+        let (mut k, ctx) = prime_chat_kernel();
+        let mut acted = k.prime_turn(&ctx, "what is going on?").unwrap();
+        acted.created_task = Some(relux_core::TaskId::new("task_0001"));
+        k.record_conversation_turn(&ctx, "make the first task", &acted, &[]);
+        let chat = k.prime_turn(&ctx, "what is going on?").unwrap();
+        for i in 0..crate::prime_history::MAX_HISTORY_TURNS {
+            k.record_conversation_turn(&ctx, &format!("m{i}"), &chat, &[]);
+        }
+        assert!(k.recent_conversation_context(&ctx).contains("created task_0001"));
+        let tasks_before = k.snapshot().tasks.len();
+
+        let musing = k
+            .prime_turn(&ctx, "i wonder if we should also clean up the docs someday")
+            .unwrap();
+        assert_eq!(musing.disposition, PrimeDisposition::Answered);
+        assert_ne!(musing.intent, relux_core::PrimeIntent::TaskCreation);
+        assert!(musing.created_task.is_none());
+        assert_eq!(k.snapshot().tasks.len(), tasks_before);
+    }
+
+    #[test]
     fn clear_conversation_drops_history_and_any_pending_clarification() {
         let (mut k, ctx) = prime_chat_kernel();
         // Leave a pending clarification (an actionable, resolvable clarify).
@@ -10780,6 +10943,32 @@ mod tests {
         assert!(k.pending_clarification_for(&ctx).is_none());
         assert_eq!(k.recent_conversation_context(&ctx), "");
         // A second clear has nothing left to drop.
+        assert!(!k.clear_conversation(&ctx));
+    }
+
+    #[test]
+    fn clear_conversation_drops_the_rolling_summary_too() {
+        // Build a conversation long enough to evict turns into the rolling summary, then clear:
+        // the summary must be dropped along with the ring (no advisory memory survives a reset).
+        let (mut k, ctx) = prime_chat_kernel();
+        let mut acted = k.prime_turn(&ctx, "what is going on?").unwrap();
+        acted.created_task = Some(relux_core::TaskId::new("task_0001"));
+        k.record_conversation_turn(&ctx, "the opening ask", &acted, &[]);
+        let chat = k.prime_turn(&ctx, "what is going on?").unwrap();
+        for i in 0..crate::prime_history::MAX_HISTORY_TURNS {
+            k.record_conversation_turn(&ctx, &format!("m{i}"), &chat, &[]);
+        }
+        assert!(k.recent_conversation_context(&ctx).contains("Summary of earlier turns"));
+
+        assert!(k.clear_conversation(&ctx));
+        assert_eq!(k.recent_conversation_context(&ctx), "");
+        assert!(
+            !k.snapshot()
+                .conversation_summaries
+                .iter()
+                .any(|e| e.key == KernelState::conversation_key(&ctx)),
+            "the rolling summary is dropped on clear"
+        );
         assert!(!k.clear_conversation(&ctx));
     }
 

@@ -1705,3 +1705,60 @@ Pinned by the `prime_decision` unit tests (`build_prompt_with_correction_is_byte
 `loop_provider_failure_is_not_retried`, `loop_observes_then_self_corrects_a_malformed_act`) and the kernel
 `classify_cli_decision_distinguishes_malformed_from_provider_failure` test (the existing `cli_decision_*`
 no-leak tests are unchanged). No test calls a real provider.
+
+## Applied change (bounded conversation-memory compaction beyond the ring)
+
+The bounded conversation memory ("Bounded conversation memory" above) kept only the last
+`MAX_HISTORY_TURNS = 12` turns verbatim and **dropped everything older on the floor** — a
+long-running Prime thread forgot its earlier work once the ring filled. Per master plan §10.1
+(Intent Layer), §10.5 (Conversation Rules), and §17.1 ("Prime must understand conversational
+intent"), and following the reference read recorded in `reference-driven-development.md`
+("Reference read — bounded conversation-memory compaction beyond the ring"; Hermes
+`context_compressor.py` head-protect + bounded redacted digest; openclaw `context-engine/types.ts`
+`CompactResult` summary + `firstKeptEntryId` kept-entries boundary; Paperclip
+`issue-continuation-summary.ts` deterministic, char-bounded, honest-truncation digest), the evicted
+turns are now folded into a rolling, bounded, redacted, **deterministic** per-conversation summary.
+
+- **New core type `relux_core::ConversationSummary`** — bounded, secret-redacted, advisory-only:
+  the conversation's `opened_with` anchor (set once, from the first turn to age out),
+  `highlights` (the ids each evicted *acting* turn created, e.g. `"created task_0001"`),
+  `chat_turns_folded` (a size-free count of evicted conversational turns), `turns_folded`, and
+  `updated_at_secs`. Carries only ids + counts + the opening message — never a raw provider
+  envelope, tool body, or secret. Exported from `relux-core`.
+- **`crates/relux-kernel/src/prime_history.rs`.** `push_bounded` now RETURNS the turns evicted from
+  the front of the ring (openclaw's "everything before `firstKeptEntryId`"); `fold_evicted_turn`
+  (pure + deterministic, no provider call) folds each into the `ConversationSummary`, re-running
+  every field through `sanitize_text` (`redact_secrets` + control-strip + clamp) defensively and
+  bounding the highlight count (`MAX_SUMMARY_HIGHLIGHTS = 16`, oldest dropped). `render_summary`
+  renders one bounded line (`MAX_SUMMARY_RENDER_CHARS = 600`, `[summary truncated]` marker);
+  `render_context_with_summary` places it at the TOP of the SAME fenced BACKGROUND block, before
+  the verbatim recent turns. `render_context` is now the `None`-summary case, so the recent-only
+  path — and the empty-memory `""` identity — are byte-for-byte unchanged.
+- **`crates/relux-kernel/src/state.rs`.** A parallel `conversation_summaries:
+  HashMap<conversation_key, ConversationSummary>` map: `record_conversation_turn` folds the evicted
+  turns after the bounded push; the per-conversation cap evicts a stale conversation's summary
+  alongside its ring; `recent_conversation_context` renders summary + ring through
+  `render_context_with_summary`; `clear_conversation` drops the summary too. Persisted as
+  `ConversationSummaryEntry` through the same `meta` snapshot seam as `conversation_histories`
+  (`store.rs`), defaulted so older snapshots load cleanly.
+- **Safety invariants (binding).** The summary is advisory prompt context with ZERO authority,
+  exactly like the ring it compacts: never read by `classify_intent`, the fail-closed
+  `reconcile_intent` gate, or any existence/approval check — those run on the CURRENT message alone,
+  so a summary full of "created task_XXXX" highlights can never promote a casual musing into work.
+  No provider call (folding runs under the kernel lock). A brain-generated summary is deliberately
+  OUT of scope (deterministic-first; no new unbounded call) and remains the documented next
+  extension behind strict validation + a deterministic fallback.
+- **UI.** No new panel or wire field. The existing Prime **Clear** (`POST /v1/relux/prime/reset` →
+  `clear_conversation`) now also clears the rolling summary, so a reset still wipes ALL advisory
+  memory and no durable entity is touched.
+
+Pinned by the `prime_history` unit tests (`fold_records_actions_counts_chat_and_anchors_the_opening_once`,
+`fold_redacts_secrets_in_the_opening_anchor_and_bounds_highlights`, `render_summary_is_empty_until_something_is_folded`,
+`render_summary_names_actions_anchor_and_chat_count_as_reference_only`, `render_summary_is_bounded_with_an_honest_marker`,
+`render_context_with_summary_places_summary_before_recent_in_one_block`,
+`render_context_with_summary_renders_summary_alone_when_ring_is_empty`,
+`render_context_with_summary_is_empty_when_both_are_empty`) and the kernel state tests
+(`conversation_summary_accumulates_on_eviction_and_renders_in_context`,
+`conversation_summary_survives_a_snapshot_round_trip`, `conversation_summary_redacts_secrets_and_stores_no_raw_envelope`,
+`a_summary_full_of_actions_still_never_promotes_casual_chat_into_work`,
+`clear_conversation_drops_the_rolling_summary_too`). No test calls a real provider.

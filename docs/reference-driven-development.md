@@ -2165,3 +2165,65 @@ a generic `Command`, and the local echo path all return `ResumeNotSupported` wit
 reason and the operator re-runs fresh. The capability flag, the UI label, and the action all
 read from the single `plan_resume` decision, so they can never disagree. No new authority is
 granted — resume reuses the unchanged argv-only, non-bypass, bounded, redacted adapter gate.
+
+---
+
+## Reference read — bounded conversation-memory compaction beyond the ring (this slice)
+
+The audit's §6 P1: the bounded conversation memory (above) kept only the last `MAX_HISTORY_TURNS`
+turns verbatim and **dropped everything older on the floor** — a long-running Prime thread simply
+forgot its earlier work once the ring filled. This slice keeps the recent ring exactly as-is but,
+when a turn ages OUT of the front, **folds it into a rolling, bounded, secret-redacted,
+deterministic per-conversation summary** that is rendered at the TOP of the same BACKGROUND block,
+before the recent turns. It adds no authority, no provider call, and no new gate.
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/agent/context_compressor.py` — compaction kicks in past a window
+  threshold: a head/tail-protected pruning pass plus a bounded summary of the middle, with
+  `redact_sensitive_text` applied before the summary is produced and an anti-thrash counter so it
+  does not re-compress every turn. **Pattern: keep the recent boundary verbatim, summarize the
+  older middle into a bounded redacted digest, never re-summarize unboundedly.**
+- `reference/hermes-agent-main/agent/memory_manager.py` — `build_memory_context_block` again: the
+  summarized recall is fenced + labelled reference-not-instruction. **Pattern: the summary is
+  injected with the same background framing as the verbatim turns.**
+
+### openclaw — files read
+
+- `reference/openclaw-main/src/context-engine/types.ts` — `CompactResult.result = { summary,
+  firstKeptEntryId, tokensBefore, tokensAfter, ... }`: compaction yields a **summary string plus a
+  "first kept entry" boundary** — everything before the boundary is represented by the summary, the
+  kept entries stay verbatim. `AssembleResult` then prepends a `systemPromptAddition` (the summary)
+  ahead of the kept messages. **Pattern: summary + kept-entries, summary first; the ring is the
+  kept entries, the summary stands in for everything older.**
+
+### Paperclip — files read
+
+- `references/paperclip/server/src/services/issue-continuation-summary.ts` — a deterministic,
+  char-bounded continuation summary: `ISSUE_CONTINUATION_SUMMARY_MAX_BODY_CHARS = 8_000`,
+  per-section caps, `truncateText(value, max)` appends an explicit `\n[truncated]` marker, and the
+  salient facts are extracted deterministically (paths, "waiting for review/approval"), NOT by an
+  unbounded model call. **Pattern: deterministic extraction first, hard char bounds, honest
+  truncation marker.**
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| openclaw: **summary + kept-entries (`CompactResult` `summary` + `firstKeptEntryId`); summary first in the assembled prompt** | `crates/relux-kernel/src/prime_history.rs`: `push_bounded` now RETURNS the turns evicted from the front (openclaw's "everything before `firstKeptEntryId`"); `record_conversation_turn` folds each into the conversation's `relux_core::ConversationSummary`. `render_context_with_summary(summary, ring)` renders the summary line at the TOP of the one BACKGROUND block, then the verbatim recent ring (`render_context` is now the `None`-summary case, so the recent-only path is byte-for-byte unchanged). |
+| Hermes: **summarize the older middle into a bounded redacted digest** (`context_compressor`) | `fold_evicted_turn(summary, evicted, now)` is pure + deterministic: an *acting* turn contributes a redacted highlight (the ids it created, `action_summary`), a purely conversational turn contributes only to a count, and the first evicted turn seeds the conversation's `opened_with` anchor (set once). Every field re-runs through `sanitize_text` (`redact_secrets` + control-strip + clamp). |
+| Paperclip: **deterministic extraction first, no unbounded model call** | The summary is built ENTIRELY deterministically from data already redacted on the `ConversationTurn` (ids + counts + the opening message). **No provider call** — folding happens under the kernel lock, so it must stay off-network; a brain-generated summary would be a strictly-additive, strictly-validated, off-lock overlay and is deliberately NOT introduced here. |
+| Paperclip: **hard char bounds + honest truncation marker** | `MAX_SUMMARY_HIGHLIGHTS = 16` (oldest highlights dropped), per-highlight + `opened_with` clamps, and `render_summary` caps the rendered block at `MAX_SUMMARY_RENDER_CHARS = 600` with a `[summary truncated]` marker. |
+| openclaw: **bounded record persisted via the meta-json seam** | `KernelState.conversation_summaries: HashMap<conversation_key, ConversationSummary>` persisted as `ConversationSummaryEntry` through the same `meta` seam as `conversation_histories`; the per-conversation cap evicts a stale conversation's summary alongside its ring, and `clear_conversation` drops it too. |
+
+**What we deliberately do differently:** the summary is **advisory prompt context with zero
+authority**, exactly like the ring it compacts. It never reaches `classify_intent`, the fail-closed
+`reconcile_intent` gate, or any existence/approval check — the deterministic classifier + gate run
+on the CURRENT message alone, so even a summary full of "created task_XXXX" highlights can never
+promote a casual musing into work (pinned by
+`a_summary_full_of_actions_still_never_promotes_casual_chat_into_work`). It stores only ids +
+counts + the opening message — never a raw provider envelope, tool body, or secret — and the
+empty-memory decision prompt is byte-for-byte unchanged (no summary + no ring → `""`). A
+brain-generated summary is explicitly **out of scope** for this slice (deterministic-first; no new
+unbounded call), and remains the documented next extension behind strict validation + a
+deterministic fallback.
