@@ -75,3 +75,25 @@ export function runIdFromSearch(search: string): string | null {
   const id = new URLSearchParams(search).get("run");
   return id && id.length > 0 ? id : null;
 }
+
+// Task-detail deep links stay INSIDE the Relux shell too.
+//
+// IA decision (same as runs above): a task's detail is part of the Relux Work
+// surface. So a deep link to a task is `/work?task=<id>` — the query-param style
+// the Work page already uses for `?run`/`?agentId`/`?status`, and the Work page
+// reads it to open that task's detail panel. This is what Prime links to after it
+// creates a task: the old bare `/work` landed on the board with nothing focused
+// (the reported blank/wrong page), whereas `?task=` opens the new task directly.
+// The param is the single source of truth, so back/forward/refresh restore it.
+
+/// Build the in-shell href that opens a task's detail on the Work page.
+export function workTaskHref(taskId: string): string {
+  return `/work?task=${encodeURIComponent(taskId)}`;
+}
+
+/// Read the task id a `/work` URL is pointing at, or null when none is present.
+/// Accepts the raw `location.search` (with or without the leading `?`).
+export function taskIdFromSearch(search: string): string | null {
+  const id = new URLSearchParams(search).get("task");
+  return id && id.length > 0 ? id : null;
+}

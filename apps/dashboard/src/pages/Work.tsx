@@ -1,6 +1,6 @@
 import { useState, useMemo, useEffect, useRef } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
-import { runIdFromSearch, workRunShareUrl } from "../routing";
+import { runIdFromSearch, taskIdFromSearch, workRunShareUrl } from "../routing";
 import {
   latestReluxEventId,
   mergeReluxRunEvents,
@@ -44,11 +44,14 @@ export function Work() {
   const queryParams = useMemo(() => new URLSearchParams(location.search), [location.search]);
   const filterAgentId = queryParams.get("agentId");
   const filterStatus = queryParams.get("status");
-  // Run detail is URL-driven: `/work?run=<id>` opens that run's panel. Making the
-  // URL the source of truth (rather than only local state) lets a deep link from
-  // an orchestration step's run_id, plus browser back/forward/refresh, restore the
-  // same view. A missing/empty param simply shows no run panel.
+  // Run and task detail are both URL-driven and mutually exclusive:
+  // `/work?run=<id>` opens that run's panel, `/work?task=<id>` opens that task's
+  // panel. Making the URL the source of truth (rather than local state) lets a
+  // deep link — an orchestration step's run_id, or the task link Prime shows after
+  // creating a task — plus browser back/forward/refresh restore the same view. A
+  // missing/empty param simply shows no detail panel.
   const selectedRunId = runIdFromSearch(location.search);
+  const selectedTaskId = taskIdFromSearch(location.search);
 
   const { data: tasks, loading: loadingTasks, error: errorTasks, reload: reloadTasks } = useAsync<ReluxTask[]>(
     () => reluxWork.listTasks(),
@@ -65,19 +68,23 @@ export function Work() {
 
   const [newTaskTitle, setNewTaskTitle] = useState("");
   const [creating, setCreating] = useState(false);
-  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
 
-  // Point the URL at a run (or clear it), preserving any other Work filters in the
-  // querystring. This is the single way run selection changes, so it stays in sync
-  // with deep links and the browser history.
-  const setSelectedRunId = (runId: string | null) => {
-    if ((runId ?? null) === selectedRunId) return; // no-op: don't push a duplicate history entry
+  // Point the URL at a run or a task detail (or clear it), preserving any other
+  // Work filters in the querystring. Run and task panels are mutually exclusive,
+  // so focusing one clears the other. This is the single way detail selection
+  // changes, so it stays in sync with deep links and the browser history.
+  const focusDetail = (kind: "run" | "task", id: string | null) => {
     const next = new URLSearchParams(location.search);
-    if (runId) next.set("run", runId);
-    else next.delete("run");
+    next.delete("run");
+    next.delete("task");
+    if (id) next.set(kind, id);
     const search = next.toString();
-    navigate({ search: search ? `?${search}` : "" }, { replace: false });
+    const target = search ? `?${search}` : "";
+    if (target === (location.search ?? "")) return; // no-op: don't push a duplicate history entry
+    navigate({ search: target }, { replace: false });
   };
+  const setSelectedRunId = (runId: string | null) => focusDetail("run", runId);
+  const setSelectedTaskId = (taskId: string | null) => focusDetail("task", taskId);
 
   async function createTask() {
     if (!newTaskTitle.trim()) return;
@@ -120,15 +127,9 @@ export function Work() {
     reloadAgents();
   };
 
-  const handleInspectTask = (taskId: string) => {
-    setSelectedTaskId(taskId);
-    setSelectedRunId(null);
-  };
-
-  const handleInspectRun = (runId: string) => {
-    setSelectedRunId(runId);
-    setSelectedTaskId(null);
-  };
+  // focusDetail already clears the other panel, so each inspect is a single nav.
+  const handleInspectTask = (taskId: string) => setSelectedTaskId(taskId);
+  const handleInspectRun = (runId: string) => setSelectedRunId(runId);
 
   return (
     <div className="grid">

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { reluxAi, reluxPrime, type ReluxAiStatus, type ReluxPrimeTurn } from "../api";
+import { workTaskHref, workRunHref } from "../routing";
 import { PrimeAutonomyPanel } from "../components/PrimeAutonomyPanel";
 import { OrchestrationPanel } from "../components/OrchestrationPanel";
 
@@ -107,11 +108,17 @@ export function Prime() {
   return (
     <div className="chat" style={{ height: "calc(100vh - 96px)" }}>
       <AiStatusBanner status={aiStatus} />
-      <div style={{ padding: "0 10px 10px" }}>
-        <PrimeAutonomyPanel />
-      </div>
-      <div style={{ padding: "0 10px 10px" }}>
-        <OrchestrationPanel />
+      {/* Chat-first (RELUX_MASTER_PLAN §11.1 "Prime Chat — the main page or primary
+          surface"): the conversation is the page. The honest contract up front so
+          a user knows musing is safe — brainstorming stays a conversation; only an
+          explicit command creates or runs work (§10.5 Conversation Rules). The
+          autonomy/orchestration controls live in the Advanced section below the
+          input, so they never push the chat down. */}
+      <div className="prime-hint muted">
+        Brainstorming stays a conversation — say <span className="mono">"I was thinking…"</span> or
+        ask a question freely. Only an explicit command like{" "}
+        <span className="mono">"create a task to…"</span> or <span className="mono">"start it"</span>{" "}
+        creates or runs work.
       </div>
       <div className="chat-log" ref={logRef}>
         <div className="msg assistant">{GREETING}</div>
@@ -163,6 +170,17 @@ export function Prime() {
           Send
         </button>
       </div>
+
+      {/* Advanced controls: Prime Autonomy (the self-driving tick loop) and
+          multi-agent Orchestration. Collapsed by default so they never block the
+          chat (§11.1) — still one click away below the input. */}
+      <details className="prime-advanced">
+        <summary>⚙ Advanced — Prime Autonomy &amp; multi-agent Orchestration</summary>
+        <div className="prime-advanced-body">
+          <PrimeAutonomyPanel />
+          <OrchestrationPanel />
+        </div>
+      </details>
     </div>
   );
 }
@@ -285,12 +303,12 @@ function PrimeTurnCard({ turn }: { turn: ReluxPrimeTurn }) {
         <div className="row wrap" style={{ gap: 10, marginTop: 10, fontSize: 11 }}>
           {turn.created_task && (
             <span className="muted">
-              task <Link to="/work" className="mono" title="View on work board">{turn.created_task}</Link>
+              task <Link to={workTaskHref(turn.created_task)} className="mono" title="Open this task on the Work board">{turn.created_task}</Link>
             </span>
           )}
           {turn.started_run && (
             <span className="muted">
-              run <Link to="/work" className="mono" title="View execution history">{turn.started_run}</Link>
+              run <Link to={workRunHref(turn.started_run)} className="mono" title="Open this run on the Work board">{turn.started_run}</Link>
             </span>
           )}
           {turn.created_agent && (

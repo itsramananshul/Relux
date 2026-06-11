@@ -111,6 +111,17 @@ pub fn classify_intent(message: &str) -> PrimeIntent {
     {
         return PrimeIntent::ToolInvocation;
     }
+    // Ideation / musing stays a conversation (section 10.5: "be natural, but not
+    // reckless" - Prime does not create plans from casual chat). A lead-in like
+    // "I was thinking...", "what if we...", "I have an idea..." means the user is
+    // floating an idea, not commanding work, so even a sentence carrying a creation
+    // verb ("create", "build", "make") classifies as Brainstorming. Only an
+    // EXPLICIT command ("create a task to ...", "orchestrate", "assign", "run it")
+    // overrides this and mints/runs work. Checked before orchestration and task
+    // creation so the verb-based catches below cannot turn musing into a task.
+    if is_ideation(&m) && !is_explicit_command(&m) {
+        return PrimeIntent::Brainstorming;
+    }
     // Orchestration: the user explicitly wants Prime to coordinate a goal across
     // multiple agents. Gated on explicit coordination phrasing (never a bare verb)
     // and checked before task creation/agent creation so "orchestrate X, Y and Z"
@@ -637,6 +648,77 @@ fn join_list(parts: &[String]) -> String {
 //
 // Crude, deterministic pulls from the raw message. A real Prime would let the
 // model fill these slots; here they are just enough to ground the demo.
+
+/// True when the message is ideation/musing rather than a command (section 10.5).
+///
+/// These lead-ins open a discussion or float an idea ("I was thinking...",
+/// "what if we...", "I have an idea..."). On their own they classify as
+/// [`PrimeIntent::Brainstorming`] - a conversational reply - even when the
+/// sentence also contains a creation verb, so Prime does not mint a task from
+/// someone thinking out loud. An [`is_explicit_command`] in the same message
+/// overrides this. Matched against the already-lowercased message.
+fn is_ideation(m: &str) -> bool {
+    const LEAD_INS: &[&str] = &[
+        "i was thinking",
+        "i'm thinking",
+        "im thinking",
+        "i am thinking",
+        "i've been thinking",
+        "ive been thinking",
+        "i have been thinking",
+        "i was wondering",
+        "i wonder if",
+        "i wonder whether",
+        "what if we",
+        "what if i",
+        "what if you",
+        "can we talk about",
+        "could we talk about",
+        "let's talk about",
+        "lets talk about",
+        "let's discuss",
+        "lets discuss",
+        "i want to talk about",
+        "i want to discuss",
+        "i'd like to discuss",
+        "i would like to discuss",
+        "i want to brainstorm",
+        "i have an idea",
+        "i had an idea",
+        "i've got an idea",
+        "ive got an idea",
+        "i got an idea",
+        "just thinking",
+        "thinking about",
+        "thinking of",
+        "thinking we could",
+        "toying with",
+        "kicking around",
+        "playing with the idea",
+        "was thinking maybe",
+    ];
+    LEAD_INS.iter().any(|p| m.contains(p))
+}
+
+/// True when the message carries an explicit imperative to mint or run work, so
+/// it overrides an [`is_ideation`] lead-in (section 10.5). "I was thinking, create a
+/// task to X" is a command; "I was thinking we could build X" is a conversation.
+/// Matched against the already-lowercased message.
+fn is_explicit_command(m: &str) -> bool {
+    const COMMANDS: &[&str] = &[
+        "create a task",
+        "make a task",
+        "add a task",
+        "new task",
+        "start it",
+        "run it",
+        "start the run",
+        "kick off",
+        "orchestrate",
+        "assign ",
+    ];
+    COMMANDS.iter().any(|p| m.contains(p))
+}
 
 /// Turn a request into a task title by stripping a few polite/imperative
 /// lead-ins, or `None` when nothing actionable remains.
@@ -1298,6 +1380,86 @@ mod tests {
             &empty_summary(),
         );
         assert!(matches!(plan, PrimePlan::Clarify { .. }), "got {plan:?}");
+    }
+
+    #[test]
+    fn ideation_stays_a_conversation_not_a_task() {
+        // The exact regression: musing that carries a creation verb must NOT mint a
+        // task. "I was thinking to create ..." is someone floating an idea, not a
+        // command (section 10.5).
+        assert_eq!(
+            classify_intent(
+                "I was thinking to create a n8n like program using 20 agents but better than n8n"
+            ),
+            PrimeIntent::Brainstorming
+        );
+        // A spread of ideation lead-ins, each carrying a creation verb, all stay chat.
+        for msg in [
+            "I have an idea: build a workflow engine",
+            "what if we make a graph editor for agents",
+            "can we talk about creating a new orchestration layer",
+            "I want to discuss building a plugin marketplace",
+            "I'm thinking of writing a new adapter",
+        ] {
+            assert_eq!(
+                classify_intent(msg),
+                PrimeIntent::Brainstorming,
+                "{msg:?} should stay a brainstorming conversation"
+            );
+        }
+        // And the decided plan is a Reply - never a state change.
+        let plan = decide(
+            "I was thinking to create a n8n like program using 20 agents but better than n8n",
+            &PrimeIntent::Brainstorming,
+            &empty_summary(),
+        );
+        assert!(
+            matches!(plan, PrimePlan::Reply { .. }),
+            "ideation must be a Reply, got {plan:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_commands_override_ideation_lead_ins() {
+        // An explicit imperative still mints/runs work even after an ideation
+        // lead-in: the command wins (section 10.5).
+        assert_eq!(
+            classify_intent("I was thinking, create a task to summarize the README"),
+            PrimeIntent::TaskCreation
+        );
+        assert_eq!(
+            classify_intent("I had an idea - orchestrate research, build, and test it"),
+            PrimeIntent::Orchestration
+        );
+        // The canonical explicit task creation is untouched by the new guard.
+        assert_eq!(
+            classify_intent("create a task to summarize the README"),
+            PrimeIntent::TaskCreation
+        );
+        // "start it" still controls a run, never reads as ideation.
+        assert_eq!(classify_intent("start it"), PrimeIntent::RunStart);
+    }
+
+    #[test]
+    fn ideation_creating_a_task_still_starts_a_ready_run() {
+        // End-to-end of the two regression anchors together: after the ideation
+        // sentence creates nothing, an explicit "start it" still acts on the single
+        // ready task.
+        let mut s = empty_summary();
+        s.queued = vec![brief("task_0007", "Run the tests", TaskStatus::Queued)];
+        assert_eq!(
+            classify_intent("start it"),
+            PrimeIntent::RunStart,
+            "explicit run control must survive the ideation guard"
+        );
+        let plan = decide("start it", &PrimeIntent::RunStart, &s);
+        match plan {
+            PrimePlan::Act {
+                action: PrimeAction::StartRun { task_id },
+                ..
+            } => assert_eq!(task_id, "task_0007"),
+            other => panic!("expected Act/StartRun, got {other:?}"),
+        }
     }
 
     #[test]

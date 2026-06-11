@@ -7,6 +7,8 @@ import {
   workRunHref,
   workRunShareUrl,
   runIdFromSearch,
+  workTaskHref,
+  taskIdFromSearch,
 } from "../src/routing.ts";
 
 // Guard against the blank-page regression: the Relux shell must own every path
@@ -99,4 +101,47 @@ test("a shared workRunShareUrl round-trips back to the same run id", () => {
   const url = new URL(workRunShareUrl(id, "https://host"));
   assert.equal(url.pathname, "/dashboard/work");
   assert.equal(runIdFromSearch(url.search), id);
+});
+
+// Task-detail deep links: the link Prime shows after creating a task. The old
+// bare `/work` landed on the board with nothing focused (the reported blank/wrong
+// page); `/work?task=<id>` opens that task's detail panel. workTaskHref builds it;
+// taskIdFromSearch reads it back.
+
+test("workTaskHref points a task into the in-shell Work surface, not a blank board", () => {
+  assert.equal(workTaskHref("task_0001"), "/work?task=task_0001");
+  // Owned by the Relux shell so the deep link never falls into the bridge console.
+  assert.equal(isLegacyPath("/work"), false);
+});
+
+test("workTaskHref percent-encodes ids so odd characters can't break the query", () => {
+  assert.equal(workTaskHref("a b&c=d"), "/work?task=a%20b%26c%3Dd");
+});
+
+test("taskIdFromSearch round-trips the id workTaskHref encodes", () => {
+  const tricky = "task:weird/1 2&3";
+  const search = new URL(`http://x${workTaskHref(tricky)}`).search;
+  assert.equal(taskIdFromSearch(search), tricky);
+});
+
+test("taskIdFromSearch reads the task param with or without a leading '?'", () => {
+  assert.equal(taskIdFromSearch("?task=task_42"), "task_42");
+  assert.equal(taskIdFromSearch("task=task_42"), "task_42");
+  // Other Work filters alongside it don't confuse the read.
+  assert.equal(taskIdFromSearch("?status=running&task=task_42"), "task_42");
+});
+
+test("taskIdFromSearch returns null when no task is selected", () => {
+  for (const s of ["", "?", "?status=running", "?task=", "?run=run_1"]) {
+    assert.equal(taskIdFromSearch(s), null, `'${s}' must select no task`);
+  }
+});
+
+test("run and task params are read independently on the same Work URL", () => {
+  // Defensive: a URL never carries both (selecting one clears the other), but the
+  // readers must not cross-wire if it somehow did.
+  assert.equal(taskIdFromSearch("?task=task_7"), "task_7");
+  assert.equal(runIdFromSearch("?task=task_7"), null);
+  assert.equal(runIdFromSearch("?run=run_7"), "run_7");
+  assert.equal(taskIdFromSearch("?run=run_7"), null);
 });
