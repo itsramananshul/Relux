@@ -617,6 +617,31 @@ pub struct PrimeTaskUpdate {
     pub source: Option<String>,
 }
 
+/// One READ-ONLY context tool Prime consulted before answering, as a provenance row the chat
+/// surface can render (`docs/RELUX_MASTER_PLAN.md` section 10.1 Intent Layer, section 17.1
+/// "Prime must be smart and grounded"; `docs/prime-processing-audit.md` "Read-only tool loop").
+///
+/// ## The safety contract (binding)
+///
+/// This is provenance/presentation ONLY. It reports that Prime *looked* at live state through a
+/// governed read-only tool before forming its reply — it carries no action and grants no
+/// authority. Every read was executed deterministically against a state snapshot by the kernel
+/// (`crates/relux-kernel/src/prime_tools.rs`); the brain could only *request* an allowlisted
+/// read-only tool, never a mutating one (an off-allowlist name is refused and never executed).
+/// `ok` is `false` for an honest miss (e.g. a task id that does not exist) — Prime never
+/// fabricates a record. The full result body stays server-side grounding; only this short
+/// summary is shipped. Omitted from the wire on every turn that consulted no tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrimeContextRead {
+    /// The read-only tool that ran (e.g. `"get_task"`, `"list_agents"`, `"board_summary"`).
+    pub tool: String,
+    /// Whether the read found what was asked. `false` is an honest miss (unknown id / empty
+    /// result), never a fabricated record.
+    pub ok: bool,
+    /// A short, human one-line summary of what was read (e.g. `"task_0001: \"Fix login\" [queued]"`).
+    pub summary: String,
+}
+
 /// The full result of Prime handling one user message.
 ///
 /// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 10 (Prime Behavior Specification).
@@ -692,6 +717,14 @@ pub struct PrimeTurn {
     /// before. The kernel validated every field before applying it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update: Option<PrimeTaskUpdate>,
+    /// The READ-ONLY context tools Prime consulted before answering this turn, in the order it
+    /// looked (see [`PrimeContextRead`]). Present ONLY when a configured brain ran the governed
+    /// read-only tool loop and gathered at least one read; omitted on every other turn, so
+    /// existing clients see the same JSON they did before. Provenance/presentation only — every
+    /// read was a deterministic, fabricate-nothing inspection of live state, and none of it is an
+    /// action.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_reads: Vec<PrimeContextRead>,
 }
 
 /// The scope a Prime turn runs in: which namespace work lands in, which agent
@@ -830,6 +863,7 @@ mod tests {
             admin_slots: None,
             assign_slots: None,
             update: None,
+            context_reads: vec![],
         };
         let json = serde_json::to_string(&turn).unwrap();
         assert!(
@@ -861,6 +895,12 @@ mod tests {
         assert!(
             !json.contains("update"),
             "a turn that applied no task update must omit the field: {json}"
+        );
+        // The read-only context-read provenance is present ONLY when Prime ran the governed
+        // tool loop and gathered a read; a turn that consulted no tool must omit it on the wire.
+        assert!(
+            !json.contains("context_reads"),
+            "a turn that consulted no read-only tool must omit the field: {json}"
         );
         // The plan preview is present ONLY on a PlanRequest turn: a normal turn must
         // not carry `proposal` on the wire, so existing clients are unaffected (§11.1).
@@ -1111,6 +1151,31 @@ mod tests {
         let back: PrimeTaskUpdate =
             serde_json::from_str(&serde_json::to_string(&brain).unwrap()).unwrap();
         assert_eq!(back, brain);
+    }
+
+    #[test]
+    fn prime_context_read_round_trips_as_bounded_provenance() {
+        // A read-only context read carries only the tool name, the honest ok flag, and a short
+        // summary — never an action, never the full detail body.
+        let read = PrimeContextRead {
+            tool: "get_task".to_string(),
+            ok: true,
+            summary: "task_0001: \"Fix the login redirect\" [queued]".to_string(),
+        };
+        let json = serde_json::to_string(&read).unwrap();
+        assert!(!json.contains("\"type\""), "a context read must not embed an action: {json}");
+        let back: PrimeContextRead = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, read);
+
+        // An honest miss round-trips with ok=false (Prime never fabricates a record).
+        let miss = PrimeContextRead {
+            tool: "get_task".to_string(),
+            ok: false,
+            summary: "no task task_9999".to_string(),
+        };
+        let back: PrimeContextRead =
+            serde_json::from_str(&serde_json::to_string(&miss).unwrap()).unwrap();
+        assert_eq!(back, miss);
     }
 
     #[test]

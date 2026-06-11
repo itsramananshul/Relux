@@ -768,3 +768,79 @@ and runs through the identical `validate_polish` index-match invariant, so it ca
 "Create these tasks" creates. Both are strictly additive: the envelope changes only HOW the brain
 is asked (one call) and HOW its reply is parsed (one allowlisted object) — never authority. The
 dedicated specialized calls remain as the fallback; `Local` (no brain) is byte-for-byte unchanged.
+
+---
+
+## Reference read — the first safe Prime tool loop: READ-ONLY context tools (this slice)
+
+Every prior brain stage (intent, slots, wording, the unified decision envelope) is *propose-only*
+and answers from ONE static `StateSummary` snapshot baked into the prompt. The brain cannot drill
+into a specific task's detail, inspect a run, or enumerate the crew before answering — exactly the
+gap the master plan flags: Prime "can classify and propose, but it does not inspect live
+control-plane state through a governed tool interface before answering the way Hermes / Codex /
+Paperclip-like agents do" (`docs/RELUX_MASTER_PLAN.md` §10.1, §17.1). This slice ships the FIRST
+safe piece of that capability: a bounded, governed loop in which a configured brain may request
+**read-only context tools**, the kernel validates the requested tool against a read-only allowlist,
+executes it deterministically against a state snapshot, injects the result back, and lets the brain
+look again or answer. Nothing here mutates state, mints work, or grants authority.
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/agent/conversation_loop.py` `run_conversation(...)`
+  - The per-turn agentic loop is bounded by a **max-iterations cap**: `while (api_call_count <
+    agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:`
+    (L598). The loop re-calls the model after each tool execution and ends when no tool is
+    requested.
+  - **Tool-call detection**: `if assistant_message.tool_calls:` (L3106) branches the reply into "the
+    model wants a tool" vs. "the model gave a final answer".
+  - **Tool-NAME allowlist validation BEFORE execution + self-correction** (L3114-3162): `if
+    tc.function.name not in agent.valid_tool_names:` → `repaired = agent._repair_tool_call(...)`
+    (L3117-3118); a name that still fails the allowlist is NOT executed — instead an `available = ",
+    ".join(sorted(agent.valid_tool_names))` (L3131) list is built and a `role:tool` message `content
+    = f"Tool '{tc.function.name}' does not exist. Available tools: {available}"` (L3152-3153) is fed
+    back for the model to self-correct. **Pattern: validate the chosen tool against an explicit
+    name allowlist before acting; an off-list name is fed back for self-correction, never executed.**
+  - `agent/tool_executor.py` (L445-452) — an executed tool's result is appended back as a
+    `{"role":"tool","name":..,"tool_call_id":..,"content":..}` message and the loop continues.
+    **Pattern: inject the tool result back into the conversation, then re-call the model.**
+
+### Paperclip (openclaw) — files read
+
+- `reference/openclaw-main/src/agents/tool-mutation.ts` `isMutatingToolCall(toolName, args)`
+  (L140-181) + `READ_ONLY_ACTIONS` (L39-54: `get`/`list`/`read`/`status`/`show`/`fetch`/`search`/…)
+  — a single FAIL-CLOSED classifier: the `default` branch (L165-179) treats `cron`/`gateway`/
+  `canvas`/`*_actions` as mutating when `action == null || !READ_ONLY_ACTIONS.has(action)`, i.e. an
+  unknown/missing action defaults to *mutating*. **Pattern: a single fail-closed read-only vs.
+  mutating gate where the unsafe default wins.**
+- `reference/openclaw-main/src/agents/tools/common.ts` `readStringParam(…, {required})` (L91-122)
+  + `ToolInputError` (L57-64), and `sessions-spawn-tool.ts` `UNSUPPORTED_*_PARAM_KEYS` (L46-55,
+  rejected before any param is read) — typed param extraction that fails on bad input and rejects
+  unsupported keys. **Pattern: require/sanitize the mandatory arg; do not coerce junk.**
+- `reference/openclaw-main/src/agents/cli-output.ts` `parseCliOutput` +
+  `reference/openclaw-main/src/shared/balanced-json.ts` `extractBalancedJsonPrefix` (L21-69) — lift
+  the first balanced `{...}` out of a noisy reply and surface only the parsed object, never the raw
+  stdout.
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| Hermes: **bounded loop with a max-iterations cap** | `crates/relux-kernel/src/prime_tools.rs` `ContextLoop` + `MAX_TOOL_ROUNDS` (the iteration cap); the loop also stops on a repeated no-progress call. The async drivers (OpenRouter / CLI) and the synchronous test twin `run_context_loop` share the SAME stepper, so the control flow is pinned once and never drifts between providers. |
+| Hermes: **validate the chosen tool against a NAME allowlist before acting** | `classify_tool(name)` admits ONLY a name on the explicit read-only allowlist (`READ_ONLY_TOOLS`); `interpret_reply` routes an off-list name to `BrainTurn::UnknownTool`, never `Call`. |
+| Hermes: **off-list name fed back for self-correction, never executed** | `unknown_tool_feedback(name)` is the `"Tool '…' is not available. These read-only tools are available: …"` message; `ContextLoop::observe` records it as the next prompt's feedback and executes nothing. |
+| Hermes: **inject the tool result back, then re-call** | `ContextLoop::observe` pushes the executed `ContextRead` into the gathered set; `build_tools_prompt` re-grounds the next round with every prior read's body. |
+| Paperclip: **a single fail-closed read-only vs. mutating gate, unsafe default wins** | the first slice ships read-only tools only, so the allowlist IS the read-only set: `classify_tool` returns `ToolKind::Refused` for ANY name not on it (a plausible-sounding `delete_task`/`run_shell` is refused), mirroring `isMutatingToolCall`'s "unknown ⇒ unsafe" default. |
+| Paperclip: **require/sanitize the mandatory arg** | `read_id_arg` requires + sanitizes (control-strip, clamp) a `task_id`/`agent_id`; a missing/empty id is an HONEST `ok:false` read ("provide a task_id" / "does not exist"), never a fabricated record. |
+| Paperclip: **balanced-JSON extraction, surface only the parsed object** | `interpret_reply` reuses `prime_intent::extract_json_object`; on the CLI path `lift_cli_tool_text` (`server.rs`) runs `parse_adapter_result` FIRST so the raw `--output-format json` envelope never reaches the parser. |
+
+**What we deliberately do differently:** unlike Hermes (where the model also runs *mutating* tools
+and the loop produces the final answer), the Relux loop is **read-only and gather-only**. Every
+tool is a pure read of a `ContextSnapshot` (an owned, bounded projection taken ONCE under the kernel
+lock, so the brain rounds run lock-free and the executors are unit-testable without a kernel); there
+is no path from this module to `prime_execute`, an approval, or any durable change. The gathered
+reads only ground the EXISTING action-free conversational reply (folded into `grounded_facts` for
+the reply-shaping brain and surfaced as `PrimeContextRead` provenance), and the loop runs ONLY on a
+non-actionful inspection/explanation/question turn (`turn_wants_context` ∧ `!is_actionful`). The
+brain authors no intent, no slot, and no action; `Local` (no brain) gathers nothing and is
+byte-for-byte the prior reply path. This is the first rung — read before you speak — with the
+write-capable tool surface deliberately deferred until the read-only loop is proven.

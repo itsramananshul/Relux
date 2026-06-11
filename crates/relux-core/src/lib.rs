@@ -46,7 +46,8 @@ pub use plugin::{
 };
 pub use prime::{
     PendingClarification, PrimeAction, PrimeAdminSlots, PrimeAgentSlots, PrimeAssignSlots,
-    PrimeAutonomyConfig, PrimeAutonomyTickResult, PrimeContext, PrimeDisposition, PrimeIntent,
+    PrimeAutonomyConfig, PrimeAutonomyTickResult, PrimeContext, PrimeContextRead, PrimeDisposition,
+    PrimeIntent,
     PrimePlan, PrimePolishedStep, PrimeProposal, PrimeProposalPolish, PrimeProposalStep,
     PrimeSuggestion, PrimeTaskChange, PrimeTaskSlots, PrimeTaskUpdate, PrimeTurn, StateSummary,
     TaskBrief,

@@ -1664,7 +1664,7 @@ async fn run_prime(
     // not the bare answer. The board summary grounds an assignment/update against real ids. The
     // kernel re-decides the continuation authoritatively under its own lock; this preview only
     // steers which message the (slow, off-lock) brain is asked about.
-    let (continuation, board_summary) = {
+    let (continuation, board_summary, context_snapshot) = {
         let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut kernel = {
             let store = SqliteStore::open(&state.db_path)?;
@@ -1673,7 +1673,10 @@ async fn run_prime(
         let ctx = crate::ensure_bootstrapped(&mut kernel)?;
         let preview = kernel.continuation_preview(&ctx, &message);
         let summary = kernel.inspect_state();
-        (preview, summary)
+        // Snapshot the read-only context the governed tool loop reads from (the whole board,
+        // bounded), taken under THIS lock so the loop's brain rounds run lock-free below.
+        let snapshot = kernel.context_snapshot(&ctx);
+        (preview, summary, snapshot)
     };
     let is_continuation = continuation.is_some();
     // The message the brain reasons about: the COMBINED message on a continuation, else raw.
@@ -1895,6 +1898,9 @@ async fn run_prime(
     // So those turns skip the free-form shaper and go through `run_clarify_polish`,
     // which falls back to the grounded deterministic wording on any failure (§10.5,
     // §17.1). The wall is intact: this only ever runs on a non-actionful turn.
+    // The READ-ONLY context tools the governed loop gathered this turn (empty unless a brain
+    // ran the loop on an inspection turn), surfaced as provenance on the response.
+    let mut gathered_reads: Vec<relux_kernel::ContextRead> = Vec::new();
     let clarify_kind = relux_kernel::clarify_polish_kind(&turn);
     let (outcome, reply_polish) = if let Some(kind) = clarify_kind {
         // Prefer the wording the UNIFIED decision already carried (no extra brain call); it is
@@ -1915,14 +1921,42 @@ async fn run_prime(
             precomputed,
         )
         .await
+    } else if !relux_kernel::is_actionful(&turn)
+        && relux_kernel::turn_wants_context(&turn)
+        && !matches!(brain, relux_kernel::PrimeBrain::Local)
+    {
+        // An inspection / explanation / conversational-QUESTION turn: this is the first safe Prime
+        // tool loop. FIRST run the GOVERNED READ-ONLY context loop so the brain can inspect live
+        // state (a task, the crew, the runs) through validated read-only tools, THEN shape the
+        // reply grounded in what it actually observed. The loop changes nothing and never reaches
+        // an action (`docs/prime-processing-audit.md` "Read-only tool loop"); on a miss (the brain
+        // gathers nothing) `observations` is empty and the shaper behaves byte-for-byte as before.
+        // We deliberately prefer this gather-then-ground path over the unified decision's
+        // precomputed reply for these turns, because that reply was composed off the STATIC board
+        // summary — the live reads supersede it.
+        gathered_reads = gather_read_only_context(
+            brain,
+            &ai_config,
+            cli_status.clone(),
+            &context_snapshot,
+            &message,
+        )
+        .await;
+        let observations = relux_kernel::render_observations(&gathered_reads);
+        let outcome = match brain {
+            relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli => {
+                run_cli_brain(brain, cli_status.clone(), &message, &turn, &observations).await
+            }
+            _ => relux_kernel::shape_reply(&ai_config, &message, &turn, &observations).await,
+        };
+        (outcome, None)
     } else if !relux_kernel::is_actionful(&turn) {
-        // A non-actionful, non-clarify conversational turn (a greeting / direct answer /
-        // explanation / plan prose). PREFER the free-form reply the UNIFIED decision already
-        // carried — no extra brain call — validated through the SAME block-sanitize +
-        // action-claim chokepoint a brainstorm reply uses (`validated_reply`). On any miss (the
-        // envelope omitted a reply, it failed validation, or no unified decision ran) fall back
-        // to the dedicated free-form shaper, so behavior is byte-for-byte the prior path. The
-        // action-free wall is intact: this only runs on a non-actionful turn.
+        // A non-actionful, non-clarify conversational turn that does not benefit from a state
+        // lookup (a greeting / plan prose / a turn under the Local brain). PREFER the free-form
+        // reply the UNIFIED decision already carried — no extra brain call — validated through the
+        // SAME block-sanitize + action-claim chokepoint a brainstorm reply uses (`validated_reply`).
+        // On any miss fall back to the dedicated free-form shaper, so behavior is byte-for-byte the
+        // prior path. The action-free wall is intact: this only runs on a non-actionful turn.
         let precomputed_reply = decision.as_ref().and_then(|d| d.validated_reply(&turn.reply));
         match precomputed_reply {
             Some(text) => (unified_reply_outcome(brain, &ai_config, text), None),
@@ -1931,23 +1965,26 @@ async fn run_prime(
                 relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli
             ) =>
             {
-                (run_cli_brain(brain, cli_status.clone(), &message, &turn).await, None)
+                (run_cli_brain(brain, cli_status.clone(), &message, &turn, "").await, None)
             }
             None => {
                 // Local / OpenRouter go through shape_reply, which only augments via OpenRouter
                 // when that brain is selected and a key is configured.
-                (relux_kernel::shape_reply(&ai_config, &message, &turn).await, None)
+                (relux_kernel::shape_reply(&ai_config, &message, &turn, "").await, None)
             }
         }
     } else {
         // Actionful turns go through shape_reply, which keeps them deterministic so the brain
         // never narrates (and possibly overclaims) a real state change.
-        (relux_kernel::shape_reply(&ai_config, &message, &turn).await, None)
+        (relux_kernel::shape_reply(&ai_config, &message, &turn, "").await, None)
     };
 
     // 3. Merge the outcome into the response.
     let mut final_turn = turn;
     final_turn.reply = outcome.reply;
+    // Surface the read-only context reads the governed loop gathered (if any) as provenance. The
+    // full result bodies stayed server-side grounding; only the bounded summaries ship.
+    final_turn.context_reads = relux_kernel::reads_to_wire(&gathered_reads);
 
     // 4. OPTIONAL advisory polish of a plan-preview card. Whichever brain is live
     // may refine only the WORDING of the proposal (summary, step titles, clarifying
@@ -2162,6 +2199,7 @@ async fn run_cli_brain(
     status: Option<relux_core::AdapterRuntimeStatus>,
     message: &str,
     turn: &PrimeTurn,
+    observations: &str,
 ) -> AiOutcome {
     let (label, bin, kind, mode) = match brain {
         relux_kernel::PrimeBrain::ClaudeCli => (
@@ -2215,7 +2253,10 @@ async fn run_cli_brain(
         ));
     };
 
-    let prompt = relux_kernel::compose_chat_prompt(message, &turn.reply);
+    // Fold the read-only observations the governed tool loop gathered this turn (if any) into the
+    // grounded facts the CLI brain answers from; the fallback reply stays `turn.reply`.
+    let grounded = relux_kernel::grounded_facts_with_observations(&turn.reply, observations);
+    let prompt = relux_kernel::compose_chat_prompt(message, &grounded);
     let spec = relux_kernel::AdapterCommandSpec {
         program,
         args: relux_kernel::build_adapter_args(&kind),
@@ -2620,6 +2661,79 @@ fn parse_cli_decision(
         return None;
     }
     relux_kernel::parse_decision(&parsed.text).ok()
+}
+
+/// Run ONE round of the read-only context loop through a CLI brain (Claude / Codex), returning
+/// the lifted raw text (a tool-call JSON or a `{"done":true}` / final answer), or `None` on ANY
+/// failure. Same bounded, non-bypass spawn as every other CLI brain path; [`parse_adapter_result`]
+/// lifts the human text out of the `--output-format json` envelope (an error envelope is dropped),
+/// so the raw envelope never reaches [`relux_kernel::interpret_reply`].
+async fn cli_brain_tool_round(
+    brain: relux_kernel::PrimeBrain,
+    status: Option<relux_core::AdapterRuntimeStatus>,
+    prompt: String,
+) -> Option<String> {
+    let (stdout, kind) = cli_brain_json(brain, status, prompt).await?;
+    lift_cli_tool_text(&stdout, kind)
+}
+
+/// Lift one read-only-loop round's raw text out of a CLI brain's captured `stdout`, or `None`.
+/// The no-leak boundary, kept pure so it is pinned without spawning a process:
+/// [`parse_adapter_result`] lifts the human text out of the `--output-format json` envelope
+/// (degrading to raw prose otherwise), an envelope that reported an error is dropped, and an
+/// empty result is dropped. The raw envelope never escapes — only the text the loop's
+/// [`relux_kernel::interpret_reply`] then parses.
+fn lift_cli_tool_text(stdout: &str, kind: relux_core::AdapterKind) -> Option<String> {
+    let parsed = relux_core::parse_adapter_result(stdout, kind);
+    if parsed.is_error == Some(true) {
+        return None;
+    }
+    let text = parsed.text.trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
+/// Drive the bounded, governed READ-ONLY context loop for one turn and return the gathered reads.
+///
+/// This is the first safe Prime tool loop: a configured brain may request read-only context tools
+/// (inspect the board, a task, the crew, a run); the kernel validates each requested name against
+/// the read-only allowlist ([`relux_kernel::classify_tool`]), executes it deterministically against
+/// the pre-taken `snapshot` (OUTSIDE the lock), injects the result, and lets the brain ask again or
+/// stop — bounded by [`relux_kernel::MAX_TOOL_ROUNDS`]. The loop changes nothing and never reaches
+/// an action; its reads only ground the conversational reply. `Local` (no brain) gathers nothing.
+///
+/// All three brains share the SAME [`relux_kernel::ContextLoop`] stepper (the per-round "prompt →
+/// text" primitive is the only per-brain difference), so the loop's safety logic — allowlist
+/// validation, self-correction, round cap, read-only execution — is pinned once and never drifts.
+async fn gather_read_only_context(
+    brain: relux_kernel::PrimeBrain,
+    ai_config: &relux_kernel::AiConfig,
+    cli_status: Option<relux_core::AdapterRuntimeStatus>,
+    snapshot: &relux_kernel::ContextSnapshot,
+    message: &str,
+) -> Vec<relux_kernel::ContextRead> {
+    let mut lp = relux_kernel::ContextLoop::new(message, snapshot);
+    while let Some(prompt) = lp.next_prompt() {
+        let raw = match brain {
+            relux_kernel::PrimeBrain::Openrouter => {
+                relux_kernel::complete_tool_round(ai_config, prompt).await
+            }
+            relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli => {
+                cli_brain_tool_round(brain, cli_status.clone(), prompt).await
+            }
+            relux_kernel::PrimeBrain::Local => None,
+        };
+        let Some(raw) = raw else {
+            break;
+        };
+        if !lp.observe(&raw) {
+            break;
+        }
+    }
+    lp.into_reads()
 }
 
 /// The provenance label for brain-extracted slots: the OpenRouter model id, or the
@@ -5201,6 +5315,7 @@ mod tests {
             admin_slots: None,
             assign_slots: None,
             update: None,
+            context_reads: vec![],
         }
     }
 
@@ -5210,7 +5325,7 @@ mod tests {
         // exactly what to do. Never blank, never a fabricated Claude answer.
         let turn = conversational_turn("There is 1 active run.");
         let outcome =
-            run_cli_brain(relux_kernel::PrimeBrain::ClaudeCli, None, "hey", &turn).await;
+            run_cli_brain(relux_kernel::PrimeBrain::ClaudeCli, None, "hey", &turn, "").await;
         assert_eq!(outcome.mode, AiMode::Deterministic);
         assert_eq!(outcome.reply, "There is 1 active run.");
         let note = outcome.note.expect("a note explaining the next step");
@@ -5243,6 +5358,7 @@ mod tests {
             Some(status),
             "hey",
             &turn,
+            "",
         )
         .await;
         assert_eq!(outcome.mode, AiMode::Deterministic);
@@ -6375,6 +6491,33 @@ mod tests {
     }
 
     #[test]
+    fn cli_tool_round_lifts_text_and_drops_error_envelopes() {
+        // The read-only loop's CLI round: a brain's tool-call JSON wrapped in the result envelope
+        // is lifted out with no scaffolding leak, so interpret_reply sees only the inner text.
+        let inner = r#"{\"tool\":\"get_task\",\"args\":{\"task_id\":\"task_0001\"}}"#;
+        let stdout = format!(r#"{{"type":"result","is_error":false,"result":"{inner}","session_id":"abc"}}"#);
+        let text = lift_cli_tool_text(&stdout, relux_core::AdapterKind::ClaudeCli)
+            .expect("a valid envelope yields the inner tool-call text");
+        assert!(text.contains("get_task") && text.contains("task_0001"));
+        assert!(!text.contains("session_id") && !text.contains("\"type\""));
+        // The lifted text feeds the SAME validator the loop uses → a real allowlisted call.
+        assert!(matches!(
+            relux_kernel::interpret_reply(&text),
+            relux_kernel::BrainTurn::Call(_)
+        ));
+        // An error envelope is dropped (the loop round ends; the raw error never leaks).
+        let err = r#"{"type":"result","is_error":true,"result":"rate limited"}"#;
+        assert!(lift_cli_tool_text(err, relux_core::AdapterKind::ClaudeCli).is_none());
+        // Codex text mode emits the JSON as raw prose (no envelope) — still lifted.
+        let raw = r#"{"done": true}"#;
+        let text = lift_cli_tool_text(raw, relux_core::AdapterKind::CodexCli).expect("raw prose lifts");
+        assert!(matches!(
+            relux_kernel::interpret_reply(&text),
+            relux_kernel::BrainTurn::Done
+        ));
+    }
+
+    #[test]
     fn cli_polish_rejects_error_envelope() {
         // An envelope reporting an error is never used as a polish, even though it
         // might contain JSON-looking text.
@@ -6451,6 +6594,7 @@ mod tests {
             admin_slots: None,
             assign_slots: None,
             update: None,
+            context_reads: vec![],
         };
         let wire = serde_json::to_value(&turn).expect("PrimeTurn serializes");
         assert!(

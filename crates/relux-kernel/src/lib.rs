@@ -33,6 +33,7 @@ pub mod prime_clarify_memory;
 pub mod prime_decision;
 pub mod prime_intent;
 pub mod prime_slots;
+pub mod prime_tools;
 pub mod prime_update_slots;
 pub mod runtime;
 pub mod state;
@@ -44,8 +45,8 @@ pub use adapter::{
     AdapterRunOutcome,
 };
 pub use ai::{
-    classify_intent_via_openrouter, clear_stored_config, compose_chat_prompt, compose_polish_prompt,
-    decide_prime_via_openrouter,
+    classify_intent_via_openrouter, clear_stored_config, complete_tool_round, compose_chat_prompt,
+    compose_polish_prompt, decide_prime_via_openrouter, grounded_facts_with_observations,
     extract_agent_slots_via_openrouter, extract_assign_slots_via_openrouter,
     extract_permission_slots_via_openrouter,
     extract_plugin_ref_via_openrouter, extract_task_slots_via_openrouter,
@@ -100,6 +101,11 @@ pub use prime_assign_slots::{
 pub use prime_slots::{
     build_task_slots_prompt, parse_task_slots, reconcile_task_slots, BrainTaskSlots,
     ResolvedTaskSlots,
+};
+pub use prime_tools::{
+    build_tools_prompt, classify_tool, execute_context_tool, interpret_reply, reads_to_wire,
+    render_observations, run_context_loop, turn_wants_context, BrainTurn, ContextLoop, ContextRead,
+    ContextSnapshot, ContextTool, ToolCall, ToolKind, MAX_TOOL_ROUNDS, READ_ONLY_TOOLS,
 };
 pub use prime_update_slots::{
     build_update_slots_prompt, deterministic_update, parse_settable_status, parse_update_slots,

@@ -3413,6 +3413,70 @@ impl KernelState {
         }
     }
 
+    /// Take an owned, bounded read-only snapshot of the control-plane state the governed
+    /// read-only context tools ([`crate::prime_tools`]) read from. Built ONCE under the kernel
+    /// lock so the (slow) brain rounds of the tool loop run OUTSIDE the lock and the executors
+    /// stay pure over the snapshot.
+    ///
+    /// Mirrors [`Self::inspect_state`]'s grounding view (the whole board, sorted by id for a
+    /// deterministic order), projected to the compact views Prime speaks about. Bounded by
+    /// [`MAX_SNAPSHOT_ITEMS`] per collection so a large board cannot blow up the clone; the list
+    /// tools further bound what they render. Reads only — it mutates nothing and fabricates
+    /// nothing.
+    pub fn context_snapshot(&self, _ctx: &PrimeContext) -> crate::prime_tools::ContextSnapshot {
+        let summary = self.inspect_state();
+
+        let mut tasks: Vec<&Task> = self.tasks.values().collect();
+        tasks.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+        let tasks: Vec<crate::prime_tools::TaskView> = tasks
+            .into_iter()
+            .take(MAX_SNAPSHOT_ITEMS)
+            .map(|t| crate::prime_tools::TaskView {
+                id: t.id.0.clone(),
+                title: t.title.clone(),
+                status: t.status.clone(),
+                assignee: t.assigned_agent.as_ref().map(|a| a.0.clone()),
+                priority: t.priority,
+                detail: task_detail_line(&t.input),
+            })
+            .collect();
+
+        let mut agents: Vec<&Agent> = self.agents.values().collect();
+        agents.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+        let agents: Vec<crate::prime_tools::AgentView> = agents
+            .into_iter()
+            .take(MAX_SNAPSHOT_ITEMS)
+            .map(|a| crate::prime_tools::AgentView {
+                id: a.id.0.clone(),
+                name: a.name.clone(),
+                role: a.description.clone(),
+                adapter: a.adapter_plugin.0.clone(),
+                persona: a.persona.clone(),
+            })
+            .collect();
+
+        let mut runs: Vec<&Run> = self.runs.values().collect();
+        runs.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+        let runs: Vec<crate::prime_tools::RunView> = runs
+            .into_iter()
+            .rev()
+            .take(MAX_SNAPSHOT_ITEMS)
+            .map(|r| crate::prime_tools::RunView {
+                id: r.id.0.clone(),
+                task_id: r.task_id.0.clone(),
+                agent_id: r.agent_id.0.clone(),
+                status: run_status_label(&r.status),
+            })
+            .collect();
+
+        crate::prime_tools::ContextSnapshot {
+            summary,
+            tasks,
+            agents,
+            runs,
+        }
+    }
+
     /// Handle one user message as Prime (`docs/RELUX_MASTER_PLAN.md` section 10, section 16).
     ///
     /// The flow is: inspect state -> classify intent -> decide a grounded plan ->
@@ -3690,6 +3754,7 @@ impl KernelState {
                 admin_slots: None,
                 assign_slots: None,
                 update: None,
+                context_reads: vec![],
             },
             PrimePlan::Clarify { text } => PrimeTurn {
                 intent,
@@ -3710,6 +3775,7 @@ impl KernelState {
                 admin_slots: None,
                 assign_slots: None,
                 update: None,
+                context_reads: vec![],
             },
             PrimePlan::Act { action, text } => {
                 // Brain-assisted slot sharpening (validated): a create action takes
@@ -3789,6 +3855,7 @@ impl KernelState {
                     admin_slots,
                     assign_slots: None,
                     update: None,
+                    context_reads: vec![],
                 }
             }
         };
@@ -3900,6 +3967,7 @@ impl KernelState {
             admin_slots: None,
             assign_slots: None,
             update: None,
+            context_reads: vec![],
         }
     }
 
@@ -4007,6 +4075,7 @@ impl KernelState {
             admin_slots: None,
             assign_slots: None,
             update: None,
+            context_reads: vec![],
         }
     }
 
@@ -4085,6 +4154,7 @@ impl KernelState {
                     admin_slots: None,
                     assign_slots: None,
                     update: None,
+                    context_reads: vec![],
                 })
             }
             PrimeAction::CreateAndRunTask { title } => {
@@ -4151,6 +4221,7 @@ impl KernelState {
                     admin_slots: None,
                     assign_slots: None,
                     update: None,
+                    context_reads: vec![],
                 })
             }
             PrimeAction::StartRun { task_id } => {
@@ -4179,6 +4250,7 @@ impl KernelState {
                     admin_slots: None,
                     assign_slots: None,
                     update: None,
+                    context_reads: vec![],
                 })
             }
             PrimeAction::CreateAgent {
@@ -4251,6 +4323,7 @@ impl KernelState {
                     admin_slots: None,
                     assign_slots: None,
                     update: None,
+                    context_reads: vec![],
                 })
             }
             PrimeAction::AssignTask { task_id, agent_id } => {
@@ -4277,6 +4350,7 @@ impl KernelState {
                     admin_slots: None,
                     assign_slots: None,
                     update: None,
+                    context_reads: vec![],
                 })
             }
             PrimeAction::UpdateTask { task_id, patch } => {
@@ -4419,6 +4493,7 @@ impl KernelState {
                         changes: applied,
                         source: None,
                     }),
+                    context_reads: vec![],
                 })
             }
             PrimeAction::DiscoverTools => {
@@ -4449,6 +4524,7 @@ impl KernelState {
                     admin_slots: None,
                     assign_slots: None,
                     update: None,
+                    context_reads: vec![],
                 })
             }
             PrimeAction::InvokeTool {
@@ -4481,6 +4557,7 @@ impl KernelState {
                         admin_slots: None,
                         assign_slots: None,
                         update: None,
+                        context_reads: vec![],
                     })
                 }
                 Err(KernelError::OrchestrationNotMultiAgent) => Ok(PrimeTurn {
@@ -4502,6 +4579,7 @@ impl KernelState {
                     admin_slots: None,
                     assign_slots: None,
                     update: None,
+                    context_reads: vec![],
                 }),
                 Err(e) => Err(e),
             },
@@ -4527,6 +4605,7 @@ impl KernelState {
                 admin_slots: None,
                 assign_slots: None,
                 update: None,
+                context_reads: vec![],
             }),
         }
     }
@@ -4591,6 +4670,7 @@ impl KernelState {
                 admin_slots: None,
                 assign_slots: None,
                 update: None,
+                context_reads: vec![],
             }
         };
 
@@ -6222,6 +6302,49 @@ fn task_brief(t: &Task) -> TaskBrief {
     }
 }
 
+/// Per-collection cap on a [`KernelState::context_snapshot`], bounding the clone so a large board
+/// cannot blow up memory. The read-only list tools further bound what they render.
+const MAX_SNAPSHOT_ITEMS: usize = 100;
+
+/// Lift a short, sanitized one-line human detail from a task's `input` JSON for the read-only
+/// `get_task` tool, or `None` when there is no readable detail. NEVER returns the raw JSON: a
+/// string input is taken directly, an object is probed for the common human-text keys, and the
+/// result is control-char-stripped, whitespace-collapsed, and length-bounded. Pure.
+fn task_detail_line(input: &serde_json::Value) -> Option<String> {
+    const MAX_DETAIL_CHARS: usize = 240;
+    let raw = match input {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Object(map) => ["description", "details", "goal", "prompt", "summary"]
+            .iter()
+            .find_map(|k| map.get(*k).and_then(|v| v.as_str()).map(|s| s.to_string())),
+        _ => None,
+    }?;
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(MAX_DETAIL_CHARS)
+        .collect();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+/// The `snake_case` wire label for a run status (matching the serialized form), for the read-only
+/// `list_runs` tool. Pure.
+fn run_status_label(status: &RunStatus) -> String {
+    serde_json::to_value(status)
+        .ok()
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 /// Attach the one-click next-step buttons the chat surface renders for a turn
 /// (`docs/RELUX_MASTER_PLAN.md` §11.1 "Prime suggested next actions").
 ///
@@ -7413,6 +7536,52 @@ mod tests {
             format!("examples/relux-plugins/{id}"),
             true,
         );
+    }
+
+    // --- Read-only context tool loop -------------------------------------------
+    //
+    // (`docs/prime-processing-audit.md` "Read-only tool loop"). The kernel takes a bounded,
+    // read-only snapshot of live state; the pure executors read it and fabricate nothing.
+
+    #[test]
+    fn context_snapshot_feeds_the_read_only_tools_end_to_end() {
+        use crate::prime_tools::{execute_context_tool, ToolCall};
+        let (mut k, ctx) = prime_chat_kernel();
+        add_agent(&mut k, &ctx, "researcher");
+        let created = k
+            .prime_turn(&ctx, "create a task to summarize the README")
+            .unwrap();
+        let task_id = created.created_task.expect("a task was created").0;
+
+        // The snapshot reflects the live board.
+        let snap = k.context_snapshot(&ctx);
+        assert!(snap.tasks.iter().any(|t| t.id == task_id));
+        assert!(snap.agents.iter().any(|a| a.id == "researcher"));
+        assert!(snap.agents.iter().any(|a| a.id == "prime"));
+
+        // board_summary reads the real counts.
+        let r = execute_context_tool(
+            &snap,
+            &ToolCall { tool: "board_summary".to_string(), args: Default::default() },
+        );
+        assert!(r.ok && r.detail.contains("tasks_total="));
+
+        // get_task by the real id hits; an unknown id is an HONEST miss, never fabricated.
+        let mut args = serde_json::Map::new();
+        args.insert("task_id".to_string(), task_id.clone().into());
+        let r = execute_context_tool(&snap, &ToolCall { tool: "get_task".to_string(), args });
+        assert!(r.ok && r.summary.contains(&task_id));
+
+        let mut args = serde_json::Map::new();
+        args.insert("task_id".to_string(), "task_9999".into());
+        let r = execute_context_tool(&snap, &ToolCall { tool: "get_task".to_string(), args });
+        assert!(!r.ok && r.detail.contains("does not exist"));
+
+        // get_agent reads the roster.
+        let mut args = serde_json::Map::new();
+        args.insert("agent_id".to_string(), "researcher".into());
+        let r = execute_context_tool(&snap, &ToolCall { tool: "get_agent".to_string(), args });
+        assert!(r.ok && r.summary.contains("researcher"));
     }
 
     // --- Multi-turn clarification memory ----------------------------------------

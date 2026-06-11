@@ -890,6 +890,70 @@ brainstorm_chokepoint`, `a_reply_that_claims_a_completed_action_is_rejected`,
 (`cli_decision_carries_reply_and_plan_polish_through_the_no_leak_seam`). No test calls a real
 provider.
 
+## Applied change (the first safe Prime tool loop — READ-ONLY context tools)
+
+Every brain stage above is *propose-only* and answers from ONE static `StateSummary` snapshot baked
+into the prompt: the brain could not drill into a specific task, inspect a run, or enumerate the
+crew before answering. That is the gap §10.1/§17.1 names — Prime "does not inspect live
+control-plane state through a governed tool interface before answering the way Hermes/Codex/
+Paperclip-like agents do". Per master plan §10.1 (Intent Layer), §10.2 (Action Layer), §17.1, and
+following the reference read recorded in `reference-driven-development.md` (Hermes `run_conversation`
+bounded loop + tool-NAME allowlist validation + `"Tool '…' does not exist. Available: …"`
+self-correction + result injection; openclaw `isMutatingToolCall` fail-closed read-only/mutating
+gate, `common.ts` required-string/`ToolInputError`, `cli-output`/`balanced-json` parse-only-the-
+object), Prime now has the FIRST safe rung: a bounded, governed loop over **read-only context
+tools**.
+
+- **New module `relux-kernel/src/prime_tools.rs`** (pure, provider-free). `READ_ONLY_TOOLS` is the
+  explicit allowlist (`board_summary`, `list_tasks`, `get_task`, `list_agents`, `get_agent`,
+  `list_runs`); `classify_tool` is the FAIL-CLOSED gate (anything not on the allowlist is
+  `Refused`, never executed — the first slice ships read-only tools only, so the allowlist IS the
+  read-only set). `interpret_reply` lifts the brain's `{"tool":..,"args":..}` via the shared
+  balanced-brace scanner and validates the name; an off-list name becomes `UnknownTool` (fed back
+  via `unknown_tool_feedback`, Hermes's self-correction), a `{"done":true}`/no-tool reply ends the
+  loop. `execute_context_tool(snapshot, call)` is a PURE read of a `ContextSnapshot` — a missing id
+  is an honest `ok:false` ("does not exist"), never a fabricated record; lists are bounded and every
+  result is length-clamped. `ContextLoop` is the bounded driver (`MAX_TOOL_ROUNDS`, stop-on-repeat);
+  the async drivers and the synchronous `run_context_loop` test twin share the SAME stepper.
+- **New `KernelState::context_snapshot(&ctx)`** (`state.rs`) takes an owned, bounded read-only
+  projection of the live board (tasks/agents/runs, mirroring `inspect_state`'s view) ONCE under the
+  kernel lock, so the loop's brain rounds run OUTSIDE the lock and the executors stay pure.
+- **New wire type `relux_core::PrimeContextRead`** + `PrimeTurn.context_reads: Vec<…>`
+  (`skip_serializing_if = "Vec::is_empty"`, so the wire is byte-for-byte unchanged on every turn
+  that consulted no tool). Provenance only: tool name + an honest `ok` flag + a short summary; the
+  full result bodies stay server-side grounding and never ship.
+- **All three brains drive the loop** through the SAME stepper. OpenRouter via
+  `ai::complete_tool_round`; the Claude/Codex CLI brains via `server.rs` `cli_brain_tool_round` →
+  the no-leak `lift_cli_tool_text` (`parse_adapter_result` FIRST, error envelope dropped). `Local`
+  (no brain) gathers nothing.
+- **Wired in `run_prime`** (`server.rs`): the read-only snapshot is taken alongside the board
+  summary under the existing pre-turn lock; for a NON-actionful inspection turn
+  (`turn_wants_context`: `StatusQuestion`/`ExplanationRequest`/`DirectAnswer`/`Brainstorming`) the
+  loop runs OUTSIDE the lock, and the gathered observations are folded into the reply's
+  `grounded_facts` (`grounded_facts_with_observations`) for the existing reply-shaping brain
+  (`shape_reply`/`run_cli_brain`). The gathered reads are surfaced on `PrimeTurn.context_reads`.
+
+Safety invariants (binding): the loop is **read-only and gather-only**. Every tool is a pure read
+of the snapshot; there is no path from `prime_tools` to `prime_execute`, an approval, or any durable
+change. The tool NAME is fail-closed validated against the read-only allowlist before execution (an
+off-list name is refused and self-corrected, never run); the loop is bounded by `MAX_TOOL_ROUNDS`
+and stop-on-repeat; results are length/list-bounded; a missing id is an honest miss, never
+fabricated. The gathered reads only GROUND the existing action-free reply (the brain still authors
+no intent, slot, or action), and the loop runs ONLY on a non-actionful inspection turn under a
+configured brain. `Local` is byte-for-byte the prior reply path. The write-capable tool surface is
+deliberately deferred until this read-only loop is proven.
+
+Pinned by the `prime_tools` unit tests (`classify_is_fail_closed_on_unknown_names`,
+`interpret_detects_calls_unknown_tools_and_done`, `execute_reads_real_state_and_is_honest_about_
+misses`, `list_tasks_honors_an_optional_status_filter`, `get_agent_reads_the_roster`,
+`loop_gathers_validates_and_self_corrects_with_a_scripted_brain`, `loop_is_bounded_by_the_round_cap`,
+`loop_stops_on_a_repeated_call_with_no_progress`, `render_observations_and_wire_projection_are_
+bounded_and_provenance_only`, `no_brain_gathers_nothing`); the kernel integration test
+`context_snapshot_feeds_the_read_only_tools_end_to_end`; the server seam test
+`cli_tool_round_lifts_text_and_drops_error_envelopes` (the no-leak boundary, feeding the SAME
+`interpret_reply`); and the core wire guard `prime_context_read_round_trips_as_bounded_provenance`
+plus the extended omission assertion. No test calls a real provider.
+
 ## Current Prime brain stack
 
 The end-to-end shape of one Prime turn, with the brain strictly additive and the
@@ -942,6 +1006,14 @@ unavailable:
    protected install or grant. Plan previews (`PlanRequest`) remain action-free, and
    orchestration steps stay owned by the deterministic `plan_orchestration` (the brain
    only *polishes* their wording).
+3b. **Read-only context loop** (a NON-actionful inspection/explanation/question turn only) — before
+   the reply is shaped, a configured brain may run the GOVERNED READ-ONLY tool loop
+   (`prime_tools`): it requests an allowlisted read-only tool (`board_summary`/`list_tasks`/
+   `get_task`/`list_agents`/`get_agent`/`list_runs`), the kernel validates the name (off-list ⇒
+   refused + self-corrected, never run), executes it deterministically against a pre-taken state
+   snapshot, injects the result, and loops (bounded by `MAX_TOOL_ROUNDS`, stop-on-repeat). The reads
+   change nothing and only GROUND the reply (folded into `grounded_facts`, surfaced as
+   `context_reads` provenance). `Local` / an actionful turn gathers nothing.
 4. **UI response** — the reply text may be brain-shaped on a conversational turn. A
    **clarify / brainstorm / single-step plan** turn goes through the VALIDATED wording
    path (`prime_clarify`: one schema-checked question / short summary, action claims
@@ -961,6 +1033,27 @@ unavailable:
    next message will be read as the answer.
 
 ## Next recommended slice
+
+The **first safe Prime tool loop** now ships (READ-ONLY context tools): on an inspection/explanation/
+question turn the brain inspects live state (a task, the crew, the runs) through a governed,
+fail-closed, bounded read-only loop before answering. The obvious next rungs build on it:
+
+- **Dashboard provenance for `context_reads`** — the wire field is present and bounded; a compact
+  B&W "🔎 looked at: <tool> · <summary>" chip on the Prime chat (the read-only-tools counterpart of
+  the existing slot/decision chips) would make the inspection visible. Pure presentation; no new
+  authority. (Deferred from this slice to keep it backend-only and avoid a dist rebuild.)
+- **More read-only tools** — `get_run` (a single run's status/summary/error), `list_plugins` /
+  `get_plugin` (installed tools + executable status, reusing `discover_tools`), and `list_approvals`
+  are natural next reads, each a pure projection added to the snapshot + an allowlist entry.
+- **A WRITE-capable tool surface** — the read-only loop is the proving ground for the harder slice:
+  letting the brain *request* a mutating tool that still flows through the existing fail-closed
+  `decide` → `prime_execute` (safe `Act`) / human-approval (`Propose`) path, with `isMutatingToolCall`'s
+  unknown-⇒-mutating default as the gate. This must NOT bypass the action-free wall — it is a real
+  design slice, not a flag flip, and stays deferred until the read-only loop is proven in use.
+- **Read context on the unified decision** — folding the read-only loop INTO the unified
+  `PrimeBrainDecision` call (so the brain inspects, then emits intent+slots+wording with the gathered
+  context in one multi-round envelope) is the coherence win, but a larger change to the decision
+  plumbing; the self-contained inspection loop ships first.
 
 Multi-turn clarification continuation is now smart on four fronts: a **fuzzy assignee** resolves
 against the live roster (deterministic), a **by-id run start** is wired and its clarify is

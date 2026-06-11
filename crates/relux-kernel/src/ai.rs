@@ -591,15 +591,39 @@ naturally."
 /// `message` is the user's original message; `turn` is the deterministic kernel
 /// outcome (already executed). This never mutates kernel state and only ever
 /// reads `turn.reply` as grounded facts for the model to rephrase.
-pub async fn shape_reply(cfg: &AiConfig, message: &str, turn: &PrimeTurn) -> AiOutcome {
+pub async fn shape_reply(
+    cfg: &AiConfig,
+    message: &str,
+    turn: &PrimeTurn,
+    observations: &str,
+) -> AiOutcome {
     match plan_turn(cfg, turn) {
         AiPlan::Deterministic => AiOutcome::deterministic(turn.reply.clone()),
         AiPlan::DeterministicForAction => AiOutcome::deterministic_for_action(turn.reply.clone()),
         AiPlan::Augment => {
-            let messages = build_messages(message, &turn.reply);
+            // Fold the read-only observations the governed tool loop gathered this turn (if
+            // any) into the grounded facts the MODEL sees — never into the deterministic
+            // fallback reply, which stays `turn.reply` on any failure.
+            let facts = grounded_facts_with_observations(&turn.reply, observations);
+            let messages = build_messages(message, &facts);
             let result = request_completion(cfg, messages).await;
             outcome_for_augment(cfg, turn.reply.clone(), result)
         }
+    }
+}
+
+/// Fold the gathered read-only observations into the grounded facts handed to a reply-shaping
+/// brain. With no observations the facts are exactly the deterministic reply (byte-for-byte the
+/// prior behavior); with observations, the brain is told they are factual reads it performed this
+/// turn so it can answer grounded in live state. Pure; never used as the fallback reply.
+pub fn grounded_facts_with_observations(reply: &str, observations: &str) -> String {
+    if observations.trim().is_empty() {
+        reply.to_string()
+    } else {
+        format!(
+            "{reply}\n\nLive read-only observations you gathered this turn (factual reads of the \
+control plane; use them to answer, but you still performed NO action):\n{observations}"
+        )
     }
 }
 
@@ -674,6 +698,15 @@ pub async fn extract_task_slots_via_openrouter(
 /// model text, or `None` on ANY failure (no key, disabled, network error). Shared by
 /// the agent / plugin / permission slot extractors so each is a thin
 /// "build prompt → complete → parse" wrapper, exactly like the task-slot path.
+/// Run ONE round of the read-only context loop through the OpenRouter brain, returning the raw
+/// model text (a tool-call JSON or a `{"done":true}` / final answer), or `None` on ANY failure
+/// (no key, disabled, network error). The loop driver ([`crate::prime_tools::ContextLoop`])
+/// interprets the text; this is just the per-round "prompt → text" primitive. The brain only ever
+/// requests a READ-ONLY tool the kernel validates and executes — it changes nothing.
+pub async fn complete_tool_round(cfg: &AiConfig, prompt: String) -> Option<String> {
+    complete_json_only(cfg, prompt).await
+}
+
 async fn complete_json_only(cfg: &AiConfig, prompt: String) -> Option<String> {
     if !cfg.enabled() || cfg.api_key.is_none() {
         return None;
@@ -1336,6 +1369,7 @@ mod tests {
             admin_slots: None,
             assign_slots: None,
             update: None,
+            context_reads: vec![],
         }
     }
 
