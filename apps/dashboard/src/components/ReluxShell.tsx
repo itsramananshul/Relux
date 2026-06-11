@@ -3,7 +3,7 @@ import { NavLink, useLocation } from "react-router-dom";
 import { useAuth } from "../auth";
 import { AccountPanel } from "./AccountPanel";
 import { session, type SessionMetaResponse } from "../api";
-import { sessionWarning, type SessionWarning } from "../account";
+import { sessionWarning, elapsedSince, type SessionWarning } from "../account";
 
 // The standalone Relux product shell (RELUX_MASTER_PLAN section 11 Dashboard,
 // section 21 Final Product Feeling). This is what relux-kernel serves at /dashboard:
@@ -161,7 +161,7 @@ export function ReluxShell({ children }: { children: ReactNode }) {
     return () => clearInterval(id);
   }, [hasWindows]);
 
-  const elapsedSecs = sessionMeta ? Math.max(0, Math.floor((nowMs - anchorMs.current) / 1000)) : 0;
+  const elapsedSecs = sessionMeta ? elapsedSince(anchorMs.current, nowMs) : 0;
   const warn = sessionMeta ? sessionWarning(sessionMeta, elapsedSecs) : null;
 
   return (

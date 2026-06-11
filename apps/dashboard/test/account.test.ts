@@ -4,6 +4,7 @@ import {
   MIN_PASSWORD_LEN,
   validatePasswordChange,
   formatDuration,
+  elapsedSince,
   idleRemaining,
   absoluteRemaining,
   describeIdlePolicy,
@@ -99,6 +100,70 @@ test("policy descriptions read in friendly form, or null when absent", () => {
   const bare: SessionMeta = { username: "ops" };
   assert.equal(describeIdlePolicy(bare), null);
   assert.equal(describeAbsolutePolicy(bare), null);
+});
+
+// ── Local countdown / re-anchor (the basis the UI ticks on) ──────────────
+// The shell chip and the Account panel both turn a wall-clock anchor (the
+// instant /v1/auth/me was fetched) plus the current per-minute tick into the
+// `elapsedSecs` the remaining/warning helpers consume (RELUX_MASTER_PLAN "Local
+// operator login v1"). `elapsedSince` is exactly the conversion both components
+// run inline (ReluxShell.tsx / AccountPanel.tsx). These pin it and the two
+// transitions the UI leans on between fetches: a countdown crossing a warning
+// threshold with no fresh round trip, and a re-anchor on fresh metadata
+// resetting the basis to 0 against the new deadlines.
+// NB: instants are fixed literals (not Date.now()) to keep the simulation
+// deterministic — the helper only ever sees the millisecond delta.
+
+test("elapsedSince is whole seconds between two instants, clamped at 0", () => {
+  const t0 = 1_000_000; // arbitrary fixed anchor (ms)
+  assert.equal(elapsedSince(t0, t0), 0);
+  assert.equal(elapsedSince(t0, t0 + 60_000), 60);
+  // Floors sub-second slop (1.999s → 1s), never rounds up.
+  assert.equal(elapsedSince(t0, t0 + 1_999), 1);
+  // A backward clock step never yields a negative countdown.
+  assert.equal(elapsedSince(t0, t0 - 5_000), 0);
+});
+
+test("a local tick crosses the warning threshold with no fresh fetch", () => {
+  // Fetched with the absolute ceiling 35 min out — just outside the 30-min
+  // window, so the chip is hidden at the fetch instant.
+  const fetchedMs = 5_000_000;
+  const meta: SessionMeta = { username: "ops", absolute_expires_in_secs: 35 * 60 };
+  assert.equal(sessionWarning(meta, elapsedSince(fetchedMs, fetchedMs)), null);
+  // Six minutes of local ticks later (no new /me): 29 min left → the chip fires,
+  // driven purely by the elapsed delta, exactly as the topbar does between fetches.
+  const sixMinLater = fetchedMs + 6 * 60_000;
+  const w = sessionWarning(meta, elapsedSince(fetchedMs, sixMinLater));
+  assert.equal(w?.kind, "absolute");
+  assert.equal(w?.secsLeft, 29 * 60);
+});
+
+test("re-anchoring on fresh /me resets the basis against the new deadlines", () => {
+  // The idle window is closing; the local countdown already has it warning.
+  const fetchedMs = 9_000_000;
+  const stale: SessionMeta = { username: "ops", idle_expires_in_secs: 9 * 60 };
+  const driftedMs = fetchedMs + 4 * 60_000; // 4 min of ticks → 5 min left
+  assert.equal(sessionWarning(stale, elapsedSince(fetchedMs, driftedMs))?.kind, "idle");
+  // The operator acted (sliding idle forward); the Account panel closes and the
+  // shell re-fetches. Re-anchoring is a NEW fetch instant + the fresh metadata,
+  // so elapsed resets to 0 and the countdown now follows the fresh 12h deadline.
+  const reanchorMs = driftedMs; // the fresh /me lands "now"
+  const fresh: SessionMeta = { username: "ops", idle_expires_in_secs: 12 * 3600 };
+  assert.equal(elapsedSince(reanchorMs, reanchorMs), 0);
+  assert.equal(sessionWarning(fresh, elapsedSince(reanchorMs, reanchorMs)), null);
+});
+
+test("re-anchoring clears the re-auth callout once the ceiling moves out", () => {
+  // The absolute ceiling is inside its window, so the Account re-auth path is
+  // emphasised at the fetch instant.
+  const fetchedMs = 2_000_000;
+  const nearCeiling: SessionMeta = { username: "ops", absolute_expires_in_secs: 20 * 60 };
+  assert.ok(reauthCallout(nearCeiling, elapsedSince(fetchedMs, fetchedMs)));
+  // A fresh sign-in pushes the (non-sliding) ceiling back to 7d; the re-fetch
+  // re-anchors, so elapsed is 0 and the callout goes quiet again.
+  const reanchorMs = fetchedMs + 90_000;
+  const renewed: SessionMeta = { username: "ops", absolute_expires_in_secs: 7 * 86400 };
+  assert.equal(reauthCallout(renewed, elapsedSince(reanchorMs, reanchorMs)), null);
 });
 
 // ── Passive session-expiry warning (shell chip) ──────────────────────────

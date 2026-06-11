@@ -5,6 +5,7 @@ import {
   MIN_PASSWORD_LEN,
   validatePasswordChange,
   formatDuration,
+  elapsedSince,
   idleRemaining,
   absoluteRemaining,
   describeIdlePolicy,
@@ -139,7 +140,7 @@ export function AccountPanel({ who, onClose }: { who: string; onClose: () => voi
     return () => clearInterval(id);
   }, [hasCountdown]);
 
-  const elapsedSecs = meta ? Math.max(0, Math.floor((nowMs - anchorMs.current) / 1000)) : 0;
+  const elapsedSecs = meta ? elapsedSince(anchorMs.current, nowMs) : 0;
   const idleLeft = meta ? idleRemaining(meta, elapsedSecs) : null;
   const absLeft = meta ? absoluteRemaining(meta, elapsedSecs) : null;
   const idlePolicy = meta ? describeIdlePolicy(meta) : null;

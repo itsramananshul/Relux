@@ -79,6 +79,20 @@ export function formatDuration(totalSecs: number): string {
   return parts.slice(0, 2).join(" ");
 }
 
+// Whole seconds elapsed between two wall-clock instants (milliseconds): the
+// fetch anchor (when /v1/auth/me was last read) and "now". This is the single
+// conversion the shell chip and the Account panel use to turn their per-minute
+// tick into the `elapsedSecs` the remaining/warning helpers expect, so the
+// countdown advances locally between sparse fetches. Floors to whole seconds
+// (a 1.9s gap is 1s elapsed, never rounded up) and clamps ≥0 so a clock that
+// briefly steps backwards — or a "now" sampled just before the anchor — never
+// yields a negative countdown. Re-anchoring on a fresh /v1/auth/me is just
+// moving `anchorMs` to the new fetch instant: elapsed resets to 0 and the
+// countdown then follows the fresh deadlines.
+export function elapsedSince(anchorMs: number, nowMs: number): number {
+  return Math.max(0, Math.floor((nowMs - anchorMs) / 1000));
+}
+
 // The seconds remaining on the idle window right now, given the metadata and how
 // many seconds have elapsed locally since it was fetched. Anchored on the
 // kernel-computed `idle_expires_in_secs` (skew-free) and decremented by the local
