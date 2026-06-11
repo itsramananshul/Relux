@@ -490,6 +490,10 @@ fn protected_router() -> Router<AppState> {
             "/v1/relux/agents/:id/permissions",
             post(grant_agent_permission).delete(revoke_agent_permission),
         )
+        .route(
+            "/v1/relux/agents/:id/manager-grant",
+            post(manager_grant_to_subordinate),
+        )
 }
 
 /// Whether the dev/test auth bypass is requested via `RELUX_AUTH_DISABLED`.
@@ -1535,6 +1539,62 @@ async fn revoke_agent_permission(
         let agent = kernel
             .agent(&agent_id)
             .ok_or_else(|| KernelError::UnknownAgent(agent_id.to_string()))?;
+        Ok(AgentPermissionsRecord {
+            agent_id: agent.id.to_string(),
+            permissions: agent.permissions.iter().map(|p| p.to_string()).collect(),
+        })
+    })?;
+    Ok(Json(updated))
+}
+
+#[derive(Debug, Deserialize)]
+struct ManagerGrantReq {
+    target_id: String,
+    permission: String,
+}
+
+/// `POST /v1/relux/agents/:id/manager-grant` — the operator-assisted manager-subtree
+/// grant. `:id` is the **acting manager**; the body names a `target_id` subordinate and
+/// the `permission` to grant. The manager grants the capability to one of its own-Branch
+/// operatives, gated by the real `agent:<manager>:subtree:grant_permission` scope it
+/// holds (own-Branch + Active + scope — see
+/// [`relux_kernel::KernelState::manager_grant_permission_to_subordinate`]).
+///
+/// HONEST trust boundary (documented in `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §19): Relux
+/// has **no per-agent auth identity** yet — a manager agent cannot present its own
+/// credential. So the authenticated dashboard **operator** explicitly authorizes "grant
+/// as this manager"; the operator is named in the audit. The operator can NOT bypass the
+/// manager-subtree rule — an unauthorized manager (no scope / not Active / target outside
+/// its Branch) is a `403` and grants nothing, exactly as for a real agent actor. The only
+/// thing the operator supplies is the *request*; authority is still the manager's.
+///
+/// A malformed permission string is an honest `400`. An unauthorized manager (or unknown
+/// manager/target, since existence is folded into the fail-closed authority check) is a
+/// `403`. On success it returns the **target's** updated explicit permission list.
+async fn manager_grant_to_subordinate(
+    State(state): State<AppState>,
+    AxumPath(manager_id_str): AxumPath<String>,
+    headers: header::HeaderMap,
+    Json(req): Json<ManagerGrantReq>,
+) -> Result<Json<AgentPermissionsRecord>, ApiError> {
+    let manager_id = relux_core::AgentId::new(manager_id_str);
+    let target_id = relux_core::AgentId::new(req.target_id);
+    let permission = relux_core::Permission::new(&req.permission)
+        .map_err(|e| ApiError::bad_request(format!("invalid permission string: {e}")))?;
+    // The authenticated operator who stands in for the manager (the dev/test bypass has
+    // no session, so it is attributed to the generic "operator").
+    let operator = session_user(&state, &headers).unwrap_or_else(|| "operator".to_string());
+
+    let updated = locked_save(&state, |kernel| {
+        kernel.manager_grant_permission_to_subordinate_as_operator(
+            &operator,
+            &manager_id,
+            &target_id,
+            permission,
+        )?;
+        let agent = kernel
+            .agent(&target_id)
+            .ok_or_else(|| KernelError::UnknownAgent(target_id.to_string()))?;
         Ok(AgentPermissionsRecord {
             agent_id: agent.id.to_string(),
             permissions: agent.permissions.iter().map(|p| p.to_string()).collect(),
@@ -8060,6 +8120,123 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// The operator-assisted manager-subtree grant over HTTP
+    /// (`POST /v1/relux/agents/:id/manager-grant`). Exercises the real authority gate
+    /// end-to-end: a live manager with the subtree scope reaches its own-Branch
+    /// subordinate (200); a sibling target, a manager with no scope, and a paused
+    /// manager are all 403; a malformed permission is a 400; and both the success and a
+    /// denial land in the audit log under `operator:authorize_manager_grant`.
+    #[tokio::test]
+    async fn manager_grant_to_subordinate_over_http_enforces_authority_and_audits() {
+        let (state, _dir) = auth_state(true);
+
+        // Build the topology director <- lead <- ic ; peer reports to director (a
+        // sibling of lead). Each create supplies an explicit id + Lead.
+        for (id, reports_to) in [
+            ("director", None),
+            ("lead", Some("director")),
+            ("ic", Some("lead")),
+            ("peer", Some("director")),
+        ] {
+            let body = match reports_to {
+                Some(r) => format!(r#"{{"id":"{id}","name":"{id}","reports_to":"{r}"}}"#),
+                None => format!(r#"{{"id":"{id}","name":"{id}"}}"#),
+            };
+            let (status, _, b) =
+                call(&state, "POST", "/v1/relux/agents", None, Some(&body)).await;
+            assert_eq!(status, StatusCode::OK, "create {id} failed: {b}");
+        }
+
+        // Grant the lead its manager-subtree scope through the ordinary operator path.
+        let (status, _, b) = call(
+            &state,
+            "POST",
+            "/v1/relux/agents/lead/permissions",
+            None,
+            Some(r#"{"permission":"agent:lead:subtree:grant_permission"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "scope grant failed: {b}");
+
+        let perm = r#""permission":"tool:relux-tools-github:create_pr""#;
+
+        // (1) SUCCESS: lead grants to its real subordinate ic; ic's list grows.
+        let (status, _, b) = call(
+            &state,
+            "POST",
+            "/v1/relux/agents/lead/manager-grant",
+            None,
+            Some(&format!(r#"{{"target_id":"ic",{perm}}}"#)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "manager grant to subordinate failed: {b}");
+        assert!(b.contains("tool:relux-tools-github:create_pr"), "ic should now hold it: {b}");
+
+        // (2) SIBLING denial: ic's lead cannot reach peer (lead's sibling).
+        let (status, _, _) = call(
+            &state,
+            "POST",
+            "/v1/relux/agents/lead/manager-grant",
+            None,
+            Some(&format!(r#"{{"target_id":"peer",{perm}}}"#)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "sibling target must be denied");
+
+        // (3) NO-SCOPE denial: director has a real subordinate (lead) but holds no
+        // subtree scope, so it cannot grant.
+        let (status, _, _) = call(
+            &state,
+            "POST",
+            "/v1/relux/agents/director/manager-grant",
+            None,
+            Some(&format!(r#"{{"target_id":"lead",{perm}}}"#)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "manager without scope must be denied");
+
+        // (4) MALFORMED permission: rejected (400) before any authority check.
+        let (status, _, _) = call(
+            &state,
+            "POST",
+            "/v1/relux/agents/lead/manager-grant",
+            None,
+            Some(r#"{"target_id":"ic","permission":"not-a-valid-prefix"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "malformed permission must be 400");
+
+        // (5) PAUSED manager denial: a non-Active manager wields no subtree authority.
+        let (status, _, b) = call(
+            &state,
+            "PATCH",
+            "/v1/relux/agents/lead",
+            None,
+            Some(r#"{"status":"paused"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "pause lead failed: {b}");
+        let (status, _, _) = call(
+            &state,
+            "POST",
+            "/v1/relux/agents/lead/manager-grant",
+            None,
+            Some(&format!(r#"{{"target_id":"ic",{perm}}}"#)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "paused manager must be denied");
+
+        // (6) AUDIT: both a Success and a Denied operator-attribution row are present.
+        let (status, _, audit) =
+            call(&state, "GET", "/v1/relux/audit?limit=500", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            audit.contains("operator:authorize_manager_grant"),
+            "operator attribution audit missing: {audit}"
+        );
+        assert!(audit.contains("\"trust_boundary\""), "trust-boundary detail missing: {audit}");
     }
 
     #[tokio::test]

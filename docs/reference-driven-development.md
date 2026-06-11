@@ -2364,11 +2364,14 @@ permission to a subordinate). Audit ref: `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §
 | **scope membership decided by the bounded walk** (`scopeAllows` + `agentIsInSubtree`) | `relux_core::permission::manager_subtree_authorizes(grant, holder, action, target, reports_to)` = well-formed grant AND grant's manager == holder AND action matches AND `is_in_subtree(holder, target)`. Self/sibling/ancestor/unrelated all fail; total on a cyclic map. |
 | **deny-by-default + a node reaches only its own subtree** (openclaw) | `KernelState::manager_grant_permission_to_subordinate` — the one real path: a manager grants a permission to a subordinate iff the kernel chokepoint `manager_subtree_authorizes` says yes. Layers a fail-closed **liveness** rule (only an `Active` manager wields authority). Denials audited; grants nothing on failure. |
 | **the operator path is not widened** | Operator-console `grant_permission_to_agent`/`revoke` stay kernel actions with no actor gate; the manager-grant path is strictly *narrower* (own Branch, `grant_permission` action only, live only). Revoke still `matches_exact` — a subtree grant is one explicit, revocable row. |
+| **a permission request is routed to a human authorizer** (openclaw `permission-relay.ts` — a request is relayed to a human who picks allow/deny; authority correlated to a real per-session `sessionKey`/`spawnedBy` in `session-lineage-meta.ts`) | `POST /v1/relux/agents/:id/manager-grant` → `manager_grant_permission_to_subordinate_as_operator(operator, …)`. Relux has no per-agent session identity yet, so the authenticated **operator** stands in for the manager: it supplies the request and is the named, audited authorizer (`operator:authorize_manager_grant` row), but the kernel still enforces the real own-Branch + Active + scope gate — the operator cannot widen what the manager could do. The UI affordance is gated by `governance.ts::managerGrantAvailability` (mirrors the gate; no fake availability). |
 
-**What we deliberately do differently / leave out:** the enforcement primitive + model are real and
-tested, but **no HTTP route / agent-actor surface invokes the manager-grant path yet** — wiring it to a
-request carrying the manager's authenticated identity is the next slice. Only the `grant_permission`
-action is enforced (assign_task / revoke and project/namespace scopes are future). The disabled-manager
-decision is **explicit**: a non-`Active` manager wields no subtree authority (fail-closed), even over a
-genuine subordinate — the place a "disabled-Lead can't act" rule lives, exactly as foreshadowed by the
-§18 lattice slice.
+**What we deliberately do differently / leave out:** the enforcement primitive, model, **and an
+operator-assisted HTTP/UI surface** (`POST /v1/relux/agents/:id/manager-grant` + the Crew "Grant as
+manager" affordance) are now real and tested. The genuinely-remaining gap is a **per-agent-authenticated**
+actor — a manager driving its own grant *without an operator in the loop* — since Relux has no per-agent
+session identity the kernel trusts (openclaw's `sessionKey`/`spawnedBy` analogue). Only the
+`grant_permission` action is enforced (assign_task / revoke and project/namespace scopes are future). The
+disabled-manager decision is **explicit**: a non-`Active` manager wields no subtree authority
+(fail-closed), even over a genuine subordinate — the place a "disabled-Lead can't act" rule lives, exactly
+as foreshadowed by the §18 lattice slice.

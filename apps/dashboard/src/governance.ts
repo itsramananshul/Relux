@@ -139,3 +139,118 @@ export function permissionRisk(permission: string): PermissionRisk {
 export function isElevatedPermission(permission: string): boolean {
   return permissionRisk(permission) === "elevated";
 }
+
+// --- Operator-assisted manager-subtree grant (Crew Governance) ---------------
+//
+// HONEST trust boundary: Relux has no per-agent auth identity yet, so a manager agent
+// cannot authenticate its own request. The Crew Governance panel lets an authenticated
+// OPERATOR authorize "grant as this manager" — the backend still enforces the real
+// own-Branch + Active + scope rule (`POST /v1/relux/agents/:id/manager-grant`), so the
+// operator cannot widen anything the manager itself could not do. These helpers decide
+// when to OFFER that affordance (and explain, honestly, why it is unavailable) — they are
+// a UI gate only; the kernel is the authority and re-checks everything.
+
+/** A minimal agent shape the manager-grant availability check needs. */
+export interface ManagerGrantAgent {
+  id: string;
+  status?: string;
+  permissions?: string[];
+  reports_to?: string;
+}
+
+/** The actions a manager-subtree grant may scope. Today only `grant_permission` has a
+ * real enforcement path (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §19). */
+export const MANAGER_SUBTREE_GRANT_ACTION = "grant_permission";
+
+export interface ManagerGrantAvailability {
+  /** Whether the "Grant as manager" affordance should be offered for this agent. */
+  available: boolean;
+  /** An honest one-line reason when unavailable (empty when available). */
+  reason: string;
+  /** The subordinate ids the manager may grant to (its own-Branch descendants). */
+  targets: string[];
+}
+
+/**
+ * The `<action>`s for which `manager` holds a live `agent:<manager>:subtree:<action>`
+ * scope (own-id only — a grant naming another manager authorizes nothing here, mirroring
+ * the backend's `holder == manager` rule).
+ */
+export function managerSubtreeActions(manager: ManagerGrantAgent): string[] {
+  const out: string[] = [];
+  for (const p of manager.permissions ?? []) {
+    const parts = p.trim().split(":");
+    if (
+      parts.length === 4 &&
+      parts[0] === "agent" &&
+      parts[1] === manager.id &&
+      parts[2] === "subtree" &&
+      SEGMENT_RE.test(parts[3])
+    ) {
+      out.push(parts[3]);
+    }
+  }
+  return out;
+}
+
+/**
+ * Decide whether the operator may be offered the "Grant as manager" affordance for
+ * `manager`, and over which subordinate targets. Mirrors the backend authority gate so
+ * the affordance never appears when the kernel would only 403:
+ *   - the manager must be Active (a paused/disabled manager wields no subtree authority),
+ *   - it must hold a `agent:<manager>:subtree:grant_permission` scope over its OWN Branch,
+ *   - at least one operative must actually sit in that Branch (a proper descendant).
+ * The reason string is the first failing rule, so the UI can explain the unavailability.
+ */
+export function managerGrantAvailability(
+  manager: ManagerGrantAgent,
+  roster: ManagerGrantAgent[],
+): ManagerGrantAvailability {
+  const none = (reason: string): ManagerGrantAvailability => ({
+    available: false,
+    reason,
+    targets: [],
+  });
+  const status = (manager.status ?? "").toLowerCase();
+  if (status && status !== "active") {
+    return none("Only a live (Active) manager can grant to its Branch.");
+  }
+  if (!managerSubtreeActions(manager).includes(MANAGER_SUBTREE_GRANT_ACTION)) {
+    return none(
+      `No manager-subtree grant scope (add agent:${manager.id}:subtree:grant_permission first).`,
+    );
+  }
+  const targets = subordinateIds(manager.id, roster);
+  if (targets.length === 0) {
+    return none("No operatives in this manager's Branch yet.");
+  }
+  return { available: true, reason: "", targets };
+}
+
+/**
+ * The ids that (transitively) report to `rootId` — its Branch, excluding itself. A
+ * bounded walk down the `reports_to` lattice (each id visited once, so it is total even
+ * under a stray cycle). Mirrors `crates/relux-core/src/hierarchy.rs` `is_in_subtree` and
+ * the dashboard `hierarchy.ts` `descendantIds`.
+ */
+function subordinateIds(rootId: string, roster: ManagerGrantAgent[]): string[] {
+  const childrenOf = new Map<string, string[]>();
+  for (const a of roster) {
+    if (a.reports_to) {
+      const list = childrenOf.get(a.reports_to) ?? [];
+      list.push(a.id);
+      childrenOf.set(a.reports_to, list);
+    }
+  }
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const stack = [...(childrenOf.get(rootId) ?? [])];
+  while (stack.length > 0) {
+    const id = stack.pop() as string;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+    for (const child of childrenOf.get(id) ?? []) stack.push(child);
+  }
+  return out;
+}

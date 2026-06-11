@@ -16,6 +16,8 @@ import {
   isManagerSubtree,
   isScopedWildcard,
   permissionInvalidReason,
+  managerGrantAvailability,
+  type ManagerGrantAgent,
 } from "../governance";
 import { parseSkillsInput, formatSkillsInput } from "../skills";
 import { applyPreset, presetFieldsDirty } from "../presets";
@@ -136,6 +138,7 @@ export function Crew() {
                   <GovernanceSection
                     agentId={agent.id}
                     permissions={agent.permissions ?? []}
+                    roster={agents}
                     onChanged={afterChange}
                   />
                 </div>
@@ -562,10 +565,12 @@ function PermissionsList({ permissions }: { permissions: string[] }) {
 function GovernanceSection({
   agentId,
   permissions,
+  roster,
   onChanged,
 }: {
   agentId: string;
   permissions: string[];
+  roster: Agent[];
   onChanged: () => void;
 }) {
   const [newPerm, setNewPerm] = useState("");
@@ -573,6 +578,23 @@ function GovernanceSection({
   const [error, setError] = useState<string | null>(null);
 
   const invalidReason = newPerm.trim() ? permissionInvalidReason(newPerm) : null;
+
+  // Whether to offer the operator-assisted "Grant as manager" affordance for THIS agent
+  // (it holds a live manager-subtree scope over a non-empty Branch). Mirrors the backend
+  // authority gate so the affordance never appears when the kernel would only 403.
+  const thisAgent = useMemo<ManagerGrantAgent>(
+    () => ({
+      id: agentId,
+      status: roster.find((a) => a.id === agentId)?.status,
+      permissions,
+      reports_to: roster.find((a) => a.id === agentId)?.reports_to,
+    }),
+    [agentId, permissions, roster],
+  );
+  const managerGrant = useMemo(
+    () => managerGrantAvailability(thisAgent, roster as ManagerGrantAgent[]),
+    [thisAgent, roster],
+  );
 
   async function grant() {
     const perm = newPerm.trim();
@@ -704,6 +726,135 @@ function GovernanceSection({
           <p className="muted" style={{ fontSize: 11, marginTop: 2 }}>{invalidReason}</p>
         )}
       </div>
+      <ManagerGrantPanel
+        managerId={agentId}
+        available={managerGrant.available}
+        reason={managerGrant.reason}
+        targets={managerGrant.targets}
+        roster={roster}
+        onChanged={onChanged}
+      />
+    </div>
+  );
+}
+
+// The operator-assisted "Grant as manager" affordance. Shown only when THIS agent holds a
+// live manager-subtree `grant_permission` scope over a non-empty Branch (otherwise the
+// honest unavailable reason is shown). The operator authorizes acting AS the manager; the
+// backend (`POST /v1/relux/agents/:id/manager-grant`) still enforces the real own-Branch +
+// Active + scope rule, so this never widens what the manager itself could do. HONEST: no
+// per-agent auth identity yet, so the operator stands in for the manager.
+// docs/HERMES_OPENCLAW_DEEP_AUDIT.md §19.
+function ManagerGrantPanel({
+  managerId,
+  available,
+  reason,
+  targets,
+  roster,
+  onChanged,
+}: {
+  managerId: string;
+  available: boolean;
+  reason: string;
+  targets: string[];
+  roster: Agent[];
+  onChanged: () => void;
+}) {
+  const [target, setTarget] = useState("");
+  const [perm, setPerm] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const nameFor = (id: string): string => {
+    const a = roster.find((r) => r.id === id);
+    return a ? `${a.name} (${a.id})` : id;
+  };
+  const invalidReason = perm.trim() ? permissionInvalidReason(perm) : null;
+
+  async function grantAsManager() {
+    const p = perm.trim();
+    const r = permissionInvalidReason(p);
+    if (r) {
+      setError(r);
+      return;
+    }
+    if (!target) {
+      setError("Choose a subordinate in this manager's Branch.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await reluxWork.managerGrantPermission(managerId, target, p);
+      setPerm("");
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Manager grant failed.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div
+      className="manager-grant-panel"
+      style={{ marginTop: 12, borderTop: "1px dashed var(--border, #2a2a2a)", paddingTop: 10 }}
+    >
+      <h4 style={{ margin: "0 0 4px" }}>Grant as manager</h4>
+      {!available ? (
+        <p className="muted" style={{ fontSize: 12, marginTop: 0 }}>
+          Unavailable — {reason}
+        </p>
+      ) : (
+        <>
+          <p className="muted" style={{ fontSize: 12, marginTop: 0 }}>
+            You authorize acting <strong>as this manager</strong> to grant a capability to one
+            of its own-Branch operatives. The kernel still enforces the manager-subtree rule
+            (own Branch · live · scoped) — you cannot grant where the manager itself could not.
+            <span className="badge" style={{ marginLeft: 6 }}>operator stands in (no per-agent auth yet)</span>
+          </p>
+          {error && <div className="error-message">{error}</div>}
+          <div className="form-group" style={{ marginTop: 6 }}>
+            <label htmlFor={`mg-${managerId}-target`}>Subordinate:</label>
+            <select
+              id={`mg-${managerId}-target`}
+              value={target}
+              onChange={(e) => setTarget(e.target.value)}
+              style={{ width: "100%" }}
+            >
+              <option value="">— choose a Branch operative —</option>
+              {targets.map((id) => (
+                <option key={id} value={id}>{nameFor(id)}</option>
+              ))}
+            </select>
+          </div>
+          <div className="form-group" style={{ marginTop: 6 }}>
+            <label htmlFor={`mg-${managerId}-perm`}>Permission to grant:</label>
+            <div style={{ display: "flex", gap: 8 }}>
+              <input
+                id={`mg-${managerId}-perm`}
+                type="text"
+                className="mono"
+                value={perm}
+                onChange={(e) => setPerm(e.target.value)}
+                placeholder="e.g. tool:relux-tools-github:read"
+                style={{ flex: 1 }}
+              />
+              <button
+                type="button"
+                className="btn sm"
+                onClick={() => void grantAsManager()}
+                disabled={busy || !!invalidReason || !perm.trim() || !target}
+              >
+                {busy ? "…" : "Grant"}
+              </button>
+            </div>
+            {invalidReason && (
+              <p className="muted" style={{ fontSize: 11, marginTop: 2 }}>{invalidReason}</p>
+            )}
+          </div>
+        </>
+      )}
     </div>
   );
 }

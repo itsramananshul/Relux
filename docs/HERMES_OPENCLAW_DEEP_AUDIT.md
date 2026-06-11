@@ -856,7 +856,10 @@ section for the full reference read + applied-change record. In brief:
   `parent_id`/`depth`, flat by default). Relux files read/mapped: `crates/relux-core/src/permission.rs`
   (grammar + matcher), `crates/relux-core/src/hierarchy.rs` (`is_in_subtree`), `crates/relux-core/src/agent.rs`
   (`reports_to`), `crates/relux-kernel/src/state.rs` (`grant_permission_to_agent`/`revoke`,
-  `agent_holds_permission`, `reports_to_map`, `start_run` check), `apps/dashboard/src/governance.ts` +
+  `agent_holds_permission`, `reports_to_map`, `start_run` check), `crates/relux-kernel/src/server.rs`
+  (the `grant_agent_permission`/`revoke_agent_permission` handlers, the `require_session` auth guard +
+  `session_user`, the `list_audit_events` shape — the seam the new `manager-grant` route follows),
+  `apps/dashboard/src/api.ts` (the `reluxWork` grant/revoke client), `apps/dashboard/src/governance.ts` +
   `apps/dashboard/src/pages/Crew.tsx` (the Crew Governance panel).
 
 - **Scoped syntax.** Exactly one new grant shape is accepted: `agent:<manager-id>:subtree:<action>` — a
@@ -888,18 +891,47 @@ section for the full reference read + applied-change record. In brief:
   = `Denied` and grants nothing. It does **not** widen the operator-console grant/revoke path (those stay
   kernel/operator actions with no actor gate) — it adds a strictly *narrower* agent-authority path.
 
-- **Honest scope boundary.** The enforcement primitive + model are real and tested, but **no HTTP route /
-  agent-actor surface invokes `manager_grant_permission_to_subordinate` yet** — wiring it to a request
-  (with the manager's authenticated identity) is the next slice. Exact grants still authorize only
-  themselves; revoke still removes exactly the stored row via `matches_exact` (a manager-subtree grant is
-  one explicit, individually-revocable row).
+- **HTTP/API surface (SHIPPED — operator-assisted).** `POST /v1/relux/agents/:id/manager-grant` (where
+  `:id` is the **acting manager**; body `{ "target_id", "permission" }`) now invokes the primitive through
+  `KernelState::manager_grant_permission_to_subordinate_as_operator`. The route sits behind the same
+  `require_session` guard as every other control-plane route. The handler parses the permission
+  (malformed → `400`), resolves the authenticated operator from the session, and calls the kernel; an
+  unauthorized manager (no scope / not Active / target outside its Branch / unknown manager-or-target,
+  since existence folds into the fail-closed authority check) is a `403` that grants nothing. On success
+  it returns the **target's** updated explicit permission list. The grant of authority is unchanged — the
+  real own-Branch + Active + scope check in `manager_subtree_authorizes`; the operator only supplies the
+  request. Two audit rows are written: the inner agent-actor view (`agent:grant_permission` /
+  `agent:manager_grant_permission`) **plus** an `operator:authorize_manager_grant` row (Success/Denied)
+  naming the operator and carrying a `trust_boundary` note.
+
+- **HONEST trust boundary (the true remaining gap).** This is an **operator-assisted** path, not a
+  per-agent-authenticated one. Relux has **no per-agent auth identity** yet: a manager agent cannot
+  present its own credential on an HTTP request. OpenClaw correlates authority to a real per-session
+  identity (`reference/openclaw-main/src/acp/session-lineage-meta.ts`: `sessionKey` / `spawnedBy` /
+  `parentSessionKey` / `subagentControlScope`), and its permission relay routes a request to a human who
+  selects allow-once/allow-always/deny (`reference/openclaw-main/src/acp/permission-relay.ts`). Relux's
+  analogue today is the dashboard **operator** standing in for the manager — the operator authorizes
+  "grant *as* this manager", but **cannot widen** anything the manager itself could not do (the kernel
+  re-checks own-Branch + Active + scope and 403s otherwise). The genuinely-missing piece is an
+  authenticated agent actor (a per-agent session/token whose identity the kernel trusts as the manager),
+  so a manager could drive its own grant without an operator in the loop. Until then the operator is the
+  named, audited authorizer. Exact grants still authorize only themselves; revoke still removes exactly the
+  stored row via `matches_exact` (a manager-subtree grant is one explicit, individually-revocable row).
 
 - **UI.** `governance.ts` mirrors the backend grammar (`isManagerSubtree`, `managerSubtreePermission`,
   and a scope-specific rejection reason for malformed subtree strings) — the `agent:` prefix is already
   **elevated**, so a subtree grant shows the `elevated` warning and a new `scope: manager subtree` badge.
   The Crew Governance panel adds an **Advanced — manager scope** explainer with the
-  `agent:lead-1:subtree:grant_permission` example and the own-Branch / live-manager rules. No fake
-  manager-action console was added (the panel still grants as the operator).
+  `agent:lead-1:subtree:grant_permission` example and the own-Branch / live-manager rules. The panel now
+  also offers a **"Grant as manager"** affordance, gated by the pure
+  `governance.ts::managerGrantAvailability(manager, roster)` helper (mirrored from the backend gate): it
+  appears only when the selected agent is Active, holds a `agent:<id>:subtree:grant_permission` scope over
+  its **own** Branch, and has at least one operative in that Branch — otherwise it shows the honest
+  unavailable reason (no scope / not Active / empty Branch). When available it offers a Branch-subordinate
+  picker + a permission input and calls `POST /v1/relux/agents/:id/manager-grant`; a badge states "operator
+  stands in (no per-agent auth yet)". The normal operator grant/revoke form is unchanged. Helper parity is
+  pinned by `governance.test.ts` (`managerSubtreeActions` own-id-only + `managerGrantAvailability`
+  available/no-scope/paused/empty-Branch cases).
 
 - **Tests.** `permission.rs`: grammar (accept the scope, reject every malformed subtree variant +
   case-sensitivity of the keyword) and the matcher (subordinate allowed; self / sibling / ancestor /
@@ -907,11 +939,17 @@ section for the full reference read + applied-change record. In brief:
   manager_subtree_grant_enforces_branch_liveness_and_audits`: a live lead grants to a real subordinate
   (target now holds it, success audited); sibling / ancestor / self / unrelated all denied; a paused
   manager is denied (liveness); a manager with no subtree scope is denied; the denial is audited.
-  `governance.test.ts`: client-side validation + helper parity + elevated classification. Full `relux-core`
-  (156) + `relux-kernel` lib (629) suites green; clippy clean on both crates; dashboard typecheck + tests
-  (287) + bundle rebuild green.
+  `server.rs::manager_grant_to_subordinate_over_http_enforces_authority_and_audits`: the end-to-end HTTP
+  path — a live scoped lead grants to its subordinate (`200`, target's list grows); a sibling target, a
+  manager with no scope, and a paused manager are all `403`; a malformed permission is `400`; and the
+  `operator:authorize_manager_grant` audit row (with its `trust_boundary` detail) is present.
+  `governance.test.ts`: client-side validation + helper parity + elevated classification + the new
+  `managerSubtreeActions` / `managerGrantAvailability` availability gate. Full `relux-core` (156) +
+  `relux-kernel` lib (629) + `relux-kernel` bin/server (110) suites green; clippy clean on both crates;
+  dashboard typecheck + tests (289) + bundle rebuild green.
 
-- **Still missing (honest).** A request/agent-actor surface that calls the manager-grant path, more
+- **Still missing (honest).** A **truly per-agent-authenticated** actor surface (a manager driving its own
+  grant without an operator in the loop — the operator-assisted HTTP path above is the interim), more
   subtree *actions* than `grant_permission` (e.g. assign_task, revoke), project / namespace scopes,
   governed budgets, persistent `allow-always` grants, and Board-style oversight all remain open.
 

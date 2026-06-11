@@ -16,6 +16,9 @@ import {
   isManagerSubtree,
   managerSubtreePermission,
   pluginWildcardPermission,
+  managerSubtreeActions,
+  managerGrantAvailability,
+  type ManagerGrantAgent,
 } from "../src/governance.ts";
 
 test("permissionPrefix extracts the prefix incl. the colon", () => {
@@ -119,6 +122,58 @@ test("managerSubtreePermission builds the scope from a manager id + action, null
 
 test("the manager-subtree scope is an elevated (advanced/manager) capability", () => {
   assert.equal(isElevatedPermission("agent:lead-1:subtree:grant_permission"), true);
+});
+
+test("managerSubtreeActions reads own-id subtree scopes only", () => {
+  const lead: ManagerGrantAgent = {
+    id: "lead",
+    permissions: [
+      "agent:lead:subtree:grant_permission",
+      "agent:lead:subtree:assign_task",
+      "agent:other:subtree:grant_permission", // names a DIFFERENT manager → ignored
+      "tool:relux-tools-github:read", // not a subtree scope → ignored
+    ],
+  };
+  assert.deepEqual(managerSubtreeActions(lead), ["grant_permission", "assign_task"]);
+  assert.deepEqual(managerSubtreeActions({ id: "lead", permissions: [] }), []);
+});
+
+test("managerGrantAvailability mirrors the backend authority gate", () => {
+  // Topology: director <- lead <- ic ; peer reports to director (lead's sibling).
+  const roster: ManagerGrantAgent[] = [
+    { id: "director", status: "active" },
+    { id: "lead", status: "active", reports_to: "director",
+      permissions: ["agent:lead:subtree:grant_permission"] },
+    { id: "ic", status: "active", reports_to: "lead" },
+    { id: "peer", status: "active", reports_to: "director" },
+  ];
+  const lead = roster[1];
+
+  // Available: live, scoped, with a non-empty Branch (only ic, not the sibling peer).
+  const ok = managerGrantAvailability(lead, roster);
+  assert.equal(ok.available, true);
+  assert.equal(ok.reason, "");
+  assert.deepEqual(ok.targets, ["ic"]);
+
+  // No scope → unavailable with an honest reason (director has a subordinate but no scope).
+  const noScope = managerGrantAvailability(roster[0], roster);
+  assert.equal(noScope.available, false);
+  assert.match(noScope.reason, /No manager-subtree grant scope/);
+
+  // Paused manager → unavailable (a non-Active manager wields no subtree authority).
+  const paused = managerGrantAvailability({ ...lead, status: "paused" }, roster);
+  assert.equal(paused.available, false);
+  assert.match(paused.reason, /Active/);
+
+  // Scoped but empty Branch (a manager whose only report was removed) → unavailable.
+  const lonely: ManagerGrantAgent = {
+    id: "lonely",
+    status: "active",
+    permissions: ["agent:lonely:subtree:grant_permission"],
+  };
+  const empty = managerGrantAvailability(lonely, [lonely]);
+  assert.equal(empty.available, false);
+  assert.match(empty.reason, /Branch/);
 });
 
 test("control-plane prefixes are elevated; tool/task/audit are standard", () => {

@@ -1678,6 +1678,55 @@ impl KernelState {
         self.grant_permission_to_agent(target_id, permission)
     }
 
+    /// Operator-assisted manager grant: the same real manager-subtree authorization as
+    /// [`Self::manager_grant_permission_to_subordinate`], but with the **operator** who
+    /// stood in for the manager recorded in the audit trail.
+    ///
+    /// HONEST trust boundary: Relux has **no per-agent auth identity** yet — a manager
+    /// agent cannot authenticate an HTTP request on its own behalf (OpenClaw correlates
+    /// authority to a real per-session `sessionKey`/`spawnedBy`;
+    /// `reference/openclaw-main/src/acp/session-lineage-meta.ts`). So an authenticated
+    /// dashboard operator explicitly authorizes "grant *as* this manager". The operator
+    /// can **not** bypass the manager-subtree rule: the grant of authority is still the
+    /// real own-Branch + Active + scope check below; the operator only supplies the
+    /// request and is named in the audit. This adds a `operator:authorize_manager_grant`
+    /// audit row (Success/Denied) ON TOP OF the inner agent-actor audit — the operator
+    /// view (who asked) and the agent view (which manager exercised authority) are both
+    /// preserved.
+    pub fn manager_grant_permission_to_subordinate_as_operator(
+        &mut self,
+        operator: &str,
+        manager_id: &AgentId,
+        target_id: &AgentId,
+        permission: Permission,
+    ) -> Result<(), KernelError> {
+        let result = self.manager_grant_permission_to_subordinate(
+            manager_id,
+            target_id,
+            permission.clone(),
+        );
+        let namespace = self.agents.get(target_id).map(|a| a.namespace_id.clone());
+        self.record_audit(
+            "operator",
+            operator,
+            "operator:authorize_manager_grant",
+            Some("agent"),
+            Some(target_id.as_str()),
+            namespace.as_ref(),
+            if result.is_ok() {
+                AuditResult::Success
+            } else {
+                AuditResult::Denied
+            },
+            serde_json::json!({
+                "manager_id": manager_id.as_str(),
+                "permission": permission.as_str(),
+                "trust_boundary": "operator console stood in for the manager (no per-agent auth identity yet); the manager-subtree authorization was NOT bypassed",
+            }),
+        );
+        result
+    }
+
     // --- Tasks -------------------------------------------------------------
 
     /// Create a durable unit of work (`docs/RELUX_MASTER_PLAN.md` section 9.5).

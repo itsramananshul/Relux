@@ -2303,6 +2303,17 @@ export const reluxWork = {
       `/v1/relux/agents/${encodeURIComponent(id)}/permissions`,
       { permission },
     ),
+  // Operator-assisted manager-subtree grant: the authenticated operator authorizes
+  // acting AS `managerId`, which grants `permission` to its own-Branch subordinate
+  // `targetId`. The backend enforces the real own-Branch + Active + scope rule (an
+  // unauthorized manager is a 403, a malformed permission a 400); the operator cannot
+  // bypass it. HONEST: no per-agent auth yet, so the operator stands in for the manager.
+  // Returns the TARGET's updated explicit permission list.
+  managerGrantPermission: (managerId: string, targetId: string, permission: string) =>
+    api.post<ReluxAgentPermissions>(
+      `/v1/relux/agents/${encodeURIComponent(managerId)}/manager-grant`,
+      { target_id: targetId, permission },
+    ),
   // Create a new task and assign it to Prime.
   createTask: (title: string) => api.post<ReluxTask>("/v1/relux/tasks", { title }),
   // Start an execution attempt for a task.
