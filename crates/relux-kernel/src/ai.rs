@@ -733,6 +733,27 @@ pub async fn extract_permission_slots_via_openrouter(
     crate::prime_admin_slots::parse_permission_slots(&text).ok()
 }
 
+/// Re-word a clarify / brainstorm turn via the OpenRouter brain, returning the validated
+/// polished text, or `None` on ANY failure (no key, disabled, network error, malformed
+/// reply, a clarify that is not exactly one question, an action claim, low confidence, or
+/// a pure echo). The brain only re-words a turn the kernel already decided is non-actionful;
+/// it authors no action. Mirrors the slot extractors: build prompt → complete → parse →
+/// reconcile, with everything un-validated dropped (§10.5, §17.1).
+pub async fn polish_clarify_via_openrouter(
+    cfg: &AiConfig,
+    message: &str,
+    deterministic_text: &str,
+    kind: crate::prime_clarify::ClarifyKind,
+) -> Option<String> {
+    let text = complete_json_only(
+        cfg,
+        crate::prime_clarify::build_clarify_prompt(kind, message, deterministic_text),
+    )
+    .await?;
+    let parsed = crate::prime_clarify::parse_clarify(&text, kind).ok()?;
+    crate::prime_clarify::reconcile_clarify(deterministic_text, &parsed, kind)
+}
+
 /// Combine an LLM result with the deterministic fallback into a final outcome.
 /// Pure, so both the success and failure (fallback + note) paths are testable
 /// without a network.

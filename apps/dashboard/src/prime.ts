@@ -1,4 +1,4 @@
-import type { ReluxPrimeProposal, ReluxPrimeProposalStep, ReluxPrimeTaskSlots } from "./api";
+import type { ReluxPrimeProposal, ReluxPrimeProposalStep, ReluxPrimeTaskSlots, ReluxReplyPolish } from "./api";
 
 // Pure helpers for rendering Prime's reviewable plan proposal as a card
 // (RELUX_MASTER_PLAN §10 planning layer, §11.1 "Prime Chat"). The proposal is a
@@ -94,4 +94,18 @@ export function slotProvenance(slots: ReluxPrimeTaskSlots | undefined): string |
 export function brainSourceLabel(source: string | undefined): string {
   const trimmed = source?.trim();
   return trimmed ? trimmed : "AI brain";
+}
+
+// Honest provenance for a brain-polished clarify / brainstorm REPLY. The server attaches
+// `reply_polish` ONLY when a configured brain re-worded the turn through the validated
+// wording path (one schema-checked question / short summary — never a free-form lecture
+// or an action claim, both rejected server-side). Returns a short human label
+// ("brain-worded question · <source>" for a clarification, "brain-worded reply · <source>"
+// for a brainstorm), or null when the wording was the deterministic template — so the chip
+// only ever appears when the brain genuinely shaped the wording (§10.5, §17.1). The turn
+// itself stays action-free; this is presentation/provenance only.
+export function replyPolishLabel(rp: ReluxReplyPolish | undefined): string | null {
+  if (!rp) return null;
+  const noun = rp.kind === "clarification" ? "question" : "reply";
+  return `brain-worded ${noun} · ${brainSourceLabel(rp.source)}`;
 }

@@ -27,6 +27,7 @@ pub mod plugin_install;
 pub mod prime;
 pub mod prime_admin_slots;
 pub mod prime_agent_slots;
+pub mod prime_clarify;
 pub mod prime_intent;
 pub mod prime_slots;
 pub mod runtime;
@@ -42,8 +43,9 @@ pub use ai::{
     classify_intent_via_openrouter, clear_stored_config, compose_chat_prompt, compose_polish_prompt,
     extract_agent_slots_via_openrouter, extract_permission_slots_via_openrouter,
     extract_plugin_ref_via_openrouter, extract_task_slots_via_openrouter, is_actionful,
-    polish_from_cli_text, polish_proposal, proposal_wants_polish, read_stored_config, shape_reply,
-    write_stored_config, AiConfig, AiMode, AiOutcome, AiStatus, PrimeBrain, StoredAiConfig,
+    polish_clarify_via_openrouter, polish_from_cli_text, polish_proposal, proposal_wants_polish,
+    read_stored_config, shape_reply, write_stored_config, AiConfig, AiMode, AiOutcome, AiStatus,
+    PrimeBrain, StoredAiConfig,
 };
 pub use auth::{
     admin_path_for_db, clear_session_cookie, read_admin_username, reset_admin_credential,
@@ -68,6 +70,10 @@ pub use prime_admin_slots::{
 pub use prime_agent_slots::{
     build_agent_slots_prompt, parse_agent_slots, reconcile_agent_slots, BrainAgentSlots,
     ResolvedAgentSlots,
+};
+pub use prime_clarify::{
+    build_clarify_prompt, clarify_polish_kind, parse_clarify, reconcile_clarify, BrainClarify,
+    ClarifyKind,
 };
 pub use prime_intent::{
     build_intent_prompt, parse_intent_proposal, reconcile_intent, BrainIntentProposal,

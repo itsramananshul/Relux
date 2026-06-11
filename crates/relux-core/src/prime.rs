@@ -492,6 +492,12 @@ pub struct PrimeAgentSlots {
     /// not applied to a durable kernel field). Absent when none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+    /// Optional sanitized starter persona / operating style the brain proposed,
+    /// applied to the created agent's durable `persona` field (and shown in Crew).
+    /// Bounded and control-char-stripped; an overlong persona is rejected wholesale
+    /// before the agent is created. Absent when the brain proposed none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona: Option<String>,
     /// The model id / CLI brain label that produced these slots, for provenance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
@@ -864,10 +870,11 @@ mod tests {
             description: None,
             adapter: None,
             notes: None,
+            persona: None,
             source: None,
         };
         let json = serde_json::to_string(&minimal).unwrap();
-        for absent in ["description", "adapter", "notes", "source"] {
+        for absent in ["description", "adapter", "notes", "persona", "source"] {
             assert!(
                 !json.contains(absent),
                 "an unset optional must be omitted ({absent}): {json}"
@@ -882,6 +889,7 @@ mod tests {
             description: Some("Surveys options and writes briefs.".to_string()),
             adapter: Some("relux-adapter-local-prime".to_string()),
             notes: Some("Prefers concise output.".to_string()),
+            persona: Some("Methodical and concise; leads with the recommendation.".to_string()),
             source: Some("anthropic/claude-3.5-haiku".to_string()),
         };
         let back: PrimeAgentSlots =

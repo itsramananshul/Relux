@@ -68,6 +68,11 @@ const MAX_ID_CHARS: usize = 64;
 const MAX_DESC_CHARS: usize = 240;
 /// Max characters kept for free-text notes.
 const MAX_NOTES_CHARS: usize = 600;
+/// Max characters kept for the starter persona / operating style. A proposal whose
+/// raw persona exceeds this is rejected wholesale (fail closed) rather than silently
+/// truncated — a created operative either gets a bounded persona or the deterministic
+/// none, never a clipped one.
+const MAX_PERSONA_CHARS: usize = 600;
 /// Max characters kept for a normalized adapter plugin id before allowlist validation.
 const MAX_ADAPTER_CHARS: usize = 96;
 /// Max characters kept from the brain's free-text rationale (audit/provenance only).
@@ -81,6 +86,7 @@ const ALLOWED_KEYS: &[&str] = &[
     "role",
     "adapter",
     "notes",
+    "persona",
     "confidence",
     "rationale",
 ];
@@ -98,6 +104,10 @@ pub struct BrainAgentSlots {
     /// honored only if [`reconcile_agent_slots`] finds it among the live adapters.
     pub adapter: Option<String>,
     pub notes: Option<String>,
+    /// A bounded, sanitized starter persona / operating style. Validated by
+    /// [`parse_agent_slots`] (control chars stripped, length-bounded; an overlong
+    /// persona fails the whole proposal closed). Honored only when slots reconcile.
+    pub persona: Option<String>,
     pub confidence: f32,
     pub rationale: String,
 }
@@ -116,6 +126,9 @@ pub struct ResolvedAgentSlots {
     pub description: Option<String>,
     pub adapter: Option<String>,
     pub notes: Option<String>,
+    /// The bounded starter persona to write to the created agent's durable
+    /// `persona` field (and show in Crew). `None` keeps the deterministic no-persona.
+    pub persona: Option<String>,
 }
 
 /// The strict, self-contained prompt handed to a brain to extract the slots of ONE
@@ -129,13 +142,16 @@ clearly asked Prime to create on a local Relux control plane. You perform no act
 nothing; you only describe the agent's slots so the kernel can create it.\n\n\
 Respond with JSON ONLY (no prose, no code fences) in EXACTLY this shape:\n\
 {{\"name\":\"<short human name, e.g. Research Agent>\",\"role\":\"<optional one-line role/description, or omit>\",\
-\"adapter\":\"<optional existing adapter plugin id, or omit>\",\"notes\":\"<optional notes, or omit>\",\
-\"confidence\":<0.0-1.0>}}\n\n\
+\"adapter\":\"<optional existing adapter plugin id, or omit>\",\"persona\":\"<optional 1-3 sentence operating style/voice, or omit>\",\
+\"notes\":\"<optional notes, or omit>\",\"confidence\":<0.0-1.0>}}\n\n\
 Rules:\n\
 - name: a concise human name for the agent (e.g. \"Research Agent\", \"CI Watcher\"). REQUIRED.\n\
 - role: a single-line description of what the agent does. Include ONLY if the message implies one.\n\
 - adapter: include ONLY an adapter plugin id the user explicitly named; if unsure, omit it. NEVER \
 invent an adapter, plugin, or tool name.\n\
+- persona: a SHORT starter operating style / voice for the agent (1-3 sentences, e.g. \"Methodical \
+and concise; leads with the recommendation and flags risks early.\"). Include ONLY a brief, useful \
+style; keep it under a few sentences. Omit if the message implies none.\n\
 - notes: include ONLY extra context worth recording; otherwise omit it.\n\
 - Do NOT add any field other than these. Do NOT grant permissions. Do NOT claim the agent was created.\n\n\
 User message:\n{message}"
@@ -184,6 +200,25 @@ pub fn parse_agent_slots(raw: &str) -> Result<BrainAgentSlots, String> {
         .map(|s| sanitize_block(s, MAX_NOTES_CHARS))
         .filter(|s| !s.is_empty());
 
+    // Persona is NOT silently truncated: an overlong proposal fails the whole thing
+    // closed (a created operative gets a bounded persona or the deterministic none,
+    // never a clipped one). The raw length is checked before sanitization so a model
+    // padding the field cannot slip a clipped lecture through.
+    let persona = match obj.get("persona").and_then(|v| v.as_str()) {
+        Some(raw_persona) => {
+            if raw_persona.chars().count() > MAX_PERSONA_CHARS {
+                return Err("persona too long".to_string());
+            }
+            let cleaned = sanitize_block(raw_persona, MAX_PERSONA_CHARS);
+            if cleaned.is_empty() {
+                None
+            } else {
+                Some(cleaned)
+            }
+        }
+        None => None,
+    };
+
     let confidence = obj
         .get("confidence")
         .and_then(|v| v.as_f64())
@@ -201,6 +236,7 @@ pub fn parse_agent_slots(raw: &str) -> Result<BrainAgentSlots, String> {
         role,
         adapter,
         notes,
+        persona,
         confidence,
         rationale,
     })
@@ -252,9 +288,16 @@ pub fn reconcile_agent_slots(
     });
 
     // Only report brain assistance when it genuinely sharpened the slots — a brain
-    // that merely echoes the deterministic name with nothing else is a no-op.
+    // that merely echoes the deterministic name with nothing else is a no-op. A
+    // persona alone (no other field) still counts as a real contribution, so a brain
+    // that gives an otherwise-default agent a usable starter voice is honored.
     let changed_id = id != agent_id_form(deterministic_name);
-    if !changed_id && proposal.role.is_none() && adapter.is_none() && proposal.notes.is_none() {
+    if !changed_id
+        && proposal.role.is_none()
+        && adapter.is_none()
+        && proposal.notes.is_none()
+        && proposal.persona.is_none()
+    {
         return None;
     }
 
@@ -264,6 +307,7 @@ pub fn reconcile_agent_slots(
         description: proposal.role.clone(),
         adapter,
         notes: proposal.notes.clone(),
+        persona: proposal.persona.clone(),
     })
 }
 
@@ -417,9 +461,46 @@ mod tests {
             role: None,
             adapter: None,
             notes: None,
+            persona: None,
             confidence,
             rationale: String::new(),
         }
+    }
+
+    #[test]
+    fn parses_and_bounds_a_starter_persona() {
+        let p = parse_agent_slots(
+            r#"{"name":"CI Watcher","persona":"Methodical and concise; leads with the recommendation.","confidence":0.9}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            p.persona.as_deref(),
+            Some("Methodical and concise; leads with the recommendation.")
+        );
+    }
+
+    #[test]
+    fn rejects_an_overlong_persona_fail_closed() {
+        // An overlong persona is NOT silently truncated — the whole proposal fails so
+        // the agent is created deterministically (no persona) rather than with a
+        // clipped one.
+        let long = "x".repeat(MAX_PERSONA_CHARS + 1);
+        let raw = format!(r#"{{"name":"CI Watcher","persona":"{long}","confidence":0.9}}"#);
+        let err = parse_agent_slots(&raw).unwrap_err();
+        assert!(err.contains("persona too long"), "got: {err}");
+    }
+
+    #[test]
+    fn reconcile_honors_a_persona_only_contribution() {
+        // A brain that only adds a starter persona to an otherwise-default agent still
+        // counts as a real contribution (not a no-op echo).
+        let mut p = prop("new agent", 0.95);
+        p.persona = Some("Calm and methodical; flags risks early.".to_string());
+        let r = reconcile_agent_slots("new-agent", &p, &[], &[]).unwrap();
+        assert_eq!(
+            r.persona.as_deref(),
+            Some("Calm and methodical; flags risks early.")
+        );
     }
 
     #[test]

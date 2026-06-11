@@ -3821,13 +3821,17 @@ impl KernelState {
                     .and_then(|s| s.adapter.clone())
                     .unwrap_or_else(|| adapter_plugin.clone());
                 let adapter = PluginId::new(adapter_id.clone());
+                // A validated starter persona (brain-proposed, bounded, control-char
+                // stripped) gives the operative a usable voice; the deterministic path
+                // still creates it with no persona.
+                let persona = agent_slots.and_then(|s| s.persona.clone());
                 let agent_id = self.create_agent(
                     &agent_id_str,
                     &eff_name,
                     &description,
                     &adapter,
                     &ctx.namespace,
-                    None,   // No persona
+                    persona.clone(),
                     vec![], // No special permissions by default
                 )?;
                 let head = if agent_slots.is_some() {
@@ -3845,6 +3849,7 @@ impl KernelState {
                     description: s.description.clone(),
                     adapter: s.adapter.clone(),
                     notes: s.notes.clone(),
+                    persona: persona.clone(),
                     source: None,
                 });
                 Ok(PrimeTurn {
@@ -7070,9 +7075,96 @@ mod tests {
             role: None,
             adapter: None,
             notes: None,
+            persona: None,
             confidence,
             rationale: String::new(),
         }
+    }
+
+    #[test]
+    fn brain_agent_slots_seed_a_starter_persona_on_the_created_agent() {
+        // A validated persona is written to the created agent's durable `persona`
+        // field (and surfaced in provenance), while the deterministic create still
+        // gets None.
+        let (mut k, ctx) = prime_chat_kernel();
+        let mut s = agent_prop("CI Watcher", 0.9);
+        s.role = Some("Watches CI".to_string());
+        s.persona = Some("Methodical and concise; flags risks early.".to_string());
+
+        let (turn, _) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "create an agent to keep an eye on CI",
+                None,
+                BrainSlotProposals {
+                    agent: Some(&s),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let agent_id = turn.created_agent.clone().expect("an agent was created");
+        let agent = k.agent(&agent_id).unwrap();
+        assert_eq!(
+            agent.persona.as_deref(),
+            Some("Methodical and concise; flags risks early.")
+        );
+        let provenance = turn.agent_slots.expect("brain-assisted agent slots surfaced");
+        assert_eq!(
+            provenance.persona.as_deref(),
+            Some("Methodical and concise; flags risks early.")
+        );
+    }
+
+    #[test]
+    fn clarify_polish_targets_only_nonactionful_clarify_and_brainstorm() {
+        use crate::prime_clarify::{clarify_polish_kind, ClarifyKind};
+        let (mut k, ctx) = prime_chat_kernel();
+
+        // A TaskUpdate turn always clarifies → eligible for Clarify wording, and it
+        // created nothing (action-free).
+        let (update, _) = k
+            .prime_turn_with_brain(&ctx, "update task_42 priority", None, BrainSlotProposals::default())
+            .unwrap();
+        assert_eq!(clarify_polish_kind(&update), Some(ClarifyKind::Clarify));
+        assert!(update.created_task.is_none() && update.action.is_none());
+
+        // A musing turn → eligible for Brainstorm wording, and mints no task.
+        let (muse, _) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "i was thinking we could redo the onboarding flow",
+                None,
+                BrainSlotProposals::default(),
+            )
+            .unwrap();
+        assert_eq!(clarify_polish_kind(&muse), Some(ClarifyKind::Brainstorm));
+        assert!(muse.created_task.is_none());
+
+        // A real create is ACTIONFUL → the wording path never touches it (the brain is
+        // never near an action).
+        let (create, _) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "create a task to summarize the README",
+                None,
+                BrainSlotProposals::default(),
+            )
+            .unwrap();
+        assert!(create.created_task.is_some());
+        assert_eq!(clarify_polish_kind(&create), None);
+    }
+
+    #[test]
+    fn deterministic_agent_create_has_no_persona() {
+        // With no brain slots, the created agent has no persona (the deterministic
+        // fallback is unchanged).
+        let (mut k, ctx) = prime_chat_kernel();
+        let (turn, _) = k
+            .prime_turn_with_brain(&ctx, "create an agent", None, BrainSlotProposals::default())
+            .unwrap();
+        let agent_id = turn.created_agent.clone().expect("an agent was created");
+        assert!(k.agent(&agent_id).unwrap().persona.is_none());
     }
 
     #[test]

@@ -8,7 +8,7 @@ import {
   type ReluxPrimeSuggestion,
   type ReluxPrimeTurn,
 } from "../api";
-import { brainSourceLabel, hasSteps, intentProvenance, polishProvenance, proposalDisplaySummary, slotProvenance, stepDisplayTitle } from "../prime";
+import { brainSourceLabel, hasSteps, intentProvenance, polishProvenance, proposalDisplaySummary, replyPolishLabel, slotProvenance, stepDisplayTitle } from "../prime";
 import { workTaskHref, workRunHref } from "../routing";
 import { PrimeAutonomyPanel } from "../components/PrimeAutonomyPanel";
 import { OrchestrationPanel } from "../components/OrchestrationPanel";
@@ -329,6 +329,18 @@ function PrimeTurnCard({
         <span className={"badge " + tone} style={{ fontSize: 9 }} title="How the turn resolved">
           {turn.disposition.replace(/_/g, " ")}
         </span>
+        {/* A small chip when a configured brain re-WORDED this clarify/brainstorm turn
+            through the validated wording path (one schema-checked question / short
+            summary). The turn is action-free; the wording was validated server-side. */}
+        {replyPolishLabel(turn.reply_polish) && (
+          <span
+            className="badge done"
+            style={{ fontSize: 9 }}
+            title="Prime's brain phrased this reply — validated wording only, no action"
+          >
+            🧠 {replyPolishLabel(turn.reply_polish)}
+          </span>
+        )}
         <span className="muted" style={{ fontSize: 9, marginLeft: "auto" }} title="Which provider produced this reply">
           {providerLabel(turn.ai_mode)}
         </span>
@@ -433,6 +445,11 @@ function PrimeTurnCard({
           </div>
           {turn.agent_slots.description && (
             <div className="muted" style={{ marginTop: 2 }}>{turn.agent_slots.description}</div>
+          )}
+          {turn.agent_slots.persona && (
+            <div className="muted" style={{ marginTop: 4, fontSize: 11, fontStyle: "italic" }}>
+              persona: {turn.agent_slots.persona}
+            </div>
           )}
           {(turn.agent_slots.adapter || turn.agent_slots.notes) && (
             <div className="muted" style={{ marginTop: 4, fontSize: 11 }}>

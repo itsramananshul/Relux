@@ -281,3 +281,66 @@ is unchanged in kind (`Propose` → approval), so a brain slot can NEVER execute
 install or grant by itself. Every durable change still flows through `decide` →
 `prime_execute` (safe `Act`s) or a human approval (risky `Propose`s); the brain authors a
 *proposal*, the kernel validates it.
+
+---
+
+## Reference read — brain-assisted clarification wording + agent persona seed (this slice)
+
+The last keyword surfaces the audit flagged are now behind a brain: the **reflect-and-clarify
+wording** (the `Clarify` / `Brainstorming` / single-step `PlanRequest` / `TaskUpdate` replies,
+previously fixed templates in `crate::prime`) and the created-agent **starter persona** (today
+`create_agent` is always handed `None`). The brain may now *re-word* an already-decided
+non-actionful turn, and *propose* a bounded persona — both validated hard before anything is
+shown or stored.
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/agent/prompt_builder.py` / `agent/system_prompt.py` — the
+  `<missing_context>` / `<act_dont_ask>` blocks steer the model to ask **ONE targeted question**
+  when context is missing rather than guessing or lecturing. We fold the same instruction into
+  `crates/relux-kernel/src/prime_clarify.rs` `build_clarify_prompt` (Clarify ⇒ "EXACTLY ONE
+  concrete question"), **and validate the result structurally** (`parse_clarify` enforces a
+  single `?` ending the text) rather than trusting the model to obey — the Hermes "prompt steers,
+  but a deterministic check decides" shape.
+- `reference/hermes-agent-main/agent/message_sanitization.py` —
+  `_escape_invalid_chars_in_json_strings` (L143-182) and the tool-error length clamp
+  (`_sanitize_tool_error`, L515-528): sanitize control chars and CLAMP length on every
+  model-produced string. Mirrored in `prime_clarify::sanitize_line` / `sanitize_block` and in the
+  persona sanitizer (`prime_agent_slots`, control chars stripped + length-bounded).
+- `reference/hermes-agent-main/agent/conversation_loop.py` — the empty/junk-output fallback
+  (~L3466-3480): reuse the last real content when the model misbehaves. Mirrored: any failure
+  (no brain, malformed JSON, non-question, low confidence, echo) falls back to the deterministic
+  template wording, so the brain is strictly additive.
+
+### Paperclip (openclaw) — files read
+
+- `reference/openclaw-main/src/agents/tools/sessions-spawn-tool.ts`
+  (`UNSUPPORTED_SESSIONS_SPAWN_PARAM_KEYS` rejected at L277-284 BEFORE any param is read) +
+  `src/agents/tools/common.ts` (`readStringParam` required, `ToolInputError`, L57-122 — a required
+  string THROWS on bad input). We mirror it: `parse_clarify` / `parse_agent_slots` accept ONLY
+  their allowlist (`text`/`confidence`/`rationale`; agent `persona` added to the allowlist) and
+  fail the whole proposal closed on any other key; the mandatory `text`/`name` must be non-empty.
+- `reference/openclaw-main/src/agents/cli-output.ts` (`parseCliOutput`) +
+  `src/shared/balanced-json.ts` (`extractBalancedJsonPrefix`, L21-69): pull the reply out of a
+  noisy CLI envelope and surface only the parsed text. The CLI path runs `parse_adapter_result`
+  FIRST, then `prime_intent::extract_json_object`, so the raw `--output-format json` envelope
+  never reaches the validator or the chat bubble (`server.rs` `parse_cli_clarify`).
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| Hermes: **prompt steers ONE question, a deterministic check decides** | `prime_clarify::build_clarify_prompt` demands one question; `parse_clarify` **structurally enforces** exactly one `?` ending the text (a multi-question lecture or a statement is rejected → deterministic template stands). |
+| Hermes: **sanitize control chars + clamp length** | `prime_clarify::sanitize_line`/`sanitize_block` and the new `persona` sanitizer strip control chars and clamp (clarify 240 chars single-line, brainstorm 600, persona 600). |
+| openclaw: **reject unsupported keys, require the mandatory string** | `parse_clarify` allowlist = `text`/`confidence`/`rationale`; `parse_agent_slots` allowlist gains `persona`; any other key fails closed; empty `text`/`name` rejected. |
+| openclaw: **balanced-JSON extraction, surface only parsed text** | `parse_cli_clarify` runs `parse_adapter_result` then `extract_json_object`; an error envelope / prose / non-question yields `None` and the deterministic wording stands — no raw envelope leak. |
+| openclaw: **never silently truncate a sensitive field** | an **overlong persona fails the whole proposal closed** (`MAX_PERSONA_CHARS`), so a created operative gets a bounded persona or the deterministic none — never a clipped one. |
+
+**What we deliberately do differently:** the brain only **re-words** a turn the deterministic
+classifier already decided is a non-actionful `Reply`/`Clarify` — it picks no intent, authors no
+slot, and runs nothing (`clarify_polish_kind` returns `None` for every actionful turn, so the
+wording path is never near an action). A polished reply that asserts a completed action
+(`I created…` / `run started` / …) is rejected wholesale, so the brain can never narrate a state
+change that did not happen. The persona is the only *durable* contribution here, and it flows
+only through the already-validated `AgentCreation` → `create_agent(persona)` seam; the
+deterministic path still creates a personaless agent.

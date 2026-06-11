@@ -1585,6 +1585,21 @@ struct PrimeResponse {
     /// when it actually decided. Provenance only; never affects execution.
     #[serde(skip_serializing_if = "Option::is_none")]
     intent_source: Option<String>,
+    /// Present only when a configured brain re-worded a clarify / brainstorm turn's
+    /// reply (the validated wording path). Advisory provenance for the small chip; the
+    /// turn stays action-free and the wording was schema-validated. Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_polish: Option<ReplyPolishProvenance>,
+}
+
+/// Provenance for a brain-polished clarify / brainstorm reply: which KIND of wording
+/// was re-shaped and which brain produced it. Presentation/provenance only.
+#[derive(Debug, Serialize)]
+struct ReplyPolishProvenance {
+    /// "clarification" | "brainstorm".
+    kind: String,
+    /// The OpenRouter model id / CLI brain label that produced the wording.
+    source: String,
 }
 
 /// Run exactly one durable Prime turn (`docs/RELUX_MASTER_PLAN.md` section 10) over
@@ -1750,17 +1765,27 @@ async fn run_prime(
     // result) always keeps the grounded deterministic reply. Conversational turns
     // route to the chosen brain. This happens OUTSIDE the lock because it can
     // involve a slow network/process call.
-    let outcome = if !relux_kernel::is_actionful(&turn)
+    //
+    // A clarify / brainstorm turn is the special case: the brain may re-WORD it, but
+    // through the VALIDATED wording path (one schema-checked, length-bounded question
+    // or short summary — never free-form prose that could lecture or claim an action).
+    // So those turns skip the free-form shaper and go through `run_clarify_polish`,
+    // which falls back to the grounded deterministic wording on any failure (§10.5,
+    // §17.1). The wall is intact: this only ever runs on a non-actionful turn.
+    let clarify_kind = relux_kernel::clarify_polish_kind(&turn);
+    let (outcome, reply_polish) = if let Some(kind) = clarify_kind {
+        run_clarify_polish(brain, &ai_config, cli_status.clone(), &message, &turn, kind).await
+    } else if !relux_kernel::is_actionful(&turn)
         && matches!(
             brain,
             relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli
         ) {
-        run_cli_brain(brain, cli_status.clone(), &message, &turn).await
+        (run_cli_brain(brain, cli_status.clone(), &message, &turn).await, None)
     } else {
         // Local / OpenRouter (and actionful turns) go through shape_reply, which
         // keeps actionful turns deterministic and only augments via OpenRouter
         // when that brain is selected and a key is configured.
-        relux_kernel::shape_reply(&ai_config, &message, &turn).await
+        (relux_kernel::shape_reply(&ai_config, &message, &turn).await, None)
     };
 
     // 3. Merge the outcome into the response.
@@ -1826,6 +1851,7 @@ async fn run_prime(
         ai_model: outcome.model,
         ai_note: outcome.note,
         intent_source: intent_source_label,
+        reply_polish,
     }))
 }
 
@@ -2308,6 +2334,103 @@ fn slot_source_label(brain: relux_kernel::PrimeBrain, cfg: &relux_kernel::AiConf
         relux_kernel::PrimeBrain::CodexCli => "Codex CLI".to_string(),
         relux_kernel::PrimeBrain::Local => "AI brain".to_string(),
     }
+}
+
+/// Produce the conversational reply for a clarify / brainstorm turn through the
+/// VALIDATED wording path, returning the final outcome plus the provenance to surface.
+///
+/// Unlike the free-form shaper, the brain here returns ONE schema-checked, length-bounded
+/// question/summary; the kernel-side validators
+/// ([`relux_kernel::parse_clarify`] → [`relux_kernel::reconcile_clarify`]) reject anything
+/// malformed, a clarify that is not exactly one question, an action claim, low confidence,
+/// or a pure echo. On ANY failure the grounded deterministic wording stands with no
+/// provenance. This runs ONLY on a non-actionful clarify/brainstorm turn, so it can never
+/// touch an action (the action-free wall, `docs/prime-processing-audit.md`).
+async fn run_clarify_polish(
+    brain: relux_kernel::PrimeBrain,
+    cfg: &relux_kernel::AiConfig,
+    status: Option<relux_core::AdapterRuntimeStatus>,
+    message: &str,
+    turn: &PrimeTurn,
+    kind: relux_kernel::ClarifyKind,
+) -> (AiOutcome, Option<ReplyPolishProvenance>) {
+    let deterministic = turn.reply.clone();
+    let polished = match brain {
+        relux_kernel::PrimeBrain::Openrouter => {
+            relux_kernel::polish_clarify_via_openrouter(cfg, message, &deterministic, kind).await
+        }
+        relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli => {
+            polish_clarify_via_cli(brain, status, message, &deterministic, kind).await
+        }
+        relux_kernel::PrimeBrain::Local => None,
+    };
+
+    match polished {
+        Some(text) => {
+            let mode = match brain {
+                relux_kernel::PrimeBrain::Openrouter => AiMode::Openrouter,
+                relux_kernel::PrimeBrain::ClaudeCli => AiMode::ClaudeCli,
+                relux_kernel::PrimeBrain::CodexCli => AiMode::CodexCli,
+                relux_kernel::PrimeBrain::Local => AiMode::Deterministic,
+            };
+            let source = slot_source_label(brain, cfg);
+            let outcome = AiOutcome {
+                mode,
+                reply: text,
+                model: Some(source.clone()),
+                note: None,
+            };
+            let provenance = ReplyPolishProvenance {
+                kind: kind.label().to_string(),
+                source,
+            };
+            (outcome, Some(provenance))
+        }
+        // No brain / unavailable / invalid: keep the grounded deterministic wording.
+        None => (
+            AiOutcome::deterministic_fallback(deterministic, None),
+            None,
+        ),
+    }
+}
+
+/// Re-word a clarify / brainstorm turn via a local CLI brain (Claude / Codex), returning
+/// the validated polished text or `None`. Same bounded, non-bypass spawn as every other
+/// CLI brain path; the captured stdout is lifted out of the result envelope and run
+/// through the SAME validators ([`parse_cli_clarify`]), so the raw envelope never escapes
+/// and an error envelope / prose / a non-question / an action claim all yield `None`.
+async fn polish_clarify_via_cli(
+    brain: relux_kernel::PrimeBrain,
+    status: Option<relux_core::AdapterRuntimeStatus>,
+    message: &str,
+    deterministic_text: &str,
+    kind: relux_kernel::ClarifyKind,
+) -> Option<String> {
+    let (stdout, akind) = cli_brain_json(
+        brain,
+        status,
+        relux_kernel::build_clarify_prompt(kind, message, deterministic_text),
+    )
+    .await?;
+    parse_cli_clarify(&stdout, akind, kind, deterministic_text)
+}
+
+/// Lift validated clarify/brainstorm wording out of a CLI brain's captured `stdout`, or
+/// `None`. The same no-leak boundary as [`parse_cli_task_slots`]: [`parse_adapter_result`]
+/// lifts the human text out of the result envelope, an error envelope is dropped, and the
+/// lifted text is validated + reconciled. The raw envelope never escapes.
+fn parse_cli_clarify(
+    stdout: &str,
+    kind: relux_core::AdapterKind,
+    clarify_kind: relux_kernel::ClarifyKind,
+    deterministic_text: &str,
+) -> Option<String> {
+    let parsed = relux_core::parse_adapter_result(stdout, kind);
+    if parsed.is_error == Some(true) {
+        return None;
+    }
+    let proposal = relux_kernel::parse_clarify(&parsed.text, clarify_kind).ok()?;
+    relux_kernel::reconcile_clarify(deterministic_text, &proposal, clarify_kind)
 }
 
 /// Validate a CLI brain's captured `stdout` into an advisory proposal polish, or
@@ -4094,6 +4217,10 @@ struct AgentRecord {
     namespace: String,
     status: String,
     permissions_summary: String,
+    /// The agent's starter persona / operating style, when one was set (today via the
+    /// brain-assisted agent-slot path). Omitted when none, so the wire stays compact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    persona: Option<String>,
     created_at: String,
 }
 
@@ -4107,6 +4234,7 @@ fn agent_record(agent: &relux_core::Agent) -> AgentRecord {
         namespace: agent.namespace_id.as_str().to_string(),
         status: format!("{:?}", agent.status),
         permissions_summary: format!("{} permissions", agent.permissions.len()),
+        persona: agent.persona.clone(),
         created_at: agent.created_at.clone(),
     }
 }
@@ -5686,6 +5814,68 @@ mod tests {
         assert!(
             parse_cli_permission_slots(&stdout, relux_core::AdapterKind::ClaudeCli).is_none(),
             "an unsupported subject_kind must fail closed"
+        );
+    }
+
+    // --- Brain-assisted CLARIFY / BRAINSTORM wording: the no-leak parse boundary ---
+
+    #[test]
+    fn cli_clarify_lifted_from_a_result_envelope() {
+        let inner = r#"{\"text\":\"Which task should I update - task_42 or task_7?\",\"confidence\":0.9}"#;
+        let stdout = format!(r#"{{"type":"result","is_error":false,"result":"{inner}","session_id":"abc"}}"#);
+        let text = parse_cli_clarify(
+            &stdout,
+            relux_core::AdapterKind::ClaudeCli,
+            relux_kernel::ClarifyKind::Clarify,
+            "Which task should I update, and what should change?",
+        )
+        .expect("a valid envelope yields validated wording");
+        assert!(text.ends_with('?'));
+        // No envelope scaffolding leaks into the wording.
+        assert!(!text.contains("session_id") && !text.contains("\"type\""));
+    }
+
+    #[test]
+    fn cli_clarify_error_envelope_and_non_question_yield_nothing() {
+        // An error envelope is dropped.
+        let err = r#"{"type":"result","is_error":true,"result":"rate limited"}"#;
+        assert!(parse_cli_clarify(
+            err,
+            relux_core::AdapterKind::ClaudeCli,
+            relux_kernel::ClarifyKind::Clarify,
+            "Which task?",
+        )
+        .is_none());
+        // A clarify that is not exactly one question fails validation at the seam.
+        let inner = r#"{\"text\":\"I will update the task now.\",\"confidence\":0.9}"#;
+        let stdout = format!(r#"{{"type":"result","is_error":false,"result":"{inner}"}}"#);
+        assert!(
+            parse_cli_clarify(
+                &stdout,
+                relux_core::AdapterKind::ClaudeCli,
+                relux_kernel::ClarifyKind::Clarify,
+                "Which task?",
+            )
+            .is_none(),
+            "a non-question clarify must yield nothing"
+        );
+    }
+
+    #[test]
+    fn cli_clarify_brainstorm_rejects_an_action_claim() {
+        // A brainstorm reply that narrates a completed action is rejected at the seam,
+        // so the user is never told something false even though the turn is action-free.
+        let inner = r#"{\"text\":\"I created the task and started the run.\",\"confidence\":0.95}"#;
+        let stdout = format!(r#"{{"type":"result","is_error":false,"result":"{inner}"}}"#);
+        assert!(
+            parse_cli_clarify(
+                &stdout,
+                relux_core::AdapterKind::CodexCli,
+                relux_kernel::ClarifyKind::Brainstorm,
+                "Good - let's think it through.",
+            )
+            .is_none(),
+            "an action claim must fail closed"
         );
     }
 

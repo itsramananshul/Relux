@@ -10,6 +10,7 @@ import {
   intentProvenance,
   slotProvenance,
   brainSourceLabel,
+  replyPolishLabel,
 } from "../src/prime.ts";
 import type { ReluxPrimeProposal, ReluxPrimeTaskSlots } from "../src/api.ts";
 
@@ -138,6 +139,26 @@ test("intentProvenance shows a label only when the brain decided the intent", ()
   assert.equal(intentProvenance("deterministic"), null);
   assert.equal(intentProvenance(undefined), null);
   assert.equal(intentProvenance(""), null);
+});
+
+// A brain-polished clarify/brainstorm reply shows a small chip ONLY when the server
+// attached `reply_polish` (i.e. a configured brain re-worded the turn through the
+// validated wording path). The label distinguishes a clarifying question from a
+// brainstorm reply and carries the brain source; an absent overlay attributes nothing,
+// so the chip never overclaims a brain decision on a deterministic-worded turn.
+test("replyPolishLabel reads honestly per kind and source, and is null when absent", () => {
+  assert.equal(
+    replyPolishLabel({ kind: "clarification", source: "anthropic/claude-3.5-haiku" }),
+    "brain-worded question · anthropic/claude-3.5-haiku",
+  );
+  assert.equal(
+    replyPolishLabel({ kind: "brainstorm", source: "Claude CLI" }),
+    "brain-worded reply · Claude CLI",
+  );
+  // No overlay -> nothing to attribute.
+  assert.equal(replyPolishLabel(undefined), null);
+  // An unstamped source degrades to the generic brain label, never blank.
+  assert.equal(replyPolishLabel({ kind: "clarification", source: "   " }), "brain-worded question · AI brain");
 });
 
 test("polishProvenance is null without a polish overlay and generic when the source is unrecorded", () => {

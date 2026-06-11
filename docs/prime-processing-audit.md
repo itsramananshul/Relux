@@ -461,6 +461,62 @@ assertion); the server seam tests (`cli_agent_slots_*`, `cli_plugin_ref_*`,
 `cli_permission_slots_*`); and the dashboard `brainSourceLabel` test. No test calls a real
 provider.
 
+## Applied change (brain-assisted clarification wording + agent persona seed)
+
+The remaining keyword surfaces flagged by the previous "Next recommended slice" are now
+behind the brain: the **reflect-and-clarify wording** and the created-agent **starter
+persona**. Per master plan §10.5 ("ask clarifying questions when needed"), §10.1/§10.2,
+and §17.1, and following the reference read recorded in
+`reference-driven-development.md` (Hermes `<missing_context>`/`<act_dont_ask>` ask-one-
+question steering + `message_sanitization` clamp; openclaw `sessions-spawn-tool`/`common.ts`
+allowlist + required string, `cli-output`/`balanced-json` envelope lift), a configured brain
+may now *re-word* an ambiguous/musing turn and *propose* a bounded persona — validated hard.
+
+- **New module `relux-kernel/src/prime_clarify.rs`.** `clarify_polish_kind(turn)` decides which
+  turns are eligible: a `NeedsClarification` turn (every `Clarify` arm, incl. `TaskUpdate`,
+  orchestration single-step, run/assign ambiguity) → a `Clarify` wording polish; a
+  `Brainstorming` reply or a **single-step** `PlanRequest` steer → a `Brainstorm` polish; **every
+  actionful turn → `None`**, so the brain is never near an action. `build_clarify_prompt` demands
+  JSON-only `{text, confidence}`. `parse_clarify` lifts the JSON via the shared balanced-brace
+  scanner, **rejects any field outside `text`/`confidence`/`rationale`**, sanitizes + clamps the
+  text (clarify forced single-line, 240 chars; brainstorm 600), **structurally enforces a single
+  `?` for a clarify** (a multi-question lecture or a statement is rejected), and **rejects any
+  reply that claims a completed action** (a keyword safety rail). `reconcile_clarify` drops a
+  low-confidence or pure-echo proposal. The brain only ever swaps `turn.reply` text on a
+  non-actionful turn — the action-free wall is intact.
+- **Both brains feed one validator.** OpenRouter goes through
+  `ai::polish_clarify_via_openrouter`; the Claude/Codex CLI brains spawn in the same bounded,
+  non-bypass mode and their stdout is lifted by `parse_adapter_result` FIRST (`server.rs`
+  `polish_clarify_via_cli` / `parse_cli_clarify`) so the raw envelope never reaches the parser or
+  the chat bubble. Both land on the SAME `parse_clarify` → `reconcile_clarify`. Wired in
+  `run_prime` OUTSIDE the lock, gated on `clarify_polish_kind`; the free-form shaper is skipped
+  for these turns so the brain returns ONE validated question/summary, never free-form prose. Any
+  failure leaves the grounded deterministic template wording in place, with no provenance.
+- **Agent persona seed.** The data model already supports it (`Agent.persona`,
+  `KernelState::create_agent(persona)` — previously always handed `None`). `prime_agent_slots`
+  now accepts an optional `persona` (added to the allowlist), sanitized/clamped, with an
+  **overlong persona failing the whole proposal closed** (never silently truncated). A
+  persona-alone proposal counts as a real contribution. The validated persona flows through the
+  existing `AgentCreation` → `create_agent` seam and is surfaced on the new agent card (Prime
+  chat) and on **Crew**. The deterministic path still creates a personaless agent.
+- **Provenance (UI).** A small `🧠 brain-worded question/reply · <source>` chip on the Prime
+  chat turn (server stamps `reply_polish` on the response) when the brain re-worded the turn; the
+  agent-slot card shows the seeded persona; Crew renders an agent's persona when set. All
+  presentation/provenance only — the wording was schema-validated and the turn is action-free.
+
+Pinned by the `prime_clarify` unit tests (clean clarify/brainstorm parse, noisy-reply extraction,
+invalid JSON / unsupported field fail-closed, exactly-one-question enforcement, action-claim
+rejection, control-char strip + clamp, reconcile low-confidence/echo); the kernel integration
+tests (`clarify_polish_targets_only_nonactionful_clarify_and_brainstorm`,
+`brain_agent_slots_seed_a_starter_persona_on_the_created_agent`,
+`deterministic_agent_create_has_no_persona`); the `prime_agent_slots` persona unit tests
+(`parses_and_bounds_a_starter_persona`, `rejects_an_overlong_persona_fail_closed`,
+`reconcile_honors_a_persona_only_contribution`); the server seam tests
+(`cli_clarify_lifted_from_a_result_envelope`,
+`cli_clarify_error_envelope_and_non_question_yield_nothing`,
+`cli_clarify_brainstorm_rejects_an_action_claim`); and the dashboard `replyPolishLabel` test +
+the extended `PrimeAgentSlots` persona round-trip. No test calls a real provider.
+
 ## Current Prime brain stack
 
 The end-to-end shape of one Prime turn, with the brain strictly additive and the
@@ -490,23 +546,35 @@ deterministic kernel always the authority:
    protected install or grant. Plan previews (`PlanRequest`) remain action-free, and
    orchestration steps stay owned by the deterministic `plan_orchestration` (the brain
    only *polishes* their wording).
-4. **UI response** — the reply text may be brain-shaped on a conversational turn
-   (`shape_reply` / CLI brain), a plan card may carry an advisory polish overlay, a
-   sharpened create carries a `slots` card, a sharpened agent a `agent_slots` card,
+4. **UI response** — the reply text may be brain-shaped on a conversational turn. A
+   **clarify / brainstorm / single-step plan** turn goes through the VALIDATED wording
+   path (`prime_clarify`: one schema-checked question / short summary, action claims
+   rejected); other conversational turns go through the free-form `shape_reply` / CLI
+   brain. A plan card may carry an advisory polish overlay, a sharpened create carries a
+   `slots` card, a sharpened agent an `agent_slots` card (incl. a seeded **persona**),
    and a sharpened risky `Propose` an advisory `admin_slots` card. Every brain
-   contribution is labeled (intent → `brain-classified`; polish/slots → the model id
-   or CLI label via the shared `brainSourceLabel`) and is presentation/provenance only
-   — never a fresh authority.
+   contribution is labeled (intent → `brain-classified`; re-worded reply → `🧠
+   brain-worded question/reply`; polish/slots → the model id or CLI label via the shared
+   `brainSourceLabel`) and is presentation/provenance only — never a fresh authority.
 
 ## Next recommended slice
 
-The brittle keyword gaps the roadmap flagged — `derive_agent_name`,
-`derive_plugin_id`, and the permission-subject slice — are now all behind the
-validated brain-slot layer (see above). The remaining keyword surfaces are the
-**reflect-and-clarify** prompts: when the optional LLM brain is enabled, let it
-*propose* the clarifying question across the brainstorm / orchestration / task-update
-arms — the same "model suggests wording, deterministic classifier owns the action"
-seam now used for the plan proposal — while keeping the action-free wall intact. A
-further rung: let the agent-slot brain also propose a starter **persona** (today
-`create_agent` is always handed `None`), validated/clamped the same way, so a created
-operative arrives with a usable voice rather than a blank one.
+The reflect-and-clarify wording and the agent persona seed are now behind the
+validated brain layer (see the applied change above), so Prime's ambiguous/clarifying
+turns and its created operatives no longer read as fixed templates. The remaining
+keyword surfaces are narrower:
+
+- **The slot field-extractors themselves** (`extract_task_id`,
+  `extract_agent_id_from_assignment`, `update_change_phrase`, `orchestration_goal`,
+  `plan_goal`) are still deterministic string-slicing. They are the *grounding* the brain
+  reconciles against and the fallback when no brain is live, so they should stay — but the
+  `AssignTask` arm (today pure `extract_task_id` + `extract_agent_id_from_assignment`) is a
+  candidate for the same validated-slot treatment (a brain proposes `{task_id, agent_id}`,
+  reconciled against `summary.all_task_ids` / `all_agent_ids`).
+- **A persona for the manual Crew create form** — today persona is brain-seeded only; a
+  small optional persona input on the Crew form (validated/clamped the same way) would let an
+  operator set one without the brain.
+- **Multi-turn clarify memory** — a `Clarify` turn asks one question, but the next turn does
+  not yet *carry* the prior question's context; Hermes's per-turn transcript memory
+  (`docs/relix-hermes-integration.md`) is the transplant that would let a follow-up answer
+  resolve the original ambiguous request without the user re-stating it.

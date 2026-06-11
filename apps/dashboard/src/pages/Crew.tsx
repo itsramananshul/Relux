@@ -110,6 +110,11 @@ export function Crew() {
               <div key={agent.id} className="agent-card">
                 <h3>{agent.name} ({agent.id})</h3>
                 <p><strong>Role:</strong> {agent.description || "N/A"}</p>
+                {agent.persona && (
+                  <p style={{ fontStyle: "italic" }}>
+                    <strong>Persona:</strong> {agent.persona}
+                  </p>
+                )}
                 <p><strong>Status:</strong> {agent.status || "—"}</p>
                 <p><strong>Adapter:</strong> {agent.adapter_plugin || "—"}</p>
                 <p><strong>Permissions:</strong> {agent.permissions_summary || "N/A"}</p>

@@ -1447,7 +1447,20 @@ export interface ReluxPrimeAgentSlots {
   description?: string;
   adapter?: string;
   notes?: string;
+  // A bounded, validated starter persona / operating style the brain proposed and the
+  // kernel wrote to the created agent (and shows in Crew). Omitted when none.
+  persona?: string;
   source?: string;
+}
+
+// Provenance for a brain-polished clarify / brainstorm reply, present ONLY when a
+// configured brain re-worded the turn's wording through the VALIDATED path. The turn
+// stays action-free; this is the small chip's label source.
+export interface ReluxReplyPolish {
+  // "clarification" | "brainstorm"
+  kind: string;
+  // The OpenRouter model id / CLI brain label that produced the wording.
+  source: string;
 }
 
 // Brain-assisted, VALIDATED subject of a risky admin action (a plugin install or a
@@ -1488,6 +1501,10 @@ export interface ReluxPrimeTurn {
   // permission grant), present ONLY on a Propose turn the brain sharpened. The action
   // stays approval-gated. Omitted on every other turn.
   admin_slots?: ReluxPrimeAdminSlots;
+  // Provenance for a brain-polished clarify / brainstorm reply, present ONLY when a
+  // configured brain re-worded this turn's wording through the validated path. The turn
+  // stays action-free; this is advisory provenance for the small chip. Omitted otherwise.
+  reply_polish?: ReluxReplyPolish;
   // Tool fields: present only when Prime ran (or honestly refused) a tool this
   // turn. `invoked_tool` is "<plugin_id>/<tool_name>"; `tool_output` carries the
   // real kernel output; `tool_error` is an honest reason a tool did NOT run.
@@ -1844,6 +1861,9 @@ export interface ReluxAgent {
   namespace: string;
   status: string;
   permissions_summary: string;
+  // The agent's starter persona / operating style, when one was set (today via the
+  // brain-assisted agent-creation path). Omitted when none.
+  persona?: string;
   created_at: string;
 }
 
