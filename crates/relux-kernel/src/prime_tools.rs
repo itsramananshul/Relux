@@ -408,6 +408,31 @@ pub fn interpret_reply(raw: &str) -> BrainTurn {
     }
 }
 
+/// Validate ONE read-only tool request object (`{"tool":..,"args":..}`) the brain proposed inside
+/// its UNIFIED decision envelope ([`crate::prime_decision`]), returning an allowlisted [`ToolCall`]
+/// or `None`.
+///
+/// Fail-closed, exactly like [`interpret_reply`]'s tool branch: the name is sanitized and run
+/// through [`classify_tool`]; a name NOT on the read-only allowlist (a mutating / unknown / made-up
+/// tool such as `delete_task` or `run_shell`) is rejected (`None`), never executed. The `args`
+/// object is carried through to the executor, which sanitizes each id at read time. Pure. This is
+/// the parse-time gate for the unified-decision tool-request path; the deterministic runtime
+/// execution is [`execute_requested_reads`].
+pub fn validate_tool_request(value: &serde_json::Value) -> Option<ToolCall> {
+    let obj = value.as_object()?;
+    let raw = obj.get("tool").and_then(|v| v.as_str())?;
+    let tool = sanitize_line(raw, MAX_ARG_CHARS);
+    if classify_tool(&tool) != ToolKind::ReadOnly {
+        return None;
+    }
+    let args = obj
+        .get("args")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    Some(ToolCall { tool, args })
+}
+
 /// Execute one allowlisted read-only tool against the snapshot. PURE: reads only, mutates
 /// nothing, fabricates nothing. An unknown id is an honest `ok: false` read. The `tool` is
 /// assumed already validated by [`classify_tool`]; a name that somehow is not handled returns a
@@ -913,6 +938,40 @@ pub fn run_context_loop<F: FnMut(&str) -> Option<String>>(
     lp.into_reads()
 }
 
+/// Execute a bounded, PRE-VALIDATED list of read-only tool requests against the snapshot,
+/// returning the gathered reads. This is the UNIFIED-DECISION counterpart of the multi-round
+/// [`ContextLoop`]: when the brain requests its read-only tools UP FRONT in one decision envelope
+/// (instead of over several loop rounds), the kernel executes them here deterministically with NO
+/// further brain call, then grounds the reply in the observations — so the unified path issues one
+/// fewer brain round than the sidecar loop and never executes the same reads twice.
+///
+/// PURE: reads only, mutates nothing, fabricates nothing — every entry is already an allowlisted
+/// [`ToolCall`] (see [`validate_tool_request`]), so no mutating/unknown name can reach an executor.
+/// Bounded exactly like the loop: at most [`MAX_TOOL_ROUNDS`] reads run (extra requests are dropped,
+/// matching the round cap), and a repeated identical read (same tool + body) is skipped so a brain
+/// that lists the same tool twice does not double-count.
+pub fn execute_requested_reads(snapshot: &ContextSnapshot, calls: &[ToolCall]) -> Vec<ContextRead> {
+    let mut reads: Vec<ContextRead> = Vec::new();
+    for call in calls.iter().take(MAX_TOOL_ROUNDS) {
+        let read = execute_context_tool(snapshot, call);
+        if reads.iter().any(|r| r.tool == read.tool && r.detail == read.detail) {
+            continue;
+        }
+        reads.push(read);
+    }
+    reads
+}
+
+/// The read-only tool names, comma-joined — grounding for the unified decision prompt's
+/// `tool_requests` section so the brain names only a real read-only tool. Pure.
+pub fn read_only_tool_names() -> String {
+    READ_ONLY_TOOLS
+        .iter()
+        .map(|t| t.name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Render the gathered reads as a compact grounded-facts block to fold into the conversational
 /// reply prompt, or an empty string when nothing was gathered. The brain that shapes the final
 /// reply treats these as factual reads it performed this turn. Bounded by construction (each read
@@ -1259,5 +1318,52 @@ mod tests {
         let reads = run_context_loop("hi", &snap, |_| None);
         assert!(reads.is_empty());
         assert!(render_observations(&reads).is_empty());
+    }
+
+    #[test]
+    fn validate_tool_request_is_fail_closed_on_mutating_and_unknown_names() {
+        // A read-only request validates into an allowlisted ToolCall, args carried through.
+        let v = serde_json::json!({"tool":"get_task","args":{"task_id":"task_0001"}});
+        let call = validate_tool_request(&v).expect("a read-only request validates");
+        assert_eq!(call.tool, "get_task");
+        assert_eq!(call.args.get("task_id").unwrap().as_str(), Some("task_0001"));
+        // A mutating / unknown / made-up name is rejected at parse time — never an executable call.
+        assert!(validate_tool_request(&serde_json::json!({"tool":"delete_task"})).is_none());
+        assert!(validate_tool_request(&serde_json::json!({"tool":"run_shell","args":{}})).is_none());
+        assert!(validate_tool_request(&serde_json::json!({"tool":"create_task"})).is_none());
+        // A missing/empty tool name or a non-object request is rejected.
+        assert!(validate_tool_request(&serde_json::json!({"args":{}})).is_none());
+        assert!(validate_tool_request(&serde_json::json!({"tool":""})).is_none());
+        assert!(validate_tool_request(&serde_json::json!("get_task")).is_none());
+    }
+
+    #[test]
+    fn execute_requested_reads_is_bounded_deduped_and_read_only() {
+        let snap = snapshot();
+        // A pre-validated request list (as the unified decision would carry) runs deterministically
+        // with no brain round, in order.
+        let calls = vec![
+            ToolCall { tool: "board_summary".into(), args: Default::default() },
+            ToolCall {
+                tool: "get_task".into(),
+                args: serde_json::Map::from_iter([("task_id".into(), "task_0001".into())]),
+            },
+        ];
+        let reads = execute_requested_reads(&snap, &calls);
+        assert_eq!(reads.len(), 2);
+        assert_eq!(reads[0].tool, "board_summary");
+        assert!(reads[1].ok && reads[1].detail.contains("Fix the login redirect"));
+
+        // A repeated identical read is skipped (no double-count), and the list is capped at the
+        // round budget so a long request list can never spin.
+        let mut many: Vec<ToolCall> =
+            vec![ToolCall { tool: "board_summary".into(), args: Default::default() }; 3];
+        for _ in 0..MAX_TOOL_ROUNDS + 5 {
+            many.push(ToolCall { tool: "list_tasks".into(), args: Default::default() });
+        }
+        let reads = execute_requested_reads(&snap, &many);
+        assert!(reads.len() <= MAX_TOOL_ROUNDS, "the request list is bounded by the round cap");
+        // board_summary appears at most once despite three identical entries.
+        assert_eq!(reads.iter().filter(|r| r.tool == "board_summary").count(), 1);
     }
 }

@@ -1925,23 +1925,34 @@ async fn run_prime(
         && relux_kernel::turn_wants_context(&turn)
         && !matches!(brain, relux_kernel::PrimeBrain::Local)
     {
-        // An inspection / explanation / conversational-QUESTION turn: this is the first safe Prime
-        // tool loop. FIRST run the GOVERNED READ-ONLY context loop so the brain can inspect live
-        // state (a task, the crew, the runs) through validated read-only tools, THEN shape the
-        // reply grounded in what it actually observed. The loop changes nothing and never reaches
-        // an action (`docs/prime-processing-audit.md` "Read-only tool loop"); on a miss (the brain
-        // gathers nothing) `observations` is empty and the shaper behaves byte-for-byte as before.
-        // We deliberately prefer this gather-then-ground path over the unified decision's
-        // precomputed reply for these turns, because that reply was composed off the STATIC board
-        // summary — the live reads supersede it.
-        gathered_reads = gather_read_only_context(
-            brain,
-            &ai_config,
-            cli_status.clone(),
-            &context_snapshot,
-            &message,
-        )
-        .await;
+        // An inspection / explanation / conversational-QUESTION turn: the brain may inspect live
+        // state before answering. UNIFIED-FIRST: when the ONE decision envelope already requested
+        // read-only context tools (`tool_requests`, validated against the read-only allowlist at
+        // parse time), execute THOSE deterministically against the pre-taken snapshot — no second
+        // multi-round brain loop and no DUPLICATE execution. FALLBACK: when the envelope requested
+        // none (or there was no usable unified decision), run the sidecar `ContextLoop` exactly as
+        // before. Either path THEN shapes the reply grounded in what was actually observed — the
+        // one bounded follow-up brain response. The reads change nothing and never reach an action
+        // (`docs/prime-processing-audit.md` "Read context on the unified decision"); on a miss the
+        // observations are empty and the shaper behaves byte-for-byte as before. We deliberately
+        // prefer the live reads over the unified decision's precomputed `reply` for these turns,
+        // because that reply was composed off the STATIC board summary — the live reads supersede it.
+        let requested = decision
+            .as_ref()
+            .map(|d| d.context_requests.clone())
+            .unwrap_or_default();
+        gathered_reads = if requested.is_empty() {
+            gather_read_only_context(
+                brain,
+                &ai_config,
+                cli_status.clone(),
+                &context_snapshot,
+                &message,
+            )
+            .await
+        } else {
+            relux_kernel::execute_requested_reads(&context_snapshot, &requested)
+        };
         let observations = relux_kernel::render_observations(&gathered_reads);
         let outcome = match brain {
             relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli => {
@@ -6476,6 +6487,25 @@ mod tests {
         let reply = d.validated_reply("Hi.").expect("a confident, distinct reply is honored");
         assert_eq!(reply, "Hey - what can I help with?");
         assert!(!reply.contains("session_id") && !reply.contains("\"type\""));
+    }
+
+    #[test]
+    fn cli_decision_carries_read_only_tool_requests_through_the_no_leak_seam() {
+        // An inspection turn answered in ONE envelope: the brain requests read-only context tools
+        // up front, lifted out of the CLI result envelope with no scaffolding leak and validated
+        // against the read-only allowlist. A smuggled mutating request is dropped, never executed.
+        let inner = r#"{\"classification\":{\"intent\":\"status_question\",\"confidence\":0.9},\"tool_requests\":[{\"tool\":\"get_task\",\"args\":{\"task_id\":\"task_0001\"}},{\"tool\":\"delete_task\"}]}"#;
+        let stdout = format!(r#"{{"type":"result","is_error":false,"result":"{inner}","session_id":"abc"}}"#);
+        let d = parse_cli_decision(&stdout, relux_core::AdapterKind::ClaudeCli)
+            .expect("a tool_requests envelope validates");
+        assert_eq!(d.context_requests.len(), 1, "only the read-only request survives");
+        assert_eq!(d.context_requests[0].tool, "get_task");
+        assert_eq!(
+            d.context_requests[0].args.get("task_id").unwrap().as_str(),
+            Some("task_0001")
+        );
+        // No envelope scaffolding leaks into the validated request.
+        assert!(!d.context_requests[0].tool.contains("session_id"));
     }
 
     #[test]

@@ -97,6 +97,10 @@ const ALLOWED_TOP_LEVEL_KEYS: &[&str] = &[
     "assign",
     "update",
     "wording",
+    // Read-only context tools the brain wants the kernel to run BEFORE it answers — the unified
+    // counterpart of the standalone read-only loop. `context_reads` is accepted as an alias.
+    "tool_requests",
+    "context_reads",
     // The free-form conversational reply for a non-clarify chat turn (greeting / direct
     // answer / explanation). `assistant_message` is accepted as an alias for the same field.
     "reply",
@@ -134,6 +138,16 @@ pub struct PrimeBrainDecision {
     pub assign: Option<crate::prime_assign_slots::BrainAssignSlots>,
     /// By-id update slots for a `TaskUpdate` turn the deterministic rail could not resolve.
     pub update: Option<crate::prime_update_slots::BrainUpdateSlots>,
+    /// Read-only context tool requests the brain made in this ONE unified decision envelope,
+    /// already validated against the read-only allowlist
+    /// ([`crate::prime_tools::validate_tool_request`]): a mutating / unknown / made-up tool name is
+    /// dropped at parse time and NEVER executed. On a non-actionful inspection turn the server runs
+    /// these deterministically against the live snapshot
+    /// ([`crate::prime_tools::execute_requested_reads`]) and grounds the reply in the observations —
+    /// instead of running the separate sidecar tool loop (no duplicate execution). Empty when the
+    /// brain requested no context tools (the sidecar [`crate::prime_tools::ContextLoop`] is then the
+    /// fallback). Bounded by the loop's round cap at parse time.
+    pub context_requests: Vec<crate::prime_tools::ToolCall>,
     /// The raw wording sub-object (`{text, confidence, rationale?}`) re-serialized to JSON,
     /// NOT yet validated against a `ClarifyKind`. It is validated and reconciled later via
     /// [`Self::validated_wording`] against the turn's actual kind + deterministic text
@@ -180,6 +194,7 @@ impl PrimeBrainDecision {
             self.assign.is_some(),
             self.update.is_some(),
             self.wording.is_some(),
+            !self.context_requests.is_empty(),
             self.reply.is_some(),
             self.plan_polish.is_some(),
         ]
@@ -258,6 +273,7 @@ impl PrimeBrainDecision {
 /// Kept ASCII and self-contained so it works as a one-shot CLI stdin prompt.
 pub fn build_decision_prompt(message: &str, summary: &StateSummary) -> String {
     let labels = intent_labels().join(", ");
+    let tools = crate::prime_tools::read_only_tool_names();
     let (tasks, agents) = board_catalog(summary);
     format!(
         "You are the single decision stage for Prime, the operator of a local Relux control \
@@ -277,6 +293,7 @@ the rest. The shape is:\n\
   \"assign\": {{\"task_id\":\"<existing task id>\",\"agent_id\":\"<existing agent id>\",\"confidence\":0.0-1.0}},\n\
   \"update\": {{\"task_id\":\"<existing task id>\",\"title\":\"<optional>\",\"details\":\"<optional>\",\"priority\":<optional 1-9>,\"status\":\"<optional blocked|cancelled>\",\"assignee\":\"<optional existing agent id>\",\"confidence\":0.0-1.0}},\n\
   \"wording\": {{\"text\":\"<one clarifying question, or a short brainstorm reply>\",\"confidence\":0.0-1.0}},\n\
+  \"tool_requests\": [{{\"tool\":\"<read-only tool>\",\"args\":{{...}}}}],\n\
   \"reply\": {{\"text\":\"<a short, natural conversational answer>\",\"confidence\":0.0-1.0}},\n\
   \"plan_polish\": {{\"summary\":\"<clearer one-line plan summary>\",\"questions\":[\"<optional>\"],\"risks\":[\"<optional>\"]}},\n\
   \"confidence\": 0.0-1.0\n\
@@ -293,6 +310,10 @@ existing task by id.\n\
 are unsure of an id, omit that field. Never invent an id.\n\
 - Include \"wording\" ONLY when the turn is a clarifying question or a brainstorm reply. For a \
 clarify it MUST be EXACTLY ONE concrete question ending in '?'. Never assert a completed action.\n\
+- Include \"tool_requests\" ONLY when answering needs you to inspect live state first (e.g. a \
+specific task's detail, a run, the full crew). Each entry MUST name a READ-ONLY tool from: \
+{tools}. These tools ONLY read; they change nothing. The kernel runs them and you answer grounded \
+in the results. Never request a tool that writes, deletes, or runs anything.\n\
 - Include \"reply\" with a short, natural conversational answer when the turn is plain \
 conversation (a greeting, a direct factual answer, an explanation) rather than a clarifying \
 question. Keep it brief; never claim you created, started, installed, granted, or changed \
@@ -463,6 +484,23 @@ pub fn parse_decision(raw: &str) -> Result<PrimeBrainDecision, String> {
         .filter(|v| v.is_object())
         .and_then(|v| serde_json::to_string(v).ok());
 
+    // Read-only context tool requests: a list of `{tool, args}` the brain wants run BEFORE it
+    // answers. Each entry is validated against the READ-ONLY allowlist via
+    // `prime_tools::validate_tool_request` — a mutating / unknown / made-up name is DROPPED here and
+    // can never execute — and the list is capped at the loop's round budget so it stays bounded.
+    // A non-array `tool_requests` yields no requests. `context_reads` is accepted as an alias.
+    let context_requests = obj
+        .get("tool_requests")
+        .or_else(|| obj.get("context_reads"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(crate::prime_tools::validate_tool_request)
+                .take(crate::prime_tools::MAX_TOOL_ROUNDS)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
     // Carry the free-form reply raw (re-serialized), validated later via `validated_reply`. A
     // brain may emit `reply` as a bare string ("Hello!") or as a `{text, confidence}` object;
     // normalize a bare string to `{text:...}` so the existing brainstorm validator sees the
@@ -506,6 +544,7 @@ pub fn parse_decision(raw: &str) -> Result<PrimeBrainDecision, String> {
         permission,
         assign,
         update,
+        context_requests,
         wording,
         reply,
         plan_polish,
@@ -796,6 +835,73 @@ mod tests {
         let polish = drift.validated_polish(&proposal, "m").unwrap();
         assert!(polish.step_titles.is_empty(), "drifted titles must be dropped");
         assert_eq!(polish.summary.as_deref(), Some("Refined."));
+    }
+
+    #[test]
+    fn carries_read_only_tool_requests_validated_against_the_allowlist() {
+        // The unified envelope may request read-only context tools up front; each is validated
+        // through the SAME read-only allowlist the loop uses, so the kernel can run them
+        // deterministically with no second multi-round brain loop.
+        let d = parse_decision(
+            r#"{
+                "classification":{"intent":"status_question","confidence":0.9},
+                "tool_requests":[
+                    {"tool":"get_task","args":{"task_id":"task_0001"}},
+                    {"tool":"list_agents"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(d.context_requests.len(), 2);
+        assert_eq!(d.context_requests[0].tool, "get_task");
+        assert_eq!(
+            d.context_requests[0].args.get("task_id").unwrap().as_str(),
+            Some("task_0001")
+        );
+        assert_eq!(d.context_requests[1].tool, "list_agents");
+        // The section counts toward the usable total alongside the classification.
+        assert_eq!(d.section_count(), 2);
+    }
+
+    #[test]
+    fn a_mutating_tool_request_is_rejected_never_executed() {
+        // A mutating / unknown tool named in tool_requests is DROPPED at parse time (fail closed),
+        // so it can never reach an executor. The valid read-only request alongside it survives.
+        let d = parse_decision(
+            r#"{
+                "tool_requests":[
+                    {"tool":"delete_task","args":{"task_id":"task_0001"}},
+                    {"tool":"run_shell","args":{"cmd":"rm -rf /"}},
+                    {"tool":"board_summary"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(d.context_requests.len(), 1, "only the read-only request survives");
+        assert_eq!(d.context_requests[0].tool, "board_summary");
+
+        // An envelope whose ONLY tool requests are mutating has no usable section -> the caller
+        // falls back to the specialized/sidecar paths (the brain is strictly additive).
+        assert!(parse_decision(r#"{"tool_requests":[{"tool":"delete_task"}]}"#).is_err());
+    }
+
+    #[test]
+    fn context_reads_is_accepted_as_an_alias_for_tool_requests() {
+        let d = parse_decision(r#"{"context_reads":[{"tool":"list_runs"}]}"#).unwrap();
+        assert_eq!(d.context_requests.len(), 1);
+        assert_eq!(d.context_requests[0].tool, "list_runs");
+    }
+
+    #[test]
+    fn tool_requests_are_bounded_by_the_round_cap() {
+        // A brain that lists more requests than the round budget is capped at parse time, so the
+        // deterministic execution can never exceed the loop's bound.
+        let many: Vec<String> = (0..crate::prime_tools::MAX_TOOL_ROUNDS + 6)
+            .map(|_| r#"{"tool":"board_summary"}"#.to_string())
+            .collect();
+        let raw = format!(r#"{{"tool_requests":[{}]}}"#, many.join(","));
+        let d = parse_decision(&raw).unwrap();
+        assert!(d.context_requests.len() <= crate::prime_tools::MAX_TOOL_ROUNDS);
     }
 
     #[test]

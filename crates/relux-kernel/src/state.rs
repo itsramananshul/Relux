@@ -7715,6 +7715,47 @@ mod tests {
         assert!(!r.ok && r.detail.contains("does not exist"));
     }
 
+    #[test]
+    fn unified_decision_tool_requests_execute_against_the_live_snapshot() {
+        // The "read context on the unified decision" path end-to-end: the brain's ONE decision
+        // envelope requests read-only context tools, the kernel parses + validates them against the
+        // read-only allowlist, and the server-side deterministic executor runs them against the
+        // live snapshot with no further brain call — the unified counterpart of the sidecar loop.
+        use crate::prime_decision::parse_decision;
+        use crate::prime_tools::execute_requested_reads;
+        let (mut k, ctx) = prime_chat_kernel();
+        add_agent(&mut k, &ctx, "researcher");
+        let created = k
+            .prime_turn(&ctx, "create a task to summarize the README")
+            .unwrap();
+        let task_id = created.created_task.expect("a task was created").0;
+
+        // A unified decision a status-question turn might produce: classify + request two reads,
+        // one of them a smuggled mutating tool that must be rejected at parse time.
+        let raw = format!(
+            r#"{{"classification":{{"intent":"status_question","confidence":0.9}},
+                 "tool_requests":[
+                    {{"tool":"get_task","args":{{"task_id":"{task_id}"}}}},
+                    {{"tool":"list_agents"}},
+                    {{"tool":"delete_task","args":{{"task_id":"{task_id}"}}}}
+                 ]}}"#
+        );
+        let decision = parse_decision(&raw).expect("a valid unified decision");
+        // The mutating request was dropped; only the two read-only requests survive.
+        assert_eq!(decision.context_requests.len(), 2);
+
+        // Executed deterministically against the live snapshot — grounded, read-only, honest.
+        let snap = k.context_snapshot(&ctx);
+        let reads = execute_requested_reads(&snap, &decision.context_requests);
+        assert_eq!(reads.len(), 2);
+        let get_task = reads.iter().find(|r| r.tool == "get_task").unwrap();
+        assert!(get_task.ok && get_task.summary.contains(&task_id));
+        let list_agents = reads.iter().find(|r| r.tool == "list_agents").unwrap();
+        assert!(list_agents.ok && list_agents.detail.contains("researcher"));
+        // No mutation happened: the task is still on the board, unchanged.
+        assert!(k.context_snapshot(&ctx).tasks.iter().any(|t| t.id == task_id));
+    }
+
     // --- Multi-turn clarification memory ----------------------------------------
     //
     // (`docs/prime-processing-audit.md` "Multi-turn clarify memory"). A clarifying

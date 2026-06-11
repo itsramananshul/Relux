@@ -1046,6 +1046,69 @@ Pinned by the new `prime_tools` unit tests (`get_run_reads_real_runs_and_is_hone
 as protected, list_approvals reads the empty queue honestly, get_run on an unknown id is an honest
 miss). No test calls a real provider; no wire/dashboard change was needed.
 
+## Applied change (read context on the unified decision)
+
+The read-only context loop shipped as a SELF-CONTAINED sidecar: the unified `PrimeBrainDecision`
+answered intent + slots + wording from one static board snapshot, and THEN a separate multi-round
+`ContextLoop` ran to gather live reads on a non-actionful inspection turn. So an inspection turn
+cost the unified call PLUS up to `MAX_TOOL_ROUNDS` loop calls PLUS the reply call — two disjoint
+brain interactions, less coherent than how Hermes/Codex answer (ONE response carries the answer AND
+the structured tool requests). Per master plan §10.1 (Intent Layer), §10.2 (Action Layer), §17.1,
+and following the reference read recorded in `reference-driven-development.md` (Hermes
+`run_conversation` one-response-carries-content-and-tool_calls + name-allowlist validation + bounded
+inject-and-ground; openclaw `tool-mutation` fail-closed read-only gate, `update-plan-tool` per-entry
+validation, `sessions-spawn-tool` unsupported-key rejection, `cli-output`/`balanced-json`
+parse-only-the-object), the ONE unified decision envelope may now ALSO carry the brain's read-only
+tool requests, executed deterministically and grounded into the reply — the sidecar loop kept as the
+fallback, with NO mutation path.
+
+- **New section `tool_requests` on `PrimeBrainDecision`** (`relux-kernel/src/prime_decision.rs`):
+  an array of `{tool, args}` the brain wants run BEFORE it answers, carried in the SAME envelope as
+  intent/slots/wording. `parse_decision` validates EACH entry through the SAME read-only allowlist
+  the loop uses (`prime_tools::validate_tool_request` → `classify_tool`): a mutating / unknown /
+  made-up name (`delete_task`, `run_shell`) is DROPPED at parse time and can never execute; the list
+  is capped at `MAX_TOOL_ROUNDS`; `context_reads` is accepted as an alias. The section counts toward
+  the usable-section total, and `tool_requests`/`context_reads` join the top-level allowlist (any
+  OTHER unknown top-level key still fails the whole envelope closed). `build_decision_prompt`
+  describes the section and lists the read-only tool names.
+- **Deterministic, bounded execution** (`relux-kernel/src/prime_tools.rs`):
+  `execute_requested_reads(snapshot, calls)` runs the validated list against the pre-taken
+  `ContextSnapshot` — bounded by `MAX_TOOL_ROUNDS`, repeated identical reads skipped — with NO brain
+  round. It is the unified counterpart of the multi-round `ContextLoop`; both are read-only and
+  gather-only, and both feed `render_observations` → the existing reply shaper.
+- **Wired in `run_prime` (server.rs), unified-first.** On a non-actionful inspection turn
+  (`turn_wants_context` ∧ `!is_actionful` ∧ a configured brain), if the unified decision carried
+  `context_requests`, the server executes THOSE deterministically (no second multi-round loop, no
+  DUPLICATE execution) and shapes the reply grounded in the observations — the one bounded follow-up
+  response. When the envelope requested none (or there was no usable decision), the sidecar
+  `gather_read_only_context` loop runs exactly as before. `Local` always takes the sidecar path
+  (gathering nothing), byte-for-byte the prior behavior.
+- **Both brains feed one parser.** OpenRouter via `ai::decide_prime_via_openrouter`; the
+  Claude/Codex CLI brains via `server.rs` `decide_prime_via_cli` → the no-leak `parse_cli_decision`
+  (`parse_adapter_result` FIRST, so the raw `--output-format json` envelope never reaches the request
+  validation or the chat).
+- **Safety invariants (binding).** The fold changes only WHEN the read-only tools are requested (in
+  the one decision call) and removes a duplicate brain interaction; it changes NOTHING about
+  authority or the read-only-and-gather-only contract. Every requested tool is a pure read of the
+  owned snapshot validated against the read-only allowlist; a mutating request is rejected at parse
+  time; the execution is deterministic and bounded; there is no path from this path to
+  `prime_execute`, an approval, or any mutation. The reads only GROUND the action-free reply, and on
+  any failure / a no-request turn / `Local` the sidecar loop is the byte-for-byte fallback.
+- **UI.** No dashboard change: the requested reads land on the SAME `PrimeTurn.context_reads` wire
+  type (tool + ok + summary), so the existing provenance chip (`🔎 used: get_task, list_agents`)
+  surfaces them automatically with the same no-leak, bounded rendering. The dashboard bundle is
+  unchanged.
+
+Pinned by the `prime_decision` unit tests (`carries_read_only_tool_requests_validated_against_the_
+allowlist`, `a_mutating_tool_request_is_rejected_never_executed`,
+`context_reads_is_accepted_as_an_alias_for_tool_requests`, `tool_requests_are_bounded_by_the_round_
+cap`); the `prime_tools` unit tests (`validate_tool_request_is_fail_closed_on_mutating_and_unknown_
+names`, `execute_requested_reads_is_bounded_deduped_and_read_only`); the kernel integration test
+`unified_decision_tool_requests_execute_against_the_live_snapshot` (parse + validate + execute
+against the live board, mutating request dropped, no mutation); and the server seam test
+`cli_decision_carries_read_only_tool_requests_through_the_no_leak_seam`. No test calls a real
+provider; no wire/dashboard change was needed.
+
 ## Current Prime brain stack
 
 The end-to-end shape of one Prime turn, with the brain strictly additive and the
@@ -1099,12 +1162,16 @@ unavailable:
    orchestration steps stay owned by the deterministic `plan_orchestration` (the brain
    only *polishes* their wording).
 3b. **Read-only context loop** (a NON-actionful inspection/explanation/question turn only) — before
-   the reply is shaped, a configured brain may run the GOVERNED READ-ONLY tool loop
-   (`prime_tools`): it requests an allowlisted read-only tool (`board_summary`/`list_tasks`/
-   `get_task`/`list_agents`/`get_agent`/`list_runs`/`get_run`/`list_plugins`/`list_approvals`), the
-   kernel validates the name (off-list ⇒
-   refused + self-corrected, never run), executes it deterministically against a pre-taken state
-   snapshot, injects the result, and loops (bounded by `MAX_TOOL_ROUNDS`, stop-on-repeat). The reads
+   the reply is shaped, a configured brain may inspect live state through the GOVERNED READ-ONLY
+   tools (`prime_tools`): an allowlisted read-only tool (`board_summary`/`list_tasks`/`get_task`/
+   `list_agents`/`get_agent`/`list_runs`/`get_run`/`list_plugins`/`list_approvals`), validated by
+   name (off-list ⇒ refused, never run) and executed deterministically against a pre-taken state
+   snapshot. **UNIFIED-FIRST:** when the ONE decision envelope (step 0c) already carried
+   `tool_requests`, the kernel executes those validated read-only requests deterministically
+   (`execute_requested_reads`, bounded by `MAX_TOOL_ROUNDS`, repeated reads skipped) with NO second
+   brain loop. **FALLBACK:** when the envelope requested none (or there was no usable decision), the
+   sidecar multi-round `ContextLoop` runs (request → validate → inject → re-prompt, bounded by
+   `MAX_TOOL_ROUNDS`, stop-on-repeat) — so there is never duplicate execution. Either way the reads
    change nothing and only GROUND the reply (folded into `grounded_facts`, surfaced as
    `context_reads` provenance). `Local` / an actionful turn gathers nothing.
 4. **UI response** — the reply text may be brain-shaped on a conversational turn. A
@@ -1142,10 +1209,13 @@ before answering. The obvious next rungs build on it:
   `decide` → `prime_execute` (safe `Act`) / human-approval (`Propose`) path, with `isMutatingToolCall`'s
   unknown-⇒-mutating default as the gate. This must NOT bypass the action-free wall — it is a real
   design slice, not a flag flip, and stays deferred until the read-only loop is proven in use.
-- **Read context on the unified decision** — folding the read-only loop INTO the unified
-  `PrimeBrainDecision` call (so the brain inspects, then emits intent+slots+wording with the gathered
-  context in one multi-round envelope) is the coherence win, but a larger change to the decision
-  plumbing; the self-contained inspection loop ships first.
+- **~~Read context on the unified decision~~ (DONE)** — the unified `PrimeBrainDecision` now carries
+  the brain's read-only `tool_requests` alongside intent+slots+wording; Relux executes the validated
+  reads deterministically (`execute_requested_reads`, no second brain loop, no duplicate execution)
+  and grounds the reply in them, with the sidecar `ContextLoop` as the fallback. The next coherence
+  win is a **multi-round** read on the unified call (request → observe → request again INSIDE the one
+  envelope flow before emitting the final intent/slots/reply), which needs the decision call itself
+  to loop; the single-pass up-front request shipped first.
 
 Multi-turn clarification continuation is now smart on four fronts: a **fuzzy assignee** resolves
 against the live roster (deterministic), a **by-id run start** is wired and its clarify is
