@@ -481,7 +481,7 @@ pub fn decide(message: &str, intent: &PrimeIntent, summary: &StateSummary) -> Pr
             }
         },
         PrimeIntent::TaskUpdate => PrimePlan::Clarify {
-            text: "Which task should I update, and what should change?".to_string(),
+            text: task_update_clarify(message),
         },
         PrimeIntent::DashboardNavigation => PrimePlan::Reply {
             text: "The board, runs, approvals, and audit log are the operating surfaces. The dashboard UI is a later slice; for now I can summarize any of them."
@@ -514,8 +514,7 @@ pub fn decide(message: &str, intent: &PrimeIntent, summary: &StateSummary) -> Pr
                 }
             } else {
                 PrimePlan::Clarify {
-                    text: "That reads like a single piece of work, not something to split across agents. Give me the distinct steps - e.g. \"research the options, implement a prototype, and write the docs\" - or say \"create a task to ...\" and I'll make one brief."
-                        .to_string(),
+                    text: orchestration_clarify(&goal),
                 }
             }
         }
@@ -798,6 +797,81 @@ fn brainstorm_reply(message: &str) -> String {
         ),
         None => "Good - let's think it through. Tell me the goal you're after and any constraints, and I'll lay out a few approaches with their trade-offs. Nothing gets created or run while we're talking; when an idea is worth pursuing, I can turn it into a task in one step."
             .to_string(),
+    }
+}
+
+/// Build the clarify for an `Orchestration` request whose goal does not actually
+/// split across agents (section 10.4, section 10.5).
+///
+/// Same reflect-and-clarify shape as [`brainstorm_reply`]: instead of a fixed
+/// nudge, it echoes the parsed `goal` back so the user sees what Prime understood
+/// of a single-step request, then asks for the distinct steps. The goal is the
+/// already-stripped phrase from [`orchestration_goal`] (lead-ins removed, original
+/// case preserved). Falls back to the generic prompt when the recovered goal is
+/// not a nameable phrase — a lone word, or the whole message when nothing stripped
+/// (so a bare "orchestrate this" is never quoted back as if it named work).
+fn orchestration_clarify(goal: &str) -> String {
+    let g = goal.trim();
+    let words = g.split_whitespace().count();
+    if (2..=18).contains(&words) {
+        format!(
+            "\"{g}\" reads like a single piece of work, not something to split across agents. What are the distinct steps — e.g. \"research the options, implement a prototype, and write the docs\"? Or say \"create a task to …\" and I'll make one brief."
+        )
+    } else {
+        "That reads like a single piece of work, not something to split across agents. Give me the distinct steps - e.g. \"research the options, implement a prototype, and write the docs\" - or say \"create a task to ...\" and I'll make one brief."
+            .to_string()
+    }
+}
+
+/// Build the clarify for a `TaskUpdate` request (section 10.5).
+///
+/// `TaskUpdate` always clarifies today — there is no `UpdateTask` action wired, so
+/// this never claims to apply an edit. But instead of the old fixed "Which task
+/// should I update, and what should change?", it reflects whatever the message
+/// already named — the target task id ([`extract_task_id`]) and/or the field being
+/// changed ([`update_change_phrase`]) — and asks only for the piece that is still
+/// missing. Same reflect-and-clarify shape as [`brainstorm_reply`].
+fn task_update_clarify(message: &str) -> String {
+    let task_id = extract_task_id(message);
+    let field = update_change_phrase(message);
+    match (task_id, field) {
+        (Some(id), Some(field)) => {
+            format!("Got it — change the {field} on {id}. What should the new {field} be?")
+        }
+        (Some(id), None) => {
+            format!("I can update {id}. What should change — its priority, title, assignee, or status?")
+        }
+        (None, Some(field)) => {
+            format!("Which task's {field} should I change? Give me its id (task_…) or title.")
+        }
+        (None, None) => {
+            "Which task should I update, and what should change — priority, title, assignee, or status?"
+                .to_string()
+        }
+    }
+}
+
+/// Name the field a `TaskUpdate` message wants to change, when it says so, so the
+/// clarify reflects the user's intent instead of asking generically. Conservative
+/// and ordered: priority wins over the others, then title/rename, then assignee
+/// (covers "reassign"), then status (covers "mark … done/blocked"). `None` when
+/// the message names no recognizable field.
+fn update_change_phrase(message: &str) -> Option<&'static str> {
+    let m = message.to_lowercase();
+    if m.contains("priority") {
+        Some("priority")
+    } else if m.contains("rename") || m.contains("title") || m.contains(" name") {
+        Some("title")
+    } else if m.contains("reassign") || m.contains("assignee") || m.contains("assign") {
+        Some("assignee")
+    } else if m.contains("mark ")
+        || m.contains("status")
+        || m.contains("done")
+        || m.contains("blocked")
+    {
+        Some("status")
+    } else {
+        None
     }
 }
 
@@ -1522,6 +1596,80 @@ mod tests {
             &empty_summary(),
         );
         assert!(matches!(plan, PrimePlan::Clarify { .. }), "got {plan:?}");
+    }
+
+    #[test]
+    fn orchestration_clarify_reflects_the_parsed_goal() {
+        // Same reflect-and-clarify shape as brainstorming: a single-step goal is
+        // echoed back so the user sees what Prime understood, then asked to split
+        // it — not a generic nudge (section 10.5).
+        let plan = decide(
+            "orchestrate summarizing the README",
+            &PrimeIntent::Orchestration,
+            &empty_summary(),
+        );
+        let text = match plan {
+            PrimePlan::Clarify { text } => text,
+            other => panic!("expected Clarify, got {other:?}"),
+        };
+        assert!(
+            text.contains("summarizing the README"),
+            "clarify must reflect the parsed goal, got {text:?}"
+        );
+        assert!(text.contains('?'), "clarify must ask for the steps, got {text:?}");
+
+        // A bare directive that strips to nothing nameable falls back to the
+        // generic prompt rather than quoting the whole message back.
+        let bare = decide("orchestrate", &PrimeIntent::Orchestration, &empty_summary());
+        match bare {
+            PrimePlan::Clarify { text } => assert!(
+                text.starts_with("That reads like a single piece of work"),
+                "no-goal request falls back to the generic prompt, got {text:?}"
+            ),
+            other => panic!("expected Clarify, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_update_clarify_reflects_target_and_field() {
+        // The update arm always clarifies (no UpdateTask action wired), but it now
+        // reflects whatever the message already named and asks only for the missing
+        // piece (section 10.5).
+        let cases = [
+            // (message, must-contain substrings)
+            (
+                "update task_42 priority to high",
+                vec!["task_42", "priority"],
+            ),
+            ("set priority on the onboarding task", vec!["priority"]),
+            ("rename task_7", vec!["task_7", "title"]),
+            ("reassign task_9", vec!["task_9", "assignee"]),
+        ];
+        for (msg, needles) in cases {
+            let plan = decide(msg, &PrimeIntent::TaskUpdate, &empty_summary());
+            let text = match plan {
+                PrimePlan::Clarify { text } => text,
+                other => panic!("{msg:?} must clarify, got {other:?}"),
+            };
+            for needle in needles {
+                assert!(
+                    text.contains(needle),
+                    "clarify for {msg:?} must reflect {needle:?}, got {text:?}"
+                );
+            }
+            assert!(text.contains('?'), "clarify for {msg:?} must ask, got {text:?}");
+        }
+
+        // Names neither a task nor a field: improved generic that still enumerates
+        // the editable fields instead of the old bare two-part question.
+        let plan = decide("change task somehow", &PrimeIntent::TaskUpdate, &empty_summary());
+        match plan {
+            PrimePlan::Clarify { text } => assert!(
+                text.contains("priority") && text.contains("status"),
+                "generic clarify enumerates the editable fields, got {text:?}"
+            ),
+            other => panic!("expected Clarify, got {other:?}"),
+        }
     }
 
     #[test]

@@ -89,10 +89,36 @@ needed") and pattern (3) above, it now calls `brainstorm_reply(message)`, which:
 
 Pinned by `brainstorm_reply_reflects_the_topic_and_asks_a_clarifying_question`.
 
+## Applied change (reflect-and-clarify, second slice)
+
+`relux-kernel/src/prime.rs` — two more `Clarify` arms emitted a fixed prompt that
+ignored what the user already said. Per §10.5 and pattern (3), they now reflect the
+parsed target/goal back, the same shape as `brainstorm_reply`:
+
+- **`Orchestration` single-step** now calls `orchestration_clarify(&goal)`. When a
+  coordination request does not actually split, it quotes the already-stripped
+  `orchestration_goal` back ("\"summarizing the README\" reads like a single piece
+  of work …") and asks for the distinct steps, instead of a generic nudge. It falls
+  back to the old generic prompt when the recovered goal is not a nameable phrase
+  (a lone word, or the whole message when nothing stripped), so a bare "orchestrate
+  this" is never quoted back as if it named work.
+- **`TaskUpdate`** now calls `task_update_clarify(message)`, which reflects whatever
+  the message already named — the target task id (`extract_task_id`) and/or the
+  field being changed (`update_change_phrase`: priority / title / assignee /
+  status) — and asks only for the missing piece. The no-info case still clarifies
+  but enumerates the editable fields instead of the old bare two-part question.
+
+Both stay a `PrimePlan::Clarify`: the deterministic classifier still owns the
+action decision and the action-free wall is intact. `TaskUpdate` has no
+`UpdateTask` action wired today, so the reflection never claims to apply an edit —
+it only asks for the value. Pinned by `orchestration_clarify_reflects_the_parsed_goal`
+and `task_update_clarify_reflects_target_and_field`.
+
 ## Next recommended slice
 
-Extend the same reflect-and-clarify shape to the `Orchestration` single-step
-`Clarify` and `TaskUpdate` arms (echo the parsed goal/target back), and — when the
-optional LLM brain is enabled — let it *propose* the clarifying question while the
-deterministic classifier still owns the action decision (keep the action-free
-wall intact).
+When the optional LLM brain is enabled, let it *propose* the clarifying question
+(across all the reflect-and-clarify arms — brainstorm, orchestration, task update)
+while the deterministic classifier still owns the action decision (keep the
+action-free wall intact). Until then, extend the reflection to the remaining bare
+arms (`AssignTask` missing-piece branches, `ApprovalResponse`) if they begin to
+read generically next to the reflected ones.
