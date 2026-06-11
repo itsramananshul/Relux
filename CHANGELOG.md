@@ -9,6 +9,58 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.6 (Windows bundle).** The `relux-kernel` /
+  `relux-core` crates move from `0.1.5` to `0.1.6` for a user-facing patch that
+  keeps **Prime conversational on ideation** and records the post-v0.1.5 session
+  work that had not yet shipped in a bundle. The headline fix (detailed in the
+  entry below): **brainstorming no longer auto-creates tasks** — musing lead-ins
+  ("I was thinking…", "what if we…", "I have an idea…") classify as a conversation
+  even when the sentence carries a creation verb, while an **explicit command**
+  (`create a task to…`, `orchestrate`, `assign`, `start it`) still mints/runs work;
+  **Prime task/run links deep-link into Work** via `/work?task=<id>` (and
+  `/work?run=<id>`), opening that item focused; and the **Prime page is chat-first**
+  (Autonomy + Orchestration moved into a collapsed *Advanced* disclosure below the
+  input). This release also bundles the post-v0.1.5 operator-session work recorded
+  in the entries below — **restart-persistent sessions** (auth v1.2), **live
+  session-file reconcile** so `reset-admin` revokes without a `serve` restart (auth
+  v1.3), and the **absolute-session-cap decision** ruled intentional (auth v1.4):
+  the hard ceiling is wall-clock from session mint and only a fresh re-auth
+  re-anchors it — activity never extends it. Build the bundle with
+  `scripts\relux-package-local.ps1 -FullE2E`. This version line is the
+  `relux-kernel` crate version (separate from the legacy Relix workspace versions
+  in the dated sections below). See `docs/RELUX_MASTER_PLAN.md` → *Release history*.
+- **Prime stays conversational on ideation, deep-links tasks, chat-first page.**
+  Three user-facing product fixes to Prime (`RELUX_MASTER_PLAN.md` §10.5
+  Conversation Rules, §11.1 Prime Chat). **(1) Ideation no longer mints tasks.**
+  `classify_intent` now treats musing lead-ins ("I was thinking…", "what if we…",
+  "I have an idea…") as **Brainstorming** even when the sentence carries a creation
+  verb — so *"I was thinking to create an n8n-like program using 20 agents"* stays a
+  conversation instead of silently creating a task. An **explicit command**
+  (`create a task to…`, `orchestrate`, `assign`, `start it`) still overrides and
+  mints/runs work. **(2) Task/run links deep-link into Work.** The link after task
+  creation pointed at a bare `/work` and opened with nothing focused; it now uses
+  `/work?task=<id>` (and `/work?run=<id>` for runs). Work reads `?task=` URL-driven
+  and **mutually exclusive** with `?run=`, opening that task's detail panel and
+  degrading honestly when the id is missing. **(3) Prime page is chat-first.** The
+  Autonomy and Orchestration panels moved out of the top of the page into a
+  collapsed **Advanced** disclosure below the input, so the chat is the primary
+  surface, with an honest hint that brainstorming stays a conversation and only
+  explicit commands create/run work. Regression tests pin the exact musing
+  sentence, the explicit-command override, that "start it" still acts on a ready
+  task, and the `?task=`/`?run=` routing helpers (mirroring the existing run
+  routing). `cargo test -p relux-kernel` green; dashboard routing tests green; the
+  built `dashboard-dist` bundle is refreshed. See `docs/RELUX_MASTER_PLAN.md` →
+  *Conversation Rules* / *Prime Chat*.
+- **The absolute session cap is intentional, not a sliding bug (auth v1.4).** The
+  hard **absolute** session ceiling (`SESSION_ABSOLUTE_MAX_SECS`) is **wall-clock
+  from the moment a session is minted** and is **never** extended by activity — only
+  a fresh re-auth (logout + new login) re-anchors a new window. This was reframed
+  from a "caveat" into an explicit, tested decision: the `auth.rs` doc comment now
+  states it so the constant is not mistaken for a sliding cap, and a new lib test
+  (`a_fresh_login_re_anchors_the_absolute_window_but_activity_never_does`) pins both
+  halves at the kernel-unit level. No behavior change. `cargo test -p relux-kernel`
+  green (lib + bin); clippy clean. See `docs/RELUX_MASTER_PLAN.md` → *Local operator
+  login v1* and the divergence ledger in `docs/product-spine-implementation.md`.
 - **Live session-file reconcile — `reset-admin` no longer needs a `serve` restart
   to revoke sessions (auth v1.3).** A **running** `relux-kernel serve` now picks up an
   out-of-band change to the persisted session file without a restart. Before every

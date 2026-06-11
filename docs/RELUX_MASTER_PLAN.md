@@ -1820,49 +1820,54 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
-- **post-v0.1.5 (unreleased)** — **restart-persistent operator sessions.** The
-  v0.1.5 caveat that sessions were in-memory (a `serve` restart forced everyone to
-  re-sign-in) is closed: the session table is now mirrored to a gitignored local
-  file (`dev-data/relux/dashboard-sessions.json`; `RELUX_SESSION_FILE` overrides)
-  next to the admin credential, with the same atomic, OS-permission-restricted write
-  as `dashboard-admin.json`. What persists is a **SHA-256 hash of each opaque session
+- **v0.1.6** (2026-06-10) — a user-facing patch on top of v0.1.5 that keeps **Prime
+  conversational on ideation** and ships the post-v0.1.5 operator-session work that
+  had not yet been bundled. **Prime stays conversational / deep-links / chat-first:**
+  brainstorming no longer auto-creates tasks — `classify_intent` treats musing
+  lead-ins ("I was thinking…", "what if we…", "I have an idea…") as **Brainstorming**
+  even when the sentence carries a creation verb, so *"I was thinking to create an
+  n8n-like program using 20 agents"* stays a conversation, while an **explicit
+  command** (`create a task to…`, `orchestrate`, `assign`, `start it`) still
+  overrides and mints/runs work; Prime task/run links now deep-link into the Work
+  surface via `/work?task=<id>` (and `/work?run=<id>`), opening that item's detail
+  panel focused and degrading honestly when the id is missing; and the Prime page is
+  **chat-first**, with Autonomy + Orchestration moved into a collapsed **Advanced**
+  disclosure below the input and an honest hint that brainstorming stays a
+  conversation. **Restart-persistent operator sessions (auth v1.2):** the v0.1.5
+  caveat that sessions were in-memory (a `serve` restart forced everyone to
+  re-sign-in) is closed — the session table is mirrored to a gitignored local file
+  (`dev-data/relux/dashboard-sessions.json`; `RELUX_SESSION_FILE` overrides) next to
+  the admin credential, with the same atomic, OS-permission-restricted write as
+  `dashboard-admin.json`. What persists is a **SHA-256 hash of each opaque session
   id** plus its metadata (username, idle deadline, absolute deadline) — **never the
-  raw id**, so a leaked file cannot be replayed as a cookie; the cookie still carries
-  the raw id and the middleware hashes it to look it up. Expired rows are pruned on
-  load and on use. Every existing safety property is preserved end-to-end across a
-  restart: logout removes the row from disk, a password change invalidates every
-  *other* session on disk (keeping the caller's), the sliding-refresh/absolute-cap
-  deadlines are the ones persisted, `RELUX_AUTH_DISABLED` still bypasses, and
-  `reset-admin` now also **clears the session file** so recovery invalidates old
-  sessions on the next restart. Proven by `relux-kernel` unit tests (restart
-  survives, expired not loaded, no raw sid on disk, logout/password-change/reset
-  persist) + an in-process HTTP test (login → rebuild the server state from the same
-  files → same cookie still authenticates → logout persists removal). *(This slice's
-  "running serve needs a restart for out-of-band recovery" caveat is closed by the
-  live-reconcile slice below.)*
-- **post-v0.1.5 (unreleased)** — **live session-file reconcile / no-restart
-  revocation (auth v1.3).** A **running** `relux-kernel serve` now picks up an
-  out-of-band session-file change without a restart. Before every session operation
-  the store cheaply re-`stat`s its backing file (fingerprint = mtime + length, plus a
-  "file absent" state) and, only when that fingerprint differs from what it last
-  wrote, reconciles its in-memory table with disk: a **deleted** file (what
-  `reset-admin` does) drops all in-memory sessions (fail-closed), and an external
-  **rewrite** is reloaded so the running process adopts it instead of clobbering it on
-  its next persist. The fast path — the running process is the only writer — is a
-  single `stat` with no read/parse. The critical ordering: `create`/`refresh`
-  reconcile *before* they persist, so a fresh login after a delete cannot rewrite the
-  revoked sessions back to disk. **Effect:** `reset-admin` now invalidates old cookies
-  on a running server on the **next request** — no restart required (the restart only
-  still matters to load a new credential into a stopped process, or for a wedged one).
-  Sliding refresh, logout, password-change invalidation, and `RELUX_AUTH_DISABLED` are
-  unchanged. Proven by `relux-kernel` unit tests (external delete revokes on the same
-  handle; delete + new login doesn't resurrect; external rewrite adopted; unchanged
-  file not reloaded) + an in-process HTTP test (one running server: login → 200 →
-  delete the session file → next request 401 → fresh login works). *Remaining caveat:*
-  detection is `stat`-granularity, so revocation bites on the next session-touching
-  request rather than instantly; a same-mtime-and-same-length external *rewrite* could
-  be missed, but *deletion* (the recovery case) flips present→absent and is always
-  caught.
+  raw id**, so a leaked file cannot be replayed as a cookie; expired rows are pruned
+  on load and use; logout removes the row, a password change invalidates every
+  *other* session on disk (keeping the caller's), and `reset-admin` now also **clears
+  the session file**. **Live session-file reconcile / no-restart revocation (auth
+  v1.3):** a **running** `serve` now picks up an out-of-band session-file change
+  without a restart — before every session operation the store cheaply re-`stat`s its
+  backing file (fingerprint = mtime + length, plus a "file absent" state) and only
+  when that differs reconciles its in-memory table with disk: a **deleted** file
+  (what `reset-admin` does) drops all in-memory sessions (fail-closed), and an
+  external **rewrite** is adopted instead of clobbered; `create`/`refresh` reconcile
+  *before* they persist, so a fresh login after a delete cannot rewrite revoked
+  sessions back. **Effect:** `reset-admin` invalidates old cookies on a running
+  server on the **next request** — no restart required. **Absolute session cap ruled
+  intentional (auth v1.4):** the hard **absolute** ceiling
+  (`SESSION_ABSOLUTE_MAX_SECS`) is wall-clock from session mint and is **never**
+  extended by activity — only a fresh re-auth (logout + new login) re-anchors a new
+  window; the `auth.rs` doc comment now states this and a lib test
+  (`a_fresh_login_re_anchors_the_absolute_window_but_activity_never_does`) pins both
+  halves (no behavior change). Proven by `relux-kernel` unit + in-process HTTP tests
+  (restart survives, no raw sid on disk, external delete revokes on a live handle,
+  delete + new login doesn't resurrect, the absolute-window decision) and dashboard
+  routing tests (the `?task=`/`?run=` deep links). *Caveats:* one admin only (no
+  multi-user, roles, or per-operator audit); the loopback API has **no transport
+  TLS**; reconcile detection is `stat`-granularity (revocation bites on the next
+  session-touching request, and a same-mtime-and-same-length external *rewrite* could
+  be missed, though *deletion* — the recovery case — is always caught); and
+  `RELUX_AUTH_DISABLED` leaves the surface fully open by design. Every safety
+  property from v0.1.5 still holds on every path.
 - **v0.1.5** (2026-06-10) — first build on top of v0.1.4 that puts a **single-admin
   local operator login** in front of the standalone dashboard/API; the surface is no
   longer open by default. **First-run admin setup + login:** on first launch the

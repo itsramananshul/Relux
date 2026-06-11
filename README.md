@@ -31,14 +31,14 @@ It serves on `http://127.0.0.1:19891` by default. If that port is already taken
 the exact command to pick another port — set `RELUX_HTTP_ADDR=127.0.0.1:<port>`
 for a source checkout, or use `.\Start-Relux.ps1 -Port <port>` with the bundle.
 
-#### Run the packaged release (v0.1.5, no build needed)
+#### Run the packaged release (v0.1.6, no build needed)
 
 Prefer a prebuilt Windows bundle over building from source? Grab the latest
 [**Relux local release**](https://github.com/itsramananshul/Relux/releases) zip
-(`relux-local-0.1.5-windows-x64.zip`), extract it, and launch it - no Rust, no npm:
+(`relux-local-0.1.6-windows-x64.zip`), extract it, and launch it - no Rust, no npm:
 
 ```powershell
-# inside the extracted relux-local-0.1.5-windows-x64 folder
+# inside the extracted relux-local-0.1.6-windows-x64 folder
 powershell -NoProfile -ExecutionPolicy Bypass -File .\Start-Relux.ps1
 # override the port if 19891 is taken:  .\Start-Relux.ps1 -Port 20000
 ```
@@ -57,8 +57,13 @@ Then, in your browser:
    log in); install it, click **Refresh**, then **"Use Claude CLI for Prime"**
    again. No JSON or env-var editing is required for normal Claude setup.
 3. Open **Prime** and chat - e.g. `create a task to summarize the README`. A
-   greeting stays a greeting; an action creates real, kernel-grounded work. Each
-   reply shows its source (`via Claude CLI` / `deterministic`).
+   greeting stays a greeting and brainstorming stays a conversation (musing like
+   *"I was thinking we could…"* never silently mints a task); only an explicit
+   command (`create a task to…`, `orchestrate`, `assign`, `start it`) creates or
+   runs real, kernel-grounded work. Each reply shows its source (`via Claude CLI` /
+   `deterministic`), and a task/run link deep-links into **Work** with that item
+   focused. The page is chat-first — Autonomy and Orchestration live under the
+   collapsed **Advanced** disclosure below the input.
 4. Open **Work** to see the created task, assign it to an agent on **Crew**, and
    run it with **Run assigned**.
 
