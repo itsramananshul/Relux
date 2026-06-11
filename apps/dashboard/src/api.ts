@@ -1437,6 +1437,32 @@ export interface ReluxPrimeTaskSlots {
   source?: string;
 }
 
+// Brain-assisted, VALIDATED agent-creation slots that shaped a created agent, present
+// ONLY on an agent-creation turn the brain genuinely sharpened. The kernel validated
+// every field (name normalized into a non-colliding id, adapter checked against the
+// live roster) before the agent was created.
+export interface ReluxPrimeAgentSlots {
+  name: string;
+  id: string;
+  description?: string;
+  adapter?: string;
+  notes?: string;
+  source?: string;
+}
+
+// Brain-assisted, VALIDATED subject of a risky admin action (a plugin install or a
+// permission grant), present ONLY on a Propose turn the brain sharpened. The action
+// ALWAYS stays gated behind a human approval; this is advisory provenance only.
+export interface ReluxPrimeAdminSlots {
+  // "plugin_install" | "permission_grant"
+  kind: string;
+  plugin_id?: string;
+  subject_kind?: string;
+  subject_id?: string;
+  permission?: string;
+  source?: string;
+}
+
 export interface ReluxPrimeTurn {
   intent: string;
   reply: string;
@@ -1455,6 +1481,13 @@ export interface ReluxPrimeTurn {
   // Brain-assisted, validated task slots, present ONLY on a create turn the brain
   // sharpened (§10.1, §10.2, §17.1). Omitted on every other turn.
   slots?: ReluxPrimeTaskSlots;
+  // Brain-assisted, validated agent slots, present ONLY on an agent-creation turn the
+  // brain sharpened. Omitted on every other turn.
+  agent_slots?: ReluxPrimeAgentSlots;
+  // Brain-assisted, validated subject of a risky admin action (plugin install /
+  // permission grant), present ONLY on a Propose turn the brain sharpened. The action
+  // stays approval-gated. Omitted on every other turn.
+  admin_slots?: ReluxPrimeAdminSlots;
   // Tool fields: present only when Prime ran (or honestly refused) a tool this
   // turn. `invoked_tool` is "<plugin_id>/<tool_name>"; `tool_output` carries the
   // real kernel output; `tool_error` is an honest reason a tool did NOT run.

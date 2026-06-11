@@ -455,6 +455,83 @@ pub struct PrimeTaskSlots {
     pub source: Option<String>,
 }
 
+/// The brain-assisted, validated slots that shaped a *created agent*, present ONLY
+/// on an `AgentCreation` turn the brain genuinely sharpened (the counterpart of
+/// [`PrimeTaskSlots`] for crew creation).
+///
+/// The brain only ever *proposes* these slots; the kernel validates each one before
+/// the agent is created (`crates/relux-kernel/src/prime_agent_slots.rs`):
+///
+/// - `name`/`id` are normalized (id is lowercased and reduced to `[a-z0-9-]`) and
+///   length-clamped; an id that collides with an EXISTING agent is rejected wholesale
+///   (the brain can never reshape a create into a duplicate);
+/// - `adapter` is honored ONLY when it names an EXISTING adapter plugin — an unknown
+///   adapter is dropped and the deterministic default stands (the brain can never
+///   invent or enable an adapter);
+/// - `description`/`notes` are sanitized and length-clamped;
+/// - a low-confidence, malformed, unknown-field, empty-name, or duplicate proposal is
+///   rejected wholesale and the deterministic name stands (this struct is absent).
+///
+/// Omitted from the wire on every turn the brain did not sharpen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrimeAgentSlots {
+    /// The normalized display name the brain produced and the kernel accepted.
+    pub name: String,
+    /// The agent id derived from the name (lowercase, `[a-z0-9-]`). This is the id
+    /// the created agent actually carries.
+    pub id: String,
+    /// Optional sanitized role/description the brain extracted. Absent when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The adapter plugin id, present ONLY when it named an existing adapter the
+    /// kernel honored. Absent when the brain named none or named an unknown adapter
+    /// (in which case the deterministic default adapter was used).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<String>,
+    /// Optional sanitized free-text notes the brain extracted (advisory/UI only;
+    /// not applied to a durable kernel field). Absent when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    /// The model id / CLI brain label that produced these slots, for provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+/// The brain-assisted, validated subject of a *risky, approval-gated* admin action
+/// (a plugin install or a permission grant), present ONLY on a `Propose` turn the
+/// brain sharpened.
+///
+/// This is purely advisory provenance: the action it describes is ALWAYS gated
+/// behind a human approval (`PrimePlan::Propose`), so a brain slot can never execute
+/// a plugin install or a permission grant by itself — it only sharpens the subject
+/// the human reviews. The kernel validates each field
+/// (`crates/relux-kernel/src/prime_admin_slots.rs`): a plugin id is normalized to a
+/// plausible `[a-z0-9-]` id; a permission grant's `subject_id` is honored ONLY when
+/// it names an EXISTING agent (validated against the live roster, exactly like a task
+/// assignee), and the permission label is sanitized. A low-confidence, malformed,
+/// unknown-field, or unvalidated-subject proposal is rejected and the deterministic
+/// subject stands (this struct is absent).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrimeAdminSlots {
+    /// Which admin action this sharpened: `"plugin_install"` or `"permission_grant"`.
+    pub kind: String,
+    /// The normalized plugin id, present on a `plugin_install` sharpening.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_id: Option<String>,
+    /// The subject kind (today always `"agent"`), present on a `permission_grant`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_kind: Option<String>,
+    /// The validated subject id (an EXISTING agent), present on a `permission_grant`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_id: Option<String>,
+    /// The sanitized permission label, present on a `permission_grant`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission: Option<String>,
+    /// The model id / CLI brain label that produced these slots, for provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
 /// The full result of Prime handling one user message.
 ///
 /// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 10 (Prime Behavior Specification).
@@ -503,6 +580,18 @@ pub struct PrimeTurn {
     /// slot before the task was created.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slots: Option<PrimeTaskSlots>,
+    /// The brain-assisted, validated agent slots that shaped a created agent, present
+    /// ONLY on an `AgentCreation` turn the brain genuinely sharpened (see
+    /// [`PrimeAgentSlots`]). Omitted on every other turn, so existing clients see the
+    /// same JSON they did before. Provenance/presentation only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_slots: Option<PrimeAgentSlots>,
+    /// The brain-assisted, validated subject of a risky admin action (plugin install
+    /// or permission grant), present ONLY on a `Propose` turn the brain sharpened (see
+    /// [`PrimeAdminSlots`]). The action stays gated behind a human approval; this is
+    /// advisory provenance only. Omitted on every other turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_slots: Option<PrimeAdminSlots>,
 }
 
 /// The scope a Prime turn runs in: which namespace work lands in, which agent
@@ -597,6 +686,8 @@ mod tests {
             suggested_actions: vec![],
             proposal: None,
             slots: None,
+            agent_slots: None,
+            admin_slots: None,
         };
         let json = serde_json::to_string(&turn).unwrap();
         assert!(
@@ -608,6 +699,16 @@ mod tests {
         assert!(
             !json.contains("slots"),
             "a turn with no brain-assisted slots must omit the field: {json}"
+        );
+        // The agent/admin slot provenance is likewise present ONLY on a sharpened
+        // agent-creation / approval turn; a plain turn must omit both on the wire.
+        assert!(
+            !json.contains("agent_slots"),
+            "a turn with no brain-assisted agent slots must omit the field: {json}"
+        );
+        assert!(
+            !json.contains("admin_slots"),
+            "a turn with no brain-assisted admin slots must omit the field: {json}"
         );
         // The plan preview is present ONLY on a PlanRequest turn: a normal turn must
         // not carry `proposal` on the wire, so existing clients are unaffected (§11.1).
@@ -751,6 +852,74 @@ mod tests {
         let back: PrimeTaskSlots =
             serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
         assert_eq!(back, full);
+    }
+
+    #[test]
+    fn prime_agent_slots_round_trip_and_omit_empty_optionals() {
+        // A minimal agent slot carries only name+id; every optional the brain did not
+        // contribute is omitted from the wire.
+        let minimal = PrimeAgentSlots {
+            name: "Research Agent".to_string(),
+            id: "research-agent".to_string(),
+            description: None,
+            adapter: None,
+            notes: None,
+            source: None,
+        };
+        let json = serde_json::to_string(&minimal).unwrap();
+        for absent in ["description", "adapter", "notes", "source"] {
+            assert!(
+                !json.contains(absent),
+                "an unset optional must be omitted ({absent}): {json}"
+            );
+        }
+        let back: PrimeAgentSlots = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, minimal);
+
+        let full = PrimeAgentSlots {
+            name: "Research Agent".to_string(),
+            id: "research-agent".to_string(),
+            description: Some("Surveys options and writes briefs.".to_string()),
+            adapter: Some("relux-adapter-local-prime".to_string()),
+            notes: Some("Prefers concise output.".to_string()),
+            source: Some("anthropic/claude-3.5-haiku".to_string()),
+        };
+        let back: PrimeAgentSlots =
+            serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
+        assert_eq!(back, full);
+    }
+
+    #[test]
+    fn prime_admin_slots_round_trip_and_omit_empty_optionals() {
+        // A permission-grant sharpening carries the validated subject; the plugin
+        // fields are omitted (and vice versa), so the wire stays compact.
+        let perm = PrimeAdminSlots {
+            kind: "permission_grant".to_string(),
+            plugin_id: None,
+            subject_kind: Some("agent".to_string()),
+            subject_id: Some("code-agent".to_string()),
+            permission: Some("tool:relux-tools-github:access".to_string()),
+            source: Some("Claude CLI".to_string()),
+        };
+        let json = serde_json::to_string(&perm).unwrap();
+        assert!(!json.contains("plugin_id"), "unset plugin_id must be omitted: {json}");
+        let back: PrimeAdminSlots = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, perm);
+
+        let plugin = PrimeAdminSlots {
+            kind: "plugin_install".to_string(),
+            plugin_id: Some("relux-tools-github".to_string()),
+            subject_kind: None,
+            subject_id: None,
+            permission: None,
+            source: None,
+        };
+        let json = serde_json::to_string(&plugin).unwrap();
+        for absent in ["subject_kind", "subject_id", "permission", "source"] {
+            assert!(!json.contains(absent), "unset {absent} must be omitted: {json}");
+        }
+        let back: PrimeAdminSlots = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, plugin);
     }
 
     #[test]

@@ -390,6 +390,77 @@ tests (`cli_slots_*`: valid envelope, plain JSON, error envelope, prose-without-
 unsupported-field fail-closed); and the dashboard `slotProvenance` test. No test
 calls a real provider.
 
+## Applied change (brain-assisted agent + admin slots)
+
+The validated-slot layer now reaches past task creation to the next brittle Prime
+paths flagged in the roadmap: **agent creation** (`derive_agent_name`), **plugin
+identity** (`derive_plugin_id`), and **permission-subject extraction** (the
+`message.contains("agent")` slice). Per master plan §10.1/§10.2/§10.3 and the
+reference read recorded in `reference-driven-development.md` (Hermes
+`coerce_tool_args` / sanitization; openclaw `sessions-spawn-tool` unsupported-key
+rejection + required-string + clamp, `common.ts` `readStringParam`/`ToolInputError`,
+`approval-classifier.ts` subject resolution + `normalizeToolName` + kind allowlists),
+a configured brain may now *propose* these slots, validated hard before anything.
+
+- **New module `relux-kernel/src/prime_agent_slots.rs`** (executable path). For an
+  `AgentCreation` turn the brain proposes `{name, role?, adapter?, notes?, confidence}`.
+  `parse_agent_slots` rejects any field outside the allowlist (fail closed), requires a
+  non-empty name, and sanitizes/clamps every string. `reconcile_agent_slots` normalizes
+  the name into an id (`agent_id_form`), **rejects a duplicate** (an id colliding with an
+  existing agent fails the whole proposal — a create can never be reshaped into a clash),
+  and honors an `adapter` ONLY when it names a live adapter plugin (else the deterministic
+  default stands). The validated name/description/adapter flow into the kernel's existing
+  `create_agent`; `notes` are advisory/UI only.
+- **New module `relux-kernel/src/prime_admin_slots.rs`** (advisory; the action stays
+  approval-gated). For a `PluginInstallation` turn the brain proposes `{plugin_id,
+  confidence}` → normalized; for a `PermissionChange` turn it proposes `{subject_kind,
+  subject_id, permission?, confidence}` — `subject_kind` is checked against the
+  `["agent"]` allowlist (an off-allowlist kind fails closed), `subject_id` is honored
+  ONLY when it names an EXISTING agent (`summary.all_agent_ids`), and the permission
+  label is sanitized to the `[a-z0-9:_-]` grammar. `sharpen_admin_action` (state.rs)
+  reshapes the proposed `InstallPlugin`/`GrantPermission` subject — but the turn stays a
+  `PrimePlan::Propose` behind a human approval, so **a brain slot can never execute a
+  protected install or grant by itself** (the kernel logs an approval and changes
+  nothing; pinned by tests asserting the permission set / plugin count are unchanged).
+- **New wire fields `PrimeTurn.agent_slots` / `PrimeTurn.admin_slots`** (`relux-core`,
+  both `skip_serializing_if = "Option::is_none"`, so the wire is byte-for-byte unchanged
+  on every un-sharpened turn). Provenance/presentation only — the kernel validated every
+  field before acting/proposing.
+- **One kernel chokepoint.** `KernelState::prime_turn_with_brain` takes a
+  `BrainSlotProposals` bundle (task/agent/plugin/permission); `prime_turn_with_intent_
+  and_slots` is now a thin wrapper passing only task slots, so the deterministic path is
+  unchanged. The Act arm reconciles task/agent slots; the Propose arm sharpens the admin
+  subject. The server dispatches the slot brain on the RESOLVED intent (the same
+  reconciliation the kernel redoes), so a chat/status/plan turn never invokes it, and
+  stamps the provenance label (model id / `Claude CLI` / `Codex CLI`) onto each card.
+- **Both brains feed one validator per slot type.** OpenRouter goes through
+  `ai::extract_{agent_slots,plugin_ref,permission_slots}_via_openrouter` (via a shared
+  `complete_json_only` helper); the Claude/Codex CLI brains spawn in the same bounded,
+  non-bypass mode (shared `cli_brain_json`) and their stdout is lifted by
+  `parse_adapter_result` FIRST (`server.rs` `parse_cli_{agent_slots,plugin_ref,
+  permission_slots}`) so the raw envelope never reaches the parser or the UI.
+- **Dashboard.** Compact B&W chips on the Prime chat (`apps/dashboard/src/pages/Prime.tsx`
+  + the shared `brainSourceLabel` helper in `src/prime.ts`): an "brain-extracted agent"
+  card (normalized name/id, role, adapter) and an advisory admin card (the sharpened
+  plugin id, or the grant subject + permission) that says plainly *"Advisory — requires
+  your approval before anything changes."* The **Crew** and **Plugins** pages were
+  verified to render via the safe `useAsync` hook (no `useLoaderData` blank-route bug).
+
+Pinned by `prime_agent_slots_round_trip_and_omit_empty_optionals` /
+`prime_admin_slots_round_trip_and_omit_empty_optionals` (core wire guards, plus the
+extended omission assertions in `prime_suggestion_round_trips_…`); the `prime_agent_slots`
+and `prime_admin_slots` unit tests (clean parse, noisy-reply extraction, invalid JSON,
+unsupported-field / unsupported-subject-kind fail-closed, empty-name reject, control-char
+clamp, duplicate-id reject, existing-only adapter/subject, low-confidence/echo no-op,
+permission-label sanitize); the kernel integration tests (`brain_agent_slots_sharpen_a_
+created_agent_…`, `brain_agent_slot_rejects_a_duplicate_id_…`, `no_agent_slot_proposal_…`,
+`brain_permission_subject_sharpens_…_but_stays_approval_gated` + the unchanged-permission-
+set safety assertion, `brain_permission_subject_is_dropped_when_the_agent_does_not_exist`,
+`brain_plugin_ref_sharpens_…_but_stays_approval_gated` + the unchanged-plugin-count safety
+assertion); the server seam tests (`cli_agent_slots_*`, `cli_plugin_ref_*`,
+`cli_permission_slots_*`); and the dashboard `brainSourceLabel` test. No test calls a real
+provider.
+
 ## Current Prime brain stack
 
 The end-to-end shape of one Prime turn, with the brain strictly additive and the
@@ -400,29 +471,42 @@ deterministic kernel always the authority:
    chat can never become work; low confidence keeps the deterministic intent;
    `create_and_run` without run language downgrades to `create`). No brain → the
    deterministic `classify_intent` decides.
-2. **Validated slots** — only when the resolved intent is a create the kernel will
-   act on, the brain *proposes* task slots (`prime_slots::build_task_slots_prompt` →
-   `parse_task_slots`); `reconcile_task_slots` validates them against the
-   deterministic title and the live agent roster (allowlist fields, clamp lengths/
-   priority, existing-agent assignee only). Any failure → deterministic slots.
+2. **Validated slots** — dispatched on the resolved intent at the single chokepoint
+   `prime_turn_with_brain` (a `BrainSlotProposals` bundle):
+   - a **create** intent → task slots (`prime_slots`): allowlist fields, clamp
+     lengths/priority, existing-agent assignee only;
+   - an **`AgentCreation`** → agent slots (`prime_agent_slots`): normalized
+     non-colliding id (duplicate rejected), existing-only adapter, sanitized
+     role/notes — applied to the executable `create_agent`;
+   - a **`PluginInstallation` / `PermissionChange`** → advisory admin subject
+     (`prime_admin_slots`): a normalized plugin id, or a permission subject validated
+     against the live agent roster + a `["agent"]` kind allowlist + a sanitized label.
+   Any failure (no brain, low confidence, invalid JSON, unsupported field/kind,
+   duplicate id, unknown adapter/subject) → the deterministic slot stands.
 3. **Deterministic / policy execution** — `decide` → `prime_execute` is the SOLE
    path that changes durable state. Risky intents still become `Propose` behind a
-   human approval; the brain runs nothing and authors no action. Plan previews
-   (`PlanRequest`) remain action-free, and orchestration steps stay owned by the
-   deterministic `plan_orchestration` (the brain only *polishes* their wording).
+   human approval; the admin slots only sharpen the *subject the human reviews* —
+   `sharpen_admin_action` never changes the action's kind, so the brain runs no
+   protected install or grant. Plan previews (`PlanRequest`) remain action-free, and
+   orchestration steps stay owned by the deterministic `plan_orchestration` (the brain
+   only *polishes* their wording).
 4. **UI response** — the reply text may be brain-shaped on a conversational turn
-   (`shape_reply` / CLI brain), a plan card may carry an advisory polish overlay,
-   and a sharpened create carries a `slots` provenance card. Every brain
+   (`shape_reply` / CLI brain), a plan card may carry an advisory polish overlay, a
+   sharpened create carries a `slots` card, a sharpened agent a `agent_slots` card,
+   and a sharpened risky `Propose` an advisory `admin_slots` card. Every brain
    contribution is labeled (intent → `brain-classified`; polish/slots → the model id
-   or CLI label) and is presentation/provenance only — never a fresh authority.
+   or CLI label via the shared `brainSourceLabel`) and is presentation/provenance only
+   — never a fresh authority.
 
 ## Next recommended slice
 
-When the optional LLM brain is enabled, let it *propose* the clarifying question
-across the remaining reflect-and-clarify arms (brainstorm, orchestration, task
-update) — the same "model suggests wording, deterministic classifier owns the
-action" seam now used for the plan proposal — while keeping the action-free wall
-intact. (Extending the advisory polish to the CLI brains (claude/codex) through the
-same `validate_polish` chokepoint is now done — see above; surfacing the CLI brain's
-provenance label on the card the way the OpenRouter model id already is, is now done
-too — the `polishProvenance` helper renders either visibly on the badge.)
+The brittle keyword gaps the roadmap flagged — `derive_agent_name`,
+`derive_plugin_id`, and the permission-subject slice — are now all behind the
+validated brain-slot layer (see above). The remaining keyword surfaces are the
+**reflect-and-clarify** prompts: when the optional LLM brain is enabled, let it
+*propose* the clarifying question across the brainstorm / orchestration / task-update
+arms — the same "model suggests wording, deterministic classifier owns the action"
+seam now used for the plan proposal — while keeping the action-free wall intact. A
+further rung: let the agent-slot brain also propose a starter **persona** (today
+`create_agent` is always handed `None`), validated/clamped the same way, so a created
+operative arrives with a usable voice rather than a blank one.

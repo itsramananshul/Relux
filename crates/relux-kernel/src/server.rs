@@ -1654,7 +1654,10 @@ async fn run_prime(
     // validates them against the deterministic title + the live agent roster behind
     // the fail-closed gate. ANY failure yields `None` and the deterministic slots
     // stand — strictly additive (§10.1, §10.2, §17.1).
-    let slot_proposal = {
+    // The slot brain is dispatched on the RESOLVED intent: task slots for a create,
+    // agent slots for an `AgentCreation`, the advisory plugin/permission subject for a
+    // risky `Propose`. There is no point asking for slots on a chat/status/plan turn.
+    let (task_slots, agent_slots, plugin_ref, permission_slots) = {
         let deterministic_intent = relux_kernel::classify_intent(&message);
         let resolved_intent = match intent_proposal.as_ref() {
             Some(p) => {
@@ -1662,39 +1665,80 @@ async fn run_prime(
             }
             None => deterministic_intent,
         };
-        let wants_slots = matches!(
-            resolved_intent,
-            relux_core::PrimeIntent::TaskCreation | relux_core::PrimeIntent::CreateAndRunTask
-        );
-        if wants_slots {
-            match brain {
-                relux_kernel::PrimeBrain::Openrouter => {
-                    relux_kernel::extract_task_slots_via_openrouter(&ai_config, &message).await
-                }
-                relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli => {
-                    extract_task_slots_via_cli(brain, cli_status.clone(), &message).await
-                }
-                relux_kernel::PrimeBrain::Local => None,
+        use relux_core::PrimeIntent as I;
+        match resolved_intent {
+            I::TaskCreation | I::CreateAndRunTask => {
+                let p = match brain {
+                    relux_kernel::PrimeBrain::Openrouter => {
+                        relux_kernel::extract_task_slots_via_openrouter(&ai_config, &message).await
+                    }
+                    relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli => {
+                        extract_task_slots_via_cli(brain, cli_status.clone(), &message).await
+                    }
+                    relux_kernel::PrimeBrain::Local => None,
+                };
+                (p, None, None, None)
             }
-        } else {
-            None
+            I::AgentCreation => {
+                let p = match brain {
+                    relux_kernel::PrimeBrain::Openrouter => {
+                        relux_kernel::extract_agent_slots_via_openrouter(&ai_config, &message).await
+                    }
+                    relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli => {
+                        extract_agent_slots_via_cli(brain, cli_status.clone(), &message).await
+                    }
+                    relux_kernel::PrimeBrain::Local => None,
+                };
+                (None, p, None, None)
+            }
+            I::PluginInstallation => {
+                let p = match brain {
+                    relux_kernel::PrimeBrain::Openrouter => {
+                        relux_kernel::extract_plugin_ref_via_openrouter(&ai_config, &message).await
+                    }
+                    relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli => {
+                        extract_plugin_ref_via_cli(brain, cli_status.clone(), &message).await
+                    }
+                    relux_kernel::PrimeBrain::Local => None,
+                };
+                (None, None, p, None)
+            }
+            I::PermissionChange => {
+                let p = match brain {
+                    relux_kernel::PrimeBrain::Openrouter => {
+                        relux_kernel::extract_permission_slots_via_openrouter(&ai_config, &message)
+                            .await
+                    }
+                    relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli => {
+                        extract_permission_slots_via_cli(brain, cli_status.clone(), &message).await
+                    }
+                    relux_kernel::PrimeBrain::Local => None,
+                };
+                (None, None, None, p)
+            }
+            _ => (None, None, None, None),
         }
     };
 
     // 1. Run the deterministic kernel turn (must happen under the lock), passing
-    // the optional brain intent proposal AND slot proposal so the kernel reconciles
-    // + audits the final intent and validates the slots at its single chokepoint.
+    // the optional brain intent proposal AND the slot bundle so the kernel reconciles
+    // + audits the final intent and validates every slot at its single chokepoint.
     // `intent_source` records who decided.
     let (turn, summary, intent_source) = {
         let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut store = SqliteStore::open(&state.db_path)?;
         let mut kernel = store.load()?;
         let ctx = crate::ensure_bootstrapped(&mut kernel)?;
-        let (turn, intent_source) = kernel.prime_turn_with_intent_and_slots(
+        let (turn, intent_source) = kernel.prime_turn_with_brain(
             &ctx,
             &message,
             intent_proposal.as_ref(),
-            slot_proposal.as_ref(),
+            relux_kernel::BrainSlotProposals {
+                task: task_slots.as_ref(),
+                agent: agent_slots.as_ref(),
+                plugin: plugin_ref.as_ref(),
+                permission: permission_slots.as_ref(),
+            },
         )?;
         let summary = state_response(&kernel, &state.db_path);
         store.save(&kernel)?;
@@ -1756,6 +1800,15 @@ async fn run_prime(
     // only that the brain assisted); the server, which knows the brain + model,
     // fills it in. Present only when the kernel attached brain-assisted slots.
     if let Some(slots) = final_turn.slots.as_mut() {
+        slots.source = Some(slot_source_label(brain, &ai_config));
+    }
+    // The same provenance stamping for the brain-assisted agent slots (a sharpened
+    // `AgentCreation`) and the advisory admin slots (a sharpened plugin/permission
+    // `Propose`). Present only when the kernel attached them.
+    if let Some(slots) = final_turn.agent_slots.as_mut() {
+        slots.source = Some(slot_source_label(brain, &ai_config));
+    }
+    if let Some(slots) = final_turn.admin_slots.as_mut() {
         slots.source = Some(slot_source_label(brain, &ai_config));
     }
 
@@ -2098,6 +2151,63 @@ async fn extract_task_slots_via_cli(
     status: Option<relux_core::AdapterRuntimeStatus>,
     message: &str,
 ) -> Option<relux_kernel::BrainTaskSlots> {
+    let (stdout, kind) =
+        cli_brain_json(brain, status, relux_kernel::build_task_slots_prompt(message)).await?;
+    parse_cli_task_slots(&stdout, kind)
+}
+
+/// Extract agent-creation slots via a CLI brain, validated through the SAME boundary
+/// as the task-slot path: bounded non-bypass spawn → [`parse_adapter_result`] →
+/// [`relux_kernel::parse_agent_slots`]. Any failure → `None` (deterministic name).
+async fn extract_agent_slots_via_cli(
+    brain: relux_kernel::PrimeBrain,
+    status: Option<relux_core::AdapterRuntimeStatus>,
+    message: &str,
+) -> Option<relux_kernel::BrainAgentSlots> {
+    let (stdout, kind) =
+        cli_brain_json(brain, status, relux_kernel::build_agent_slots_prompt(message)).await?;
+    parse_cli_agent_slots(&stdout, kind)
+}
+
+/// Extract a plugin reference via a CLI brain (advisory; the install stays
+/// approval-gated). Same validation boundary; any failure → `None`.
+async fn extract_plugin_ref_via_cli(
+    brain: relux_kernel::PrimeBrain,
+    status: Option<relux_core::AdapterRuntimeStatus>,
+    message: &str,
+) -> Option<relux_kernel::BrainPluginRef> {
+    let (stdout, kind) =
+        cli_brain_json(brain, status, relux_kernel::build_plugin_ref_prompt(message)).await?;
+    parse_cli_plugin_ref(&stdout, kind)
+}
+
+/// Extract a permission-grant subject via a CLI brain (advisory; the grant stays
+/// approval-gated). Same validation boundary; any failure → `None`.
+async fn extract_permission_slots_via_cli(
+    brain: relux_kernel::PrimeBrain,
+    status: Option<relux_core::AdapterRuntimeStatus>,
+    message: &str,
+) -> Option<relux_kernel::BrainPermissionSlots> {
+    let (stdout, kind) = cli_brain_json(
+        brain,
+        status,
+        relux_kernel::build_permission_slots_prompt(message),
+    )
+    .await?;
+    parse_cli_permission_slots(&stdout, kind)
+}
+
+/// Spawn a CLI brain in the same bounded, non-bypass mode every other Prime CLI path
+/// uses (argv-only, prompt on stdin, wall-clock timeout, output cap, secret
+/// redaction) and return its captured `stdout` plus the adapter kind, or `None` on a
+/// missing/disabled adapter, spawn error, timeout, or empty/failed output. The shared
+/// spawn for every brain-assisted slot extraction so each typed extractor is just
+/// "build prompt → spawn → parse".
+async fn cli_brain_json(
+    brain: relux_kernel::PrimeBrain,
+    status: Option<relux_core::AdapterRuntimeStatus>,
+    prompt: String,
+) -> Option<(String, relux_core::AdapterKind)> {
     let kind = match brain {
         relux_kernel::PrimeBrain::ClaudeCli => relux_core::AdapterKind::ClaudeCli,
         relux_kernel::PrimeBrain::CodexCli => relux_core::AdapterKind::CodexCli,
@@ -2109,7 +2219,6 @@ async fn extract_task_slots_via_cli(
     }
     let program = st.resolved_path.clone()?;
 
-    let prompt = relux_kernel::build_task_slots_prompt(message);
     let spec = relux_kernel::AdapterCommandSpec {
         program,
         args: relux_kernel::build_adapter_args(&kind),
@@ -2125,12 +2234,12 @@ async fn extract_task_slots_via_cli(
     };
 
     let run = tokio::task::spawn_blocking(move || relux_kernel::run_adapter_command(&spec)).await;
-    let outcome = match run {
-        Ok(Ok(outcome)) if outcome.success && !outcome.stdout.trim().is_empty() => outcome,
-        _ => return None,
-    };
-
-    parse_cli_task_slots(&outcome.stdout, kind)
+    match run {
+        Ok(Ok(outcome)) if outcome.success && !outcome.stdout.trim().is_empty() => {
+            Some((outcome.stdout, kind))
+        }
+        _ => None,
+    }
 }
 
 /// Lift validated task slots out of a CLI brain's captured `stdout`, or `None`.
@@ -2148,6 +2257,45 @@ fn parse_cli_task_slots(
         return None;
     }
     relux_kernel::parse_task_slots(&parsed.text).ok()
+}
+
+/// Lift validated agent slots out of a CLI brain's `stdout` (the same no-leak boundary
+/// as [`parse_cli_task_slots`]). The raw envelope never escapes.
+fn parse_cli_agent_slots(
+    stdout: &str,
+    kind: relux_core::AdapterKind,
+) -> Option<relux_kernel::BrainAgentSlots> {
+    let parsed = relux_core::parse_adapter_result(stdout, kind);
+    if parsed.is_error == Some(true) {
+        return None;
+    }
+    relux_kernel::parse_agent_slots(&parsed.text).ok()
+}
+
+/// Lift a validated plugin reference out of a CLI brain's `stdout` (advisory; the
+/// install stays approval-gated). Same no-leak boundary.
+fn parse_cli_plugin_ref(
+    stdout: &str,
+    kind: relux_core::AdapterKind,
+) -> Option<relux_kernel::BrainPluginRef> {
+    let parsed = relux_core::parse_adapter_result(stdout, kind);
+    if parsed.is_error == Some(true) {
+        return None;
+    }
+    relux_kernel::parse_plugin_ref(&parsed.text).ok()
+}
+
+/// Lift a validated permission-grant subject out of a CLI brain's `stdout` (advisory;
+/// the grant stays approval-gated). Same no-leak boundary.
+fn parse_cli_permission_slots(
+    stdout: &str,
+    kind: relux_core::AdapterKind,
+) -> Option<relux_kernel::BrainPermissionSlots> {
+    let parsed = relux_core::parse_adapter_result(stdout, kind);
+    if parsed.is_error == Some(true) {
+        return None;
+    }
+    relux_kernel::parse_permission_slots(&parsed.text).ok()
 }
 
 /// The provenance label for brain-extracted slots: the OpenRouter model id, or the
@@ -4591,6 +4739,8 @@ mod tests {
             suggested_actions: Vec::new(),
             proposal: None,
             slots: None,
+            agent_slots: None,
+            admin_slots: None,
         }
     }
 
@@ -5485,6 +5635,60 @@ mod tests {
         );
     }
 
+    // --- Brain-assisted AGENT slots: the no-leak parse boundary ---------------
+
+    #[test]
+    fn cli_agent_slots_lifted_from_a_result_envelope() {
+        let inner = r#"{\"name\":\"CI Watcher\",\"role\":\"Watches CI\",\"confidence\":0.9}"#;
+        let stdout = format!(r#"{{"type":"result","is_error":false,"result":"{inner}","session_id":"abc"}}"#);
+        let s = parse_cli_agent_slots(&stdout, relux_core::AdapterKind::ClaudeCli)
+            .expect("a valid envelope yields validated agent slots");
+        assert_eq!(s.name, "CI Watcher");
+        assert_eq!(s.role.as_deref(), Some("Watches CI"));
+        assert!(!s.name.contains("session_id") && !s.name.contains("\"type\""));
+    }
+
+    #[test]
+    fn cli_agent_slots_error_envelope_and_unsupported_field_yield_nothing() {
+        let err = r#"{"type":"result","is_error":true,"result":"rate limited"}"#;
+        assert!(parse_cli_agent_slots(err, relux_core::AdapterKind::ClaudeCli).is_none());
+        // An unsupported field (a smuggled permission key) fails the whole proposal.
+        let inner = r#"{\"name\":\"x\",\"permissions\":[\"tool:relux-tools-shell:exec\"],\"confidence\":0.9}"#;
+        let stdout = format!(r#"{{"type":"result","is_error":false,"result":"{inner}"}}"#);
+        assert!(
+            parse_cli_agent_slots(&stdout, relux_core::AdapterKind::ClaudeCli).is_none(),
+            "an unsupported field must fail closed"
+        );
+    }
+
+    // --- Brain-assisted ADMIN slots: the no-leak parse boundary ---------------
+
+    #[test]
+    fn cli_plugin_ref_lifted_and_normalized_from_an_envelope() {
+        let inner = r#"{\"plugin_id\":\"Relux-Tools-GitHub\",\"confidence\":0.9}"#;
+        let stdout = format!(r#"{{"type":"result","is_error":false,"result":"{inner}"}}"#);
+        let p = parse_cli_plugin_ref(&stdout, relux_core::AdapterKind::ClaudeCli)
+            .expect("a valid envelope yields a validated plugin ref");
+        assert_eq!(p.plugin_id, "relux-tools-github");
+    }
+
+    #[test]
+    fn cli_permission_slots_lifted_from_an_envelope_and_kind_fails_closed() {
+        let inner = r#"{\"subject_kind\":\"agent\",\"subject_id\":\"code-agent\",\"permission\":\"tool:relux-tools-github:access\",\"confidence\":0.9}"#;
+        let stdout = format!(r#"{{"type":"result","is_error":false,"result":"{inner}"}}"#);
+        let s = parse_cli_permission_slots(&stdout, relux_core::AdapterKind::CodexCli)
+            .expect("a valid envelope yields validated permission slots");
+        assert_eq!(s.subject_id.as_deref(), Some("code-agent"));
+        assert_eq!(s.permission.as_deref(), Some("tool:relux-tools-github:access"));
+        // An off-allowlist subject_kind fails the whole proposal closed at the seam.
+        let bad = r#"{\"subject_kind\":\"plugin\",\"subject_id\":\"relux-tools-github\",\"confidence\":0.9}"#;
+        let stdout = format!(r#"{{"type":"result","is_error":false,"result":"{bad}"}}"#);
+        assert!(
+            parse_cli_permission_slots(&stdout, relux_core::AdapterKind::ClaudeCli).is_none(),
+            "an unsupported subject_kind must fail closed"
+        );
+    }
+
     #[test]
     fn cli_polish_rejects_error_envelope() {
         // An envelope reporting an error is never used as a polish, even though it
@@ -5558,6 +5762,8 @@ mod tests {
             suggested_actions: Vec::new(),
             proposal: None,
             slots: None,
+            agent_slots: None,
+            admin_slots: None,
         };
         let wire = serde_json::to_value(&turn).expect("PrimeTurn serializes");
         assert!(

@@ -8,7 +8,7 @@ import {
   type ReluxPrimeSuggestion,
   type ReluxPrimeTurn,
 } from "../api";
-import { hasSteps, intentProvenance, polishProvenance, proposalDisplaySummary, slotProvenance, stepDisplayTitle } from "../prime";
+import { brainSourceLabel, hasSteps, intentProvenance, polishProvenance, proposalDisplaySummary, slotProvenance, stepDisplayTitle } from "../prime";
 import { workTaskHref, workRunHref } from "../routing";
 import { PrimeAutonomyPanel } from "../components/PrimeAutonomyPanel";
 import { OrchestrationPanel } from "../components/OrchestrationPanel";
@@ -398,6 +398,100 @@ function PrimeTurnCard({
               {turn.slots.priority != null && <span>priority {turn.slots.priority}</span>}
             </div>
           )}
+        </div>
+      )}
+
+      {/* Brain-assisted AGENT slots (RELUX_MASTER_PLAN §10.1, §10.2, §17.1). A compact
+          chip surfacing the normalized name/id, role, and adapter the brain proposed
+          and the kernel validated (duplicate id rejected, adapter checked against the
+          live roster) — present ONLY when the kernel attached them. The agent was
+          already created through the deterministic execute path; this shows what the
+          brain contributed, never a fresh authority. */}
+      {turn.agent_slots && (
+        <div
+          style={{
+            marginTop: 10,
+            border: "1px solid var(--border)",
+            borderRadius: 6,
+            padding: "8px 10px",
+            fontSize: 12,
+          }}
+        >
+          <div className="row wrap" style={{ gap: 6, alignItems: "center", marginBottom: 4 }}>
+            <span
+              className="badge done"
+              style={{ fontSize: 9 }}
+              title="Prime's brain extracted and normalized this agent — not keyword slicing"
+            >
+              🧠 {brainSourceLabel(turn.agent_slots.source)}
+            </span>
+            <span className="muted" style={{ fontSize: 9 }}>brain-extracted agent</span>
+          </div>
+          <div>
+            <strong>{turn.agent_slots.name}</strong>{" "}
+            <span className="mono muted" style={{ fontSize: 11 }}>{turn.agent_slots.id}</span>
+          </div>
+          {turn.agent_slots.description && (
+            <div className="muted" style={{ marginTop: 2 }}>{turn.agent_slots.description}</div>
+          )}
+          {(turn.agent_slots.adapter || turn.agent_slots.notes) && (
+            <div className="muted" style={{ marginTop: 4, fontSize: 11 }}>
+              {turn.agent_slots.adapter && (
+                <span>
+                  adapter <span className="mono">{turn.agent_slots.adapter}</span>
+                </span>
+              )}
+              {turn.agent_slots.adapter && turn.agent_slots.notes && <span> · </span>}
+              {turn.agent_slots.notes && <span>{turn.agent_slots.notes}</span>}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Brain-assisted ADMIN slots (RELUX_MASTER_PLAN §10.3, §17.1). A risky plugin
+          install / permission grant the brain SHARPENED — but the action stays gated
+          behind the human approval below; this chip is advisory provenance only. The
+          permission subject was validated against the live agent roster; a plugin id
+          is normalized. Nothing changes until the user approves. */}
+      {turn.admin_slots && (
+        <div
+          style={{
+            marginTop: 10,
+            border: "1px solid var(--border)",
+            borderRadius: 6,
+            padding: "8px 10px",
+            fontSize: 12,
+          }}
+        >
+          <div className="row wrap" style={{ gap: 6, alignItems: "center", marginBottom: 4 }}>
+            <span
+              className="badge done"
+              style={{ fontSize: 9 }}
+              title="Prime's brain sharpened the subject of this risky action — it still needs your approval"
+            >
+              🧠 {brainSourceLabel(turn.admin_slots.source)}
+            </span>
+            <span className="muted" style={{ fontSize: 9 }}>
+              {turn.admin_slots.kind === "plugin_install" ? "brain-extracted plugin" : "brain-extracted approval subject"}
+            </span>
+          </div>
+          {turn.admin_slots.kind === "plugin_install" && turn.admin_slots.plugin_id && (
+            <div>
+              install plugin <span className="mono">{turn.admin_slots.plugin_id}</span>
+            </div>
+          )}
+          {turn.admin_slots.kind === "permission_grant" && (
+            <div>
+              grant{" "}
+              {turn.admin_slots.permission && <span className="mono">{turn.admin_slots.permission}</span>}
+              {turn.admin_slots.subject_id && (
+                <span> to <span className="mono">{turn.admin_slots.subject_id}</span></span>
+              )}
+            </div>
+          )}
+          <div className="muted" style={{ marginTop: 4, fontSize: 10 }}>
+            Advisory — requires your approval before anything changes.
+          </div>
         </div>
       )}
 

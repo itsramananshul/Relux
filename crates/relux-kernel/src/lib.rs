@@ -25,6 +25,8 @@ pub mod event;
 pub mod loader;
 pub mod plugin_install;
 pub mod prime;
+pub mod prime_admin_slots;
+pub mod prime_agent_slots;
 pub mod prime_intent;
 pub mod prime_slots;
 pub mod runtime;
@@ -38,9 +40,10 @@ pub use adapter::{
 };
 pub use ai::{
     classify_intent_via_openrouter, clear_stored_config, compose_chat_prompt, compose_polish_prompt,
-    extract_task_slots_via_openrouter, is_actionful, polish_from_cli_text, polish_proposal,
-    proposal_wants_polish, read_stored_config, shape_reply, write_stored_config, AiConfig, AiMode,
-    AiOutcome, AiStatus, PrimeBrain, StoredAiConfig,
+    extract_agent_slots_via_openrouter, extract_permission_slots_via_openrouter,
+    extract_plugin_ref_via_openrouter, extract_task_slots_via_openrouter, is_actionful,
+    polish_from_cli_text, polish_proposal, proposal_wants_polish, read_stored_config, shape_reply,
+    write_stored_config, AiConfig, AiMode, AiOutcome, AiStatus, PrimeBrain, StoredAiConfig,
 };
 pub use auth::{
     admin_path_for_db, clear_session_cookie, read_admin_username, reset_admin_credential,
@@ -57,6 +60,15 @@ pub use plugin_install::{
     refresh_bundled_plugins, remove_plugin, GENERATED_MANIFEST_AUTHOR,
 };
 pub use prime::{classify_intent, decide, is_chat_guarded};
+pub use prime_admin_slots::{
+    build_permission_slots_prompt, build_plugin_ref_prompt, parse_permission_slots,
+    parse_plugin_ref, reconcile_permission_slots, reconcile_plugin_ref, BrainPermissionSlots,
+    BrainPluginRef, ResolvedPermissionSlots,
+};
+pub use prime_agent_slots::{
+    build_agent_slots_prompt, parse_agent_slots, reconcile_agent_slots, BrainAgentSlots,
+    ResolvedAgentSlots,
+};
 pub use prime_intent::{
     build_intent_prompt, parse_intent_proposal, reconcile_intent, BrainIntentProposal,
     IntentSource,
@@ -67,8 +79,8 @@ pub use prime_slots::{
 };
 pub use runtime::{invoke_http_loopback, RuntimeClientError};
 pub use state::{
-    run_briefs_in_parallel, AppliedProposedChange, AppliedProposedChangeSet, BundledRefresh,
-    BundledRefreshSummary,
+    run_briefs_in_parallel, AppliedProposedChange, AppliedProposedChangeSet, BrainSlotProposals,
+    BundledRefresh, BundledRefreshSummary,
     FinishedBrief, KernelCounters, KernelSnapshot, KernelState, PreparedBrief, RoundPrep,
 };
 pub use store::SqliteStore;

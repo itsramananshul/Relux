@@ -82,6 +82,16 @@ export function intentProvenance(source: string | undefined): string | null {
 // chip never overclaims a brain decision (§10.1, §10.2, §17.1).
 export function slotProvenance(slots: ReluxPrimeTaskSlots | undefined): string | null {
   if (!slots) return null;
-  const source = slots.source?.trim();
-  return source ? source : "AI brain";
+  return brainSourceLabel(slots.source);
+}
+
+// The shared provenance-label rule for every brain-assisted slot card (task, agent,
+// admin): return the stamped model id / CLI brain label, falling back to a neutral
+// "AI brain" when an older kernel left `source` unset. Callers render this ONLY when
+// the kernel attached a slot object — and the kernel only attaches one when the
+// fail-closed validators accepted the slots — so the label always reflects a genuine,
+// validated brain contribution (§10.1, §10.2, §17.1).
+export function brainSourceLabel(source: string | undefined): string {
+  const trimmed = source?.trim();
+  return trimmed ? trimmed : "AI brain";
 }

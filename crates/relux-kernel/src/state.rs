@@ -3432,7 +3432,42 @@ impl KernelState {
         intent_proposal: Option<&crate::prime_intent::BrainIntentProposal>,
         slot_proposal: Option<&crate::prime_slots::BrainTaskSlots>,
     ) -> Result<(PrimeTurn, crate::prime_intent::IntentSource), KernelError> {
+        self.prime_turn_with_brain(
+            ctx,
+            message,
+            intent_proposal,
+            BrainSlotProposals {
+                task: slot_proposal,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Like [`Self::prime_turn_with_intent_and_slots`], but accepts the full bundle of
+    /// brain-proposed slots for whichever action the turn produces — task slots for a
+    /// create, agent slots for an `AgentCreation`, and the advisory plugin/permission
+    /// subject for a risky `Propose`. Each is validated at this single chokepoint
+    /// before it can shape anything: a create is sharpened only after the fail-closed
+    /// intent gate accepted it, an agent slot is rejected on a duplicate id / unknown
+    /// adapter, and the plugin/permission subject only sharpens an action that STAYS
+    /// gated behind a human approval. With an all-`None` bundle this is byte-for-byte
+    /// the deterministic turn. Durable state still flows only through `decide` →
+    /// [`Self::prime_execute`] (or, for risky actions, a human approval).
+    pub fn prime_turn_with_brain(
+        &mut self,
+        ctx: &PrimeContext,
+        message: &str,
+        intent_proposal: Option<&crate::prime_intent::BrainIntentProposal>,
+        slots: BrainSlotProposals<'_>,
+    ) -> Result<(PrimeTurn, crate::prime_intent::IntentSource), KernelError> {
         let summary = self.inspect_state();
+        // The live adapter roster, so a brain-proposed agent adapter is honored only
+        // when it names one that actually exists (fail closed).
+        let adapter_ids: Vec<String> = self
+            .adapter_runtime_status()
+            .into_iter()
+            .map(|a| a.plugin_id)
+            .collect();
         let deterministic = classify_intent(message);
         let (intent, intent_source) = match intent_proposal {
             Some(proposal) => {
@@ -3474,6 +3509,8 @@ impl KernelState {
                 suggested_actions: Vec::new(),
                 proposal: None,
                 slots: None,
+                agent_slots: None,
+                admin_slots: None,
             },
             PrimePlan::Clarify { text } => PrimeTurn {
                 intent,
@@ -3490,23 +3527,42 @@ impl KernelState {
                 suggested_actions: Vec::new(),
                 proposal: None,
                 slots: None,
+                agent_slots: None,
+                admin_slots: None,
             },
             PrimePlan::Act { action, text } => {
-                // Brain-assisted slot sharpening (validated): only for a create
-                // action, only when a slot proposal is present, and only when it
-                // reconciles against the deterministic title + the live agent roster
-                // behind the fail-closed gate (`prime_slots.rs`). The brain authors
-                // no new work here — it sharpens a create the deterministic path
+                // Brain-assisted slot sharpening (validated): a create action takes
+                // task slots; an `AgentCreation` takes agent slots. Each reconciles
+                // against the deterministic value + the live rosters behind the
+                // fail-closed gate, and only sharpens an action the deterministic path
                 // already decided. `None` (no proposal, low confidence, unknown
-                // assignee with nothing else) keeps the deterministic slots.
-                let resolved = match (&action, slot_proposal) {
+                // assignee/adapter, duplicate id) keeps the deterministic slots.
+                let resolved_task = match (&action, slots.task) {
                     (
                         PrimeAction::CreateTask { title } | PrimeAction::CreateAndRunTask { title },
                         Some(proposal),
                     ) => crate::prime_slots::reconcile_task_slots(title, proposal, &summary),
                     _ => None,
                 };
-                self.prime_execute(ctx, intent, action, text, resolved.as_ref())?
+                let resolved_agent = match (&action, slots.agent) {
+                    (PrimeAction::CreateAgent { name, .. }, Some(proposal)) => {
+                        crate::prime_agent_slots::reconcile_agent_slots(
+                            name,
+                            proposal,
+                            &summary.all_agent_ids,
+                            &adapter_ids,
+                        )
+                    }
+                    _ => None,
+                };
+                self.prime_execute(
+                    ctx,
+                    intent,
+                    action,
+                    text,
+                    resolved_task.as_ref(),
+                    resolved_agent.as_ref(),
+                )?
             }
             PrimePlan::Propose {
                 action,
@@ -3514,6 +3570,14 @@ impl KernelState {
                 risk,
                 text,
             } => {
+                // Brain-assisted admin-subject sharpening (advisory). A plugin install
+                // or permission grant STAYS gated behind the human approval below; the
+                // brain only sharpens the subject the human reviews (a normalized
+                // plugin id, or an existing-agent permission subject — validated). On
+                // no/low-confidence/unvalidated proposal the deterministic subject
+                // stands and no provenance is attached.
+                let (action, text, admin_slots) =
+                    sharpen_admin_action(action, text, &slots, &summary);
                 let rendered = describe_action(&action);
                 let approval = self.request_approval(
                     ctx.agent.as_str(),
@@ -3540,6 +3604,8 @@ impl KernelState {
                     suggested_actions: Vec::new(),
                     proposal: None,
                     slots: None,
+                    agent_slots: None,
+                    admin_slots,
                 }
             }
         };
@@ -3582,6 +3648,7 @@ impl KernelState {
         action: PrimeAction,
         text: String,
         slots: Option<&crate::prime_slots::ResolvedTaskSlots>,
+        agent_slots: Option<&crate::prime_agent_slots::ResolvedAgentSlots>,
     ) -> Result<PrimeTurn, KernelError> {
         match &action {
             PrimeAction::CreateTask { title } => {
@@ -3640,6 +3707,8 @@ impl KernelState {
                         priority: s.priority,
                         source: None,
                     }),
+                    agent_slots: None,
+                    admin_slots: None,
                 })
             }
             PrimeAction::CreateAndRunTask { title } => {
@@ -3702,6 +3771,8 @@ impl KernelState {
                     suggested_actions: Vec::new(),
                     proposal: None,
                     slots: provenance,
+                    agent_slots: None,
+                    admin_slots: None,
                 })
             }
             PrimeAction::StartRun { task_id } => {
@@ -3726,24 +3797,56 @@ impl KernelState {
                     suggested_actions: Vec::new(),
                     proposal: None,
                     slots: None,
+                    agent_slots: None,
+                    admin_slots: None,
                 })
             }
             PrimeAction::CreateAgent {
                 name,
                 adapter_plugin,
             } => {
-                let agent_id_str = name.to_lowercase().replace(" ", "-");
-                let adapter = PluginId::new(adapter_plugin.clone());
+                // The brain may sharpen the agent slots (validated against the live
+                // agent + adapter rosters); otherwise the deterministic name stands.
+                // The id is the normalized handle (brain id when present, else derived
+                // the same way the deterministic path always did). The description and
+                // adapter are taken from the brain only when validated.
+                let eff_name = agent_slots.map(|s| s.name.clone()).unwrap_or_else(|| name.clone());
+                let agent_id_str = agent_slots
+                    .map(|s| s.id.clone())
+                    .unwrap_or_else(|| name.to_lowercase().replace(' ', "-"));
+                let description = agent_slots
+                    .and_then(|s| s.description.clone())
+                    .unwrap_or_else(|| "Agent created by Prime".to_string());
+                let adapter_id = agent_slots
+                    .and_then(|s| s.adapter.clone())
+                    .unwrap_or_else(|| adapter_plugin.clone());
+                let adapter = PluginId::new(adapter_id.clone());
                 let agent_id = self.create_agent(
                     &agent_id_str,
-                    name,
-                    "Agent created by Prime", // Default description
+                    &eff_name,
+                    &description,
                     &adapter,
                     &ctx.namespace,
                     None,   // No persona
                     vec![], // No special permissions by default
                 )?;
-                let reply = format!("{text} Created agent {agent_id}.");
+                let head = if agent_slots.is_some() {
+                    format!("Creating agent \"{eff_name}\".")
+                } else {
+                    text
+                };
+                let reply = format!("{head} Created agent {agent_id}.");
+                // Provenance reflects only what the brain genuinely contributed and the
+                // kernel applied: a no-op echo never reaches here (reconcile returned
+                // None), so a present `agent_slots` always sharpened the create.
+                let provenance = agent_slots.map(|s| relux_core::PrimeAgentSlots {
+                    name: eff_name.clone(),
+                    id: agent_id_str.clone(),
+                    description: s.description.clone(),
+                    adapter: s.adapter.clone(),
+                    notes: s.notes.clone(),
+                    source: None,
+                });
                 Ok(PrimeTurn {
                     intent,
                     reply,
@@ -3759,6 +3862,8 @@ impl KernelState {
                     suggested_actions: Vec::new(),
                     proposal: None,
                     slots: None,
+                    agent_slots: provenance,
+                    admin_slots: None,
                 })
             }
             PrimeAction::AssignTask { task_id, agent_id } => {
@@ -3781,6 +3886,8 @@ impl KernelState {
                     suggested_actions: Vec::new(),
                     proposal: None,
                     slots: None,
+                    agent_slots: None,
+                    admin_slots: None,
                 })
             }
             PrimeAction::DiscoverTools => {
@@ -3807,6 +3914,8 @@ impl KernelState {
                     suggested_actions: Vec::new(),
                     proposal: None,
                     slots: None,
+                    agent_slots: None,
+                    admin_slots: None,
                 })
             }
             PrimeAction::InvokeTool {
@@ -3835,6 +3944,8 @@ impl KernelState {
                         suggested_actions: Vec::new(),
                         proposal: None,
                         slots: None,
+                        agent_slots: None,
+                        admin_slots: None,
                     })
                 }
                 Err(KernelError::OrchestrationNotMultiAgent) => Ok(PrimeTurn {
@@ -3852,6 +3963,8 @@ impl KernelState {
                     suggested_actions: Vec::new(),
                     proposal: None,
                     slots: None,
+                    agent_slots: None,
+                    admin_slots: None,
                 }),
                 Err(e) => Err(e),
             },
@@ -3873,6 +3986,8 @@ impl KernelState {
                 suggested_actions: Vec::new(),
                 proposal: None,
                 slots: None,
+                agent_slots: None,
+                admin_slots: None,
             }),
         }
     }
@@ -3933,6 +4048,8 @@ impl KernelState {
                 suggested_actions: Vec::new(),
                 proposal: None,
                 slots: None,
+                agent_slots: None,
+                admin_slots: None,
             }
         };
 
@@ -5688,6 +5805,96 @@ fn attach_suggestions(
 
 /// Render a `PrimeAction` as a one-line human-readable string for approvals and
 /// audit metadata.
+/// The bundle of OPTIONAL brain-proposed slots handed to
+/// [`KernelState::prime_turn_with_brain`], one per action the brain can sharpen.
+///
+/// Every field is `None` on the deterministic path; each is reconciled and validated
+/// at the single kernel chokepoint before it can shape anything. Defaulting to all
+/// `None` keeps the simple call sites byte-for-byte deterministic.
+#[derive(Default)]
+pub struct BrainSlotProposals<'a> {
+    /// Task slots for a `TaskCreation` / `CreateAndRunTask` turn.
+    pub task: Option<&'a crate::prime_slots::BrainTaskSlots>,
+    /// Agent slots for an `AgentCreation` turn.
+    pub agent: Option<&'a crate::prime_agent_slots::BrainAgentSlots>,
+    /// Advisory plugin reference for a `PluginInstallation` `Propose` turn.
+    pub plugin: Option<&'a crate::prime_admin_slots::BrainPluginRef>,
+    /// Advisory permission subject for a `PermissionChange` `Propose` turn.
+    pub permission: Option<&'a crate::prime_admin_slots::BrainPermissionSlots>,
+}
+
+/// Sharpen a risky, approval-gated admin action (`InstallPlugin` / `GrantPermission`)
+/// with a validated brain proposal, returning the (possibly reshaped) action, the
+/// updated human-readable text, and the advisory provenance to surface.
+///
+/// This is advisory only: the returned action is ALWAYS still proposed behind a human
+/// approval by the caller. The brain can never execute an install or a grant — it only
+/// sharpens the subject the human reviews. On no/low-confidence/unvalidated proposal
+/// the action is returned unchanged with `None` provenance (the deterministic subject
+/// stands). A permission subject is honored ONLY when it names an EXISTING agent; a
+/// plugin id is normalized; neither can invent capability.
+fn sharpen_admin_action(
+    action: PrimeAction,
+    text: String,
+    slots: &BrainSlotProposals<'_>,
+    summary: &relux_core::StateSummary,
+) -> (PrimeAction, String, Option<relux_core::PrimeAdminSlots>) {
+    match action {
+        PrimeAction::InstallPlugin { plugin_id } => {
+            if let Some(proposal) = slots.plugin {
+                if let Some(sharpened) =
+                    crate::prime_admin_slots::reconcile_plugin_ref(&plugin_id, proposal)
+                {
+                    let text = format!("I can install the plugin {sharpened}.");
+                    let admin = relux_core::PrimeAdminSlots {
+                        kind: "plugin_install".to_string(),
+                        plugin_id: Some(sharpened.clone()),
+                        subject_kind: None,
+                        subject_id: None,
+                        permission: None,
+                        source: None,
+                    };
+                    return (PrimeAction::InstallPlugin { plugin_id: sharpened }, text, Some(admin));
+                }
+            }
+            (PrimeAction::InstallPlugin { plugin_id }, text, None)
+        }
+        PrimeAction::GrantPermission {
+            subject_id,
+            permission,
+        } => {
+            if let Some(proposal) = slots.permission {
+                if let Some(sharpened) =
+                    crate::prime_admin_slots::reconcile_permission_slots(proposal, summary)
+                {
+                    // Keep the deterministic permission label unless the brain offered
+                    // a (sanitized) one of its own.
+                    let permission = sharpened.permission.clone().unwrap_or(permission);
+                    let text = format!("I can grant {permission} to {}.", sharpened.subject_id);
+                    let admin = relux_core::PrimeAdminSlots {
+                        kind: "permission_grant".to_string(),
+                        plugin_id: None,
+                        subject_kind: Some(sharpened.subject_kind.clone()),
+                        subject_id: Some(sharpened.subject_id.clone()),
+                        permission: Some(permission.clone()),
+                        source: None,
+                    };
+                    return (
+                        PrimeAction::GrantPermission {
+                            subject_id: sharpened.subject_id,
+                            permission,
+                        },
+                        text,
+                        Some(admin),
+                    );
+                }
+            }
+            (PrimeAction::GrantPermission { subject_id, permission }, text, None)
+        }
+        other => (other, text, None),
+    }
+}
+
 fn describe_action(action: &PrimeAction) -> String {
     match action {
         PrimeAction::CreateTask { title } => format!("create task \"{title}\""),
@@ -6855,6 +7062,212 @@ mod tests {
         let provenance = turn.slots.expect("a sharpened title surfaces provenance");
         assert_eq!(provenance.title, "Ping the health endpoint");
         assert!(provenance.assignee.is_none());
+    }
+
+    fn agent_prop(name: &str, confidence: f32) -> crate::prime_agent_slots::BrainAgentSlots {
+        crate::prime_agent_slots::BrainAgentSlots {
+            name: name.to_string(),
+            role: None,
+            adapter: None,
+            notes: None,
+            confidence,
+            rationale: String::new(),
+        }
+    }
+
+    #[test]
+    fn brain_agent_slots_sharpen_a_created_agent_id_name_and_description() {
+        // A validated agent-slot proposal normalizes the name into a clean id and
+        // applies a real role/description — while the create still flows through the
+        // deterministic execute path (the deterministic name would have been the
+        // generic "new-agent" with "Agent created by Prime").
+        let (mut k, ctx) = prime_chat_kernel();
+        let mut s = agent_prop("CI Watcher", 0.9);
+        s.role = Some("Watches CI and files a brief on failure".to_string());
+
+        let (turn, _src) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "create an agent to keep an eye on CI",
+                None,
+                BrainSlotProposals {
+                    agent: Some(&s),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(turn.intent, relux_core::PrimeIntent::AgentCreation);
+        assert_eq!(turn.disposition, PrimeDisposition::Executed);
+        let agent_id = turn.created_agent.clone().expect("an agent was created");
+        assert_eq!(agent_id.as_str(), "ci-watcher");
+        let agent = k.agent(&agent_id).unwrap();
+        assert_eq!(agent.name, "CI Watcher");
+        assert_eq!(agent.description, "Watches CI and files a brief on failure");
+        let provenance = turn.agent_slots.expect("brain-assisted agent slots surfaced");
+        assert_eq!(provenance.id, "ci-watcher");
+        assert_eq!(provenance.name, "CI Watcher");
+        // The kernel leaves the provenance source unset; the server stamps the label.
+        assert!(provenance.source.is_none());
+    }
+
+    #[test]
+    fn brain_agent_slot_rejects_a_duplicate_id_and_keeps_the_deterministic_name() {
+        // The brain proposes a name that normalizes to an existing agent id: the whole
+        // proposal is rejected (fail closed) so a create can never be reshaped into a
+        // collision, and the deterministic name stands.
+        let (mut k, ctx) = prime_chat_kernel();
+        add_agent(&mut k, &ctx, "research-agent");
+        let mut dup = agent_prop("Research Agent", 0.9);
+        dup.role = Some("Does research".to_string());
+
+        let (turn, _) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "create an agent",
+                None,
+                BrainSlotProposals {
+                    agent: Some(&dup),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::AgentCreation);
+        // Fell back to the deterministic "new-agent" name; no provenance chip.
+        assert_eq!(turn.created_agent.unwrap().as_str(), "new-agent");
+        assert!(turn.agent_slots.is_none());
+    }
+
+    #[test]
+    fn no_agent_slot_proposal_is_byte_for_byte_the_deterministic_create() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let (turn, _) = k
+            .prime_turn_with_brain(&ctx, "create an agent", None, BrainSlotProposals::default())
+            .unwrap();
+        assert_eq!(turn.created_agent.unwrap().as_str(), "new-agent");
+        assert!(turn.agent_slots.is_none());
+    }
+
+    fn permission_prop(
+        subject_id: &str,
+        permission: Option<&str>,
+        confidence: f32,
+    ) -> crate::prime_admin_slots::BrainPermissionSlots {
+        crate::prime_admin_slots::BrainPermissionSlots {
+            subject_kind: Some("agent".to_string()),
+            subject_id: Some(subject_id.to_string()),
+            permission: permission.map(|p| p.to_string()),
+            confidence,
+            rationale: String::new(),
+        }
+    }
+
+    #[test]
+    fn brain_permission_subject_sharpens_the_proposal_but_stays_approval_gated() {
+        // The brain sharpens the subject of a risky grant — but the grant STAYS behind
+        // a human approval: nothing is actually granted, only an approval is logged.
+        let (mut k, ctx) = prime_chat_kernel();
+        let code_agent = add_agent(&mut k, &ctx, "code-agent");
+        // This message has no "agent" token, so the deterministic subject would be the
+        // "(unspecified subject)" placeholder — the brain sharpens it to a real agent.
+        let p = permission_prop("code-agent", Some("tool:relux-tools-github:access"), 0.9);
+
+        let (turn, _) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "give it access to github",
+                None,
+                BrainSlotProposals {
+                    permission: Some(&p),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(turn.intent, relux_core::PrimeIntent::PermissionChange);
+        assert_eq!(turn.disposition, PrimeDisposition::AwaitingApproval);
+        assert!(turn.approval.is_some(), "a grant is proposed behind approval");
+        match turn.action.as_ref().expect("the proposed action is present") {
+            PrimeAction::GrantPermission { subject_id, permission } => {
+                assert_eq!(subject_id, "code-agent");
+                assert_eq!(permission, "tool:relux-tools-github:access");
+            }
+            other => panic!("expected GrantPermission, got {other:?}"),
+        }
+        let admin = turn.admin_slots.expect("admin provenance surfaced");
+        assert_eq!(admin.kind, "permission_grant");
+        assert_eq!(admin.subject_id.as_deref(), Some("code-agent"));
+        // SAFETY: the permission was NOT actually granted — the agent's permission set
+        // is unchanged. Only a human approval can apply it.
+        assert!(
+            k.agent(&code_agent).unwrap().permissions.is_empty(),
+            "a brain slot must never grant a permission by itself"
+        );
+    }
+
+    #[test]
+    fn brain_permission_subject_is_dropped_when_the_agent_does_not_exist() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let unknown = permission_prop("ghost-agent", Some("tool:relux-tools-github:access"), 0.9);
+        let (turn, _) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "give it access to github",
+                None,
+                BrainSlotProposals {
+                    permission: Some(&unknown),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(turn.disposition, PrimeDisposition::AwaitingApproval);
+        // Unknown subject dropped → the deterministic placeholder subject stands and
+        // no provenance is attached.
+        match turn.action.as_ref().unwrap() {
+            PrimeAction::GrantPermission { subject_id, .. } => {
+                assert_eq!(subject_id, "(unspecified subject)");
+            }
+            other => panic!("expected GrantPermission, got {other:?}"),
+        }
+        assert!(turn.admin_slots.is_none());
+    }
+
+    #[test]
+    fn brain_plugin_ref_sharpens_the_install_proposal_but_stays_approval_gated() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let p = crate::prime_admin_slots::BrainPluginRef {
+            plugin_id: "relux-tools-github".to_string(),
+            confidence: 0.9,
+            rationale: String::new(),
+        };
+        let plugins_before = k.plugin_count();
+
+        let (turn, _) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "install the plugin",
+                None,
+                BrainSlotProposals {
+                    plugin: Some(&p),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(turn.intent, relux_core::PrimeIntent::PluginInstallation);
+        assert_eq!(turn.disposition, PrimeDisposition::AwaitingApproval);
+        assert!(turn.approval.is_some());
+        match turn.action.as_ref().unwrap() {
+            PrimeAction::InstallPlugin { plugin_id } => {
+                assert_eq!(plugin_id, "relux-tools-github");
+            }
+            other => panic!("expected InstallPlugin, got {other:?}"),
+        }
+        let admin = turn.admin_slots.expect("admin provenance surfaced");
+        assert_eq!(admin.kind, "plugin_install");
+        assert_eq!(admin.plugin_id.as_deref(), Some("relux-tools-github"));
+        // SAFETY: nothing was installed — only an approval was logged.
+        assert_eq!(k.plugin_count(), plugins_before, "a brain slot must never install");
     }
 
     #[test]

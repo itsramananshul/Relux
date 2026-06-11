@@ -211,3 +211,73 @@ brain title/details/priority but **never** the brain's assignee (the run stays o
 Prime, the only agent wired for the required grant). Every durable change still
 flows through `decide` → `prime_execute`; the brain authors a *proposal*, the kernel
 validates and applies it.
+
+---
+
+## Reference read — Prime brain-assisted agent + admin slots (this slice)
+
+The validated-slot pattern now extends past task creation to the next brittle Prime
+paths: **agent creation** (the executable `AgentCreation` → `CreateAgent` `Act`) and
+the two risky, approval-gated **admin** subjects — **plugin install** and **permission
+grant**. The brittle bits replaced are `crate::prime::derive_agent_name` (named/called
+markers + a few hard-coded keywords, else `new-agent`), `derive_plugin_id` (first
+`relux-`-prefixed token), and the permission subject slice
+(`if message.contains("agent") { derive_agent_name(...) }`).
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/model_tools.py` — `coerce_tool_args` (L535-616) and
+  `_coerce_number` / `_coerce_boolean` (L672-728): each tool argument is coerced to its
+  registered schema type before dispatch; a non-coercible value is dropped, not fatal.
+  Same shape we reuse for the optional slots (a bad adapter/permission field is dropped,
+  the rest stands).
+- `reference/hermes-agent-main/agent/message_sanitization.py` —
+  `_escape_invalid_chars_in_json_strings` (L143-182), the tool-error length clamp
+  (`_sanitize_tool_error`, L515-528): sanitize control chars and CLAMP length on every
+  model-produced string. Mirrored in the agent/admin slot sanitizers (control chars
+  stripped, ids/labels length-clamped).
+
+### Paperclip (openclaw) — files read
+
+- `reference/openclaw-main/src/agents/tools/sessions-spawn-tool.ts` — the closest
+  analogue to "create a new worker from a conversational request":
+  `UNSUPPORTED_SESSIONS_SPAWN_PARAM_KEYS` (L46-55) rejected at L277-284 **before any
+  param is read**; `readStringParam(params, "task", { required: true })` (L285); the
+  default-the-rest pattern `params.cleanup === "keep" | "delete" ? … : "keep"` (L302);
+  the numeric clamp `Math.max(0, Math.floor(...))` (L355). **Pattern: reject unsupported
+  keys up front, require/trim the mandatory string, default/clamp the rest.**
+- `reference/openclaw-main/src/agents/tools/common.ts` — `readStringParam` (L91-122) and
+  `ToolInputError` (L57-64): typed extraction that *throws* on bad input rather than
+  coercing silently.
+- `reference/openclaw-main/src/acp/approval-classifier.ts` — the canonical
+  *approval-subject* resolution: `resolveToolNameForPermission` (L73-103) pulls the
+  subject from multiple sources and **cross-checks them**, `normalizeToolName` (L57-63)
+  lowercases + length-bounds + accepts only a strict `^[a-z0-9._-]+$` shape (else
+  `undefined`), and `EXEC_CAPABLE_TOOL_IDS` / `CONTROL_PLANE_TOOL_IDS` (L15-23) are
+  explicit allowlists that force a NON-auto-approve class. **Pattern: normalize the
+  subject to a strict id shape, check its kind against an allowlist, and never
+  auto-approve a control-plane subject.**
+- `reference/openclaw-main/src/agents/tools/subagents-tool.ts` — `resolveControlled
+  SubagentTarget` only acts on a target that resolves to an EXISTING run (L104-115,
+  L146-157); an unknown target is an error, never invented. Mirrors honoring a
+  permission subject / agent adapter only when it exists.
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| openclaw: **reject unsupported keys, require the mandatory string, default the rest** (`sessions-spawn-tool`) | `prime_agent_slots::parse_agent_slots` / `prime_admin_slots::parse_{plugin_ref,permission_slots}` accept ONLY their allowlist; any other key fails the proposal closed; `name`/`plugin_id` are required; role/adapter/notes/permission default to absent. |
+| openclaw: **normalize a subject to a strict id shape** (`normalizeToolName`) | `agent_id_form` / `sanitize_plugin_id` / `sanitize_id` lowercase + reduce to `[a-z0-9-]` + clamp; `sanitize_permission` keeps only the `[a-z0-9:_-]` grammar. |
+| openclaw: **check the subject KIND against an allowlist** (`CONTROL_PLANE_TOOL_IDS`) | `prime_admin_slots::SUBJECT_KINDS = ["agent"]`; an off-allowlist `subject_kind` (e.g. a smuggled `"plugin"`) fails the whole permission proposal closed. |
+| openclaw: **act only on a subject that EXISTS** (`resolveControlledSubagentTarget`, approval cross-check) | `reconcile_agent_slots` honors an adapter only if it's in the live adapter roster and **rejects a duplicate agent id**; `reconcile_permission_slots` honors a subject only if it names an EXISTING agent (`summary.all_agent_ids`) — the brain can never invent/enable an adapter or grant subject. |
+| Hermes: **coerce-or-drop, never fatal** (`coerce_tool_args`) | a bad/unknown adapter or an unvalidated permission subject is dropped (the deterministic value stands), never an error. |
+| openclaw: **work/control-plane is one explicit, GATED capability** (`tool-policy`) | the brain can sharpen a plugin-install / permission-grant subject, but the action STAYS a `PrimePlan::Propose` behind a human approval — `sharpen_admin_action` reshapes only the *subject the human reviews*, and the kernel still logs an approval and executes nothing. |
+
+**What we deliberately do differently:** agent creation is the only *executable* extension
+(a `CreateAgent` `Act`): the brain may sharpen the name/id/description/adapter, but the id
+may never collide with an existing agent and the adapter must already exist. Plugin install
+and permission grant are **advisory only** — the brain sharpens the subject, but the action
+is unchanged in kind (`Propose` → approval), so a brain slot can NEVER execute a protected
+install or grant by itself. Every durable change still flows through `decide` →
+`prime_execute` (safe `Act`s) or a human approval (risky `Propose`s); the brain authors a
+*proposal*, the kernel validates it.

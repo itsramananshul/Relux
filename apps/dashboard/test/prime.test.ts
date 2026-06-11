@@ -9,6 +9,7 @@ import {
   polishProvenance,
   intentProvenance,
   slotProvenance,
+  brainSourceLabel,
 } from "../src/prime.ts";
 import type { ReluxPrimeProposal, ReluxPrimeTaskSlots } from "../src/api.ts";
 
@@ -118,6 +119,17 @@ test("slotProvenance shows the brain label only when slots are present", () => {
   // An older kernel that left `source` unset degrades to a generic label.
   assert.equal(slotProvenance(slots()), "AI brain");
   assert.equal(slotProvenance(slots({ source: "   " })), "AI brain");
+});
+
+test("brainSourceLabel is the shared provenance rule for agent/admin slot cards", () => {
+  // The stamped model id / CLI label is surfaced verbatim.
+  assert.equal(brainSourceLabel("anthropic/claude-3.5-haiku"), "anthropic/claude-3.5-haiku");
+  assert.equal(brainSourceLabel("Codex CLI"), "Codex CLI");
+  // An unstamped / blank source degrades to the generic label (the caller only
+  // renders the card when the kernel attached a validated slot object, so a label is
+  // always shown — never null — for agent/admin cards).
+  assert.equal(brainSourceLabel(undefined), "AI brain");
+  assert.equal(brainSourceLabel("   "), "AI brain");
 });
 
 test("intentProvenance shows a label only when the brain decided the intent", () => {

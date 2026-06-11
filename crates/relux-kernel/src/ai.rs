@@ -670,6 +670,69 @@ pub async fn extract_task_slots_via_openrouter(
     }
 }
 
+/// Run one JSON-only extraction prompt through the OpenRouter brain, returning the raw
+/// model text, or `None` on ANY failure (no key, disabled, network error). Shared by
+/// the agent / plugin / permission slot extractors so each is a thin
+/// "build prompt → complete → parse" wrapper, exactly like the task-slot path.
+async fn complete_json_only(cfg: &AiConfig, prompt: String) -> Option<String> {
+    if !cfg.enabled() || cfg.api_key.is_none() {
+        return None;
+    }
+    let messages = vec![
+        ChatMessage {
+            role: "system",
+            content: "You output only compact JSON. No prose, no code fences.".to_string(),
+        },
+        ChatMessage {
+            role: "user",
+            content: prompt,
+        },
+    ];
+    request_completion(cfg, messages).await.ok()
+}
+
+/// Extract an agent's creation slots from one user message via the OpenRouter brain,
+/// as VALIDATED [`crate::prime_agent_slots::BrainAgentSlots`], or `None` on ANY
+/// failure. The kernel still reconciles them against the deterministic name and the
+/// live agent/adapter rosters behind the fail-closed gate; the brain stays strictly
+/// additive (§10.1, §10.2, §17.1).
+pub async fn extract_agent_slots_via_openrouter(
+    cfg: &AiConfig,
+    message: &str,
+) -> Option<crate::prime_agent_slots::BrainAgentSlots> {
+    let text = complete_json_only(cfg, crate::prime_agent_slots::build_agent_slots_prompt(message))
+        .await?;
+    crate::prime_agent_slots::parse_agent_slots(&text).ok()
+}
+
+/// Extract the plugin a user asked Prime to install via the OpenRouter brain, as a
+/// VALIDATED [`crate::prime_admin_slots::BrainPluginRef`], or `None`. The install
+/// stays approval-gated; this only sharpens the subject the human reviews.
+pub async fn extract_plugin_ref_via_openrouter(
+    cfg: &AiConfig,
+    message: &str,
+) -> Option<crate::prime_admin_slots::BrainPluginRef> {
+    let text = complete_json_only(cfg, crate::prime_admin_slots::build_plugin_ref_prompt(message))
+        .await?;
+    crate::prime_admin_slots::parse_plugin_ref(&text).ok()
+}
+
+/// Extract the subject of a permission grant via the OpenRouter brain, as VALIDATED
+/// [`crate::prime_admin_slots::BrainPermissionSlots`], or `None`. The grant stays
+/// approval-gated; the kernel still validates the subject against the live agent
+/// roster before proposing it.
+pub async fn extract_permission_slots_via_openrouter(
+    cfg: &AiConfig,
+    message: &str,
+) -> Option<crate::prime_admin_slots::BrainPermissionSlots> {
+    let text = complete_json_only(
+        cfg,
+        crate::prime_admin_slots::build_permission_slots_prompt(message),
+    )
+    .await?;
+    crate::prime_admin_slots::parse_permission_slots(&text).ok()
+}
+
 /// Combine an LLM result with the deterministic fallback into a final outcome.
 /// Pure, so both the success and failure (fallback + note) paths are testable
 /// without a network.
@@ -1187,6 +1250,8 @@ mod tests {
             suggested_actions: Vec::new(),
             proposal: None,
             slots: None,
+            agent_slots: None,
+            admin_slots: None,
         }
     }
 
