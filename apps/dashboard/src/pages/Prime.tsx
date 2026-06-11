@@ -538,6 +538,33 @@ function PrimeTurnCard({
         </div>
       )}
 
+      {turn.assign_slots && (
+        <div
+          style={{
+            marginTop: 10,
+            border: "1px solid var(--border)",
+            borderRadius: 6,
+            padding: "8px 10px",
+            fontSize: 12,
+          }}
+        >
+          <div className="row wrap" style={{ gap: 6, alignItems: "center", marginBottom: 4 }}>
+            <span
+              className="badge done"
+              style={{ fontSize: 9 }}
+              title="Prime's brain resolved the task and agent from your request — both validated against the live board"
+            >
+              🧠 {brainSourceLabel(turn.assign_slots.source)}
+            </span>
+            <span className="muted" style={{ fontSize: 9 }}>brain-resolved assignment</span>
+          </div>
+          <div>
+            assign <span className="mono">{turn.assign_slots.task_id}</span> to{" "}
+            <span className="mono">{turn.assign_slots.agent_id}</span>
+          </div>
+        </div>
+      )}
+
       {(turn.created_task || turn.started_run || turn.created_agent || turn.approval) && (
         <div className="row wrap" style={{ gap: 10, marginTop: 10, fontSize: 11 }}>
           {turn.created_task && (

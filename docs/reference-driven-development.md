@@ -491,3 +491,70 @@ clarify becomes resolvable.
 validated against the live `summary.queued`/`all_task_ids`, so a continuation can only start a task
 that genuinely exists and is ready. This supersedes the earlier slice's note that a run-start clarify
 is never recorded (that was true only while no by-id action existed).
+
+---
+
+## Reference read — brain-assisted continuation resolution (this slice)
+
+The deterministic slices above fixed the *common* assignment/run-start continuations. This
+slice adds the brain as a strictly-additive fallback for the cases the extractors still miss
+("assign the readme task to the helper" — no `task_` token; a continuation where the original
+request and the answer only TOGETHER name both task and agent). When a pending clarification is
+continued, the brain may now *propose* the missing `{task_id, agent_id}` from the full context,
+validated against the live state before any assignment happens — the deterministic combine stays
+the fallback.
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/model_tools.py` `coerce_tool_args` (L535-616) /
+  `_coerce_number` / `_coerce_json` (L672-728) — each model-proposed argument is coerced to its
+  registered schema type before dispatch; a non-coercible value is dropped, not fatal. Mirrored
+  in `crates/relux-kernel/src/prime_assign_slots.rs` `parse_assign_slots` (allowlist, sanitize,
+  clamp; a bad field drops, an unsupported field fails closed).
+- `reference/hermes-agent-main/agent/conversation_loop.py` (`run_conversation`,
+  `messages = list(conversation_history)` then append the new user message; ~L330-400) — a
+  follow-up is interpreted against the prior turn's context. We carry the single pending
+  question's grounding and dispatch the brain on the COMBINED message (the kernel reclassifies
+  the same combined text), so the brain answers the earlier question in context, not blind.
+
+### Paperclip (openclaw) — files read
+
+- `reference/openclaw-main/src/agents/bash-tools.exec-approval-followup.ts`
+  (`sendExecApprovalFollowup` → `buildExecApprovalFollowupPrompt`) — a resolved pending handoff
+  is continued by running a FRESH, fully-validated turn with the stored context injected into the
+  prompt, not by a privileged shortcut. We mirror it: the server computes the combined message,
+  dispatches the slot brain on it, and the kernel re-runs the SAME `decide`/validate pipeline;
+  the brain authors a proposal, never an action.
+- `reference/openclaw-main/src/agents/bash-tools.exec-approval-followup-state.ts`
+  (`consumeExecApprovalFollowupRuntimeHandoff`, L113-146) — a pending record is consumed only
+  when it matches and has not expired, then cleared. The kernel's `continuation_preview` is the
+  read-only counterpart the server consults to learn the combined message + recorded intent
+  BEFORE dispatching the (slow, off-lock) slot brain; the kernel re-decides authoritatively under
+  its own lock.
+- `reference/openclaw-main/src/auto-reply/reply/subagents-utils.ts`
+  `resolveSubagentTargetFromRuns` (L80-145) — resolve a fuzzy reference to an EXISTING target;
+  reused via `crate::prime::resolve_assignee` for the `agent_id`, with the `task_id` likewise
+  honored only when it is in `summary.all_task_ids`.
+- `reference/openclaw-main/src/agents/tools/sessions-spawn-tool.ts`
+  (`UNSUPPORTED_SESSIONS_SPAWN_PARAM_KEYS`) + `src/agents/tools/common.ts` (`readStringParam`)
+  + `src/shared/balanced-json.ts` (`extractBalancedJsonPrefix`) — reject unsupported keys, trim
+  the strings, lift the JSON from a noisy reply; mirrored in `parse_assign_slots` and the CLI
+  no-leak seam `parse_cli_assign_slots`.
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| openclaw: **continue a resolved pending record by running a FRESH validated turn with the stored context injected** | the server reads `KernelState::continuation_preview` (combined message + recorded intent), dispatches the slot brain on the COMBINED message, and the kernel re-runs `decide`/validate; the brain authors only a proposal. |
+| openclaw: **resolve a reference only to an EXISTING target** (`resolveSubagentTargetFromRuns`) | `prime_assign_slots::reconcile_assign_slots` honors `task_id` only when it is in `summary.all_task_ids` and resolves `agent_id` via `resolve_assignee` (always an existing agent); BOTH must validate or the deterministic clarify stands. |
+| openclaw: **a bundle is consumed only when it matches** (TTL/key match) | `BrainSlotProposals.continuation` marks slots computed on the combined message; the kernel keeps the bundle ONLY when `continued == slots.continuation`, so a proposal computed for the wrong message can never shape an action. |
+| Hermes: **coerce/sanitize, drop the bad field, fail closed on the unsupported one** | `parse_assign_slots` allowlist (`task_id`/`agent_id`/`confidence`/`rationale`), sanitize + clamp; an unsupported field fails the whole proposal closed. |
+
+**What we deliberately do differently:** unlike the create-slot layer (which only *sharpens* an
+action the deterministic path already produced), an assignment slot can PROMOTE an
+under-specified `AssignTask` turn into a real `AssignTask` action — but ONLY because assignment is
+a safe, in-scope action (no approval, no risk gate; the deterministic path already produces it
+freely) and BOTH ids are validated against the live state first. The brain authors no risky action
+and can name nothing that is not real; a risky intent still becomes an approval-gated `Propose`,
+and any failure (no brain, low confidence, unknown id, mismatched continuation flag) leaves the
+deterministic clarify in place.

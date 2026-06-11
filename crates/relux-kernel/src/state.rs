@@ -3533,12 +3533,21 @@ impl KernelState {
                 crate::prime_clarify_memory::ClarifyResolution::Continue { combined } => {
                     effective_message = combined;
                     continued = true;
-                    // The brain proposals were computed on the raw answer; ignore them so
-                    // the combined message is classified/extracted deterministically.
+                    // The raw-answer intent proposal is meaningless for the combined
+                    // message; the combined text is reclassified deterministically.
                     intent_proposal = None;
-                    slots = BrainSlotProposals::default();
                 }
             }
+        }
+        // The slot bundle is valid ONLY for the message it was computed on. The server
+        // computes *continuation* slots on the COMBINED message (when it detects a
+        // pending continuation) and *fresh* slots on the raw message; it marks which via
+        // `slots.continuation`. Keep the bundle only when that matches the turn we
+        // actually produced — so a proposal computed for the wrong message can never
+        // shape an action (a continuation never applies raw-answer slots, and a fresh
+        // turn never applies combined-message slots).
+        if continued != slots.continuation {
+            slots = BrainSlotProposals::default();
         }
         let message: &str = &effective_message;
 
@@ -3558,6 +3567,55 @@ impl KernelState {
             None => (deterministic, crate::prime_intent::IntentSource::Deterministic),
         };
         let plan = decide(message, &intent, &summary);
+
+        // Brain-assisted assignment resolution: when the intent is `AssignTask` but the
+        // deterministic plan did NOT produce the assignment (the extractors missed the
+        // task id or the assignee, so it clarified), a VALIDATED brain proposal of
+        // {task_id, agent_id} — both existence-checked against the live state — promotes
+        // it to the SAME safe `AssignTask` action the deterministic path would have
+        // produced. This is allowed only because assignment is a safe, in-scope action
+        // and both ids must already exist (the brain authors no risky action and can name
+        // nothing that is not real). On no/low-confidence/unvalidated proposal the
+        // deterministic clarify stands (the fallback always exists).
+        let mut assign_provenance: Option<relux_core::PrimeAssignSlots> = None;
+        let plan = if intent == relux_core::PrimeIntent::AssignTask
+            && !matches!(
+                &plan,
+                PrimePlan::Act {
+                    action: PrimeAction::AssignTask { .. },
+                    ..
+                }
+            ) {
+            match slots.assign.and_then(|proposal| {
+                crate::prime_assign_slots::reconcile_assign_slots(
+                    crate::prime::extract_task_id(message).as_deref(),
+                    crate::prime::extract_assignee_phrase(message).as_deref(),
+                    proposal,
+                    &summary,
+                )
+            }) {
+                Some(resolved) => {
+                    assign_provenance = Some(relux_core::PrimeAssignSlots {
+                        task_id: resolved.task_id.clone(),
+                        agent_id: resolved.agent_id.clone(),
+                        source: None,
+                    });
+                    PrimePlan::Act {
+                        action: PrimeAction::AssignTask {
+                            task_id: resolved.task_id.clone(),
+                            agent_id: resolved.agent_id.clone(),
+                        },
+                        text: format!(
+                            "Assigning task {} to agent {}.",
+                            resolved.task_id, resolved.agent_id
+                        ),
+                    }
+                }
+                None => plan,
+            }
+        } else {
+            plan
+        };
 
         self.record_audit(
             "agent",
@@ -3594,6 +3652,7 @@ impl KernelState {
                 slots: None,
                 agent_slots: None,
                 admin_slots: None,
+                assign_slots: None,
             },
             PrimePlan::Clarify { text } => PrimeTurn {
                 intent,
@@ -3612,6 +3671,7 @@ impl KernelState {
                 slots: None,
                 agent_slots: None,
                 admin_slots: None,
+                assign_slots: None,
             },
             PrimePlan::Act { action, text } => {
                 // Brain-assisted slot sharpening (validated): a create action takes
@@ -3689,9 +3749,13 @@ impl KernelState {
                     slots: None,
                     agent_slots: None,
                     admin_slots,
+                    assign_slots: None,
                 }
             }
         };
+        // Attach the brain-assisted assignment provenance when the promotion above
+        // produced the `AssignTask` action (a deterministic assignment carries none).
+        turn.assign_slots = assign_provenance;
         // Multi-turn clarification memory: record a NEW pending clarification when this
         // turn asked an actionable, resolvable clarifying question, or clear any existing
         // one when the turn resolved/changed it. The combined message is stored as the new
@@ -3726,6 +3790,28 @@ impl KernelState {
             .get(&key)
             .filter(|p| now < p.expires_at_secs)
             .cloned()
+    }
+
+    /// Read-only preview of whether `message` would CONTINUE a pending clarification, and
+    /// if so the combined message + the pending intent. The server calls this BEFORE the
+    /// turn (outside the lock would be wrong; it is a quick read under a short lock) so it
+    /// can dispatch the slot brain on the COMBINED message + the recorded intent — exactly
+    /// the message the kernel will reclassify. Returns `None` when there is no pending
+    /// record, it is expired, or the follow-up is a fresh request / cancellation (the same
+    /// decision the kernel redoes authoritatively under the lock).
+    pub fn continuation_preview(
+        &self,
+        ctx: &PrimeContext,
+        message: &str,
+    ) -> Option<(String, relux_core::PrimeIntent)> {
+        let key = Self::conversation_key(ctx);
+        let pending = self.pending_clarifications.get(&key)?;
+        match crate::prime_clarify_memory::resolve_pending(pending, message, self.clock.secs()) {
+            crate::prime_clarify_memory::ClarifyResolution::Continue { combined } => {
+                Some((combined, pending.intent.clone()))
+            }
+            _ => None,
+        }
     }
 
     /// Build the natural reply turn when the user explicitly cancels a pending
@@ -3763,6 +3849,7 @@ impl KernelState {
             slots: None,
             agent_slots: None,
             admin_slots: None,
+            assign_slots: None,
         }
     }
 
@@ -3914,6 +4001,7 @@ impl KernelState {
                     }),
                     agent_slots: None,
                     admin_slots: None,
+                    assign_slots: None,
                 })
             }
             PrimeAction::CreateAndRunTask { title } => {
@@ -3978,6 +4066,7 @@ impl KernelState {
                     slots: provenance,
                     agent_slots: None,
                     admin_slots: None,
+                    assign_slots: None,
                 })
             }
             PrimeAction::StartRun { task_id } => {
@@ -4004,6 +4093,7 @@ impl KernelState {
                     slots: None,
                     agent_slots: None,
                     admin_slots: None,
+                    assign_slots: None,
                 })
             }
             PrimeAction::CreateAgent {
@@ -4074,6 +4164,7 @@ impl KernelState {
                     slots: None,
                     agent_slots: provenance,
                     admin_slots: None,
+                    assign_slots: None,
                 })
             }
             PrimeAction::AssignTask { task_id, agent_id } => {
@@ -4098,6 +4189,7 @@ impl KernelState {
                     slots: None,
                     agent_slots: None,
                     admin_slots: None,
+                    assign_slots: None,
                 })
             }
             PrimeAction::DiscoverTools => {
@@ -4126,6 +4218,7 @@ impl KernelState {
                     slots: None,
                     agent_slots: None,
                     admin_slots: None,
+                    assign_slots: None,
                 })
             }
             PrimeAction::InvokeTool {
@@ -4156,6 +4249,7 @@ impl KernelState {
                         slots: None,
                         agent_slots: None,
                         admin_slots: None,
+                        assign_slots: None,
                     })
                 }
                 Err(KernelError::OrchestrationNotMultiAgent) => Ok(PrimeTurn {
@@ -4175,6 +4269,7 @@ impl KernelState {
                     slots: None,
                     agent_slots: None,
                     admin_slots: None,
+                    assign_slots: None,
                 }),
                 Err(e) => Err(e),
             },
@@ -4198,6 +4293,7 @@ impl KernelState {
                 slots: None,
                 agent_slots: None,
                 admin_slots: None,
+                assign_slots: None,
             }),
         }
     }
@@ -4260,6 +4356,7 @@ impl KernelState {
                 slots: None,
                 agent_slots: None,
                 admin_slots: None,
+                assign_slots: None,
             }
         };
 
@@ -6031,6 +6128,15 @@ pub struct BrainSlotProposals<'a> {
     pub plugin: Option<&'a crate::prime_admin_slots::BrainPluginRef>,
     /// Advisory permission subject for a `PermissionChange` `Propose` turn.
     pub permission: Option<&'a crate::prime_admin_slots::BrainPermissionSlots>,
+    /// Resolved assignment slots for an `AssignTask` turn the deterministic extractors
+    /// could not complete (validated against the live state before promoting to an Act).
+    pub assign: Option<&'a crate::prime_assign_slots::BrainAssignSlots>,
+    /// Whether this bundle was computed by the caller on the COMBINED message of a
+    /// multi-turn *continuation* (vs. the raw message of a fresh turn). The kernel keeps
+    /// the bundle only when this matches the turn it actually produced — continuation
+    /// slots are valid ONLY on a continuation, raw slots ONLY on a fresh turn — so a
+    /// proposal computed for the wrong message can never shape an action.
+    pub continuation: bool,
 }
 
 /// Sharpen a risky, approval-gated admin action (`InstallPlugin` / `GrantPermission`)
@@ -7353,6 +7459,127 @@ mod tests {
             confidence,
             rationale: String::new(),
         }
+    }
+
+    fn assign_slots(
+        task_id: &str,
+        agent_id: &str,
+        confidence: f32,
+    ) -> crate::prime_assign_slots::BrainAssignSlots {
+        crate::prime_assign_slots::BrainAssignSlots {
+            task_id: Some(task_id.to_string()),
+            agent_id: Some(agent_id.to_string()),
+            confidence,
+            rationale: String::new(),
+        }
+    }
+
+    #[test]
+    fn brain_assign_slots_resolve_an_under_specified_assignment() {
+        // The deterministic extractors cannot find a task id in "assign the readme task to
+        // the helper" (no `task_` token), so the turn would clarify. A VALIDATED brain
+        // proposal of {task_id, agent_id} — both existence-checked — promotes it to the
+        // same safe AssignTask action, with honest provenance.
+        let (mut k, ctx) = prime_chat_kernel();
+        let helper = add_agent(&mut k, &ctx, "helper");
+        let task_id = k
+            .prime_turn(&ctx, "create a task to summarize the README")
+            .unwrap()
+            .created_task
+            .expect("a task was created");
+
+        // Sanity: without the brain, this clarifies (no task id parsed).
+        let (det, _src) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "assign the readme task to the helper",
+                None,
+                BrainSlotProposals::default(),
+            )
+            .unwrap();
+        assert_eq!(det.disposition, PrimeDisposition::NeedsClarification);
+
+        // With a validated brain proposal, the same message resolves to a real assignment.
+        let p = assign_slots(task_id.as_str(), "helper", 0.9);
+        let (turn, _src) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "assign the readme task to the helper",
+                None,
+                BrainSlotProposals {
+                    assign: Some(&p),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(turn.disposition, PrimeDisposition::Executed);
+        match turn.action {
+            Some(relux_core::PrimeAction::AssignTask { task_id: t, agent_id }) => {
+                assert_eq!(t, task_id.as_str());
+                assert_eq!(agent_id, "helper");
+            }
+            other => panic!("expected a promoted AssignTask, got {other:?}"),
+        }
+        let prov = turn.assign_slots.expect("brain-resolved assignment surfaces provenance");
+        assert_eq!(prov.task_id, task_id.as_str());
+        assert_eq!(prov.agent_id, "helper");
+        assert_eq!(k.task(&task_id).unwrap().assigned_agent.as_ref(), Some(&helper));
+    }
+
+    #[test]
+    fn brain_assign_slots_fail_closed_on_an_unknown_id() {
+        // A brain proposal naming a task/agent that does not exist can NOT invent an
+        // assignment — the deterministic clarify stands.
+        let (mut k, ctx) = prime_chat_kernel();
+        add_agent(&mut k, &ctx, "helper");
+        let _ = k.prime_turn(&ctx, "create a task to summarize the README").unwrap();
+
+        let p = assign_slots("task_9999", "ghost", 0.9); // neither exists
+        let (turn, _src) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "assign the readme task to the helper",
+                None,
+                BrainSlotProposals {
+                    assign: Some(&p),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(turn.disposition, PrimeDisposition::NeedsClarification);
+        assert!(turn.action.is_none());
+        assert!(turn.assign_slots.is_none());
+    }
+
+    #[test]
+    fn continuation_slots_are_dropped_on_a_fresh_turn_and_vice_versa() {
+        // The bundle is applied only to the message it was computed on: a bundle MARKED
+        // continuation must NOT shape a fresh (non-continuation) turn.
+        let (mut k, ctx) = prime_chat_kernel();
+        add_agent(&mut k, &ctx, "helper");
+        let task_id = k
+            .prime_turn(&ctx, "create a task to summarize the README")
+            .unwrap()
+            .created_task
+            .unwrap();
+
+        // A valid proposal, but marked as a continuation while this is a FRESH turn:
+        // the safety gate drops it, so the turn clarifies instead of assigning.
+        let p = assign_slots(task_id.as_str(), "helper", 0.9);
+        let (turn, _src) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "assign the readme task to the helper",
+                None,
+                BrainSlotProposals {
+                    assign: Some(&p),
+                    continuation: true, // mismatched: this is not a continuation
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(turn.disposition, PrimeDisposition::NeedsClarification);
+        assert!(turn.action.is_none());
     }
 
     #[test]

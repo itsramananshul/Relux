@@ -1668,77 +1668,132 @@ async fn run_prime(
         relux_kernel::PrimeBrain::Local => None,
     };
 
-    // 0c. Brain-assisted task SLOT extraction (OUTSIDE the lock — another slow
-    // network/process call). Only when the RESOLVED intent (deterministic
-    // classification reconciled with the brain's proposal, exactly as the kernel
-    // will redo it) is a create intent: there is no point asking for task slots on
-    // a chat/status/plan turn. The brain only *proposes* slots; the kernel
-    // validates them against the deterministic title + the live agent roster behind
-    // the fail-closed gate. ANY failure yields `None` and the deterministic slots
-    // stand — strictly additive (§10.1, §10.2, §17.1).
-    // The slot brain is dispatched on the RESOLVED intent: task slots for a create,
-    // agent slots for an `AgentCreation`, the advisory plugin/permission subject for a
-    // risky `Propose`. There is no point asking for slots on a chat/status/plan turn.
-    let (task_slots, agent_slots, plugin_ref, permission_slots) = {
-        let deterministic_intent = relux_kernel::classify_intent(&message);
-        let resolved_intent = match intent_proposal.as_ref() {
-            Some(p) => {
-                relux_kernel::reconcile_intent(deterministic_intent.clone(), p, &message).0
-            }
-            None => deterministic_intent,
+    // 0b2. Continuation pre-flight (a short read under the lock). If this message
+    // CONTINUES a pending clarification, the slot brain must be dispatched on the
+    // COMBINED message + the recorded intent — exactly what the kernel will reclassify
+    // under the lock — not on the bare answer. We also snapshot the live board so the
+    // assignment prompt can ground against real ids. The kernel re-decides the
+    // continuation authoritatively under its own lock; this preview only steers which
+    // message/intent the (slow, off-lock) slot brain is asked about.
+    let (continuation, board_summary) = {
+        let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut kernel = {
+            let store = SqliteStore::open(&state.db_path)?;
+            store.load()?
         };
+        let ctx = crate::ensure_bootstrapped(&mut kernel)?;
+        let preview = kernel.continuation_preview(&ctx, &message);
+        let summary = kernel.inspect_state();
+        (preview, summary)
+    };
+
+    // 0c. Brain-assisted SLOT extraction (OUTSIDE the lock — another slow
+    // network/process call). The brain is asked about the message and intent the kernel
+    // will actually act on: on a continuation, the COMBINED message + the recorded
+    // intent; otherwise the raw message + its RESOLVED intent (deterministic
+    // classification reconciled with the brain's proposal, exactly as the kernel will
+    // redo it). There is no point asking for slots on a chat/status/plan turn. The brain
+    // only *proposes* slots; the kernel validates each against the live state behind the
+    // fail-closed gate, and a slot bundle marked `continuation` is honored ONLY on a
+    // continuation. ANY failure yields `None` and the deterministic outcome stands —
+    // strictly additive (§10.1, §10.2, §17.1).
+    let is_continuation = continuation.is_some();
+    let (slot_message, slot_intent) = match continuation.as_ref() {
+        Some((combined, intent)) => (combined.clone(), intent.clone()),
+        None => {
+            let deterministic_intent = relux_kernel::classify_intent(&message);
+            let resolved_intent = match intent_proposal.as_ref() {
+                Some(p) => {
+                    relux_kernel::reconcile_intent(deterministic_intent.clone(), p, &message).0
+                }
+                None => deterministic_intent,
+            };
+            (message.clone(), resolved_intent)
+        }
+    };
+    let (task_slots, agent_slots, plugin_ref, permission_slots, assign_slots) = {
         use relux_core::PrimeIntent as I;
-        match resolved_intent {
+        match slot_intent {
             I::TaskCreation | I::CreateAndRunTask => {
                 let p = match brain {
                     relux_kernel::PrimeBrain::Openrouter => {
-                        relux_kernel::extract_task_slots_via_openrouter(&ai_config, &message).await
+                        relux_kernel::extract_task_slots_via_openrouter(&ai_config, &slot_message)
+                            .await
                     }
                     relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli => {
-                        extract_task_slots_via_cli(brain, cli_status.clone(), &message).await
+                        extract_task_slots_via_cli(brain, cli_status.clone(), &slot_message).await
                     }
                     relux_kernel::PrimeBrain::Local => None,
                 };
-                (p, None, None, None)
+                (p, None, None, None, None)
             }
             I::AgentCreation => {
                 let p = match brain {
                     relux_kernel::PrimeBrain::Openrouter => {
-                        relux_kernel::extract_agent_slots_via_openrouter(&ai_config, &message).await
+                        relux_kernel::extract_agent_slots_via_openrouter(&ai_config, &slot_message)
+                            .await
                     }
                     relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli => {
-                        extract_agent_slots_via_cli(brain, cli_status.clone(), &message).await
+                        extract_agent_slots_via_cli(brain, cli_status.clone(), &slot_message).await
                     }
                     relux_kernel::PrimeBrain::Local => None,
                 };
-                (None, p, None, None)
+                (None, p, None, None, None)
             }
             I::PluginInstallation => {
                 let p = match brain {
                     relux_kernel::PrimeBrain::Openrouter => {
-                        relux_kernel::extract_plugin_ref_via_openrouter(&ai_config, &message).await
+                        relux_kernel::extract_plugin_ref_via_openrouter(&ai_config, &slot_message)
+                            .await
                     }
                     relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli => {
-                        extract_plugin_ref_via_cli(brain, cli_status.clone(), &message).await
+                        extract_plugin_ref_via_cli(brain, cli_status.clone(), &slot_message).await
                     }
                     relux_kernel::PrimeBrain::Local => None,
                 };
-                (None, None, p, None)
+                (None, None, p, None, None)
             }
             I::PermissionChange => {
                 let p = match brain {
                     relux_kernel::PrimeBrain::Openrouter => {
-                        relux_kernel::extract_permission_slots_via_openrouter(&ai_config, &message)
-                            .await
+                        relux_kernel::extract_permission_slots_via_openrouter(
+                            &ai_config,
+                            &slot_message,
+                        )
+                        .await
                     }
                     relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli => {
-                        extract_permission_slots_via_cli(brain, cli_status.clone(), &message).await
+                        extract_permission_slots_via_cli(brain, cli_status.clone(), &slot_message)
+                            .await
                     }
                     relux_kernel::PrimeBrain::Local => None,
                 };
-                (None, None, None, p)
+                (None, None, None, p, None)
             }
-            _ => (None, None, None, None),
+            I::AssignTask => {
+                let p = match brain {
+                    relux_kernel::PrimeBrain::Openrouter => {
+                        relux_kernel::extract_assign_slots_via_openrouter(
+                            &ai_config,
+                            &slot_message,
+                            &board_summary,
+                        )
+                        .await
+                    }
+                    relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli => {
+                        extract_assign_slots_via_cli(
+                            brain,
+                            cli_status.clone(),
+                            &slot_message,
+                            &board_summary,
+                        )
+                        .await
+                    }
+                    relux_kernel::PrimeBrain::Local => None,
+                };
+                (None, None, None, None, p)
+            }
+            _ => (None, None, None, None, None),
         }
     };
 
@@ -1760,6 +1815,8 @@ async fn run_prime(
                 agent: agent_slots.as_ref(),
                 plugin: plugin_ref.as_ref(),
                 permission: permission_slots.as_ref(),
+                assign: assign_slots.as_ref(),
+                continuation: is_continuation,
             },
         )?;
         // Read back any pending clarification this turn LEFT active, so the chat can
@@ -1844,6 +1901,10 @@ async fn run_prime(
         slots.source = Some(slot_source_label(brain, &ai_config));
     }
     if let Some(slots) = final_turn.admin_slots.as_mut() {
+        slots.source = Some(slot_source_label(brain, &ai_config));
+    }
+    // And the brain-resolved assignment slots (a promoted `AssignTask`).
+    if let Some(slots) = final_turn.assign_slots.as_mut() {
         slots.source = Some(slot_source_label(brain, &ai_config));
     }
 
@@ -2193,6 +2254,25 @@ async fn extract_task_slots_via_cli(
     parse_cli_task_slots(&stdout, kind)
 }
 
+/// Extract assignment slots (`{task_id, agent_id}`) via a CLI brain, grounded in the
+/// live board, validated through the SAME no-leak boundary as the task-slot path. Any
+/// failure → `None` (the deterministic clarify stands). The kernel still validates both
+/// ids against the live state before promoting any assignment.
+async fn extract_assign_slots_via_cli(
+    brain: relux_kernel::PrimeBrain,
+    status: Option<relux_core::AdapterRuntimeStatus>,
+    message: &str,
+    summary: &relux_core::StateSummary,
+) -> Option<relux_kernel::BrainAssignSlots> {
+    let (stdout, kind) = cli_brain_json(
+        brain,
+        status,
+        relux_kernel::build_assign_slots_prompt(message, summary),
+    )
+    .await?;
+    parse_cli_assign_slots(&stdout, kind)
+}
+
 /// Extract agent-creation slots via a CLI brain, validated through the SAME boundary
 /// as the task-slot path: bounded non-bypass spawn → [`parse_adapter_result`] →
 /// [`relux_kernel::parse_agent_slots`]. Any failure → `None` (deterministic name).
@@ -2294,6 +2374,19 @@ fn parse_cli_task_slots(
         return None;
     }
     relux_kernel::parse_task_slots(&parsed.text).ok()
+}
+
+/// Lift validated assignment slots out of a CLI brain's `stdout` (the same no-leak
+/// boundary as [`parse_cli_task_slots`]). The raw envelope never escapes.
+fn parse_cli_assign_slots(
+    stdout: &str,
+    kind: relux_core::AdapterKind,
+) -> Option<relux_kernel::BrainAssignSlots> {
+    let parsed = relux_core::parse_adapter_result(stdout, kind);
+    if parsed.is_error == Some(true) {
+        return None;
+    }
+    relux_kernel::parse_assign_slots(&parsed.text).ok()
 }
 
 /// Lift validated agent slots out of a CLI brain's `stdout` (the same no-leak boundary
@@ -4880,6 +4973,7 @@ mod tests {
             slots: None,
             agent_slots: None,
             admin_slots: None,
+            assign_slots: None,
         }
     }
 
@@ -5774,6 +5868,40 @@ mod tests {
         );
     }
 
+    // --- Brain-assisted ASSIGNMENT slots: the no-leak parse boundary ----------
+    //
+    // These pin `parse_cli_assign_slots` WITHOUT spawning a real CLI: the raw envelope
+    // must never reach the validated slots, an error/prose envelope yields nothing, and
+    // an unsupported field fails the whole proposal closed.
+
+    #[test]
+    fn cli_assign_slots_lifted_from_a_result_envelope() {
+        let inner = r#"{\"task_id\":\"task_0001\",\"agent_id\":\"researcher\",\"confidence\":0.9}"#;
+        let stdout = format!(r#"{{"type":"result","is_error":false,"result":"{inner}","session_id":"abc"}}"#);
+        let s = parse_cli_assign_slots(&stdout, relux_core::AdapterKind::ClaudeCli)
+            .expect("a valid envelope yields validated assign slots");
+        assert_eq!(s.task_id.as_deref(), Some("task_0001"));
+        assert_eq!(s.agent_id.as_deref(), Some("researcher"));
+    }
+
+    #[test]
+    fn cli_assign_slots_error_envelope_and_prose_yield_nothing() {
+        let err = r#"{"type":"result","is_error":true,"result":"rate limited"}"#;
+        assert!(parse_cli_assign_slots(err, relux_core::AdapterKind::ClaudeCli).is_none());
+        let prose = r#"{"type":"result","is_error":false,"result":"Sure, I'll assign that."}"#;
+        assert!(parse_cli_assign_slots(prose, relux_core::AdapterKind::ClaudeCli).is_none());
+    }
+
+    #[test]
+    fn cli_assign_slots_unsupported_field_fails_closed() {
+        let inner = r#"{\"task_id\":\"task_0001\",\"agent_id\":\"researcher\",\"run_now\":true,\"confidence\":0.9}"#;
+        let stdout = format!(r#"{{"type":"result","is_error":false,"result":"{inner}"}}"#);
+        assert!(
+            parse_cli_assign_slots(&stdout, relux_core::AdapterKind::ClaudeCli).is_none(),
+            "an unsupported field must fail closed"
+        );
+    }
+
     // --- Brain-assisted AGENT slots: the no-leak parse boundary ---------------
 
     #[test]
@@ -5965,6 +6093,7 @@ mod tests {
             slots: None,
             agent_slots: None,
             admin_slots: None,
+            assign_slots: None,
         };
         let wire = serde_json::to_value(&turn).expect("PrimeTurn serializes");
         assert!(

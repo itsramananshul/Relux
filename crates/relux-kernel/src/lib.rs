@@ -27,6 +27,7 @@ pub mod plugin_install;
 pub mod prime;
 pub mod prime_admin_slots;
 pub mod prime_agent_slots;
+pub mod prime_assign_slots;
 pub mod prime_clarify;
 pub mod prime_clarify_memory;
 pub mod prime_intent;
@@ -42,7 +43,8 @@ pub use adapter::{
 };
 pub use ai::{
     classify_intent_via_openrouter, clear_stored_config, compose_chat_prompt, compose_polish_prompt,
-    extract_agent_slots_via_openrouter, extract_permission_slots_via_openrouter,
+    extract_agent_slots_via_openrouter, extract_assign_slots_via_openrouter,
+    extract_permission_slots_via_openrouter,
     extract_plugin_ref_via_openrouter, extract_task_slots_via_openrouter, is_actionful,
     polish_clarify_via_openrouter, polish_from_cli_text, polish_proposal, proposal_wants_polish,
     read_stored_config, shape_reply, write_stored_config, AiConfig, AiMode, AiOutcome, AiStatus,
@@ -85,6 +87,10 @@ pub use prime_clarify_memory::{
 pub use prime_intent::{
     build_intent_prompt, parse_intent_proposal, reconcile_intent, BrainIntentProposal,
     IntentSource,
+};
+pub use prime_assign_slots::{
+    build_assign_slots_prompt, parse_assign_slots, reconcile_assign_slots, BrainAssignSlots,
+    ResolvedAssignSlots,
 };
 pub use prime_slots::{
     build_task_slots_prompt, parse_task_slots, reconcile_task_slots, BrainTaskSlots,

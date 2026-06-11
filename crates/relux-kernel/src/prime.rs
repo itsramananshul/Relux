@@ -1570,7 +1570,7 @@ fn derive_permission_label(message: &str) -> String {
     }
 }
 
-fn extract_task_id(message: &str) -> Option<String> {
+pub(crate) fn extract_task_id(message: &str) -> Option<String> {
     let m = message.to_lowercase();
     if let Some(start_idx) = m.find("task_") {
         let remainder = &m[start_idx + "task_".len()..];
@@ -1638,7 +1638,7 @@ const ASSIGNEE_STOPWORDS: &[&str] = &[
 /// [`extract_agent_id_from_assignment`] (which takes only the FIRST word, kept as the
 /// deterministic "did the user name an agent?" presence signal the clarify branches
 /// still use), this keeps the whole multi-word phrase so a fuzzy reference can resolve.
-fn extract_assignee_phrase(message: &str) -> Option<String> {
+pub(crate) fn extract_assignee_phrase(message: &str) -> Option<String> {
     let m = message.to_lowercase();
     let remainder = if let Some(i) = m.find(" to ") {
         &m[i + " to ".len()..]

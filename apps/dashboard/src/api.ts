@@ -1476,6 +1476,16 @@ export interface ReluxPrimeAdminSlots {
   source?: string;
 }
 
+// Brain-resolved assignment slots, present ONLY on an AssignTask turn the brain resolved
+// (where the deterministic extractors could not, but a validated proposal supplied the
+// missing task/agent). Both ids were validated against the live state before the
+// assignment happened; this is provenance for a small chip. Omitted on every other turn.
+export interface ReluxPrimeAssignSlots {
+  task_id: string;
+  agent_id: string;
+  source?: string;
+}
+
 // A small, bounded record of a clarifying question Prime is still waiting on the user
 // to answer for an actionable request (multi-turn clarify memory). Present on the
 // response ONLY while a clarification is pending; the chat shows a "waiting for: <needs>"
@@ -1517,6 +1527,9 @@ export interface ReluxPrimeTurn {
   // permission grant), present ONLY on a Propose turn the brain sharpened. The action
   // stays approval-gated. Omitted on every other turn.
   admin_slots?: ReluxPrimeAdminSlots;
+  // Brain-resolved assignment slots, present ONLY on an AssignTask turn the brain
+  // resolved (both ids validated against the live state). Omitted on every other turn.
+  assign_slots?: ReluxPrimeAssignSlots;
   // Provenance for a brain-polished clarify / brainstorm reply, present ONLY when a
   // configured brain re-worded this turn's wording through the validated path. The turn
   // stays action-free; this is advisory provenance for the small chip. Omitted otherwise.

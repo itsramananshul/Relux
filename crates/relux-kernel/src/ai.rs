@@ -705,6 +705,24 @@ pub async fn extract_agent_slots_via_openrouter(
     crate::prime_agent_slots::parse_agent_slots(&text).ok()
 }
 
+/// Extract an assignment's slots (`{task_id, agent_id}`) from one user message via the
+/// OpenRouter brain, grounded in the live board, as VALIDATED
+/// [`crate::prime_assign_slots::BrainAssignSlots`], or `None` on ANY failure. The kernel
+/// still validates both ids against the live state before promoting any assignment; the
+/// brain stays strictly additive (§10.1, §10.2, §17.1).
+pub async fn extract_assign_slots_via_openrouter(
+    cfg: &AiConfig,
+    message: &str,
+    summary: &relux_core::StateSummary,
+) -> Option<crate::prime_assign_slots::BrainAssignSlots> {
+    let text = complete_json_only(
+        cfg,
+        crate::prime_assign_slots::build_assign_slots_prompt(message, summary),
+    )
+    .await?;
+    crate::prime_assign_slots::parse_assign_slots(&text).ok()
+}
+
 /// Extract the plugin a user asked Prime to install via the OpenRouter brain, as a
 /// VALIDATED [`crate::prime_admin_slots::BrainPluginRef`], or `None`. The install
 /// stays approval-gated; this only sharpens the subject the human reviews.
@@ -1273,6 +1291,7 @@ mod tests {
             slots: None,
             agent_slots: None,
             admin_slots: None,
+            assign_slots: None,
         }
     }
 

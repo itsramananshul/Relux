@@ -538,6 +538,36 @@ pub struct PrimeAdminSlots {
     pub source: Option<String>,
 }
 
+/// The brain-assisted, validated slots of a task ASSIGNMENT ({task_id, agent_id}),
+/// present ONLY on an `AssignTask` turn the brain *resolved* — i.e. where the
+/// deterministic extractors could not produce the assignment on their own but a brain
+/// proposal, reconciled against the live state, supplied the missing piece(s).
+///
+/// Unlike [`PrimeTaskSlots`] (which sharpens an action the deterministic path already
+/// produced), this slot can PROMOTE an ambiguous/under-specified assignment into the
+/// SAME safe `AssignTask` action the deterministic path would have produced — but only
+/// because assignment is a safe, in-scope action and BOTH ids are validated against the
+/// live state before anything happens (`crates/relux-kernel/src/prime_assign_slots.rs`):
+///
+/// - `task_id` is honored ONLY when it names an EXISTING task (`summary.all_task_ids`);
+/// - `agent_id` is resolved against the live agent roster (the same fuzzy
+///   exact→prefix→substring resolution the deterministic path uses) and is ALWAYS an
+///   existing agent — the brain can never invent an assignee or a task;
+/// - a low-confidence, malformed, unknown-field proposal, or one whose ids do not both
+///   validate, is rejected wholesale and the deterministic outcome (a clarify) stands.
+///
+/// Omitted from the wire on every turn the brain did not resolve.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrimeAssignSlots {
+    /// The existing task id the assignment targets (validated against `all_task_ids`).
+    pub task_id: String,
+    /// The existing agent id the task was assigned to (resolved against the roster).
+    pub agent_id: String,
+    /// The model id / CLI brain label that produced these slots, for provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
 /// The full result of Prime handling one user message.
 ///
 /// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 10 (Prime Behavior Specification).
@@ -598,6 +628,13 @@ pub struct PrimeTurn {
     /// advisory provenance only. Omitted on every other turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admin_slots: Option<PrimeAdminSlots>,
+    /// The brain-assisted, validated assignment slots that RESOLVED an under-specified
+    /// `AssignTask` turn (see [`PrimeAssignSlots`]), present ONLY when the brain supplied
+    /// a task/agent the deterministic extractors missed and both validated against the
+    /// live state. Omitted on every other turn, so existing clients see the same JSON
+    /// they did before. Provenance/presentation only; the kernel validated both ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assign_slots: Option<PrimeAssignSlots>,
 }
 
 /// The scope a Prime turn runs in: which namespace work lands in, which agent
@@ -734,6 +771,7 @@ mod tests {
             slots: None,
             agent_slots: None,
             admin_slots: None,
+            assign_slots: None,
         };
         let json = serde_json::to_string(&turn).unwrap();
         assert!(
@@ -755,6 +793,10 @@ mod tests {
         assert!(
             !json.contains("admin_slots"),
             "a turn with no brain-assisted admin slots must omit the field: {json}"
+        );
+        assert!(
+            !json.contains("assign_slots"),
+            "a turn with no brain-resolved assignment slots must omit the field: {json}"
         );
         // The plan preview is present ONLY on a PlanRequest turn: a normal turn must
         // not carry `proposal` on the wire, so existing clients are unaffected (§11.1).

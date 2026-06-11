@@ -642,6 +642,55 @@ Pinned by `run_start_honors_an_explicit_ready_task_id`,
 `only_resolvable_intents_are_recorded` (`prime_clarify_memory`), and
 `a_run_start_clarification_is_resolved_by_a_task_id_follow_up` (kernel integration).
 
+## Applied change (brain-assisted continuation resolution)
+
+The deterministic slices above fixed the common assignment/run-start continuations. This
+slice adds the brain as a strictly-additive fallback for what the extractors still miss — an
+assignment referenced without a `task_` token, or a continuation where the original request and
+the answer only TOGETHER name both task and agent. Per master plan §10.1/§10.2 and §17.1, and
+following the reference read in `reference-driven-development.md` (openclaw
+`exec-approval-followup` continue-by-fresh-validated-turn + `resolveSubagentTargetFromRuns`
+existing-target resolution; Hermes `coerce_tool_args` + follow-up-in-context), a brain may now
+*propose* the missing `{task_id, agent_id}`, validated against the live state.
+
+- **New module `relux-kernel/src/prime_assign_slots.rs`.** `build_assign_slots_prompt` grounds
+  the brain in the live board; `parse_assign_slots` lifts the JSON, rejects any field outside the
+  allowlist (fail closed), and sanitizes/clamps; `reconcile_assign_slots` honors `task_id` ONLY
+  when it exists (`summary.all_task_ids`), resolves `agent_id` via the shared
+  `prime::resolve_assignee` (always an existing agent), and requires BOTH — a half-resolved
+  assignment is never invented. New wire type `relux_core::PrimeAssignSlots` (provenance only,
+  `skip_serializing_if`).
+- **Kernel chokepoint.** `BrainSlotProposals` gains `assign` + a `continuation` flag. On an
+  `AssignTask` intent where the deterministic plan did NOT produce the assignment, a validated
+  proposal PROMOTES it to the same safe `AssignTask` action (assignment is safe and in-scope, and
+  both ids are validated — the brain authors no risky action). The bundle is kept ONLY when
+  `continued == slots.continuation`, so a proposal computed for the wrong message can never shape
+  an action. `KernelState::continuation_preview` is the read-only seam the server consults to
+  learn the combined message + recorded intent before dispatching the brain.
+- **Both brains feed one validator.** OpenRouter via `ai::extract_assign_slots_via_openrouter`;
+  the Claude/Codex CLI brains via `server.rs` `extract_assign_slots_via_cli` → the no-leak
+  `parse_cli_assign_slots` (`parse_adapter_result` FIRST). The server dispatches the slot brain on
+  the COMBINED message of a continuation (else the raw message + resolved intent), and stamps the
+  provenance label.
+- **Safety (binding).** Strictly additive — any failure (no brain, low confidence, unknown id,
+  mismatched continuation flag) leaves the deterministic clarify in place. Durable state still
+  flows only through `decide` → `prime_execute`; a risky intent still becomes an approval-gated
+  `Propose`. The brain can promote ONLY a safe assignment, and only to ids that already exist.
+- **Dashboard.** A compact B&W "🧠 brain-resolved assignment" card on the Prime chat
+  (`apps/dashboard/src/pages/Prime.tsx`, reusing the shared `brainSourceLabel`), present only when
+  the kernel attached `assign_slots`.
+
+Pinned by the `prime_assign_slots` unit tests (clean/noisy parse, unsupported-field /
+objectless fail-closed, reconcile validates-both / fails-closed-on-unknown-or-low-confidence /
+falls-back-to-deterministic, prompt grounding); the kernel integration tests
+(`brain_assign_slots_resolve_an_under_specified_assignment`,
+`brain_assign_slots_fail_closed_on_an_unknown_id`,
+`continuation_slots_are_dropped_on_a_fresh_turn_and_vice_versa`); the server seam tests
+(`cli_assign_slots_lifted_from_a_result_envelope`,
+`cli_assign_slots_error_envelope_and_prose_yield_nothing`,
+`cli_assign_slots_unsupported_field_fails_closed`); and the core wire guard (the extended
+omission assertion). No test calls a real provider.
+
 ## Current Prime brain stack
 
 The end-to-end shape of one Prime turn, with the brain strictly additive and the
@@ -650,10 +699,14 @@ deterministic kernel always the authority:
 0. **Clarification context** — BEFORE classifying, `prime_turn_with_brain` checks for a
    bounded pending clarification from the prior turn (`prime_clarify_memory::resolve_pending`,
    keyed `namespace::actor`, TTL-bounded). A bare answer is *combined* with the stored original
-   message and the combined text drives the rest of the turn (deterministic only — the
-   raw-answer brain proposals are dropped); a standalone command/question supersedes the pending
-   context; "never mind" cancels it; an expired record is ignored. The follow-up therefore
-   continues the original request through the same pipeline instead of being classified blind.
+   message and the combined text drives the rest of the turn; a standalone command/question
+   supersedes the pending context; "never mind" cancels it; an expired record is ignored. On a
+   continuation the server dispatches the slot brain on the COMBINED message (learned via the
+   read-only `continuation_preview`), and the kernel keeps those slots ONLY when the bundle's
+   `continuation` flag matches the turn it produced — so a fuzzy assignee or an
+   extractor-missed `{task_id, agent_id}` can be brain-resolved in context, with the deterministic
+   combine as the fallback. The follow-up therefore continues the original request through the
+   same pipeline instead of being classified blind.
 1. **Intent** — the brain *proposes* a label (`prime_intent::build_intent_prompt` →
    `parse_intent_proposal`); `reconcile_intent` is the fail-closed gate (guarded
    chat can never become work; low confidence keeps the deterministic intent;
@@ -668,9 +721,13 @@ deterministic kernel always the authority:
      role/notes — applied to the executable `create_agent`;
    - a **`PluginInstallation` / `PermissionChange`** → advisory admin subject
      (`prime_admin_slots`): a normalized plugin id, or a permission subject validated
-     against the live agent roster + a `["agent"]` kind allowlist + a sanitized label.
+     against the live agent roster + a `["agent"]` kind allowlist + a sanitized label;
+   - an **`AssignTask`** the deterministic path could not complete → assignment slots
+     (`prime_assign_slots`): `task_id` honored only when it exists, `agent_id` resolved via
+     `resolve_assignee` to an existing agent, BOTH required — then it PROMOTES the turn to the
+     same safe `AssignTask` action (safe + fully validated, so no approval needed).
    Any failure (no brain, low confidence, invalid JSON, unsupported field/kind,
-   duplicate id, unknown adapter/subject) → the deterministic slot stands.
+   duplicate id, unknown adapter/subject/task) → the deterministic slot stands.
 3. **Deterministic / policy execution** — `decide` → `prime_execute` is the SOLE
    path that changes durable state. Risky intents still become `Propose` behind a
    human approval; the admin slots only sharpen the *subject the human reviews* —
@@ -694,28 +751,21 @@ deterministic kernel always the authority:
 
 ## Next recommended slice
 
-Multi-turn clarification memory now carries the prior question's context into the next turn
-(see the applied change above), so a follow-up answer resolves the original request without
-re-stating it. The remaining keyword surfaces are narrower:
+Multi-turn clarification continuation is now smart on three fronts: a **fuzzy assignee** resolves
+against the live roster (deterministic), a **by-id run start** is wired and its clarify is
+remembered, and a **brain-assisted continuation** can resolve the `{task_id, agent_id}` the
+extractors miss (validated against live state, deterministic combine as the fallback). The
+remaining surfaces are narrower:
 
-- **The slot field-extractors themselves** (`extract_task_id`,
-  `extract_agent_id_from_assignment`, `update_change_phrase`, `orchestration_goal`,
+- **By-id task update** — `TaskUpdate` is still the one resolvable-looking clarify NOT remembered,
+  because no `UpdateTask` action is wired (no faked capability). Wiring a `PrimeAction::UpdateTask
+  { task_id, change }` (priority/title/status/assignee, each validated) would let the same memory
+  resolve "raise the priority" → "task_0001 to 8", and would extend the brain-assisted-slot
+  pattern to the update path.
+- **The remaining slot field-extractors** (`update_change_phrase`, `orchestration_goal`,
   `plan_goal`) are still deterministic string-slicing. They are the *grounding* the brain
-  reconciles against and the fallback when no brain is live, so they should stay — but the
-  `AssignTask` arm (today pure `extract_task_id` + `extract_agent_id_from_assignment`) is a
-  candidate for the same validated-slot treatment (a brain proposes `{task_id, agent_id}`,
-  reconciled against `summary.all_task_ids` / `all_agent_ids`). This would also let the
-  *continuation* path resolve a fuzzy assignee ("the researcher") the deterministic extractor
-  misses today.
-- **Brain-assisted resolution of a bare follow-up answer** — the continuation path is
-  deterministic-only on a `Continue` (the bare answer is combined and re-classified); a
-  validated brain extractor proposing `{task_id, agent_id}` from the combined message
-  (reconciled against the live roster) would let a brain sharpen an answer the extractors miss,
-  while the deterministic combine stays the fallback.
-- **By-id run-start / task-update actions** — a run-start / task-update clarify is deliberately
-  NOT remembered today because no `StartRun { task_id }` / `UpdateTask` action is wired for
-  Prime to resolve it into. Wiring those actions would let the same memory resolve "start it"
-  → "task_0001" and "raise the priority" → "task_0001 to 8".
+  reconciles against and the fallback when no brain is live, so they should stay — but the update
+  path is the next candidate for the validated-slot treatment.
 - **A persona for the manual Crew create form** — today persona is brain-seeded only; a
   small optional persona input on the Crew form (validated/clamped the same way) would let an
   operator set one without the brain.
