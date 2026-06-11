@@ -40,6 +40,13 @@ $ErrorActionPreference = 'Continue'
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $RepoRoot
 
+# Windows-local build-parallelism cap (-j N) for the kernel release build below.
+# See scripts/cargo-jobs.ps1; override with $env:RELUX_CARGO_JOBS (0 = no cap).
+# The targeted `cargo test -p ... <filter>` steps above are deliberately left
+# uncapped: they rebuild only a handful of units, so the cap would not help.
+. (Join-Path $PSScriptRoot 'cargo-jobs.ps1')
+$JobsArgs = Get-CargoJobsArgs
+
 $script:Results = @()
 function Pass($name, $note) { $script:Results += [pscustomobject]@{ Result = 'PASS'; Name = $name; Note = $note }; Write-Host ("  PASS  {0}" -f $name) -ForegroundColor Green }
 function Fail($name, $note) { $script:Results += [pscustomobject]@{ Result = 'FAIL'; Name = $name; Note = $note }; Write-Host ("  FAIL  {0}  ({1})" -f $name, $note) -ForegroundColor Red }
@@ -132,7 +139,7 @@ try {
         Write-Host '-- HTTP wiring --' -ForegroundColor Cyan
         $exe = Join-Path $RepoRoot 'target\release\relux-kernel.exe'
         if (-not $SkipBuild) {
-            & cargo build --release -p relux-kernel 2>$null | Out-Null
+            & cargo build --release -p relux-kernel @JobsArgs 2>$null | Out-Null
         }
         if (-not (Test-Path $exe)) {
             Skip 'http review/apply route checks' 'release binary missing (build failed or -SkipBuild without a prior build)'

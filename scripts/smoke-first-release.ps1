@@ -74,6 +74,15 @@ Set-Location (Join-Path $PSScriptRoot '..')
 $Root = (Get-Location).Path
 $Base = "http://127.0.0.1:$BridgePort"
 
+# Windows-local build-parallelism cap (-j N) for the mesh build below. The
+# relix-cli/-controller/-web-bridge graph (reqwest + rustls + libp2p +
+# web-bridge) is the heaviest cold link in the repo and the most prone to the
+# commit-limit OOM (LNK1102) that emits bogus rlib/metadata errors on a green
+# tree. See scripts/cargo-jobs.ps1; override with $env:RELUX_CARGO_JOBS (0 = no
+# cap).
+. (Join-Path $PSScriptRoot 'cargo-jobs.ps1')
+$JobsArgs = Get-CargoJobsArgs
+
 # System.Net.Http is not auto-loaded in Windows PowerShell 5.1.
 Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
 
@@ -153,7 +162,7 @@ try {
     # -- 0) build (required behavior #1) -----------------------------
     if (-not $SkipBuild) {
         Write-Host "Building binaries (relix-cli, relix-controller, relix-web-bridge) ..." -ForegroundColor Cyan
-        & cargo build -p relix-cli -p relix-controller -p relix-web-bridge
+        & cargo build -p relix-cli -p relix-controller -p relix-web-bridge @JobsArgs
         if ($LASTEXITCODE -ne 0) { Record 'build' $false 'cargo build failed'; throw 'build failed' }
         Record 'build' $true 'cargo build -p relix-cli -p relix-controller -p relix-web-bridge'
     } else {

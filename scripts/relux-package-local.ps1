@@ -29,6 +29,13 @@ $ErrorActionPreference = "Stop"
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $KernelToml = Join-Path $Root "crates\relux-kernel\Cargo.toml"
 
+# Windows-local build-parallelism cap (-j N) for the fallback release build
+# below. See scripts/cargo-jobs.ps1; override with $env:RELUX_CARGO_JOBS (0 = no
+# cap). The readiness gate this calls (relux-first-release-check.ps1) applies the
+# same cap to its own cargo steps.
+. (Join-Path $PSScriptRoot "cargo-jobs.ps1")
+$JobsArgs = Get-CargoJobsArgs
+
 # -- version + git metadata ------------------------------------------------
 if (-not $Version) {
     $versionLine = Select-String -Path $KernelToml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
@@ -83,7 +90,7 @@ if ($SkipChecks) {
 $ReleaseExe = Join-Path $Root "target\release\relux-kernel.exe"
 if (-not (Test-Path -LiteralPath $ReleaseExe)) {
     Write-Host "Release binary missing; building target\release\relux-kernel.exe ..." -ForegroundColor DarkGray
-    & cargo build -p relux-kernel --release
+    & cargo build -p relux-kernel --release @JobsArgs
     if ($LASTEXITCODE -ne 0) {
         throw "Release build failed."
     }

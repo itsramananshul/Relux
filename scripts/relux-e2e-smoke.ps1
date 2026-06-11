@@ -81,6 +81,11 @@ $ErrorActionPreference = 'Stop'
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $ReleaseExe = Join-Path $Root 'target\release\relux-kernel.exe'
 
+# Windows-local build-parallelism cap (-j N) for the release build below. See
+# scripts/cargo-jobs.ps1; override with $env:RELUX_CARGO_JOBS (0 = no cap).
+. (Join-Path $PSScriptRoot 'cargo-jobs.ps1')
+$JobsArgs = Get-CargoJobsArgs
+
 # System.Net.Http is not auto-loaded in Windows PowerShell 5.1.
 Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
 
@@ -130,7 +135,7 @@ try {
     Section 'Release binary'
     if (-not $SkipBuild) {
         Write-Host '  building target\release\relux-kernel.exe ...' -ForegroundColor DarkGray
-        & cargo build -p relux-kernel --release
+        & cargo build -p relux-kernel --release @JobsArgs
         if ($LASTEXITCODE -ne 0) { Fail 'release build' 'cargo build failed'; throw 'release build failed' }
         Pass 'release build' 'cargo build -p relux-kernel --release'
     } else {

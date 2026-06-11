@@ -9,6 +9,14 @@ $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $ReleaseExe = Join-Path $Root "target\release\relux-kernel.exe"
 $Failures = 0
 
+# Windows-local build-parallelism cap (-j N) for the heavy cargo gates below.
+# relux-kernel pulls reqwest/rustls/axum, so a cold build/test/clippy is a big
+# link storm that can hit the commit-limit OOM (LNK1102) and emit bogus
+# rlib/metadata errors. See scripts/cargo-jobs.ps1; override with
+# $env:RELUX_CARGO_JOBS (0 = no cap).
+. (Join-Path $PSScriptRoot "cargo-jobs.ps1")
+$JobsArgs = Get-CargoJobsArgs
+
 function Write-Step {
     param([string]$Name, [string]$Status, [string]$Detail = "")
     $color = if ($Status -eq "PASS") { "Green" } elseif ($Status -eq "SKIP") { "Yellow" } else { "Red" }
@@ -60,9 +68,9 @@ $Cargo = Assert-Command "cargo available" "cargo"
 $Npm = Assert-Command "npm available" "npm"
 
 if ($Cargo) {
-    Invoke-NativeStep -Name "cargo test core/kernel" -Exe $Cargo -Arguments @("test", "-p", "relux-core", "-p", "relux-kernel")
-    Invoke-NativeStep -Name "cargo clippy core/kernel" -Exe $Cargo -Arguments @("clippy", "-p", "relux-core", "-p", "relux-kernel", "--all-targets", "--", "-D", "warnings")
-    Invoke-NativeStep -Name "kernel release build" -Exe $Cargo -Arguments @("build", "-p", "relux-kernel", "--release")
+    Invoke-NativeStep -Name "cargo test core/kernel" -Exe $Cargo -Arguments (@("test", "-p", "relux-core", "-p", "relux-kernel") + $JobsArgs)
+    Invoke-NativeStep -Name "cargo clippy core/kernel" -Exe $Cargo -Arguments (@("clippy", "-p", "relux-core", "-p", "relux-kernel", "--all-targets") + $JobsArgs + @("--", "-D", "warnings"))
+    Invoke-NativeStep -Name "kernel release build" -Exe $Cargo -Arguments (@("build", "-p", "relux-kernel", "--release") + $JobsArgs)
 }
 
 if ($Npm) {
@@ -89,7 +97,7 @@ $portGuidanceCheck = Join-Path $PSScriptRoot "check-port-guidance.ps1"
 if (Test-Path -LiteralPath $ReleaseExe) {
     Invoke-NativeStep -Name "release doctor" -Exe $ReleaseExe -Arguments @("doctor")
 } elseif ($Cargo) {
-    Invoke-NativeStep -Name "doctor via cargo" -Exe $Cargo -Arguments @("run", "-p", "relux-kernel", "--", "doctor")
+    Invoke-NativeStep -Name "doctor via cargo" -Exe $Cargo -Arguments (@("run", "-p", "relux-kernel") + $JobsArgs + @("--", "doctor"))
 }
 
 if ($SkipSmoke) {

@@ -134,6 +134,44 @@ Running these locally catches issues before they consume Actions minutes.
 box, then finishes with the first-release live smoke described above as the
 release gate.
 
+## Windows build-parallelism cap (local gates)
+
+On a memory-constrained Windows box, a from-scratch fully parallel build of the
+heavy crates — `relux-kernel` (reqwest + rustls + axum) and the legacy relix
+mesh (`relix-cli`/`-controller`/`relix-web-bridge`, which add libp2p) — launches
+many codegen+link units at once and exhausts the system commit limit. `link.exe`
+then dies with **LNK1102** (exit code 1102 / `0xc000012d` `STATUS_COMMIT_LIMIT`)
+and rustc can throw an internal compiler error. The crashed units leave partial
+artifacts in `target/`, which cascade into **bogus** follow-on errors on an
+otherwise-green tree — "crate X required to be available in rlib format", "found
+invalid metadata files for crate core/test", "can't find crate for
+relix_runtime". These are not source defects; the same command succeeds from a
+warm `target/` or with throttled parallelism.
+
+The local PowerShell gates therefore cap peak build parallelism. `scripts/cargo-jobs.ps1`
+exposes `Get-CargoJobsArgs`, which returns a `-j <N>` fragment (default **2**)
+that the heavy cargo invocations splice in:
+
+- `scripts/ci-local.ps1` — the `cargo clippy --workspace --all-targets` gate
+  (the serial `cargo test --workspace` gate is already capped harder via
+  `CARGO_BUILD_JOBS=1`).
+- `scripts/relux-first-release-check.ps1` — the core/kernel test, clippy, and
+  release-build steps.
+- `scripts/relux-package-local.ps1`, `scripts/relux-e2e-smoke.ps1`,
+  `scripts/smoke-proposed-change-apply.ps1` — the `relux-kernel --release`
+  builds.
+- `scripts/smoke-first-release.ps1` — the relix-mesh `cargo build` (the heaviest
+  cold link in the repo).
+
+A warm/incremental build has too few units for the cap to bite, so tiny
+package-specific targeted tests (e.g. `cargo test -p relux-core <filter>`) are
+left uncapped. The cap is a Windows-local script convenience, **not** a global
+`.cargo/config.toml` `[build] jobs` setting — a global config would silently
+throttle every build for every user and platform. Override per-shell with
+`$env:RELUX_CARGO_JOBS` (a higher integer for a bigger box, or `0` to disable the
+cap and use cargo's default of all cores). GitHub Actions is unaffected; the
+hosted runners have the headroom to build at full parallelism.
+
 ## Toolchain
 
 `rust-toolchain.toml` pins **Rust 1.95** with `rustfmt` and `clippy`. The

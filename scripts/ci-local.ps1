@@ -23,6 +23,14 @@ $ErrorActionPreference = 'Continue'
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $RepoRoot
 
+# Windows-local build-parallelism cap. The workspace clippy gate below is a cold
+# full-workspace build; throttling its peak parallelism avoids the linker
+# commit-limit OOM (LNK1102) that otherwise emits bogus "rlib format"/metadata
+# errors on a green tree. See scripts/cargo-jobs.ps1 and docs/ci-strategy.md.
+# (The serial test gate is already capped harder via CARGO_BUILD_JOBS=1.)
+. (Join-Path $PSScriptRoot 'cargo-jobs.ps1')
+$JobsArgs = Get-CargoJobsArgs
+
 # Each gate is a name + a scriptblock. Order matters: cheapest/fastest
 # feedback first (fmt), then clippy, then the full serial test, then the
 # supply-chain check.
@@ -41,7 +49,7 @@ $Steps = @(
     },
     @{
         Name   = 'cargo clippy --workspace --all-targets -- -D warnings'
-        Script = { cargo clippy --workspace --all-targets -- -D warnings }
+        Script = { cargo clippy --workspace --all-targets @JobsArgs -- -D warnings }
     },
     @{
         # Dashboard dist parity: the committed React bundle
