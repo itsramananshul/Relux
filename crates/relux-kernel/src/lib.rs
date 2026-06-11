@@ -25,6 +25,7 @@ pub mod event;
 pub mod loader;
 pub mod plugin_install;
 pub mod prime;
+pub mod prime_after_action;
 pub mod prime_admin_slots;
 pub mod prime_agent_slots;
 pub mod prime_assign_slots;
@@ -51,7 +52,7 @@ pub use ai::{
     extract_agent_slots_via_openrouter, extract_assign_slots_via_openrouter,
     extract_permission_slots_via_openrouter,
     extract_plugin_ref_via_openrouter, extract_task_slots_via_openrouter,
-    extract_update_slots_via_openrouter, is_actionful,
+    extract_update_slots_via_openrouter, is_actionful, polish_after_action_via_openrouter,
     polish_clarify_via_openrouter, polish_from_cli_text, polish_proposal, proposal_wants_polish,
     read_stored_config, shape_reply, write_stored_config, AiConfig, AiMode, AiOutcome, AiStatus,
     PrimeBrain, StoredAiConfig,
@@ -81,6 +82,10 @@ pub use prime_admin_slots::{
 pub use prime_agent_slots::{
     build_agent_slots_prompt, parse_agent_slots, reconcile_agent_slots, BrainAgentSlots,
     ResolvedAgentSlots,
+};
+pub use prime_after_action::{
+    after_action_kind, build_action_envelope, build_after_action_prompt, parse_after_action,
+    reconcile_after_action, ActionEnvelope, ActionFacts, ActionResultKind, BrainAfterAction,
 };
 pub use prime_clarify::{
     build_clarify_prompt, clarify_polish_kind, parse_clarify, reconcile_clarify, BrainClarify,

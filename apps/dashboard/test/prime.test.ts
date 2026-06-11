@@ -13,6 +13,7 @@ import {
   replyPolishLabel,
   decisionSourceLabel,
   requestedToolLabel,
+  afterActionLabel,
   pendingClarificationLabel,
   updateChangeSummary,
   updateProvenance,
@@ -189,6 +190,19 @@ test("requestedToolLabel names the governed write tool, and is null when absent"
   // No honored write tool (a vetoed request, or a normal turn) -> nothing to attribute.
   assert.equal(requestedToolLabel(undefined), null);
   assert.equal(requestedToolLabel("   "), null);
+});
+
+test("afterActionLabel names the brain that re-worded a post-execution confirmation, null when absent", () => {
+  // The server attaches `after_action_source` only when a brain shaped an ACTIONFUL turn's
+  // confirmation after the action ran. The chip reads as wording provenance.
+  assert.equal(
+    afterActionLabel("anthropic/claude-3.5-haiku"),
+    "after-action wording · anthropic/claude-3.5-haiku",
+  );
+  assert.equal(afterActionLabel("Claude CLI"), "after-action wording · Claude CLI");
+  // The reply stayed deterministic (no brain / any failure) -> nothing to attribute.
+  assert.equal(afterActionLabel(undefined), null);
+  assert.equal(afterActionLabel("   "), null);
 });
 
 test("polishProvenance is null without a polish overlay and generic when the source is unrecorded", () => {

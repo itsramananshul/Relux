@@ -823,6 +823,30 @@ pub async fn polish_clarify_via_openrouter(
     crate::prime_clarify::reconcile_clarify(deterministic_text, &parsed, kind)
 }
 
+/// Shape the POST-EXECUTION (after-action) reply for an actionful turn via the OpenRouter
+/// brain, returning the validated wording, or `None` on ANY failure (no key, disabled, network
+/// error, malformed reply, a contradiction of the real result, an invented id, low confidence,
+/// or a pure echo).
+///
+/// The action has ALREADY been executed (or proposed) by the kernel; this only re-words the
+/// confirmation, grounded ONLY in the sanitized [`crate::prime_after_action::ActionEnvelope`].
+/// Mirrors the clarify path (build prompt → complete → parse → reconcile), with every claim
+/// validated against the envelope so the brain can never narrate unexecuted work
+/// (`docs/prime-processing-audit.md` "after-action narration", §10.2, §17.1).
+pub async fn polish_after_action_via_openrouter(
+    cfg: &AiConfig,
+    message: &str,
+    envelope: &crate::prime_after_action::ActionEnvelope,
+) -> Option<String> {
+    let text = complete_json_only(
+        cfg,
+        crate::prime_after_action::build_after_action_prompt(message, envelope),
+    )
+    .await?;
+    let parsed = crate::prime_after_action::parse_after_action(&text, envelope).ok()?;
+    crate::prime_after_action::reconcile_after_action(&envelope.grounded_reply, &parsed)
+}
+
 /// Produce ONE UNIFIED Prime decision (intent + every applicable slot + optional wording) in
 /// a single OpenRouter call, as a VALIDATED [`crate::prime_decision::PrimeBrainDecision`], or
 /// `None` on ANY failure (no key, disabled, network error, unparseable/empty envelope).

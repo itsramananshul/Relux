@@ -8248,6 +8248,115 @@ mod tests {
         assert!(turn.assign_slots.is_none());
     }
 
+    // --- Post-execution (after-action) reply shaping ----------------------------
+    //
+    // (`docs/prime-processing-audit.md` "after-action narration"). The action has ALREADY run (or
+    // been proposed) through the unchanged path; the brain only RE-WORDS the confirmation,
+    // grounded in a sanitized result envelope and validated against it. These tests drive a REAL
+    // executed/proposed turn through the kernel, then exercise the envelope + validator with
+    // synthetic brain replies (no provider is ever called), asserting the wording is shaped while
+    // durable state is unchanged by the shaping, and that a contradiction/failure falls back.
+
+    #[test]
+    fn after_action_shapes_a_real_create_but_changes_no_state() {
+        use crate::prime_after_action::{
+            after_action_kind, build_action_envelope, parse_after_action, reconcile_after_action,
+            ActionResultKind,
+        };
+        let (mut k, ctx) = prime_chat_kernel();
+        // A real deterministic create executes and leaves exactly one task.
+        let turn = k
+            .prime_turn(&ctx, "create a task to fix the login redirect")
+            .unwrap();
+        let created = turn.created_task.clone().expect("a task was created");
+        let tasks_before = k.inspect_state().tasks_total;
+
+        assert_eq!(after_action_kind(&turn), Some(ActionResultKind::Executed));
+        let env = build_action_envelope(&turn, ActionResultKind::Executed);
+        assert!(env.ids.contains(&created.as_str().to_string()));
+
+        // A valid, grounded confirmation that references the real id is shaped and honored.
+        let shaped = parse_after_action(
+            &format!(
+                r#"{{"text":"Done - I created {} to fix the login redirect.","confidence":0.9}}"#,
+                created.as_str()
+            ),
+            &env,
+        )
+        .unwrap();
+        assert!(reconcile_after_action(&env.grounded_reply, &shaped).is_some());
+
+        // SAFETY: the shaping is pure — no new task appeared; the only task is the one the turn
+        // already created.
+        assert_eq!(k.inspect_state().tasks_total, tasks_before);
+    }
+
+    #[test]
+    fn after_action_falls_back_when_the_brain_claims_unexecuted_work() {
+        use crate::prime_after_action::{
+            build_action_envelope, parse_after_action, ActionResultKind,
+        };
+        let (mut k, ctx) = prime_chat_kernel();
+        let turn = k
+            .prime_turn(&ctx, "create a task to fix the login redirect")
+            .unwrap();
+        let env = build_action_envelope(&turn, ActionResultKind::Executed);
+        // The create did NOT start a run; a reply that claims one is rejected → deterministic
+        // wording stands (the server falls back to `shape_reply`).
+        assert!(parse_after_action(
+            r#"{"text":"Created the task and started the run.","confidence":0.95}"#,
+            &env
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn after_action_proposal_must_not_say_installed_and_installs_nothing() {
+        use crate::prime_after_action::{
+            after_action_kind, build_action_envelope, parse_after_action, ActionResultKind,
+        };
+        use crate::prime_write_tools::{parse_write_tool_request, WriteToolSlot};
+        let (mut k, ctx) = prime_chat_kernel();
+        let before = k.installed_plugins().len();
+        let req = parse_write_tool_request(&serde_json::json!({
+            "tool": "plugin.install",
+            "args": {"plugin_id": "relux-tools-github"}
+        }))
+        .unwrap();
+        let intent = req.intent_proposal();
+        let WriteToolSlot::Plugin(plugin) = &req.slot else {
+            panic!("expected a plugin slot");
+        };
+        let (turn, _) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "install the github plugin",
+                Some(&intent),
+                BrainSlotProposals {
+                    plugin: Some(plugin),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(turn.disposition, PrimeDisposition::AwaitingApproval);
+        // The after-action kind is Proposed, so a completion claim is rejected.
+        assert_eq!(after_action_kind(&turn), Some(ActionResultKind::Proposed));
+        let env = build_action_envelope(&turn, ActionResultKind::Proposed);
+        assert!(parse_after_action(
+            r#"{"text":"The plugin is now installed for you.","confidence":0.95}"#,
+            &env
+        )
+        .is_err());
+        // Proposal-language is accepted (it correctly says approval is needed).
+        assert!(parse_after_action(
+            r#"{"text":"I've proposed installing relux-tools-github; it needs your approval.","confidence":0.9}"#,
+            &env
+        )
+        .is_ok());
+        // SAFETY: nothing was installed by the shaping or the proposal.
+        assert_eq!(k.installed_plugins().len(), before);
+    }
+
     /// Create one task assigned to Prime and return its id, for the update tests.
     fn make_task(k: &mut KernelState, ctx: &PrimeContext) -> relux_core::TaskId {
         k.prime_turn(ctx, "create a task to summarize the README")

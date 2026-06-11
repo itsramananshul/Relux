@@ -1167,6 +1167,69 @@ safety assertions, `casual_chat_never_triggers_a_write_tool`,
 (`cli_decision_carries_a_write_tool_request_through_the_no_leak_seam`); and the dashboard
 `requestedToolLabel` test. No test calls a real provider; the dashboard bundle was rebuilt.
 
+## Applied change (safe post-execution after-action reply shaping)
+
+Every brain stage above composes its reply BEFORE the kernel executes, so the action-free wall
+kept an ACTIONFUL turn's reply strictly deterministic (`is_actionful` → `shape_reply` keeps it
+`DeterministicForAction`). The brain could classify, sharpen slots, request a governed tool, and
+re-word a *conversational* turn — but never the confirmation a user reads AFTER a create / update /
+assign / start / agent.create executes, or after a plugin.install / permission.grant is proposed.
+That was the explicitly-deferred "after-action narration" rung. Per master plan §10.2 (Action
+Layer) and §17.1, and following the reference read recorded in `reference-driven-development.md`
+(Hermes `tool_executor` inject-the-real-bounded-result-then-answer + `conversation_loop`
+deterministic fallback; openclaw `exec-approval-followup` succeeded/failed/did-not-run grounding +
+`sanitizeUserFacingText` + the no-leak CLI-output seam), a configured brain may now re-word an
+actionful turn's confirmation AFTER the kernel executed, grounded ONLY in a sanitized result
+envelope and validated against it.
+
+- **New module `relux-kernel/src/prime_after_action.rs`.** `after_action_kind(turn)` gates which
+  turns are eligible: `Executed` for a safe disposition `Executed` turn, `Proposed` for an
+  `AwaitingApproval` turn — and `None` for a NON-actionful turn (the clarify/brainstorm/free-form
+  paths shape those), a TOOL turn (`invoked_tool`/`tool_output`/`tool_error`/`ToolDiscovery`,
+  preserving the long-standing "never narrate a tool result" wall), and a high-risk action that is
+  not a proposal (defensive). `build_action_envelope(turn, kind)` derives a sanitized, bounded
+  `ActionEnvelope` from the ALREADY-executed turn: the result kind, a short action label, the
+  concrete ids it produced/targeted, the durable `ActionFacts`, and the redacted grounded reply.
+  `build_after_action_prompt` hands ONLY that to the brain with the three openclaw-style steers
+  (executed = confirm / proposed = NOT done, awaiting approval / failed = do not claim success).
+- **The validator is the INVERSE of `prime_clarify`.** Where the pre-execution clarify path rejects
+  EVERY action claim, `parse_after_action` honors a completion claim ONLY when the envelope's
+  matching fact is confirmed: a create that started no run rejects a "started the run" claim; a
+  still-pending `Proposed` install rejects an "installed"/"is now installed" claim (Prime never
+  EXECUTES an install/grant — those facts are NEVER set); a `Failed` envelope rejects a success
+  claim; and a structured id-shaped token (`task_`/`run_`/`appr_`/`approval_`) not in the
+  envelope's ids fails the reply closed (an invented id). The allowlist (`text`/`confidence`/
+  `rationale`), control-char strip, length clamp, and secret/path redaction (`redact_secrets`:
+  secret-prefixed tokens, high-entropy blobs, absolute unix/windows paths) mirror the slot/clarify
+  discipline. `reconcile_after_action` drops a low-confidence or pure-echo proposal.
+- **Both brains feed one validator.** OpenRouter via `ai::polish_after_action_via_openrouter`; the
+  Claude/Codex CLI brains via `server.rs` `polish_after_action_via_cli` → the no-leak
+  `parse_cli_after_action` (`parse_adapter_result` FIRST, error envelope dropped). Wired in
+  `run_prime` OUTSIDE the lock, in the ACTIONFUL branch (which previously only ran `shape_reply`):
+  a non-Local brain attempts the after-action call; on ANY failure it falls back to the grounded
+  deterministic reply via `shape_reply`, byte-for-byte the prior behavior. `Local` always falls
+  back.
+- **Safety invariants (binding).** The action ALREADY ran (or was proposed) through the unchanged
+  `decide` → `prime_execute` / approval path; this stage ONLY re-words the confirmation and changes
+  nothing — there is no path from `prime_after_action` to a mutation. The brain can never claim
+  unexecuted work, invent an id, narrate a failure as a success, or say installed/granted on a
+  still-pending proposal; any such reply is rejected wholesale and the deterministic reply stands.
+- **UI.** A small `🧠 after-action wording · <source>` chip (`PrimeResponse.after_action_source` +
+  the pure `afterActionLabel` helper), present ONLY when a brain genuinely shaped the actionful
+  turn's confirmation. The existing action/update/provenance cards are untouched.
+
+Pinned by the `prime_after_action` unit tests (gating executed/proposed/tool/high-risk; envelope
+ids/facts/redaction; valid executed confirmation; claim-of-unexecuted-work rejection; proposed
+must-not-say-installed; failed must-not-claim-success; invented-id rejection; control-strip +
+secret/path redaction; unsupported-field/empty-text rejection; low-confidence/echo reconcile;
+prompt steer); the kernel integration tests (`after_action_shapes_a_real_create_but_changes_no_
+state`, `after_action_falls_back_when_the_brain_claims_unexecuted_work`,
+`after_action_proposal_must_not_say_installed_and_installs_nothing`); the server seam tests
+(`cli_after_action_lifted_from_a_result_envelope`,
+`cli_after_action_drops_error_envelope_contradiction_and_invented_id`,
+`cli_after_action_proposal_rejects_installed_claim`); and the dashboard `afterActionLabel` test. No
+test calls a real provider; the dashboard bundle was rebuilt.
+
 ## Current Prime brain stack
 
 The end-to-end shape of one Prime turn, with the brain strictly additive and the
@@ -1261,6 +1324,20 @@ per-section specialized calls below as the fallback when that envelope is unavai
    the turn leaves a clarification pending, the response carries `pending_clarification` and
    the chat shows a `⏳ waiting for: <needs>` chip with a Cancel action, so the user knows the
    next message will be read as the answer.
+4b. **Post-execution (after-action) wording** (an ACTIONFUL non-tool turn only) — the reply on an
+   actionful turn was always deterministic, because the brain composed its decision BEFORE the
+   kernel executed. After `decide` → `prime_execute` / approval has ALREADY run, a configured brain
+   may re-word the FINAL confirmation through the VALIDATED after-action path (`prime_after_action`):
+   the kernel builds a sanitized, bounded `ActionEnvelope` (kind executed/proposed/failed, the
+   action label, the concrete ids, the durable facts, the redacted grounded reply) and the brain
+   answers grounded ONLY in it. The validator is the INVERSE of the clarify path: a completion claim
+   is honored ONLY when the envelope's fact is confirmed; a success claim on a failure, an
+   installed/granted claim on a still-pending proposal, or an invented id all fail the reply closed,
+   and secret-shaped tokens / absolute paths are redacted. Any failure (no brain, low confidence,
+   contradiction, invented id, echo) falls back to the grounded deterministic reply. The action
+   already ran; this changes only the wording. The chip `🧠 after-action wording · <source>` appears
+   only when the brain genuinely shaped an actionful confirmation. A TOOL turn (real kernel output)
+   keeps the deterministic reply, and `Local` always falls back.
 
 ## Next recommended slice
 
@@ -1281,11 +1358,16 @@ before answering. The obvious next rungs build on it:
   `decide` → `prime_execute` (safe `Act`) / human-approval (`Propose`) path. `classify_write_tool` is
   the fail-closed gate (unknown ⇒ refused), and the SAME `reconcile_intent` gate keeps a mutating
   tool off guarded chat. The next rungs build on it: a **multi-round write loop** (request → observe
-  → act INSIDE the one envelope flow, which needs the decision call itself to loop), an **after-action
-  narration** (a brain reply on an actionful turn — deferred since the brain composes its reply
-  before the kernel executes, so it needs a post-execution re-shaping pass that preserves the
-  action-free wall), and **richer write tools** (e.g. `run.retry`, an `orchestration` tool) as each
-  proves out.
+  → act INSIDE the one envelope flow, which needs the decision call itself to loop) and **richer
+  write tools** (e.g. `run.retry`, an `orchestration` tool) as each proves out.
+- **~~After-action narration~~ (DONE)** — a brain reply on an ACTIONFUL turn, the post-execution
+  re-shaping pass that preserves the action-free wall (`prime_after_action`). After the kernel has
+  ALREADY executed (or proposed) the action, the brain re-words the confirmation grounded ONLY in a
+  sanitized `ActionEnvelope` and validated against it (a completion claim is honored only when its
+  fact is confirmed; a success-on-failure, installed/granted-on-a-proposal, or invented id is
+  rejected; secrets/paths redacted), falling back to the deterministic reply on any failure. The
+  remaining deferral here is a **multi-round write loop** (act → observe the result → act again
+  INSIDE the one envelope flow), which needs the decision call itself to loop.
 - **~~Read context on the unified decision~~ (DONE)** — the unified `PrimeBrainDecision` now carries
   the brain's read-only `tool_requests` alongside intent+slots+wording; Relux executes the validated
   reads deterministically (`execute_requested_reads`, no second brain loop, no duplicate execution)

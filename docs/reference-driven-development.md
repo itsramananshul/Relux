@@ -1129,3 +1129,78 @@ assign/update promotions, honoring only a task that EXISTS and is READY). The mu
 is intentionally tiny (`task.create`/`task.update`/`task.assign`/`task.start`/`agent.create` safe;
 `plugin.install`/`permission.grant` approval-only); a multi-round write loop, after-action narration,
 and richer tools stay deferred.
+
+---
+
+## Reference read — safe POST-EXECUTION after-action reply shaping (this slice)
+
+Every prior brain stage composes its reply BEFORE the kernel executes the turn, so the
+action-free wall keeps an ACTIONFUL turn's reply strictly deterministic (`is_actionful` →
+`shape_reply` keeps it `DeterministicForAction`). The brain could classify, sharpen slots,
+request a governed tool, and re-word a *conversational* turn — but it could never phrase the
+confirmation a user reads AFTER a create / update / assign / start / agent.create executes, or
+after a plugin.install / permission.grant is proposed. That was the explicitly-deferred
+"after-action narration" rung (`docs/prime-processing-audit.md`): "the brain composes its reply
+before the kernel executes, so an honest after-action narration needs a post-execution
+re-shaping pass that preserves the action-free wall." This slice ships it.
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/agent/tool_executor.py` (L348-452) — the post-execution display
+  loop: each executed tool's result is appended back as a `{"role":"tool","name":..,
+  "tool_call_id":..,"content":..}` message (L446-452) carrying an `is_error` flag and a BOUNDED
+  preview (`result_preview = _err_text[:200]`, L372), and the loop continues so the model produces
+  its FINAL answer grounded in that actual result. **Pattern: the final answer is grounded in the
+  real, bounded execution result (success vs. `is_error`), injected AFTER the action ran.**
+- `reference/hermes-agent-main/agent/conversation_loop.py` `run_conversation(...)` (~L3106-3162,
+  L3466-3480) — after the tool result is injected the model is re-called for the final answer; an
+  empty/junk model output falls back to the last real content. **Pattern: re-shape the answer over
+  the injected result; a deterministic fallback always exists.** Mirrored:
+  `crates/relux-kernel/src/prime_after_action.rs` hands the brain the sanitized, bounded
+  `ActionEnvelope` (kind = executed / proposed / failed) as the ONLY ground truth and re-words the
+  confirmation — but, unlike Hermes, the Relux brain executes NOTHING here: the action already ran
+  deterministically; on any failure the grounded deterministic reply stands.
+
+### Paperclip (openclaw) — files read
+
+- `reference/openclaw-main/src/agents/bash-tools.exec-approval-followup.ts`
+  `buildExecApprovalFollowupPrompt` (L64-82) / `buildExecDeniedFollowupPrompt` (L34-48) — the
+  canonical "narrate the result after the approved action completed" prompt: it injects the "Exact
+  completion details" (the result envelope) and steers "if it succeeded, share the relevant output;
+  if it failed, explain what went wrong" (L79-81), while the DENIED variant insists "An async
+  command did not run … Do not claim there is new command output" (L36-46). **Pattern: ground the
+  follow-up in the exact result, and distinguish succeeded / failed / did-not-run so the model
+  never claims work that did not happen.**
+- `reference/openclaw-main/src/agents/pi-embedded-helpers/sanitize-user-facing-text.ts`
+  `sanitizeUserFacingText` (used at `bash-tools.exec-approval-followup.ts` L102-123) — the result
+  body shown to the user is sanitized before display. **Pattern: sanitize the user-facing result.**
+- `reference/openclaw-main/src/agents/tools/sessions-spawn-tool.ts` (`UNSUPPORTED_*_PARAM_KEYS`) +
+  `src/agents/tools/common.ts` (`readStringParam` required) + `src/shared/balanced-json.ts`
+  (`extractBalancedJsonPrefix`) + `src/agents/cli-output.ts` (`parseCliOutput`) — reject unsupported
+  keys, require the mandatory string, lift the parsed object out of a noisy CLI reply (never the raw
+  stdout). Mirrored in `parse_after_action` (allowlist `text`/`confidence`/`rationale`, require a
+  non-empty `text`) and the no-leak `parse_cli_after_action` (`parse_adapter_result` FIRST).
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| Hermes: **final answer grounded in the real, bounded result, injected after the action ran** | `prime_after_action::build_action_envelope` builds a sanitized, bounded `ActionEnvelope` from the ALREADY-executed `PrimeTurn` (kind, action label, the concrete ids it produced/targeted, the durable facts, the redacted grounded reply); `build_after_action_prompt` hands ONLY that to the brain, which runs AFTER the kernel executed. |
+| openclaw: **succeeded → share output / failed → explain / did-not-run → do not claim output** (`buildExecApprovalFollowupPrompt` / `buildExecDeniedFollowupPrompt`) | the three `ActionResultKind` prompt variants: `Executed` ("ALREADY done — confirm, you MAY mention the ids"), `Proposed` ("NOT done — awaiting approval — never say installed/granted/created/started"), `Failed` ("did not complete — do NOT claim success"). |
+| Hermes: **the result carries an `is_error` flag the answer must honor** | the INVERSE of `prime_clarify`'s blanket action-claim rejection: a completion claim is honored ONLY when the envelope's matching fact is confirmed; a success claim on a `Failed` envelope is rejected; an `installed`/`granted` claim is rejected on every turn (Prime never EXECUTES an install/grant — always an approval-gated `Propose`). |
+| openclaw: **sanitize the user-facing result** (`sanitizeUserFacingText`) | `sanitize_block` (control-strip, clamp) + `redact_secrets` (mask secret-prefixed tokens, high-entropy blobs, absolute unix/windows paths) on BOTH the envelope's grounded reply and the brain's reply; an id-shaped token (`task_`/`run_`/`appr_`/`approval_`) not in `envelope.ids` fails the reply closed (an invented id). |
+| openclaw: **reject unsupported keys, require the mandatory string, no raw-envelope leak** | `parse_after_action` allowlist + required non-empty `text`; the CLI path lifts the reply via `parse_adapter_result` FIRST (`parse_cli_after_action`), so the raw `--output-format json` envelope never reaches the validator or the chat. |
+| Hermes/openclaw: **a deterministic fallback always exists** | strictly additive — no brain (Local), low confidence, malformed JSON, an unsupported field, a contradiction, an invented id, or a pure echo all fall back to the grounded deterministic reply (`shape_reply`'s `DeterministicForAction`) with no provenance. |
+
+**What we deliberately do differently:** unlike Hermes (where the model runs the tool and then
+answers in the SAME loop) the Relux action already ran deterministically through `decide` →
+`prime_execute` / approval; this stage ONLY re-words the confirmation and changes nothing — there
+is no path from `prime_after_action` to a mutation. It runs ONLY on a non-tool ACTIONFUL turn
+(`after_action_kind` returns `None` for a tool turn, preserving the long-standing
+"never narrate a tool result" wall, and for a non-actionful turn, which the clarify/brainstorm/
+free-form paths already shape). A high-risk action is narrated ONLY as a proposal (it is always a
+`Propose`, so the envelope kind is `Proposed` and a completion claim is rejected) — Prime never
+says installed/granted. This is the post-execution counterpart of the pre-execution wording path
+(`prime_clarify`): the same allowlist/sanitize/clamp discipline, but the claim validation is the
+INVERSE — a claim grounded in the real result is honored, a claim that contradicts it is refused.
+A multi-round write loop and richer tools stay deferred.

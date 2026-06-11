@@ -1612,6 +1612,16 @@ struct PrimeResponse {
     /// unaffected.
     #[serde(skip_serializing_if = "Option::is_none")]
     requested_tool: Option<String>,
+    /// Present ONLY when a configured brain shaped this turn's POST-EXECUTION (after-action)
+    /// reply — the action had ALREADY run (or been proposed) through the unchanged `decide` →
+    /// `prime_execute` / approval path, and the brain re-worded the confirmation, grounded ONLY
+    /// in a sanitized result envelope and validated against it (no claim of unexecuted work, no
+    /// invented id, no "installed"/"granted" on a still-pending proposal). The value is the model
+    /// id / CLI brain label. The chat renders a small "after-action wording · <source>" chip.
+    /// Wording/provenance only; the brain changed no state. Absent on every turn where the reply
+    /// stayed the grounded deterministic one (including Local / any failure).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    after_action_source: Option<String>,
 }
 
 /// Provenance for a brain-polished clarify / brainstorm reply: which KIND of wording
@@ -1931,6 +1941,9 @@ async fn run_prime(
     // The READ-ONLY context tools the governed loop gathered this turn (empty unless a brain
     // ran the loop on an inspection turn), surfaced as provenance on the response.
     let mut gathered_reads: Vec<relux_kernel::ContextRead> = Vec::new();
+    // Set when the brain shaped this turn's POST-EXECUTION (after-action) reply — provenance for
+    // the small chip; the action already ran through the unchanged path, so this is wording only.
+    let mut after_action_source: Option<String> = None;
     let clarify_kind = relux_kernel::clarify_polish_kind(&turn);
     let (outcome, reply_polish) = if let Some(kind) = clarify_kind {
         // Prefer the wording the UNIFIED decision already carried (no extra brain call); it is
@@ -2014,9 +2027,42 @@ async fn run_prime(
                 (relux_kernel::shape_reply(&ai_config, &message, &turn, "").await, None)
             }
         }
+    } else if let Some(kind) = relux_kernel::after_action_kind(&turn)
+        .filter(|_| !matches!(brain, relux_kernel::PrimeBrain::Local))
+    {
+        // An ACTIONFUL turn under a configured brain. The brain composed its decision BEFORE the
+        // kernel executed, so it could not honestly narrate the result — that is why an actionful
+        // reply has always stayed deterministic. This is the deferred "after-action narration"
+        // pass: the action has ALREADY run (or been proposed) through the unchanged `decide` →
+        // `prime_execute` / approval path, and the brain now re-words the FINAL confirmation,
+        // grounded ONLY in a sanitized result envelope and validated against it — it may not claim
+        // unexecuted work, invent an id, say installed/granted on a still-pending proposal, or
+        // narrate a failure as success (`docs/prime-processing-audit.md` "after-action narration").
+        // On ANY failure (malformed reply, contradiction, invented id, low confidence, echo, or an
+        // unavailable adapter) we fall back to the grounded deterministic reply via `shape_reply`,
+        // which keeps the turn deterministic — byte-for-byte the prior behavior. The action-free
+        // wall holds: nothing here changes state; only the confirmation wording can change.
+        let envelope = relux_kernel::build_action_envelope(&turn, kind);
+        let shaped = match brain {
+            relux_kernel::PrimeBrain::Openrouter => {
+                relux_kernel::polish_after_action_via_openrouter(&ai_config, &message, &envelope)
+                    .await
+            }
+            relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli => {
+                polish_after_action_via_cli(brain, cli_status.clone(), &message, &envelope).await
+            }
+            relux_kernel::PrimeBrain::Local => None,
+        };
+        match shaped {
+            Some(text) => {
+                after_action_source = Some(slot_source_label(brain, &ai_config));
+                (unified_reply_outcome(brain, &ai_config, text), None)
+            }
+            None => (relux_kernel::shape_reply(&ai_config, &message, &turn, "").await, None),
+        }
     } else {
-        // Actionful turns go through shape_reply, which keeps them deterministic so the brain
-        // never narrates (and possibly overclaims) a real state change.
+        // A non-shapeable actionful turn (a tool result, or the Local brain): keep the grounded
+        // deterministic reply so the brain never narrates (and possibly overclaims) a state change.
         (relux_kernel::shape_reply(&ai_config, &message, &turn, "").await, None)
     };
 
@@ -2139,6 +2185,7 @@ async fn run_prime(
         pending_clarification,
         decision_source,
         requested_tool,
+        after_action_source,
     }))
 }
 
@@ -2929,6 +2976,45 @@ fn parse_cli_clarify(
     }
     let proposal = relux_kernel::parse_clarify(&parsed.text, clarify_kind).ok()?;
     relux_kernel::reconcile_clarify(deterministic_text, &proposal, clarify_kind)
+}
+
+/// Shape the POST-EXECUTION (after-action) reply for an actionful turn via a local CLI brain
+/// (Claude / Codex), returning the validated wording or `None`. Same bounded, non-bypass spawn
+/// as every other CLI brain path; the captured stdout is lifted out of the result envelope and
+/// run through the SAME validators ([`parse_cli_after_action`]), so the raw envelope never
+/// escapes and an error envelope / prose / a contradiction / an invented id all yield `None`
+/// (the grounded deterministic reply then stands). The action already ran; this only re-words it.
+async fn polish_after_action_via_cli(
+    brain: relux_kernel::PrimeBrain,
+    status: Option<relux_core::AdapterRuntimeStatus>,
+    message: &str,
+    envelope: &relux_kernel::ActionEnvelope,
+) -> Option<String> {
+    let (stdout, akind) = cli_brain_json(
+        brain,
+        status,
+        relux_kernel::build_after_action_prompt(message, envelope),
+    )
+    .await?;
+    parse_cli_after_action(&stdout, akind, envelope)
+}
+
+/// Lift validated after-action wording out of a CLI brain's captured `stdout`, or `None`. The
+/// same no-leak boundary as [`parse_cli_clarify`]: [`parse_adapter_result`] lifts the human text
+/// out of the result envelope, an error envelope is dropped, and the lifted text is validated +
+/// reconciled against the sanitized [`relux_kernel::ActionEnvelope`]. The raw envelope never
+/// escapes; a contradiction / invented id / low confidence yields `None`.
+fn parse_cli_after_action(
+    stdout: &str,
+    kind: relux_core::AdapterKind,
+    envelope: &relux_kernel::ActionEnvelope,
+) -> Option<String> {
+    let parsed = relux_core::parse_adapter_result(stdout, kind);
+    if parsed.is_error == Some(true) {
+        return None;
+    }
+    let proposal = relux_kernel::parse_after_action(&parsed.text, envelope).ok()?;
+    relux_kernel::reconcile_after_action(&envelope.grounded_reply, &proposal)
 }
 
 /// Validate a CLI brain's captured `stdout` into an advisory proposal polish, or
@@ -6459,6 +6545,79 @@ mod tests {
             .is_none(),
             "an action claim must fail closed"
         );
+    }
+
+    // --- After-action (post-execution) wording: the no-leak parse boundary ------
+    //
+    // These pin `parse_cli_after_action` WITHOUT spawning a real CLI. The raw
+    // `--output-format json` envelope must never reach the validated wording, and the lifted text
+    // is validated against the sanitized result envelope (no claim of unexecuted work, no invented
+    // id, no "installed" on a still-pending proposal).
+
+    fn executed_create_envelope() -> relux_kernel::ActionEnvelope {
+        relux_kernel::ActionEnvelope {
+            kind: relux_kernel::ActionResultKind::Executed,
+            action_label: "created a task".to_string(),
+            facts: relux_kernel::ActionFacts {
+                task_created: true,
+                ..Default::default()
+            },
+            ids: vec!["task_0001".to_string()],
+            grounded_reply: "Created task_0001: Fix the login redirect.".to_string(),
+        }
+    }
+
+    #[test]
+    fn cli_after_action_lifted_from_a_result_envelope() {
+        let env = executed_create_envelope();
+        let inner = r#"{\"text\":\"Done - I created task_0001 to fix the login redirect.\",\"confidence\":0.9}"#;
+        let stdout = format!(r#"{{"type":"result","is_error":false,"result":"{inner}","session_id":"abc"}}"#);
+        let text = parse_cli_after_action(&stdout, relux_core::AdapterKind::ClaudeCli, &env)
+            .expect("a valid envelope yields validated wording");
+        assert!(text.contains("task_0001"));
+        // No envelope scaffolding leaks into the wording.
+        assert!(!text.contains("session_id") && !text.contains("\"type\""));
+    }
+
+    #[test]
+    fn cli_after_action_drops_error_envelope_contradiction_and_invented_id() {
+        let env = executed_create_envelope();
+        // An error envelope is dropped.
+        let err = r#"{"type":"result","is_error":true,"result":"rate limited"}"#;
+        assert!(parse_cli_after_action(err, relux_core::AdapterKind::ClaudeCli, &env).is_none());
+        // A claim of a run that did not start fails validation at the seam.
+        let inner = r#"{\"text\":\"Created task_0001 and started the run.\",\"confidence\":0.95}"#;
+        let stdout = format!(r#"{{"type":"result","is_error":false,"result":"{inner}"}}"#);
+        assert!(
+            parse_cli_after_action(&stdout, relux_core::AdapterKind::ClaudeCli, &env).is_none(),
+            "a claim of unexecuted work must yield nothing"
+        );
+        // An invented id is rejected.
+        let inner = r#"{\"text\":\"Created task_9999 for you.\",\"confidence\":0.9}"#;
+        let stdout = format!(r#"{{"type":"result","is_error":false,"result":"{inner}"}}"#);
+        assert!(
+            parse_cli_after_action(&stdout, relux_core::AdapterKind::CodexCli, &env).is_none(),
+            "an invented id must yield nothing"
+        );
+    }
+
+    #[test]
+    fn cli_after_action_proposal_rejects_installed_claim() {
+        let env = relux_kernel::ActionEnvelope {
+            kind: relux_kernel::ActionResultKind::Proposed,
+            action_label: "proposed installing a plugin (awaiting your approval)".to_string(),
+            facts: relux_kernel::ActionFacts::default(),
+            ids: vec!["appr_0001".to_string()],
+            grounded_reply: "Installing a plugin needs your approval (appr_0001).".to_string(),
+        };
+        // "installed" on a still-pending proposal fails closed.
+        let inner = r#"{\"text\":\"The plugin is now installed.\",\"confidence\":0.95}"#;
+        let stdout = format!(r#"{{"type":"result","is_error":false,"result":"{inner}"}}"#);
+        assert!(parse_cli_after_action(&stdout, relux_core::AdapterKind::ClaudeCli, &env).is_none());
+        // Proposal-language is accepted.
+        let inner = r#"{\"text\":\"I've proposed the install; it needs your approval (appr_0001).\",\"confidence\":0.9}"#;
+        let stdout = format!(r#"{{"type":"result","is_error":false,"result":"{inner}"}}"#);
+        assert!(parse_cli_after_action(&stdout, relux_core::AdapterKind::ClaudeCli, &env).is_some());
     }
 
     // --- Unified decision: the no-leak parse boundary --------------------------

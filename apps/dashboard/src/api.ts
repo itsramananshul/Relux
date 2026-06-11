@@ -1616,6 +1616,14 @@ export interface ReluxPrimeTurn {
   /// chip. The mutation still flowed through the unchanged fail-closed decide → execute / approval
   /// path; the brain wrote nothing directly. Absent on every turn with no honored write tool.
   requested_tool?: string;
+  /// Present ONLY when a configured brain shaped this turn's POST-EXECUTION (after-action)
+  /// reply — the action had ALREADY run (or been proposed) through the unchanged decide →
+  /// execute / approval path, and the brain re-worded the confirmation, grounded ONLY in a
+  /// sanitized result envelope and validated against it (no claim of unexecuted work, no invented
+  /// id, no "installed"/"granted" on a still-pending proposal). The value is the model id / CLI
+  /// brain label. The chat renders a small "after-action wording · <source>" chip. Wording /
+  /// provenance only; the brain changed no state. Absent when the reply stayed deterministic.
+  after_action_source?: string;
 }
 
 export const reluxPrime = {

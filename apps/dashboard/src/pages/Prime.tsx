@@ -8,7 +8,7 @@ import {
   type ReluxPrimeSuggestion,
   type ReluxPrimeTurn,
 } from "../api";
-import { boundedContextReads, brainSourceLabel, contextReadDetail, contextReadsHadMiss, contextReadsUsedLabel, decisionSourceLabel, hasSteps, intentProvenance, pendingClarificationLabel, polishProvenance, proposalDisplaySummary, replyPolishLabel, requestedToolLabel, slotProvenance, stepDisplayTitle, updateProvenance } from "../prime";
+import { afterActionLabel, boundedContextReads, brainSourceLabel, contextReadDetail, contextReadsHadMiss, contextReadsUsedLabel, decisionSourceLabel, hasSteps, intentProvenance, pendingClarificationLabel, polishProvenance, proposalDisplaySummary, replyPolishLabel, requestedToolLabel, slotProvenance, stepDisplayTitle, updateProvenance } from "../prime";
 import { workTaskHref, workRunHref } from "../routing";
 import { PrimeAutonomyPanel } from "../components/PrimeAutonomyPanel";
 import { OrchestrationPanel } from "../components/OrchestrationPanel";
@@ -363,6 +363,20 @@ function PrimeTurnCard({
             title="The brain requested this governed write tool; Prime routed it through the normal validation/approval path"
           >
             🛠 {requestedToolLabel(turn.requested_tool)}
+          </span>
+        )}
+        {/* A small chip when the brain re-worded an ACTIONFUL turn's confirmation AFTER the
+            kernel already executed (or proposed) the action — grounded in a sanitized result
+            envelope and validated against it (no claim of unexecuted work, no invented id). The
+            action ran through the unchanged decide → execute / approval path; the brain changed
+            no state, only the wording. */}
+        {afterActionLabel(turn.after_action_source) && (
+          <span
+            className="badge done"
+            style={{ fontSize: 9 }}
+            title="Prime's brain phrased this confirmation after the action ran — grounded in the real result, no state changed"
+          >
+            🧠 {afterActionLabel(turn.after_action_source)}
           </span>
         )}
         <span className="muted" style={{ fontSize: 9, marginLeft: "auto" }} title="Which provider produced this reply">

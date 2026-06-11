@@ -150,6 +150,19 @@ export function requestedToolLabel(tool: string | undefined): string | null {
   return trimmed ? `requested tool: ${trimmed}` : null;
 }
 
+// The label for the small POST-EXECUTION (after-action) wording chip. The server attaches
+// `after_action_source` ONLY when a configured brain re-worded an ACTIONFUL turn's confirmation
+// AFTER the kernel already executed (or proposed) the action — grounded in a sanitized result
+// envelope and validated against it (no claim of unexecuted work, no invented id, no
+// "installed"/"granted" on a still-pending proposal). Returns a short "after-action wording ·
+// <source>" label, or null when the reply stayed the grounded deterministic one (no brain / any
+// failure). Provenance only: the action already ran through the unchanged decide → execute /
+// approval path; the brain changed no state, only the confirmation wording.
+export function afterActionLabel(source: string | undefined): string | null {
+  const trimmed = source?.trim();
+  return trimmed ? `after-action wording · ${brainSourceLabel(trimmed)}` : null;
+}
+
 // Compact provenance for the READ-ONLY context tools Prime consulted before answering
 // this turn (the governed read-only tool loop). Returns a short "used: get_task,
 // list_agents" label naming the DISTINCT tools in look order, bounded so a long loop
