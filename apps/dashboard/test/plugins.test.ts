@@ -9,6 +9,7 @@ import {
   installResultSummary,
   visibleTools,
   isRunnableTool,
+  toolReadiness,
   adapterStatusBadge,
   ADAPTER_STATE_LABEL,
 } from "../src/plugins.ts";
@@ -183,6 +184,76 @@ test("isRunnableTool is true only for ready tools", () => {
   assert.equal(isRunnableTool(tool({ executable: "ready" })), true);
   assert.equal(isRunnableTool(tool({ executable: "runtime_disabled" })), false);
   assert.equal(isRunnableTool(tool({ executable: "missing_permission" })), false);
+});
+
+// ── Tool readiness (the honest invocation surface) ────────────────────────────
+// The single classifier that drives the Tools list: every non-ready state is a
+// CLEAR refusal/disabled reason (never a blank "not callable"), and ONLY "ready"
+// is runnable — matching what the kernel enforces in call_tool/invoke_tool.
+
+test("a ready tool is runnable, ok-toned, and offers no next step", () => {
+  const r = toolReadiness(tool({ executable: "ready" }));
+  assert.equal(r.runnable, true);
+  assert.equal(r.tone, "ok");
+  assert.equal(r.label, "ready");
+  assert.equal(r.nextStep, undefined);
+});
+
+test("a needs_approval tool is NOT runnable and explains the approval refusal", () => {
+  // The exact regression the mission pins: a higher-risk configured tool must be
+  // refused on the direct invoke path and SAY so — never blank, never pretend-run.
+  const r = toolReadiness(tool({ executable: "needs_approval", risk: "high" }));
+  assert.equal(r.runnable, false);
+  assert.equal(r.label, "needs approval");
+  assert.match(r.reason, /requires approval|refused/i);
+  assert.match(r.reason, /high-risk/);
+  assert.match(r.nextStep ?? "", /lower its risk/i);
+});
+
+test("a runtime_not_configured tool points at configuring a loopback runtime", () => {
+  const r = toolReadiness(tool({ executable: "runtime_not_configured" }));
+  assert.equal(r.runnable, false);
+  assert.match(r.reason, /no runtime|never auto-runs/i);
+  assert.match(r.nextStep ?? "", /loopback|runtime/i);
+});
+
+test("a runtime_disabled tool points at re-enabling the runtime", () => {
+  const r = toolReadiness(tool({ executable: "runtime_disabled" }));
+  assert.equal(r.runnable, false);
+  assert.match(r.reason, /disabled/i);
+  assert.match(r.nextStep ?? "", /re-enable/i);
+});
+
+test("a missing_permission tool names the missing permission and the fix", () => {
+  const r = toolReadiness(
+    tool({ executable: "missing_permission", permission: "tool:relux-tools-demo:run" }),
+  );
+  assert.equal(r.runnable, false);
+  assert.match(r.reason, /tool:relux-tools-demo:run/);
+  assert.match(r.nextStep ?? "", /grant/i);
+});
+
+test("a not_implemented tool is honestly muted with no next step", () => {
+  const r = toolReadiness(tool({ executable: "not_implemented" }));
+  assert.equal(r.runnable, false);
+  assert.equal(r.tone, "muted");
+  assert.match(r.reason, /no supported runtime/i);
+  assert.equal(r.nextStep, undefined);
+});
+
+test("every non-ready readiness state carries a real reason (no blank refusal)", () => {
+  for (const executable of [
+    "needs_approval",
+    "runtime_not_configured",
+    "runtime_disabled",
+    "missing_permission",
+    "not_implemented",
+  ]) {
+    const r = toolReadiness(tool({ executable }));
+    assert.equal(r.runnable, false, `${executable} must not be runnable`);
+    assert.ok(r.reason.length > 0, `${executable} must explain itself`);
+    assert.ok(r.label.length > 0, `${executable} must have a badge label`);
+  }
 });
 
 // ── Live adapter runtime badge (Plugins page) ─────────────────────────────────

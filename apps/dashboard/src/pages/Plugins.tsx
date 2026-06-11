@@ -22,8 +22,10 @@ import {
   pluginKindLabel,
   pluginNextStep,
   pluginStatus,
+  toolReadiness,
   visibleTools,
   type StatusVariant,
+  type ToolReadiness,
 } from "../plugins";
 
 // Map a derived status variant to the shared badge palette (B&W + semantic
@@ -242,41 +244,8 @@ function ToolsSection() {
 
 function ToolRow({ tool }: { tool: ReluxToolDescriptor }) {
   const [open, setOpen] = useState(false);
-  const ready = tool.executable === "ready";
-
-  const statusBadge =
-    tool.executable === "ready" ? (
-      <span className="badge done">ready</span>
-    ) : tool.executable === "missing_permission" ? (
-      <span className="badge backlog" title="The default agent lacks this tool's permission">
-        missing permission
-      </span>
-    ) : tool.executable === "runtime_not_configured" ? (
-      <span
-        className="badge backlog"
-        title="Installed, but no runtime is configured. Configure an HTTP loopback endpoint for the plugin to make it executable."
-      >
-        runtime not configured
-      </span>
-    ) : tool.executable === "runtime_disabled" ? (
-      <span
-        className="badge backlog"
-        title="An HTTP loopback runtime is configured for this plugin but it is disabled."
-      >
-        runtime disabled
-      </span>
-    ) : tool.executable === "needs_approval" ? (
-      <span
-        className="badge in_progress"
-        title="This tool is configured as higher-risk, so it requires approval and cannot be invoked directly. Lower its risk (or mark it low-risk + auto-approve) to make it directly callable."
-      >
-        needs approval
-      </span>
-    ) : (
-      <span className="badge" title="Installed as metadata; the kernel has no runtime for it yet">
-        installed, runtime not implemented yet
-      </span>
-    );
+  const readiness = toolReadiness(tool);
+  const ready = readiness.runnable;
 
   return (
     <>
@@ -296,25 +265,54 @@ function ToolRow({ tool }: { tool: ReluxToolDescriptor }) {
           </div>
         </td>
         <td className="muted" style={{ fontSize: 12 }}>{tool.risk}</td>
-        <td>{statusBadge}</td>
+        <td>
+          <span className={`badge ${BADGE_CLASS[readiness.tone]}`} title={readiness.reason}>
+            {readiness.label}
+          </span>
+        </td>
         <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
-          {ready ? (
-            <button className="btn ghost sm" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
-              {open ? "Close" : "Invoke"}
-            </button>
-          ) : (
-            <span className="muted" style={{ fontSize: 11 }}>not callable</span>
-          )}
+          {/* Every row has a real, non-blank action: a ready tool toggles its
+              invoke form; a non-ready tool toggles an honest "Why not?" panel
+              that states the refusal/disabled reason and the next step — never a
+              dead-end "not callable" with nothing behind it. */}
+          <button
+            className="btn ghost sm"
+            onClick={() => setOpen((v) => !v)}
+            aria-expanded={open}
+          >
+            {open ? "Close" : ready ? "Invoke" : "Why not?"}
+          </button>
         </td>
       </tr>
-      {open && ready && (
+      {open && (
         <tr>
           <td colSpan={4} style={{ background: "transparent" }}>
-            <InvokeTool tool={tool} />
+            {ready ? <InvokeTool tool={tool} /> : <ToolNotRunnable readiness={readiness} />}
           </td>
         </tr>
       )}
     </>
+  );
+}
+
+// The honest, non-blank panel for a tool the kernel will NOT run directly. It
+// states WHY (the same refusal/disabled reason the kernel enforces in
+// `call_tool`/`invoke_tool`) and the concrete next step — so an operator is never
+// left at a dead-end or a blank page, and the UI never pretends a gated tool ran.
+function ToolNotRunnable({ readiness }: { readiness: ToolReadiness }) {
+  return (
+    <div className="card" style={{ margin: "6px 0", padding: 12 }}>
+      <div style={{ fontSize: 12, marginBottom: readiness.nextStep ? 6 : 0 }}>
+        <strong>Not runnable: </strong>
+        {readiness.reason}
+      </div>
+      {readiness.nextStep && (
+        <div className="muted" style={{ fontSize: 12 }}>
+          <strong>Next step: </strong>
+          {readiness.nextStep}
+        </div>
+      )}
+    </div>
   );
 }
 

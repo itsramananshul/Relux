@@ -2673,6 +2673,45 @@ and the `relux-core` `tool::tests` (approval predicate). The dashboard form live
 live in `apps/dashboard/src/plugins.ts`, unit-tested in
 `apps/dashboard/test/plugins.test.ts`.
 
+#### Tool invocation workflow + honest readiness (UI/API)
+
+The end-to-end operator workflow for a generated wrapper, all on the **Plugins**
+page (no separate Tools route — the Tools list and its actions are inline, so a
+non-ready tool never opens a blank page):
+
+1. **Install** the source → a metadata-only wrapper (no tools, nothing runnable).
+2. **Configure a tool** (Plugin Tool Config v1 above) → the tool becomes
+   *discoverable*, statused `runtime_not_configured`.
+3. **Enable a loopback runtime** (`PUT /v1/relux/plugins/:id/runtime`, a
+   `http://127.0.0.1|localhost|[::1]:<port>` base URL) → a **low-risk** tool flips
+   to `ready` once the calling agent holds the derived permission.
+4. **Invoke** — `POST /v1/relux/tools/invoke { plugin_id, tool_name, input?,
+   agent_id? }`, or the inline JSON-input form on a `ready` tool row. The call runs
+   the same permission gate → approval gate → runtime as the CLI, is audited, and
+   returns a structured `ToolInvocationResult { output }`. The runtime itself
+   (`crates/relux-kernel/src/runtime.rs`) is **loopback-only, JSON-in/JSON-out,
+   bounded** (256 KiB request cap, 1 MiB response cap, per-call connect/read/write
+   timeout clamped to `[1,300]`s, no redirects/TLS/streaming); a connect/timeout/
+   non-200/oversized/invalid-JSON/`{"error":…}` response is an honest
+   `KernelError`, never a fabricated success. Relux never shells out to plugin
+   commands or runs downloaded plugin code in-process (§18).
+
+**Honest readiness in the UI.** `apps/dashboard/src/plugins.ts` `toolReadiness`
+is the single classifier (mirroring openclaw `acp/approval-classifier.ts` — one
+function, a named class, only the safe class is runnable) that maps the kernel's
+`executable` status to what the operator sees. ONLY `ready` is runnable (an
+Invoke form); every other state renders a clear, non-blank **"Why not?"** panel
+with the honest reason + next step — `needs_approval` (refused on the direct path
+until the risk is lowered; a per-call approval flow is not wired yet),
+`runtime_not_configured`, `runtime_disabled`, `missing_permission`,
+`not_implemented`. This is the same refusal the kernel enforces in
+`call_tool`/`invoke_tool`, just rendered honestly — a gated tool is never shown as
+runnable and the UI never pretends a refused tool ran. Pinned by
+`apps/dashboard/test/plugins.test.ts` (`toolReadiness` per-state assertions) and
+the kernel tests above. **Remaining gap:** there is no per-tool-call approval flow
+yet, so a `needs_approval` tool can only be made runnable by reconfiguring it as
+low-risk — it is honestly blocked, never silently run.
+
 ### Adapter Runtime v1 (local coding-agent CLIs)
 
 An Adapter plugin (§8.1) decides how an assigned task runs. The bundled

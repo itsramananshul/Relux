@@ -273,6 +273,89 @@ export function installResultSummary(p: ReluxPlugin): InstallSummary {
   };
 }
 
+// ── Tool readiness (the honest invocation surface) ────────────────────────────
+// ONE classifier from the kernel's `executable` state to what the operator sees
+// and may do — mirroring openclaw's approval-classifier
+// (`reference/openclaw-main/src/acp/approval-classifier.ts`, where a single
+// function maps a tool to a named class and only the safe classes auto-approve;
+// every other class carries an explicit reason and is never auto-run). Here
+// `runnable` is true ONLY for "ready"; every other state is non-runnable with a
+// concrete reason + next step, so a non-ready tool reads as a clear refusal /
+// disabled state — never a blank row, never a pretend invocation. The kernel is
+// authoritative (it refuses the same states in `call_tool`/`invoke_tool`); this
+// just renders the same truth honestly.
+export interface ToolReadiness {
+  // True ONLY when the kernel reports the tool ready to invoke directly.
+  runnable: boolean;
+  // Short badge label.
+  label: string;
+  // ok = runnable now; warn = an operator action would make it runnable; muted =
+  // unsupported / off, nothing to do here.
+  tone: StatusVariant;
+  // One honest sentence: why it is (not) runnable.
+  reason: string;
+  // The concrete next step an operator can take, or undefined when there is none.
+  nextStep?: string;
+}
+
+export function toolReadiness(t: ReluxToolDescriptor): ToolReadiness {
+  switch (t.executable) {
+    case "ready":
+      return {
+        runnable: true,
+        label: "ready",
+        tone: "ok",
+        reason:
+          "A built-in handler or an enabled HTTP loopback runtime backs this tool. Every call is permission-checked and audited.",
+      };
+    case "needs_approval":
+      return {
+        runnable: false,
+        label: "needs approval",
+        tone: "warn",
+        reason: `Configured as ${t.risk}-risk, so it requires approval and is refused on the direct invoke path — it is never run just because a runtime is enabled.`,
+        nextStep:
+          "Lower its risk to low (with auto-approve) on the plugin's Configure panel to make it directly callable. A per-call approval flow is not wired yet.",
+      };
+    case "runtime_not_configured":
+      return {
+        runnable: false,
+        label: "runtime not configured",
+        tone: "warn",
+        reason:
+          "Installed, but no runtime backs it yet. Relux never auto-runs downloaded code — it only calls a local loopback server you run.",
+        nextStep:
+          'Point this plugin at an HTTP loopback endpoint ("Runtime" on its plugin row), then invoke.',
+      };
+    case "runtime_disabled":
+      return {
+        runnable: false,
+        label: "runtime disabled",
+        tone: "warn",
+        reason:
+          "An HTTP loopback runtime is configured for this plugin but is currently disabled, so invocation is refused.",
+        nextStep: "Re-enable the loopback runtime on its plugin row to make this tool callable again.",
+      };
+    case "missing_permission":
+      return {
+        runnable: false,
+        label: "missing permission",
+        tone: "warn",
+        reason: `The scoped agent does not hold this tool's permission (${t.permission}).`,
+        nextStep: "Grant the permission to the agent, or invoke as an agent that already holds it.",
+      };
+    case "not_implemented":
+    default:
+      return {
+        runnable: false,
+        label: "runtime not implemented",
+        tone: "muted",
+        reason:
+          "The kernel has no supported runtime for this tool. Listed honestly rather than pretending to run.",
+      };
+  }
+}
+
 export interface VisibleTools {
   shown: ReluxToolDescriptor[];
   hiddenCount: number;
@@ -283,7 +366,7 @@ export interface VisibleTools {
 // metadata-only or unconfigured plugin never looks usable; a toggle reveals the
 // rest with their honest non-runnable status. Nothing is permanently hidden.
 export function isRunnableTool(t: ReluxToolDescriptor): boolean {
-  return t.executable === "ready";
+  return toolReadiness(t).runnable;
 }
 
 export function visibleTools(

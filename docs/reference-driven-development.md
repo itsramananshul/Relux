@@ -1485,3 +1485,46 @@ declare `approval: never`, so this changes none of their behavior (verified by t
 loopback **runtime** stays the separate, explicit run-enabling step, and Relux still never infers a tool or
 runs downloaded code — the operator authors the tool, points it at a local server they run, and only then
 can it run.
+
+---
+
+## Reference read — honest readiness for the tool-invocation UI (this slice)
+
+The backend invocation path was already complete and tested: the HTTP **loopback runtime**
+(`crates/relux-kernel/src/runtime.rs`, bounded/loopback-only/JSON-in-out), `state.rs`
+`call_tool`/`invoke_tool` (permission gate → approval gate → runtime, all audited), the
+`/v1/relux/tools/invoke` endpoint, and the approval refusal made load-bearing in the prior slice
+(`approval_blocks_direct_invocation` → `ToolExecutability::NeedsApproval`). The one remaining gap was
+the **UI**: a `ready` tool got an inline invoke form, but every non-runnable tool showed only a terse
+"not callable" plus a hover tooltip — not the "clear disabled/refusal state with a reason" the product
+bar requires. This slice closes that with a single readiness classifier and an honest inline panel; no
+backend behavior changes (`docs/RELUX_MASTER_PLAN.md` §7.4 Plugin Kernel Layer, §8.2 ToolSet Plugins).
+
+### Paperclip (openclaw) — files read
+
+- `reference/openclaw-main/src/acp/approval-classifier.ts` — `classifyAcpToolApproval` (L186-225): **ONE
+  classifier** maps a tool to a named `AcpApprovalClass`
+  (`readonly_scoped`/`readonly_search`/`mutating`/`exec_capable`/`control_plane`/…) and an `autoApprove`
+  boolean; **only the safe read classes return `autoApprove: true`** — every other class is non-auto with
+  an explicit named class, never a blank/auto path (`EXEC_CAPABLE_TOOL_IDS` / `CONTROL_PLANE_TOOL_IDS`,
+  L15-23, force a non-auto class). `normalizeToolName` (L57-63) lowercases + length-bounds + accepts only a
+  strict `^[a-z0-9._-]+$` shape. **Pattern: one function, a named class per state, only the safe class is
+  runnable — the unsafe states are surfaced with their honest class, never hidden or auto-run.**
+- `reference/openclaw-main/src/agents/cli-output.ts` (`parseCliOutput`) — re-confirmed: surface only the
+  parsed result, never a raw envelope. The invoke result panel renders `result.output` (the parsed tool
+  output), not the wire envelope.
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| openclaw: **one classifier → named class, only the safe class auto-runs** (`classifyAcpToolApproval`) | `apps/dashboard/src/plugins.ts` `toolReadiness(t)` maps the kernel's six `executable` states to `{ runnable, label, tone, reason, nextStep }`; `runnable` is true **only** for `ready` — every other state is non-runnable with a concrete reason + next step. `isRunnableTool` now delegates to it (single source of truth). |
+| openclaw: **the unsafe states are SURFACED with their class, never hidden/auto-run** | `ToolRow` (`apps/dashboard/src/pages/Plugins.tsx`) renders a `ready` tool's invoke form OR, for any non-ready tool, an inline **"Why not?"** `ToolNotRunnable` panel stating the refusal/disabled reason + next step — never a blank "not callable", never a pretend run. The same refusal the kernel enforces in `call_tool`/`invoke_tool`, rendered honestly. |
+| openclaw: **strict, bounded normalization before acting** (`normalizeToolName`) | unchanged from the prior slice — the kernel derives/sanitizes the `tool:<id>:<verb>` permission and validates the loopback URL; the UI only displays what the kernel already validated. |
+
+**What we deliberately do differently:** this is a UI-only, no-backend-change slice — the kernel stays
+authoritative (it refuses the same states), and `toolReadiness` is a pure, React-free helper so
+`node --test` pins every state without a DOM (`apps/dashboard/test/plugins.test.ts`). The Tools surface is
+inline on the Plugins page (no separate route), so a non-ready tool never opens a blank page. The honest
+limit is recorded, not papered over: a `needs_approval` tool has no per-call approval flow yet, so it is
+shown as blocked with the only real next step (reconfigure as low-risk), never silently run.
