@@ -2804,3 +2804,55 @@ the lock across its spawn, so it keeps capturing at finalize — stated plainly 
   rebuilt.
 
 See `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §25 for the applied-change record and the remaining gaps.
+
+## Reference read — first safe mid-run cancellation for process-backed runs (this slice)
+
+### Files read (reference)
+
+- `reference/openclaw-main/src/process/exec.ts` (vendored) — the process exec threads an `AbortSignal` into
+  the child spawn and kills the process when it fires; captured output is `maxBuffer`-bounded. **Pattern
+  learned:** an external signal (not just the deadline) can terminate the owned child; the cancel is wired
+  into the SAME spawn that owns the process.
+- `references/paperclip/server/src/adapters/process/execute.ts` (vendored) — `runChildProcess` kills the child
+  on `timeoutSec`/`graceSec` (a `graceSec` window before the hard kill). **Pattern learned:** killing the
+  owned child handle on an external stop signal is the mechanism; a grace period is the refinement (Relux's is
+  immediate this slice — recorded as a remaining gap).
+
+### The exact logic learned
+
+Mid-run cancellation = a flag the running spawn polls + the spawn's existing kill path fired when the flag is
+set. The flag must live where it can reach a child spawned with the orchestration's kernel lock RELEASED, so
+it cannot itself take that lock — the same liveness constraint as the live run-log (§25). The result is
+recorded as an intentional terminal state distinct from a failure.
+
+### How Relux maps it
+
+| OpenClaw/Paperclip pattern | Relux adaptation |
+|---|---|
+| `AbortSignal` threaded into the spawn | `run_adapter_command_streaming_cancellable(spec, sink, Option<CancelToken>)`; the existing 40ms `try_wait` loop checks `cancel.is_cancelled()` on the same tick as the deadline. `run_adapter_command{,_streaming}` delegate with `None` (unchanged). |
+| Kill the owned child on the signal | Relux reuses its timeout kill path; `kill_child_tree` adds a best-effort Windows tree kill (`taskkill /PID <pid> /T /F`) for the shim→node→… tree, then the owned `child.kill()` fallback. The outcome carries `cancelled: true`. |
+| Signal lives outside the spawn, reaches it without the work lock | `RunCancellations` registry (`Arc<Mutex<HashMap<run_id, Arc<CancelState>>>>`) on `AppState`, INDEPENDENT of the kernel lock (mirrors `LiveRunLogs`); `request` sets an `AtomicBool` via a race-free `swap`. The off-lock driver opens a `CancelToken` per brief; the server finishes it after finalize. |
+| Terminate → terminal state | `finalize_cli_run` detects `cancelled` and marks the run `RunStatus::Cancelled` + `RunFailureClass::Cancelled`, no retry, `run_cancelled` event + `run:cancel` audit — distinct from a Failed run, excluded from the recovery projections. |
+| `graceSec` before hard kill | NOT adopted this slice — the kill is immediate; recorded as a remaining gap. |
+
+**What we deliberately do differently:** cancellation is wired ONLY for the off-lock parallel driver (the one
+path that releases the kernel lock during the spawn). The synchronous in-kernel driver holds the lock across
+its spawn, so no cancel can interleave there by construction — the API honestly reports `not_running` rather
+than faking a cancel. Only an off-lock streaming run has a live `CancelToken`; everything else is honestly
+not-cancellable.
+
+### Files changed in Relux
+
+- `crates/relux-kernel/src/run_cancel.rs` (new) — `RunCancellations` registry + `CancelToken`/`CancelState` +
+  `CancelOutcome`; exported from `lib.rs`. Pure unit tests.
+- `crates/relux-kernel/src/adapter.rs` — `AdapterRunOutcome.cancelled`, `run_adapter_command_streaming_cancellable`,
+  the cancel poll + `kill_child_tree`.
+- `crates/relux-kernel/src/state.rs` — `PreparedBrief::run_with_sink_cancellable`,
+  `run_briefs_in_parallel_streaming(.., cancels)`, the `finalize_cli_run` cancel branch + `cancel_cli_run` /
+  `cancel_run`, the `capture_cli_run_log` cancelled line.
+- `crates/relux-kernel/src/server.rs` — `AppState.run_cancellations`, the `POST /v1/relux/runs/:id/cancel`
+  handler + route, `run_parallel_round` begins/finishes cancel tokens.
+- `apps/dashboard/src/{api.ts,runview.ts,pages/Work.tsx}` — `cancelRun` + `ReluxCancelRunResponse`,
+  `canCancelRun`, the Cancel-run button + inline honest result; bundle rebuilt.
+
+See `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §26 for the applied-change record and the remaining gaps.

@@ -85,6 +85,15 @@ export function canResumeRun(run: ReluxRun | ReluxRunDetail): boolean {
   return terminal && !!session?.resume_supported;
 }
 
+// Whether the UI should offer a Cancel action for a run. A cancel only reaches an
+// in-flight, process-backed run, so we offer it for a RUNNING run; the backend is
+// the honest authority (a run that turns out not to be a cancellable off-lock
+// process run returns `not_running` and the UI surfaces that message rather than
+// silently doing nothing). HERMES_OPENCLAW_DEEP_AUDIT §8/§26.
+export function canCancelRun(run: ReluxRun | ReluxRunDetail): boolean {
+  return run.status === "running";
+}
+
 // An honest one-line label for a run's session handoff: the source + whether
 // Relux can resume it. When a session was captured but is NOT resumable, the id is
 // still kept for handoff/audit/manual continuation — we say so rather than imply a

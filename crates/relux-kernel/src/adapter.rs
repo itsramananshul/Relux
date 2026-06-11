@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 use relux_core::{redact_secrets, AdapterKind, RunLogSource};
 
 use crate::live_run_log::RunLogSink;
+use crate::run_cancel::CancelToken;
 
 /// The safe, non-bypass permission mode Relux passes to the Claude CLI. This is
 /// deliberately NOT `bypassPermissions` and Relux never passes
@@ -65,6 +66,11 @@ pub struct AdapterRunOutcome {
     pub success: bool,
     /// True when the run was killed because it exceeded its timeout.
     pub timed_out: bool,
+    /// True when the run was killed because an operator requested cancellation
+    /// mid-flight (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §8/§26). Distinct from
+    /// `timed_out`: a cancel is intentional and terminal (classified
+    /// [`relux_core::RunFailureClass::Cancelled`]), never auto-retried.
+    pub cancelled: bool,
     pub stdout: String,
     pub stderr: String,
     pub stdout_truncated: bool,
@@ -257,7 +263,7 @@ fn path_extensions() -> Vec<String> {
 /// closed so it can never block on interactive input. On timeout the child is
 /// killed.
 pub fn run_adapter_command(spec: &AdapterCommandSpec) -> std::io::Result<AdapterRunOutcome> {
-    run_adapter_command_streaming(spec, None)
+    run_adapter_command_streaming_cancellable(spec, None, None)
 }
 
 /// Like [`run_adapter_command`] but additionally **streams** each stdout/stderr
@@ -280,6 +286,26 @@ pub fn run_adapter_command_streaming(
     spec: &AdapterCommandSpec,
     sink: Option<RunLogSink>,
 ) -> std::io::Result<AdapterRunOutcome> {
+    run_adapter_command_streaming_cancellable(spec, sink, None)
+}
+
+/// Like [`run_adapter_command_streaming`] but additionally honours an optional
+/// [`CancelToken`]: between its existing poll ticks the spawn checks
+/// [`CancelToken::is_cancelled`] and, when an operator has requested cancellation,
+/// kills the child (best-effort process tree on Windows; the immediate child
+/// otherwise), records a `system` cancellation line on the live sink, and returns
+/// an outcome with `cancelled: true` (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §8/§26 —
+/// the mid-run cancellation seam mirroring OpenClaw's `AbortSignal` + Paperclip's
+/// timeout/grace kill in `runChildProcess`).
+///
+/// This reuses the SAME kill path the timeout already uses; the only new input is
+/// the operator cancel flag. With `cancel: None` this is exactly the streaming
+/// behaviour, and with `sink: None` too it is the original non-streaming behaviour.
+pub fn run_adapter_command_streaming_cancellable(
+    spec: &AdapterCommandSpec,
+    sink: Option<RunLogSink>,
+    cancel: Option<CancelToken>,
+) -> std::io::Result<AdapterRunOutcome> {
     if let Some(s) = &sink {
         s.system(format!("spawned adapter '{}'", spec.program));
     }
@@ -296,6 +322,11 @@ pub fn run_adapter_command_streaming(
     }
 
     let mut child = command.spawn()?;
+    // Record the child pid so a cancel request can target the process tree (the
+    // immediate child is always killed via the owned handle regardless).
+    if let Some(c) = &cancel {
+        c.set_pid(child.id());
+    }
 
     // Feed the prompt on stdin from a dedicated thread, then close stdin (EOF).
     // A dedicated thread avoids a deadlock when the prompt is larger than the
@@ -325,14 +356,28 @@ pub fn run_adapter_command_streaming(
         sink.as_ref().map(|s| (RunLogSource::Stderr, s.clone())),
     );
 
-    // Poll for completion until the timeout, then kill. std has no wait-with-
-    // timeout, so this is a short-sleep poll loop - cheap and deterministic.
+    // Poll for completion until the timeout (or an operator cancel), then kill.
+    // std has no wait-with-timeout, so this is a short-sleep poll loop - cheap and
+    // deterministic. The cancel flag is checked on the SAME tick as the deadline,
+    // so an operator request is honoured within ~40ms.
     let start = Instant::now();
     let mut timed_out = false;
+    let mut cancelled = false;
     let status = loop {
         match child.try_wait()? {
             Some(status) => break Some(status),
             None => {
+                // Operator-requested cancellation: kill the child (best-effort
+                // tree) and stop. Intentional + terminal — never auto-retried.
+                if cancel.as_ref().map(|c| c.is_cancelled()).unwrap_or(false) {
+                    if let Some(s) = &sink {
+                        s.system("cancellation requested by operator; terminating adapter");
+                    }
+                    kill_child_tree(&mut child);
+                    let _ = child.wait();
+                    cancelled = true;
+                    break None;
+                }
                 if start.elapsed() >= spec.timeout {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -356,13 +401,14 @@ pub fn run_adapter_command_streaming(
     }
 
     let exit_code = status.as_ref().and_then(|s| s.code());
-    let success = !timed_out && status.map(|s| s.success()).unwrap_or(false);
+    let success = !timed_out && !cancelled && status.map(|s| s.success()).unwrap_or(false);
 
     Ok(AdapterRunOutcome {
         program: spec.program.clone(),
         exit_code,
         success,
         timed_out,
+        cancelled,
         stdout: redact_secrets(&String::from_utf8_lossy(&stdout_bytes)),
         stderr: redact_secrets(&String::from_utf8_lossy(&stderr_bytes)),
         stdout_truncated,
@@ -423,6 +469,31 @@ where
         }
         (kept, truncated)
     })
+}
+
+/// Kill a child process, best-effort including its descendants.
+///
+/// On Windows a CLI shim (`claude.cmd` → `node` → …) spawns a tree of grandchild
+/// processes; [`std::process::Child::kill`] alone (TerminateProcess on the one pid)
+/// would orphan them. So we first ask `taskkill /T /F /PID <pid>` to terminate the
+/// whole tree, then always call `kill()` on the owned handle as the guaranteed
+/// fallback for the immediate child. On non-Windows we kill the immediate child
+/// (descendant cleanup would need a process group; the immediate adapter process is
+/// what holds the work, and an orphaned helper exits when its pipes close).
+fn kill_child_tree(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        let pid = child.id();
+        // Best-effort tree kill; ignore failure (the direct kill below is the
+        // guaranteed fallback). No shell: argv only, output suppressed.
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
 }
 
 #[cfg(test)]
@@ -804,5 +875,123 @@ mod tests {
         let b = run_adapter_command_streaming(&spec, None).expect("spawn ok");
         assert!(a.success && b.success);
         assert!(a.stdout.contains("PLAIN_OUT") && b.stdout.contains("PLAIN_OUT"));
+        // A successful run is never marked cancelled.
+        assert!(!a.cancelled && !b.cancelled);
+    }
+
+    // --- Mid-run cancellation (the operator AbortSignal) -------------------
+
+    /// Write a fake CLI that loops for a long time (~10s) so a cancel can kill it
+    /// well before it would finish on its own. Cross-platform.
+    fn write_long_running_cli(dir: &std::path::Path, name: &str) -> PathBuf {
+        #[cfg(windows)]
+        {
+            let path = dir.join(format!("{name}.cmd"));
+            // ~10s wait (ping -n 11 ≈ 10s); prints a line first so a live tail can
+            // confirm it started.
+            std::fs::write(
+                &path,
+                "@echo off\r\necho STARTED\r\nping -n 11 127.0.0.1 >NUL\r\necho DONE\r\n",
+            )
+            .unwrap();
+            path
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.join(name);
+            std::fs::write(&path, "#!/bin/sh\necho STARTED\nsleep 10\necho DONE\n").unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+            path
+        }
+    }
+
+    #[test]
+    fn cancellation_kills_a_running_adapter_and_marks_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_long_running_cli(dir.path(), "long-agent");
+        let spec = AdapterCommandSpec {
+            program: bin.to_string_lossy().to_string(),
+            args: vec![],
+            stdin: String::new(),
+            working_dir: None,
+            // A long timeout so the run can only end via cancellation, not the
+            // deadline — proving the cancel path, not the timeout path.
+            timeout: Duration::from_secs(120),
+            max_output_bytes: 4096,
+        };
+        let live = crate::live_run_log::LiveRunLogs::new();
+        let cancels = crate::run_cancel::RunCancellations::new();
+        let run_id = relux_core::RunId::new("run_cancel_adapter");
+        let sink = live.begin(&run_id);
+        let token = cancels.begin(&run_id);
+
+        // Run the long process on a worker; the main thread waits until it has
+        // started (the live STARTED line) then requests cancellation.
+        let worker = std::thread::spawn(move || {
+            run_adapter_command_streaming_cancellable(&spec, Some(sink), Some(token))
+        });
+        let started = Instant::now();
+        loop {
+            if live
+                .snapshot(&run_id, None)
+                .map(|s| s.lines.iter().any(|l| l.text.contains("STARTED")))
+                .unwrap_or(false)
+            {
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(20), "process never started");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(cancels.request(&run_id), crate::run_cancel::CancelOutcome::Requested);
+
+        // The worker must return promptly (well under the 120s timeout) BECAUSE it
+        // was cancelled, not because it finished or timed out.
+        let outcome = worker.join().expect("worker joined").expect("spawn ok");
+        assert!(outcome.cancelled, "outcome must be marked cancelled");
+        assert!(!outcome.success, "a cancelled run is not a success");
+        assert!(!outcome.timed_out, "a cancel is distinct from a timeout");
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "cancel did not stop the run promptly (elapsed {:?})",
+            started.elapsed()
+        );
+        // The cancellation system line is on the live tail; DONE never printed.
+        let snap = live.snapshot(&run_id, None).expect("live buffer");
+        assert!(
+            snap.lines.iter().any(|l| l.source == RunLogSource::System
+                && l.text.contains("cancellation requested")),
+            "missing cancellation system line: {:?}",
+            snap.lines
+        );
+        assert!(
+            !snap.lines.iter().any(|l| l.text.contains("DONE")),
+            "the process was not actually killed (DONE printed): {:?}",
+            snap.lines
+        );
+    }
+
+    #[test]
+    fn no_cancel_request_runs_to_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_fake_cli(dir.path(), "uncancelled-agent", "FINISHED_OK");
+        let spec = AdapterCommandSpec {
+            program: bin.to_string_lossy().to_string(),
+            args: vec![],
+            stdin: String::new(),
+            working_dir: None,
+            timeout: Duration::from_secs(10),
+            max_output_bytes: 1024,
+        };
+        let cancels = crate::run_cancel::RunCancellations::new();
+        let token = cancels.begin(&relux_core::RunId::new("run_uncancelled"));
+        // A token is present but never requested → the run completes normally.
+        let outcome =
+            run_adapter_command_streaming_cancellable(&spec, None, Some(token)).expect("spawn ok");
+        assert!(outcome.success);
+        assert!(!outcome.cancelled);
+        assert!(outcome.stdout.contains("FINISHED_OK"));
     }
 }

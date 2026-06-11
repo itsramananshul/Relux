@@ -140,6 +140,14 @@ test("getRunLogs omits a zero/undefined since (degrades to a full fetch)", async
   assert.equal(captured!.url, "/v1/relux/runs/run_0001/logs");
 });
 
+test("cancelRun POSTs the cancel route", async () => {
+  // The mid-run cancel request shape (HERMES_OPENCLAW_DEEP_AUDIT §8/§26).
+  stubFetch({ run_id: "run_0001", status: "requested", cancelling: true, message: "ok" });
+  await reluxWork.cancelRun("run_0001");
+  assert.equal(captured!.method, "POST");
+  assert.equal(captured!.url, "/v1/relux/runs/run_0001/cancel");
+});
+
 // --- Committed bundle (no stale dist) ---------------------------------------
 
 test("the committed dashboard bundle ships the Logs/Tail copy (no stale dist)", () => {

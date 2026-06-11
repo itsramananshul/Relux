@@ -45,6 +45,7 @@ pub mod prime_slots;
 pub mod prime_tools;
 pub mod prime_update_slots;
 pub mod prime_write_tools;
+pub mod run_cancel;
 pub mod runtime;
 pub mod state;
 pub mod store;
@@ -55,6 +56,7 @@ pub use adapter::{
     run_adapter_command, run_adapter_command_streaming, AdapterCommandSpec, AdapterRunOutcome,
 };
 pub use live_run_log::{LiveRunLogs, RunLogSink};
+pub use run_cancel::{CancelOutcome, CancelState, CancelToken, RunCancellations};
 pub use agent_config::{
     validate_agent_update, validate_new_agent, AgentConfigError, CreateAgentInput,
     ResolvedAgentUpdate, ResolvedNewAgent, UpdateAgentInput,

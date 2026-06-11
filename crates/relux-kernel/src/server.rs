@@ -95,6 +95,15 @@ struct AppState {
     /// never blocks on a kernel operation. See [`relux_kernel::LiveRunLogs`] and
     /// `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §8/§10.
     live_run_logs: relux_kernel::LiveRunLogs,
+    /// In-process registry of cancel tokens for in-flight, process-backed adapter
+    /// runs. The off-lock orchestration spawn opens a token per brief; an operator
+    /// `POST /v1/relux/runs/:id/cancel` sets the flag and the spawn kills its child
+    /// mid-flight. Independent of the kernel `lock` (so a cancel is never blocked by
+    /// a kernel operation), and bounded by its own backstop. Only an off-lock
+    /// streaming run is cancellable — every other run honestly reports not-running.
+    /// See [`relux_kernel::RunCancellations`] and `docs/HERMES_OPENCLAW_DEEP_AUDIT.md`
+    /// §8/§26.
+    run_cancellations: relux_kernel::RunCancellations,
 }
 
 /// Resolve the effective AI config from the local secrets file (when present)
@@ -133,6 +142,7 @@ async fn serve() -> Result<(), KernelError> {
         lock: Arc::new(Mutex::new(())),
         jobs: JobRegistry::default(),
         live_run_logs: relux_kernel::LiveRunLogs::new(),
+        run_cancellations: relux_kernel::RunCancellations::new(),
     };
 
     // Bootstrap + persist once so a fresh store already lists the bundled
@@ -202,6 +212,7 @@ async fn serve() -> Result<(), KernelError> {
     println!("   GET    /v1/relux/runs/:id/logs              (bounded redacted stdout/stderr/system tail; optional ?since=<seq>)");
     println!("   POST   /v1/relux/runs/:id/retry");
     println!("   POST   /v1/relux/runs/:id/resume            (continue the captured provider session; 422 if unsupported)");
+    println!("   POST   /v1/relux/runs/:id/cancel            (cancel an in-flight process run; honest not-running otherwise)");
     println!("   POST   /v1/relux/runs/:id/proposed-changes/:index/review {{ \"decision\": \"approve|reject\" }}");
     println!("   POST   /v1/relux/runs/:id/proposed-changes/:index/apply");
     println!("   GET    /v1/relux/audit");
@@ -461,6 +472,7 @@ fn protected_router() -> Router<AppState> {
         .route("/v1/relux/runs/:id/logs", get(get_run_logs))
         .route("/v1/relux/runs/:id/retry", post(retry_run))
         .route("/v1/relux/runs/:id/resume", post(resume_run))
+        .route("/v1/relux/runs/:id/cancel", post(cancel_run))
         .route(
             "/v1/relux/runs/:id/proposed-changes/:index/review",
             post(review_proposed_change),
@@ -2534,6 +2546,69 @@ async fn resume_run(
     let run_id = relux_core::RunId::new(id);
     let new_run_id = locked_save_persisting(&state, |kernel| kernel.resume_run(&run_id))?;
     Ok(Json(RetryRunResponse { run_id: new_run_id }))
+}
+
+/// The honest result of a cancel request, returned by `POST .../cancel`.
+#[derive(Debug, Serialize)]
+struct CancelRunResponse {
+    run_id: String,
+    /// `requested` | `already_requested` | `not_running` (the wire form of
+    /// [`relux_kernel::CancelOutcome`]).
+    status: String,
+    /// True when the run is (or already was) being cancelled — false only for a run
+    /// that is not a cancellable in-flight process run.
+    cancelling: bool,
+    /// A short, honest human message for the UI.
+    message: String,
+}
+
+/// POST `/v1/relux/runs/:id/cancel` — request mid-run cancellation of an in-flight,
+/// process-backed adapter run (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §8/§26).
+///
+/// Session-gated (the operator console is the human authority). Validates the run
+/// exists under the kernel lock (404 for an unknown run), then sets the cancel flag
+/// in the lock-INDEPENDENT [`relux_kernel::RunCancellations`] registry so the
+/// off-lock spawn kills its child within a poll tick. The run is then finalized as
+/// [`relux_core::RunStatus::Cancelled`] by the orchestration driver's finalize phase.
+///
+/// HONEST: only a run that is actually streaming off-lock has a live cancel token.
+/// A request for any other run — already finished, never started off-lock, or a
+/// synchronous lock-holding run — returns `not_running` with `cancelling: false`
+/// and a clear reason; the kernel never claims to cancel something it cannot reach.
+/// A repeat request for an already-cancelling run is idempotent (`already_requested`).
+async fn cancel_run(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<CancelRunResponse>, ApiError> {
+    let run_id = relux_core::RunId::new(id);
+    // 404 only for an unknown run id (read-only validation under the lock).
+    locked_read(&state, |kernel| {
+        kernel
+            .run(&run_id)
+            .ok_or_else(|| KernelError::UnknownRun(run_id.to_string()))?;
+        Ok(())
+    })?;
+    // Set the cancel flag WITHOUT the kernel lock — the off-lock spawn polls it.
+    let outcome = state.run_cancellations.request(&run_id);
+    let message = match outcome {
+        relux_kernel::CancelOutcome::Requested => {
+            "Cancellation requested — the run is being stopped.".to_string()
+        }
+        relux_kernel::CancelOutcome::AlreadyRequested => {
+            "This run is already being cancelled.".to_string()
+        }
+        relux_kernel::CancelOutcome::NotRunning => {
+            "This run is not a cancellable in-flight process run (it already \
+             finished, never started, or runs on the synchronous path)."
+                .to_string()
+        }
+    };
+    Ok(Json(CancelRunResponse {
+        run_id: run_id.to_string(),
+        status: outcome.as_str().to_string(),
+        cancelling: outcome.is_cancelling(),
+        message,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -5102,7 +5177,11 @@ fn run_parallel_round(
     // `GET /v1/relux/runs/:id/logs` sees the tail WHILE the briefs run (the lock is
     // free during this window). The captured outcomes are identical to the
     // non-streaming driver.
-    let finished = relux_kernel::run_briefs_in_parallel_streaming(prepared, &state.live_run_logs);
+    let finished = relux_kernel::run_briefs_in_parallel_streaming(
+        prepared,
+        &state.live_run_logs,
+        &state.run_cancellations,
+    );
 
     // Phase 3: merge every finished brief back under the lock, then finalize.
     let snap = locked_save_persisting(state, move |kernel| {
@@ -5116,10 +5195,12 @@ fn run_parallel_round(
     })?;
 
     // The canonical, persisted run logs now exist (finalize captured them), so drop
-    // the in-memory live buffers — subsequent polls serve the durable log and the
-    // live registry stays bounded.
+    // the in-memory live buffers AND the cancel tokens — subsequent polls serve the
+    // durable log, a later cancel honestly reports not-running, and both registries
+    // stay bounded.
     for rid in &streamed_run_ids {
         state.live_run_logs.finish(rid);
+        state.run_cancellations.finish(rid);
     }
     Ok(snap)
 }
@@ -7334,6 +7415,7 @@ mod tests {
             lock: Arc::new(Mutex::new(())),
             jobs: JobRegistry::default(),
             live_run_logs: relux_kernel::LiveRunLogs::new(),
+            run_cancellations: relux_kernel::RunCancellations::new(),
         };
         (state, dir, oid)
     }
@@ -7502,6 +7584,7 @@ mod tests {
             lock: Arc::new(Mutex::new(())),
             jobs: JobRegistry::default(),
             live_run_logs: relux_kernel::LiveRunLogs::new(),
+            run_cancellations: relux_kernel::RunCancellations::new(),
         }
     }
 
@@ -8486,6 +8569,7 @@ mod tests {
             lock: Arc::new(Mutex::new(())),
             jobs: JobRegistry::default(),
             live_run_logs: relux_kernel::LiveRunLogs::new(),
+            run_cancellations: relux_kernel::RunCancellations::new(),
         };
         (state, dir)
     }
@@ -8725,6 +8809,56 @@ mod tests {
         let log3: serde_json::Value = serde_json::from_str(&body3).unwrap();
         // The durable log for this never-executed run is empty (no fabricated lines).
         assert!(log3["lines"].as_array().unwrap().is_empty(), "durable wins, honestly empty: {body3}");
+    }
+
+    #[tokio::test]
+    async fn cancel_route_requests_cancel_for_a_live_run_and_is_honest_otherwise() {
+        let (state, _dir) = auth_state(true);
+        // A real, RUNNING run; the off-lock spawn would register a cancel token.
+        let run_id = seed_running_run_without_log(&state);
+        let rid = relux_core::RunId::new(run_id.clone());
+
+        // No live token yet ⇒ honest not_running (cancelling=false), still 200.
+        let (status0, _c, body0) =
+            call(&state, "POST", &format!("/v1/relux/runs/{run_id}/cancel"), None, None).await;
+        assert_eq!(status0, StatusCode::OK, "body: {body0}");
+        let r0: serde_json::Value = serde_json::from_str(&body0).unwrap();
+        assert_eq!(r0["status"], "not_running");
+        assert_eq!(r0["cancelling"], false);
+
+        // Simulate the off-lock spawn opening a cancel token for this run.
+        let token = state.run_cancellations.begin(&rid);
+        assert!(!token.is_cancelled());
+
+        // First cancel ⇒ requested + the spawn's flag is now set.
+        let (status1, _c, body1) =
+            call(&state, "POST", &format!("/v1/relux/runs/{run_id}/cancel"), None, None).await;
+        assert_eq!(status1, StatusCode::OK, "body: {body1}");
+        let r1: serde_json::Value = serde_json::from_str(&body1).unwrap();
+        assert_eq!(r1["status"], "requested");
+        assert_eq!(r1["cancelling"], true);
+        assert!(token.is_cancelled(), "the off-lock spawn must now see the cancel flag");
+
+        // Repeat ⇒ idempotent already_requested (still cancelling).
+        let (status2, _c, body2) =
+            call(&state, "POST", &format!("/v1/relux/runs/{run_id}/cancel"), None, None).await;
+        assert_eq!(status2, StatusCode::OK);
+        let r2: serde_json::Value = serde_json::from_str(&body2).unwrap();
+        assert_eq!(r2["status"], "already_requested");
+        assert_eq!(r2["cancelling"], true);
+
+        // Once finalized (token dropped) a later cancel honestly reports not_running.
+        state.run_cancellations.finish(&rid);
+        let (status3, _c, body3) =
+            call(&state, "POST", &format!("/v1/relux/runs/{run_id}/cancel"), None, None).await;
+        assert_eq!(status3, StatusCode::OK);
+        let r3: serde_json::Value = serde_json::from_str(&body3).unwrap();
+        assert_eq!(r3["status"], "not_running");
+
+        // An unknown run id is the kernel's existing UnknownRun 400.
+        let (status4, _c, _b) =
+            call(&state, "POST", "/v1/relux/runs/run_nope/cancel", None, None).await;
+        assert_eq!(status4, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -9691,6 +9825,7 @@ mod tests {
             lock: Arc::new(Mutex::new(())),
             jobs: JobRegistry::default(),
             live_run_logs: relux_kernel::LiveRunLogs::new(),
+            run_cancellations: relux_kernel::RunCancellations::new(),
         };
 
         // Boot 1: first-run setup mints a session cookie.

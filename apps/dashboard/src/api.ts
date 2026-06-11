@@ -2383,6 +2383,17 @@ export interface ReluxRunLog {
   stderr_truncated?: boolean;
 }
 
+// The honest result of a mid-run cancel request (backend `CancelRunResponse`).
+// `status` is the wire form of the kernel's cancel outcome; `cancelling` is true
+// for both a fresh request and an idempotent repeat, false only when the run is
+// not a cancellable in-flight process run.
+export interface ReluxCancelRunResponse {
+  run_id: string;
+  status: "requested" | "already_requested" | "not_running";
+  cancelling: boolean;
+  message: string;
+}
+
 export interface ReluxAuditEntry {
   id: string;
   ts: string; // Assuming timestamp as string for now, could be number
@@ -2528,6 +2539,15 @@ export const reluxWork = {
   // new run's id.
   resumeRun: (id: string) =>
     api.post<{ run_id: string }>(`/v1/relux/runs/${encodeURIComponent(id)}/resume`),
+
+  // Request mid-run cancellation of an in-flight, process-backed adapter run
+  // (HERMES_OPENCLAW_DEEP_AUDIT §8/§26). Honest: only an off-lock streaming run is
+  // cancellable — any other run (already finished, never started, synchronous
+  // path) returns `status: "not_running"` with `cancelling: false` and a clear
+  // message (a 200, not an error). A repeat for an already-cancelling run is
+  // idempotent (`already_requested`). An unknown run id is a 400.
+  cancelRun: (id: string) =>
+    api.post<ReluxCancelRunResponse>(`/v1/relux/runs/${encodeURIComponent(id)}/cancel`),
 
   // Record an operator accept/reject of a proposed change (master plan §15).
   // Returns the updated run detail so the panel can refresh in one round trip.

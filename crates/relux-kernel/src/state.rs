@@ -7419,7 +7419,9 @@ impl KernelState {
                 Ok(run_id)
             }
             Ok(outcome) => {
-                let reason = if outcome.timed_out {
+                let reason = if outcome.cancelled {
+                    format!("adapter '{}' was cancelled by operator", binary)
+                } else if outcome.timed_out {
                     format!(
                         "adapter '{}' timed out after {}s",
                         binary, timeout_seconds
@@ -7442,19 +7444,29 @@ impl KernelState {
                     serde_json::json!({
                         "exit_code": outcome.exit_code,
                         "timed_out": outcome.timed_out,
+                        "cancelled": outcome.cancelled,
                         "stdout": outcome.stdout,
                         "stderr": outcome.stderr,
                         "duration_ms": outcome.duration_ms,
                     }),
                 );
                 // Capture the bounded, redacted run-log tail for the logs surface
-                // (a failed run still has stdout/stderr worth showing).
+                // (a failed/cancelled run still has stdout/stderr worth showing).
                 self.capture_cli_run_log(&run_id, &config_kind, &binary, &outcome);
                 self.set_run_metrics(&run_id, outcome.duration_ms, None, None);
-                // A wall-clock timeout is a safe-to-retry transient; a non-zero
-                // exit is genuinely unclassifiable (the cause could be anything) so
-                // it stays Unknown — NOT auto-retried, since a coding-agent run can
-                // mutate a workspace.
+                // A cancel is intentional + terminal: mark the run Cancelled (NOT
+                // Failed) with the Cancelled failure class, so it never auto-retries
+                // and never reads as an operator-action failure. A wall-clock
+                // timeout is a safe-to-retry transient; a non-zero exit is genuinely
+                // unclassifiable (the cause could be anything) so it stays Unknown —
+                // NOT auto-retried, since a coding-agent run can mutate a workspace.
+                if outcome.cancelled {
+                    self.cancel_cli_run(&run_id, task_id, namespace.as_ref(), adapter, &reason);
+                    return Err(KernelError::AdapterExecutionFailed {
+                        plugin: adapter.to_string(),
+                        message: reason,
+                    });
+                }
                 let exit_class = if outcome.timed_out {
                     RunFailureClass::Timeout
                 } else {
@@ -7531,6 +7543,80 @@ impl KernelState {
         );
     }
 
+    /// Mark a CLI run **cancelled** (not failed) + its task failed, and audit it.
+    /// Used only when an operator killed the adapter mid-flight
+    /// (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §8/§26). The run records the terminal
+    /// [`RunStatus::Cancelled`] with the [`RunFailureClass::Cancelled`] class (so the
+    /// UI shows a Cancelled chip + remediation and the recovery projections never
+    /// treat it as a retry/operator-action failure); the task goes Failed so it is
+    /// not stuck Running and the operator can start it fresh.
+    fn cancel_cli_run(
+        &mut self,
+        run_id: &RunId,
+        task_id: &TaskId,
+        namespace: Option<&NamespaceId>,
+        adapter: &PluginId,
+        reason: &str,
+    ) {
+        let agent = self
+            .runs
+            .get(run_id)
+            .map(|r| r.agent_id.as_str().to_string())
+            .unwrap_or_else(|| "agent".to_string());
+        let _ = self.cancel_run(run_id, reason);
+        let _ = self.fail_task(task_id);
+        self.record_audit(
+            "agent",
+            &agent,
+            "adapter:cancel",
+            Some("adapter"),
+            Some(adapter.as_str()),
+            namespace,
+            AuditResult::Failed,
+            serde_json::json!({ "run": run_id.as_str(), "reason": reason }),
+        );
+    }
+
+    /// Mark a run **cancelled**: terminal [`RunStatus::Cancelled`] + the
+    /// [`RunFailureClass::Cancelled`] class, no retry state (a cancel is never
+    /// auto-retried), with a `run_cancelled` transcript event + audit. The honest
+    /// counterpart to [`Self::fail_run_classified`] for an intentional operator stop
+    /// (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §8/§26).
+    pub fn cancel_run(&mut self, run_id: &RunId, reason: &str) -> Result<(), KernelError> {
+        let ended = self.clock.tick();
+        let (agent_id, task_id) = {
+            let run = self
+                .runs
+                .get_mut(run_id)
+                .ok_or_else(|| KernelError::UnknownRun(run_id.to_string()))?;
+            run.status = RunStatus::Cancelled;
+            run.ended_at = Some(ended);
+            run.error = Some(reason.to_string());
+            run.failure_class = Some(RunFailureClass::Cancelled);
+            run.retry = None;
+            (run.agent_id.clone(), run.task_id.clone())
+        };
+        let task_namespace = self.tasks.get(&task_id).map(|t| t.namespace_id.clone());
+        self.push_run_event(
+            run_id,
+            "run_cancelled",
+            "kernel",
+            reason,
+            serde_json::json!({ "failure_class": RunFailureClass::Cancelled.as_str() }),
+        );
+        self.record_audit(
+            "agent",
+            agent_id.as_str(),
+            "run:cancel",
+            Some("run"),
+            Some(run_id.as_str()),
+            task_namespace.as_ref(),
+            AuditResult::Failed,
+            serde_json::Value::Null,
+        );
+        Ok(())
+    }
+
     /// Capture a bounded, redacted **run-log tail** from a finished CLI adapter
     /// run (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §8/§10). Built from the adapter's
     /// already-redacted, byte-capped stdout/stderr (each split into per-line
@@ -7556,7 +7642,9 @@ impl KernelState {
         builder.push_system(format!("spawned {} adapter '{}'", kind.as_str(), binary));
         builder.push_output(relux_core::RunLogSource::Stdout, &outcome.stdout);
         builder.push_output(relux_core::RunLogSource::Stderr, &outcome.stderr);
-        let outcome_line = if outcome.timed_out {
+        let outcome_line = if outcome.cancelled {
+            format!("adapter cancelled by operator after {} ms", outcome.duration_ms)
+        } else if outcome.timed_out {
             format!("adapter timed out after {} ms", outcome.duration_ms)
         } else {
             format!(
@@ -7985,7 +8073,23 @@ impl PreparedBrief {
     /// (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §8/§10). The captured outcome is
     /// unchanged — streaming is strictly additive.
     pub fn run_with_sink(self, sink: Option<crate::live_run_log::RunLogSink>) -> FinishedBrief {
-        let outcome = crate::adapter::run_adapter_command_streaming(&self.plan.spec, sink);
+        self.run_with_sink_cancellable(sink, None)
+    }
+
+    /// Like [`Self::run_with_sink`] but additionally honours an optional
+    /// [`crate::run_cancel::CancelToken`]: if an operator requests cancellation
+    /// mid-flight the spawn kills the child and the outcome is marked `cancelled`,
+    /// which `finalize_cli_run` records as a
+    /// [`relux_core::RunFailureClass::Cancelled`] run
+    /// (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §8/§26). Strictly additive — with
+    /// `cancel: None` this is exactly [`Self::run_with_sink`].
+    pub fn run_with_sink_cancellable(
+        self,
+        sink: Option<crate::live_run_log::RunLogSink>,
+        cancel: Option<crate::run_cancel::CancelToken>,
+    ) -> FinishedBrief {
+        let outcome =
+            crate::adapter::run_adapter_command_streaming_cancellable(&self.plan.spec, sink, cancel);
         FinishedBrief {
             step_index: self.step_index,
             round_no: self.round_no,
@@ -8063,16 +8167,23 @@ pub fn run_briefs_in_parallel(prepared: Vec<PreparedBrief>) -> Vec<FinishedBrief
 /// [`crate::live_run_log::LiveRunLogs::finish`] after the brief's canonical log is
 /// finalized + persisted. The captured outcomes are identical to the non-streaming
 /// driver — streaming is strictly additive.
+/// Each brief additionally opens a [`crate::run_cancel::CancelToken`] in the shared
+/// `cancels` registry before its process starts, so an operator can kill it
+/// mid-flight via `POST /v1/relux/runs/:id/cancel` while the kernel lock is free
+/// (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §8/§26). The caller drops both the live
+/// buffer and the cancel token via `finish` after the brief finalizes.
 pub fn run_briefs_in_parallel_streaming(
     prepared: Vec<PreparedBrief>,
     live: &crate::live_run_log::LiveRunLogs,
+    cancels: &crate::run_cancel::RunCancellations,
 ) -> Vec<FinishedBrief> {
     if prepared.len() <= 1 {
         return prepared
             .into_iter()
             .map(|p| {
                 let sink = live.begin(p.run_id());
-                p.run_with_sink(Some(sink))
+                let cancel = cancels.begin(p.run_id());
+                p.run_with_sink_cancellable(Some(sink), Some(cancel))
             })
             .collect();
     }
@@ -8080,7 +8191,8 @@ pub fn run_briefs_in_parallel_streaming(
         .into_iter()
         .map(|p| {
             let sink = live.begin(p.run_id());
-            std::thread::spawn(move || p.run_with_sink(Some(sink)))
+            let cancel = cancels.begin(p.run_id());
+            std::thread::spawn(move || p.run_with_sink_cancellable(Some(sink), Some(cancel)))
         })
         .collect();
     handles.into_iter().filter_map(|h| h.join().ok()).collect()
@@ -14688,6 +14800,77 @@ mod tests {
             .audit_log()
             .iter()
             .any(|e| e.action == "adapter:execute" && e.result == AuditResult::Success));
+    }
+
+    #[test]
+    fn cancel_run_marks_run_cancelled_with_cancelled_class() {
+        // The operator-cancel finalize (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §8/§26):
+        // a running run becomes terminal Cancelled with the Cancelled failure class,
+        // no retry, and a `run_cancelled` transcript event — distinct from a failure.
+        let mut k = adapter_kernel();
+        let (_agent, task) = cli_task(&mut k);
+        let run_id = k.start_run(&task).expect("start run");
+        assert_eq!(k.run(&run_id).unwrap().status, RunStatus::Running);
+
+        k.cancel_run(&run_id, "adapter 'claude' was cancelled by operator")
+            .expect("cancel ok");
+
+        let run = k.run(&run_id).unwrap();
+        assert_eq!(
+            run.status,
+            RunStatus::Cancelled,
+            "a cancel is terminal-Cancelled, not Failed"
+        );
+        assert_eq!(run.failure_class, Some(RunFailureClass::Cancelled));
+        assert!(run.retry.is_none(), "a cancel is never auto-retried");
+        assert!(run.ended_at.is_some());
+        assert!(
+            k.run_events(&run_id).iter().any(|e| e.kind == "run_cancelled"),
+            "the transcript must record the intentional stop"
+        );
+        // Recovery projections never treat a cancel as a retry / operator-action
+        // failure (they key on RunStatus::Failed; a Cancelled run is excluded).
+        assert!(!k.transient_retry_ready(u64::MAX).contains(&run_id));
+        let cancel_audit = k
+            .audit_log()
+            .iter()
+            .any(|e| e.action == "run:cancel");
+        assert!(cancel_audit, "a cancel is audited");
+    }
+
+    #[test]
+    fn capture_cli_run_log_marks_a_cancelled_outcome() {
+        // A cancelled adapter outcome captures an honest "cancelled by operator"
+        // system line in the durable run-log tail (§8/§26).
+        let mut k = adapter_kernel();
+        let (_agent, task) = cli_task(&mut k);
+        let run_id = k.start_run(&task).expect("start run");
+        let outcome = crate::adapter::AdapterRunOutcome {
+            program: "fake".to_string(),
+            exit_code: None,
+            success: false,
+            timed_out: false,
+            cancelled: true,
+            stdout: "partial output\n".to_string(),
+            stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            duration_ms: 1234,
+        };
+        k.capture_cli_run_log(&run_id, &AdapterKind::ClaudeCli, "fake", &outcome);
+        let log = k.run_log(&run_id, None);
+        assert!(
+            log.lines.iter().any(|l| l.source == relux_core::RunLogSource::System
+                && l.text.contains("cancelled by operator")),
+            "missing cancellation outcome line: {:?}",
+            log.lines
+        );
+        // The captured partial stdout is still present (a cancel still shows output).
+        assert!(log
+            .lines
+            .iter()
+            .any(|l| l.source == relux_core::RunLogSource::Stdout
+                && l.text.contains("partial output")));
     }
 
     #[test]

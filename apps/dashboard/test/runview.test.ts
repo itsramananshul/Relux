@@ -33,6 +33,7 @@ import {
   recoveryStatusLine,
   runSession,
   canResumeRun,
+  canCancelRun,
   sessionHandoffLabel,
 } from "../src/runview.ts";
 
@@ -110,6 +111,18 @@ test("canResumeRun prefers backend resumable flag, falls back honestly", () => {
   );
   // No session at all → not resumable.
   assert.equal(canResumeRun({ ...base, status: "failed" } as any), false);
+});
+
+test("canCancelRun offers Cancel only for a running run", () => {
+  const base = { id: "r1", task_id: "t", agent_id: "a", adapter_plugin: "p" };
+  // An in-flight (running) run is offered Cancel; the backend is the honest
+  // authority on whether it is actually a cancellable off-lock process run.
+  assert.equal(canCancelRun({ ...base, status: "running" } as any), true);
+  // A terminal or not-yet-running run is never offered Cancel.
+  assert.equal(canCancelRun({ ...base, status: "completed" } as any), false);
+  assert.equal(canCancelRun({ ...base, status: "failed" } as any), false);
+  assert.equal(canCancelRun({ ...base, status: "cancelled" } as any), false);
+  assert.equal(canCancelRun({ ...base, status: "pending" } as any), false);
 });
 
 test("sessionHandoffLabel is honest about resume support", () => {

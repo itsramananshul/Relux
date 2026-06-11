@@ -437,7 +437,13 @@ safe (adds no authority), bounded, feasible in one commit, and reuses existing v
 - **argv-only (no shell injection), non-bypass** (Claude `--permission-mode default`, never
   `--dangerously-skip-permissions`), bounded timeout + output cap, secret-redacted output, read-only
   PATH probe (`find_on_path`). Two CLI-stdout shaping seams both go through `parse_adapter_result`.
-- **Partial/missing**: serverless/sandboxed backends and mid-run cancellation are missing. A bounded,
+- **Partial/missing**: serverless/sandboxed backends are missing. **Mid-run cancellation now exists for the
+  off-lock streaming path** (SHIPPED — see §26): an operator `POST /v1/relux/runs/:id/cancel` sets a flag in
+  a lock-independent `RunCancellations` registry, the streaming spawn polls it between its existing `try_wait`
+  ticks and kills the child (best-effort process tree on Windows via `taskkill /T /F`), and the run finalizes
+  as `RunStatus::Cancelled` with `RunFailureClass::Cancelled`. Honest: only a run actually streaming off-lock
+  is cancellable; the synchronous lock-holding driver and any finished/never-started run report not-running.
+  A bounded,
   redacted **run-log / tail** of the captured stdout/stderr/system output is persisted + served + shown
   (SHIPPED — see §24), and **LIVE per-chunk streaming during the run is now wired** for the off-lock
   (parallel orchestration) path (SHIPPED THIS ROUND — see §25): `run_adapter_command_streaming` feeds an
@@ -458,7 +464,13 @@ safe (adds no authority), bounded, feasible in one commit, and reuses existing v
   serves that live tail (without the kernel lock) until the canonical persisted log exists. Maps Paperclip
   `runChildProcess(..., { onLog })`. Remaining: live tailing on the synchronous lock-holding path, an SSE/
   WebSocket push (this is still POLLED), and a per-run live byte/retention budget beyond the line cap.
-- **P2 — mid-run cancellation** (`AbortSignal`-style) for a long adapter spawn. *(backend, tests.)*
+- **P2 — mid-run cancellation (SHIPPED THIS ROUND, §26).** An `AbortSignal`-style cancel for a long adapter
+  spawn: a lock-independent `RunCancellations` registry + a cancel flag the streaming spawn polls and kills its
+  child on, a session-gated `POST /v1/relux/runs/:id/cancel`, and a `RunStatus::Cancelled` /
+  `RunFailureClass::Cancelled` finalize. Wired for the off-lock parallel path only (the synchronous driver holds
+  the kernel lock across its spawn, so a cancel can't interleave there — it honestly reports not-cancellable).
+  Maps OpenClaw `exec.ts` `AbortSignal` + Paperclip `runChildProcess` timeout/grace kill. Remaining: cancel on
+  the synchronous path, a configurable grace period before the hard kill, and unix process-group tree kill.
 - **Deferred — serverless backends** (Hermes Modal/Daytona): the "execution workspaces" phase.
 
 ---
@@ -516,8 +528,10 @@ safe (adds no authority), bounded, feasible in one commit, and reuses existing v
 - **Partial/missing**: a bounded, redacted **run-log / tail** (stdout/stderr/system) is shown in the Work
   run detail with truncation/redaction markers + a Refresh/poll (SHIPPED — see §24), and it now shows
   **LIVE lines for an in-flight parallel run** (the poll merges the `?since=<seq>` tail the off-lock spawn
-  streams, so lines appear before the run finalizes — SHIPPED THIS ROUND, see §25); a true SSE/WebSocket
-  push (vs the poll), an org chart, and issue-as-conversation threading remain.
+  streams, so lines appear before the run finalizes — SHIPPED THIS ROUND, see §25); the Work run detail now
+  also shows a **Cancel run** button for a running run that requests mid-run cancellation and surfaces the
+  honest result inline (SHIPPED THIS ROUND, see §26); a true SSE/WebSocket push (vs the poll), an org chart,
+  and issue-as-conversation threading remain.
 
 ### Priority & slices
 
@@ -525,6 +539,9 @@ safe (adds no authority), bounded, feasible in one commit, and reuses existing v
   Logs/Tail section with stdout/stderr/system entries, honest truncation/redaction markers, an empty
   "No logs"/"No logs yet" state, and a Refresh/poll that now surfaces LIVE lines for an in-flight parallel
   run before it finalizes. A true SSE/WebSocket push (vs the poll) pairs with §8. *(frontend, backend, tests.)*
+- **P2 — Cancel run button (SHIPPED in §26).** A Cancel control on a running run's detail that POSTs the cancel
+  route and shows the honest outcome inline (requested / already cancelling / not a cancellable in-flight run),
+  never a silent no-op. *(frontend, backend, tests.)*
 - **P2 — crew org-chart view** once `reports_to` (§3) lands. *(frontend.)*
 
 ---
@@ -1525,6 +1542,79 @@ section for the full reference read + applied-change record. In brief:
 - **Still missing (honest).** Live tailing on the synchronous lock-holding driver, a true SSE/WebSocket push
   (the live tail is still POLLED on the 1.5s cadence), mid-run cancellation, a per-run live byte/retention
   budget beyond the line cap, and cross-run log search all remain open.
+
+---
+
+## 26. Implemented this round — first safe mid-run cancellation for process-backed runs (§8/§10 P2)
+
+- **Reference read (BINDING).** OpenClaw (vendored) `reference/openclaw-main/src/process/exec.ts` threads an
+  `AbortSignal` into the child spawn and kills the process when it fires (the `AbortSignal`-style cancel the
+  audit names). Paperclip (vendored) `references/paperclip/server/src/adapters/process/execute.ts`
+  `runChildProcess` kills the child on `timeoutSec`/`graceSec` — confirming "kill the owned child handle when an
+  external signal says stop." Relux already had that exact kill path: [`crate::adapter`]'s poll loop kills the
+  child on a wall-clock timeout. This slice fires the SAME kill from an operator cancel flag instead of (only)
+  the deadline. Relux files read/mapped: `crates/relux-kernel/src/{adapter.rs,state.rs,server.rs,live_run_log.rs,lib.rs}`,
+  `crates/relux-core/src/{run.rs,run_failure.rs}`, `apps/dashboard/src/{api.ts,runview.ts,pages/Work.tsx}`.
+
+- **Model (lock-independent, bounded, honest).** New `crates/relux-kernel/src/run_cancel.rs` —
+  `RunCancellations` (an `Arc<Mutex<HashMap<run_id, Arc<CancelState>>>>` registry INDEPENDENT of the kernel
+  store lock, mirroring `LiveRunLogs`), `CancelToken` (the spawn's cloneable poll/pid handle), `CancelState`
+  (an `AtomicBool cancelled` + an `AtomicU32 pid`), and a `CancelOutcome` (`Requested` / `AlreadyRequested` /
+  `NotRunning`). `request` uses an atomic `swap` so the idempotency check is race-free; the registry is bounded
+  by a `MAX_LIVE_CANCELS` backstop (oldest evicted). Fully unit-tested in `run_cancel.rs`.
+
+- **Adapter seam (strictly additive).** `relux_kernel::run_adapter_command_streaming_cancellable(spec, sink, cancel)`
+  is the new entry point; `run_adapter_command_streaming(spec, sink)` and `run_adapter_command(spec)` delegate
+  with `cancel: None`, so every existing path is byte-for-byte unchanged. After the spawn the child pid is
+  recorded on the token; the existing 40ms `try_wait` poll loop now checks `cancel.is_cancelled()` on the SAME
+  tick as the deadline, and on a request it appends a `system` cancellation line to the live sink, kills the
+  child via `kill_child_tree` (best-effort `taskkill /PID <pid> /T /F` on Windows for the shim→node→… tree, then
+  the owned `child.kill()` as the guaranteed fallback; the immediate child on unix), and returns an
+  `AdapterRunOutcome { cancelled: true, success: false, .. }`.
+
+- **State / finalize (Cancelled, not Failed).** `finalize_cli_run` detects `outcome.cancelled` BEFORE the
+  generic failure branch and routes to `cancel_cli_run` → `cancel_run`, which marks the run terminal
+  `RunStatus::Cancelled` with `failure_class = RunFailureClass::Cancelled` and `retry = None` (a cancel is
+  intentional + never auto-retried), pushes a `run_cancelled` transcript event, audits `run:cancel`, and marks
+  the task Failed (so it is not stuck Running). The recovery projections key on `RunStatus::Failed`, so a
+  Cancelled run is correctly excluded from both `transient_retry_ready` and `runs_needing_operator_action`. The
+  durable run-log capture renders an honest "cancelled by operator" outcome line.
+
+- **Driver wiring.** `run_briefs_in_parallel_streaming(prepared, live, cancels)` opens a `CancelToken` per brief
+  (alongside the live-log sink) before its process starts and runs it via `PreparedBrief::run_with_sink_cancellable`,
+  with the kernel lock RELEASED (the existing off-lock window). The server `run_parallel_round` drops both the
+  live buffer and the cancel token (`live.finish` + `run_cancellations.finish`) after the round finalizes, so a
+  later cancel honestly reports `NotRunning` and both registries stay bounded.
+
+- **API (session-gated, honest).** `POST /v1/relux/runs/:id/cancel` (`server.rs` `cancel_run`) validates the run
+  exists under the lock (400 for an unknown id), then sets the cancel flag WITHOUT the kernel lock and returns
+  `{ run_id, status, cancelling, message }`. Only an off-lock streaming run is cancellable; any other run —
+  finished, never started, or the synchronous lock-holding path — returns `not_running` with `cancelling: false`
+  and a clear message (a 200, never a fabricated cancel). A repeat for an already-cancelling run is idempotent.
+
+- **UI.** `apps/dashboard/src/api.ts` `reluxWork.cancelRun` + `ReluxCancelRunResponse`; `runview.ts`
+  `canCancelRun` (offered for a `running` run, backend is the authority); the Work Run Detail adds a **Cancel run**
+  button next to Retry/Resume that POSTs the cancel, surfaces the honest result message inline (never a silent
+  no-op), and reloads the run + logs so the Cancelled status and the cancellation system log line appear as the
+  spawn finalizes. The committed dashboard bundle was rebuilt.
+
+- **Tests.** `run_cancel.rs`: request sets the flag, idempotent repeat, unknown/finished → not-running, finish
+  drops the token, pid round-trip, the bounded backstop, wire strings. `adapter.rs`: a real long-running fake
+  process is killed mid-flight and marked `cancelled` (returns well under its 120s timeout, DONE never prints,
+  the cancellation system line is on the live tail), and a never-requested token runs to completion. `state.rs`:
+  `cancel_run` marks the run Cancelled + Cancelled-class + no retry + `run_cancelled` event + audited + excluded
+  from the recovery projections; `capture_cli_run_log` renders the cancelled outcome line. `server.rs`: the cancel
+  route reports requested → already_requested → not_running (after finish) and a 400 for an unknown run. Frontend:
+  `runview.test.ts` pins `canCancelRun`, `reluxrunlog.test.ts` pins the `cancelRun` POST request shape. Full
+  `relux-core` (178) + `relux-kernel` lib (682) + bin/server (117) suites green; clippy clean on both crates;
+  dashboard typecheck + tests (332) + bundle rebuild green.
+
+- **Still missing (honest).** Mid-run cancellation on the SYNCHRONOUS in-kernel driver (it holds the kernel lock
+  across its spawn, so no cancel can interleave there by construction — it honestly reports not-cancellable), a
+  configurable grace period before the hard kill (the kill is immediate), a unix process-group tree kill (only
+  the immediate child is killed on unix; Windows kills the tree via `taskkill`), and an automatic
+  cancel-on-orchestration-job-cancel (the existing job cancel still stops only BETWEEN rounds; this run-level
+  cancel is the per-run kill) all remain open.
 
 ---
 

@@ -20,6 +20,7 @@ import {
   formatRunDuration,
   canRetryRun,
   canResumeRun,
+  canCancelRun,
   runSession,
   sessionHandoffLabel,
   runMetricsLine,
@@ -455,11 +456,16 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
   const [retrying, setRetrying] = useState(false);
   const [resuming, setResuming] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  // The honest one-line result of the last cancel request (e.g. "requested" or
+  // "not a cancellable in-flight process run"), shown inline so the button is
+  // never a silent no-op. Cleared when the panel switches runs.
+  const [cancelNote, setCancelNote] = useState<string | null>(null);
   // Copy-link state: the shareable absolute `/work?run=` URL is the same one a
   // deep link restores, so an operator can hand a run to a teammate. Reset when
   // the panel switches runs so a stale "copied" note never sticks.
   const [shareNote, setShareNote] = useState<string | null>(null);
-  useEffect(() => { setShareNote(null); }, [runId]);
+  useEffect(() => { setShareNote(null); setCancelNote(null); }, [runId]);
 
   async function copyLink() {
     const url = workRunShareUrl(runId, window.location.origin);
@@ -634,6 +640,27 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
     }
   }
 
+  // Request mid-run cancellation of an in-flight, process-backed run
+  // (HERMES_OPENCLAW_DEEP_AUDIT §8/§26). The backend is the honest authority: a run
+  // that is not a cancellable off-lock process run returns `not_running` and we show
+  // that message inline rather than implying a stop that never happened. On a real
+  // request we reload the run + logs so the Cancelled status and the cancellation
+  // system log line surface as the spawn finalizes.
+  async function cancel() {
+    setCancelling(true);
+    setCancelNote(null);
+    try {
+      const res = await reluxWork.cancelRun(runId);
+      setCancelNote(res.message);
+      reloadRun();
+      void refreshLogs();
+    } catch (e) {
+      setCancelNote(e instanceof Error ? e.message : "Cancel failed");
+    } finally {
+      setCancelling(false);
+    }
+  }
+
   const error = errorRun;
   const duration = run ? formatRunDuration(run.duration_ms) : null;
   const metrics = run ? runMetricsLine(run) : null;
@@ -781,9 +808,22 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
               {resuming ? "Resuming…" : "Resume session"}
             </button>
           )}
+          {run && canCancelRun(run) && (
+            <button
+              className="btn ghost sm"
+              title="Cancel this in-flight run: kills the adapter process mid-flight (only an off-lock parallel run is cancellable; the result tells you honestly)."
+              onClick={() => void cancel()}
+              disabled={cancelling}
+            >
+              {cancelling ? "Cancelling…" : "Cancel run"}
+            </button>
+          )}
           <button className="btn ghost sm" onClick={onClose}>Close</button>
         </div>
       </div>
+      {cancelNote && (
+        <div className="muted" style={{ fontSize: 11, marginBottom: 8 }}>{cancelNote}</div>
+      )}
       {shareNote && (
         <div className="muted mono" style={{ fontSize: 11, marginBottom: 8, wordBreak: "break-all" }}>{shareNote}</div>
       )}
