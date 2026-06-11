@@ -39,7 +39,9 @@
 use std::path::Path;
 use std::time::Duration;
 
-use relux_core::{PrimeDisposition, PrimeIntent, PrimeTurn};
+use relux_core::{
+    PrimeDisposition, PrimeIntent, PrimePolishedStep, PrimeProposal, PrimeProposalPolish, PrimeTurn,
+};
 use serde::{Deserialize, Serialize};
 
 /// OpenRouter's OpenAI-compatible chat-completions endpoint.
@@ -62,6 +64,19 @@ const MAX_TOKENS: u32 = 500;
 /// Hard cap on the characters we accept back, so a runaway response can't bloat
 /// the API payload regardless of what the provider returns.
 const MAX_REPLY_CHARS: usize = 4_000;
+
+// Bounds on a proposal-polish overlay. Presentation strings only, so these are
+// generous-but-finite: a runaway model reply can never balloon the card.
+/// Max characters kept for a polished one-line summary.
+const MAX_POLISH_SUMMARY_CHARS: usize = 240;
+/// Max characters kept for a single polished step title.
+const MAX_POLISH_TITLE_CHARS: usize = 160;
+/// Max characters kept for a single clarifying question / risk note.
+const MAX_POLISH_NOTE_CHARS: usize = 240;
+/// Max clarifying questions kept on the overlay.
+const MAX_POLISH_QUESTIONS: usize = 4;
+/// Max advisory risk notes kept on the overlay.
+const MAX_POLISH_RISKS: usize = 4;
 
 // --- Configuration ---------------------------------------------------------
 
@@ -612,6 +627,244 @@ fn outcome_for_augment(
     }
 }
 
+// --- Proposal polish (advisory, presentation-only) -------------------------
+//
+// The next rung of "LLM shapes text only": when the OpenRouter brain is enabled,
+// it may also refine the WORDING of a plan-preview card — a clearer summary,
+// per-step titles, clarifying questions, advisory risk notes. It has NO action
+// authority: every authoritative field (step count, order, agent grounding,
+// `multi_step`, and `goal`, which the commit re-wraps as `orchestrate <goal>`)
+// comes only from the deterministic planner. A model suggestion is VALIDATED
+// against the authoritative proposal before it is attached; anything that does not
+// line up exactly is dropped and the deterministic preview stands. Nothing in the
+// commit path ever reads the overlay (§10 planning layer, §11.1, §17.1).
+
+/// What to do with a proposal before any network call. Pure and testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolishPlan {
+    /// Leave the deterministic proposal as-is (brain off / not OpenRouter / the
+    /// proposal is single-step, so there is nothing to refine).
+    Skip,
+    /// OpenRouter is live and the proposal is a genuine multi-step plan: ask the
+    /// model for a presentation overlay.
+    Augment,
+}
+
+/// Decide whether to polish a proposal, given the config. Pure: no env, no
+/// network. Restricted to the OpenRouter brain (the clean JSON-returning path);
+/// the CLI brains keep the deterministic preview. Single-step proposals carry
+/// nothing to refine and always skip.
+pub fn plan_polish(cfg: &AiConfig, proposal: &PrimeProposal) -> PolishPlan {
+    if !proposal.multi_step || proposal.steps.is_empty() {
+        return PolishPlan::Skip;
+    }
+    match cfg.effective_brain() {
+        PrimeBrain::Openrouter if cfg.enabled() => PolishPlan::Augment,
+        _ => PolishPlan::Skip,
+    }
+}
+
+/// The raw, untrusted polish a model returns. Every field is optional/defaulted so
+/// a partial or malformed-but-parseable reply never panics; validation against the
+/// authoritative proposal happens in [`validate_polish`].
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PolishSuggestion {
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    steps: Vec<PolishStepIn>,
+    #[serde(default)]
+    questions: Vec<String>,
+    #[serde(default)]
+    risks: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PolishStepIn {
+    /// 1-based index of the authoritative step this title refines. Defaults to 0
+    /// when the model omits it, which matches no real step (steps are 1-based), so
+    /// an unindexed suggestion is safely rejected rather than mis-applied.
+    #[serde(default)]
+    index: u32,
+    #[serde(default)]
+    title: String,
+}
+
+/// Validate a model suggestion against the AUTHORITATIVE proposal and distill the
+/// advisory overlay. Pure: the proposal's steps/agents/goal are never mutated.
+///
+/// The invariant lives here: `step_titles` is accepted ONLY when the suggestion's
+/// step indexes match the authoritative steps exactly — same count, same set, no
+/// duplicates, no extras. Any mismatch (the model merged, split, reordered, added,
+/// or renamed steps) drops the titles entirely and the deterministic titles stand.
+/// When accepted, titles are emitted keyed to authoritative indexes in
+/// authoritative order, so even a reordered model array yields a canonical overlay.
+/// `questions`/`risks` are pure additive advisory text (trimmed, bounded). Returns
+/// `None` when nothing usable survives validation.
+fn validate_polish(proposal: &PrimeProposal, raw: PolishSuggestion) -> Option<PrimeProposalPolish> {
+    let summary = clean_polish_text(raw.summary.as_deref().unwrap_or(""), MAX_POLISH_SUMMARY_CHARS);
+
+    // Authoritative indexes, in order. The overlay can only ever speak about these.
+    let authoritative: Vec<u32> = proposal.steps.iter().map(|s| s.index).collect();
+
+    // Map the suggestion's titles by index, rejecting duplicates outright.
+    let mut by_index: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+    let mut duplicate = false;
+    for s in &raw.steps {
+        if by_index.insert(s.index, s.title.clone()).is_some() {
+            duplicate = true;
+        }
+    }
+    // Exact 1:1 correspondence with the authoritative steps, or no titles at all.
+    let indexes_match = !duplicate
+        && by_index.len() == authoritative.len()
+        && authoritative.iter().all(|i| by_index.contains_key(i));
+    let step_titles: Vec<PrimePolishedStep> = if indexes_match {
+        authoritative
+            .iter()
+            .filter_map(|i| {
+                let title = clean_polish_text(by_index.get(i).map(String::as_str).unwrap_or(""), MAX_POLISH_TITLE_CHARS);
+                title.map(|title| PrimePolishedStep { index: *i, title })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let questions = clean_polish_notes(&raw.questions, MAX_POLISH_QUESTIONS);
+    let risks = clean_polish_notes(&raw.risks, MAX_POLISH_RISKS);
+
+    if summary.is_none() && step_titles.is_empty() && questions.is_empty() && risks.is_empty() {
+        return None;
+    }
+    Some(PrimeProposalPolish {
+        summary,
+        step_titles,
+        questions,
+        risks,
+        model: None,
+    })
+}
+
+/// Trim, drop-if-empty, and truncate one presentation string.
+fn clean_polish_text(s: &str, max: usize) -> Option<String> {
+    let t = s.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(truncate_chars(t, max))
+    }
+}
+
+/// Trim/drop-empty/truncate a list of advisory notes and cap the count.
+fn clean_polish_notes(notes: &[String], max_count: usize) -> Vec<String> {
+    notes
+        .iter()
+        .filter_map(|n| clean_polish_text(n, MAX_POLISH_NOTE_CHARS))
+        .take(max_count)
+        .collect()
+}
+
+/// Combine an LLM polish result with the authoritative proposal into a final
+/// overlay. Pure, so both the success and failure (no overlay) paths are testable
+/// without a network. A failed call, or a suggestion that fails validation, yields
+/// `None` — the caller then leaves the deterministic proposal unpolished.
+fn finalize_polish(
+    cfg: &AiConfig,
+    proposal: &PrimeProposal,
+    result: Result<PolishSuggestion, String>,
+) -> Option<PrimeProposalPolish> {
+    let suggestion = result.ok()?;
+    let mut polish = validate_polish(proposal, suggestion)?;
+    polish.model = Some(cfg.model.clone());
+    Some(polish)
+}
+
+/// Produce an advisory presentation overlay for a plan proposal, or `None`.
+///
+/// This NEVER mutates kernel state and NEVER changes what the plan does: it reads
+/// the authoritative proposal as grounding, asks the model for better wording, and
+/// returns a validated overlay (or `None` on skip/error/invalid). The caller
+/// attaches it to `proposal.polish`; the commit path is unaffected.
+pub async fn polish_proposal(
+    cfg: &AiConfig,
+    proposal: &PrimeProposal,
+) -> Option<PrimeProposalPolish> {
+    match plan_polish(cfg, proposal) {
+        PolishPlan::Skip => None,
+        PolishPlan::Augment => {
+            let messages = build_polish_messages(proposal);
+            let result = request_completion(cfg, messages)
+                .await
+                .and_then(|text| parse_polish_json(&text));
+            finalize_polish(cfg, proposal, result)
+        }
+    }
+}
+
+/// Pull a `PolishSuggestion` out of a model reply. Tolerant of surrounding prose:
+/// it lifts the first balanced-looking JSON object and parses that. Returns
+/// `Err(reason)` (secret-free) when no usable JSON object is present.
+fn parse_polish_json(text: &str) -> Result<PolishSuggestion, String> {
+    let start = text.find('{').ok_or_else(|| "no json object".to_string())?;
+    let end = text.rfind('}').ok_or_else(|| "no json object".to_string())?;
+    if end <= start {
+        return Err("no json object".to_string());
+    }
+    serde_json::from_str::<PolishSuggestion>(&text[start..=end])
+        .map_err(|_| "invalid polish json".to_string())
+}
+
+/// Build the strict-JSON polish prompt. The system message forbids any structural
+/// change and any action claim; the user message supplies the authoritative steps
+/// (by index) the model must mirror exactly, and pins the output schema.
+fn build_polish_messages(proposal: &PrimeProposal) -> Vec<ChatMessage> {
+    const SYSTEM: &str = "You are Prime, refining the WORDING of an already-decided plan preview \
+for a local Relux control plane. You have NO authority to change the plan. You MUST NOT add, \
+remove, reorder, merge, or split steps; you MUST keep exactly one entry per given step, keyed by \
+its index; you MUST NOT change which agent a step is assigned to; and you MUST NOT claim any work \
+was created or run (a preview commits nothing). Improve only the wording: a clearer one-line \
+summary, clearer step titles, a few clarifying questions, and advisory risk notes. Reply with a \
+SINGLE JSON object and nothing else, using this schema: \
+{\"summary\": string, \"steps\": [{\"index\": number, \"title\": string}], \"questions\": [string], \
+\"risks\": [string]}. Use plain ASCII.";
+
+    let steps_json: Vec<serde_json::Value> = proposal
+        .steps
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "index": s.index,
+                "title": s.title,
+                "role": s.role,
+                "agent": s.agent,
+            })
+        })
+        .collect();
+    let grounding = serde_json::json!({
+        "goal": proposal.goal,
+        "steps": steps_json,
+    });
+
+    let user = format!(
+        "Here is the authoritative plan preview to refine. Mirror its steps EXACTLY (same indexes, \
+same count, same order, same agents); only improve the wording. Authoritative plan:\n{}\n\nReturn \
+the JSON object described above.",
+        serde_json::to_string_pretty(&grounding).unwrap_or_else(|_| "{}".to_string())
+    );
+
+    vec![
+        ChatMessage {
+            role: "system",
+            content: SYSTEM.to_string(),
+        },
+        ChatMessage {
+            role: "user",
+            content: user,
+        },
+    ]
+}
+
 // --- Prompt construction ---------------------------------------------------
 
 /// Build the chat messages. The system prompt pins Prime's identity and the hard
@@ -1066,5 +1319,218 @@ mod tests {
         assert!(p.contains("hey"));
         assert!(p.contains("There is 1 active run."));
         assert!(p.contains("did NOT perform any action"));
+    }
+
+    // --- Proposal polish (advisory, presentation-only) ---------------------
+
+    fn step(index: u32, title: &str, role: &str, agent: &str) -> relux_core::PrimeProposalStep {
+        relux_core::PrimeProposalStep {
+            index,
+            title: title.to_string(),
+            role: role.to_string(),
+            agent: agent.to_string(),
+        }
+    }
+
+    fn multi_proposal() -> PrimeProposal {
+        PrimeProposal {
+            goal: "ship the beta".to_string(),
+            multi_step: true,
+            steps: vec![
+                step(1, "research the options", "research", "research-agent"),
+                step(2, "build a prototype", "implementation", "prime"),
+            ],
+            agents: vec!["research-agent".to_string(), "prime".to_string()],
+            polish: None,
+        }
+    }
+
+    fn polish_step(index: u32, title: &str) -> PolishStepIn {
+        PolishStepIn {
+            index,
+            title: title.to_string(),
+        }
+    }
+
+    #[test]
+    fn plan_polish_skips_unless_openrouter_live_and_multi_step() {
+        let p = multi_proposal();
+        // No key -> Skip even for a multi-step plan.
+        let no_key = AiConfig::from_parts(None, None, false, None);
+        assert_eq!(plan_polish(&no_key, &p), PolishPlan::Skip);
+        // OpenRouter live + multi-step -> Augment.
+        let live = AiConfig::from_parts(Some("k".into()), None, false, None);
+        assert_eq!(plan_polish(&live, &p), PolishPlan::Augment);
+        // A CLI brain keeps the deterministic preview (no structured polish).
+        let cli = live.clone().with_brain(Some(PrimeBrain::ClaudeCli));
+        assert_eq!(plan_polish(&cli, &p), PolishPlan::Skip);
+        // A single-step proposal carries nothing to refine -> Skip even when live.
+        let single = PrimeProposal {
+            multi_step: false,
+            steps: vec![],
+            agents: vec![],
+            ..multi_proposal()
+        };
+        assert_eq!(plan_polish(&live, &single), PolishPlan::Skip);
+    }
+
+    #[test]
+    fn validate_polish_applies_titles_only_on_exact_index_match() {
+        let p = multi_proposal();
+        // Exact 1:1 by index -> titles applied, keyed to authoritative indexes.
+        let ok = PolishSuggestion {
+            summary: Some("A clear two-stage path to a shippable beta.".into()),
+            steps: vec![
+                polish_step(2, "Build a working prototype"),
+                polish_step(1, "Survey the available options"),
+            ],
+            questions: vec![],
+            risks: vec![],
+        };
+        let overlay = validate_polish(&p, ok).expect("a valid suggestion produces an overlay");
+        assert_eq!(overlay.step_titles.len(), 2);
+        // Emitted in AUTHORITATIVE order regardless of the model's array order.
+        assert_eq!(overlay.step_titles[0].index, 1);
+        assert_eq!(overlay.step_titles[0].title, "Survey the available options");
+        assert_eq!(overlay.step_titles[1].index, 2);
+        assert_eq!(overlay.step_titles[1].title, "Build a working prototype");
+        assert!(overlay.summary.is_some());
+    }
+
+    #[test]
+    fn validate_polish_rejects_titles_that_change_count_order_or_agents() {
+        let p = multi_proposal();
+
+        // The model tried to ADD a third step -> all titles dropped (count differs).
+        let extra = PolishSuggestion {
+            steps: vec![
+                polish_step(1, "a"),
+                polish_step(2, "b"),
+                polish_step(3, "c"),
+            ],
+            ..Default::default()
+        };
+        assert!(
+            validate_polish(&p, extra).is_none(),
+            "an added step must drop the whole overlay (no usable advisory left)"
+        );
+
+        // The model dropped a step -> titles dropped (set differs).
+        let fewer = PolishSuggestion {
+            steps: vec![polish_step(1, "only one")],
+            ..Default::default()
+        };
+        assert!(validate_polish(&p, fewer).is_none());
+
+        // The model renamed an index (1,3 instead of 1,2) -> titles dropped.
+        let renamed = PolishSuggestion {
+            steps: vec![polish_step(1, "a"), polish_step(3, "b")],
+            ..Default::default()
+        };
+        assert!(validate_polish(&p, renamed).is_none());
+
+        // A duplicate index is rejected too.
+        let dup = PolishSuggestion {
+            steps: vec![polish_step(1, "a"), polish_step(1, "b")],
+            ..Default::default()
+        };
+        assert!(validate_polish(&p, dup).is_none());
+
+        // When a mismatch coexists with a valid summary, the summary survives but
+        // the step titles are still dropped: the authoritative titles stand.
+        let mixed = PolishSuggestion {
+            summary: Some("nice plan".into()),
+            steps: vec![polish_step(9, "ghost step")],
+            ..Default::default()
+        };
+        let overlay = validate_polish(&p, mixed).expect("the summary is still usable");
+        assert!(
+            overlay.step_titles.is_empty(),
+            "mismatched step indexes must yield no polished titles"
+        );
+        assert_eq!(overlay.summary.as_deref(), Some("nice plan"));
+
+        // The authoritative proposal is never mutated by validation.
+        assert_eq!(p.steps.len(), 2);
+        assert_eq!(p.steps[0].agent, "research-agent");
+        assert_eq!(p.steps[1].agent, "prime");
+    }
+
+    #[test]
+    fn validate_polish_bounds_questions_and_risks() {
+        let p = multi_proposal();
+        let many = PolishSuggestion {
+            questions: vec![
+                "q1".into(),
+                "  ".into(), // blank dropped
+                "q2".into(),
+                "q3".into(),
+                "q4".into(),
+                "q5".into(), // beyond the cap
+            ],
+            risks: vec!["r1".into(), "r2".into(), "r3".into(), "r4".into(), "r5".into()],
+            ..Default::default()
+        };
+        let overlay = validate_polish(&p, many).expect("questions/risks are usable advisory");
+        assert_eq!(overlay.questions.len(), MAX_POLISH_QUESTIONS);
+        assert_eq!(overlay.risks.len(), MAX_POLISH_RISKS);
+        assert!(overlay.questions.iter().all(|q| !q.trim().is_empty()));
+    }
+
+    #[test]
+    fn validate_polish_returns_none_when_nothing_usable() {
+        let p = multi_proposal();
+        let empty = PolishSuggestion::default();
+        assert!(validate_polish(&p, empty).is_none());
+        // A whitespace-only summary with no other content is also nothing usable.
+        let blank = PolishSuggestion {
+            summary: Some("   ".into()),
+            ..Default::default()
+        };
+        assert!(validate_polish(&p, blank).is_none());
+    }
+
+    #[test]
+    fn finalize_polish_attaches_model_on_success_and_none_on_error() {
+        let cfg = AiConfig::from_parts(Some("k".into()), Some("m/x".into()), false, None);
+        let p = multi_proposal();
+        // An LLM error -> no overlay; the deterministic proposal stays unpolished.
+        let err: Result<PolishSuggestion, String> = Err("timeout".into());
+        assert!(finalize_polish(&cfg, &p, err).is_none());
+        // A valid suggestion -> overlay carries the model id for provenance.
+        let ok = Ok(PolishSuggestion {
+            summary: Some("tidy".into()),
+            ..Default::default()
+        });
+        let overlay = finalize_polish(&cfg, &p, ok).expect("valid suggestion yields an overlay");
+        assert_eq!(overlay.model.as_deref(), Some("m/x"));
+    }
+
+    #[tokio::test]
+    async fn polish_proposal_skips_with_no_network_when_brain_is_not_live() {
+        // No key configured: the public entry point returns None without any HTTP
+        // call, so the deterministic preview is returned unchanged (LLM unavailable
+        // -> fallback). Single-step proposals skip the same way.
+        let off = AiConfig::from_parts(None, None, false, None);
+        assert!(polish_proposal(&off, &multi_proposal()).await.is_none());
+
+        let live = AiConfig::from_parts(Some("k".into()), None, false, None);
+        let single = PrimeProposal {
+            multi_step: false,
+            steps: vec![],
+            agents: vec![],
+            ..multi_proposal()
+        };
+        assert!(polish_proposal(&live, &single).await.is_none());
+    }
+
+    #[test]
+    fn parse_polish_json_lifts_object_from_surrounding_prose() {
+        let text = "Sure! Here is the JSON:\n{\"summary\":\"hi\",\"questions\":[\"q\"]}\nHope it helps.";
+        let parsed = parse_polish_json(text).expect("a JSON object is present");
+        assert_eq!(parsed.summary.as_deref(), Some("hi"));
+        assert_eq!(parsed.questions, vec!["q".to_string()]);
+        // No object at all -> a stable, secret-free error (caller falls back).
+        assert!(parse_polish_json("no json here").is_err());
     }
 }

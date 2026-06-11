@@ -1386,17 +1386,42 @@ export interface ReluxPrimeProposalStep {
   agent: string;
 }
 
+// One polished step title (§10 planning layer, §17.1). `index` keys it to an
+// existing authoritative step; `title` is presentation-only wording the LLM brain
+// suggested. The kernel only ever emits an index that matches a real step.
+export interface ReluxPrimePolishedStep {
+  index: number;
+  title: string;
+}
+
+// An advisory, PRESENTATION-ONLY overlay the optional LLM brain may attach to a
+// plan preview (§10 planning layer, §11.1, §17.1). It refines WORDING only — it
+// never changes the number of steps, their order, the agent each lands on, or the
+// goal (which the commit re-wraps as `orchestrate <goal>`). The kernel validates
+// it against the authoritative proposal before attaching, so polished titles align
+// 1:1 with the real steps or are absent entirely. Render it on top of the
+// authoritative fields; the deterministic values remain the source of truth.
+export interface ReluxPrimeProposalPolish {
+  summary?: string;
+  step_titles?: ReluxPrimePolishedStep[];
+  questions?: string[];
+  risks?: string[];
+  model?: string;
+}
+
 // A reviewable, ACTION-FREE plan preview attached to a PlanRequest turn so the
 // chat can render a card instead of parsing the prose reply (§10 planning layer,
 // §11.1). `multi_step` is true for a genuine split (with `steps`/`agents`); false
 // steers to the one-task path with empty steps. Nothing is committed by showing
 // this — the explicit "Create these tasks" suggestion is the only commit path.
-// Omitted on every non-plan turn.
+// Omitted on every non-plan turn. `polish`, when present, is advisory wording only
+// (see ReluxPrimeProposalPolish) and never alters what the commit creates.
 export interface ReluxPrimeProposal {
   goal: string;
   multi_step: boolean;
   steps: ReluxPrimeProposalStep[];
   agents: string[];
+  polish?: ReluxPrimeProposalPolish;
 }
 
 export interface ReluxPrimeTurn {

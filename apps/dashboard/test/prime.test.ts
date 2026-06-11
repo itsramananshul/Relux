@@ -1,6 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { countNoun, proposalSummary, hasSteps } from "../src/prime.ts";
+import {
+  countNoun,
+  proposalSummary,
+  hasSteps,
+  stepDisplayTitle,
+  proposalDisplaySummary,
+} from "../src/prime.ts";
 import type { ReluxPrimeProposal } from "../src/api.ts";
 
 // The plan proposal card must read HONESTLY: the summary reflects the actual step
@@ -51,4 +57,30 @@ test("hasSteps is true only for a genuine multi-step plan with steps", () => {
   // A proposal flagged multi_step but carrying no steps still renders no table —
   // the card never shows an empty step list.
   assert.equal(hasSteps(proposal({ steps: [] })), false);
+});
+
+// Advisory polish is PRESENTATION ONLY: a polished title/summary overrides what is
+// shown, but the authoritative step/agent/order data is untouched (§10, §17.1).
+test("stepDisplayTitle prefers the polished title only for the matching step index", () => {
+  const p = proposal({
+    polish: { step_titles: [{ index: 2, title: "Build a working prototype" }] },
+  });
+  // Step 1 has no polished title -> the authoritative title shows.
+  assert.equal(stepDisplayTitle(p, p.steps[0]), "research the options");
+  // Step 2 has a polished title -> the refined wording shows.
+  assert.equal(stepDisplayTitle(p, p.steps[1]), "Build a working prototype");
+});
+
+test("stepDisplayTitle falls back to the authoritative title when polish is absent or blank", () => {
+  const plain = proposal();
+  assert.equal(stepDisplayTitle(plain, plain.steps[0]), "research the options");
+  const blank = proposal({ polish: { step_titles: [{ index: 1, title: "   " }] } });
+  assert.equal(stepDisplayTitle(blank, blank.steps[0]), "research the options");
+});
+
+test("proposalDisplaySummary prefers the polished summary, else the deterministic line", () => {
+  const polished = proposal({ polish: { summary: "A clear two-stage path to a beta." } });
+  assert.equal(proposalDisplaySummary(polished), "A clear two-stage path to a beta.");
+  // No polish -> the authoritative count line is shown unchanged.
+  assert.equal(proposalDisplaySummary(proposal()), "2 steps across 2 agents.");
 });

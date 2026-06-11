@@ -336,6 +336,75 @@ pub struct PrimeProposal {
     /// The distinct agents this plan would assign work to, including the `"prime"`
     /// fallback for unmatched roles. Empty for a single-step goal.
     pub agents: Vec<String>,
+    /// An OPTIONAL, advisory presentation overlay produced by the LLM brain when
+    /// it is enabled (see [`PrimeProposalPolish`]). Absent on every unpolished
+    /// turn, so the wire is byte-for-byte unchanged for existing clients. It NEVER
+    /// alters what the plan does: step count, order, agent grounding, the
+    /// `multi_step` flag, and `goal` (which the commit re-wraps as
+    /// `orchestrate <goal>`) all stay exactly as the deterministic planner set
+    /// them. Polish refines wording only and is never read by any action/commit
+    /// path (§10 planning layer, §11.1, §17.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub polish: Option<PrimeProposalPolish>,
+}
+
+/// An advisory, PRESENTATION-ONLY overlay the optional LLM brain may attach to a
+/// plan preview to make it read better (`docs/RELUX_MASTER_PLAN.md` §10 planning
+/// layer, §11.1, §17.1 "Prime must be smart and grounded").
+///
+/// ## The safety contract (binding)
+///
+/// The LLM has ZERO action authority here. This overlay can only refine *wording*
+/// the operator reads — a friendlier one-line summary, clearer per-step titles, a
+/// couple of clarifying questions, and advisory risk notes. It can NEVER:
+///
+/// - change the number of steps, their order, or the agent each lands on,
+/// - change the `goal` (the commit re-wraps it as `orchestrate <goal>`),
+/// - introduce a step or assignee the deterministic planner did not produce, or
+/// - feed back into any action: nothing in the commit path ever reads `polish`.
+///
+/// The kernel VALIDATES a model suggestion against the authoritative
+/// [`PrimeProposal`] before attaching it: `step_titles` is accepted only when its
+/// indexes match the authoritative steps exactly (same count, same set, no
+/// extras); otherwise that part is dropped and the deterministic titles stand.
+/// `questions`/`risks` are pure additive advisory text (trimmed and bounded). If
+/// the model is unavailable or errors, no overlay is attached and the preview is
+/// exactly the deterministic one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrimeProposalPolish {
+    /// A refined one-line summary of the plan (presentation only). The
+    /// deterministic "N steps across M agents" line still stands behind it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Per-step refined titles, each keyed to an authoritative step `index`. Only
+    /// ever populated when the model's indexes matched the authoritative steps
+    /// exactly; the authoritative title remains the source of truth and is shown
+    /// when no polished title is present for a step.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub step_titles: Vec<PrimePolishedStep>,
+    /// Clarifying questions the operator may want to resolve before committing.
+    /// Advisory only — answering them is not required and they commit nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub questions: Vec<String>,
+    /// Advisory risk notes about the plan. Presentation only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub risks: Vec<String>,
+    /// The model id that produced this overlay, for provenance on the card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// One polished step title, keyed to the authoritative step it refines.
+///
+/// `index` is the 1-based position of an existing [`PrimeProposalStep`]; the
+/// kernel only ever emits this with an `index` that matches a real step, so it can
+/// never name a step the planner did not produce.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrimePolishedStep {
+    /// The authoritative step this title refines (1-based, matches a real step).
+    pub index: u32,
+    /// The refined, presentation-only title.
+    pub title: String,
 }
 
 /// The full result of Prime handling one user message.
@@ -517,6 +586,7 @@ mod tests {
                 },
             ],
             agents: vec!["research-agent".to_string(), "prime".to_string()],
+            polish: None,
         };
         let json = serde_json::to_string(&proposal).unwrap();
         // No action verbs leak into a preview - it is informational only.
@@ -533,11 +603,57 @@ mod tests {
             multi_step: false,
             steps: vec![],
             agents: vec![],
+            polish: None,
         };
         let back: PrimeProposal =
             serde_json::from_str(&serde_json::to_string(&single).unwrap()).unwrap();
         assert_eq!(back, single);
         assert!(back.steps.is_empty());
+    }
+
+    #[test]
+    fn proposal_polish_is_advisory_and_omitted_when_absent() {
+        // The unpolished wire is byte-for-byte unchanged: no `polish` key appears.
+        let proposal = PrimeProposal {
+            goal: "ship the beta".to_string(),
+            multi_step: true,
+            steps: vec![PrimeProposalStep {
+                index: 1,
+                title: "research the options".to_string(),
+                role: "research".to_string(),
+                agent: "research-agent".to_string(),
+            }],
+            agents: vec!["research-agent".to_string()],
+            polish: None,
+        };
+        let json = serde_json::to_string(&proposal).unwrap();
+        assert!(
+            !json.contains("polish"),
+            "an unpolished proposal must not carry a polish key: {json}"
+        );
+
+        // A polished proposal round-trips and still carries the AUTHORITATIVE
+        // steps untouched; the overlay only adds presentation strings.
+        let polished = PrimeProposal {
+            polish: Some(PrimeProposalPolish {
+                summary: Some("A clear three-stage path to a shippable beta.".to_string()),
+                step_titles: vec![PrimePolishedStep {
+                    index: 1,
+                    title: "Survey the available options".to_string(),
+                }],
+                questions: vec!["Which platform are we targeting first?".to_string()],
+                risks: vec!["Scope may grow past the beta cutoff.".to_string()],
+                model: Some("openai/gpt-4o-mini".to_string()),
+            }),
+            ..proposal.clone()
+        };
+        let back: PrimeProposal =
+            serde_json::from_str(&serde_json::to_string(&polished).unwrap()).unwrap();
+        assert_eq!(back, polished);
+        // The overlay never mutates the authoritative steps/agents/goal.
+        assert_eq!(back.steps, proposal.steps);
+        assert_eq!(back.agents, proposal.agents);
+        assert_eq!(back.goal, proposal.goal);
     }
 
     #[test]

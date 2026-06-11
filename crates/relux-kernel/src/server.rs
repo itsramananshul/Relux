@@ -1649,6 +1649,20 @@ async fn run_prime(
     let mut final_turn = turn;
     final_turn.reply = outcome.reply;
 
+    // 4. OPTIONAL advisory polish of a plan-preview card. When the OpenRouter brain
+    // is enabled, let the model refine only the WORDING of the proposal (summary,
+    // step titles, clarifying questions, risk notes). This is presentation-only and
+    // happens OUTSIDE the lock: the authoritative steps/agents/goal — and therefore
+    // the "Create these tasks" commit — are never changed by it, and a skip/error
+    // simply leaves the deterministic preview in place (§10 planning layer, §17.1).
+    if let Some(proposal) = final_turn.proposal.clone() {
+        if let Some(polish) = relux_kernel::polish_proposal(&ai_config, &proposal).await {
+            if let Some(p) = final_turn.proposal.as_mut() {
+                p.polish = Some(polish);
+            }
+        }
+    }
+
     Ok(Json(PrimeResponse {
         turn: final_turn,
         state: summary,

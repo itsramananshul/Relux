@@ -5511,6 +5511,11 @@ fn attach_suggestions(
             multi_step: multi,
             steps,
             agents,
+            // The deterministic proposal carries NO polish. When the OpenRouter
+            // brain is enabled, the server layers an advisory presentation overlay
+            // on top OUTSIDE the lock (see `polish_proposal`); it never changes the
+            // authoritative steps/agents/goal built here (§10 planning layer, §17.1).
+            polish: None,
         });
     }
 }

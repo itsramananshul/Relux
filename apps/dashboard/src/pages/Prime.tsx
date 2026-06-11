@@ -8,7 +8,7 @@ import {
   type ReluxPrimeSuggestion,
   type ReluxPrimeTurn,
 } from "../api";
-import { proposalSummary, hasSteps } from "../prime";
+import { hasSteps, proposalDisplaySummary, stepDisplayTitle } from "../prime";
 import { workTaskHref, workRunHref } from "../routing";
 import { PrimeAutonomyPanel } from "../components/PrimeAutonomyPanel";
 import { OrchestrationPanel } from "../components/OrchestrationPanel";
@@ -415,12 +415,25 @@ function ProposalCard({ proposal }: { proposal: ReluxPrimeProposal }) {
         <span className="badge todo" style={{ fontSize: 9 }} title="A reviewable plan — nothing is created yet">
           plan preview
         </span>
+        {proposal.polish && (
+          <span
+            className="badge backlog"
+            style={{ fontSize: 9 }}
+            title={
+              proposal.polish.model
+                ? `Wording refined by ${proposal.polish.model}. The steps, order, and assignees are unchanged.`
+                : "Wording refined by the AI brain. The steps, order, and assignees are unchanged."
+            }
+          >
+            AI-refined wording
+          </span>
+        )}
         <span className="mono" style={{ fontSize: 13, fontWeight: 600 }}>
           {proposal.goal}
         </span>
       </div>
       <div className="muted" style={{ fontSize: 11, marginBottom: hasSteps(proposal) ? 8 : 0 }}>
-        {proposalSummary(proposal)}
+        {proposalDisplaySummary(proposal)}
       </div>
       {hasSteps(proposal) && (
         <ol style={{ margin: 0, paddingLeft: 0, listStyle: "none" }}>
@@ -439,7 +452,7 @@ function ProposalCard({ proposal }: { proposal: ReluxPrimeProposal }) {
               <span className="mono muted" style={{ fontSize: 11, minWidth: 16 }}>
                 {s.index}.
               </span>
-              <span style={{ flex: 1, minWidth: 160 }}>{s.title}</span>
+              <span style={{ flex: 1, minWidth: 160 }}>{stepDisplayTitle(proposal, s)}</span>
               <span className="badge backlog" style={{ fontSize: 9 }} title="Specialist role this step needs">
                 {s.role}
               </span>
@@ -450,11 +463,39 @@ function ProposalCard({ proposal }: { proposal: ReluxPrimeProposal }) {
           ))}
         </ol>
       )}
+      {/* Advisory, presentation-only notes the AI brain may attach (§17.1). These
+          are wording aids for the operator — answering a question or noting a risk
+          commits nothing and changes no step. */}
+      {proposal.polish?.questions && proposal.polish.questions.length > 0 && (
+        <PolishNotes label="Worth clarifying first" items={proposal.polish.questions} />
+      )}
+      {proposal.polish?.risks && proposal.polish.risks.length > 0 && (
+        <PolishNotes label="Risks to keep in mind" items={proposal.polish.risks} />
+      )}
       {/* The honest contract: a preview commits nothing. The "Create these tasks"
           (or one-task) button below is the only path that materializes work. */}
       <div className="muted" style={{ fontSize: 10, marginTop: 8, fontStyle: "italic" }}>
         Nothing is created yet — use the button below to commit this plan.
       </div>
+    </div>
+  );
+}
+
+// A compact list of advisory polish notes (clarifying questions / risks). Purely
+// presentational: it renders the AI brain's wording and commits nothing (§17.1).
+function PolishNotes({ label, items }: { label: string; items: string[] }) {
+  return (
+    <div style={{ marginTop: 8, borderTop: "1px solid var(--border)", paddingTop: 8 }}>
+      <div className="muted" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: 0.4, marginBottom: 4 }}>
+        {label}
+      </div>
+      <ul style={{ margin: 0, paddingLeft: 16, fontSize: 12 }}>
+        {items.map((it, i) => (
+          <li key={i} style={{ marginBottom: 2 }}>
+            {it}
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }

@@ -188,11 +188,60 @@ guard: a non-plan turn omits `proposal`), `plan_request_attaches_a_structured_
 action_free_proposal` and `plan_request_single_step_proposal_steers_to_one_task`
 (kernel), and `apps/dashboard/test/prime.test.ts` (card helpers).
 
+## Applied change (advisory LLM polish of the plan proposal — presentation only)
+
+The structured card above is built entirely by the deterministic planner. When the
+optional **OpenRouter** brain is enabled, it may now also refine the *wording* of
+that card — a clearer summary, per-step titles, clarifying questions, advisory risk
+notes — while the deterministic `plan_orchestration` stays the sole authority on
+**step count, order, agent grounding, the `multi_step` flag, the `goal`, and the
+commit action**. This mirrors the bridge/coordinator's "model drafts, server
+validates" seam (`product-spine-implementation.md` → AI Prime Planner) but applied
+to the relux-kernel `PrimeTurn.proposal` surface, and keeps the action-free wall
+intact: the LLM gets ZERO action authority.
+
+- **New `PrimeProposalPolish` / `PrimePolishedStep`** (`relux-core`) and an optional
+  `PrimeProposal.polish` field (`skip_serializing_if = "Option::is_none"`, so the
+  unpolished wire is byte-for-byte unchanged). The overlay carries only presentation
+  strings: `summary`, `step_titles` (each keyed to a real step `index`),
+  `questions`, `risks`, and the `model` for provenance. It is never read by any
+  action/commit path.
+- **`polish_proposal` + the pure `plan_polish` / `validate_polish` / `finalize_polish`**
+  (`relux-kernel/src/ai.rs`). The brain is asked for a strict-JSON overlay, then the
+  kernel **validates it against the authoritative proposal**: `step_titles` is
+  accepted ONLY when the model's indexes match the real steps exactly (same count,
+  same set, no duplicates, no extras) — any merge/split/reorder/add/rename drops the
+  titles entirely and the deterministic titles stand; `questions`/`risks` are trimmed
+  and count/length-bounded; a failed or unusable call attaches nothing. Restricted to
+  the OpenRouter brain (the clean JSON path); CLI brains keep the deterministic card.
+- **Wired in `run_prime`** (`relux-kernel/src/server.rs`) OUTSIDE the lock, after the
+  reply is shaped — so the slow model call never holds the kernel lock, and a
+  skip/error simply leaves the deterministic preview in place.
+- **Dashboard** (`apps/dashboard`) — the `ProposalCard` shows the polished summary /
+  step titles when present (falling back to the authoritative values via the pure
+  `stepDisplayTitle` / `proposalDisplaySummary` helpers), an **"AI-refined wording"**
+  provenance badge (with the model on hover), and advisory question/risk lists. The
+  authoritative steps/agents/order are unchanged; the commit button is untouched.
+
+Invariant (binding): the polish overlay is **advisory/presentation only**. It can
+never change what "Create these tasks" creates (that re-runs `plan_orchestration` on
+the unchanged `goal`), and it only ever exists on a non-actionful `PlanRequest` turn.
+
+Pinned by `proposal_polish_is_advisory_and_omitted_when_absent` (core wire guard),
+`plan_polish_skips_unless_openrouter_live_and_multi_step`,
+`validate_polish_applies_titles_only_on_exact_index_match`,
+`validate_polish_rejects_titles_that_change_count_order_or_agents`,
+`validate_polish_bounds_questions_and_risks`,
+`finalize_polish_attaches_model_on_success_and_none_on_error`,
+`polish_proposal_skips_with_no_network_when_brain_is_not_live` (kernel), and the
+`stepDisplayTitle` / `proposalDisplaySummary` tests in
+`apps/dashboard/test/prime.test.ts`. No test calls a real provider.
+
 ## Next recommended slice
 
 When the optional LLM brain is enabled, let it *propose* the clarifying question
-(across all the reflect-and-clarify arms — brainstorm, orchestration, task update)
-while the deterministic classifier still owns the action decision (keep the
-action-free wall intact). Until then, extend the reflection to the remaining bare
-arms (`AssignTask` missing-piece branches, `ApprovalResponse`) if they begin to
-read generically next to the reflected ones.
+across the remaining reflect-and-clarify arms (brainstorm, orchestration, task
+update) — the same "model suggests wording, deterministic classifier owns the
+action" seam now used for the plan proposal — while keeping the action-free wall
+intact. Also consider extending the advisory polish to the CLI brains (claude/codex)
+by parsing their JSON envelope through the same `validate_polish` chokepoint.

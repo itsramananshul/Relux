@@ -1,4 +1,4 @@
-import type { ReluxPrimeProposal } from "./api";
+import type { ReluxPrimeProposal, ReluxPrimeProposalStep } from "./api";
 
 // Pure helpers for rendering Prime's reviewable plan proposal as a card
 // (RELUX_MASTER_PLAN §10 planning layer, §11.1 "Prime Chat"). The proposal is a
@@ -27,4 +27,22 @@ export function proposalSummary(p: ReluxPrimeProposal): string {
 // steps, so the card shows just the goal + the one-task route — no empty table.
 export function hasSteps(p: ReluxPrimeProposal): boolean {
   return p.multi_step && p.steps.length > 0;
+}
+
+// The title to DISPLAY for a step: the LLM-polished wording when one is present
+// for this exact step index, otherwise the authoritative deterministic title. The
+// polished string is presentation-only — it never changes which step this is, its
+// order, or the agent it lands on (§10 planning layer, §17.1). The kernel only
+// emits a polished title keyed to a real step index, so this is a safe override.
+export function stepDisplayTitle(p: ReluxPrimeProposal, step: ReluxPrimeProposalStep): string {
+  const polished = p.polish?.step_titles?.find((t) => t.index === step.index);
+  return polished?.title?.trim() ? polished.title : step.title;
+}
+
+// The summary line to display: the polished one-line summary when the brain
+// supplied one, otherwise the deterministic "N steps across M agents" line. Both
+// are presentation only; nothing about the plan changes either way.
+export function proposalDisplaySummary(p: ReluxPrimeProposal): string {
+  const polished = p.polish?.summary?.trim();
+  return polished ? polished : proposalSummary(p);
 }
