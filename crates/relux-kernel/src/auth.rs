@@ -66,6 +66,18 @@ pub const SESSION_TTL_SECS: i64 = 12 * 60 * 60;
 /// repeatedly, but **never past this cap** — after a week a session is forced to
 /// re-authenticate regardless of activity. This bounds how long a single stolen
 /// or forgotten cookie stays useful even under continuous traffic.
+///
+/// **Design decision (intentional — do not turn into a sliding window):** the cap
+/// is wall-clock from mint and is **deliberately not re-anchored by activity**.
+/// That non-renewal *is* the security property — a continuously-active (or stolen)
+/// cookie still dies at the 7-day mark, which a sliding cap would defeat by living
+/// forever under steady traffic. The **only** way to obtain a fresh absolute window
+/// is an explicit re-authentication: logging out and signing back in mints a brand
+/// new session anchored at its own creation ([`SessionStore::create`]). The
+/// dashboard Account *"Sign out and sign back in"* control drives exactly this, so
+/// the operator always has a clear path to a new window — it just costs a real
+/// re-auth, never a silent renewal. (Activity slides only the idle window; see
+/// [`SESSION_TTL_SECS`] and [`SessionStore::refresh`].)
 pub const SESSION_ABSOLUTE_MAX_SECS: i64 = 7 * 24 * 60 * 60;
 
 /// Minimum password length accepted at setup. Deliberately modest — this guards
@@ -1182,6 +1194,44 @@ mod tests {
             assert_eq!(abs2, abs, "the absolute ceiling is immutable across refreshes");
             assert!(expires_at <= abs2, "idle deadline stays under the ceiling");
         }
+    }
+
+    #[test]
+    fn a_fresh_login_re_anchors_the_absolute_window_but_activity_never_does() {
+        // Pins the intentional absolute-cap policy (see SESSION_ABSOLUTE_MAX_SECS):
+        // activity never re-anchors the hard ceiling, but an explicit re-auth (a
+        // fresh login — what the Account "Sign out and sign back in" path drives)
+        // mints a new session whose window is anchored at its own creation. This is
+        // the kernel-unit complement to the HTTP-level re-auth test.
+        let (auth, _tmp) = auth();
+        let now = now_secs();
+        // An "old" session nearing the end of its absolute life: ~1 day of ceiling
+        // left even though its idle window looks open.
+        let old_abs = now + 24 * 60 * 60;
+        auth.sessions
+            .insert_raw("old", "ops", now + SESSION_TTL_SECS, old_abs);
+        // Sliding the old session (real activity) leaves the ceiling exactly where
+        // it was — activity cannot buy a new absolute window.
+        auth.refresh_session("old").expect("old session still live");
+        let (_e, old_abs_after) = auth.sessions.peek("old").unwrap();
+        assert_eq!(
+            old_abs_after, old_abs,
+            "activity must NOT re-anchor the absolute cap"
+        );
+        // A fresh login (explicit re-auth) mints a new session whose ceiling is a
+        // full window from its own mint — strictly past the old session's ceiling.
+        // This is the ONLY way to reset the absolute cap.
+        let fresh = auth.create_session("ops");
+        let (_fe, fresh_abs) = auth.sessions.peek(&fresh).unwrap();
+        assert!(
+            (fresh_abs - (now + SESSION_ABSOLUTE_MAX_SECS)).abs() <= 2,
+            "a fresh login anchors a new absolute window at its mint; got {fresh_abs}"
+        );
+        assert!(
+            fresh_abs > old_abs,
+            "re-auth's absolute window must extend past the old session's ceiling \
+             ({fresh_abs} <= {old_abs})"
+        );
     }
 
     // ── Restart-persistent sessions ─────────────────────────────
