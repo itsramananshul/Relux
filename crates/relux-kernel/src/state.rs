@@ -1287,6 +1287,69 @@ impl KernelState {
         self.agents.get(id)
     }
 
+    /// Apply an operator edit to an existing agent's configurable fields.
+    ///
+    /// Each argument is "leave unchanged" when `None`; for `persona`, `Some(None)`
+    /// CLEARS it and `Some(Some(_))` sets it. The caller (the HTTP layer) is
+    /// responsible for sanitizing/validating the values via
+    /// [`crate::agent_config::validate_agent_update`]; this method enforces the two
+    /// invariants the kernel owns: the agent must exist, and a new adapter must be an
+    /// installed plugin (the manual-config counterpart to `create_agent`'s check).
+    /// The brain-seeded create path is untouched — this is edit-only.
+    pub fn update_agent(
+        &mut self,
+        id: &AgentId,
+        name: Option<String>,
+        description: Option<String>,
+        persona: Option<Option<String>>,
+        adapter_plugin: Option<PluginId>,
+        status: Option<AgentStatus>,
+    ) -> Result<(), KernelError> {
+        if !self.agents.contains_key(id) {
+            return Err(KernelError::UnknownAgent(id.to_string()));
+        }
+        if let Some(ref plugin) = adapter_plugin {
+            if !self.plugins.contains_key(plugin) {
+                return Err(KernelError::UnknownPlugin(plugin.to_string()));
+            }
+        }
+
+        let (namespace, adapter_label) = {
+            // Safe: existence checked above.
+            let agent = self.agents.get_mut(id).expect("agent exists");
+            if let Some(n) = name {
+                agent.name = n;
+            }
+            if let Some(d) = description {
+                agent.description = d;
+            }
+            if let Some(p) = persona {
+                agent.persona = p;
+            }
+            if let Some(a) = adapter_plugin {
+                agent.adapter_plugin = a;
+            }
+            if let Some(s) = status {
+                agent.status = s;
+            }
+            (
+                agent.namespace_id.clone(),
+                agent.adapter_plugin.as_str().to_string(),
+            )
+        };
+        self.record_audit(
+            "kernel",
+            "kernel",
+            "agent:update",
+            Some("agent"),
+            Some(id.as_str()),
+            Some(&namespace),
+            AuditResult::Success,
+            serde_json::json!({ "adapter": adapter_label }),
+        );
+        Ok(())
+    }
+
     pub fn agent_count(&self) -> usize {
         self.agents.len()
     }
@@ -11725,6 +11788,61 @@ mod tests {
             matches!(err, KernelError::PermissionAlreadyGranted(..)),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn update_agent_applies_fields_persists_and_audits() {
+        let (mut k, _prime, _task, _run, _echo) = primed_kernel();
+        let ns = NamespaceId::new("workspace");
+        let adapter = PluginId::new("relux-adapter-local-prime");
+        let id = k
+            .create_agent("editme", "Edit Me", "first role", &adapter, &ns, None, vec![])
+            .unwrap();
+
+        // Edit name/description/persona/status; leave the adapter unchanged (None).
+        k.update_agent(
+            &id,
+            Some("Edited Name".to_string()),
+            Some("new role".to_string()),
+            Some(Some("calm and precise".to_string())),
+            None,
+            Some(AgentStatus::Paused),
+        )
+        .unwrap();
+
+        let agent = k.agent(&id).unwrap();
+        assert_eq!(agent.name, "Edited Name");
+        assert_eq!(agent.description, "new role");
+        assert_eq!(agent.persona.as_deref(), Some("calm and precise"));
+        assert_eq!(agent.status, AgentStatus::Paused);
+        // The adapter was left untouched.
+        assert_eq!(agent.adapter_plugin.as_str(), "relux-adapter-local-prime");
+        assert!(k
+            .audit_log()
+            .iter()
+            .any(|e| e.action == "agent:update" && e.result == AuditResult::Success));
+
+        // Persona can be cleared with Some(None).
+        k.update_agent(&id, None, None, Some(None), None, None).unwrap();
+        assert!(k.agent(&id).unwrap().persona.is_none());
+    }
+
+    #[test]
+    fn update_agent_rejects_unknown_agent_and_unknown_adapter() {
+        let (mut k, prime, _task, _run, _echo) = primed_kernel();
+
+        let unknown = AgentId::new("ghost");
+        let err = k
+            .update_agent(&unknown, Some("x".to_string()), None, None, None, None)
+            .unwrap_err();
+        assert!(matches!(err, KernelError::UnknownAgent(_)), "got {err:?}");
+
+        // An adapter that is not an installed plugin is rejected; the agent is untouched.
+        let bogus = PluginId::new("relux-adapter-not-installed");
+        let err = k
+            .update_agent(&prime, None, None, None, Some(bogus), None)
+            .unwrap_err();
+        assert!(matches!(err, KernelError::UnknownPlugin(_)), "got {err:?}");
     }
 
     // --- Adapter runtime tests --------------------------------------------

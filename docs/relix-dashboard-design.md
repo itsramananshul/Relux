@@ -159,6 +159,16 @@ The **agent detail** has tabs: **Overview** (latest run, charts, recent issues, 
 
 Because Relix's existing agent-gate already understands categories, risk, secrets, and scopes natively, this panel is a *face* on machinery that exists — not new enforcement logic. Consider shipping **role presets** (CEO / manager / worker / read-only) that set sensible toggle bundles, with the raw toggles underneath for power users.
 
+### 9.1 Crew create/edit configuration (IMPLEMENTED)
+
+The full org-chart agent-detail tabs above are the target; the **Crew page** (`/crew`, `apps/dashboard/src/pages/Crew.tsx`) ships the operational core of the **Configuration** tab today, so an operator can configure crew directly (for a product where Prime hires/uses crew, this is table stakes):
+
+- **Create** — a `CrewMemberForm` (name, optional id derived from the name, role/description, **persona** = operating style, and an **adapter/runtime** picker populated from the live adapter roster, defaulting to the local Prime adapter).
+- **Edit** — each crew card has an **Edit** action that opens the same form inline, adding a **status** select (the operator-settable `active`/`paused`/`disabled`; machine-driven `Error` is not offered). Absent fields are left unchanged; an empty persona clears it.
+- The existing **Adapters** status cards (enable/disable a CLI adapter) stay on the same page — adapter *runtime* control and agent *configuration* sit side by side.
+
+Backend: `POST /v1/relux/agents` (now accepts `persona` + a validated adapter) and `PATCH /v1/relux/agents/:id` (edit). Both validate/sanitize/clamp through `crates/relux-kernel/src/agent_config.rs` (pure, unit-tested): name required, id/name unique, adapter must resolve to a known/installed adapter, status from the allowlist, persona bounded **and secret-redacted**. Validation failures surface as honest 400s in the form (duplicate id/name, unknown adapter, bad status); a missing agent on edit is a 404. The richer permission/budget/skills governance from §9 above remains future work — this slice covers identity, role, persona, adapter, and enabled/paused/disabled status only.
+
 ---
 
 ## 10. The other surfaces (briefly)

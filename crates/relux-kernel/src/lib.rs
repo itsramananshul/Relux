@@ -17,6 +17,7 @@
 //! plugins will later sit behind.
 
 pub mod adapter;
+pub mod agent_config;
 pub mod ai;
 pub mod auth;
 pub mod builtin;
@@ -48,6 +49,10 @@ pub mod store;
 pub use adapter::{
     build_adapter_args, compose_prompt, find_on_path, run_adapter_command, AdapterCommandSpec,
     AdapterRunOutcome,
+};
+pub use agent_config::{
+    validate_agent_update, validate_new_agent, AgentConfigError, CreateAgentInput,
+    ResolvedAgentUpdate, ResolvedNewAgent, UpdateAgentInput,
 };
 pub use ai::{
     classify_intent_via_openrouter, clear_stored_config, complete_tool_round, compose_chat_prompt,
@@ -176,6 +181,8 @@ pub enum KernelError {
     UnknownAgent(String),
     #[error("agent already exists: {0}")]
     AgentExists(String),
+    #[error("invalid agent configuration: {0}")]
+    InvalidAgentConfig(String),
     #[error("unknown task: {0}")]
     UnknownTask(String),
     #[error("unknown run: {0}")]

@@ -377,6 +377,10 @@ fn protected_router() -> Router<AppState> {
             put(set_ai_config).patch(set_ai_config).delete(clear_ai_config),
         )
         .route("/v1/relux/agents", get(list_agents).post(create_agent))
+        .route(
+            "/v1/relux/agents/:id",
+            put(update_agent).patch(update_agent),
+        )
         .route("/v1/relux/prime", post(run_prime))
         .route("/v1/relux/prime/reset", post(reset_prime_conversation))
         .route("/v1/relux/prime/autonomy", get(get_autonomy_config).put(update_autonomy_config).patch(update_autonomy_config))
@@ -1487,6 +1491,7 @@ struct CreateAgentReq {
     id: Option<String>,
     name: String,
     role: Option<String>,
+    persona: Option<String>,
     adapter_plugin: Option<String>,
 }
 
@@ -1494,43 +1499,115 @@ async fn create_agent(
     State(state): State<AppState>,
     Json(req): Json<CreateAgentReq>,
 ) -> Result<Json<AgentRecord>, ApiError> {
-    let name = req.name.trim().to_string();
-    if name.is_empty() {
-        return Err(ApiError::bad_request("name is required"));
-    }
-
-    let agent_id_str = match req.id {
-        Some(id) if !id.trim().is_empty() => id.trim().to_string(),
-        _ => name.to_lowercase().replace(' ', "-"), // Sanitize/derive id if omitted
-    };
-
-    let description = req.role.unwrap_or_default();
-    let adapter_plugin = req
-        .adapter_plugin
-        .unwrap_or_else(|| "relux-adapter-local-prime".to_string());
-    let adapter_plugin_id = relux_core::PluginId::new(adapter_plugin);
-
     let agent = locked_save(&state, |kernel| {
         let ctx = crate::ensure_bootstrapped(kernel)?;
-        if kernel.agent(&relux_core::AgentId::new(&agent_id_str)).is_some() {
-            return Err(KernelError::AgentExists(agent_id_str.clone()));
-        }
 
-        // Grant minimal safe permissions for MVP
+        // Gather the live rosters the validator needs: installed adapters (the
+        // allowlist a chosen adapter must resolve to) and the existing ids/names
+        // (uniqueness). Validation is pure; the kernel just hands it the state.
+        let known_adapters: Vec<String> = kernel
+            .adapter_runtime_status()
+            .into_iter()
+            .map(|a| a.plugin_id)
+            .collect();
+        let existing_ids: Vec<String> =
+            kernel.agents().into_iter().map(|a| a.id.as_str().to_string()).collect();
+        let existing_names: Vec<String> =
+            kernel.agents().into_iter().map(|a| a.name.clone()).collect();
+
+        let resolved = relux_kernel::validate_new_agent(
+            relux_kernel::CreateAgentInput {
+                id: req.id.as_deref(),
+                name: &req.name,
+                role: req.role.as_deref(),
+                persona: req.persona.as_deref(),
+                adapter_plugin: req.adapter_plugin.as_deref(),
+            },
+            &known_adapters,
+            &existing_ids,
+            &existing_names,
+        )
+        .map_err(|e| KernelError::InvalidAgentConfig(e.message()))?;
+
+        let adapter_plugin_id = relux_core::PluginId::new(resolved.adapter_plugin);
+        // Grant minimal safe permissions for MVP (the echo tool); richer grants flow
+        // through the explicit, approval-gated permission path.
         let permissions = vec![relux_core::Permission::new("tool:relux-tools-echo:say").unwrap()];
 
         let id = kernel.create_agent(
-            &agent_id_str,
-            &name,
-            &description,
+            &resolved.id,
+            &resolved.name,
+            &resolved.description,
             &adapter_plugin_id,
             &ctx.namespace,
-            None, // persona
+            resolved.persona,
             permissions,
         )?;
         Ok(agent_record(kernel.agent(&id).unwrap()))
     })?;
     Ok(Json(agent))
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateAgentReq {
+    name: Option<String>,
+    role: Option<String>,
+    persona: Option<String>,
+    adapter_plugin: Option<String>,
+    status: Option<String>,
+}
+
+/// Edit an existing agent's configurable fields (name, role, persona, adapter,
+/// status). Absent fields are left unchanged; an empty `persona` clears it. All
+/// values are sanitized/validated against the live rosters before they are applied.
+async fn update_agent(
+    State(state): State<AppState>,
+    AxumPath(agent_id_str): AxumPath<String>,
+    Json(req): Json<UpdateAgentReq>,
+) -> Result<Json<AgentRecord>, ApiError> {
+    let agent_id = relux_core::AgentId::new(agent_id_str.clone());
+    let record = locked_save(&state, |kernel| {
+        if kernel.agent(&agent_id).is_none() {
+            return Err(KernelError::UnknownAgent(agent_id_str.clone()));
+        }
+
+        let known_adapters: Vec<String> = kernel
+            .adapter_runtime_status()
+            .into_iter()
+            .map(|a| a.plugin_id)
+            .collect();
+        // Names held by every OTHER agent (renaming to one's own name is allowed).
+        let names_except_self: Vec<String> = kernel
+            .agents()
+            .into_iter()
+            .filter(|a| a.id != agent_id)
+            .map(|a| a.name.clone())
+            .collect();
+
+        let resolved = relux_kernel::validate_agent_update(
+            relux_kernel::UpdateAgentInput {
+                name: req.name.as_deref(),
+                role: req.role.as_deref(),
+                persona: req.persona.as_deref(),
+                adapter_plugin: req.adapter_plugin.as_deref(),
+                status: req.status.as_deref(),
+            },
+            &known_adapters,
+            &names_except_self,
+        )
+        .map_err(|e| KernelError::InvalidAgentConfig(e.message()))?;
+
+        kernel.update_agent(
+            &agent_id,
+            resolved.name,
+            resolved.description,
+            resolved.persona,
+            resolved.adapter_plugin.map(relux_core::PluginId::new),
+            resolved.status,
+        )?;
+        Ok(agent_record(kernel.agent(&agent_id).unwrap()))
+    })?;
+    Ok(Json(record))
 }
 
 async fn create_task(
@@ -5322,7 +5399,8 @@ fn status_for(err: &KernelError) -> StatusCode {
         // undecided/consumed approval is a resolvable conflict (409); a tampered
         // stored snapshot is unprocessable (422, fail closed).
         KernelError::ToolDoesNotRequireApproval { .. }
-        | KernelError::ToolInvocationArgsTooLarge { .. } => StatusCode::BAD_REQUEST,
+        | KernelError::ToolInvocationArgsTooLarge { .. }
+        | KernelError::InvalidAgentConfig(_) => StatusCode::BAD_REQUEST,
         KernelError::NoBoundToolInvocation(_) => StatusCode::NOT_FOUND,
         KernelError::ToolInvocationNotApproved { .. }
         | KernelError::ToolInvocationConsumed(_) => StatusCode::CONFLICT,
@@ -7406,6 +7484,77 @@ mod tests {
             call(&state, "GET", "/v1/relux/state", None, None).await;
         assert_eq!(state_status, StatusCode::UNAUTHORIZED);
         assert!(body.contains("\"needs_setup\":true"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn agent_create_and_edit_workflow_over_http() {
+        // Dev bypass so the calls need no session; exercises the manual Crew config path.
+        let (state, _dir) = auth_state(true);
+
+        // Create with a persona; the default (local Prime) adapter is used.
+        let (status, _, body) = call(
+            &state,
+            "POST",
+            "/v1/relux/agents",
+            None,
+            Some(r#"{"name":"Research Bot","role":"does research","persona":"calm and precise"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "create failed: {body}");
+        assert!(body.contains("\"id\":\"research-bot\""), "got: {body}");
+        assert!(body.contains("\"persona\":\"calm and precise\""), "got: {body}");
+        assert!(
+            body.contains("relux-adapter-local-prime"),
+            "default adapter expected: {body}"
+        );
+
+        // A duplicate display name is an honest 400.
+        let (status, _, body) = call(
+            &state,
+            "POST",
+            "/v1/relux/agents",
+            None,
+            Some(r#"{"name":"research bot"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "dup name should 400: {body}");
+        assert!(body.contains("already exists"), "got: {body}");
+
+        // An unknown adapter is rejected (not a known/installed adapter).
+        let (status, _, body) = call(
+            &state,
+            "POST",
+            "/v1/relux/agents",
+            None,
+            Some(r#"{"name":"Bad Bot","adapter_plugin":"relux-adapter-bogus"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "unknown adapter should 400: {body}");
+        assert!(body.contains("unknown adapter"), "got: {body}");
+
+        // Edit: pause the agent and clear the persona.
+        let (status, _, body) = call(
+            &state,
+            "PATCH",
+            "/v1/relux/agents/research-bot",
+            None,
+            Some(r#"{"status":"disabled","persona":""}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "edit failed: {body}");
+        assert!(body.contains("\"status\":\"Disabled\""), "got: {body}");
+        assert!(!body.contains("\"persona\""), "persona should be cleared: {body}");
+
+        // Editing a non-existent agent is a 404.
+        let (status, _, _) = call(
+            &state,
+            "PATCH",
+            "/v1/relux/agents/ghost",
+            None,
+            Some(r#"{"role":"x"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

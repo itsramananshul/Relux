@@ -1737,3 +1737,58 @@ configured". The pure derivation lives in `readiness.ts` (React-free, like
 `routing`/`onboarding`/`plugins`) so `node --test` pins all four required states
 (`test/readiness.test.ts`) and a render test (`test/readiness-render.test.mjs`)
 proves Home mounts and the committed bundle carries the copy.
+
+---
+
+## Reference read — manual Crew create/edit configuration (this slice)
+
+The brain-assisted agent-slot path could already *propose* a created operative's
+name/id/role/adapter/persona (`prime_agent_slots`), but the MANUAL surface lagged: the
+Crew page offered only a two-field name+role create with no persona, no adapter choice,
+and **no edit at all** — for a product where Prime hires/uses crew, an operator could not
+configure crew directly. This slice adds a safe, usable manual create/edit workflow that
+reuses the same validation discipline the brain path already adopted, so the two surfaces
+agree on what a valid agent config is.
+
+### Paperclip (openclaw) — files read
+
+- `reference/openclaw-main/src/agents/tools/sessions-spawn-tool.ts` (the closest analogue
+  to "configure a new worker from an operator request) — `UNSUPPORTED_SESSIONS_SPAWN_PARAM_KEYS`
+  is checked and rejected (L277-284) **before any param is read**; `readStringParam(params,
+  "task", { required: true })` (L285) requires the mandatory string; the optional fields
+  default-the-rest (`cleanup === "keep" | "delete" ? … : "keep"`, L302-303). **Pattern: reject
+  unsupported keys up front, require the mandatory string, default/clamp the rest.**
+- `reference/openclaw-main/src/acp/approval-classifier.ts` `normalizeToolName` (L57-63) —
+  a subject is lowercased, length-bounded (`> 128 ⇒ undefined`), and accepted only against a
+  strict `^[a-z0-9._-]+$` shape. **Pattern: normalize an id/subject to a strict, bounded shape
+  before it is honored.**
+- `reference/openclaw-main/src/agents/tools/common.ts` `readStringParam` / `ToolInputError`
+  (L57-122) — typed extraction that *throws* on bad input rather than coercing silently.
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/agent/message_sanitization.py` —
+  `_escape_invalid_chars_in_json_strings` (L143-182) and the tool-error length clamp
+  (`_sanitize_tool_error`, L515-528): **sanitize control chars and CLAMP length on every
+  operator-/model-produced string.** Mirrored in the agent-config sanitizers.
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| openclaw: **reject unsupported keys, require the mandatory string, default the rest** (`sessions-spawn-tool`) | `crates/relux-kernel/src/agent_config.rs` `validate_new_agent` requires a non-empty `name` (`NameRequired`), defaults the adapter to the local Prime adapter when absent, and clamps role/persona; the HTTP request structs accept ONLY the known fields (serde drops the rest). |
+| openclaw: **normalize an id to a strict, bounded shape** (`normalizeToolName`) | `normalize_agent_id` lowercases, keeps only `[a-z0-9-]` (separators collapse to one hyphen), trims, and clamps to `MAX_AGENT_ID_CHARS`; an id that normalizes to empty fails (`IdInvalid`). |
+| openclaw: **act only on a target that EXISTS** (approval cross-check) | a chosen adapter is honored ONLY when it resolves to an EXISTING roster id from `kernel.adapter_runtime_status()` (case-insensitive, canonical case preserved); an unknown adapter is rejected (`UnknownAdapter`). Id AND display-name uniqueness are checked against the live roster (`DuplicateId`/`DuplicateName`). |
+| Hermes: **sanitize control chars + clamp length** (`message_sanitization`) | `sanitize_line`/`sanitize_block` strip control chars, collapse whitespace, and clamp; the persona is additionally run through `relux_core::redact::redact_secrets` so a pasted `sk-ant-…`/`ghp_…`/`key=…` is masked before storage — never persisted verbatim. |
+| openclaw: **a settable field is checked against an allowlist** (status/cleanup defaults) | `resolve_status` honors ONLY `{active, paused, disabled}` (operator-settable); the machine-driven `Error` and unknown values are rejected (`InvalidStatus`), so an edit can never forge a lifecycle state. |
+
+**What we deliberately do differently:** this is the MANUAL path, so validation lives at the
+HTTP boundary (pure functions in `agent_config.rs`, the kernel hands them the live rosters) and
+the result flows through `KernelState::create_agent` / the new `KernelState::update_agent` under
+the kernel lock — the brain-seeded create path is **untouched** (it still calls `create_agent`
+with its own already-validated slots). Edit is field-granular ("absent ⇒ unchanged"; an empty
+`persona` is a deliberate clear) and `update_agent` re-checks the two invariants the kernel owns
+(the agent exists; a new adapter is an installed plugin), so a stale/forged patch can never edit a
+non-existent agent or point one at a non-adapter plugin. The persona is the only free-text durable
+field and it is bounded + secret-redacted; nothing here grants new capability (permission grants
+stay on the explicit, approval-gated path).

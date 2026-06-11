@@ -99,6 +99,18 @@ test("Crew RENDERS under a declarative router (no useLoaderData throw)", () => {
   assert.match(html, /Create New Crew Member/);
 });
 
+test("the create form exposes the name, persona, and adapter fields", () => {
+  // The manual Crew config workflow: an operator must be able to set a name, an
+  // optional persona (operating style), and pick an adapter/runtime. These render
+  // even before any data loads (the create section is always shown), so the page
+  // is usable on first paint.
+  const html = render();
+  assert.match(html, /Persona \(operating style/);
+  assert.match(html, /Adapter \/ Runtime/);
+  // The adapter picker always offers the safe local-Prime default option.
+  assert.match(html, /Default \(local Prime\)/);
+});
+
 // ── Shipped-bundle path: the artifact the kernel actually serves ────────────
 
 test("the committed dashboard bundle carries the Crew copy (no stale dist)", () => {

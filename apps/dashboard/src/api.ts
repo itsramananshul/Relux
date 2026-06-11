@@ -1965,6 +1965,19 @@ export interface ReluxAgent {
   created_at: string;
 }
 
+// Operator-supplied fields for creating/editing a crew member (agent). Every field
+// is optional on the wire: create requires `name`; edit treats an absent field as
+// "leave unchanged" and an empty `persona` as "clear". The backend
+// sanitizes/clamps/validates each value (see crates/relux-kernel agent_config).
+export interface ReluxAgentConfig {
+  id?: string;
+  name?: string;
+  role?: string;
+  persona?: string;
+  adapter_plugin?: string;
+  status?: string;
+}
+
 // One read-only artifact reference captured from an adapter's structured result
 // envelope (master plan §9.6 / §15). This is a REFERENCE the adapter declared —
 // name/type/summary/source (+ optional sanitized relative path + size) — NOT a
@@ -2137,6 +2150,14 @@ export const reluxWork = {
   },
   // All agents, sorted by id.
   listAgents: () => api.get<ReluxAgent[]>("/v1/relux/agents"),
+  // Create a new crew member (agent). The backend sanitizes/validates and derives
+  // the id from the name when one is not supplied; an unknown adapter / duplicate
+  // id or name is an honest 400.
+  createAgent: (body: ReluxAgentConfig) => api.post<ReluxAgent>("/v1/relux/agents", body),
+  // Edit an existing agent's configurable fields. Absent fields are left unchanged;
+  // an empty `persona` clears it. Returns the updated agent record.
+  updateAgent: (id: string, body: ReluxAgentConfig) =>
+    api.patch<ReluxAgent>(`/v1/relux/agents/${encodeURIComponent(id)}`, body),
   // Create a new task and assign it to Prime.
   createTask: (title: string) => api.post<ReluxTask>("/v1/relux/tasks", { title }),
   // Start an execution attempt for a task.
