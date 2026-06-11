@@ -626,3 +626,75 @@ explicit-but-wrong reference is never silently "corrected". Prime never decrees 
 faked. Status synonyms (cancel→cancelled, block→blocked) and the priority/title/details parsing stay
 deterministic string helpers: they are the grounding the brain reconciles against and the fallback
 when no brain is live.
+
+---
+
+## Reference read — unified Prime brain decision envelope (this slice)
+
+The slices above each added ONE specialized brain call (intent, then task / agent / admin /
+assign / update slots, then clarify wording). They are individually correct, but a single Prime
+turn could fire the brain TWO or THREE times in series (intent → slots for the resolved intent →
+wording for a clarify). That is slow, costly, and less coherent than how Hermes / Codex / Claude
+actually work — ONE model response carries both the answer and the structured actions in a single
+turn. This slice adds a UNIFIED decision envelope that carries intent + every applicable slot +
+optional wording in ONE provider call, while keeping the deterministic/policy execution authority
+and every old specialized parser as the fallback.
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/agent/conversation_loop.py` `run_conversation(...)` — a SINGLE
+  model response carries both `content` (the answer) and `tool_calls` (the structured actions) in
+  one assistant message (`_m.get("tool_calls")`, ~L630-875), and the tool-validation block
+  validates the chosen tool against the NAME ALLOWLIST before acting (~L3116-3162). **Pattern: one
+  response carries the answer AND the structured actions; each is validated against an allowlist
+  before it is used.** We mirror the one-response shape: `crates/relux-kernel/src/prime_decision.rs`
+  `parse_decision` lifts ONE envelope carrying the intent AND the slots AND the wording, and each
+  piece round-trips through its existing validator before it can shape anything. We deliberately
+  differ in that the Relux brain still executes NOTHING — every durable change flows through the
+  deterministic kernel path.
+- `reference/hermes-agent-main/model_tools.py` `coerce_tool_args` (L535-616) — each argument is
+  coerced to its registered schema type, a non-coercible value dropped, not fatal. Mirrored by the
+  per-section reuse: a section whose own validator rejects it is DROPPED (its specialized/
+  deterministic fallback applies), not fatal to the whole envelope.
+
+### Paperclip (openclaw) — files read
+
+- `reference/openclaw-main/src/shared/balanced-json.ts` `extractBalancedJsonPrefix` (L21-69) and
+  `src/agents/cli-output.ts` `parseCliOutput` — lift the first balanced `{...}` out of a noisy
+  reply and surface only the parsed object, never the raw stdout. We reuse the SAME scanner
+  (`crate::prime_intent::extract_json_object`); on the CLI path the server runs
+  `parse_adapter_result` FIRST (`server.rs` `parse_cli_decision`), so the raw `--output-format json`
+  envelope never reaches the parser or the UI.
+- `reference/openclaw-main/src/agents/tools/update-plan-tool.ts` `readPlanSteps` (L39-74) — a
+  structured payload is validated FIELD-BY-FIELD and COMPOSITIONALLY (each plan step independently
+  against its schema + `PLAN_STEP_STATUSES` allowlist; a bad one is an input error). **Pattern:
+  validate a composite payload section-by-section against explicit schemas/allowlists.** Mirrored
+  by `parse_decision`'s compositional validation (each known section through its own validator).
+- `reference/openclaw-main/src/agents/tools/sessions-spawn-tool.ts`
+  (`UNSUPPORTED_SESSIONS_SPAWN_PARAM_KEYS`, rejected before any param is read) — reject unsupported
+  keys outright. Mirrored: `parse_decision` rejects any UNKNOWN top-level key and fails the WHOLE
+  envelope closed (the brain may not smuggle an un-modeled authority key past the parser).
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| Hermes: **one response carries the answer AND the structured actions**, each allowlist-validated before use | `prime_decision::parse_decision` lifts ONE envelope: `classification` (intent), `task`/`agent`/`plugin`/`permission`/`assign`/`update` slots, and `wording`. Each section is validated by its EXISTING validator (`parse_intent_proposal`, `parse_task_slots`, …) — no weaker duplicate logic. `ai::decide_prime_via_openrouter` / `server.rs` `decide_prime_via_cli` make the one call. |
+| openclaw: **`additionalProperties: false`** (reject unsupported keys) | An UNKNOWN top-level key fails the WHOLE envelope closed; the caller then falls back to the specialized paths. |
+| openclaw: **compositional, field-by-field validation** (`readPlanSteps`) | A KNOWN section that fails its own validator is DROPPED (that section falls back to its specialized call / the deterministic rail) while the rest of the envelope stands — documented per-section vs. whole-envelope fail-closed policy. |
+| openclaw: **balanced-JSON extraction, surface only parsed text** | reuse `extract_json_object`; the CLI path lifts the reply via `parse_adapter_result` FIRST (`parse_cli_decision`), so the raw envelope never leaks. |
+| Hermes/openclaw: **deterministic fallback always exists** | the unified call is strictly additive: ANY failure (no brain, malformed/empty envelope, unknown top-level key, zero usable sections) drops the caller to the prior specialized intent/slot/wording calls and the deterministic rails. |
+
+**What we deliberately do differently:** the envelope changes only HOW the brain is asked (one
+call) and HOW its reply is parsed (one allowlisted object) — it changes NOTHING about authority.
+The fail-closed intent gate (`reconcile_intent`) still runs at the kernel chokepoint, so guarded
+chat can never be promoted to work; every slot is still reconciled against the live state, and the
+kernel uses ONLY the sections that match the turn it produces (a `task` proposal on an assign turn
+is simply ignored). Risky plugin/permission slots are still advisory-only behind a human approval.
+The wording is carried raw and validated LATER against the turn's actual `ClarifyKind` through the
+SAME `parse_clarify`/`reconcile_clarify` chokepoint, so a clarify is still forced to one question
+and an action-claim is still rejected. The brain authors a *proposal*; the kernel validates and
+applies it — exactly as before, now in one round-trip. The remaining brain calls (the free-form
+conversational reply via `shape_reply`/`run_cli_brain` for non-clarify chat, and the advisory
+multi-step plan-card polish) stay specialized: they are not part of the intent+slots+wording
+decision, and folding them in is a future slice.

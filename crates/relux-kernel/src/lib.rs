@@ -30,6 +30,7 @@ pub mod prime_agent_slots;
 pub mod prime_assign_slots;
 pub mod prime_clarify;
 pub mod prime_clarify_memory;
+pub mod prime_decision;
 pub mod prime_intent;
 pub mod prime_slots;
 pub mod prime_update_slots;
@@ -44,6 +45,7 @@ pub use adapter::{
 };
 pub use ai::{
     classify_intent_via_openrouter, clear_stored_config, compose_chat_prompt, compose_polish_prompt,
+    decide_prime_via_openrouter,
     extract_agent_slots_via_openrouter, extract_assign_slots_via_openrouter,
     extract_permission_slots_via_openrouter,
     extract_plugin_ref_via_openrouter, extract_task_slots_via_openrouter,
@@ -86,6 +88,7 @@ pub use prime_clarify_memory::{
     is_cancellation, is_resolvable_clarify_intent, resolve_pending, ClarifyResolution,
     CLARIFY_TTL_SECS,
 };
+pub use prime_decision::{build_decision_prompt, parse_decision, PrimeBrainDecision};
 pub use prime_intent::{
     build_intent_prompt, parse_intent_proposal, reconcile_intent, BrainIntentProposal,
     IntentSource,

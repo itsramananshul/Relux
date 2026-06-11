@@ -128,6 +128,17 @@ export function replyPolishLabel(rp: ReluxReplyPolish | undefined): string | nul
   return `brain-worded ${noun} · ${brainSourceLabel(rp.source)}`;
 }
 
+// The label for the small "one brain decision" chip. The server attaches `decision_source`
+// ONLY when a SINGLE unified brain call carried more than one proposal this turn (intent +
+// slots + wording answered together), so the chip honestly names the one decision behind the
+// per-section chips. Returns null when the turn used the prior serial calls or no brain, so
+// the chip never overclaims a unified decision. Provenance only; the turn's authority is
+// unchanged.
+export function decisionSourceLabel(source: string | undefined): string | null {
+  const trimmed = source?.trim();
+  return trimmed ? `one brain decision · ${trimmed}` : null;
+}
+
 // The label for the small "waiting for: …" chip shown while Prime is still expecting an
 // answer to a clarifying question (multi-turn clarify memory). The kernel attaches
 // `pending_clarification` ONLY when an actionable request is awaiting a missing field, and

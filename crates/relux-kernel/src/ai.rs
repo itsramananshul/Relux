@@ -790,6 +790,31 @@ pub async fn polish_clarify_via_openrouter(
     crate::prime_clarify::reconcile_clarify(deterministic_text, &parsed, kind)
 }
 
+/// Produce ONE UNIFIED Prime decision (intent + every applicable slot + optional wording) in
+/// a single OpenRouter call, as a VALIDATED [`crate::prime_decision::PrimeBrainDecision`], or
+/// `None` on ANY failure (no key, disabled, network error, unparseable/empty envelope).
+///
+/// This is the one-shot counterpart to the separate `classify_intent_via_openrouter` +
+/// `extract_*_slots_via_openrouter` + `polish_clarify_via_openrouter` calls: a configured
+/// brain answers the whole turn at once, exactly as Hermes/Codex carry the answer and the
+/// structured actions in one model response. The model only *proposes*; every section is
+/// validated by its existing allowlist in [`crate::prime_decision::parse_decision`], and the
+/// kernel still reconciles intent + slots against the live state behind the fail-closed gate.
+/// On `None` the caller falls back to the specialized paths and the deterministic rails, so
+/// the brain stays strictly additive (§10.1, §10.2, §17.1).
+pub async fn decide_prime_via_openrouter(
+    cfg: &AiConfig,
+    message: &str,
+    summary: &relux_core::StateSummary,
+) -> Option<crate::prime_decision::PrimeBrainDecision> {
+    let text = complete_json_only(
+        cfg,
+        crate::prime_decision::build_decision_prompt(message, summary),
+    )
+    .await?;
+    crate::prime_decision::parse_decision(&text).ok()
+}
+
 /// Combine an LLM result with the deterministic fallback into a final outcome.
 /// Pure, so both the success and failure (fallback + note) paths are testable
 /// without a network.

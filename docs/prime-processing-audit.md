@@ -760,10 +760,80 @@ the server seam tests (`cli_update_slots_*`); the core wire guard
 (`prime_task_update_round_trips_and_omits_source_when_absent` + the extended omission assertion);
 and the dashboard `updateChangeSummary` / `updateProvenance` test. No test calls a real provider.
 
+## Applied change (unified brain decision envelope)
+
+The brain stack had grown one specialized call at a time, so a single Prime turn could fire
+the brain TWO or THREE times in series — intent, then slots for the resolved intent, then
+clarify wording. That is slow, costly, and less coherent than how Hermes/Codex/Claude work
+(ONE model response carries the answer and the structured actions in one turn). Per master
+plan §10.1/§10.2/§17.1 and following the reference read recorded in
+`reference-driven-development.md` (Hermes `run_conversation` one-response-carries-everything +
+allowlist validation; openclaw `extractBalancedJsonPrefix`/`parseCliOutput` parse-only-the-
+object, `readPlanSteps` compositional field-by-field validation, `sessions-spawn-tool`
+unsupported-key rejection), a configured brain may now answer the WHOLE turn in ONE call.
+
+- **New module `relux-kernel/src/prime_decision.rs`.** `PrimeBrainDecision` carries optional,
+  strictly-allowlisted sections: `classification` (intent), `task`/`agent`/`plugin`/
+  `permission`/`assign`/`update` slots, `wording`, plus `confidence`/`provenance`.
+  `build_decision_prompt(message, summary)` is the one grounded prompt; `parse_decision` lifts
+  the envelope via the shared balanced-brace scanner, **rejects any UNKNOWN top-level key
+  (fail the WHOLE envelope closed)**, and validates each KNOWN section by REUSING its existing
+  validator (`parse_intent_proposal`, `parse_task_slots`, `parse_agent_slots`,
+  `parse_plugin_ref`, `parse_permission_slots`, `parse_assign_slots`, `parse_update_slots`) —
+  no weaker duplicate logic. An **invalid nested section is dropped** (its specialized/
+  deterministic fallback applies) while the rest of the envelope stands; an envelope with zero
+  usable sections is a failure. The carried wording is validated LATER against the turn's
+  actual `ClarifyKind` through the SAME `parse_clarify`/`reconcile_clarify` chokepoint
+  (`validated_wording`), so a clarify is still forced to one question and an action-claim is
+  still rejected.
+- **Both brains feed one parser.** OpenRouter via `ai::decide_prime_via_openrouter`; the
+  Claude/Codex CLI brains via `server.rs` `decide_prime_via_cli` → the no-leak
+  `parse_cli_decision` (`parse_adapter_result` FIRST, so the raw `--output-format json`
+  envelope never reaches the parser or the chat).
+- **Wired in `run_prime` (server.rs), unified-first.** The continuation pre-flight + board
+  snapshot run first; then ONE unified decision call on the COMBINED message (continuation) or
+  the raw message, grounded with the live board. Its `classification` becomes the intent
+  proposal and its slots become the `BrainSlotProposals` bundle fed to the unchanged
+  `prime_turn_with_brain` chokepoint; a carried clarify wording is reused by `run_clarify_polish`
+  with NO second call. **Fallback:** when the unified call returns nothing usable (no brain,
+  disabled, malformed/empty envelope, unknown top-level key), the prior specialized stack runs —
+  a dedicated intent call, then a dedicated slot call for the resolved intent, then the dedicated
+  clarify polish — so behavior is byte-for-byte the old path whenever the unified shape is
+  unavailable (`Local` always takes this path, exactly as before).
+- **Flows now on the unified call:** intent + task/agent/plugin/permission/assign/update slots +
+  clarify/brainstorm wording, all in one round-trip. **Still specialized (documented):** the
+  free-form conversational reply for non-clarify chat (`shape_reply`/`run_cli_brain`) and the
+  advisory multi-step plan-card polish (`polish_proposal`) — neither is part of the
+  intent+slots+wording decision; folding them in is a future slice.
+- **Safety invariants (binding).** The envelope changes only HOW the brain is asked and parsed,
+  NOT authority. The fail-closed intent gate (`reconcile_intent`) still runs at the kernel
+  chokepoint (guarded chat can never become work); every slot is still reconciled against the
+  live state and the kernel uses ONLY the sections matching the turn it produces; risky
+  plugin/permission slots stay advisory behind a human approval; the wording stays action-free
+  and schema-validated. The brain authors a *proposal*; `decide` → `prime_execute` (or a human
+  approval) remains the SOLE path that changes durable state.
+- **UI.** A single concise `🧠 one brain decision · <source>` chip (the pure
+  `decisionSourceLabel` helper + `PrimeResponse.decision_source`) is shown ONLY when the one
+  unified call carried more than one proposal; the existing per-section chips (intent, slots,
+  wording) still attribute each piece. No new panel.
+
+Pinned by the `prime_decision` unit tests (full valid decision, noisy-reply extraction, unknown
+top-level fail-closed, invalid/objectless nested section dropped, off-allowlist intent label
+dropped, no-usable-section error, `validated_wording` reuse, assign/update reuse); the kernel
+integration tests (`unified_decision_creates_a_task_with_title_and_details_in_one_envelope`,
+`unified_decision_updates_a_task_by_id_in_one_envelope`,
+`unified_decision_supplies_validated_clarify_wording_in_one_envelope`,
+`unified_decision_ideation_still_creates_nothing`); the server seam tests (`cli_decision_*`:
+valid envelope, plain JSON, error envelope/prose, unknown-top-level fail-closed); and the
+dashboard `decisionSourceLabel` test. No test calls a real provider.
+
 ## Current Prime brain stack
 
 The end-to-end shape of one Prime turn, with the brain strictly additive and the
-deterministic kernel always the authority:
+deterministic kernel always the authority. **A configured brain now answers the structured
+turn in ONE unified decision call** (`prime_decision`: intent + applicable slots + optional
+wording), with the per-section specialized calls below as the fallback when that envelope is
+unavailable:
 
 0. **Clarification context** — BEFORE classifying, `prime_turn_with_brain` checks for a
    bounded pending clarification from the prior turn (`prime_clarify_memory::resolve_pending`,

@@ -1583,6 +1583,11 @@ export interface ReluxPrimeTurn {
   /// small "waiting for: …" chip with a cancel action; the next message is read as the
   /// answer and continues the original request. Absent when nothing is pending.
   pending_clarification?: ReluxPendingClarification;
+  /// Present ONLY when a single UNIFIED brain decision carried more than one proposal this
+  /// turn (intent + slots + wording answered in one provider call). The value is the model id
+  /// / CLI brain label. The chat renders one concise "one brain decision · <source>" chip; the
+  /// per-section chips still attribute each piece. Provenance only; never affects state.
+  decision_source?: string;
 }
 
 export const reluxPrime = {

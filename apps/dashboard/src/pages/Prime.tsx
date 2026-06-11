@@ -8,7 +8,7 @@ import {
   type ReluxPrimeSuggestion,
   type ReluxPrimeTurn,
 } from "../api";
-import { brainSourceLabel, hasSteps, intentProvenance, pendingClarificationLabel, polishProvenance, proposalDisplaySummary, replyPolishLabel, slotProvenance, stepDisplayTitle, updateProvenance } from "../prime";
+import { brainSourceLabel, decisionSourceLabel, hasSteps, intentProvenance, pendingClarificationLabel, polishProvenance, proposalDisplaySummary, replyPolishLabel, slotProvenance, stepDisplayTitle, updateProvenance } from "../prime";
 import { workTaskHref, workRunHref } from "../routing";
 import { PrimeAutonomyPanel } from "../components/PrimeAutonomyPanel";
 import { OrchestrationPanel } from "../components/OrchestrationPanel";
@@ -339,6 +339,18 @@ function PrimeTurnCard({
             title="Prime's brain phrased this reply — validated wording only, no action"
           >
             🧠 {replyPolishLabel(turn.reply_polish)}
+          </span>
+        )}
+        {/* One concise chip when a SINGLE unified brain decision produced this turn's
+            intent + slots + wording in one call (vs. the prior serial calls). The
+            per-section chips above still attribute each piece. */}
+        {decisionSourceLabel(turn.decision_source) && (
+          <span
+            className="badge done"
+            style={{ fontSize: 9 }}
+            title="Intent, slots, and wording came from one validated brain decision"
+          >
+            🧠 {decisionSourceLabel(turn.decision_source)}
           </span>
         )}
         <span className="muted" style={{ fontSize: 9, marginLeft: "auto" }} title="Which provider produced this reply">

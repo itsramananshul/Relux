@@ -1597,6 +1597,12 @@ struct PrimeResponse {
     /// non-secret user text only. Absent when no clarification is pending.
     #[serde(skip_serializing_if = "Option::is_none")]
     pending_clarification: Option<relux_core::PendingClarification>,
+    /// Present ONLY when a single UNIFIED brain decision carried more than one proposal this
+    /// turn (intent + slots + wording answered in one provider call). The value is the model
+    /// id / CLI brain label. The chat renders one concise "one brain decision · <source>" chip;
+    /// the per-section chips still attribute each piece. Provenance only; never affects state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decision_source: Option<String>,
 }
 
 /// Provenance for a brain-polished clarify / brainstorm reply: which KIND of wording
@@ -1652,29 +1658,12 @@ async fn run_prime(
         None
     };
 
-    // 0b. Brain-mediated intent proposal (OUTSIDE the lock — it can involve a slow
-    // network/process call). When a real brain is configured it *proposes* the
-    // intent of this message; the kernel then validates and reconciles it behind
-    // the fail-closed gate. ANY failure (no key, disabled, timeout, off-allowlist
-    // reply) yields `None`, and the kernel falls back to the deterministic keyword
-    // classifier — the brain is strictly additive (§10.1, §17.1).
-    let intent_proposal = match brain {
-        relux_kernel::PrimeBrain::Openrouter => {
-            relux_kernel::classify_intent_via_openrouter(&ai_config, &message).await
-        }
-        relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli => {
-            classify_intent_via_cli(brain, cli_status.clone(), &message).await
-        }
-        relux_kernel::PrimeBrain::Local => None,
-    };
-
-    // 0b2. Continuation pre-flight (a short read under the lock). If this message
-    // CONTINUES a pending clarification, the slot brain must be dispatched on the
-    // COMBINED message + the recorded intent — exactly what the kernel will reclassify
-    // under the lock — not on the bare answer. We also snapshot the live board so the
-    // assignment prompt can ground against real ids. The kernel re-decides the
-    // continuation authoritatively under its own lock; this preview only steers which
-    // message/intent the (slow, off-lock) slot brain is asked about.
+    // 0b. Continuation pre-flight + board snapshot (a short read under the lock). If this
+    // message CONTINUES a pending clarification, the brain must reason about the COMBINED
+    // message + the recorded intent — exactly what the kernel will reclassify under the lock —
+    // not the bare answer. The board summary grounds an assignment/update against real ids. The
+    // kernel re-decides the continuation authoritatively under its own lock; this preview only
+    // steers which message the (slow, off-lock) brain is asked about.
     let (continuation, board_summary) = {
         let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut kernel = {
@@ -1686,36 +1675,85 @@ async fn run_prime(
         let summary = kernel.inspect_state();
         (preview, summary)
     };
-
-    // 0c. Brain-assisted SLOT extraction (OUTSIDE the lock — another slow
-    // network/process call). The brain is asked about the message and intent the kernel
-    // will actually act on: on a continuation, the COMBINED message + the recorded
-    // intent; otherwise the raw message + its RESOLVED intent (deterministic
-    // classification reconciled with the brain's proposal, exactly as the kernel will
-    // redo it). There is no point asking for slots on a chat/status/plan turn. The brain
-    // only *proposes* slots; the kernel validates each against the live state behind the
-    // fail-closed gate, and a slot bundle marked `continuation` is honored ONLY on a
-    // continuation. ANY failure yields `None` and the deterministic outcome stands —
-    // strictly additive (§10.1, §10.2, §17.1).
     let is_continuation = continuation.is_some();
-    let (slot_message, slot_intent) = match continuation.as_ref() {
-        Some((combined, intent)) => (combined.clone(), intent.clone()),
-        None => {
-            let deterministic_intent = relux_kernel::classify_intent(&message);
-            let resolved_intent = match intent_proposal.as_ref() {
-                Some(p) => {
-                    relux_kernel::reconcile_intent(deterministic_intent.clone(), p, &message).0
-                }
-                None => deterministic_intent,
-            };
-            (message.clone(), resolved_intent)
-        }
+    // The message the brain reasons about: the COMBINED message on a continuation, else raw.
+    let decision_message = match continuation.as_ref() {
+        Some((combined, _)) => combined.clone(),
+        None => message.clone(),
     };
-    let (task_slots, agent_slots, plugin_ref, permission_slots, assign_slots, update_slots) = {
+
+    // 0c. UNIFIED brain decision (OUTSIDE the lock — ONE slow network/process call). When a
+    // brain is configured it answers the WHOLE turn at once: the proposed intent + whichever
+    // slots apply + optional clarifying wording, in ONE validated envelope — the Hermes/Codex
+    // "one response carries the answer and the structured actions" shape, replacing the prior
+    // serial intent → slot → wording calls. The model only *proposes*; the kernel reconciles
+    // intent + every slot against the live state behind the fail-closed gate. ANY failure →
+    // `None`, and the specialized per-section stack below runs as the fallback (§10.1, §10.2,
+    // §17.1).
+    let decision = match brain {
+        relux_kernel::PrimeBrain::Openrouter => {
+            relux_kernel::decide_prime_via_openrouter(&ai_config, &decision_message, &board_summary)
+                .await
+        }
+        relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli => {
+            decide_prime_via_cli(brain, cli_status.clone(), &decision_message, &board_summary).await
+        }
+        relux_kernel::PrimeBrain::Local => None,
+    };
+
+    // 0d. Derive the intent proposal + the slot bundle. PREFERRED: the one unified decision
+    // (no further brain calls this turn). FALLBACK: when the unified call produced nothing
+    // usable (no brain, disabled, malformed/empty envelope), the prior specialized stack runs —
+    // a dedicated intent call, then a dedicated slot call for the resolved intent — so behavior
+    // is byte-for-byte the old path whenever the unified shape is unavailable. Either way the
+    // kernel validates every section; it uses only the sections that match the turn it produces
+    // (a `task` proposal on an assign turn is simply ignored), and on a continuation it drops
+    // the intent proposal and keeps the slot bundle only because `continuation` matches below.
+    let intent_proposal: Option<relux_kernel::BrainIntentProposal>;
+    let mut task_slots: Option<relux_kernel::BrainTaskSlots> = None;
+    let mut agent_slots: Option<relux_kernel::BrainAgentSlots> = None;
+    let mut plugin_ref: Option<relux_kernel::BrainPluginRef> = None;
+    let mut permission_slots: Option<relux_kernel::BrainPermissionSlots> = None;
+    let mut assign_slots: Option<relux_kernel::BrainAssignSlots> = None;
+    let mut update_slots: Option<relux_kernel::BrainUpdateSlots> = None;
+    if let Some(d) = decision.as_ref() {
+        intent_proposal = d.classification.clone();
+        task_slots = d.task.clone();
+        agent_slots = d.agent.clone();
+        plugin_ref = d.plugin.clone();
+        permission_slots = d.permission.clone();
+        assign_slots = d.assign.clone();
+        update_slots = d.update.clone();
+    } else {
+        // Specialized fallback (the prior multi-call stack), reached only when the unified
+        // decision was unavailable. A dedicated intent proposal, then a dedicated slot call for
+        // the message + intent the kernel will act on.
+        intent_proposal = match brain {
+            relux_kernel::PrimeBrain::Openrouter => {
+                relux_kernel::classify_intent_via_openrouter(&ai_config, &message).await
+            }
+            relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli => {
+                classify_intent_via_cli(brain, cli_status.clone(), &message).await
+            }
+            relux_kernel::PrimeBrain::Local => None,
+        };
+        let (slot_message, slot_intent) = match continuation.as_ref() {
+            Some((combined, intent)) => (combined.clone(), intent.clone()),
+            None => {
+                let deterministic_intent = relux_kernel::classify_intent(&message);
+                let resolved_intent = match intent_proposal.as_ref() {
+                    Some(p) => {
+                        relux_kernel::reconcile_intent(deterministic_intent.clone(), p, &message).0
+                    }
+                    None => deterministic_intent,
+                };
+                (message.clone(), resolved_intent)
+            }
+        };
         use relux_core::PrimeIntent as I;
         match slot_intent {
             I::TaskCreation | I::CreateAndRunTask => {
-                let p = match brain {
+                task_slots = match brain {
                     relux_kernel::PrimeBrain::Openrouter => {
                         relux_kernel::extract_task_slots_via_openrouter(&ai_config, &slot_message)
                             .await
@@ -1725,10 +1763,9 @@ async fn run_prime(
                     }
                     relux_kernel::PrimeBrain::Local => None,
                 };
-                (p, None, None, None, None, None)
             }
             I::AgentCreation => {
-                let p = match brain {
+                agent_slots = match brain {
                     relux_kernel::PrimeBrain::Openrouter => {
                         relux_kernel::extract_agent_slots_via_openrouter(&ai_config, &slot_message)
                             .await
@@ -1738,10 +1775,9 @@ async fn run_prime(
                     }
                     relux_kernel::PrimeBrain::Local => None,
                 };
-                (None, p, None, None, None, None)
             }
             I::PluginInstallation => {
-                let p = match brain {
+                plugin_ref = match brain {
                     relux_kernel::PrimeBrain::Openrouter => {
                         relux_kernel::extract_plugin_ref_via_openrouter(&ai_config, &slot_message)
                             .await
@@ -1751,10 +1787,9 @@ async fn run_prime(
                     }
                     relux_kernel::PrimeBrain::Local => None,
                 };
-                (None, None, p, None, None, None)
             }
             I::PermissionChange => {
-                let p = match brain {
+                permission_slots = match brain {
                     relux_kernel::PrimeBrain::Openrouter => {
                         relux_kernel::extract_permission_slots_via_openrouter(
                             &ai_config,
@@ -1768,10 +1803,9 @@ async fn run_prime(
                     }
                     relux_kernel::PrimeBrain::Local => None,
                 };
-                (None, None, None, p, None, None)
             }
             I::AssignTask => {
-                let p = match brain {
+                assign_slots = match brain {
                     relux_kernel::PrimeBrain::Openrouter => {
                         relux_kernel::extract_assign_slots_via_openrouter(
                             &ai_config,
@@ -1791,10 +1825,9 @@ async fn run_prime(
                     }
                     relux_kernel::PrimeBrain::Local => None,
                 };
-                (None, None, None, None, p, None)
             }
             I::TaskUpdate => {
-                let p = match brain {
+                update_slots = match brain {
                     relux_kernel::PrimeBrain::Openrouter => {
                         relux_kernel::extract_update_slots_via_openrouter(
                             &ai_config,
@@ -1814,11 +1847,10 @@ async fn run_prime(
                     }
                     relux_kernel::PrimeBrain::Local => None,
                 };
-                (None, None, None, None, None, p)
             }
-            _ => (None, None, None, None, None, None),
+            _ => {}
         }
-    };
+    }
 
     // 1. Run the deterministic kernel turn (must happen under the lock), passing
     // the optional brain intent proposal AND the slot bundle so the kernel reconciles
@@ -1865,7 +1897,24 @@ async fn run_prime(
     // §17.1). The wall is intact: this only ever runs on a non-actionful turn.
     let clarify_kind = relux_kernel::clarify_polish_kind(&turn);
     let (outcome, reply_polish) = if let Some(kind) = clarify_kind {
-        run_clarify_polish(brain, &ai_config, cli_status.clone(), &message, &turn, kind).await
+        // Prefer the wording the UNIFIED decision already carried (no extra brain call); it is
+        // validated by the SAME `parse_clarify`/`reconcile_clarify` chokepoint via
+        // `validated_wording`. When the unified envelope omitted wording or it failed
+        // validation, fall back to a dedicated clarify-polish call. A failure on either path
+        // leaves the grounded deterministic wording in place.
+        let precomputed = decision
+            .as_ref()
+            .and_then(|d| d.validated_wording(kind, &turn.reply));
+        run_clarify_polish(
+            brain,
+            &ai_config,
+            cli_status.clone(),
+            &message,
+            &turn,
+            kind,
+            precomputed,
+        )
+        .await
     } else if !relux_kernel::is_actionful(&turn)
         && matches!(
             brain,
@@ -1947,6 +1996,15 @@ async fn run_prime(
         relux_kernel::IntentSource::Deterministic => None,
     };
 
+    // The unified-decision provenance: shown ONLY when ONE brain call produced more than one
+    // proposal (the thing that distinguishes the unified path from the prior serial calls). The
+    // per-section chips already attribute each piece; this names the single decision behind
+    // them, so the chat shows one concise "from one brain decision" label instead of a panel.
+    let decision_source = decision
+        .as_ref()
+        .filter(|d| d.section_count() >= 2)
+        .map(|_| slot_source_label(brain, &ai_config));
+
     Ok(Json(PrimeResponse {
         turn: final_turn,
         state: summary,
@@ -1956,6 +2014,7 @@ async fn run_prime(
         intent_source: intent_source_label,
         reply_polish,
         pending_clarification,
+        decision_source,
     }))
 }
 
@@ -2492,6 +2551,44 @@ fn parse_cli_permission_slots(
     relux_kernel::parse_permission_slots(&parsed.text).ok()
 }
 
+/// Produce ONE UNIFIED Prime decision (intent + every applicable slot + optional wording) via
+/// a local CLI brain (Claude / Codex) in a single spawn, validated through the SAME no-leak
+/// boundary as the specialized slot paths. Any failure → `None` (the caller falls back to the
+/// specialized intent / slot / wording calls). The kernel still validates each section against
+/// the live state behind the fail-closed gate.
+async fn decide_prime_via_cli(
+    brain: relux_kernel::PrimeBrain,
+    status: Option<relux_core::AdapterRuntimeStatus>,
+    message: &str,
+    summary: &relux_core::StateSummary,
+) -> Option<relux_kernel::PrimeBrainDecision> {
+    let (stdout, kind) = cli_brain_json(
+        brain,
+        status,
+        relux_kernel::build_decision_prompt(message, summary),
+    )
+    .await?;
+    parse_cli_decision(&stdout, kind)
+}
+
+/// Lift a validated unified decision out of a CLI brain's captured `stdout`, or `None`. The
+/// no-leak parse boundary, kept pure so it is pinned without spawning a process:
+/// [`parse_adapter_result`] lifts the human text out of the `--output-format json` envelope
+/// (degrading to raw prose otherwise, exactly as the other CLI seams do), an envelope that
+/// reported an error is dropped, and the lifted text is validated by
+/// [`relux_kernel::parse_decision`] (which itself rejects unknown top-level keys and validates
+/// each section through its existing allowlist). The raw envelope never escapes this function.
+fn parse_cli_decision(
+    stdout: &str,
+    kind: relux_core::AdapterKind,
+) -> Option<relux_kernel::PrimeBrainDecision> {
+    let parsed = relux_core::parse_adapter_result(stdout, kind);
+    if parsed.is_error == Some(true) {
+        return None;
+    }
+    relux_kernel::parse_decision(&parsed.text).ok()
+}
+
 /// The provenance label for brain-extracted slots: the OpenRouter model id, or the
 /// CLI brain's display label. Surfaced on the slot card the way the intent/polish
 /// provenance is. `Local` never produces slots, so it degrades to a neutral label.
@@ -2521,16 +2618,23 @@ async fn run_clarify_polish(
     message: &str,
     turn: &PrimeTurn,
     kind: relux_kernel::ClarifyKind,
+    precomputed: Option<String>,
 ) -> (AiOutcome, Option<ReplyPolishProvenance>) {
     let deterministic = turn.reply.clone();
-    let polished = match brain {
-        relux_kernel::PrimeBrain::Openrouter => {
-            relux_kernel::polish_clarify_via_openrouter(cfg, message, &deterministic, kind).await
-        }
-        relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli => {
-            polish_clarify_via_cli(brain, status, message, &deterministic, kind).await
-        }
-        relux_kernel::PrimeBrain::Local => None,
+    let polished = match precomputed {
+        // The unified decision already produced validated wording for this turn — use it
+        // directly, with no second brain call (the one-call-per-turn win).
+        Some(text) => Some(text),
+        None => match brain {
+            relux_kernel::PrimeBrain::Openrouter => {
+                relux_kernel::polish_clarify_via_openrouter(cfg, message, &deterministic, kind)
+                    .await
+            }
+            relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli => {
+                polish_clarify_via_cli(brain, status, message, &deterministic, kind).await
+            }
+            relux_kernel::PrimeBrain::Local => None,
+        },
     };
 
     match polished {
@@ -6126,6 +6230,71 @@ mod tests {
             )
             .is_none(),
             "an action claim must fail closed"
+        );
+    }
+
+    // --- Unified decision: the no-leak parse boundary --------------------------
+    //
+    // These pin `parse_cli_decision` — the composition `decide_prime_via_cli` runs after the
+    // spawn — WITHOUT spawning a real CLI. The raw `--output-format json` envelope must never
+    // reach the validated decision, and each section must survive only through its existing
+    // allowlist validator.
+
+    #[test]
+    fn cli_decision_lifted_from_a_result_envelope() {
+        // The Claude CLI wraps the unified decision JSON inside its result envelope;
+        // parse_adapter_result lifts the inner string, then parse_decision validates each
+        // section. One envelope carries intent + task slots together.
+        let inner = r#"{\"classification\":{\"intent\":\"task_creation\",\"confidence\":0.9},\"task\":{\"title\":\"Fix the login redirect bug\",\"priority\":8,\"confidence\":0.9}}"#;
+        let stdout = format!(r#"{{"type":"result","is_error":false,"result":"{inner}","session_id":"abc","duration_ms":12}}"#);
+        let d = parse_cli_decision(&stdout, relux_core::AdapterKind::ClaudeCli)
+            .expect("a valid envelope yields a validated decision");
+        assert_eq!(
+            d.classification.as_ref().unwrap().intent,
+            relux_core::PrimeIntent::TaskCreation
+        );
+        let task = d.task.as_ref().unwrap();
+        assert_eq!(task.title, "Fix the login redirect bug");
+        assert_eq!(task.priority, Some(8));
+        // No envelope scaffolding leaks into the validated sections.
+        assert!(!task.title.contains("session_id") && !task.title.contains("\"type\""));
+    }
+
+    #[test]
+    fn cli_decision_plain_json_from_codex_text_mode() {
+        let stdout = r#"{"classification":{"intent":"brainstorming","confidence":0.7},"wording":{"text":"What outcome are you after?","confidence":0.8}}"#;
+        let d = parse_cli_decision(stdout, relux_core::AdapterKind::CodexCli)
+            .expect("raw JSON prose still validates");
+        assert_eq!(
+            d.classification.as_ref().unwrap().intent,
+            relux_core::PrimeIntent::Brainstorming
+        );
+        assert!(d.wording.is_some());
+    }
+
+    #[test]
+    fn cli_decision_error_envelope_and_prose_yield_nothing() {
+        let err = r#"{"type":"result","is_error":true,"result":"rate limited","session_id":"x"}"#;
+        assert!(
+            parse_cli_decision(err, relux_core::AdapterKind::ClaudeCli).is_none(),
+            "an error envelope must yield no decision"
+        );
+        let prose = r#"{"type":"result","is_error":false,"result":"Sure, here is what I think."}"#;
+        assert!(
+            parse_cli_decision(prose, relux_core::AdapterKind::ClaudeCli).is_none(),
+            "prose with no JSON object must not produce a decision"
+        );
+    }
+
+    #[test]
+    fn cli_decision_unknown_top_level_field_fails_closed() {
+        // A smuggled un-modeled top-level key fails the WHOLE envelope at the seam, so the
+        // turn falls back to the specialized paths rather than acting on a partial decision.
+        let inner = r#"{\"classification\":{\"intent\":\"task_creation\",\"confidence\":0.9},\"execute\":true}"#;
+        let stdout = format!(r#"{{"type":"result","is_error":false,"result":"{inner}"}}"#);
+        assert!(
+            parse_cli_decision(&stdout, relux_core::AdapterKind::ClaudeCli).is_none(),
+            "an unknown top-level field must fail the envelope closed"
         );
     }
 

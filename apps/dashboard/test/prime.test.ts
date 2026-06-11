@@ -11,6 +11,7 @@ import {
   slotProvenance,
   brainSourceLabel,
   replyPolishLabel,
+  decisionSourceLabel,
   pendingClarificationLabel,
   updateChangeSummary,
   updateProvenance,
@@ -162,6 +163,18 @@ test("replyPolishLabel reads honestly per kind and source, and is null when abse
   assert.equal(replyPolishLabel(undefined), null);
   // An unstamped source degrades to the generic brain label, never blank.
   assert.equal(replyPolishLabel({ kind: "clarification", source: "   " }), "brain-worded question · AI brain");
+});
+
+test("decisionSourceLabel names the one unified decision, and is null when absent", () => {
+  // A single unified brain call carried multiple proposals -> one concise chip.
+  assert.equal(
+    decisionSourceLabel("anthropic/claude-3.5-haiku"),
+    "one brain decision · anthropic/claude-3.5-haiku",
+  );
+  assert.equal(decisionSourceLabel("Claude CLI"), "one brain decision · Claude CLI");
+  // No unified decision (serial calls / no brain) -> nothing to attribute.
+  assert.equal(decisionSourceLabel(undefined), null);
+  assert.equal(decisionSourceLabel("   "), null);
 });
 
 test("polishProvenance is null without a polish overlay and generic when the source is unrecorded", () => {

@@ -8157,6 +8157,125 @@ mod tests {
         assert!(provenance.assignee.is_none());
     }
 
+    // --- Unified brain decision (one envelope → intent + slots + wording) -----------------
+    // These exercise the full unified path end-to-end EXCEPT the provider call: a realistic
+    // synthetic envelope is parsed by `parse_decision`, decomposed into the SAME bundle the
+    // server builds, and fed through the unchanged `prime_turn_with_brain` chokepoint. No test
+    // calls a real provider.
+
+    #[test]
+    fn unified_decision_creates_a_task_with_title_and_details_in_one_envelope() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let d = crate::prime_decision::parse_decision(
+            r#"{"classification":{"intent":"task_creation","confidence":0.9},
+                "task":{"title":"Fix the login redirect bug","details":"Blank page after SSO.","priority":8,"confidence":0.9}}"#,
+        )
+        .unwrap();
+        // One envelope carried the intent AND the slots; the kernel reconciles both.
+        let (turn, src) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "handle the login redirect mess",
+                d.classification.as_ref(),
+                BrainSlotProposals {
+                    task: d.task.as_ref(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::TaskCreation);
+        assert_eq!(src, crate::prime_intent::IntentSource::Brain);
+        let task = k.task(&turn.created_task.unwrap()).unwrap();
+        assert_eq!(task.title, "Fix the login redirect bug");
+        assert_eq!(task.priority, 8);
+        assert_eq!(
+            task.input.get("details").and_then(|v| v.as_str()),
+            Some("Blank page after SSO.")
+        );
+    }
+
+    #[test]
+    fn unified_decision_updates_a_task_by_id_in_one_envelope() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let task_id = k
+            .prime_turn(&ctx, "create a task to summarize the README")
+            .unwrap()
+            .created_task
+            .expect("a task was created");
+        // The deterministic rail cannot resolve "bump the readme task priority" (no id), so it
+        // clarifies; the unified decision carries the resolved id + field and promotes it.
+        let d = crate::prime_decision::parse_decision(&format!(
+            r#"{{"classification":{{"intent":"task_update","confidence":0.9}},
+                "update":{{"task_id":"{}","priority":8,"confidence":0.9}}}}"#,
+            task_id.as_str()
+        ))
+        .unwrap();
+        let (turn, _src) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "bump the readme task priority",
+                d.classification.as_ref(),
+                BrainSlotProposals {
+                    update: d.update.as_ref(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::TaskUpdate);
+        assert_eq!(turn.disposition, PrimeDisposition::Executed);
+        assert_eq!(k.task(&task_id).unwrap().priority, 8);
+    }
+
+    #[test]
+    fn unified_decision_supplies_validated_clarify_wording_in_one_envelope() {
+        let (mut k, ctx) = prime_chat_kernel();
+        // An under-specified assignment clarifies deterministically.
+        let (turn, _src) = k
+            .prime_turn_with_brain(&ctx, "assign this task", None, BrainSlotProposals::default())
+            .unwrap();
+        assert_eq!(turn.disposition, PrimeDisposition::NeedsClarification);
+        let kind = crate::prime_clarify::clarify_polish_kind(&turn).expect("a clarify turn");
+        // The wording the unified envelope carried is validated through the SAME clarify
+        // chokepoint (exactly one question, no action claim) — no separate polish call.
+        let d = crate::prime_decision::parse_decision(
+            r#"{"wording":{"text":"Which task should I assign, and to whom?","confidence":0.9}}"#,
+        )
+        .unwrap();
+        let polished = d
+            .validated_wording(kind, &turn.reply)
+            .expect("validated wording");
+        assert!(polished.ends_with('?'));
+        assert_ne!(polished, turn.reply);
+    }
+
+    #[test]
+    fn unified_decision_ideation_still_creates_nothing() {
+        // Even a maximally confident unified decision proposing task creation + slots cannot
+        // mint work from guarded musing: the fail-closed intent gate keeps it a conversation.
+        let (mut k, ctx) = prime_chat_kernel();
+        let d = crate::prime_decision::parse_decision(
+            r#"{"classification":{"intent":"task_creation","confidence":0.99},
+                "task":{"title":"Refactor the auth module","confidence":0.99}}"#,
+        )
+        .unwrap();
+        let (turn, src) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "we should refactor the auth module",
+                d.classification.as_ref(),
+                BrainSlotProposals {
+                    task: d.task.as_ref(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::Brainstorming);
+        assert!(turn.created_task.is_none());
+        assert!(turn.slots.is_none());
+        assert_eq!(src, crate::prime_intent::IntentSource::Deterministic);
+        assert_eq!(k.task_count(), 0, "ideation must not create work");
+    }
+
     fn agent_prop(name: &str, confidence: f32) -> crate::prime_agent_slots::BrainAgentSlots {
         crate::prime_agent_slots::BrainAgentSlots {
             name: name.to_string(),
