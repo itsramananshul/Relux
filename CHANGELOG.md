@@ -9,6 +9,24 @@ once a stable release is cut.
 
 ### Added
 
+- **Prime plan previews render as a proposal card, not just prose.** Implements
+  `RELUX_MASTER_PLAN.md` §11.1 (Prime Chat shows *"plugin/action results"* and
+  *"suggested next actions"*) and §10 (planning layer). A `PlanRequest` turn now
+  carries a STRUCTURED, action-free `proposal` on the wire (`PrimeProposal` /
+  `PrimeProposalStep` in `relux-core`): the goal, whether it is a genuine
+  `multi_step` plan, the ordered steps (1-based index, title, the specialist role,
+  and the agent each would land on — `"prime"` when no specialist fits), and the
+  distinct agents. The dashboard Prime page renders it as a compact B&W **plan
+  preview** card — goal heading, an *N steps across M agents* summary, and the
+  proposed steps with their role + assignee. **Nothing runs from showing it:** the
+  card commits nothing; the explicit **Create these tasks** (multi-step) /
+  **Turn this into a task** (single-step) button — still a pre-written `send:false`
+  suggestion — is the lone commit path, keyed off the SAME decomposition the card
+  shows. The proposal carries no action and is omitted on every non-plan turn, so
+  existing clients see the same JSON. New core/kernel tests pin the wire shape
+  (present for a plan, absent for normal chat/task-creation, descriptive-only) and
+  `apps/dashboard/test/prime.test.ts` pins the card helpers; dashboard bundle
+  rebuilt into `crates/relix-web-bridge/dashboard-dist`.
 - **Prime suggested next actions — one-click buttons replace "type this" copy.**
   Implements `RELUX_MASTER_PLAN.md` §11.1 (Prime Chat shows *"Prime suggested next
   actions"*), with §10.5 (Conversation Rules) and §17.1 (smart & grounded). Each

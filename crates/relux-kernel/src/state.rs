@@ -3412,6 +3412,7 @@ impl KernelState {
                 tool_output: None,
                 tool_error: None,
                 suggested_actions: Vec::new(),
+                proposal: None,
             },
             PrimePlan::Clarify { text } => PrimeTurn {
                 intent,
@@ -3426,6 +3427,7 @@ impl KernelState {
                 tool_output: None,
                 tool_error: None,
                 suggested_actions: Vec::new(),
+                proposal: None,
             },
             PrimePlan::Act { action, text } => self.prime_execute(ctx, intent, action, text)?,
             PrimePlan::Propose {
@@ -3458,6 +3460,7 @@ impl KernelState {
                     tool_output: None,
                     tool_error: None,
                     suggested_actions: Vec::new(),
+                    proposal: None,
                 }
             }
         };
@@ -3510,6 +3513,7 @@ impl KernelState {
                     tool_output: None,
                     tool_error: None,
                     suggested_actions: Vec::new(),
+                    proposal: None,
                 })
             }
             PrimeAction::CreateAndRunTask { title } => {
@@ -3539,6 +3543,7 @@ impl KernelState {
                     tool_output: None,
                     tool_error: None,
                     suggested_actions: Vec::new(),
+                    proposal: None,
                 })
             }
             PrimeAction::StartRun { task_id } => {
@@ -3561,6 +3566,7 @@ impl KernelState {
                     tool_output: None,
                     tool_error: None,
                     suggested_actions: Vec::new(),
+                    proposal: None,
                 })
             }
             PrimeAction::CreateAgent {
@@ -3592,6 +3598,7 @@ impl KernelState {
                     tool_output: None,
                     tool_error: None,
                     suggested_actions: Vec::new(),
+                    proposal: None,
                 })
             }
             PrimeAction::AssignTask { task_id, agent_id } => {
@@ -3612,6 +3619,7 @@ impl KernelState {
                     tool_output: None,
                     tool_error: None,
                     suggested_actions: Vec::new(),
+                    proposal: None,
                 })
             }
             PrimeAction::DiscoverTools => {
@@ -3636,6 +3644,7 @@ impl KernelState {
                     tool_output: None,
                     tool_error: None,
                     suggested_actions: Vec::new(),
+                    proposal: None,
                 })
             }
             PrimeAction::InvokeTool {
@@ -3662,6 +3671,7 @@ impl KernelState {
                         tool_output: None,
                         tool_error: None,
                         suggested_actions: Vec::new(),
+                        proposal: None,
                     })
                 }
                 Err(KernelError::OrchestrationNotMultiAgent) => Ok(PrimeTurn {
@@ -3677,6 +3687,7 @@ impl KernelState {
                     tool_output: None,
                     tool_error: None,
                     suggested_actions: Vec::new(),
+                    proposal: None,
                 }),
                 Err(e) => Err(e),
             },
@@ -3696,6 +3707,7 @@ impl KernelState {
                 tool_output: None,
                 tool_error: None,
                 suggested_actions: Vec::new(),
+                proposal: None,
             }),
         }
     }
@@ -3754,6 +3766,7 @@ impl KernelState {
                 tool_output,
                 tool_error,
                 suggested_actions: Vec::new(),
+                proposal: None,
             }
         };
 
@@ -5454,7 +5467,8 @@ fn attach_suggestions(
     if turn.intent == PrimeIntent::PlanRequest {
         let goal = plan_goal(message);
         let plan = relux_core::plan_orchestration(&goal, summary);
-        let suggestion = if plan.is_multi_agent() {
+        let multi = plan.is_multi_agent();
+        let suggestion = if multi {
             PrimeSuggestion {
                 label: "Create these tasks".to_string(),
                 message: format!("orchestrate {goal}"),
@@ -5468,6 +5482,36 @@ fn attach_suggestions(
             }
         };
         turn.suggested_actions.push(suggestion);
+
+        // Attach the reviewable plan preview as STRUCTURED data so the dashboard can
+        // render a card instead of parsing the prose reply (§10 planning layer,
+        // §11.1). It is built from the SAME `plan` the commit suggestion is keyed on,
+        // so the card shows exactly what "Create these tasks" would create. The
+        // proposal carries no action - it is informational only; the explicit
+        // suggestion above is the lone commit path (§10.5, §17.1). A single-step goal
+        // gets an empty-step proposal so the card can still name the goal and the
+        // one-task route honestly, without inventing a fan-out.
+        let steps: Vec<relux_core::PrimeProposalStep> = if multi {
+            plan.steps
+                .iter()
+                .enumerate()
+                .map(|(i, s)| relux_core::PrimeProposalStep {
+                    index: (i + 1) as u32,
+                    title: s.title.clone(),
+                    role: s.role.label().to_string(),
+                    agent: s.agent_id.clone().unwrap_or_else(|| "prime".to_string()),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let agents = if multi { plan.agent_labels() } else { Vec::new() };
+        turn.proposal = Some(relux_core::PrimeProposal {
+            goal,
+            multi_step: multi,
+            steps,
+            agents,
+        });
     }
 }
 
@@ -6509,6 +6553,87 @@ mod tests {
             .expect("brainstorming offers a promote-to-task button");
         assert_eq!(promote.message, "create a task to redo the onboarding flow");
         assert!(!promote.send, "promoting an idea pre-fills, never auto-sends");
+    }
+
+    #[test]
+    fn plan_request_attaches_a_structured_action_free_proposal() {
+        // §10 planning layer / §11.1: a plan request previews work as a STRUCTURED
+        // proposal (so the dashboard renders a card, not parsed prose) and creates
+        // NOTHING. The proposal mirrors the same decomposition the "Create these
+        // tasks" commit is keyed on, and a normal turn never carries it.
+        let (mut k, ctx) = prime_chat_kernel();
+        let ns = ctx.namespace.clone();
+        let adapter = PluginId::new("relux-adapter-local-prime");
+        for id in ["research-agent", "code-agent", "doc-agent"] {
+            k.create_agent(id, id, "specialist", &adapter, &ns, None, vec![])
+                .unwrap();
+        }
+
+        let before = k.task_count();
+        let turn = k
+            .prime_turn(
+                &ctx,
+                "plan out research the options, build a prototype, and write the docs",
+            )
+            .unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::PlanRequest);
+        // Action-free: the preview mints and runs nothing (§10.5, §17.1).
+        assert_eq!(turn.disposition, PrimeDisposition::Answered);
+        assert!(turn.created_task.is_none());
+        assert_eq!(k.task_count(), before, "a plan preview must not create work");
+
+        let proposal = turn.proposal.as_ref().expect("a plan request carries a proposal");
+        assert!(proposal.multi_step, "a genuine split is a multi-step plan");
+        assert!(
+            proposal.steps.len() >= 2,
+            "a multi-step plan lists its briefs: {:?}",
+            proposal.steps
+        );
+        // The steps are positioned and grounded in roles/agents - never invented.
+        assert_eq!(proposal.steps[0].index, 1);
+        assert!(!proposal.steps[0].role.is_empty());
+        assert!(!proposal.steps[0].agent.is_empty());
+        assert!(!proposal.agents.is_empty(), "the plan names its assignees");
+        // The proposal's goal is exactly what the commit suggestion re-wraps, so the
+        // previewed and committed plans decompose from identical input.
+        let commit = turn
+            .suggested_actions
+            .iter()
+            .find(|s| s.label == "Create these tasks")
+            .expect("a multi-step plan offers the explicit commit");
+        assert_eq!(commit.message, format!("orchestrate {}", proposal.goal));
+        assert!(!commit.send, "the commit pre-fills, never auto-sends");
+
+        // A normal turn never carries the proposal (the wire stays unchanged for
+        // existing clients).
+        let greet = k.prime_turn(&ctx, "hey").unwrap();
+        assert!(greet.proposal.is_none(), "a greeting carries no proposal");
+        let made = k
+            .prime_turn(&ctx, "create a task to summarize the README")
+            .unwrap();
+        assert!(
+            made.proposal.is_none(),
+            "task creation is not a plan preview - no proposal"
+        );
+    }
+
+    #[test]
+    fn plan_request_single_step_proposal_steers_to_one_task() {
+        // A goal that does not genuinely split is steered to the one-task path: the
+        // proposal is present (so the card can name the goal honestly) but flags
+        // multi_step=false with no fanned-out steps (§10.5).
+        let (mut k, ctx) = prime_chat_kernel();
+        let turn = k.prime_turn(&ctx, "plan out summarizing the README").unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::PlanRequest);
+        let proposal = turn.proposal.as_ref().expect("a plan request carries a proposal");
+        assert!(!proposal.multi_step, "a single piece of work is not a multi-step plan");
+        assert!(proposal.steps.is_empty(), "a single-step plan fans out nothing");
+        let one_task = turn
+            .suggested_actions
+            .iter()
+            .find(|s| s.label == "Turn this into a task")
+            .expect("a single-step plan offers the one-task route");
+        assert!(!one_task.send, "the one-task route pre-fills, never auto-sends");
     }
 
     #[test]

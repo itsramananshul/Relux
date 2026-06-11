@@ -4218,6 +4218,7 @@ mod tests {
             tool_output: None,
             tool_error: None,
             suggested_actions: Vec::new(),
+            proposal: None,
         }
     }
 
@@ -4941,6 +4942,7 @@ mod tests {
             tool_output: None,
             tool_error: None,
             suggested_actions: Vec::new(),
+            proposal: None,
         };
         let wire = serde_json::to_value(&turn).expect("PrimeTurn serializes");
         assert!(

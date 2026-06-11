@@ -153,6 +153,41 @@ The orchestration `Act` path (the commit target) and the formal approval-id
 `plan_request_single_step_steers_to_one_task`, and
 `plan_goal_round_trips_with_orchestration`.
 
+## Applied change (structured plan proposal on the wire + dashboard card)
+
+The plan-request rung above shipped the *preview as prose* in `PrimeTurn.reply`
+plus a "Create these tasks" suggestion; the dashboard could only render the prose
+and a generic button. Per master plan §11.1 (Prime Chat shows "plugin/action
+results" and "suggested next actions") and §10 (planning layer), a plan now also
+rides the wire as STRUCTURED, action-free data so the chat renders a real
+proposal card instead of parsing text.
+
+- **New `PrimeProposal` / `PrimeProposalStep`** (`relux-core`) — descriptive only:
+  `goal`, `multi_step`, ordered `steps` (1-based `index`, `title`, role `label`,
+  and the `agent` each would land on — `"prime"` when no specialist fits), and the
+  distinct `agents`. There is **no `PrimeAction`** in a proposal: it is a preview,
+  not a command.
+- **`PrimeTurn.proposal: Option<PrimeProposal>`** with `skip_serializing_if =
+  "Option::is_none"` — present **only** on a `PlanRequest` turn, omitted on every
+  other turn, so existing clients see exactly the JSON they did before.
+- **Built in `attach_suggestions`** (`relux-kernel/src/state.rs`) from the SAME
+  `plan_orchestration(&goal, summary)` the "Create these tasks" suggestion is keyed
+  on, so the card shows exactly what the commit would create. A single-step goal
+  gets a `multi_step: false` proposal with no steps (the card names the goal and
+  the one-task route honestly, without fanning out).
+- **Dashboard `ProposalCard`** (`apps/dashboard/src/pages/Prime.tsx` + pure helpers
+  in `src/prime.ts`) — a compact B&W card: goal heading, a `N steps across M
+  agents` summary, and the proposed steps with their role + assignee. The card
+  commits nothing; the explicit "Create these tasks" / "Turn this into a task"
+  button (still from `suggested_actions`) is the lone commit path. No echo, no
+  auto-run.
+
+Pinned by `prime_proposal_round_trips_and_carries_only_descriptive_data` and the
+extended `prime_suggestion_round_trips_and_is_omitted_when_empty` (core wire
+guard: a non-plan turn omits `proposal`), `plan_request_attaches_a_structured_
+action_free_proposal` and `plan_request_single_step_proposal_steers_to_one_task`
+(kernel), and `apps/dashboard/test/prime.test.ts` (card helpers).
+
 ## Next recommended slice
 
 When the optional LLM brain is enabled, let it *propose* the clarifying question

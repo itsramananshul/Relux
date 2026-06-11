@@ -4,9 +4,11 @@ import {
   reluxAi,
   reluxPrime,
   type ReluxAiStatus,
+  type ReluxPrimeProposal,
   type ReluxPrimeSuggestion,
   type ReluxPrimeTurn,
 } from "../api";
+import { proposalSummary, hasSteps } from "../prime";
 import { workTaskHref, workRunHref } from "../routing";
 import { PrimeAutonomyPanel } from "../components/PrimeAutonomyPanel";
 import { OrchestrationPanel } from "../components/OrchestrationPanel";
@@ -336,6 +338,13 @@ function PrimeTurnCard({
 
       <ToolResult turn={turn} />
 
+      {/* The reviewable plan proposal (RELUX_MASTER_PLAN §10 planning layer, §11.1):
+          a compact card showing the proposed shape — goal, steps, roles, and the
+          agents work would land on. It is informational only; nothing runs from
+          showing it. The explicit commit is the "Create these tasks" button below
+          (from suggested_actions), so the card never acts on its own (§10.5, §17.1). */}
+      {turn.proposal && <ProposalCard proposal={turn.proposal} />}
+
       {(turn.created_task || turn.started_run || turn.created_agent || turn.approval) && (
         <div className="row wrap" style={{ gap: 10, marginTop: 10, fontSize: 11 }}>
           {turn.created_task && (
@@ -382,6 +391,70 @@ function PrimeTurnCard({
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+// A compact, B&W plan proposal card (RELUX_MASTER_PLAN §10 planning layer, §11.1).
+// It renders STRICTLY what Prime's proposal carried — the goal as a heading, a
+// summary line, and (for a genuine multi-step plan) the proposed steps with their
+// role and the agent each would land on. It mints nothing and runs nothing: the
+// only commit path is Prime's explicit "Create these tasks" suggestion rendered
+// below the card. The card invents no step or assignee (§17.1).
+function ProposalCard({ proposal }: { proposal: ReluxPrimeProposal }) {
+  return (
+    <div
+      style={{
+        marginTop: 10,
+        border: "1px solid var(--border)",
+        borderRadius: 6,
+        padding: "10px 12px",
+      }}
+    >
+      <div className="row wrap" style={{ gap: 6, alignItems: "center", marginBottom: 4 }}>
+        <span className="badge todo" style={{ fontSize: 9 }} title="A reviewable plan — nothing is created yet">
+          plan preview
+        </span>
+        <span className="mono" style={{ fontSize: 13, fontWeight: 600 }}>
+          {proposal.goal}
+        </span>
+      </div>
+      <div className="muted" style={{ fontSize: 11, marginBottom: hasSteps(proposal) ? 8 : 0 }}>
+        {proposalSummary(proposal)}
+      </div>
+      {hasSteps(proposal) && (
+        <ol style={{ margin: 0, paddingLeft: 0, listStyle: "none" }}>
+          {proposal.steps.map((s) => (
+            <li
+              key={s.index}
+              className="row wrap"
+              style={{
+                gap: 8,
+                alignItems: "baseline",
+                padding: "4px 0",
+                borderTop: "1px solid var(--border)",
+                fontSize: 12,
+              }}
+            >
+              <span className="mono muted" style={{ fontSize: 11, minWidth: 16 }}>
+                {s.index}.
+              </span>
+              <span style={{ flex: 1, minWidth: 160 }}>{s.title}</span>
+              <span className="badge backlog" style={{ fontSize: 9 }} title="Specialist role this step needs">
+                {s.role}
+              </span>
+              <span className="mono muted" style={{ fontSize: 10 }} title="Agent this step would be assigned to">
+                → {s.agent}
+              </span>
+            </li>
+          ))}
+        </ol>
+      )}
+      {/* The honest contract: a preview commits nothing. The "Create these tasks"
+          (or one-task) button below is the only path that materializes work. */}
+      <div className="muted" style={{ fontSize: 10, marginTop: 8, fontStyle: "italic" }}>
+        Nothing is created yet — use the button below to commit this plan.
+      </div>
     </div>
   );
 }

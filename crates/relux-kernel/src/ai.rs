@@ -779,6 +779,7 @@ mod tests {
             tool_output: None,
             tool_error: None,
             suggested_actions: Vec::new(),
+            proposal: None,
         }
     }
 

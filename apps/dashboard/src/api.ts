@@ -1375,6 +1375,30 @@ export interface ReluxPrimeSuggestion {
   send: boolean;
 }
 
+// One proposed step of a reviewable plan (RELUX_MASTER_PLAN §10 planning layer,
+// §11.1). Purely descriptive: a 1-based position, the brief title, the role it
+// needs, and the agent it would land on ("prime" when no specialist fits). There
+// is no action here — a proposal is a preview, never a command.
+export interface ReluxPrimeProposalStep {
+  index: number;
+  title: string;
+  role: string;
+  agent: string;
+}
+
+// A reviewable, ACTION-FREE plan preview attached to a PlanRequest turn so the
+// chat can render a card instead of parsing the prose reply (§10 planning layer,
+// §11.1). `multi_step` is true for a genuine split (with `steps`/`agents`); false
+// steers to the one-task path with empty steps. Nothing is committed by showing
+// this — the explicit "Create these tasks" suggestion is the only commit path.
+// Omitted on every non-plan turn.
+export interface ReluxPrimeProposal {
+  goal: string;
+  multi_step: boolean;
+  steps: ReluxPrimeProposalStep[];
+  agents: string[];
+}
+
 export interface ReluxPrimeTurn {
   intent: string;
   reply: string;
@@ -1387,6 +1411,9 @@ export interface ReluxPrimeTurn {
   // One-click next actions Prime suggests for this turn (§11.1). Omitted when
   // there are none.
   suggested_actions?: ReluxPrimeSuggestion[];
+  // A reviewable, action-free plan preview, present ONLY on a plan-request turn
+  // (§10 planning layer, §11.1). Omitted on every other turn.
+  proposal?: ReluxPrimeProposal;
   // Tool fields: present only when Prime ran (or honestly refused) a tool this
   // turn. `invoked_tool` is "<plugin_id>/<tool_name>"; `tool_output` carries the
   // real kernel output; `tool_error` is an honest reason a tool did NOT run.

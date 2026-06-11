@@ -288,6 +288,56 @@ pub struct PrimeSuggestion {
     pub send: bool,
 }
 
+/// One proposed step of a reviewable plan, as a card row the dashboard renders.
+///
+/// Carries ONLY descriptive data - a 1-based position, the brief title, the
+/// specialist role it needs, and the agent it would land on. There is no
+/// executable action here: a proposal is a preview, not a command. The kernel
+/// builds these from the pure [`crate::OrchestrationPlan`] decomposition so the
+/// card shows exactly what the "Create these tasks" commit would create - never
+/// an invented step.
+///
+/// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 10 (planning layer),
+/// section 11.1 (Prime Chat - plugin/action results / suggested next actions).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrimeProposalStep {
+    /// The 1-based position shown in the card.
+    pub index: u32,
+    /// The brief's title.
+    pub title: String,
+    /// The specialist role label this step needs (e.g. `"research"`).
+    pub role: String,
+    /// The agent this step would be assigned to, or `"prime"` when no specialist
+    /// is on the roster (the kernel's grounded fallback - never an invented name).
+    pub agent: String,
+}
+
+/// A reviewable, ACTION-FREE plan preview attached to a `PlanRequest` turn so the
+/// dashboard can render the proposed shape as a card instead of parsing the prose
+/// reply (`docs/RELUX_MASTER_PLAN.md` section 10 planning layer, section 11.1).
+///
+/// It is purely informational: titles, role labels, and the agents work would land
+/// on, grounded in the planner's real decomposition. It carries NO `PrimeAction`
+/// and commits nothing - the only path that materializes it is the explicit
+/// "Create these tasks" suggestion, which routes the normal grounded turn
+/// (section 10.5, section 17.1: Prime must not turn musing into work on its own).
+/// Omitted from the wire on every non-plan turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrimeProposal {
+    /// The goal this plan decomposes, exactly as the commit suggestion re-wraps it
+    /// (so the previewed and committed plans come from identical input).
+    pub goal: String,
+    /// `true` when the goal genuinely splits into multiple briefs (a real plan);
+    /// `false` when it reads as one piece of work and is steered to the one-task
+    /// path. A single-step proposal carries an empty `steps` list.
+    pub multi_step: bool,
+    /// The proposed steps in order. Empty for a single-step goal.
+    pub steps: Vec<PrimeProposalStep>,
+    /// The distinct agents this plan would assign work to, including the `"prime"`
+    /// fallback for unmatched roles. Empty for a single-step goal.
+    pub agents: Vec<String>,
+}
+
 /// The full result of Prime handling one user message.
 ///
 /// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 10 (Prime Behavior Specification).
@@ -320,6 +370,14 @@ pub struct PrimeTurn {
     /// routed through the normal turn path — never a privileged shortcut.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suggested_actions: Vec<PrimeSuggestion>,
+    /// A reviewable, action-free plan preview, present ONLY on a `PlanRequest`
+    /// turn so the dashboard can render the proposed shape as a card
+    /// (`docs/RELUX_MASTER_PLAN.md` section 10 planning layer, section 11.1).
+    /// Omitted on every other turn, so existing clients see the same JSON they
+    /// did before. It carries no action - the commit is the separate explicit
+    /// "Create these tasks" suggestion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<PrimeProposal>,
 }
 
 /// The scope a Prime turn runs in: which namespace work lands in, which agent
@@ -412,11 +470,18 @@ mod tests {
             tool_output: None,
             tool_error: None,
             suggested_actions: vec![],
+            proposal: None,
         };
         let json = serde_json::to_string(&turn).unwrap();
         assert!(
             !json.contains("suggested_actions"),
             "empty suggestions must be omitted: {json}"
+        );
+        // The plan preview is present ONLY on a PlanRequest turn: a normal turn must
+        // not carry `proposal` on the wire, so existing clients are unaffected (§11.1).
+        assert!(
+            !json.contains("proposal"),
+            "an action-free turn must omit the proposal field: {json}"
         );
 
         let s = PrimeSuggestion {
@@ -426,6 +491,53 @@ mod tests {
         };
         let back: PrimeSuggestion = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back, s);
+    }
+
+    #[test]
+    fn prime_proposal_round_trips_and_carries_only_descriptive_data() {
+        // A proposal is a reviewable PREVIEW: it round-trips on the wire and carries
+        // only descriptive rows (title/role/agent) - never a PrimeAction. The kernel
+        // builds it from the planner's real decomposition; the commit is a separate
+        // explicit suggestion (§10 planning layer, §11.1, §17.1).
+        let proposal = PrimeProposal {
+            goal: "ship the beta".to_string(),
+            multi_step: true,
+            steps: vec![
+                PrimeProposalStep {
+                    index: 1,
+                    title: "research the options".to_string(),
+                    role: "research".to_string(),
+                    agent: "research-agent".to_string(),
+                },
+                PrimeProposalStep {
+                    index: 2,
+                    title: "build a prototype".to_string(),
+                    role: "implementation".to_string(),
+                    agent: "prime".to_string(),
+                },
+            ],
+            agents: vec!["research-agent".to_string(), "prime".to_string()],
+        };
+        let json = serde_json::to_string(&proposal).unwrap();
+        // No action verbs leak into a preview - it is informational only.
+        assert!(
+            !json.contains("\"type\""),
+            "a proposal must not embed an action: {json}"
+        );
+        let back: PrimeProposal = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, proposal);
+
+        // A single-step proposal carries the goal but no fanned-out steps.
+        let single = PrimeProposal {
+            goal: "summarize the README".to_string(),
+            multi_step: false,
+            steps: vec![],
+            agents: vec![],
+        };
+        let back: PrimeProposal =
+            serde_json::from_str(&serde_json::to_string(&single).unwrap()).unwrap();
+        assert_eq!(back, single);
+        assert!(back.steps.is_empty());
     }
 
     #[test]
