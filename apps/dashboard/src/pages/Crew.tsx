@@ -1,7 +1,6 @@
-import { useState, useEffect, useMemo } from "react";
-import { useLoaderData, Link } from "react-router-dom";
+import { useState, useMemo } from "react";
+import { Link } from "react-router-dom";
 import {
-  fetchJson,
   postJson,
   reluxWork,
   reluxAdapters,
@@ -13,16 +12,27 @@ import { useAsync } from "../components/common";
 
 type Agent = ReluxAgent;
 
-export async function loader() {
-  return await fetchJson("/v1/relux/agents");
-}
+// NOTE: this page deliberately does NOT use react-router's `useLoaderData()`.
+// The SPA mounts under a plain <BrowserRouter> (a declarative router, not a data
+// router built with createBrowserRouter), so calling `useLoaderData()` here threw
+// "useLoaderData must be used within a data router" on mount — an uncaught render
+// error that white-screened the whole /crew route (the reported blank page).
+// Crew loads its own data through the same `useAsync` hook every other Relux page
+// uses, so it renders a real view (loading / error / empty / list) regardless of
+// router wiring or API state.
 
 export function Crew() {
-  const initialAgents = useLoaderData() as Agent[];
-  const [agents, setAgents] = useState<Agent[]>(initialAgents);
+  const {
+    data: agentsData,
+    loading: agentsLoading,
+    error: agentsError,
+    reload: reloadAgents,
+  } = useAsync<Agent[]>(() => reluxWork.listAgents(), []);
+  const agents = agentsData ?? [];
+
   const [name, setName] = useState("");
   const [role, setRole] = useState("");
-  const [error, setError] = useState<string | null>(null);
+  const [createError, setCreateError] = useState<string | null>(null);
 
   const { data: tasks, error: tasksError, reload: reloadTasks } = useAsync<ReluxTask[]>(
     () => reluxWork.listTasks(),
@@ -48,57 +58,61 @@ export function Crew() {
     return counts;
   }, [tasks]);
 
-
-  const fetchAgents = async () => {
-    try {
-      const data = (await fetchJson("/v1/relux/agents")) as Agent[];
-      setAgents(data);
-      void reloadTasks(); // Also reload tasks to update counts for agents
-    } catch (err) {
-      console.error("Failed to fetch agents:", err);
-      setError("Failed to load agents.");
-    }
-  };
-
   const handleCreateAgent = async (e: React.FormEvent) => {
     e.preventDefault();
-    setError(null);
+    setCreateError(null);
     try {
-      const newAgent = (await postJson("/v1/relux/agents", { name, role })) as Agent;
-      setAgents((prev) => [...prev, newAgent]);
+      await postJson<Agent>("/v1/relux/agents", { name, role });
       setName("");
       setRole("");
-    } catch (err: any) {
+      reloadAgents(); // refresh the roster so the new member shows
+      reloadTasks(); // and the per-agent task counts
+    } catch (err) {
       console.error("Failed to create agent:", err);
-      setError(err.message || "Failed to create agent.");
+      setCreateError(err instanceof Error ? err.message : "Failed to create agent.");
     }
   };
 
-  useEffect(() => {
-    fetchAgents();
-  }, []);
+  // A created_at that isn't a parseable date must not throw inside render.
+  const createdLabel = (raw: string): string => {
+    const d = new Date(raw);
+    return Number.isNaN(d.getTime()) ? raw || "—" : d.toLocaleString();
+  };
 
   return (
     <div className="crew-page">
       <div className="section">
         <h2>Your Crew</h2>
-        {error && <div className="error-message">{error}</div>}
+        {agentsError && (
+          <div className="error-message">
+            Could not load your crew: {String(agentsError)}{" "}
+            <button className="btn ghost sm" onClick={() => reloadAgents()}>
+              Retry
+            </button>
+          </div>
+        )}
         {tasksError && (
           <div className="error-message">
-            Error loading tasks: {String(tasksError)}
+            Error loading task counts: {String(tasksError)}
           </div>
         )}
         <div className="agent-list">
-          {agents.length === 0 ? (
-            <p>No agents found. Create one below!</p>
+          {agentsLoading && !agentsData ? (
+            <p>Loading your crew&hellip;</p>
+          ) : agents.length === 0 ? (
+            <p>
+              {agentsError
+                ? "Crew unavailable — fix the error above and retry."
+                : "No agents yet. Create one below to get started."}
+            </p>
           ) : (
             agents.map((agent) => (
               <div key={agent.id} className="agent-card">
                 <h3>{agent.name} ({agent.id})</h3>
                 <p><strong>Role:</strong> {agent.description || "N/A"}</p>
-                <p><strong>Status:</strong> {agent.status}</p>
-                <p><strong>Adapter:</strong> {agent.adapter_plugin}</p>
-                <p><strong>Permissions:</strong> {agent.permissions_summary}</p>
+                <p><strong>Status:</strong> {agent.status || "—"}</p>
+                <p><strong>Adapter:</strong> {agent.adapter_plugin || "—"}</p>
+                <p><strong>Permissions:</strong> {agent.permissions_summary || "N/A"}</p>
                 <p>
                   <strong>Queued Tasks:</strong>{" "}
                   <Link to={`/work?agentId=${agent.id}&status=queued`} className="link">
@@ -111,7 +125,7 @@ export function Crew() {
                     {agentTaskCounts[agent.id]?.running || 0}
                   </Link>
                 </p>
-                <p className="created-at">Created: {new Date(agent.created_at).toLocaleString()}</p>
+                <p className="created-at">Created: {createdLabel(agent.created_at)}</p>
               </div>
             ))
           )}
@@ -122,6 +136,7 @@ export function Crew() {
 
       <div className="section">
         <h2>Create New Crew Member</h2>
+        {createError && <div className="error-message">{createError}</div>}
         <form onSubmit={handleCreateAgent} className="create-agent-form">
           <div className="form-group">
             <label htmlFor="agent-name">Name:</label>

@@ -22,7 +22,11 @@ export const PRIMARY: NavEntry[] = [
 ];
 
 export const ORG: NavEntry[] = [
-  { to: "/agents", label: "Crew", icon: "◍" },
+  // "Crew" must open the Relux-shell Crew page (/crew), not the legacy bridge
+  // `/agents` console. Pointing it at /agents sent operators to a different
+  // surface entirely (and, under `relux-kernel serve`, the bridge-gated page),
+  // so the real Crew view was unreachable from the rail.
+  { to: "/crew", label: "Crew", icon: "◍" },
   { to: "/lattice", label: "Lattice", icon: "⬡" },
   { to: "/company", label: "Company", icon: "▦" },
   { to: "/costs", label: "Costs", icon: "$" },

@@ -492,8 +492,7 @@ pub fn decide(message: &str, intent: &PrimeIntent, summary: &StateSummary) -> Pr
         // The kernel attaches a one-click "turn this into a task" suggestion
         // (section 11.1) so musing flows into work without retyping a command.
         PrimeIntent::Brainstorming => PrimePlan::Reply {
-            text: "Good - let's think it through. Tell me the goal you're after and any constraints, and I'll lay out a few approaches with their trade-offs. Nothing gets created or run while we're talking; when an idea is worth pursuing, I can turn it into a task in one step."
-                .to_string(),
+            text: brainstorm_reply(message),
         },
         // Orchestration: decompose the goal across agents. The pure planner decides
         // whether the goal genuinely splits into multiple briefs; only a real
@@ -777,6 +776,29 @@ fn task_title(message: &str) -> Option<String> {
         }
     }
     Some(title.to_string())
+}
+
+/// Build Prime's brainstorming reply (section 10.5: "ask clarifying questions
+/// when needed").
+///
+/// The fixed open-ended prompt was the same regardless of what the user said —
+/// it never reflected the idea or asked anything specific. When the message
+/// names a topic (the same noun/verb phrase [`brainstorm_task_candidate`]
+/// recovers for the one-click suggestion), this reflects that topic back and
+/// asks ONE concrete clarifying question, so a vague idea gets a useful, grounded
+/// follow-up. It stays a CONVERSATION: nothing is created or run, and the kernel
+/// still attaches the "turn this into a task" suggestion (section 11.1). The
+/// topic is the cleaned candidate (lead-ins stripped), quoted as a reflection —
+/// not a verbatim echo of the raw message. Falls back to the open-ended prompt
+/// when the message carries no nameable topic (pure connective musing).
+fn brainstorm_reply(message: &str) -> String {
+    match brainstorm_task_candidate(message) {
+        Some(topic) => format!(
+            "Let's shape the idea: \"{topic}\". Two things help me think it through with you: what outcome would make this a win, and is there a constraint I should design around — time, scope, or an approach to avoid? Nothing gets created or run while we talk; when it's worth pursuing, I can turn it into a task in one step."
+        ),
+        None => "Good - let's think it through. Tell me the goal you're after and any constraints, and I'll lay out a few approaches with their trade-offs. Nothing gets created or run while we're talking; when an idea is worth pursuing, I can turn it into a task in one step."
+            .to_string(),
+    }
 }
 
 /// Recover the candidate work a brainstorm message gestures at, for the
@@ -1562,6 +1584,42 @@ mod tests {
         );
         // Pure connective musing with nothing nameable left yields None.
         assert_eq!(brainstorm_task_candidate("maybe we could"), None);
+    }
+
+    #[test]
+    fn brainstorm_reply_reflects_the_topic_and_asks_a_clarifying_question() {
+        // section 10.5: Prime should "ask clarifying questions when needed". When
+        // the idea names a topic, the brainstorming reply reflects that topic and
+        // asks ONE concrete follow-up — instead of the old fixed prompt. It stays
+        // a conversation: no task is created or run.
+        let msg = "I was thinking we could redo the onboarding flow";
+        let plan = decide(msg, &PrimeIntent::Brainstorming, &empty_summary());
+        let text = match plan {
+            PrimePlan::Reply { text } => text,
+            other => panic!("brainstorming must stay a Reply, got {other:?}"),
+        };
+        // It reflects the recovered topic (the noun phrase, lead-ins stripped) and
+        // asks a clarifying question, while reaffirming nothing is created yet.
+        assert!(
+            text.contains("redo the onboarding flow"),
+            "reply must reflect the topic, got {text:?}"
+        );
+        assert!(text.contains('?'), "reply must ask a clarifying question, got {text:?}");
+        assert!(
+            text.to_lowercase().contains("nothing gets created"),
+            "reply must reaffirm it stays a conversation, got {text:?}"
+        );
+
+        // Pure connective musing with nothing nameable falls back to the
+        // open-ended prompt (still a Reply, still no action).
+        let bare = decide("maybe we could", &PrimeIntent::Brainstorming, &empty_summary());
+        match bare {
+            PrimePlan::Reply { text } => assert!(
+                text.contains("let's think it through"),
+                "no-topic musing falls back to the open-ended prompt, got {text:?}"
+            ),
+            other => panic!("expected Reply, got {other:?}"),
+        }
     }
 
     #[test]
