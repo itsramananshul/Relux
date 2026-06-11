@@ -267,6 +267,59 @@ envelope ignored, structural drift rejected, no-adapter → `None`), and the
 `Claude CLI`/`Codex CLI` labels, the no-overlay `null`, and the generic fallback when
 `model` is unstamped). No test calls a real provider.
 
+## Applied change (conversation guard — questions & musing never mint work)
+
+The classifier was still too action-happy: the broad task-creation catch matched a
+work verb anywhere as a **substring**, so an informational question or a musing
+that merely mentioned work was silently turned into a task. "how does the build
+work?", "what's the best way to fix the flaky tests?", "we should refactor auth",
+and even "show me a preview" (the substring "review") or "the prefix is wrong"
+(the substring "fix") all minted a task. That is exactly the behavior §17.1 forbids
+("Prime must understand conversational intent", "must not blindly turn every
+message into a plan") and §10.5 rules out ("ask clarifying questions when needed",
+do not create work from casual chat). This is the Hermes/Paperclip pattern (1)
+"classify before you act" and (4) "conversation is action-free" applied one rung
+deeper — the *question vs. command* boundary, not just the *ideation lead-in*
+boundary the earlier slice drew.
+
+`relux-kernel/src/prime.rs` — three tightenings in `classify_intent`, all gated so
+an explicit command always wins:
+
+- **Conversation guard.** A new `is_question(&m)` predicate (a wh-/auxiliary opener
+  — how/what/why/should/is/do/… — or a trailing "?") routes a question with **no
+  explicit command** to `Brainstorming`, *before* the task-creation catch. So a
+  deliberative question answers conversationally and offers a one-click "turn this
+  into a task" instead of minting one. `is_explicit_command` still overrides ("can
+  you create a task to fix X?" acts), and status/explanation/tool questions are
+  classified above the guard so it never swallows them. Polite directives
+  ("can/could/would you …") are deliberately **not** question openers, so a clear
+  request still acts.
+- **Whole-word work verbs.** The task-creation catch now matches the `CREATION_VERBS`
+  only as **whole words** (`has_word`), never substrings — "the prefix is wrong",
+  "show me a preview", "the building plan", and "it fixes the crash" stop being read
+  as new work, while "please fix the login bug" still creates it. `StatusQuestion`
+  moved above the catch too, so "give me a status of the build" reports state instead
+  of being read as work off "build".
+- **Declarative soft-intent is musing.** `is_ideation` gained the soft-intent openers
+  ("i want to", "i'd like to", "we should", "we could", "i think we", "maybe we",
+  "let's", "what about/how about") so a stated wish stays a conversation unless an
+  explicit command rides along ("let's create a task to X" still acts;
+  "we should refactor auth" becomes a conversation). `brainstorm_task_candidate`
+  learned the matching question/soft-intent strips so the "turn this into a task"
+  pre-fill names the work cleanly ("what's the best way to fix the tests?" →
+  `fix the tests`).
+
+Every routed turn stays a `PrimePlan::Reply` (Brainstorming) — nothing is created or
+run, and the kernel still attaches the "Turn this into a task" / "Plan this out"
+suggestions, so the conversation flows into work in one explicit click. The
+action-free wall and the deterministic-classifier-owns-the-action seam are intact;
+the LLM brain (when live) still only shapes the *reply* for these conversational
+turns. Pinned by `questions_about_work_stay_a_conversation_not_a_task`,
+`soft_intent_musing_stays_a_conversation_not_a_task`,
+`work_verbs_match_whole_words_not_substrings`,
+`explicit_command_inside_a_question_still_acts`, and
+`brainstorm_candidate_strips_question_and_soft_intent_lead_ins`.
+
 ## Next recommended slice
 
 When the optional LLM brain is enabled, let it *propose* the clarifying question

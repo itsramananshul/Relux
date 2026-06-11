@@ -204,28 +204,10 @@ pub fn classify_intent(message: &str) -> PrimeIntent {
     {
         return PrimeIntent::AssignTask;
     }
-    if has(&[
-        "create a task",
-        "make a task",
-        "new task",
-        "add a task",
-        "build",
-        "fix",
-        "implement",
-        "investigate",
-        "summarize",
-        "review",
-        "refactor",
-        "write ",
-        "set up",
-        "add ",
-        "create ",
-        "update the",
-        "draft ",
-    ]) || CREATION_VERBS.contains(&first_word.as_str())
-    {
-        return PrimeIntent::TaskCreation;
-    }
+    // Status question: grounded in live runs/tasks. Checked BEFORE the task-creation
+    // catch and the conversation guard below, so "give me a status of the build"
+    // reports state instead of being read as work (off "build") or swallowed by the
+    // question guard as a thing to discuss.
     if m == "status"
         || has(&[
             "what is going on",
@@ -244,6 +226,31 @@ pub fn classify_intent(message: &str) -> PrimeIntent {
         ])
     {
         return PrimeIntent::StatusQuestion;
+    }
+    // Conversation guard (section 10.5; section 17.1: "Prime must understand
+    // conversational intent" and "must not blindly turn every message into a
+    // plan"). A QUESTION - "how does the build work?", "what's the best way to fix
+    // the tests?", "should we refactor this?" - is the user asking or deliberating,
+    // not commanding work. So even when it carries a work verb it must NOT be minted
+    // into a task by the catch below; with no explicit command it becomes a
+    // Brainstorming conversation - Prime engages the idea and offers a one-click
+    // "turn this into a task", creating nothing. An explicit command in the same
+    // breath ("can you create a task to fix X") still acts, because
+    // [`is_explicit_command`] (and the specific intents above) already claimed it.
+    // Status/explanation/tool questions are classified above, so the guard never
+    // swallows them.
+    if is_question(&m) && !is_explicit_command(&m) {
+        return PrimeIntent::Brainstorming;
+    }
+    // Task creation: the broad "this is work" catch. A work verb counts only as a
+    // WHOLE WORD ("please fix the login bug"), never a substring - so "the prefix
+    // is wrong" (fix), "show me a preview" (review), "the building plan" (build),
+    // and "it fixes the crash" (fix) are no longer misread as new work off an
+    // embedded verb. Explicit task phrases still match directly.
+    if has(&["create a task", "make a task", "new task", "add a task", "set up", "update the"])
+        || CREATION_VERBS.iter().any(|v| has_word(&m, v))
+    {
+        return PrimeIntent::TaskCreation;
     }
     if has(&["retry", "try again", "rerun", "re-run"]) {
         return PrimeIntent::RunRetry;
@@ -741,6 +748,24 @@ fn is_ideation(m: &str) -> bool {
         "kicking around",
         "playing with the idea",
         "was thinking maybe",
+        // Declarative soft-intent openers: stating a wish or a "we could / let's"
+        // suggestion is musing, not a command, so it stays a conversation unless an
+        // explicit command rides along (the caller gates on !is_explicit_command).
+        // "i want to start it" / "let's create a task to X" still act because the
+        // command wins; "i want to build X" / "we should refactor auth" become a
+        // Brainstorming conversation that offers a one-click task instead of minting
+        // one (section 10.5, section 17.1).
+        "i want to",
+        "i'd like to",
+        "i would like to",
+        "we should",
+        "we could",
+        "we might",
+        "i think we",
+        "maybe we",
+        "let's",
+        "what about",
+        "how about",
     ];
     LEAD_INS.iter().any(|p| m.contains(p))
 }
@@ -772,6 +797,63 @@ fn is_explicit_command(m: &str) -> bool {
         "lay out the steps",
     ];
     COMMANDS.iter().any(|p| m.contains(p))
+}
+
+/// True when the message reads as a QUESTION - the user asking or deliberating,
+/// not commanding (section 17.1: "Prime must understand conversational intent").
+///
+/// Matched against the already-lowercased message. A question is signalled by an
+/// interrogative opener (a wh-word, or a yes/no auxiliary like "should"/"is"/"do")
+/// OR a trailing "?". Polite directives ("can you ...", "could you ...", "would
+/// you ...") are deliberately NOT openers: those carry a command and are handled
+/// by [`is_explicit_command`] / the work-verb catch, so "can you fix the bug"
+/// still acts. The caller gates this with `!is_explicit_command`, so a question
+/// that also names an explicit command still acts.
+fn is_question(m: &str) -> bool {
+    let m = m.trim();
+    let first: String = m
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .collect();
+    let opener = matches!(
+        first.as_str(),
+        "how" | "what" | "whats" | "why" | "when" | "where" | "which" | "who" | "whose" | "whom"
+            | "should" | "shall" | "is" | "are" | "am" | "do" | "does" | "did" | "was" | "were"
+            | "has" | "have" | "had"
+    );
+    opener || m.ends_with('?')
+}
+
+/// True when `word` appears in `haystack` as a WHOLE WORD - delimited by a
+/// non-alphanumeric boundary (or string edge) on both sides - rather than as a
+/// substring. Lets the task-creation catch fire on "please fix the bug" while NOT
+/// firing on "the prefix is wrong" / "show me a preview" / "the building plan".
+/// Both inputs are expected to be lowercase ASCII (the classifier's normalized
+/// message and the literal verbs in [`CREATION_VERBS`]).
+fn has_word(haystack: &str, word: &str) -> bool {
+    if word.is_empty() {
+        return false;
+    }
+    let mut from = 0;
+    while let Some(rel) = haystack[from..].find(word) {
+        let start = from + rel;
+        let end = start + word.len();
+        let before_ok = start == 0
+            || !haystack[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphanumeric());
+        let after_ok = end == haystack.len()
+            || !haystack[end..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric());
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
 }
 
 /// Turn a request into a task title by stripping a few polite/imperative
@@ -969,12 +1051,17 @@ pub fn brainstorm_task_candidate(message: &str) -> Option<String> {
         "i want to discuss",
         "i want to talk about",
         "i want to brainstorm",
+        "i would like to",
+        "i'd like to",
+        "i want to",
         "can we talk about",
         "could we talk about",
         "let's talk about",
         "lets talk about",
         "let's discuss",
         "lets discuss",
+        "let's",
+        "lets",
         "talk about",
         "thinking about",
         "thinking of",
@@ -986,6 +1073,29 @@ pub fn brainstorm_task_candidate(message: &str) -> Option<String> {
         "what if i",
         "what if you",
         "what if",
+        // Question / suggestion lead-ins, so a deliberative question routed here by
+        // the conversation guard ("what's the best way to fix the tests?") yields a
+        // clean candidate ("fix the tests"). Longest-first so the specific phrasing
+        // wins before the bare opener. Best-effort: it only pre-fills the input.
+        "what's the best way to",
+        "what is the best way to",
+        "whats the best way to",
+        "what's the right way to",
+        "what is the right way to",
+        "how should we",
+        "how should i",
+        "how do we",
+        "how do i",
+        "how can we",
+        "how can i",
+        "how would we",
+        "how would i",
+        "how do you",
+        "is it worth",
+        "is there a way to",
+        "should i",
+        "what about",
+        "how about",
         "i think we should",
         "i think we could",
         "i think",
@@ -2047,6 +2157,123 @@ mod tests {
         );
         // "start it" still controls a run, never reads as ideation.
         assert_eq!(classify_intent("start it"), PrimeIntent::RunStart);
+    }
+
+    #[test]
+    fn questions_about_work_stay_a_conversation_not_a_task() {
+        // section 17.1: Prime must understand conversational intent and must not
+        // blindly turn every message into a plan. An informational/deliberative
+        // QUESTION that merely mentions a work verb is NOT minted into a task - it
+        // is answered as a conversation (Brainstorming), which creates nothing.
+        for msg in [
+            "how does the build work?",
+            "what's the best way to fix the flaky tests?",
+            "should we refactor the auth module?",
+            "is it worth rewriting the scheduler?",
+            "what do you think we should build next?",
+        ] {
+            assert_eq!(
+                classify_intent(msg),
+                PrimeIntent::Brainstorming,
+                "{msg:?} is a question, not a task"
+            );
+            let plan = decide(msg, &PrimeIntent::Brainstorming, &empty_summary());
+            assert!(
+                matches!(plan, PrimePlan::Reply { .. }),
+                "{msg:?} must stay a Reply, got {plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn soft_intent_musing_stays_a_conversation_not_a_task() {
+        // Declarative soft-intent ("we should ...", "let's ...", "I want to ...") is
+        // musing, not a command, so it does not mint a task (section 10.5). Each of
+        // these carries a creation verb and would previously have been read as work.
+        for msg in [
+            "we should refactor the auth module",
+            "let's build a graph editor for agents",
+            "I want to build a workflow engine",
+            "I'd like to redo the onboarding flow",
+            "maybe we could add a plugin marketplace",
+        ] {
+            assert_eq!(
+                classify_intent(msg),
+                PrimeIntent::Brainstorming,
+                "{msg:?} is soft-intent musing, not a task"
+            );
+        }
+    }
+
+    #[test]
+    fn work_verbs_match_whole_words_not_substrings() {
+        // The task-creation catch fires on a work verb only as a WHOLE WORD, so an
+        // embedded verb no longer fabricates work (section 17.1). None of these
+        // carry a command, a question opener, or a soft-intent lead-in, so they must
+        // not classify as task creation off the embedded verb.
+        for msg in [
+            "the prefix is wrong",          // "fix" inside "prefix"
+            "show me a preview",            // "review" inside "preview"
+            "the building plan looks off",  // "build" inside "building"
+            "it fixes the crash already",   // "fix" inside "fixes"
+        ] {
+            assert_ne!(
+                classify_intent(msg),
+                PrimeIntent::TaskCreation,
+                "{msg:?} must not be read as task creation off an embedded verb"
+            );
+        }
+        // A real whole-word verb still creates work.
+        assert_eq!(
+            classify_intent("please fix the login bug"),
+            PrimeIntent::TaskCreation
+        );
+        assert_eq!(
+            classify_intent("refactor the scheduler"),
+            PrimeIntent::TaskCreation
+        );
+    }
+
+    #[test]
+    fn explicit_command_inside_a_question_still_acts() {
+        // The conversation guard never blocks an explicit command, even when the
+        // message is phrased as a question (section 10.5).
+        assert_eq!(
+            classify_intent("can you create a task to fix the login bug?"),
+            PrimeIntent::TaskCreation
+        );
+        // Status / explanation / tool questions are classified before the guard, so
+        // it never swallows them.
+        assert_eq!(
+            classify_intent("what is going on?"),
+            PrimeIntent::StatusQuestion
+        );
+        assert_eq!(
+            classify_intent("why did it fail?"),
+            PrimeIntent::ExplanationRequest
+        );
+        assert_eq!(
+            classify_intent("what tools can you use?"),
+            PrimeIntent::ToolDiscovery
+        );
+    }
+
+    #[test]
+    fn brainstorm_candidate_strips_question_and_soft_intent_lead_ins() {
+        // The recovered candidate (for the one-click "turn this into a task") drops
+        // question and soft-intent lead-ins so the pre-fill names the work cleanly.
+        assert_eq!(
+            brainstorm_task_candidate("what's the best way to fix the flaky tests?"),
+            Some("fix the flaky tests".to_string())
+        );
+        assert_eq!(
+            brainstorm_task_candidate("we should refactor the auth module"),
+            Some("refactor the auth module".to_string())
+        );
+        assert_eq!(
+            brainstorm_task_candidate("I want to build a workflow engine"),
+            Some("build a workflow engine".to_string())
+        );
     }
 
     #[test]
