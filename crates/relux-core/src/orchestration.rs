@@ -503,6 +503,7 @@ mod tests {
             tasks_failed: 0,
             pending_approvals: 0,
             all_agent_ids: ids.iter().map(|s| s.to_string()).collect(),
+            agent_skills: vec![],
             all_task_ids: vec![],
             queued: vec![],
             recent: vec![],

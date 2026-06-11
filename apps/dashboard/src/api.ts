@@ -1966,6 +1966,9 @@ export interface ReluxAgent {
   // The agent's starter persona / operating style, when one was set (today via the
   // brain-assisted agent-creation path). Omitted when none.
   persona?: string;
+  // The agent's specialty tags/skills (bounded slugs). Always present (possibly empty);
+  // used to route work to a specialist and rendered as chips on the Crew card.
+  skills?: string[];
   created_at: string;
 }
 
@@ -1986,6 +1989,10 @@ export interface ReluxAgentConfig {
   persona?: string;
   adapter_plugin?: string;
   status?: string;
+  // Specialty tags/skills. On create, absent => none. On edit, present => REPLACE the
+  // whole list (an empty array clears it); absent => leave unchanged. The backend
+  // re-validates/sanitizes/bounds each entry.
+  skills?: string[];
 }
 
 // One read-only artifact reference captured from an adapter's structured result

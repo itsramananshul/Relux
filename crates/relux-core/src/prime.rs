@@ -231,6 +231,11 @@ pub struct StateSummary {
     pub pending_approvals: usize,
     /// All agents known to the system, by their ID.
     pub all_agent_ids: Vec<String>,
+    /// Each agent's specialty skills/tags (slugs), keyed by agent id. Used by fuzzy
+    /// assignee resolution to route work to a unique specialist. `#[serde(default)]`
+    /// so an older serialized summary (no skills) deserializes to an empty list.
+    #[serde(default)]
+    pub agent_skills: Vec<(String, Vec<String>)>,
     /// All tasks known to the system, by their ID.
     pub all_task_ids: Vec<String>,
     /// Tasks assigned and ready to start, in id order.

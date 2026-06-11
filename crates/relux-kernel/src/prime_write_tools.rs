@@ -420,6 +420,7 @@ mod tests {
             tasks_failed: 0,
             pending_approvals: 0,
             all_agent_ids: agents.iter().map(|s| s.to_string()).collect(),
+            agent_skills: vec![],
             all_task_ids: tasks.iter().map(|s| s.to_string()).collect(),
             queued: queued
                 .iter()

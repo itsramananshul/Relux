@@ -553,7 +553,7 @@ pub fn decide(message: &str, intent: &PrimeIntent, summary: &StateSummary) -> Pr
                         // unique prefix → unique substring, ambiguity asked not guessed,
                         // and a resolved id is always one that exists (fail closed).
                         let phrase = extract_assignee_phrase(message).unwrap_or_default();
-                        match resolve_assignee(&phrase, &summary.all_agent_ids) {
+                        match resolve_assignee(&phrase, &summary.all_agent_ids, &summary.agent_skills) {
                             AssigneeResolution::Resolved(agent_id) => PrimePlan::Act {
                                 action: PrimeAction::AssignTask {
                                     task_id: task_id_str.clone(),
@@ -1796,12 +1796,22 @@ pub(crate) enum AssigneeResolution {
 /// EXISTING agent id, an ambiguity, or nothing.
 ///
 /// The match runs in fail-closed priority order (the openclaw target-resolution shape):
-/// exact (case-insensitive) → unique prefix → unique substring. A tier with more than one
-/// distinct match is `Ambiguous` (asked about, never guessed); a tier with exactly one is
-/// `Resolved`. Stopwords and sub-2-char noise are dropped first (the Hermes normalize
-/// step), and a returned id is always taken verbatim from the roster — so a fuzzy phrase
-/// can only ever name an agent that actually exists.
-pub(crate) fn resolve_assignee(phrase: &str, roster: &[String]) -> AssigneeResolution {
+/// exact (case-insensitive) id/name → unique **skill/tag** → unique prefix → unique
+/// substring. A tier with more than one distinct match is `Ambiguous` (asked about, never
+/// guessed); a tier with exactly one is `Resolved`. Stopwords and sub-2-char noise are
+/// dropped first (the Hermes normalize step), and a returned id is always taken verbatim
+/// from the roster — so a fuzzy phrase can only ever name an agent that actually exists.
+///
+/// The skill tier sits AFTER the exact id/name match and BEFORE the looser prefix/substring
+/// fallback (`docs/relix-dashboard-design.md` §9.1): a phrase like "the researcher" resolves
+/// to the single agent tagged `researcher`, but if two agents share that skill it is
+/// `Ambiguous` (Prime asks which one) — a shared skill is never silently guessed.
+/// `agent_skills` maps an agent id to its specialty slugs (`summary.agent_skills`).
+pub(crate) fn resolve_assignee(
+    phrase: &str,
+    roster: &[String],
+    agent_skills: &[(String, Vec<String>)],
+) -> AssigneeResolution {
     let toks: Vec<String> = phrase
         .to_lowercase()
         .split_whitespace()
@@ -1843,6 +1853,28 @@ pub(crate) fn resolve_assignee(phrase: &str, roster: &[String]) -> AssigneeResol
     match exact.len() {
         1 => return AssigneeResolution::Resolved(exact[0].clone()),
         n if n > 1 => return AssigneeResolution::Ambiguous(exact),
+        _ => {}
+    }
+
+    // Skill/tag tier: an agent whose specialty slugs contain one of the candidate slugs.
+    // Matched by exact slug equality (both sides are normalized slugs), so "research"
+    // routes to the agent tagged `research` but never to an unrelated longer word.
+    // Unique → resolve; shared by more than one agent → ambiguous (asked, never guessed).
+    let mut skill_hits: Vec<String> = Vec::new();
+    for (lc, orig) in &roster_lc {
+        let tagged = agent_skills.iter().any(|(aid, skills)| {
+            aid.to_lowercase() == *lc
+                && skills
+                    .iter()
+                    .any(|s| candidates.iter().any(|c| c == &s.to_lowercase()))
+        });
+        if tagged && !skill_hits.contains(orig) {
+            skill_hits.push(orig.clone());
+        }
+    }
+    match skill_hits.len() {
+        1 => return AssigneeResolution::Resolved(skill_hits[0].clone()),
+        n if n > 1 => return AssigneeResolution::Ambiguous(skill_hits),
         _ => {}
     }
 
@@ -1948,6 +1980,7 @@ mod tests {
             tasks_failed: 0,
             pending_approvals: 0,
             all_agent_ids: vec![],
+            agent_skills: vec![],
             all_task_ids: vec![],
             queued: vec![],
             recent: vec![],
@@ -1967,26 +2000,36 @@ mod tests {
         ids.iter().map(|s| s.to_string()).collect()
     }
 
+    // A typed empty skill map for the id/name-only resolution tests.
+    const NO_SKILLS: &[(String, Vec<String>)] = &[];
+
+    fn skills(pairs: &[(&str, &[&str])]) -> Vec<(String, Vec<String>)> {
+        pairs
+            .iter()
+            .map(|(id, sk)| (id.to_string(), sk.iter().map(|s| s.to_string()).collect()))
+            .collect()
+    }
+
     #[test]
     fn resolve_assignee_matches_exact_prefix_and_substring_against_the_roster() {
         let r = roster(&["prime", "researcher", "research-bot"]);
         // Exact (case-insensitive).
         assert_eq!(
-            resolve_assignee("researcher", &r),
+            resolve_assignee("researcher", &r, NO_SKILLS),
             AssigneeResolution::Resolved("researcher".to_string())
         );
         assert_eq!(
-            resolve_assignee("Researcher", &r),
+            resolve_assignee("Researcher", &r, NO_SKILLS),
             AssigneeResolution::Resolved("researcher".to_string())
         );
         // Stopwords are dropped: "the researcher" still resolves.
         assert_eq!(
-            resolve_assignee("the researcher", &r),
+            resolve_assignee("the researcher", &r, NO_SKILLS),
             AssigneeResolution::Resolved("researcher".to_string())
         );
         // A multi-word phrase joins to the hyphenated id.
         assert_eq!(
-            resolve_assignee("research bot", &r),
+            resolve_assignee("research bot", &r, NO_SKILLS),
             AssigneeResolution::Resolved("research-bot".to_string())
         );
     }
@@ -1995,7 +2038,7 @@ mod tests {
     fn resolve_assignee_reports_ambiguity_and_never_invents() {
         let r = roster(&["prime", "researcher", "research-bot"]);
         // "research" prefixes BOTH researcher and research-bot -> ambiguous, never guessed.
-        match resolve_assignee("research", &r) {
+        match resolve_assignee("research", &r, NO_SKILLS) {
             AssigneeResolution::Ambiguous(mut m) => {
                 m.sort();
                 assert_eq!(m, vec!["research-bot".to_string(), "researcher".to_string()]);
@@ -2004,11 +2047,63 @@ mod tests {
         }
         // An unknown name matches nothing on the roster (fail closed).
         assert_eq!(
-            resolve_assignee("missing-agent", &r),
+            resolve_assignee("missing-agent", &r, NO_SKILLS),
             AssigneeResolution::Unresolved
         );
         // A phrase of only stopwords/noise resolves to nothing.
-        assert_eq!(resolve_assignee("the agent", &r), AssigneeResolution::Unresolved);
+        assert_eq!(
+            resolve_assignee("the agent", &r, NO_SKILLS),
+            AssigneeResolution::Unresolved
+        );
+    }
+
+    #[test]
+    fn resolve_assignee_routes_a_unique_skill_to_its_specialist() {
+        // Two agents with opaque ids; only their skills connect a phrase to them.
+        let r = roster(&["agent-a", "agent-b"]);
+        let sk = skills(&[("agent-a", &["rust", "backend"]), ("agent-b", &["design"])]);
+        // A phrase naming a skill held by exactly one agent resolves to that agent —
+        // even though the id/name match nothing. Stopwords are dropped first.
+        assert_eq!(
+            resolve_assignee("the rust specialist", &r, &sk),
+            AssigneeResolution::Resolved("agent-a".to_string())
+        );
+        assert_eq!(
+            resolve_assignee("design", &r, &sk),
+            AssigneeResolution::Resolved("agent-b".to_string())
+        );
+        // A skill no agent holds falls through to Unresolved (never invented).
+        assert_eq!(
+            resolve_assignee("kubernetes", &r, &sk),
+            AssigneeResolution::Unresolved
+        );
+    }
+
+    #[test]
+    fn resolve_assignee_clarifies_a_shared_skill_instead_of_guessing() {
+        // Both agents share the "rust" skill -> ambiguous, Prime must ask which one.
+        let r = roster(&["agent-a", "agent-b"]);
+        let sk = skills(&[("agent-a", &["rust"]), ("agent-b", &["rust"])]);
+        match resolve_assignee("rust", &r, &sk) {
+            AssigneeResolution::Ambiguous(mut m) => {
+                m.sort();
+                assert_eq!(m, vec!["agent-a".to_string(), "agent-b".to_string()]);
+            }
+            other => panic!("expected ambiguity on a shared skill, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_assignee_prefers_an_exact_id_over_a_skill_match() {
+        // An exact id/name match wins before the skill tier is consulted: "researcher"
+        // is an id, so it resolves to that agent even though another agent is tagged
+        // with the "researcher" skill.
+        let r = roster(&["researcher", "helper"]);
+        let sk = skills(&[("helper", &["researcher"])]);
+        assert_eq!(
+            resolve_assignee("researcher", &r, &sk),
+            AssigneeResolution::Resolved("researcher".to_string())
+        );
     }
 
     #[test]
@@ -2050,6 +2145,52 @@ mod tests {
                 assert!(text.contains("researcher") && text.contains("research-bot"));
             }
             other => panic!("expected a Clarify, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assign_decide_routes_by_a_unique_skill() {
+        // The roster ids are opaque; only the skill connects "the rust specialist" to
+        // the right agent. The decide() arm resolves it through the skill tier.
+        let mut s = empty_summary();
+        s.all_task_ids = roster(&["task_0001"]);
+        s.all_agent_ids = roster(&["agent-a", "agent-b"]);
+        s.agent_skills = skills(&[("agent-a", &["rust"]), ("agent-b", &["design"])]);
+        let plan = decide(
+            "assign task_0001 to the rust specialist",
+            &PrimeIntent::AssignTask,
+            &s,
+        );
+        match plan {
+            PrimePlan::Act {
+                action: PrimeAction::AssignTask { task_id, agent_id },
+                ..
+            } => {
+                assert_eq!(task_id, "task_0001");
+                assert_eq!(agent_id, "agent-a");
+            }
+            other => panic!("expected an AssignTask Act, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assign_decide_clarifies_a_shared_skill_instead_of_assigning() {
+        // Two agents share the "rust" skill -> Prime must ask, never guess an assignee.
+        let mut s = empty_summary();
+        s.all_task_ids = roster(&["task_0001"]);
+        s.all_agent_ids = roster(&["agent-a", "agent-b"]);
+        s.agent_skills = skills(&[("agent-a", &["rust"]), ("agent-b", &["rust"])]);
+        let plan = decide(
+            "assign task_0001 to the rust specialist",
+            &PrimeIntent::AssignTask,
+            &s,
+        );
+        match plan {
+            PrimePlan::Clarify { text } => {
+                assert!(text.contains("More than one agent matches"), "got: {text}");
+                assert!(text.contains("agent-a") && text.contains("agent-b"));
+            }
+            other => panic!("expected a Clarify on a shared skill, got {other:?}"),
         }
     }
 

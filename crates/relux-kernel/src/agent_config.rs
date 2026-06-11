@@ -35,6 +35,12 @@ pub const MAX_AGENT_DESC_CHARS: usize = 240;
 /// `prime_agent_slots::MAX_PERSONA_CHARS` so manual and seeded personas share one bound.
 pub const MAX_AGENT_PERSONA_CHARS: usize = 600;
 
+/// Per-skill slug length clamp. A specialty tag is a short word/slug, not prose.
+pub const MAX_SKILL_CHARS: usize = 32;
+/// Maximum number of skills/tags on one agent. Bounds the list so a pasted blob cannot
+/// balloon the record or the assignment-matching candidate set.
+pub const MAX_SKILLS: usize = 16;
+
 /// The safe default adapter when an operator does not pick one: the local
 /// deterministic Prime adapter (always usable, no CLI spawn).
 pub const DEFAULT_ADAPTER_PLUGIN: &str = "relux-adapter-local-prime";
@@ -54,6 +60,10 @@ pub enum AgentConfigError {
     UnknownAdapter(String),
     /// The requested status is not an operator-settable status.
     InvalidStatus(String),
+    /// A provided skill/tag contained nothing that sanitizes to a valid slug.
+    InvalidSkill(String),
+    /// More than [`MAX_SKILLS`] distinct skills/tags were supplied.
+    TooManySkills(usize),
 }
 
 impl AgentConfigError {
@@ -74,6 +84,12 @@ impl AgentConfigError {
             AgentConfigError::InvalidStatus(s) => {
                 format!("invalid status '{s}'; use active, paused, or disabled")
             }
+            AgentConfigError::InvalidSkill(s) => {
+                format!("invalid skill '{s}'; use short words or slugs (letters, digits, hyphens)")
+            }
+            AgentConfigError::TooManySkills(n) => {
+                format!("too many skills ({n}); at most {MAX_SKILLS} are allowed")
+            }
         }
     }
 }
@@ -91,6 +107,9 @@ pub struct CreateAgentInput<'a> {
     pub role: Option<&'a str>,
     pub persona: Option<&'a str>,
     pub adapter_plugin: Option<&'a str>,
+    /// Specialty tags/skills. Absent => no skills; present => validated to a bounded
+    /// slug list (each invalid entry is rejected with a clear error).
+    pub skills: Option<&'a [String]>,
 }
 
 /// A validated, ready-to-apply new agent config.
@@ -101,6 +120,7 @@ pub struct ResolvedNewAgent {
     pub description: String,
     pub persona: Option<String>,
     pub adapter_plugin: String,
+    pub skills: Vec<String>,
 }
 
 /// Raw operator input for editing an agent. A field left `None` means "leave
@@ -112,10 +132,14 @@ pub struct UpdateAgentInput<'a> {
     pub persona: Option<&'a str>,
     pub adapter_plugin: Option<&'a str>,
     pub status: Option<&'a str>,
+    /// Present => REPLACE the whole skill list (an empty list clears all skills);
+    /// absent => leave the current skills unchanged.
+    pub skills: Option<&'a [String]>,
 }
 
 /// A validated, ready-to-apply agent edit. Outer `None` = unchanged; for persona,
-/// `Some(None)` = clear, `Some(Some(_))` = set.
+/// `Some(None)` = clear, `Some(Some(_))` = set. For skills, `Some(list)` replaces the
+/// whole list (an empty list clears it).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ResolvedAgentUpdate {
     pub name: Option<String>,
@@ -123,6 +147,7 @@ pub struct ResolvedAgentUpdate {
     pub persona: Option<Option<String>>,
     pub adapter_plugin: Option<String>,
     pub status: Option<AgentStatus>,
+    pub skills: Option<Vec<String>>,
 }
 
 /// Normalize a display name (or an explicitly-typed id) into a strict agent id:
@@ -190,6 +215,46 @@ pub fn sanitize_persona(raw: &str) -> String {
     let block = sanitize_block(raw, MAX_AGENT_PERSONA_CHARS);
     let redacted = redact_secrets(&block);
     redacted.chars().take(MAX_AGENT_PERSONA_CHARS).collect::<String>().trim().to_string()
+}
+
+/// Reduce one raw skill/tag to a strict slug: lowercase, keep only `[a-z0-9-]`
+/// (separators collapse to a single hyphen), trim hyphens, clamp to [`MAX_SKILL_CHARS`].
+/// Returns `None` when nothing valid remains (e.g. an emoji-only or control-only input),
+/// which the caller surfaces as an honest [`AgentConfigError::InvalidSkill`]. Mirrors
+/// [`normalize_agent_id`]'s strict-id discipline (openclaw `normalizeToolName`).
+pub fn sanitize_skill(raw: &str) -> Option<String> {
+    let slug = normalize_agent_id(raw); // same `[a-z0-9-]` slug shape, already clamped/trimmed
+    let clamped: String = slug.chars().take(MAX_SKILL_CHARS).collect();
+    let trimmed = clamped.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+/// Validate a raw skills list into a bounded, deduped slug list. Each entry must
+/// sanitize to a non-empty slug (else [`AgentConfigError::InvalidSkill`]); duplicates are
+/// dropped (first occurrence wins); more than [`MAX_SKILLS`] distinct skills is rejected
+/// ([`AgentConfigError::TooManySkills`]). An empty input yields an empty list (= no skills).
+pub fn validate_skills(raw: &[String]) -> Result<Vec<String>, AgentConfigError> {
+    let mut out: Vec<String> = Vec::new();
+    for entry in raw {
+        // Skip blank-only entries silently (a trailing comma in the UI), but reject an
+        // entry that had real content yet sanitized to nothing (e.g. "💥").
+        if entry.trim().is_empty() {
+            continue;
+        }
+        let slug = sanitize_skill(entry)
+            .ok_or_else(|| AgentConfigError::InvalidSkill(entry.trim().to_string()))?;
+        if !out.contains(&slug) {
+            out.push(slug);
+        }
+    }
+    if out.len() > MAX_SKILLS {
+        return Err(AgentConfigError::TooManySkills(out.len()));
+    }
+    Ok(out)
 }
 
 /// Case-insensitive membership against a roster of ids/names.
@@ -265,12 +330,18 @@ pub fn validate_new_agent(
         _ => DEFAULT_ADAPTER_PLUGIN.to_string(),
     };
 
+    let skills = match input.skills {
+        Some(raw) => validate_skills(raw)?,
+        None => Vec::new(),
+    };
+
     Ok(ResolvedNewAgent {
         id,
         name,
         description,
         persona,
         adapter_plugin,
+        skills,
     })
 }
 
@@ -316,6 +387,11 @@ pub fn validate_agent_update(
         }
     }
 
+    // Present => replace the whole skill list (an empty list clears it).
+    if let Some(raw) = input.skills {
+        resolved.skills = Some(validate_skills(raw)?);
+    }
+
     Ok(resolved)
 }
 
@@ -341,7 +417,7 @@ mod tests {
     #[test]
     fn create_requires_name() {
         let err = validate_new_agent(
-            CreateAgentInput { id: None, name: "   ", role: None, persona: None, adapter_plugin: None },
+            CreateAgentInput { id: None, name: "   ", role: None, persona: None, adapter_plugin: None, skills: None },
             &adapters(),
             &[],
             &[],
@@ -353,7 +429,7 @@ mod tests {
     #[test]
     fn create_derives_id_and_defaults_adapter() {
         let ok = validate_new_agent(
-            CreateAgentInput { id: None, name: "Research Bot", role: Some("does research"), persona: None, adapter_plugin: None },
+            CreateAgentInput { id: None, name: "Research Bot", role: Some("does research"), persona: None, adapter_plugin: None, skills: None },
             &adapters(),
             &[],
             &[],
@@ -369,7 +445,7 @@ mod tests {
     #[test]
     fn create_rejects_duplicate_id_and_name() {
         let dup_id = validate_new_agent(
-            CreateAgentInput { id: Some("research-bot"), name: "Other", role: None, persona: None, adapter_plugin: None },
+            CreateAgentInput { id: Some("research-bot"), name: "Other", role: None, persona: None, adapter_plugin: None, skills: None },
             &adapters(),
             &["research-bot".to_string()],
             &[],
@@ -378,7 +454,7 @@ mod tests {
         assert_eq!(dup_id, AgentConfigError::DuplicateId("research-bot".to_string()));
 
         let dup_name = validate_new_agent(
-            CreateAgentInput { id: None, name: "Research Bot", role: None, persona: None, adapter_plugin: None },
+            CreateAgentInput { id: None, name: "Research Bot", role: None, persona: None, adapter_plugin: None, skills: None },
             &adapters(),
             &[],
             &["research bot".to_string()],
@@ -390,7 +466,7 @@ mod tests {
     #[test]
     fn create_rejects_unknown_adapter() {
         let err = validate_new_agent(
-            CreateAgentInput { id: None, name: "Bot", role: None, persona: None, adapter_plugin: Some("relux-adapter-evil") },
+            CreateAgentInput { id: None, name: "Bot", role: None, persona: None, adapter_plugin: Some("relux-adapter-evil"), skills: None },
             &adapters(),
             &[],
             &[],
@@ -402,7 +478,7 @@ mod tests {
     #[test]
     fn create_resolves_adapter_canonical_case() {
         let ok = validate_new_agent(
-            CreateAgentInput { id: None, name: "Bot", role: None, persona: None, adapter_plugin: Some("RELUX-Adapter-Claude-CLI") },
+            CreateAgentInput { id: None, name: "Bot", role: None, persona: None, adapter_plugin: Some("RELUX-Adapter-Claude-CLI"), skills: None },
             &adapters(),
             &[],
             &[],
@@ -416,7 +492,7 @@ mod tests {
         // Overlong personas are clamped, not rejected.
         let long = "word ".repeat(400);
         let ok = validate_new_agent(
-            CreateAgentInput { id: None, name: "Bot", role: None, persona: Some(&long), adapter_plugin: None },
+            CreateAgentInput { id: None, name: "Bot", role: None, persona: Some(&long), adapter_plugin: None, skills: None },
             &adapters(),
             &[],
             &[],
@@ -429,7 +505,7 @@ mod tests {
         let secret = format!("{}{}", "sk-ant-", "0123456789abcdef0123456789");
         let with_secret = format!("Use my key {secret} when you run");
         let ok = validate_new_agent(
-            CreateAgentInput { id: None, name: "Bot2", role: None, persona: Some(&with_secret), adapter_plugin: None },
+            CreateAgentInput { id: None, name: "Bot2", role: None, persona: Some(&with_secret), adapter_plugin: None, skills: None },
             &adapters(),
             &[],
             &[],
@@ -443,7 +519,7 @@ mod tests {
     #[test]
     fn update_leaves_absent_fields_unchanged() {
         let resolved = validate_agent_update(
-            UpdateAgentInput { name: None, role: None, persona: None, adapter_plugin: None, status: None },
+            UpdateAgentInput { name: None, role: None, persona: None, adapter_plugin: None, status: None, skills: None },
             &adapters(),
             &[],
         )
@@ -454,7 +530,7 @@ mod tests {
     #[test]
     fn update_clears_persona_on_empty() {
         let resolved = validate_agent_update(
-            UpdateAgentInput { name: None, role: None, persona: Some("   "), adapter_plugin: None, status: None },
+            UpdateAgentInput { name: None, role: None, persona: Some("   "), adapter_plugin: None, status: None, skills: None },
             &adapters(),
             &[],
         )
@@ -465,7 +541,7 @@ mod tests {
     #[test]
     fn update_validates_status_and_adapter() {
         let ok = validate_agent_update(
-            UpdateAgentInput { name: None, role: None, persona: None, adapter_plugin: Some("relux-adapter-claude-cli"), status: Some("Disabled") },
+            UpdateAgentInput { name: None, role: None, persona: None, adapter_plugin: Some("relux-adapter-claude-cli"), status: Some("Disabled"), skills: None },
             &adapters(),
             &[],
         )
@@ -474,7 +550,7 @@ mod tests {
         assert_eq!(ok.status, Some(AgentStatus::Disabled));
 
         let bad_status = validate_agent_update(
-            UpdateAgentInput { name: None, role: None, persona: None, adapter_plugin: None, status: Some("error") },
+            UpdateAgentInput { name: None, role: None, persona: None, adapter_plugin: None, status: Some("error"), skills: None },
             &adapters(),
             &[],
         )
@@ -485,7 +561,7 @@ mod tests {
     #[test]
     fn update_rejects_duplicate_name_but_allows_self() {
         let dup = validate_agent_update(
-            UpdateAgentInput { name: Some("Taken"), role: None, persona: None, adapter_plugin: None, status: None },
+            UpdateAgentInput { name: Some("Taken"), role: None, persona: None, adapter_plugin: None, status: None, skills: None },
             &adapters(),
             &["taken".to_string()],
         )
@@ -494,11 +570,91 @@ mod tests {
 
         // Renaming to a name not held by anyone else is fine.
         let ok = validate_agent_update(
-            UpdateAgentInput { name: Some("Fresh"), role: None, persona: None, adapter_plugin: None, status: None },
+            UpdateAgentInput { name: Some("Fresh"), role: None, persona: None, adapter_plugin: None, status: None, skills: None },
             &adapters(),
             &["taken".to_string()],
         )
         .unwrap();
         assert_eq!(ok.name.as_deref(), Some("Fresh"));
+    }
+
+    fn skills(raw: &[&str]) -> Vec<String> {
+        raw.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn validate_skills_slugifies_dedups_and_clamps() {
+        // Slugified (lowercase, separators → hyphen), deduped (case-insensitive), order kept.
+        let ok = validate_skills(&skills(&["Rust", "  back end ", "rust", "Data_Science"])).unwrap();
+        assert_eq!(ok, vec!["rust", "back-end", "data-science"]);
+        // Blank entries (a trailing comma in the UI) are skipped, not errors.
+        let ok = validate_skills(&skills(&["rust", "   ", ""])).unwrap();
+        assert_eq!(ok, vec!["rust"]);
+        // An over-long skill is clamped to MAX_SKILL_CHARS, not rejected.
+        let long = "a".repeat(100);
+        let ok = validate_skills(&[long]).unwrap();
+        assert_eq!(ok[0].chars().count(), MAX_SKILL_CHARS);
+    }
+
+    #[test]
+    fn validate_skills_rejects_unsanitizable_and_overflow() {
+        // An entry with real content that sanitizes to nothing is an honest error.
+        let err = validate_skills(&skills(&["💥🔥"])).unwrap_err();
+        assert_eq!(err, AgentConfigError::InvalidSkill("💥🔥".to_string()));
+        // More than MAX_SKILLS distinct skills is rejected.
+        let many: Vec<String> = (0..MAX_SKILLS + 1).map(|i| format!("skill-{i}")).collect();
+        let err = validate_skills(&many).unwrap_err();
+        assert_eq!(err, AgentConfigError::TooManySkills(MAX_SKILLS + 1));
+    }
+
+    #[test]
+    fn create_accepts_and_validates_skills() {
+        let provided = skills(&["Rust", "rust", "Backend"]);
+        let ok = validate_new_agent(
+            CreateAgentInput { id: None, name: "Bot", role: None, persona: None, adapter_plugin: None, skills: Some(&provided) },
+            &adapters(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(ok.skills, vec!["rust", "backend"]);
+        // No skills field => empty list (backwards compatible).
+        let ok = validate_new_agent(
+            CreateAgentInput { id: None, name: "Bot", role: None, persona: None, adapter_plugin: None, skills: None },
+            &adapters(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(ok.skills.is_empty());
+    }
+
+    #[test]
+    fn update_replaces_or_clears_skills() {
+        // A present list REPLACES the whole skill set.
+        let provided = skills(&["design", "ux"]);
+        let resolved = validate_agent_update(
+            UpdateAgentInput { name: None, role: None, persona: None, adapter_plugin: None, status: None, skills: Some(&provided) },
+            &adapters(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(resolved.skills, Some(vec!["design".to_string(), "ux".to_string()]));
+        // An empty list CLEARS all skills.
+        let resolved = validate_agent_update(
+            UpdateAgentInput { name: None, role: None, persona: None, adapter_plugin: None, status: None, skills: Some(&[]) },
+            &adapters(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(resolved.skills, Some(vec![]));
+        // Absent => unchanged (None).
+        let resolved = validate_agent_update(
+            UpdateAgentInput { name: None, role: None, persona: None, adapter_plugin: None, status: None, skills: None },
+            &adapters(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(resolved.skills, None);
     }
 }

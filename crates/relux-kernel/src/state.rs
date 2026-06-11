@@ -1238,6 +1238,9 @@ impl KernelState {
     ///
     /// `adapter_plugin` must reference a registered Adapter plugin; the agent is
     /// granted exactly `permissions` and nothing more (least privilege, section 17.5).
+    /// This is the original (skill-less) entry point — it delegates to
+    /// [`Self::create_agent_with_skills`] with an empty skill list so every existing
+    /// caller keeps working unchanged (backwards compatible).
     #[allow(clippy::too_many_arguments)]
     pub fn create_agent(
         &mut self,
@@ -1248,6 +1251,33 @@ impl KernelState {
         namespace: &NamespaceId,
         persona: Option<String>,
         permissions: Vec<Permission>,
+    ) -> Result<AgentId, KernelError> {
+        self.create_agent_with_skills(
+            id,
+            name,
+            description,
+            adapter_plugin,
+            namespace,
+            persona,
+            permissions,
+            Vec::new(),
+        )
+    }
+
+    /// Create a configured agent actor carrying bounded specialty `skills`/tags (the
+    /// manual Crew-config path). Skills must already be validated/sanitized by
+    /// [`crate::agent_config::validate_skills`]; this method just stores them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_agent_with_skills(
+        &mut self,
+        id: &str,
+        name: &str,
+        description: &str,
+        adapter_plugin: &PluginId,
+        namespace: &NamespaceId,
+        persona: Option<String>,
+        permissions: Vec<Permission>,
+        skills: Vec<String>,
     ) -> Result<AgentId, KernelError> {
         if !self.plugins.contains_key(adapter_plugin) {
             return Err(KernelError::UnknownPlugin(adapter_plugin.to_string()));
@@ -1266,6 +1296,7 @@ impl KernelState {
             namespace_id: namespace.clone(),
             owner: "founder".to_string(),
             permissions,
+            skills,
             status: AgentStatus::Active,
             created_at: self.clock.tick(),
         };
@@ -1295,7 +1326,10 @@ impl KernelState {
     /// [`crate::agent_config::validate_agent_update`]; this method enforces the two
     /// invariants the kernel owns: the agent must exist, and a new adapter must be an
     /// installed plugin (the manual-config counterpart to `create_agent`'s check).
-    /// The brain-seeded create path is untouched — this is edit-only.
+    /// The brain-seeded create path is untouched — this is edit-only. This original
+    /// signature delegates to [`Self::update_agent_with_skills`] with `skills = None`
+    /// (leave skills unchanged), so existing callers keep working unchanged.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_agent(
         &mut self,
         id: &AgentId,
@@ -1304,6 +1338,24 @@ impl KernelState {
         persona: Option<Option<String>>,
         adapter_plugin: Option<PluginId>,
         status: Option<AgentStatus>,
+    ) -> Result<(), KernelError> {
+        self.update_agent_with_skills(id, name, description, persona, adapter_plugin, status, None)
+    }
+
+    /// Apply an operator edit including the optional specialty `skills`/tags: `None`
+    /// leaves the current skills unchanged, `Some(list)` REPLACES the whole list (an
+    /// empty list clears it). Skills must already be validated by
+    /// [`crate::agent_config::validate_skills`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_agent_with_skills(
+        &mut self,
+        id: &AgentId,
+        name: Option<String>,
+        description: Option<String>,
+        persona: Option<Option<String>>,
+        adapter_plugin: Option<PluginId>,
+        status: Option<AgentStatus>,
+        skills: Option<Vec<String>>,
     ) -> Result<(), KernelError> {
         if !self.agents.contains_key(id) {
             return Err(KernelError::UnknownAgent(id.to_string()));
@@ -1331,6 +1383,9 @@ impl KernelState {
             }
             if let Some(s) = status {
                 agent.status = s;
+            }
+            if let Some(sk) = skills {
+                agent.skills = sk;
             }
             (
                 agent.namespace_id.clone(),
@@ -4179,6 +4234,12 @@ impl KernelState {
             tasks_failed: failed,
             pending_approvals: self.pending_approval_count(),
             all_agent_ids: self.agents.keys().map(|id| id.0.clone()).collect(),
+            agent_skills: self
+                .agents
+                .values()
+                .filter(|a| !a.skills.is_empty())
+                .map(|a| (a.id.0.clone(), a.skills.clone()))
+                .collect(),
             all_task_ids: self.tasks.keys().map(|id| id.0.clone()).collect(),
             queued,
             recent,

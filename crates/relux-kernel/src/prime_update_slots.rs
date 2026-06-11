@@ -341,7 +341,7 @@ pub fn deterministic_update(message: &str, summary: &StateSummary) -> Determinis
         }
         Some(UpdateField::Assignee) => {
             if let Some(phrase) = extract_assignee_phrase(message) {
-                match resolve_assignee(&phrase, &summary.all_agent_ids) {
+                match resolve_assignee(&phrase, &summary.all_agent_ids, &summary.agent_skills) {
                     AssigneeResolution::Resolved(id) => patch.assignee = Some(id),
                     AssigneeResolution::Ambiguous(mut matches) => {
                         matches.sort();
@@ -544,7 +544,7 @@ pub fn reconcile_update_slots(
         .cloned()?;
 
     let assignee = proposal.assignee.as_ref().and_then(|phrase| {
-        match resolve_assignee(phrase, &summary.all_agent_ids) {
+        match resolve_assignee(phrase, &summary.all_agent_ids, &summary.agent_skills) {
             AssigneeResolution::Resolved(id) => Some(id),
             _ => None,
         }
@@ -711,6 +711,7 @@ mod tests {
             tasks_failed: 0,
             pending_approvals: 0,
             all_agent_ids: agents.iter().map(|s| s.to_string()).collect(),
+            agent_skills: vec![],
             all_task_ids: tasks.iter().map(|s| s.to_string()).collect(),
             queued: tasks
                 .iter()

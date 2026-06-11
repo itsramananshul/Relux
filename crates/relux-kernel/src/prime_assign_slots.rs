@@ -229,7 +229,7 @@ pub fn reconcile_assign_slots(
         .or(deterministic_agent_ref)
         .map(str::trim)
         .filter(|s| !s.is_empty())?;
-    let agent_id = match resolve_assignee(agent_ref, &summary.all_agent_ids) {
+    let agent_id = match resolve_assignee(agent_ref, &summary.all_agent_ids, &summary.agent_skills) {
         AssigneeResolution::Resolved(id) => id,
         _ => return None,
     };
@@ -286,6 +286,7 @@ mod tests {
             tasks_failed: 0,
             pending_approvals: 0,
             all_agent_ids: agents.iter().map(|s| s.to_string()).collect(),
+            agent_skills: vec![],
             all_task_ids: tasks.iter().map(|s| s.to_string()).collect(),
             queued: tasks
                 .iter()

@@ -109,6 +109,8 @@ test("the create form exposes the name, persona, and adapter fields", () => {
   assert.match(html, /Adapter \/ Runtime/);
   // The adapter picker always offers the safe local-Prime default option.
   assert.match(html, /Default \(local Prime\)/);
+  // The skills/tags field is part of the same create section.
+  assert.match(html, /Skills \/ Tags \(comma-separated/);
 });
 
 // ── Shipped-bundle path: the artifact the kernel actually serves ────────────
@@ -122,6 +124,9 @@ test("the committed dashboard bundle carries the Crew copy (no stale dist)", () 
   assert.match(bundle, /Your Crew/);
   assert.match(bundle, /Loading your crew/);
   assert.match(bundle, /Create New Crew Member/);
+  // The skills/tags field copy must be in the shipped bundle (catches a stale dist
+  // after the skills slice landed in source).
+  assert.match(bundle, /Skills \/ Tags \(comma-separated/);
 });
 
 test("the committed bundle points the rail's Crew entry at /crew, not legacy /agents", () => {

@@ -1523,6 +1523,9 @@ struct CreateAgentReq {
     role: Option<String>,
     persona: Option<String>,
     adapter_plugin: Option<String>,
+    /// Optional specialty tags/skills (each a short word/slug); validated and bounded
+    /// server-side. Absent => no skills.
+    skills: Option<Vec<String>>,
 }
 
 async fn create_agent(
@@ -1552,6 +1555,7 @@ async fn create_agent(
                 role: req.role.as_deref(),
                 persona: req.persona.as_deref(),
                 adapter_plugin: req.adapter_plugin.as_deref(),
+                skills: req.skills.as_deref(),
             },
             &known_adapters,
             &existing_ids,
@@ -1564,7 +1568,7 @@ async fn create_agent(
         // through the explicit, approval-gated permission path.
         let permissions = vec![relux_core::Permission::new("tool:relux-tools-echo:say").unwrap()];
 
-        let id = kernel.create_agent(
+        let id = kernel.create_agent_with_skills(
             &resolved.id,
             &resolved.name,
             &resolved.description,
@@ -1572,6 +1576,7 @@ async fn create_agent(
             &ctx.namespace,
             resolved.persona,
             permissions,
+            resolved.skills,
         )?;
         Ok(agent_record(kernel.agent(&id).unwrap()))
     })?;
@@ -1585,6 +1590,9 @@ struct UpdateAgentReq {
     persona: Option<String>,
     adapter_plugin: Option<String>,
     status: Option<String>,
+    /// Present => REPLACE the whole skill list (an empty list clears it); absent =>
+    /// leave skills unchanged.
+    skills: Option<Vec<String>>,
 }
 
 /// Edit an existing agent's configurable fields (name, role, persona, adapter,
@@ -1621,19 +1629,21 @@ async fn update_agent(
                 persona: req.persona.as_deref(),
                 adapter_plugin: req.adapter_plugin.as_deref(),
                 status: req.status.as_deref(),
+                skills: req.skills.as_deref(),
             },
             &known_adapters,
             &names_except_self,
         )
         .map_err(|e| KernelError::InvalidAgentConfig(e.message()))?;
 
-        kernel.update_agent(
+        kernel.update_agent_with_skills(
             &agent_id,
             resolved.name,
             resolved.description,
             resolved.persona,
             resolved.adapter_plugin.map(relux_core::PluginId::new),
             resolved.status,
+            resolved.skills,
         )?;
         Ok(agent_record(kernel.agent(&agent_id).unwrap()))
     })?;
@@ -5284,6 +5294,9 @@ struct AgentRecord {
     /// brain-assisted agent-slot path). Omitted when none, so the wire stays compact.
     #[serde(skip_serializing_if = "Option::is_none")]
     persona: Option<String>,
+    /// The agent's specialty tags/skills (bounded slugs). Always present (possibly
+    /// empty) so the Crew UI can render chips and the assignment matcher reads them.
+    skills: Vec<String>,
     created_at: String,
 }
 
@@ -5299,6 +5312,7 @@ fn agent_record(agent: &relux_core::Agent) -> AgentRecord {
         permissions_summary: format!("{} permissions", agent.permissions.len()),
         permissions: agent.permissions.iter().map(|p| p.to_string()).collect(),
         persona: agent.persona.clone(),
+        skills: agent.skills.clone(),
         created_at: agent.created_at.clone(),
     }
 }
@@ -7535,7 +7549,7 @@ mod tests {
             "POST",
             "/v1/relux/agents",
             None,
-            Some(r#"{"name":"Research Bot","role":"does research","persona":"calm and precise"}"#),
+            Some(r#"{"name":"Research Bot","role":"does research","persona":"calm and precise","skills":["Research","research","Data Science"]}"#),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "create failed: {body}");
@@ -7544,6 +7558,11 @@ mod tests {
         assert!(
             body.contains("relux-adapter-local-prime"),
             "default adapter expected: {body}"
+        );
+        // Skills are slugified + deduped (case-insensitive) and round-trip on the wire.
+        assert!(
+            body.contains("\"skills\":[\"research\",\"data-science\"]"),
+            "skills not normalized/persisted: {body}"
         );
 
         // A duplicate display name is an honest 400.
@@ -7570,18 +7589,48 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST, "unknown adapter should 400: {body}");
         assert!(body.contains("unknown adapter"), "got: {body}");
 
-        // Edit: pause the agent and clear the persona.
+        // An unsanitizable skill (an entry with real content that slugs to nothing) is a 400.
+        let (status, _, body) = call(
+            &state,
+            "POST",
+            "/v1/relux/agents",
+            None,
+            Some(r#"{"name":"Emoji Bot","skills":["💥🔥"]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "invalid skill should 400: {body}");
+        assert!(body.contains("invalid skill"), "got: {body}");
+
+        // Edit: pause the agent, clear the persona, and REPLACE the skill list.
         let (status, _, body) = call(
             &state,
             "PATCH",
             "/v1/relux/agents/research-bot",
             None,
-            Some(r#"{"status":"disabled","persona":""}"#),
+            Some(r#"{"status":"disabled","persona":"","skills":["frontend"]}"#),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "edit failed: {body}");
         assert!(body.contains("\"status\":\"Disabled\""), "got: {body}");
         assert!(!body.contains("\"persona\""), "persona should be cleared: {body}");
+        assert!(body.contains("\"skills\":[\"frontend\"]"), "skills not replaced: {body}");
+
+        // Edit again with an empty skills array CLEARS the list (present => replace).
+        let (status, _, body) = call(
+            &state,
+            "PATCH",
+            "/v1/relux/agents/research-bot",
+            None,
+            Some(r#"{"skills":[]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "clear-skills edit failed: {body}");
+        assert!(body.contains("\"skills\":[]"), "skills should be cleared: {body}");
+
+        // The list endpoint reflects the agent (skills now empty after the clear).
+        let (status, _, body) = call(&state, "GET", "/v1/relux/agents", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("\"id\":\"research-bot\""), "list missing agent: {body}");
 
         // Editing a non-existent agent is a 404.
         let (status, _, _) = call(

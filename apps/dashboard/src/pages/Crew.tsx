@@ -14,6 +14,7 @@ import {
   isElevatedPermission,
   permissionInvalidReason,
 } from "../governance";
+import { parseSkillsInput, formatSkillsInput } from "../skills";
 
 type Agent = ReluxAgent;
 
@@ -143,6 +144,7 @@ export function Crew() {
                   )}
                   <p><strong>Status:</strong> {agent.status || "—"}</p>
                   <p><strong>Adapter:</strong> {agent.adapter_plugin || "—"}</p>
+                  <SkillChips skills={agent.skills ?? []} />
                   <PermissionsList permissions={agent.permissions ?? []} />
                   <p>
                     <strong>Queued Tasks:</strong>{" "}
@@ -204,6 +206,7 @@ function CrewMemberForm({
   const [id, setId] = useState("");
   const [role, setRole] = useState(agent?.description ?? "");
   const [persona, setPersona] = useState(agent?.persona ?? "");
+  const [skillsText, setSkillsText] = useState(formatSkillsInput(agent?.skills));
   const [adapter, setAdapter] = useState(agent?.adapter_plugin ?? "");
   const [status, setStatus] = useState((agent?.status ?? "active").toLowerCase());
   const [busy, setBusy] = useState(false);
@@ -216,8 +219,10 @@ function CrewMemberForm({
     setBusy(true);
     setError(null);
     try {
+      // Parsed, deduped, bounded slug list (the backend re-validates and is authoritative).
+      const skills = parseSkillsInput(skillsText);
       if (mode === "create") {
-        const body: ReluxAgentConfig = { name, role, persona };
+        const body: ReluxAgentConfig = { name, role, persona, skills };
         if (id.trim()) body.id = id.trim();
         if (adapter) body.adapter_plugin = adapter;
         await reluxWork.createAgent(body);
@@ -226,11 +231,13 @@ function CrewMemberForm({
         setId("");
         setRole("");
         setPersona("");
+        setSkillsText("");
         setAdapter("");
       } else if (agent) {
-        // Send every field so an empty value is a deliberate clear (persona) or
-        // keeps the current value. The backend leaves absent fields unchanged.
-        const body: ReluxAgentConfig = { name, role, persona, status };
+        // Send every field so an empty value is a deliberate clear (persona/skills) or
+        // keeps the current value. The backend leaves absent fields unchanged; a present
+        // (possibly empty) skills array REPLACES the whole list.
+        const body: ReluxAgentConfig = { name, role, persona, status, skills };
         if (adapter) body.adapter_plugin = adapter;
         await reluxWork.updateAgent(agent.id, body);
       }
@@ -287,6 +294,20 @@ function CrewMemberForm({
         />
       </div>
       <div className="form-group">
+        <label htmlFor={`${idPrefix}-skills`}>Skills / Tags (comma-separated, optional):</label>
+        <input
+          id={`${idPrefix}-skills`}
+          type="text"
+          value={skillsText}
+          onChange={(e) => setSkillsText(e.target.value)}
+          placeholder="e.g. research, rust, frontend"
+        />
+        <p className="muted" style={{ fontSize: 11, marginTop: 2 }}>
+          Specialties used to route work to a specialist. Each becomes a short slug
+          (lowercase, hyphenated); duplicates and invalid entries are dropped server-side.
+        </p>
+      </div>
+      <div className="form-group">
         <label htmlFor={`${idPrefix}-adapter`}>Adapter / Runtime:</label>
         <select
           id={`${idPrefix}-adapter`}
@@ -328,6 +349,31 @@ function CrewMemberForm({
         )}
       </div>
     </form>
+  );
+}
+
+// Compact skill/tag chips for a crew card. Skills are bounded slugs used to route work
+// to a specialist during assignment matching; rendered as small muted chips (color is
+// reserved for meaning, so these stay monochrome). An agent with no skills shows nothing.
+function SkillChips({ skills }: { skills: string[] }) {
+  if (skills.length === 0) {
+    return (
+      <p>
+        <strong>Skills:</strong> none
+      </p>
+    );
+  }
+  return (
+    <div style={{ marginBottom: 8 }}>
+      <strong style={{ fontSize: 13 }}>Skills:</strong>{" "}
+      <span style={{ display: "inline-flex", flexWrap: "wrap", gap: 4, verticalAlign: "middle" }}>
+        {skills.map((s) => (
+          <span key={s} className="badge mono skill-chip" style={{ fontSize: 11 }}>
+            {s}
+          </span>
+        ))}
+      </span>
+    </div>
   );
 }
 

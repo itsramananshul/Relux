@@ -1844,3 +1844,61 @@ explicit grant (least privilege means there are no implicit capabilities to reac
 effective power always equals exactly its listed permissions. Skills/tags and per-agent budget
 remain future work: the `Agent` model has neither field, and inventing unenforced budget UI or a
 core-struct skills field is outside a minimal, safe slice.
+
+---
+
+## Reference read — model-backed crew skills/tags + skill-aware assignment matching (this slice)
+
+The two Crew slices above deferred **skills/tags** ("the `Agent` model has neither field"). This
+slice adds a bounded specialty-tag list to the core `Agent`, persisted and backwards-compatible,
+and uses it in **assignment matching only** — routing work to a unique specialist, asking when a
+skill is shared, never guessing. Skills are *specialty*, not *power*: they never gate a capability
+(that stays the explicit, audited permission path).
+
+### Paperclip (openclaw) — files read
+
+- `reference/openclaw-main/src/auto-reply/reply/subagents-utils.ts` `resolveSubagentTargetFromRuns`
+  (L44-145) — the canonical fuzzy-target resolver: exact alias → exact label → alias-prefix →
+  label-prefix → runId-prefix, where a tier with exactly one match RESOLVES, a tier with more than
+  one is an **ambiguity error**, and no match is `unknownTarget`; the resolved entry is always an
+  EXISTING run. **Pattern: ordered tiers, unique-resolves / multiple-is-ambiguous / none-fails, and
+  resolve only to a target that exists.** Mirrored: the skill tier is inserted into
+  `resolve_assignee`'s ordered tiers (after exact id/name, before the looser prefix/substring),
+  resolving only when exactly one roster agent holds the skill, returning `Ambiguous` for a shared
+  skill, and always yielding a real roster id.
+- `reference/openclaw-main/src/agents/tools/sessions-spawn-tool.ts` —
+  `UNSUPPORTED_SESSIONS_SPAWN_PARAM_KEYS` rejected before any param is read (L46-55, L277-284),
+  `readStringParam(..., { required: true })`, and the numeric clamp `Math.max(0, Math.floor(...))`
+  (L355). **Pattern: reject unsupported up front, require the mandatory string, clamp the rest.**
+  Mirrored in `agent_config::validate_skills`: each entry is slugified + length-clamped, the list
+  is count-bounded, a content-but-unsanitizable entry is rejected (`InvalidSkill`), and overflow is
+  rejected (`TooManySkills`).
+- `reference/openclaw-main/src/acp/approval-classifier.ts` `normalizeToolName` (L57-63) — lowercase,
+  length-bound, accept only a strict `^[a-z0-9._-]+$` shape (else `undefined`). Mirrored:
+  `sanitize_skill` reduces an entry to the strict `[a-z0-9-]` slug shape (reusing the
+  `normalize_agent_id` discipline) before it is stored or matched.
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/agent/agent_runtime_helpers.py` `repair_tool_call` (L1566-1636) —
+  normalize/strip the candidate, then match against the KNOWN set in priority order, resolving only
+  to a member of that set. Mirrored: a skill phrase is normalized (stopwords dropped, slugified) and
+  matched against the live roster's skill map; a `Resolved` id is always taken verbatim from the
+  roster — a skill phrase can never invent an assignee.
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| openclaw: **ordered tiers; unique resolves, multiple is ambiguous, none fails; resolve only to an existing target** (`resolveSubagentTargetFromRuns`) | `crates/relux-kernel/src/prime.rs` `resolve_assignee` inserts a **skill tier** after exact id/name and before prefix/substring: exactly one agent tagged with a candidate slug → `Resolved`; more than one → `Ambiguous` (the `AssignTask` decide arm asks "which one?"); none → fall through. The id is taken verbatim from `summary.all_agent_ids` (fail closed). |
+| openclaw: **reject unsupported, require, clamp** (`sessions-spawn-tool`) + **strict id shape** (`normalizeToolName`) | `agent_config::{sanitize_skill,validate_skills}`: strict slug, `MAX_SKILL_CHARS`/`MAX_SKILLS` clamps, dedup, `InvalidSkill`/`TooManySkills` honest 400s. Create ⇒ absent is none; edit ⇒ present replaces the whole list (empty clears). |
+| Hermes: **normalize then match the known set, resolve only to a member** (`repair_tool_call`) | the skill candidates are the same normalized tokens `resolve_assignee` already builds; an exact id/name match still wins before the skill tier is consulted, so a skill never overrides a direct reference. |
+| openclaw: **work/capability is an explicit gated thing, never inferred** (`tool-policy`) | a skill is matched for *routing only* — it grants **no** capability. `relux_core::Agent.skills` is `#[serde(default)]` so existing stored agents load unchanged, and `StateSummary.agent_skills` is a read-only grounding projection the brain never authors. |
+
+**What we deliberately do differently:** this is a deterministic change with no brain in the loop —
+it is the fallback the brain-assisted assignment slot already reconciles against (`prime_assign_slots`
+/ `prime_update_slots` call the same `resolve_assignee`, now skill-aware), so the safety shape
+(resolve only to an existing agent; ambiguity asked, not guessed) holds whether or not a brain is
+configured. Skills are validated/sanitized identically on the manual HTTP path and would be on any
+future brain-proposed path, and they never widen authority: an agent's effective power still equals
+exactly its explicit permissions.
