@@ -9,6 +9,66 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.17 (Windows bundle).** The `relux-kernel` /
+  `relux-core` crates move from `0.1.16` to `0.1.17`, bundling the post-v0.1.16
+  **scoped-permission + chain-of-command governance** slice (driven by
+  `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §3/§5/§6/§16–§19) into a fresh Windows
+  release. No master-plan safety property is weakened: every new path stays
+  fail-closed, governed, and bounded, and no new authority is granted that the
+  holder did not already have. Headlines:
+  - **Bounded deterministic conversation compaction beyond the 12-turn ring
+    (`HERMES_OPENCLAW_DEEP_AUDIT.md` §6/§16).** Prime's conversation memory keeps
+    a bounded, deterministic compaction of history older than the 12-turn working
+    ring, so older context is summarized rather than silently dropped — advisory
+    prompt-context only, with no new authority and no provider call required.
+  - **Minimal scoped tool-plugin grants (`HERMES_OPENCLAW_DEEP_AUDIT.md` §5/§17).**
+    A single strictly-validated scoped permission, `tool:<plugin-id>:*`,
+    authorizes every concrete tool in one plugin. `Permission::new` accepts the
+    wildcard only in that exact shape (`*`, `tool:*`, `tool:*:*`, `agent:<id>:*`,
+    partial globs, and path-like/injection strings are rejected fail-closed as
+    `MalformedScope`). Enforcement moves grant-vs-required from `matches_exact` to
+    a new `authorizes()` (exact OR same-plugin scope) at the two reads every
+    tool-invocation and `start_run` check routes through; grant dedup and revoke
+    stay exact-match, so a scope is one explicit, individually-revocable row that
+    never pattern-expands. Crew Governance mirrors the grammar and badges scoped
+    rows.
+  - **`reports_to` org-lattice (Lead) model + pure subtree helpers
+    (`HERMES_OPENCLAW_DEEP_AUDIT.md` §3/§18).** `Agent` gains an optional
+    `reports_to` (Lead; `#[serde(default)]`, backwards compatible) and a new pure
+    `hierarchy` module (`chain_of_command` / `is_in_subtree` / `would_create_cycle`,
+    all bounded by `MAX_HIERARCHY_DEPTH = 50` and total even on a cyclic map). The
+    kernel resolves a Lead against the roster, rejects reporting cycles under the
+    lock, and enriches each Crew card with the Lead's name + direct-report ids.
+    Display + validation only this round: it widens no permission and enforcement
+    is unchanged.
+  - **Manager-subtree scoped grant + one real subtree-gated enforcement path
+    (`HERMES_OPENCLAW_DEEP_AUDIT.md` §5/§19).** A strict
+    `agent:<manager-id>:subtree:<action>` grant grammar with a pure
+    `manager_subtree_authorizes` matcher (grant well-formed AND manager == holder
+    AND action matches AND target is a proper descendant via the bounded
+    `is_in_subtree` walk; self/sibling/ancestor/unrelated all denied), wired to ONE
+    real, narrow enforcement path: an Active manager granting a permission to an
+    operative inside its OWN Branch (`manager_grant_permission_to_subordinate`,
+    denials audited).
+  - **Operator-assisted HTTP/UI surface for the manager-subtree grant
+    (`HERMES_OPENCLAW_DEEP_AUDIT.md` §19).** A governed
+    `POST /v1/relux/agents/:id/manager-grant` (behind `require_session`) and a Crew
+    "Grant as manager" panel wire the §19 primitive to a real authenticated
+    request path. Honest trust boundary: this is **operator-assisted**, not
+    per-agent-authenticated — Relux has no per-agent session identity yet, so the
+    authenticated operator stands in for the manager as the named, audited
+    authorizer (`operator:authorize_manager_grant`) and cannot widen what the
+    manager itself could do. Malformed permission → 400; unauthorized manager
+    (no scope / not Active / target outside Branch / unknown) → 403.
+
+  Built reference-first per `docs/reference-driven-development.md`, with the exact
+  reference files read and the Relux mapping recorded there and in
+  `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §16–§19. `cargo test` + `clippy` clean on
+  `relux-core`/`relux-kernel`; dashboard tests + typecheck + build green; the
+  tracked `dashboard-dist` bundle was rebuilt and committed in sync. Build the
+  bundle with `scripts\relux-package-local.ps1 -FullE2E`. This version line is the
+  `relux-kernel` crate version (separate from the legacy Relix workspace versions
+  in the dated sections below). See `docs/RELUX_MASTER_PLAN.md` → *Release history*.
 - **Relux local release v0.1.16 (Windows bundle).** The `relux-kernel` /
   `relux-core` crates move from `0.1.15` to `0.1.16`, bundling the post-v0.1.15
   **agentic run recovery + durable session/handoff** slice (driven by

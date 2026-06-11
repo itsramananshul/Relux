@@ -1836,6 +1836,35 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.17** (2026-06-11) — a **scoped-permission + chain-of-command governance** slice on
+  top of v0.1.16, driven by `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` (§3/§5/§6/§16–§19). Every new
+  path stays fail-closed, governed, and bounded; no new authority is granted that the holder
+  did not already have, and no master-plan safety property is weakened. **Bounded conversation
+  compaction (§6/§16):** Prime's conversation memory keeps a bounded, deterministic compaction
+  of history older than the 12-turn working ring, summarizing rather than dropping older
+  context — advisory prompt-context only, no provider call required. **Scoped tool-plugin
+  grants (§5/§17):** a single strictly-validated `tool:<plugin-id>:*` permission authorizes
+  every concrete tool in one plugin; `Permission::new` accepts the wildcard only in that exact
+  shape (broad/partial globs and injection strings rejected fail-closed as `MalformedScope`),
+  and enforcement moves grant-vs-required to a new `authorizes()` (exact OR same-plugin scope)
+  while grant dedup/revoke stay exact-match so a scope never pattern-expands. **`reports_to`
+  org-lattice (Lead) model (§3/§18):** `Agent` gains an optional `reports_to` and a pure
+  `hierarchy` module (`chain_of_command` / `is_in_subtree` / `would_create_cycle`, bounded by
+  `MAX_HIERARCHY_DEPTH = 50`, total even on a cyclic map); the kernel resolves a Lead, rejects
+  reporting cycles under the lock, and enriches Crew cards — display + validation only, no
+  permission widened. **Manager-subtree scoped grant (§5/§19):** a strict
+  `agent:<manager-id>:subtree:<action>` grammar + pure `manager_subtree_authorizes` matcher
+  (manager == holder AND action matches AND target a proper descendant; self/sibling/ancestor/
+  unrelated denied), wired to ONE real enforcement path — an Active manager granting a
+  permission to an operative inside its OWN Branch. **Operator-assisted HTTP/UI surface (§19):**
+  a governed `POST /v1/relux/agents/:id/manager-grant` (behind `require_session`) + a Crew
+  "Grant as manager" panel; honest trust boundary — this is **operator-assisted**, not
+  per-agent-authenticated, so the authenticated operator stands in as the named, audited
+  authorizer (`operator:authorize_manager_grant`) and cannot widen what the manager itself
+  could do. Built reference-first per `docs/reference-driven-development.md`; `cargo test` +
+  `clippy` clean on `relux-core`/`relux-kernel`, dashboard tests + typecheck + build green, the
+  tracked `dashboard-dist` bundle rebuilt and committed in sync. Every safety property from
+  v0.1.16 still holds.
 - **v0.1.16** (2026-06-11) — an **agentic run recovery + durable session/handoff** slice on
   top of v0.1.15, driven by the new `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` (§1/§3/§7/§15). Every
   new path stays fail-closed, governed, and bounded; no new authority is granted and no
