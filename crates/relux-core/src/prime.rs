@@ -93,6 +93,15 @@ pub enum PrimeIntent {
     /// into role-typed briefs and assigns them; running is a separate governed step.
     /// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 10.4 (Delegation Rules).
     Orchestration,
+    /// The user asked Prime to lay an idea out as a reviewable PLAN before any
+    /// work is created ("plan this out", "draft a plan for X", "make a plan").
+    /// This is the explicit "idea -> plan -> tasks" rung: Prime previews the
+    /// proposed steps, creating nothing, and the user commits the plan with one
+    /// click. The preview is action-free; it never mints or runs work on its own.
+    /// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 10 (planning layer),
+    /// section 10.5 (Conversation Rules), section 11.1 (Prime suggested next actions),
+    /// section 17.1 (Prime must not blindly turn every message into a plan).
+    PlanRequest,
     /// The user asked which tools Prime can use ("what tools can you use?").
     /// Answered with grounded capability discovery, never a fabricated list.
     ToolDiscovery,

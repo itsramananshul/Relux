@@ -20,8 +20,8 @@
 //! `(message, StateSummary)`.
 
 use relux_core::{
-    plan_orchestration, PrimeAction, PrimeIntent, PrimePlan, RiskLevel, StateSummary, TaskBrief,
-    TaskStatus,
+    plan_orchestration, OrchestrationPlan, PrimeAction, PrimeIntent, PrimePlan, RiskLevel,
+    StateSummary, TaskBrief, TaskStatus,
 };
 
 /// Leading verbs that signal the user wants new work created.
@@ -154,6 +154,29 @@ pub fn classify_intent(message: &str) -> PrimeIntent {
         "plan and assign",
     ]) {
         return PrimeIntent::Orchestration;
+    }
+    // Explicit plan request (section 10 planning layer, section 11.1): the user
+    // wants Prime to lay an idea out as a REVIEWABLE plan before any work is
+    // created - the first-class "idea -> plan -> tasks" rung. Checked AFTER
+    // orchestration (so "plan and assign" still commits) and BEFORE task creation
+    // (so "make a plan to build X" previews a plan instead of minting one task).
+    // The decide() arm is action-free: nothing is created or run until the user
+    // confirms with the one-click "Create these tasks" suggestion.
+    if has(&[
+        "plan this out",
+        "plan it out",
+        "make a plan",
+        "draft a plan",
+        "come up with a plan",
+        "put together a plan",
+        "give me a plan",
+        "outline the steps",
+        "outline a plan",
+        "lay out the steps",
+        "lay out a plan",
+    ]) || starts("plan ")
+    {
+        return PrimeIntent::PlanRequest;
     }
     if has(&["and run it", "and start it", "and execute it"])
         && (has(&["create", "make", "add", "new task"])
@@ -518,6 +541,26 @@ pub fn decide(message: &str, intent: &PrimeIntent, summary: &StateSummary) -> Pr
                 }
             }
         }
+        // Plan request: lay the idea out as a REVIEWABLE plan that creates nothing
+        // (section 10 planning layer, section 11.1). The pure planner decides whether
+        // the goal genuinely splits: a multi-step goal becomes a plan preview the user
+        // commits with one explicit click (the kernel attaches a "Create these tasks"
+        // suggestion that routes the existing orchestration `Act`), a single-step goal
+        // is steered to the one-task path. Either way this turn is action-free - nothing
+        // is minted or run until the user confirms (section 10.5, section 17.1).
+        PrimeIntent::PlanRequest => {
+            let goal = plan_goal(message);
+            let plan = plan_orchestration(&goal, summary);
+            if plan.is_multi_agent() {
+                PrimePlan::Reply {
+                    text: plan_preview_text(&goal, &plan),
+                }
+            } else {
+                PrimePlan::Reply {
+                    text: plan_single_text(&goal),
+                }
+            }
+        }
         PrimeIntent::ApprovalResponse => PrimePlan::Clarify {
             text: "Tell me the approval id to approve or reject.".to_string(),
         },
@@ -718,6 +761,15 @@ fn is_explicit_command(m: &str) -> bool {
         "kick off",
         "orchestrate",
         "assign ",
+        "make a plan",
+        "draft a plan",
+        "give me a plan",
+        "come up with a plan",
+        "put together a plan",
+        "plan this out",
+        "plan it out",
+        "outline the steps",
+        "lay out the steps",
     ];
     COMMANDS.iter().any(|p| m.contains(p))
 }
@@ -1189,6 +1241,120 @@ fn orchestration_goal(message: &str) -> String {
     }
 }
 
+/// Recover the goal phrase a plan request names by stripping the plan lead-ins
+/// (longest-first so a compound lead-in wins over its shorter prefix). The result
+/// is the clean phrase the preview is built from and the same phrase the "Create
+/// these tasks" suggestion re-wraps as `orchestrate <goal>`, so the previewed plan
+/// and the committed plan are decomposed from identical input. Mirrors
+/// [`orchestration_goal`]'s strip-and-trim shape. `pub(crate)` so the kernel's
+/// suggestion builder recovers the same goal the decide() arm previewed.
+pub(crate) fn plan_goal(message: &str) -> String {
+    let trimmed = message.trim();
+    let lower = trimmed.to_lowercase();
+    const LEAD_INS: &[&str] = &[
+        "prime, ",
+        "prime ",
+        "please ",
+        "can you ",
+        "could you ",
+        "i need you to ",
+        "give me a plan to ",
+        "give me a plan for ",
+        "give me a plan ",
+        "come up with a plan to ",
+        "come up with a plan for ",
+        "come up with a plan ",
+        "put together a plan to ",
+        "put together a plan for ",
+        "put together a plan ",
+        "draft a plan to ",
+        "draft a plan for ",
+        "draft a plan ",
+        "make a plan to ",
+        "make a plan for ",
+        "make a plan ",
+        "lay out the steps to ",
+        "lay out the steps for ",
+        "lay out the steps ",
+        "outline the steps to ",
+        "outline the steps for ",
+        "outline the steps ",
+        "outline a plan to ",
+        "outline a plan for ",
+        "outline a plan ",
+        "plan this out to ",
+        "plan this out ",
+        "plan this out",
+        "plan it out to ",
+        "plan it out ",
+        "plan it out",
+        "plan out how to ",
+        "plan out ",
+        "plan how to ",
+        "plan how we ",
+        "plan for ",
+        "plan to ",
+        "plan the ",
+        "plan ",
+    ];
+    let mut start = 0usize;
+    loop {
+        let cur = &lower[start..];
+        let mut matched = false;
+        for lead in LEAD_INS {
+            if cur.starts_with(lead) {
+                start += lead.len();
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            break;
+        }
+    }
+    let goal = trimmed[start..]
+        .trim()
+        .trim_start_matches(':')
+        .trim()
+        .trim_end_matches('.')
+        .trim();
+    if goal.is_empty() {
+        trimmed.to_string()
+    } else {
+        goal.to_string()
+    }
+}
+
+/// Render a multi-step plan as a reviewable preview that COMMITS NOTHING
+/// (section 10 planning layer, section 11.1). The explicit "Create these tasks"
+/// suggestion is the only path that materializes the briefs, so the preview is
+/// purely informational - it lists the proposed steps and the agents they would
+/// land on, grounded in the planner's actual decomposition.
+fn plan_preview_text(goal: &str, plan: &OrchestrationPlan) -> String {
+    let steps: Vec<String> = plan
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| format!("{}. {} ({})", i + 1, s.title, s.role.label()))
+        .collect();
+    format!(
+        "Here is a plan for \"{goal}\" - {} across {}:\n{}\nNothing is created yet; this is just the shape. Review it, and when it is right I will create these as tasks in one step.",
+        count_phrase(plan.steps.len(), "step"),
+        count_phrase(plan.agent_labels().len(), "agent"),
+        steps.join("\n"),
+    )
+}
+
+/// Reply for a plan request whose goal does not genuinely split into multiple
+/// briefs: steer the user to the one-task path instead of fanning out a single
+/// piece of work into a storm (section 10.5). Still action-free - nothing is
+/// created until the user confirms the one-click suggestion.
+fn plan_single_text(goal: &str) -> String {
+    format!(
+        "\"{goal}\" reads like a single piece of work, not a multi-step plan. I can turn it straight into one task - nothing is created until you confirm."
+    )
+}
+
 fn derive_agent_name(message: &str) -> String {
     let m = message.to_lowercase();
     for marker in [" named ", " called ", " as "] {
@@ -1628,6 +1794,98 @@ mod tests {
             ),
             other => panic!("expected Clarify, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn classifies_plan_requests() {
+        // The explicit "idea -> plan -> tasks" rung: a plan ask classifies as
+        // PlanRequest, not task creation or orchestration (§10 planning layer).
+        for msg in [
+            "plan this out",
+            "make a plan to redo the onboarding flow",
+            "draft a plan for the migration",
+            "give me a plan to ship the beta",
+            "plan out research the options, build a prototype, and write docs",
+            "outline the steps to launch",
+        ] {
+            assert_eq!(
+                classify_intent(msg),
+                PrimeIntent::PlanRequest,
+                "{msg:?} should be a plan request"
+            );
+        }
+        // "plan and assign" is a COMMIT, not a preview: it stays Orchestration.
+        assert_eq!(
+            classify_intent("plan and assign the release across the agents"),
+            PrimeIntent::Orchestration
+        );
+        // An ideation lead-in plus an explicit plan ask escapes Brainstorming so
+        // the idea reaches the plan rung (§10.5: explicit command overrides musing).
+        assert_eq!(
+            classify_intent("i was thinking we could make a plan to overhaul billing"),
+            PrimeIntent::PlanRequest
+        );
+        // Plain task creation is untouched (no plan phrasing).
+        assert_eq!(classify_intent("fix the login bug"), PrimeIntent::TaskCreation);
+    }
+
+    #[test]
+    fn plan_request_previews_a_multi_step_plan_without_creating() {
+        // A plan request must be ACTION-FREE: it previews the steps and creates
+        // nothing. The commit is a separate explicit click (§10.5, §17.1).
+        let mut s = empty_summary();
+        s.all_agent_ids = vec![
+            "prime".to_string(),
+            "research-agent".to_string(),
+            "code-agent".to_string(),
+        ];
+        let plan = decide(
+            "plan out research the options, implement a prototype, and write the docs",
+            &PrimeIntent::PlanRequest,
+            &s,
+        );
+        let text = match plan {
+            // No Act, no Propose: a plan preview never mints or queues work.
+            PrimePlan::Reply { text } => text,
+            other => panic!("a plan preview must be an action-free Reply, got {other:?}"),
+        };
+        assert!(
+            text.contains("research the options"),
+            "preview must reflect the goal, got {text:?}"
+        );
+        assert!(
+            text.to_lowercase().contains("nothing is created"),
+            "preview must state nothing is created yet, got {text:?}"
+        );
+    }
+
+    #[test]
+    fn plan_request_single_step_steers_to_one_task() {
+        // A goal that does not genuinely split is steered to the one-task path
+        // rather than fanned into a storm (§10.5). Still action-free.
+        let plan = decide(
+            "plan out summarizing the README",
+            &PrimeIntent::PlanRequest,
+            &empty_summary(),
+        );
+        match plan {
+            PrimePlan::Reply { text } => assert!(
+                text.contains("single piece of work"),
+                "single-step plan steers to one task, got {text:?}"
+            ),
+            other => panic!("expected an action-free Reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_goal_round_trips_with_orchestration() {
+        // The goal the preview is built from must equal the goal the "Create these
+        // tasks" suggestion commits, so the previewed and committed plans decompose
+        // from identical input. The suggestion re-wraps as `orchestrate <goal>`.
+        let goal = plan_goal("plan out research the options, build a prototype, and write docs");
+        assert_eq!(goal, "research the options, build a prototype, and write docs");
+        let committed = orchestration_goal(&format!("orchestrate {goal}"));
+        assert_eq!(committed, goal, "preview and commit must share the goal");
     }
 
     #[test]

@@ -114,6 +114,45 @@ action decision and the action-free wall is intact. `TaskUpdate` has no
 it only asks for the value. Pinned by `orchestration_clarify_reflects_the_parsed_goal`
 and `task_update_clarify_reflects_target_and_field`.
 
+## Applied change (idea → plan → tasks rung)
+
+The brainstorm work left a two-rung ladder: an idea (`Brainstorming`, a
+conversation) could only jump straight to a single task ("Turn this into a
+task"), or the user had to know the magic phrase "orchestrate" to fan a goal
+into briefs — and that orchestration phrase *immediately* mints work. Per master
+plan §10 (Prime "needs an intent layer, a planning layer, and an action layer"),
+§10.5, §11.1, and §17.1 ("Prime must not blindly turn every message into a
+plan"), there is now an explicit **middle rung**: an idea becomes a *reviewable
+plan* before any task exists.
+
+- **New intent `PrimeIntent::PlanRequest`** (`relux-core`) — recognized for
+  explicit plan phrasing ("plan this out", "make a plan to …", "draft a plan for
+  …", "plan out …"). Classified **after** `Orchestration` (so "plan and assign"
+  still commits) and **before** task creation (so "make a plan to build X"
+  previews instead of minting one task); the same plan phrases are added to
+  `is_explicit_command` so an ideation lead-in + an explicit plan ask escapes
+  `Brainstorming` and reaches the rung.
+- **`decide()` is action-free for `PlanRequest`** (`relux-kernel/src/prime.rs`):
+  it runs the pure planner (`plan_orchestration`) and returns a `PrimePlan::Reply`
+  — a plan **preview** that lists the proposed steps/agents and states *nothing is
+  created yet*, or, for a goal that does not genuinely split, steers to the
+  one-task path. No `Act`, no `Propose`: the preview mints and runs nothing.
+- **Explicit one-click commit** (`attach_suggestions`, `state.rs`): a multi-step
+  preview offers "Create these tasks" → `orchestrate <goal>` (routing the
+  EXISTING, unchanged orchestration `Act`); a single-step goal offers "Turn this
+  into a task". `plan_goal` is the shared strip so the previewed and committed
+  plans decompose from identical input. Brainstorming additionally gains a "Plan
+  this out" button (→ `plan out <idea>`), so musing flows into a plan without a
+  magic phrase. Every suggestion is still just a pre-written user message
+  (`send: false`) — a button can do nothing the user could not type, and nothing
+  is created until they send it.
+
+The orchestration `Act` path (the commit target) and the formal approval-id
+`Propose` machinery are untouched. Pinned by `classifies_plan_requests`,
+`plan_request_previews_a_multi_step_plan_without_creating`,
+`plan_request_single_step_steers_to_one_task`, and
+`plan_goal_round_trips_with_orchestration`.
+
 ## Next recommended slice
 
 When the optional LLM brain is enabled, let it *propose* the clarifying question

@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::clock::Clock;
 use crate::event::RunEvent;
-use crate::prime::{brainstorm_task_candidate, classify_intent, decide};
+use crate::prime::{brainstorm_task_candidate, classify_intent, decide, plan_goal};
 use crate::KernelError;
 
 /// The monotonic counters and logical-clock position that must be restored for a
@@ -3465,7 +3465,7 @@ impl KernelState {
         // renders (`docs/RELUX_MASTER_PLAN.md` §11.1 "Prime suggested next
         // actions"). Each is just a pre-written user message, so it can do
         // nothing the user could not type.
-        attach_suggestions(&mut turn, message);
+        attach_suggestions(&mut turn, message, &summary);
         Ok(turn)
     }
 
@@ -5392,7 +5392,11 @@ fn task_brief(t: &Task) -> TaskBrief {
 /// `prime_turn`, so a button can do nothing the user could not type by hand.
 /// This is the single place suggestions are decided, keyed off the turn the
 /// kernel already produced.
-fn attach_suggestions(turn: &mut PrimeTurn, message: &str) {
+fn attach_suggestions(
+    turn: &mut PrimeTurn,
+    message: &str,
+    summary: &relux_core::StateSummary,
+) {
     use relux_core::{PrimeIntent, PrimeSuggestion};
 
     // After Prime mints a task that is ready but not yet running, offer to start
@@ -5424,6 +5428,46 @@ fn attach_suggestions(turn: &mut PrimeTurn, message: &str) {
             message: prefill,
             send: false,
         });
+        // The middle rung of "idea -> plan -> tasks" (§10 planning layer, §11.1):
+        // for an idea that is more than one piece of work, offer a one-click path
+        // to a REVIEWABLE plan preview. The button pre-fills "plan out <idea>"
+        // (`send: false`); the resulting turn creates nothing until the user
+        // commits the plan, so musing flows into a plan without a magic phrase.
+        let plan_prefill = if candidate.is_empty() {
+            "plan out ".to_string()
+        } else {
+            format!("plan out {candidate}")
+        };
+        turn.suggested_actions.push(PrimeSuggestion {
+            label: "Plan this out".to_string(),
+            message: plan_prefill,
+            send: false,
+        });
+    }
+
+    // A plan request previews work but creates nothing (§10 planning layer, §11.1).
+    // Offer the explicit one-click commit, keyed off the same decomposition the
+    // preview showed: a multi-step plan routes the existing orchestration `Act`
+    // ("Create these tasks"); a single-step goal is the one-task path. The message
+    // is exactly what the user could type by hand, so the button is never a
+    // privileged path - and nothing is created until they send it.
+    if turn.intent == PrimeIntent::PlanRequest {
+        let goal = plan_goal(message);
+        let plan = relux_core::plan_orchestration(&goal, summary);
+        let suggestion = if plan.is_multi_agent() {
+            PrimeSuggestion {
+                label: "Create these tasks".to_string(),
+                message: format!("orchestrate {goal}"),
+                send: false,
+            }
+        } else {
+            PrimeSuggestion {
+                label: "Turn this into a task".to_string(),
+                message: format!("create a task to {goal}"),
+                send: false,
+            }
+        };
+        turn.suggested_actions.push(suggestion);
     }
 }
 
