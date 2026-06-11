@@ -1,14 +1,21 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   api,
   reluxTools,
   reluxAdapters,
   reluxPrimeAutonomy,
+  reluxPlugins,
+  reluxAi,
   type ReluxToolDescriptor,
   type ReluxAdapterStatus,
   type ReluxPrimeAutonomyStatusResponse,
+  type ReluxState,
+  type ReluxAiStatus,
+  type ReluxPlugin,
 } from "../api";
 import { PrimeBrainPanel } from "../components/PrimeBrainPanel";
+import { buildReadiness } from "../readiness";
+import { ReadinessGuide } from "../components/ReadinessGuide";
 
 // Relux Health / diagnostics (RELUX_MASTER_PLAN §11.9, §22). The local
 // readiness surface for the standalone product: state counts, plugin/tool/
@@ -63,38 +70,52 @@ export function Health() {
   const [tools, setTools] = useState<ReluxToolDescriptor[] | null>(null);
   const [adapters, setAdapters] = useState<ReluxAdapterStatus[] | null>(null);
   const [autonomy, setAutonomy] = useState<ReluxPrimeAutonomyStatusResponse | null>(null);
+  // Extra reads the readiness guide needs (state counts, Prime brain, plugin
+  // list); all best-effort so one unavailable surface never blanks the page.
+  const [stateData, setStateData] = useState<ReluxState | null>(null);
+  const [ai, setAi] = useState<ReluxAiStatus | null>(null);
+  const [plugins, setPlugins] = useState<ReluxPlugin[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    const fetchAll = async () => {
+  const reload = useCallback(() => {
+    setLoading(true);
+    setError(null);
+    void (async () => {
       try {
         // Health is the core readiness signal; the rest are best-effort so a
         // single unavailable surface degrades to a calm "—" rather than blanking
         // the whole page.
         const health = await api.get<HealthResponse>("/v1/relux/health");
         setHealthData(health);
-        const [t, a, au] = await Promise.all([
+        const [t, a, au, st, aiStatus, pl] = await Promise.all([
           reluxTools.list().catch(() => null),
           reluxAdapters.list().catch(() => null),
           reluxPrimeAutonomy.getStatus().catch(() => null),
+          reluxPlugins.state().catch(() => null),
+          reluxAi.status().catch(() => null),
+          reluxPlugins.list().catch(() => null),
         ]);
         setTools(t);
         setAdapters(a);
         setAutonomy(au);
+        setStateData(st);
+        setAi(aiStatus);
+        setPlugins(pl);
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
       } finally {
         setLoading(false);
       }
-    };
-    fetchAll();
+    })();
   }, []);
 
-  if (loading) {
-    return <div className="loading">Loading health status...</div>;
-  }
+  useEffect(() => {
+    reload();
+  }, [reload]);
 
+  // Core control plane unreachable — honest error, never a faked-ready readiness
+  // surface (state is null too, so the guide could not be honest anyway).
   if (error) {
     return (
       <div className="banner err">
@@ -104,18 +125,31 @@ export function Health() {
     );
   }
 
-  if (!healthData) {
-    return <div className="empty">No health data available.</div>;
-  }
-
   const readyTools = (tools ?? []).filter((t) => t.executable === "ready").length;
   const enabledAdapters = (adapters ?? []).filter(
     (a) => a.state === "available" || a.state === "local_deterministic",
   ).length;
   const autonomyCfg = autonomy?.config;
 
+  // The same honest readiness derivation Home shows (no duplicated logic — it
+  // reuses ./readiness), built from the local /v1/relux reads this page already
+  // makes. `state` is the grounding; when a best-effort read fails the report
+  // degrades honestly (a null tools probe → "info", a null state → the guide's
+  // "Checking readiness…"), never a faked-ready summary.
+  const report = stateData
+    ? buildReadiness({ state: stateData, ai, adapters, plugins, tools })
+    : null;
+
   return (
     <div className="grid">
+      <ReadinessGuide report={report} loading={loading} onRefresh={reload} />
+      {!healthData && (
+        <div className={loading ? "loading" : "empty"}>
+          {loading ? "Loading health status..." : "No health data available."}
+        </div>
+      )}
+      {healthData && (
+        <>
       <div className="card">
         <h3>Relux Health Status</h3>
         <div className="row" style={{ gap: 8, alignItems: "center", marginBottom: 8 }}>
@@ -296,6 +330,8 @@ export function Health() {
             ))}
           </ul>
         </div>
+      )}
+        </>
       )}
     </div>
   );

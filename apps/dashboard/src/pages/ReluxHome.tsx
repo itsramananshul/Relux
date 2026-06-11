@@ -118,37 +118,6 @@ export function ReluxHome() {
       {/* Multi-agent orchestration at a glance — Prime coordinating the fleet. */}
       <OrchestrationHomeCard orchestrations={orchestrations.data} loading={orchestrations.loading} />
 
-      {/* The real product path: run work through a coding-agent adapter. */}
-      <div className="card">
-        <h3 style={{ marginTop: 0 }}>Run real work: Claude / Codex adapters</h3>
-        <p className="muted" style={{ marginTop: 0, fontSize: 13, lineHeight: 1.6 }}>
-          Prime can drive a real coding-agent CLI to execute assigned tasks. This is
-          the recommended path:
-        </p>
-        <ol className="muted" style={{ fontSize: 13, lineHeight: 1.7, marginTop: 0, paddingLeft: 18 }}>
-          <li>
-            Install and log in to the <strong>Claude CLI</strong>{" "}
-            (<span className="mono">claude</span>) or the <strong>Codex CLI</strong>{" "}
-            (<span className="mono">codex</span>) so it is on your PATH. They use
-            their own local login — no API key goes into Relux.
-          </li>
-          <li>
-            On <Link to="/crew" className="link">Crew → Adapters</Link>, enable the
-            adapter. It is disabled by default and runs the CLI in a safe,
-            non-bypass mode.
-          </li>
-          <li>
-            Create a task on <Link to="/work" className="link">Work</Link>, assign it
-            to an agent using that adapter, and run it.
-          </li>
-        </ol>
-        <p className="muted" style={{ fontSize: 12, marginTop: 4 }}>
-          Prefer natural Prime chat? Add an OpenRouter API key under{" "}
-          <Link to="/health" className="link">Health → Prime AI settings</Link>{" "}
-          (optional; Prime stays deterministic and grounded without it).
-        </p>
-      </div>
-
       {/* Installed plugins at a glance — the capability surface. */}
       <div className="card">
         <div className="row" style={{ alignItems: "center", marginBottom: 8 }}>

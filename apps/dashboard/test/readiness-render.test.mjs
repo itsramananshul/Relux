@@ -79,6 +79,16 @@ test("ReluxHome RENDERS under a declarative router (no mount throw)", () => {
   assert.match(html, /Checking readiness/);
 });
 
+test("ReluxHome no longer renders the redundant 'Run real work' instructional card", () => {
+  const html = render();
+  // The old prose card duplicated the readiness guide's brain + real-work-adapter
+  // items; the guide replaced it, so Home must not carry the stale instructions.
+  assert.doesNotMatch(html, /Run real work/);
+  // The capability is still reachable: the product framing links to Crew, and the
+  // readiness guide's real-work-adapter item links there too.
+  assert.match(html, /Manage crew/);
+});
+
 // ── Shipped-bundle path: the artifact the kernel actually serves ────────────
 
 test("the committed dashboard bundle carries the readiness copy (no stale dist)", () => {

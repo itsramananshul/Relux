@@ -258,7 +258,19 @@ operator should get a concise operational summary, not a nag.
 **Where it lives.** A single compact, app-like card (`ReadinessGuide`,
 `apps/dashboard/src/components/ReadinessGuide.tsx`) on Home, between the product
 framing card and the orchestration/plugins cards. No hero, no nested cards; it
-never blocks normal dashboard use.
+never blocks normal dashboard use. The **same** card also leads the Health page
+(`apps/dashboard/src/pages/Health.tsx`), above the raw diagnostics, so the
+first-run guidance and the operational summary are consistent on both surfaces —
+built from the same `buildReadiness` derivation over the same local `/v1/relux`
+reads (no duplicated logic). The older Home prose card that re-explained the
+Claude/Codex real-work path was **removed**: the readiness guide's brain +
+real-work-adapter items now cover it, so Home stays compact and non-redundant.
+
+**Honest degradation on Health.** Health's reads are best-effort. If the core
+`/v1/relux/health` read fails the page shows its honest "could not reach the
+control plane" banner (never a faked-ready guide). If only a secondary read fails,
+the guide degrades through `buildReadiness` — a null tools probe → an `info` row,
+a null `state` → the guide's "Checking readiness…" — rather than asserting ready.
 
 **What it derives (honest, live).** A pure, React-free module
 (`apps/dashboard/src/readiness.ts`, `buildReadiness(inputs)`) turns the four reads
@@ -301,9 +313,12 @@ fresh state has a real action.
 (fresh/local-only, Claude available but disabled, metadata plugin needs config,
 fully ready) plus the blocker and first-action priority;
 `apps/dashboard/test/readiness-render.test.mjs` proves Home mounts under the
-declarative router and the committed bundle carries the copy. Reference grounding
-(openclaw `HealthStore`/onboarding, Hermes `status`/`doctor`/`setup.status`) is
-recorded in `docs/reference-driven-development.md`.
+declarative router, the redundant "Run real work" prose card is gone, and the
+committed bundle carries the copy; `apps/dashboard/test/health-render.test.mjs`
+proves the Health page mounts the same guide and degrades to its honest loading
+state. Reference grounding (openclaw `HealthStore`/onboarding, Hermes
+`status`/`doctor`/`setup.status`) is recorded in
+`docs/reference-driven-development.md`.
 
 ---
 
