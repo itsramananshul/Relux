@@ -382,8 +382,14 @@ pub fn classify_intent(message: &str) -> PrimeIntent {
 /// - ambiguous run control becomes a `Clarify` instead of a guess.
 pub fn decide(message: &str, intent: &PrimeIntent, summary: &StateSummary) -> PrimePlan {
     match intent {
+        // A greeting is just conversation. Prime answers like a general agent
+        // (Hermes-first), NOT a work-board bot: it does not volunteer the
+        // board/queue/crew state or ask "what do you want to set up" — that belongs
+        // to a status question the user explicitly asks. It stays warm and
+        // open-ended so casual chat is never dragged into company setup
+        // (`docs/prime-processing-audit.md` "Hermes-first general agent"; §10.5, §17.1).
         PrimeIntent::Greeting => PrimePlan::Reply {
-            text: format!("I am here. {} What do you want to work on?", headline(summary)),
+            text: greeting_text().to_string(),
         },
         // A status question is grounded by actually consulting the read-only
         // `status.summary` tool through the kernel (§11.1 plugin/action results).
@@ -738,8 +744,13 @@ pub fn decide(message: &str, intent: &PrimeIntent, summary: &StateSummary) -> Pr
                     .to_string(),
             },
         },
+        // The general catch-all. Prime answers as a broad assistant FIRST: when a
+        // brain is configured it writes the real answer; this deterministic fallback
+        // keeps a Hermes-like, general framing and mentions the control plane only as
+        // one of the things it CAN do, never as the only thing and never as a prompt
+        // to set up work (§10.5, §17.1).
         PrimeIntent::DirectAnswer => PrimePlan::Reply {
-            text: "I can inspect state, create tasks, start runs, explain blockers, and request approvals for risky actions. What would you like to do?"
+            text: "I'm Prime, your local agent — ask me anything, think out loud with me, or have me help with whatever you're working on. I can also drive your Relux control plane (tasks, runs, agents, plugins) whenever you want that."
                 .to_string(),
         },
     }
@@ -1301,6 +1312,160 @@ pub fn brainstorm_task_candidate(message: &str) -> Option<String> {
         return None;
     }
     Some(candidate.to_string())
+}
+
+/// The grounded, general-agent greeting Prime opens a casual hello with.
+///
+/// Hermes-first: it reads like a normal assistant, NOT a work-board manager. It
+/// names no board/queue/crew state and asks nothing about "what to set up" — a plain
+/// hello stays a plain hello (`docs/prime-processing-audit.md` "Hermes-first general
+/// agent"; §10.5, §17.1). Control-plane state is surfaced only when the user
+/// explicitly asks a status question, never volunteered into small talk.
+fn greeting_text() -> &'static str {
+    "Hey - Prime here. What's on your mind? Happy to just talk, think something through, or answer a question - and when you actually want work done, I can drive your local Relux control plane."
+}
+
+/// Verbs that mark a brainstorm candidate as REAL, nameable work (a superset of
+/// [`CREATION_VERBS`] with the common improvement/delivery verbs). Used ONLY by
+/// [`brainstorm_offers_actionable_work`] to decide whether an idea is concrete
+/// enough to offer a one-click work button for — never to classify or to act.
+const WORK_INDICATORS: &[&str] = &[
+    "create",
+    "make",
+    "add",
+    "build",
+    "fix",
+    "implement",
+    "investigate",
+    "summarize",
+    "review",
+    "refactor",
+    "write",
+    "draft",
+    "improve",
+    "ship",
+    "design",
+    "automate",
+    "optimize",
+    "test",
+    "deploy",
+    "document",
+    "research",
+    "migrate",
+    "rewrite",
+    "redesign",
+    "redo",
+    "revamp",
+    "overhaul",
+    "set up",
+    "clean up",
+    "integrate",
+    "rebuild",
+    "update",
+    "audit",
+    "plan",
+];
+
+/// True when a message reads as venting, an insult, profanity-as-affect, or pure
+/// emotional/throwaway small talk with no work in it — frustration ("ugh, this is
+/// broken"), an insult aimed at Prime ("fuck you", "you're useless"), or a
+/// throwaway ("lol", "meh"). These get a normal conversational reply and,
+/// crucially, NO task/plan CTAs: turning "fuck you" into a "Turn this into a task"
+/// button is absurd (Hermes-first: emotional chat is chat, never a work prompt;
+/// `docs/prime-processing-audit.md` "Hermes-first general agent"; §10.5, §17.1).
+///
+/// Conservative and used ONLY to SUPPRESS work CTAs / steer wording — it never
+/// promotes anything to an action, so a false positive only means a friendlier,
+/// button-free reply. A genuine work command that merely contains a charged word
+/// ("fix the damn login bug") is unaffected: it classifies as `TaskCreation`, not
+/// `Brainstorming`, so this gate (only consulted on the brainstorm CTA path) never
+/// sees it. Matched against the lowercased message.
+pub fn is_frustration_or_emotional(message: &str) -> bool {
+    let m = message.trim().to_lowercase();
+    if m.is_empty() {
+        return false;
+    }
+    const PHRASES: &[&str] = &[
+        "fuck you",
+        "fuck off",
+        "screw you",
+        "shut up",
+        "stfu",
+        "piss off",
+        "you suck",
+        "you're useless",
+        "youre useless",
+        "you are useless",
+        "you're stupid",
+        "youre stupid",
+        "you're dumb",
+        "youre dumb",
+        "i hate you",
+        "this is useless",
+        "this is stupid",
+        "this is pointless",
+        "i give up",
+        "i'm done",
+        "im done",
+        "i am done",
+        "this sucks",
+        "i'm frustrated",
+        "im frustrated",
+        "so frustrating",
+        "this is frustrating",
+        "i'm annoyed",
+        "im annoyed",
+        "i'm pissed",
+        "im pissed",
+        "i'm so tired",
+        "im so tired",
+        "i'm exhausted",
+        "im exhausted",
+        "i'm overwhelmed",
+        "im overwhelmed",
+    ];
+    if PHRASES.iter().any(|p| m.contains(p)) {
+        return true;
+    }
+    // A short message that is essentially just a charged or throwaway word counts as
+    // emotional/small talk (so "ugh", "lol", "meh", a bare expletive get no CTAs).
+    // Bounded to short messages so a longer sentence that merely contains the word is
+    // unaffected; whole-token match so "damn" never bites "damnation".
+    const WORDS: &[&str] = &[
+        "fuck", "shit", "bitch", "asshole", "bastard", "idiot", "moron", "dumbass", "wtf", "ugh",
+        "ughhh", "meh", "lol", "lmao", "bruh", "damn", "crap", "whatever", "nevermind", "nvm",
+    ];
+    let tokens: Vec<&str> = m
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    if tokens.len() <= 4 && tokens.iter().any(|w| WORDS.contains(w)) {
+        return true;
+    }
+    false
+}
+
+/// True when a `Brainstorming` turn gestured at REAL, nameable work worth offering a
+/// one-click "Turn this into a task" / "Plan this out" button for — and false for
+/// venting, insults, or empty small talk, where those buttons are absurd.
+///
+/// This is the suggestion-suppression policy the chat surface keys its work CTAs off
+/// ([`crate::KernelState`]'s `attach_suggestions`): Hermes-first, a casual or
+/// emotional turn stays a plain conversation with NO work prompt; a button appears
+/// only when the message carries an actual work verb on something nameable
+/// (`docs/prime-processing-audit.md` "Hermes-first general agent"; §10.5, §11.1,
+/// §17.1). It gates PRESENTATION only — it can never create or run anything.
+pub fn brainstorm_offers_actionable_work(message: &str) -> bool {
+    if is_frustration_or_emotional(message) {
+        return false;
+    }
+    match brainstorm_task_candidate(message) {
+        Some(candidate) => {
+            let c = candidate.to_lowercase();
+            WORK_INDICATORS.iter().any(|v| has_word(&c, v))
+        }
+        None => false,
+    }
 }
 
 /// Map a tool-invocation message onto `(plugin_id, tool_name, input_json)`, or
@@ -2327,14 +2492,74 @@ mod tests {
     }
 
     #[test]
-    fn greeting_is_grounded_and_never_a_plan() {
+    fn greeting_is_conversational_and_never_a_work_board_prompt() {
+        // Hermes-first: a plain hello gets a plain, general reply — never a Plan, and
+        // never the old "the board's empty / what do you want to set up" steering. The
+        // reply must not volunteer board/queue/crew state or push the user into work
+        // setup on casual chat (`docs/prime-processing-audit.md` "Hermes-first general
+        // agent"; §10.5, §17.1).
         let plan = decide("hey", &PrimeIntent::Greeting, &empty_summary());
         match plan {
             PrimePlan::Reply { text } => {
-                assert!(text.contains("I am here"));
-                assert!(text.contains("idle"));
+                let lower = text.to_lowercase();
+                for banned in ["the board", "queue", "crew", "set up", "what do you want to work on"]
+                {
+                    assert!(
+                        !lower.contains(banned),
+                        "a casual greeting must not mention {banned:?}: {text:?}"
+                    );
+                }
+                // It still reads like Prime opening a conversation.
+                assert!(lower.contains("prime"));
             }
             other => panic!("greeting must be a Reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frustration_and_insults_are_flagged_emotional() {
+        for m in [
+            "fuck you",
+            "this is so frustrating",
+            "ugh",
+            "lol",
+            "you're useless",
+            "i give up",
+            "meh",
+        ] {
+            assert!(is_frustration_or_emotional(m), "{m:?} must read as emotional");
+        }
+        // A real work command that merely contains a charged word is NOT flagged as
+        // emotional small talk (and anyway classifies as task creation, not brainstorm).
+        for m in [
+            "fix the damn login bug",
+            "summarize the README",
+            "we should refactor the auth module",
+            "what is going on?",
+        ] {
+            assert!(!is_frustration_or_emotional(m), "{m:?} must NOT read as emotional");
+        }
+    }
+
+    #[test]
+    fn only_a_real_work_idea_offers_a_brainstorm_cta() {
+        // A genuine idea with a work verb gets the one-click work buttons.
+        for m in [
+            "we should refactor the auth module",
+            "i was thinking we could improve the onboarding flow",
+            "what if we automate the release process",
+        ] {
+            assert!(
+                brainstorm_offers_actionable_work(m),
+                "{m:?} should offer a work CTA"
+            );
+        }
+        // Emotional / insult / pure small talk gets NO work CTA.
+        for m in ["fuck you", "this is so frustrating", "ugh", "lol nice", "i'm so tired"] {
+            assert!(
+                !brainstorm_offers_actionable_work(m),
+                "{m:?} must NOT offer a work CTA"
+            );
         }
     }
 

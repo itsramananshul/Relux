@@ -1,5 +1,42 @@
 import type { ReluxPendingClarification, ReluxPrimeContextRead, ReluxPrimeProposal, ReluxPrimeProposalStep, ReluxPrimeTaskSlots, ReluxPrimeTaskUpdate, ReluxReplyPolish } from "./api";
 
+// Prime's chat-surface copy (RELUX_MASTER_PLAN §11.1; `docs/prime-processing-audit.md`
+// "Hermes-first general agent"). Prime is presented as a GENERAL local AI agent —
+// a chat companion that can ALSO drive the Relux control plane — not a company /
+// work-board manager. The intro, hint, placeholder, and example chips lead with
+// normal conversation; the work/crew/plugin abilities are secondary and optional.
+// Kept here (a pure .ts module) so they are unit-testable without rendering the page.
+
+// The opening line shown above the conversation. General-agent framing; it does
+// NOT lead with the board/queue/crew or "what do you want to set up".
+export const PRIME_GREETING =
+  "I'm Prime, your local AI agent. Talk to me like you would any assistant — ask a question, " +
+  "think something through, or just chat. When you want work done, I can also drive your Relux " +
+  "control plane (tasks, runs, agents, plugins) and I always ask before anything risky.";
+
+// The honest one-line contract under the header. Conversation is the default; work
+// happens only on an explicit ask, via the buttons under a reply.
+export const PRIME_HINT =
+  "Chat freely — ask anything, brainstorm, or vent; Prime won't create or run anything from " +
+  "casual conversation. When you actually want work done, just ask, or use the buttons under a " +
+  "reply to turn an idea into a task or start a run.";
+
+// The input placeholder. A general prompt, not a work-board command.
+export const PRIME_PLACEHOLDER = "Message Prime — ask anything, or tell it what to do";
+
+// Discoverable example chips. General-chat prompts come FIRST; the control-plane
+// examples are kept but secondary, so Prime never reads as work-board-only.
+export const PRIME_SUGGESTIONS = [
+  "what can you do?",
+  "help me think through an idea",
+  "what is going on?",
+  "what tools can you use?",
+  "create a task to summarize the README",
+  "orchestrate research the options, build a prototype, and write the docs",
+  "start it",
+  "why did it fail?",
+];
+
 // Pure helpers for rendering Prime's reviewable plan proposal as a card
 // (RELUX_MASTER_PLAN §10 planning layer, §11.1 "Prime Chat"). The proposal is a
 // PREVIEW: these functions only describe it. Nothing here commits work — the card

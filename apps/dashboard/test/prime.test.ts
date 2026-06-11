@@ -21,6 +21,10 @@ import {
   contextReadsHadMiss,
   contextReadDetail,
   boundedContextReads,
+  PRIME_GREETING,
+  PRIME_HINT,
+  PRIME_PLACEHOLDER,
+  PRIME_SUGGESTIONS,
 } from "../src/prime.ts";
 import type { ReluxPendingClarification, ReluxPrimeContextRead, ReluxPrimeProposal, ReluxPrimeTaskSlots, ReluxPrimeTaskUpdate } from "../src/api.ts";
 
@@ -320,6 +324,43 @@ test("contextReadDetail clamps a long summary and is honest about a miss", () =>
   // An empty summary falls back to an honest placeholder per ok/miss — never blank.
   assert.equal(contextReadDetail(read({ summary: "" })), "(no detail)");
   assert.equal(contextReadDetail(read({ ok: false, summary: "" })), "(not found)");
+});
+
+// Hermes-first chat copy: Prime is presented as a GENERAL local AI agent / chat
+// companion, not a company / work-board manager (docs/prime-processing-audit.md
+// "Hermes-first general agent"). The intro/hint/placeholder lead with normal
+// conversation; the first example chips are general-chat prompts, with the
+// control-plane examples kept but secondary.
+test("PRIME_GREETING introduces a general agent, not a work-board operator", () => {
+  const g = PRIME_GREETING.toLowerCase();
+  assert.match(g, /agent/, "Prime is framed as a general agent");
+  // It must NOT open by demanding work / setup like the old operator copy.
+  assert.doesNotMatch(g, /the local relux operator/);
+  assert.doesNotMatch(g, /tell me to create a task/);
+  // Conversation framing leads (chat / ask / talk), control-plane comes after.
+  assert.match(g, /\b(chat|ask|talk)\b/);
+});
+
+test("PRIME_HINT says casual conversation creates nothing", () => {
+  const h = PRIME_HINT.toLowerCase();
+  assert.match(h, /chat|ask|brainstorm/);
+  assert.match(h, /won't create or run|creates? nothing|won't create/);
+});
+
+test("PRIME_PLACEHOLDER is a general prompt, not a create-task command", () => {
+  assert.doesNotMatch(PRIME_PLACEHOLDER, /create a task to summarize the README/);
+  assert.match(PRIME_PLACEHOLDER.toLowerCase(), /ask anything|message prime/);
+});
+
+test("PRIME_SUGGESTIONS lead with general chat before control-plane work", () => {
+  // The very first chip is a general-capability / chat prompt, not a work command.
+  assert.doesNotMatch(PRIME_SUGGESTIONS[0].toLowerCase(), /create a task|assign |start it/);
+  assert.match(PRIME_SUGGESTIONS[0].toLowerCase(), /what can you do|help me think|chat/);
+  // The work examples are still present (control-plane stays discoverable, just secondary).
+  assert.ok(
+    PRIME_SUGGESTIONS.some((s) => s.toLowerCase().includes("create a task")),
+    "control-plane examples remain available",
+  );
 });
 
 test("boundedContextReads caps the detail list and reports the hidden count", () => {

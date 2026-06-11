@@ -1762,3 +1762,115 @@ Pinned by the `prime_history` unit tests (`fold_records_actions_counts_chat_and_
 `conversation_summary_survives_a_snapshot_round_trip`, `conversation_summary_redacts_secrets_and_stores_no_raw_envelope`,
 `a_summary_full_of_actions_still_never_promotes_casual_chat_into_work`,
 `clear_conversation_drops_the_rolling_summary_too`). No test calls a real provider.
+
+## Applied change (Hermes-first general agent — conversation default + suggestion suppression)
+
+### The bug (from a live dashboard screenshot)
+
+Prime still behaved "company / work-board first" instead of as a general AI agent:
+
+1. A casual greeting ("heyy wsuup …") was answered "… The board's empty and it's just me on
+   the crew right now. What do you want to set up?" — dragging small talk into board/company setup.
+2. An insult / vent ("fuck you") got a reasonable reply but rendered the action buttons
+   **Turn this into a task** and **Plan this out** — an absurd work prompt on emotional chat.
+3. The intro/header/placeholder/example chips were work-board-heavy ("Talk to your local
+   operator", "tell me to create a task, or start a run").
+
+The product intent (and the Hermes reference) is the opposite: Prime is a **general local AI
+agent / chat companion** that can ALSO use Paperclip/OpenClaw-style company/crew/workflow
+capabilities **when asked** — conversation first, control-plane abilities optional and explicit.
+
+### Reference reading (read first, then adapted — `docs/reference-driven-development.md`)
+
+Hermes (vendored at `reference/hermes-agent-main/`) was read for how a general agent stays
+conversational-first with tools as optional abilities:
+
+- `agent/prompt_builder.py` L134-142 `DEFAULT_AGENT_IDENTITY` — the core identity opens "You are
+  Hermes Agent, an intelligent AI assistant … helpful, knowledgeable, and direct … assist users
+  with a wide range of tasks … and executing actions **via your tools**." Tools are named as a
+  secondary means, never the framing. **Mapped:** Prime's brain identity (the unified
+  `build_decision_prompt`, the OpenRouter/CLI reply shapers in `ai.rs`, and the intent-classifier
+  prompt) now opens "You are Prime, a general-purpose local AI agent — a helpful assistant and
+  chat companion, like Codex or Hermes … and WHEN THE USER ASKS FOR WORK you can also drive a
+  local Relux control plane …". Conversation is declared first; the control plane is an optional
+  tool reached for only on an explicit work request.
+- `agent/system_prompt.py` L103-118 — tool-specific guidance is injected **only when that tool is
+  registered**; the base prompt is conversational. `build_api_kwargs`
+  (`agent/chat_completion_helpers.py` L233-474) passes tools with **no `tool_choice="required"`**
+  — the model freely chooses chat vs. tool each turn (bifurcation at `conversation_loop.py` L3106
+  `if assistant_message.tool_calls:`). **Mapped:** Relux already keeps work behind an
+  explicit-instruction gate (`reconcile_intent`, fail-closed); this slice stops the *prompt* from
+  steering every reply toward work, matching Hermes' "tools are optional, the model decides"
+  posture. The fail-closed gate is untouched — casual/emotional chat still can never be promoted
+  to a work intent.
+- `agent/message_sanitization.py` L1-140 — Hermes does **no** profanity / insult / sentiment
+  special-casing; it sanitizes only for technical correctness and lets the model respond
+  naturally. **Mapped:** Relux likewise does not "handle" profanity at the brain — the model just
+  replies. The only added deterministic signal is presentation: `is_frustration_or_emotional`
+  exists solely to SUPPRESS work CTAs, never to classify, gate, or act (a false positive only
+  means a friendlier, button-free reply).
+- `agent/prompt_builder.py` L306-338 (`<act_dont_ask>` / `<missing_context>`) — act on an obvious
+  default, ask only when genuinely ambiguous. Relux's existing ask-one-question clarify path
+  already matches this; unchanged this slice.
+
+Paperclip/OpenClaw was not re-read for this slice: the optional work path — explicit task/agent/
+orchestration creation behind `action_request` + `reconcile_intent` — is preserved exactly (see
+the earlier "unified brain decision envelope" and "governed write tool" slices).
+
+### What changed (and the safety wall that did NOT)
+
+- **Brain identity & rules (prompts only):** `prime_decision.rs build_decision_prompt`,
+  `ai.rs compose_chat_prompt` + `build_messages`, `prime_intent.rs build_intent_prompt` now frame
+  Prime as a general agent and explicitly tell the brain: greetings / small talk / jokes / venting
+  / insults / frustration / emotional messages / general Q&A are CONVERSATION (never work); do NOT
+  mention the board/queue/crew or "what do you want to set up" unless the user asked about
+  work/state, and do NOT push tasks or company setup onto casual chat.
+- **Deterministic fallback wording (`prime.rs`):** the `Greeting` reply is now a general, open
+  conversational line (`greeting_text`) that names no board/queue/crew state and asks nothing about
+  setup; the `DirectAnswer` fallback leads with general help and mentions the control plane only as
+  an optional ability.
+- **Suggestion-suppression policy (`prime.rs` + `state.rs attach_suggestions`):** the brainstorm
+  work CTAs ("Turn this into a task" / "Plan this out") now attach ONLY when
+  `brainstorm_offers_actionable_work(message)` is true — the message is not emotional/insult/small
+  talk AND its stripped candidate carries a real work verb (`WORK_INDICATORS`). A vent or insult
+  the brain happened to label `Brainstorming` gets a normal reply with no buttons. `attach_suggestions`
+  is the single backend source of truth for CTAs; the dashboard renders only what the backend
+  returns (no duplicate frontend filter).
+- **Did NOT change (the binding rails):** `reconcile_intent` (the fail-closed intent gate), every
+  existence/approval check, `decide` → `prime_execute`, and the per-call tool approval are all
+  untouched. An explicit work request still acts, still offers its real CTAs (e.g. "Start the
+  run"), and a risky action is still approval-gated. The suppression is presentation-only — it
+  creates and runs nothing.
+
+### Files changed
+
+- `crates/relux-kernel/src/prime.rs` — `greeting_text`, general `Greeting`/`DirectAnswer`
+  fallbacks, `is_frustration_or_emotional`, `brainstorm_offers_actionable_work`, `WORK_INDICATORS`;
+  updated/added tests.
+- `crates/relux-kernel/src/state.rs` — `attach_suggestions` gates the brainstorm CTAs on
+  `brainstorm_offers_actionable_work`; new tests `emotional_chat_gets_no_work_ctas`,
+  `explicit_create_still_offers_the_start_cta`.
+- `crates/relux-kernel/src/prime_decision.rs`, `crates/relux-kernel/src/ai.rs`,
+  `crates/relux-kernel/src/prime_intent.rs` — Hermes-first brain identity + conversation-first rules.
+- `apps/dashboard/src/prime.ts` (+ `pages/Prime.tsx`) — `PRIME_GREETING` / `PRIME_HINT` /
+  `PRIME_PLACEHOLDER` / `PRIME_SUGGESTIONS` general-agent copy; `apps/dashboard/test/prime.test.ts`
+  pins it; rebuilt `crates/relix-web-bridge/dashboard-dist`.
+
+### Tests
+
+Backend: `greeting_is_conversational_and_never_a_work_board_prompt`,
+`frustration_and_insults_are_flagged_emotional`, `only_a_real_work_idea_offers_a_brainstorm_cta`
+(prime.rs); `emotional_chat_gets_no_work_ctas`, `explicit_create_still_offers_the_start_cta`
+(state.rs). Frontend: the four `PRIME_*` copy tests in `prime.test.ts`. No test calls a real provider.
+
+### Remaining agent-behavior gaps
+
+- The deterministic `classify_intent` rail still has no dedicated emotional/insult intent — such
+  messages land on `DirectAnswer`/`Brainstorming` and rely on the CTA gate for correct
+  presentation; a true brain produces the natural reply. A future slice could add a `SmallTalk`
+  intent with a tailored (still button-free) reply.
+- Suggestions are suppressed, not yet *replaced* with context-aware alternatives (e.g. an "Explore
+  this idea" or "Tell me what broke" chip); the doc's softer contextual-CTA idea is deferred.
+- The `after_action` / `clarify` / read-only-tool sub-prompts still carry the older "operator"
+  identity line; they run only on already-actionful/clarify turns (not casual chat), so they were
+  left for a follow-up coherence pass.

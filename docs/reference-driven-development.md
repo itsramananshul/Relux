@@ -2617,3 +2617,65 @@ expiry yet (the kernel clock is logical, so a real time-bound TTL is deferred; r
 grant minting reuses the per-call request path's exact gates, so allow-always can NEVER widen what per-call
 approval already allows — it only removes the repeated prompt for an invocation the operator has explicitly,
 revocably blessed.
+
+---
+
+## Reference read — Prime as a Hermes-first general agent (conversation default + suggestion suppression)
+
+A live dashboard screenshot showed Prime still behaving "work-board first": a casual greeting was answered with
+the empty board / crew state and "what do you want to set up?", and an insult ("fuck you") rendered **Turn this
+into a task** / **Plan this out** buttons. The product intent is the opposite — Prime is a **general local AI
+agent / chat companion** that can ALSO drive the Paperclip-style company/control plane **when asked**. This slice
+re-grounds the conversational default in how Hermes stays a general agent with tools as optional abilities.
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/agent/prompt_builder.py`
+  - `DEFAULT_AGENT_IDENTITY` (L134-142) — the literal identity: "You are Hermes Agent, an intelligent AI
+    assistant … helpful, knowledgeable, and direct … assist users with a wide range of tasks … and executing
+    actions **via your tools**." Conversation/helpfulness is the framing; tools are a secondary means.
+  - `OPENAI_MODEL_EXECUTION_GUIDANCE` (L306-338, `<act_dont_ask>` / `<missing_context>`) — act on an obvious
+    default, ask only when the ambiguity genuinely changes the action.
+- `reference/hermes-agent-main/agent/system_prompt.py` (L60-77 assembly; L103-118 conditional tool guidance;
+  L129-151 optional, per-model tool-use enforcement) — tool guidance is injected ONLY when the tool is
+  registered; the base prompt is plain conversation, and tool-use *enforcement* is off by default for capable
+  models.
+- `reference/hermes-agent-main/agent/chat_completion_helpers.py` `build_api_kwargs` (L233-474) — tools are passed
+  with NO `tool_choice="required"`; the model freely returns text or a tool call. `conversation_loop.py` L3106
+  (`if assistant_message.tool_calls:`) is the only bifurcation — chat and tool use are symmetric, model-decided.
+- `reference/hermes-agent-main/agent/message_sanitization.py` (L1-140) — there is NO profanity / insult /
+  sentiment handling; sanitization is technical only (lone surrogates, control chars). The model just replies.
+
+### The exact logic learned
+
+A general agent stays general by **identity + freedom**, not by steering: the system prompt names it a broad
+assistant and only *mentions* tools as optional; the API never forces a tool; and the runtime adds no emotional/
+profanity special-casing — it trusts the model to answer naturally. Work happens when the model chooses a tool
+on an explicit request, not because every turn is nudged toward action.
+
+### How Relux maps it
+
+| Hermes pattern | Relux adaptation |
+|---|---|
+| Identity = "intelligent AI assistant … via your tools" (conversation-first, tools optional) | The brain prompts (`prime_decision.rs build_decision_prompt`, `ai.rs compose_chat_prompt` + `build_messages`, `prime_intent.rs build_intent_prompt`) now open "You are Prime, a general-purpose local AI agent — a helpful assistant and chat companion, like Codex or Hermes … and WHEN THE USER ASKS FOR WORK you can also drive a local Relux control plane …", and explicitly tell the brain that greetings / small talk / venting / insults / emotional messages / general Q&A are conversation, never work, and not to mention the board/queue/crew or "what to set up" or push tasks on casual chat. |
+| No `tool_choice="required"`; the model freely chats vs. acts | Unchanged authority: work is still gated by the explicit-instruction, fail-closed `reconcile_intent`. This slice removes the *prompt's* steering toward work — it does not loosen the gate. The deterministic `Greeting` / `DirectAnswer` fallback wording is likewise re-worded to general-agent framing (`prime::greeting_text`). |
+| No profanity / sentiment special-casing — the model replies naturally | Relux adds NO brain-level emotional handling either. Its only addition is a PRESENTATION gate: `prime::is_frustration_or_emotional` + `brainstorm_offers_actionable_work` suppress the brainstorm work CTAs for venting/insults/empty small talk (so "fuck you" never shows "Turn this into a task"); it classifies nothing and acts on nothing. The single CTA source of truth stays `state.rs attach_suggestions`. |
+
+**What we deliberately do differently:** Hermes has a live tool-calling loop where the model executes tools
+directly; Relux keeps every durable change behind the deterministic kernel path (`decide` → `prime_execute`)
+and the fail-closed intent gate. So "Hermes-first" here means *conversational identity + no work-steering*,
+NOT giving the model execution authority. The emotional detector is a conservative presentation-only rail (a
+false positive just yields a friendlier, button-free reply); it is explicitly not a new intent or gate.
+
+### Files read in Relux (the surface being changed)
+
+- `crates/relux-kernel/src/prime.rs` — `decide` (`Greeting` / `DirectAnswer` arms), `brainstorm_task_candidate`,
+  `is_chat_guarded`; added `greeting_text`, `is_frustration_or_emotional`, `brainstorm_offers_actionable_work`,
+  `WORK_INDICATORS`.
+- `crates/relux-kernel/src/state.rs` — `attach_suggestions` (the single CTA source).
+- `crates/relux-kernel/src/prime_decision.rs`, `crates/relux-kernel/src/ai.rs`,
+  `crates/relux-kernel/src/prime_intent.rs` — the brain identity/rule prompts.
+- `apps/dashboard/src/prime.ts`, `apps/dashboard/src/pages/Prime.tsx` — the chat-surface copy.
+
+See `docs/prime-processing-audit.md` "Hermes-first general agent" for the per-case behavior table and the
+remaining gaps.

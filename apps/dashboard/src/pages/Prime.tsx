@@ -8,7 +8,7 @@ import {
   type ReluxPrimeSuggestion,
   type ReluxPrimeTurn,
 } from "../api";
-import { afterActionLabel, boundedContextReads, brainSourceLabel, contextReadDetail, contextReadsHadMiss, contextReadsUsedLabel, decisionSourceLabel, hasSteps, intentProvenance, pendingClarificationLabel, polishProvenance, proposalDisplaySummary, replyPolishLabel, requestedToolLabel, slotProvenance, stepDisplayTitle, updateProvenance } from "../prime";
+import { afterActionLabel, boundedContextReads, brainSourceLabel, contextReadDetail, contextReadsHadMiss, contextReadsUsedLabel, decisionSourceLabel, hasSteps, intentProvenance, pendingClarificationLabel, polishProvenance, PRIME_GREETING, PRIME_HINT, PRIME_PLACEHOLDER, PRIME_SUGGESTIONS, proposalDisplaySummary, replyPolishLabel, requestedToolLabel, slotProvenance, stepDisplayTitle, updateProvenance } from "../prime";
 import { workTaskHref, workRunHref } from "../routing";
 import { PrimeAutonomyPanel } from "../components/PrimeAutonomyPanel";
 import { OrchestrationPanel } from "../components/OrchestrationPanel";
@@ -35,16 +35,11 @@ const DISPOSITION_TONE: Record<string, string> = {
   needs_clarification: "backlog",
 };
 
-const SUGGESTIONS = [
-  "what tools can you use?",
-  "what is going on?",
-  "create a task to summarize the README",
-  "create an agent named researcher",
-  "orchestrate research the options, build a prototype, and write the docs",
-  "assign task_0001 to researcher",
-  "start it",
-  "why did it fail?",
-];
+// The example chips and Prime's intro/hint/placeholder copy now live in the pure
+// `../prime` module (`PRIME_SUGGESTIONS` / `PRIME_GREETING` / `PRIME_HINT` /
+// `PRIME_PLACEHOLDER`) so the Hermes-first, general-agent framing is unit-testable
+// (`docs/prime-processing-audit.md` "Hermes-first general agent").
+const SUGGESTIONS = PRIME_SUGGESTIONS;
 
 // Human label for which provider produced a reply, shown on each Prime turn so
 // the answer's source is always transparent.
@@ -63,9 +58,7 @@ function providerLabel(mode: ReluxPrimeTurn["ai_mode"]): string {
   }
 }
 
-const GREETING =
-  "I am Prime, the local Relux operator. Ask me what is going on, tell me to create a task, " +
-  "or start a run. I act through the control plane and ask before anything risky.";
+const GREETING = PRIME_GREETING;
 
 export function Prime() {
   const [log, setLog] = useState<Entry[]>([]);
@@ -159,12 +152,7 @@ export function Prime() {
           explicit command creates or runs work (§10.5 Conversation Rules). The
           autonomy/orchestration controls live in the Advanced section below the
           input, so they never push the chat down. */}
-      <div className="prime-hint muted">
-        Brainstorming stays a conversation — think out loud or ask anything freely, and Prime won't
-        create or run work. When an idea is worth pursuing, use the buttons under Prime's reply (like{" "}
-        <span className="mono">Turn this into a task</span> or <span className="mono">Start the run</span>)
-        to act on it.
-      </div>
+      <div className="prime-hint muted">{PRIME_HINT}</div>
       <div className="chat-log" ref={logRef}>
         <div className="msg assistant">{GREETING}</div>
         {log.map((m, i) => {
@@ -203,7 +191,7 @@ export function Prime() {
         <input
           ref={inputRef}
           className="input"
-          placeholder="Message Prime - e.g. 'create a task to summarize the README'"
+          placeholder={PRIME_PLACEHOLDER}
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => {

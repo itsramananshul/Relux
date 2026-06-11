@@ -8953,7 +8953,18 @@ fn attach_suggestions(
     // path to promote the idea into a task. The button pre-fills the command with
     // the work the message gestured at (`send: false`) so the user confirms or
     // edits the title - nothing is created until they send it.
-    if turn.intent == PrimeIntent::Brainstorming {
+    //
+    // Hermes-first suggestion policy: the work CTAs appear ONLY when the message
+    // gestured at REAL, nameable work. A vent, an insult, or empty small talk that
+    // the brain happened to label `Brainstorming` ("fuck you", "ugh", "lol") gets a
+    // normal conversational reply with NO "Turn this into a task" / "Plan this out"
+    // buttons — offering those there is absurd. The gate is deterministic and
+    // presentation-only ([`crate::prime::brainstorm_offers_actionable_work`]); it
+    // creates and runs nothing (`docs/prime-processing-audit.md` "Hermes-first
+    // general agent"; §10.5, §11.1, §17.1).
+    if turn.intent == PrimeIntent::Brainstorming
+        && crate::prime::brainstorm_offers_actionable_work(message)
+    {
         let candidate = brainstorm_task_candidate(message).unwrap_or_default();
         let prefill = if candidate.is_empty() {
             "create a task to ".to_string()
@@ -12948,6 +12959,62 @@ mod tests {
             .expect("brainstorming offers a promote-to-task button");
         assert_eq!(promote.message, "create a task to redo the onboarding flow");
         assert!(!promote.send, "promoting an idea pre-fills, never auto-sends");
+    }
+
+    #[test]
+    fn emotional_chat_gets_no_work_ctas() {
+        // Hermes-first suggestion policy (`docs/prime-processing-audit.md` "Hermes-first
+        // general agent"): a vent, an insult, or empty small talk is a normal
+        // conversation — Prime answers and offers NO "Turn this into a task" / "Plan
+        // this out" buttons, even if the brain (or the deterministic rail) lands the
+        // turn on a conversational intent. Nothing is created or run.
+        let (mut k, ctx) = prime_chat_kernel();
+        let before = k.task_count();
+        for msg in ["fuck you", "ugh this is so frustrating", "lol", "i give up"] {
+            let turn = k.prime_turn(&ctx, msg).unwrap();
+            assert_eq!(
+                turn.disposition,
+                PrimeDisposition::Answered,
+                "{msg:?} must stay a plain answer"
+            );
+            assert!(
+                turn.suggested_actions.is_empty(),
+                "{msg:?} must offer no work CTAs, got {:?}",
+                turn.suggested_actions
+            );
+        }
+        assert_eq!(k.task_count(), before, "emotional chat must create no work");
+
+        // A musing with no nameable work ("i was thinking about the weather")
+        // classifies as Brainstorming deterministically, but carries no work verb, so
+        // the gate still suppresses the CTAs — exercising the gate on the brainstorm path.
+        let idle = k.prime_turn(&ctx, "i was thinking about the weather today").unwrap();
+        assert_eq!(idle.intent, relux_core::PrimeIntent::Brainstorming);
+        assert!(
+            idle.suggested_actions.is_empty(),
+            "a contentless musing offers no work CTA, got {:?}",
+            idle.suggested_actions
+        );
+    }
+
+    #[test]
+    fn explicit_create_still_offers_the_start_cta() {
+        // The Hermes-first suppression is surgical: an EXPLICIT work request still
+        // yields its action and the "Start the run" CTA — only casual/emotional chat
+        // loses the buttons.
+        let (mut k, ctx) = prime_chat_kernel();
+        let created = k
+            .prime_turn(&ctx, "create a task to summarize the README")
+            .unwrap();
+        assert!(created.created_task.is_some(), "the explicit create still acts");
+        assert!(
+            created
+                .suggested_actions
+                .iter()
+                .any(|s| s.label == "Start the run"),
+            "an explicit create still offers Start the run: {:?}",
+            created.suggested_actions
+        );
     }
 
     #[test]

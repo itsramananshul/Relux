@@ -108,12 +108,15 @@ pub struct BrainIntentProposal {
 pub fn build_intent_prompt(message: &str) -> String {
     let labels = intent_labels().join(", ");
     format!(
-        "You are the intent classifier for Prime, the operator of a local Relux control plane \
-(tasks, runs, agents, plugins, permissions, approvals, an audit log). Classify the user's \
-message into EXACTLY ONE of these intent labels:\n{labels}\n\n\
+        "You are the intent classifier for Prime, a general-purpose local AI agent (a chat \
+companion like Codex or Hermes) that can ALSO drive a local Relux control plane (tasks, runs, \
+agents, plugins, permissions, approvals, an audit log) when the user asks for work. Classify the \
+user's message into EXACTLY ONE of these intent labels:\n{labels}\n\n\
 Rules:\n\
-- Casual chat, musing, or thinking out loud (\"I was thinking we could...\", \"we should...\") \
-is brainstorming, NOT work. Never pick a work or creation intent for it.\n\
+- Casual chat, small talk, greetings, jokes, venting, insults, frustration, emotional messages, \
+musing, or thinking out loud (\"I was thinking we could...\", \"we should...\") is conversation \
+(greeting / brainstorming / direct_answer), NOT work. Never pick a work or creation intent for \
+it.\n\
 - A QUESTION the user is asking or deliberating (\"how does X work?\", \"should we refactor?\") \
 is brainstorming or direct_answer, NOT work.\n\
 - Only an explicit instruction to DO something (\"create a task to...\", \"run it\", \
