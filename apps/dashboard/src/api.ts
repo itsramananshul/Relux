@@ -2828,6 +2828,43 @@ export const reluxApprovals = {
       `/v1/relux/approvals/${encodeURIComponent(id)}/execute`,
       {},
     ),
+  // "Allow always" on a pending tool-invocation approval: approves it AND persists
+  // a standing allow-always grant so future matching invocations skip the prompt.
+  // A generic approval (no tool_invocation binding) is a 404.
+  allowAlways: (id: string) =>
+    api.post<ReluxApproval>(
+      `/v1/relux/approvals/${encodeURIComponent(id)}/allow-always`,
+      {},
+    ),
+};
+
+// -- Relux persistent allow-always grants -----------------------------------
+
+// A standing grant that lets a future matching tool invocation bypass the
+// per-call approval prompt. Bound to one exact (agent, plugin, tool) plus the
+// tool's permission + risk snapshot; matched exactly, revocable, audited.
+export interface ReluxPersistentGrant {
+  id: string;
+  created_by: string;
+  agent_id: string;
+  plugin_id: string;
+  tool_name: string;
+  permission: string;
+  risk: string;
+  created_at: string;
+  last_used_at?: string;
+}
+
+export const reluxGrants = {
+  // List all persistent allow-always grants.
+  list: () => api.get<ReluxPersistentGrant[]>("/v1/relux/grants"),
+  // Create a grant directly (the Governance affordance). A directly-runnable
+  // low-risk tool is refused (HTTP 400); a missing permission is denied.
+  create: (body: { plugin_id: string; tool_name: string; agent_id?: string }) =>
+    api.post<ReluxPersistentGrant>("/v1/relux/grants", body),
+  // Revoke a grant; the covered invocation requires per-call approval again.
+  revoke: (id: string) =>
+    api.del<{ revoked: boolean }>(`/v1/relux/grants/${encodeURIComponent(id)}`),
 };
 
 // -- Relux Permissions ------------------------------------------------------

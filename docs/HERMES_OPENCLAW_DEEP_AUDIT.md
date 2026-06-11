@@ -288,8 +288,13 @@ safe (adds no authority), bounded, feasible in one commit, and reuses existing v
   The **agent-actor surface that invokes the manager-grant path now exists** (SHIPPED — see §20: a
   per-agent access token authenticates the manager directly on `POST /v1/relux/agents/me/manager-grant`,
   no operator in the loop); the operator-assisted HTTP/UI path (§19) remains as the operator-console
-  affordance. Still open: persistent `allow-always` grants, agent-driven token enrollment, Board-style
-  multi-party oversight.
+  affordance. **Persistent `allow-always` grants now exist for one narrow surface** (SHIPPED THIS ROUND — see
+  §23): `relux_core::PersistentGrant` + the kernel `persistent_grants` store let an operator record a standing,
+  revocable, audited grant bound to one exact `(subject, plugin, tool, permission, risk)` so a future matching
+  configured-tool invocation bypasses the per-call approval *prompt* (the permission + runtime gates still
+  apply); offered as "Allow always" on a pending tool-invocation approval and listed/revoked on the Approvals
+  page. Still open: per-grant expiry/TTL, broader grant scopes (plugin-wide / project / namespace /
+  manager-issued), agent-driven token enrollment, Board-style multi-party oversight.
 
 ### Priority & slices
 
@@ -303,9 +308,11 @@ safe (adds no authority), bounded, feasible in one commit, and reuses existing v
   enforcement** itself: a permission scoped to a manager's Branch that authorization actually consults
   (Paperclip `scopeAllows` + `agentIsInSubtree`). The helper is built and tested; wiring it into a
   grant is the next slice. *(backend, tests, docs.)*
-- **P2 — persistent `allow-always` approval** (OpenClaw one-shot vs persistent): an approval that
-  records a standing grant so the same safe action isn't re-prompted. Must stay revocable. *(backend,
-  frontend, tests.)*
+- **P2 — persistent `allow-always` approval (SHIPPED in §23).** An approval that records a standing,
+  revocable, audited grant so the same gated tool invocation isn't re-prompted (`relux_core::PersistentGrant`
+  + the kernel `persistent_grants` store; "Allow always" on a pending tool-invocation approval). Remaining:
+  per-grant expiry/TTL, broader grant scopes (plugin-wide / project / namespace / manager-issued), and
+  Board-style oversight of standing grants. *(backend, frontend, tests — done.)*
 
 ---
 
@@ -1275,6 +1282,75 @@ section for the full reference read + applied-change record. In brief:
   enrollment/rotation; project / namespace scopes; governed budgets; persistent `allow-always` grants; a
   *full* manager console (Board-style oversight, live task pickers) — the panel now exercises all three
   token-authenticated routes from compact honest test affordances, but it is still not a Board-style console.
+
+---
+
+## 23. Implemented this round — the first persistent `allow-always` grant (§5 P2)
+
+- **Reference read (BINDING).** OpenClaw's persistent allow-always model:
+  `reference/openclaw-main/src/acp/permission-relay.ts`
+  (`GatewayExecApprovalDecision = "allow-once" | "allow-always" | "deny"`,
+  `buildAcpPermissionOptions` — three explicit, named options with `allow_once`/`allow_always`/`reject_once`
+  kinds — and `resolveGatewayDecisionFromPermissionOutcome`): allow-always is a distinct, operator-chosen
+  decision, never a default. `reference/openclaw-main/src/agents/bash-tools.exec-host-gateway.ts` (L610-618):
+  only the `allow-always` branch persists a durable record, and only `if (!requiresInlineEvalApproval)` — i.e.
+  allow-always is persisted ONLY for the safe-to-persist case.
+  `reference/openclaw-main/src/infra/exec-approvals.types.ts`
+  (`ExecAllowlistEntry { id, pattern, source: "allow-always", argPattern, lastUsedAt }`) +
+  `reference/openclaw-main/src/infra/exec-approvals.ts` `hasDurableExecApproval` (a later call bypasses the
+  prompt ONLY when a stored `source === "allow-always"` entry matches the EXACT command/segments; any
+  non-matching segment fails closed) + `recordAllowlistUse` (stamp `lastUsedAt`): a persisted,
+  individually-identified, per-subject record, matched EXACTLY, whose use is recorded. Mapping recorded in
+  `reference-driven-development.md` ("Reference read — persistent allow-always grant").
+
+- **What shipped.** A persistent grant primitive that lets a FUTURE matching configured-tool invocation
+  bypass the per-call approval *prompt* — explicit, revocable, auditable, and bounded to one exact
+  `(subject agent, plugin, tool)` plus the tool's CURRENT permission + risk snapshot. `relux_core::PersistentGrant`
+  (`crates/relux-core/src/persistent_grant.rs`) owns the data + the pure, fail-closed
+  `authorizes_invocation` matcher (every field exact; a changed permission or escalated/changed risk fails
+  closed). The kernel (`crates/relux-kernel/src/state.rs`) holds `persistent_grants` (snapshotted +
+  SQLite-persisted via `meta`/`next_grant` counter) and:
+  - `grant_persistent_tool_invocation` — mints a grant after the SAME fail-closed gates as the per-call
+    request path (tool exists, subject holds its permission, tool genuinely gates; a directly-runnable
+    low-risk tool is refused); idempotent on an identical grant; audited `grant:create`.
+  - the per-call gate in BOTH `call_tool` and `invoke_tool` now consults `matching_persistent_grant_id`
+    BEFORE refusing — a matching grant lets the call through and audits `grant:use` (stamping `last_used_at`),
+    while the subject's permission check and the runtime/loopback gate STILL apply (the grant bypasses ONLY
+    the prompt, never a real authorization).
+  - `revoke_persistent_grant` (hard removal, audited `grant:revoke`) and `persistent_grants()` listing.
+  - `allow_always_from_approval` — the openclaw `allow-always` decision: create the grant from a pending
+    tool-invocation approval's binding AND approve that pending approval (so the bound one-shot can still run).
+
+- **HTTP + UI.** `POST /v1/relux/approvals/:id/allow-always`, `GET/POST /v1/relux/grants`,
+  `DELETE /v1/relux/grants/:id` (`crates/relux-kernel/src/server.rs`; `UnknownPersistentGrant` → 404). The
+  Approvals page (`apps/dashboard/src/pages/ReluxApprovals.tsx`) relabels a gated tool approval's button to
+  **Approve once**, adds an **Allow always** button (with a "Allow `<tool>` for `<agent>` without asking
+  again" tooltip — narrow scope, not blanket trust), and adds an **Allow-always grants** panel that lists
+  grants (tool, agent, risk, last-used) with a per-row **Revoke**. Client: `reluxGrants` + `reluxApprovals.allowAlways`
+  (`apps/dashboard/src/api.ts`).
+
+- **HONEST trust boundary.** A grant only ever helps the EXACT subject it names (it is bound to a concrete
+  agent id), can only be created for a tool that genuinely gates, requires the subject to already hold the
+  permission, and bypasses ONLY the per-call prompt — never `agent_holds_permission`, the runtime gate, the
+  manager-subtree boundary, or the per-agent token boundary. No wildcard / blanket / global form exists here.
+
+- **Tests.** `state.rs`: a gated tool is refused without a grant then runs with one (`grant:use` audited,
+  `last_used_at` stamped); a grant covers only its exact subject/plugin/tool; a risk escalation invalidates it
+  (fail closed); revoke restores the gate (+ unknown-grant error); the permission check still denies after a
+  grant; granting a directly-runnable tool / without the permission / for an unknown tool is refused; create
+  is idempotent; `allow_always_from_approval` approves + persists and a later direct invoke bypasses; a generic
+  approval has no binding to allow-always; grants survive a snapshot roundtrip. `persistent_grant.rs`: the
+  exact-match matcher (all-fields-match authorizes; any mismatch fails closed). Full `relux-core` +
+  `relux-kernel` suites green (651 + 114); clippy clean on both. **Frontend:** `test/grants.test.ts` pins the
+  `reluxGrants` list/create/revoke + `reluxApprovals.allowAlways` request shapes and that the committed bundle
+  ships the new copy (Approve once / Allow always / Allow-always grants). Dashboard typecheck + tests (314) +
+  bundle rebuild green.
+
+- **Still missing (honest).** Per-grant expiry/TTL (the kernel clock is logical, so a real time-bound TTL is
+  deferred — revocation is the control today); a safe plugin-wide grant (`tool:<plugin>:*`) — deliberately
+  scoped to one concrete tool first; optional args-policy binding; project / namespace grant scopes; broader
+  grant subjects (manager-subtree-issued allow-always); and Board-style multi-party oversight of standing
+  grants.
 
 ---
 

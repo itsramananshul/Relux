@@ -2545,3 +2545,75 @@ kernel/operator action); the revoke is exact-only (`matches_exact`, no pattern e
 scope is removed only by revoking that exact row); no operator-assisted manager-revoke route this round (the
 token-auth path + UI form cover it). More subtree actions (status changes, …), project/namespace scopes, and
 agent-driven enrollment remain future work.
+
+---
+
+## Reference read — persistent allow-always grant (this slice)
+
+The approval surfaces so far were all one-shot: a per-call binding executes once, and a generic approval
+executes nothing. So a configured gated tool (a non-low-risk operator tool) re-prompted on EVERY invocation —
+the openclaw "allow-once vs allow-always" decision had no Relux analogue. This slice adds the first persistent
+`allow-always` grant: a standing, explicit, revocable, audited record that lets a FUTURE matching invocation
+bypass the per-call approval *prompt*, bounded to one exact `(subject, plugin, tool, permission, risk)`.
+
+### Paperclip (openclaw) — files read
+
+- `reference/openclaw-main/src/acp/permission-relay.ts` — `GatewayExecApprovalDecision =
+  "allow-once" | "allow-always" | "deny"`; `buildAcpPermissionOptions` builds three explicit, named options
+  (`allow_once` / `allow_always` / `reject_once` kinds); `resolveGatewayDecisionFromPermissionOutcome` maps the
+  selected option back to the decision. **Pattern: allow-always is a DISTINCT, operator-chosen decision offered
+  alongside allow-once and deny — never a silent default or a blanket "trust everything".**
+- `reference/openclaw-main/src/agents/bash-tools.exec-host-gateway.ts` (L609-618) — on `allow-once` the call
+  is approved for this run only; on `allow-always` it is approved AND `persistAllowAlwaysPatterns(...)` writes
+  a durable record, but ONLY `if (!requiresInlineEvalApproval)`. **Pattern: persist a standing grant ONLY for
+  the safe-to-persist case, and allow-always both approves the in-flight call AND persists.**
+- `reference/openclaw-main/src/infra/exec-approvals.types.ts` — `ExecAllowlistEntry { id, pattern,
+  source: "allow-always", commandText, argPattern, lastUsedAt }`: a persisted, individually-identified record
+  bound to a specific pattern (+ optional arg pattern), per-subject. **Pattern: an allow-always grant is an
+  individually-revocable row, not a global flag.**
+- `reference/openclaw-main/src/infra/exec-approvals.ts` — `hasDurableExecApproval(...)` /
+  `hasExactCommandDurableExecApproval` (L1017-1066): a later call bypasses the prompt ONLY when a stored
+  `source === "allow-always"` entry matches the EXACT command (pattern OR commandText equal) or every segment
+  matches an allow-always entry; any non-matching segment fails closed. `recordAllowlistUse` (L1068+) stamps
+  `lastUsedAt` on use. **Pattern: a durable grant authorizes a future call ONLY on an EXACT match (fail closed
+  otherwise), and its use is recorded.**
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/tools/approval.py` — `_YOLO_MODE_FROZEN` (a trust setting snapshotted at import
+  so a later injection cannot flip it) + the dangerous-pattern / sensitive-write-target detection that forces a
+  gate regardless. **Pattern: a standing "skip approval" decision is bounded and cannot be widened at runtime;
+  the dangerous case is never auto-allowed.** Mirrored: a Relux grant is bound to an exact tool+risk snapshot,
+  is only mintable for a tool that genuinely gates, and a risk escalation invalidates it — the standing
+  decision can never silently cover a now-more-dangerous call.
+
+### Files read in Relux (the surface being changed)
+
+- `crates/relux-kernel/src/state.rs` — the per-call gate in `call_tool` / `invoke_tool` (`tool_needs_approval`
+  → refuse) and the per-call approval flow (`request_tool_invocation_approval` / `execute_approved_tool_invocation`),
+  the `KernelSnapshot` / `from_snapshot` / `KernelCounters` persistence seams.
+- `crates/relux-core/src/tool.rs` (`approval_blocks_direct_invocation`), `permission.rs` (`Permission`,
+  `RiskLevel`), `approval.rs` — the existing approval/permission model the grant binds to.
+- `crates/relux-kernel/src/server.rs` — the approvals routes + `status_for` mapping; `store.rs` — `meta`/counter
+  persistence; `apps/dashboard/src/api.ts` + `pages/ReluxApprovals.tsx` — the Approvals UI.
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| openclaw: **allow-always is a distinct, named operator decision** (`permission-relay`) | The Approvals page relabels a gated tool approval's primary button **Approve once** and adds an **Allow always** button; `KernelState::allow_always_from_approval` approves the pending approval AND mints a grant (openclaw's "approve the in-flight call AND persist"). |
+| openclaw: **persist ONLY the safe-to-persist case** (`!requiresInlineEvalApproval`) | `grant_persistent_tool_invocation` runs the SAME fail-closed gates as the per-call request path: the tool must exist, the subject must hold its permission, and the tool must GENUINELY gate (`tool_needs_approval`); a directly-runnable low-risk tool is refused (`ToolDoesNotRequireApproval`). |
+| openclaw: **an individually-revocable, per-subject record** (`ExecAllowlistEntry { id, … }`) | `relux_core::PersistentGrant { id, subject_agent, plugin_id, tool_name, permission, risk, last_used_at }`, held in the kernel `persistent_grants` map (snapshotted + SQLite-persisted, `next_grant` counter); `revoke_persistent_grant` removes exactly that row, audited `grant:revoke`. |
+| openclaw: **bypass ONLY on an EXACT match, else fail closed** (`hasDurableExecApproval`) | `PersistentGrant::authorizes_invocation` compares subject/plugin/tool/permission/risk ALL exactly; `matching_persistent_grant_id` looks up the tool's CURRENT permission + risk, so a changed permission or escalated/changed risk no longer matches → the per-call prompt is required again. |
+| openclaw: **record use** (`recordAllowlistUse` stamps `lastUsedAt`) | when a grant lets a call through, `record_persistent_grant_use` stamps `last_used_at` and audits `grant:use` — the use of a standing grant is itself an audit event. |
+| Hermes: **the standing skip cannot be widened / never auto-allows the dangerous case** | a grant bypasses ONLY the per-call prompt — never `agent_holds_permission`, the runtime/loopback gate, the manager-subtree boundary, or the per-agent token boundary; there is no wildcard / blanket / global grant form here. |
+
+**What we deliberately do differently:** the grant authorizes a *bypass of the prompt only*, never a real
+authorization — the subject must already hold the permission (checked before the grant is consulted and again
+on every call), and the runtime gate still applies, so a grant can never make a tool runnable that the subject
+could not otherwise run. It is bound to ONE concrete tool (not a `tool:<plugin>:*` scope, even though the
+permission model supports that wildcard) to keep the first surface the narrowest safe one. There is no per-grant
+expiry yet (the kernel clock is logical, so a real time-bound TTL is deferred; revocation is the control). The
+grant minting reuses the per-call request path's exact gates, so allow-always can NEVER widen what per-call
+approval already allows — it only removes the repeated prompt for an invocation the operator has explicitly,
+revocably blessed.

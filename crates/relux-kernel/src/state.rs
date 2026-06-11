@@ -27,7 +27,8 @@ use relux_core::{
     approval_blocks_direct_invocation, clamp_runtime_timeout, plan_orchestration,
     validate_loopback_url, Agent, AgentId, Approval, ApprovalId, ApprovalStatus, AuditEvent,
     AuditResult, InstalledPlugin, Namespace, NamespaceId, Orchestration, OrchestrationBatchResult,
-    OrchestrationId, OrchestrationStatus, OrchestrationStep, Permission, PluginId, PluginManifest,
+    OrchestrationId, OrchestrationStatus, OrchestrationStep, Permission, PersistentGrant, PluginId,
+    PluginManifest,
     PluginSourceKind, PrimeAction, PrimeAutonomyConfig, PrimeAutonomyTickResult, PrimeContext,
     classify_failure, PrimeDisposition, PrimePlan, PrimeTurn, RiskLevel, RunFailureClass, RunId,
     RunRetryState, RunStatus, RuntimeKind, Run, StateSummary, StepOutcome, Task, TaskBrief, TaskId,
@@ -57,6 +58,10 @@ pub struct KernelCounters {
     /// autonomy load cleanly (orchestrations start at 0).
     #[serde(default)]
     pub next_orchestration: u64,
+    /// Next persistent-grant id. Defaulted so snapshots from before allow-always
+    /// grants load cleanly (grants start at 0).
+    #[serde(default)]
+    pub next_grant: u64,
 }
 
 /// A flat, serializable export of the entire [`KernelState`].
@@ -87,6 +92,10 @@ pub struct KernelSnapshot {
     /// snapshots (which never wrote it) load cleanly.
     #[serde(default)]
     pub pending_tool_invocations: Vec<PendingToolInvocation>,
+    /// Persistent allow-always grants, sorted by id. Defaulted so older snapshots
+    /// (which never wrote it) load cleanly.
+    #[serde(default)]
+    pub persistent_grants: Vec<PersistentGrant>,
     /// Run transcripts, in emission order.
     pub run_events: Vec<RunEvent>,
     /// The append-only audit log, in emission order.
@@ -222,6 +231,13 @@ pub struct KernelState {
     /// and consumed once by
     /// [`execute_approved_tool_invocation`](KernelState::execute_approved_tool_invocation).
     pending_tool_invocations: HashMap<ApprovalId, PendingToolInvocation>,
+    /// Persistent allow-always grants, keyed by grant id. Created by
+    /// [`grant_persistent_tool_invocation`](KernelState::grant_persistent_tool_invocation)
+    /// and consulted at the per-call approval gate in
+    /// [`call_tool`](KernelState::call_tool) / [`invoke_tool`](KernelState::invoke_tool)
+    /// so a future matching invocation bypasses the prompt; removed by
+    /// [`revoke_persistent_grant`](KernelState::revoke_persistent_grant).
+    persistent_grants: HashMap<String, PersistentGrant>,
     /// Durable Prime orchestrations, keyed by id.
     orchestrations: HashMap<OrchestrationId, Orchestration>,
     /// Per-run transcripts, in emission order.
@@ -261,6 +277,7 @@ pub struct KernelState {
     next_audit: u64,
     next_event: u64,
     next_orchestration: u64,
+    next_grant: u64,
 }
 
 /// The outcome of idempotently refreshing one bundled plugin manifest into the
@@ -351,6 +368,7 @@ impl KernelState {
             pending_tool_invocations: sorted(&self.pending_tool_invocations, |p| {
                 p.approval_id.as_str()
             }),
+            persistent_grants: sorted(&self.persistent_grants, |g| g.id.as_str()),
             run_events: self.run_events.clone(),
             audit_events: self.audit_log.clone(),
             prime_autonomy_config: self.prime_autonomy_config.clone(),
@@ -399,6 +417,7 @@ impl KernelState {
                 next_audit: self.next_audit,
                 next_event: self.next_event,
                 next_orchestration: self.next_orchestration,
+                next_grant: self.next_grant,
             },
         }
     }
@@ -449,6 +468,9 @@ impl KernelState {
                 .pending_tool_invocations
                 .insert(pending.approval_id.clone(), pending);
         }
+        for grant in snapshot.persistent_grants {
+            state.persistent_grants.insert(grant.id.clone(), grant);
+        }
         for orchestration in snapshot.orchestrations {
             state
                 .orchestrations
@@ -472,6 +494,7 @@ impl KernelState {
         state.next_audit = snapshot.counters.next_audit;
         state.next_event = snapshot.counters.next_event;
         state.next_orchestration = snapshot.counters.next_orchestration;
+        state.next_grant = snapshot.counters.next_grant;
         state.prime_autonomy_config = snapshot.prime_autonomy_config;
         state
     }
@@ -3240,29 +3263,41 @@ impl KernelState {
 
         // A tool whose declared approval blocks a direct invocation (a non-low-risk
         // operator-configured tool) is refused here - it is never run just because a
-        // runtime is enabled. Recorded honestly on the transcript + audit log.
+        // runtime is enabled - UNLESS a standing allow-always grant covers this exact
+        // (subject, plugin, tool, permission, risk). The grant bypasses ONLY this
+        // prompt; the permission check above and the runtime gate below still apply.
         if self.tool_needs_approval(plugin_id, tool_name) {
-            self.push_run_event(
-                run_id,
-                "tool_call_denied",
-                "kernel",
-                &format!("denied {tool_name}: requires approval"),
-                serde_json::json!({ "tool": tool_name, "plugin": plugin_id.as_str() }),
-            );
-            self.record_audit(
-                "agent",
-                agent_id.as_str(),
-                required.as_str(),
-                Some("tool"),
-                Some(tool_name),
-                Some(&namespace),
-                AuditResult::Denied,
-                serde_json::json!({ "run": run_id.as_str(), "reason": "requires approval" }),
-            );
-            return Err(KernelError::ToolRequiresApproval {
-                plugin: plugin_id.to_string(),
-                tool: tool_name.to_string(),
-            });
+            match self.matching_persistent_grant_id(agent_id, plugin_id, tool_name) {
+                Some(grant_id) => {
+                    self.record_persistent_grant_use(
+                        &grant_id, agent_id, plugin_id, tool_name, &namespace, &required,
+                        Some(run_id),
+                    );
+                }
+                None => {
+                    self.push_run_event(
+                        run_id,
+                        "tool_call_denied",
+                        "kernel",
+                        &format!("denied {tool_name}: requires approval"),
+                        serde_json::json!({ "tool": tool_name, "plugin": plugin_id.as_str() }),
+                    );
+                    self.record_audit(
+                        "agent",
+                        agent_id.as_str(),
+                        required.as_str(),
+                        Some("tool"),
+                        Some(tool_name),
+                        Some(&namespace),
+                        AuditResult::Denied,
+                        serde_json::json!({ "run": run_id.as_str(), "reason": "requires approval" }),
+                    );
+                    return Err(KernelError::ToolRequiresApproval {
+                        plugin: plugin_id.to_string(),
+                        tool: tool_name.to_string(),
+                    });
+                }
+            }
         }
 
         // Execute via a built-in deterministic handler or the plugin's configured
@@ -3349,26 +3384,38 @@ impl KernelState {
         }
 
         // Refuse a tool whose declared approval blocks a direct invocation (a
-        // non-low-risk operator-configured tool); audited as a denial.
+        // non-low-risk operator-configured tool); audited as a denial - UNLESS a
+        // standing allow-always grant covers this exact (subject, plugin, tool,
+        // permission, risk). The grant bypasses ONLY this prompt; the permission
+        // check above and the runtime gate below still apply.
         if self.tool_needs_approval(plugin_id, tool_name) {
-            self.record_audit(
-                "agent",
-                agent_id.as_str(),
-                required.as_str(),
-                Some("tool"),
-                Some(tool_name),
-                Some(&namespace),
-                AuditResult::Denied,
-                serde_json::json!({
-                    "via": "invoke",
-                    "plugin": plugin_id.as_str(),
-                    "reason": "requires approval"
-                }),
-            );
-            return Err(KernelError::ToolRequiresApproval {
-                plugin: plugin_id.to_string(),
-                tool: tool_name.to_string(),
-            });
+            match self.matching_persistent_grant_id(agent_id, plugin_id, tool_name) {
+                Some(grant_id) => {
+                    self.record_persistent_grant_use(
+                        &grant_id, agent_id, plugin_id, tool_name, &namespace, &required, None,
+                    );
+                }
+                None => {
+                    self.record_audit(
+                        "agent",
+                        agent_id.as_str(),
+                        required.as_str(),
+                        Some("tool"),
+                        Some(tool_name),
+                        Some(&namespace),
+                        AuditResult::Denied,
+                        serde_json::json!({
+                            "via": "invoke",
+                            "plugin": plugin_id.as_str(),
+                            "reason": "requires approval"
+                        }),
+                    );
+                    return Err(KernelError::ToolRequiresApproval {
+                        plugin: plugin_id.to_string(),
+                        tool: tool_name.to_string(),
+                    });
+                }
+            }
         }
 
         let output = match self.execute_tool_runtime(plugin_id, tool_name, &input) {
@@ -4932,6 +4979,261 @@ impl KernelState {
             permission: required.to_string(),
             output,
         })
+    }
+
+    // --- Persistent allow-always grants -----------------------------------
+
+    /// The id of a standing allow-always grant that authorizes a direct invocation
+    /// of `tool_name` on `plugin_id` as `subject`, or `None`. The tool's CURRENT
+    /// required permission and risk are looked up and the grant must match them
+    /// EXACTLY (`PersistentGrant::authorizes_invocation`), so a tool whose permission
+    /// changed or whose risk escalated since the grant was created no longer matches
+    /// (fail closed → the per-call approval is required again). An unknown plugin/tool
+    /// matches nothing. This is the read-only half of openclaw's `hasDurableExecApproval`.
+    fn matching_persistent_grant_id(
+        &self,
+        subject: &AgentId,
+        plugin_id: &PluginId,
+        tool_name: &str,
+    ) -> Option<String> {
+        let tool = self
+            .plugins
+            .get(plugin_id)
+            .and_then(|m| m.capabilities.tools.iter().find(|t| t.name == tool_name))?;
+        let permission = tool.permission.as_str();
+        let risk = &tool.risk;
+        self.persistent_grants
+            .values()
+            .find(|g| {
+                g.authorizes_invocation(subject, plugin_id.as_str(), tool_name, permission, risk)
+            })
+            .map(|g| g.id.clone())
+    }
+
+    /// Stamp a grant's `last_used_at` and audit the bypass when a standing
+    /// allow-always grant let an invocation through the per-call gate. This is the
+    /// counterpart of openclaw's `recordAllowlistUse` (record that a durable
+    /// approval was used) — the use of a persistent grant is itself an audit event.
+    #[allow(clippy::too_many_arguments)]
+    fn record_persistent_grant_use(
+        &mut self,
+        grant_id: &str,
+        agent_id: &AgentId,
+        plugin_id: &PluginId,
+        tool_name: &str,
+        namespace: &NamespaceId,
+        required: &Permission,
+        run_id: Option<&RunId>,
+    ) {
+        let used_at = self.clock.tick();
+        if let Some(g) = self.persistent_grants.get_mut(grant_id) {
+            g.last_used_at = Some(used_at);
+        }
+        self.record_audit(
+            "agent",
+            agent_id.as_str(),
+            "grant:use",
+            Some("grant"),
+            Some(grant_id),
+            Some(namespace),
+            AuditResult::Success,
+            serde_json::json!({
+                "grant": grant_id,
+                "plugin": plugin_id.as_str(),
+                "tool": tool_name,
+                "subject_agent": agent_id.as_str(),
+                "permission": required.as_str(),
+                "run": run_id.map(|r| r.as_str()),
+            }),
+        );
+    }
+
+    /// Create a persistent allow-always grant so a FUTURE matching invocation of
+    /// `tool_name` on `plugin_id` as `subject_agent` bypasses the per-call approval
+    /// prompt (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §5 P2). This is the durable
+    /// counterpart of [`request_tool_invocation_approval`](Self::request_tool_invocation_approval):
+    /// it records a standing decision instead of a one-shot binding.
+    ///
+    /// Fail-closed gates, in order (mirroring the per-call request path so a grant can
+    /// never widen the trust boundary): the tool must exist and the subject must hold
+    /// its permission; and the tool must ACTUALLY require approval (a directly-runnable
+    /// low-risk tool is refused — a grant would be meaningless). The grant snapshots the
+    /// tool's CURRENT permission + risk, which matching later re-checks exactly. Creating
+    /// an identical grant is idempotent (the existing row is returned, no duplicate).
+    pub fn grant_persistent_tool_invocation(
+        &mut self,
+        created_by: &str,
+        subject_agent: &AgentId,
+        plugin_id: &PluginId,
+        tool_name: &str,
+    ) -> Result<PersistentGrant, KernelError> {
+        let (namespace, required) =
+            self.resolve_tool_permission(subject_agent, plugin_id, tool_name)?;
+
+        if !self.agent_holds_permission(subject_agent, &required) {
+            self.record_audit(
+                "user",
+                created_by,
+                required.as_str(),
+                Some("tool"),
+                Some(tool_name),
+                Some(&namespace),
+                AuditResult::Denied,
+                serde_json::json!({
+                    "via": "grant:create",
+                    "plugin": plugin_id.as_str(),
+                    "subject_agent": subject_agent.as_str()
+                }),
+            );
+            return Err(KernelError::PermissionDenied {
+                agent: subject_agent.to_string(),
+                permission: required.to_string(),
+            });
+        }
+
+        // Only a tool that genuinely gates is grantable. A directly-runnable
+        // (low-risk auto-approve) tool needs no grant; refusing it keeps allow-always
+        // honest about what it covers (openclaw only persists allow-always for the
+        // safe-to-persist case).
+        if !self.tool_needs_approval(plugin_id, tool_name) {
+            return Err(KernelError::ToolDoesNotRequireApproval {
+                plugin: plugin_id.to_string(),
+                tool: tool_name.to_string(),
+            });
+        }
+
+        let risk = self
+            .plugins
+            .get(plugin_id)
+            .and_then(|m| m.capabilities.tools.iter().find(|t| t.name == tool_name))
+            .map(|t| t.risk.clone())
+            .unwrap_or(RiskLevel::High);
+
+        // Idempotent: an identical standing grant already covers this exact
+        // invocation — return it rather than minting a duplicate row.
+        if let Some(existing) = self.persistent_grants.values().find(|g| {
+            g.authorizes_invocation(
+                subject_agent,
+                plugin_id.as_str(),
+                tool_name,
+                required.as_str(),
+                &risk,
+            )
+        }) {
+            return Ok(existing.clone());
+        }
+
+        self.next_grant += 1;
+        let id = format!("grant_{:04}", self.next_grant);
+        let created_at = self.clock.tick();
+        let grant = PersistentGrant {
+            id: id.clone(),
+            created_by: created_by.to_string(),
+            subject_agent: subject_agent.clone(),
+            plugin_id: plugin_id.as_str().to_string(),
+            tool_name: tool_name.to_string(),
+            permission: required.as_str().to_string(),
+            risk: risk.clone(),
+            created_at,
+            last_used_at: None,
+        };
+        self.persistent_grants.insert(id.clone(), grant.clone());
+        self.record_audit(
+            "user",
+            created_by,
+            "grant:create",
+            Some("grant"),
+            Some(&id),
+            Some(&namespace),
+            AuditResult::Success,
+            serde_json::json!({
+                "plugin": plugin_id.as_str(),
+                "tool": tool_name,
+                "subject_agent": subject_agent.as_str(),
+                "permission": required.as_str(),
+                "risk": format!("{:?}", risk),
+            }),
+        );
+        Ok(grant)
+    }
+
+    /// Revoke (remove) a persistent allow-always grant by id, audited. After this
+    /// the formerly-covered invocation requires per-call approval again — the grant
+    /// stays revocable as a single, explicit row (openclaw's allowlist entries are
+    /// individually identified + removable). Errors on an unknown grant id.
+    pub fn revoke_persistent_grant(
+        &mut self,
+        id: &str,
+        revoked_by: &str,
+    ) -> Result<(), KernelError> {
+        let grant = self
+            .persistent_grants
+            .remove(id)
+            .ok_or_else(|| KernelError::UnknownPersistentGrant(id.to_string()))?;
+        let namespace = self
+            .agents
+            .get(&grant.subject_agent)
+            .map(|a| a.namespace_id.clone());
+        self.record_audit(
+            "user",
+            revoked_by,
+            "grant:revoke",
+            Some("grant"),
+            Some(id),
+            namespace.as_ref(),
+            AuditResult::Success,
+            serde_json::json!({
+                "plugin": grant.plugin_id,
+                "tool": grant.tool_name,
+                "subject_agent": grant.subject_agent.as_str(),
+            }),
+        );
+        Ok(())
+    }
+
+    /// All persistent grants, sorted by id (read-only; for the Approvals/Governance UI).
+    pub fn persistent_grants(&self) -> Vec<&PersistentGrant> {
+        let mut out: Vec<&PersistentGrant> = self.persistent_grants.values().collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
+    }
+
+    /// A single persistent grant by id, if present.
+    pub fn persistent_grant(&self, id: &str) -> Option<&PersistentGrant> {
+        self.persistent_grants.get(id)
+    }
+
+    /// "Allow always" on a PENDING per-tool-call approval: create a standing grant
+    /// from the approval's bound invocation AND approve that pending approval (so the
+    /// current bound call can still run once). This is the openclaw `allow-always`
+    /// decision: it approves the in-flight request AND persists a durable grant.
+    ///
+    /// The grant is created FIRST (re-validating the subject still holds the permission
+    /// and the tool still gates), so if it fails nothing is approved and the operator
+    /// can fall back to "approve once". The approval must carry a tool-invocation
+    /// binding; a generic approval has nothing to grant.
+    pub fn allow_always_from_approval(
+        &mut self,
+        id: &ApprovalId,
+        approver: &str,
+    ) -> Result<PersistentGrant, KernelError> {
+        let binding = self
+            .pending_tool_invocations
+            .get(id)
+            .ok_or_else(|| KernelError::NoBoundToolInvocation(id.to_string()))?;
+        let subject = binding.agent_id.clone();
+        let plugin_id = binding.plugin_id.clone();
+        let tool_name = binding.tool_name.clone();
+
+        let grant = self.grant_persistent_tool_invocation(
+            approver,
+            &subject,
+            &plugin_id,
+            &tool_name,
+        )?;
+        // Approve the in-flight pending approval too, so the bound one-shot can run.
+        self.resolve_approval(id, true, approver, None)?;
+        Ok(grant)
     }
 
     pub fn approval_count(&self) -> usize {
@@ -10015,6 +10317,250 @@ mod tests {
         assert!(binding.args_preview.contains("prod"));
         // The stored snapshot keeps the real value so the approved call runs verbatim.
         assert_eq!(binding.input["token"], "s3cr3t");
+    }
+
+    // --- Persistent allow-always grants ----------------------------------------
+
+    /// `(kernel, prime, plugin_id)` with a high-risk `deploy.run` gated tool, Prime
+    /// holding its permission, AND an enabled loopback runtime that echoes a fixed
+    /// output — ready to prove a grant lets a direct invoke through.
+    fn primed_with_gated_tool_and_runtime() -> (KernelState, AgentId, PluginId) {
+        let (mut k, prime, id) = primed_with_gated_tool();
+        let base = one_shot_http(
+            "HTTP/1.1 200 OK\r\nContent-Length: 24\r\nConnection: close\r\n\r\n{\"output\":{\"ran\":1}}\n\n",
+        );
+        k.configure_tool_runtime(&id, &base, true, Some(2_000)).unwrap();
+        (k, prime, id)
+    }
+
+    #[test]
+    fn gated_tool_is_refused_without_a_grant_then_runs_with_one() {
+        let (mut k, prime, id) = primed_with_gated_tool_and_runtime();
+
+        // Without a grant, a direct invoke of the gated tool is refused.
+        let err = k
+            .invoke_tool(&prime, &id, "deploy.run", serde_json::json!({ "env": "prod" }))
+            .unwrap_err();
+        assert!(matches!(err, KernelError::ToolRequiresApproval { .. }), "got {err:?}");
+
+        // Create a standing allow-always grant for the exact (subject, plugin, tool).
+        let grant = k
+            .grant_persistent_tool_invocation("operator", &prime, &id, "deploy.run")
+            .expect("grant created");
+        assert_eq!(grant.subject_agent.as_str(), "prime");
+        assert_eq!(grant.tool_name, "deploy.run");
+        assert_eq!(grant.permission, "tool:relux-plugin-my-repo:run");
+        assert_eq!(grant.risk, RiskLevel::High);
+        assert!(grant.last_used_at.is_none());
+
+        // Now the same invocation bypasses the prompt and actually runs.
+        let result = k
+            .invoke_tool(&prime, &id, "deploy.run", serde_json::json!({ "env": "prod" }))
+            .expect("grant bypasses the per-call prompt");
+        assert_eq!(result.output, serde_json::json!({ "ran": 1 }));
+
+        // The use is audited and the grant's last_used_at is stamped.
+        assert!(k.audit_log().iter().any(|e| e.action == "grant:use"
+            && e.result == AuditResult::Success
+            && e.metadata["grant"] == grant.id
+            && e.metadata["tool"] == "deploy.run"));
+        assert!(k.persistent_grant(&grant.id).unwrap().last_used_at.is_some());
+        // Creating it was audited too.
+        assert!(k.audit_log().iter().any(|e| e.action == "grant:create"
+            && e.metadata["tool"] == "deploy.run"));
+    }
+
+    #[test]
+    fn a_grant_only_covers_its_exact_subject_plugin_and_tool() {
+        let (mut k, prime, id) = primed_with_gated_tool_and_runtime();
+        // A second gated tool on the same plugin.
+        let other = k
+            .configure_plugin_tool(&id, tool_input(r#"{"name":"deploy.destroy","risk":"high"}"#))
+            .unwrap();
+        k.grant_permission_to_agent(&prime, other.permission.clone()).unwrap();
+        // A second agent that also holds deploy.run's permission.
+        let ns = NamespaceId::new("workspace");
+        let adapter = PluginId::new("relux-adapter-local-prime");
+        let other_agent = k
+            .create_agent("worker", "Worker", "", &adapter, &ns, None, vec![])
+            .unwrap();
+        let run_perm = relux_core::Permission::new("tool:relux-plugin-my-repo:run").unwrap();
+        k.grant_permission_to_agent(&other_agent, run_perm).unwrap();
+
+        // Grant covers ONLY (prime, deploy.run).
+        k.grant_persistent_tool_invocation("operator", &prime, &id, "deploy.run")
+            .unwrap();
+
+        // A different TOOL is still gated.
+        let err = k
+            .invoke_tool(&prime, &id, "deploy.destroy", serde_json::json!({}))
+            .unwrap_err();
+        assert!(matches!(err, KernelError::ToolRequiresApproval { .. }), "different tool: {err:?}");
+
+        // A different SUBJECT is still gated, even with the same permission.
+        let err = k
+            .invoke_tool(&other_agent, &id, "deploy.run", serde_json::json!({}))
+            .unwrap_err();
+        assert!(matches!(err, KernelError::ToolRequiresApproval { .. }), "different subject: {err:?}");
+    }
+
+    #[test]
+    fn a_risk_escalation_invalidates_the_grant() {
+        let (mut k, prime, id) = primed_with_gated_tool_and_runtime();
+        k.grant_persistent_tool_invocation("operator", &prime, &id, "deploy.run")
+            .unwrap();
+        // It runs while the risk matches.
+        assert!(k
+            .invoke_tool(&prime, &id, "deploy.run", serde_json::json!({}))
+            .is_ok());
+
+        // Re-configuring the tool to a higher risk changes the bound risk class, so
+        // the grant no longer matches and the prompt is required again (fail closed).
+        k.configure_plugin_tool(&id, tool_input(r#"{"name":"deploy.run","risk":"critical"}"#))
+            .unwrap();
+        let err = k
+            .invoke_tool(&prime, &id, "deploy.run", serde_json::json!({}))
+            .unwrap_err();
+        assert!(matches!(err, KernelError::ToolRequiresApproval { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn revoking_a_grant_restores_the_per_call_gate() {
+        let (mut k, prime, id) = primed_with_gated_tool_and_runtime();
+        let grant = k
+            .grant_persistent_tool_invocation("operator", &prime, &id, "deploy.run")
+            .unwrap();
+        // Revoke it.
+        k.revoke_persistent_grant(&grant.id, "operator").unwrap();
+        assert!(k.persistent_grant(&grant.id).is_none());
+        assert!(k.audit_log().iter().any(|e| e.action == "grant:revoke"
+            && e.metadata["tool"] == "deploy.run"));
+
+        // The invocation is gated again.
+        let err = k
+            .invoke_tool(&prime, &id, "deploy.run", serde_json::json!({}))
+            .unwrap_err();
+        assert!(matches!(err, KernelError::ToolRequiresApproval { .. }), "got {err:?}");
+
+        // Revoking an unknown grant is an honest error.
+        let err = k.revoke_persistent_grant("grant_9999", "operator").unwrap_err();
+        assert!(matches!(err, KernelError::UnknownPersistentGrant(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn the_permission_check_still_applies_after_a_grant() {
+        let (mut k, prime, id) = primed_with_gated_tool_and_runtime();
+        let grant = k
+            .grant_persistent_tool_invocation("operator", &prime, &id, "deploy.run")
+            .unwrap();
+        // Revoke Prime's underlying permission AFTER granting allow-always.
+        let run_perm = relux_core::Permission::new("tool:relux-plugin-my-repo:run").unwrap();
+        k.revoke_permission_from_agent(&prime, &run_perm).unwrap();
+
+        // The grant bypasses ONLY the prompt; the permission check still denies.
+        let err = k
+            .invoke_tool(&prime, &id, "deploy.run", serde_json::json!({}))
+            .unwrap_err();
+        assert!(matches!(err, KernelError::PermissionDenied { .. }), "got {err:?}");
+        // The grant row is untouched (it still exists; permission is the separate gate).
+        assert!(k.persistent_grant(&grant.id).is_some());
+    }
+
+    #[test]
+    fn granting_a_directly_runnable_tool_is_refused() {
+        let (mut k, prime, id) = primed_with_wrapper();
+        let def = k
+            .configure_plugin_tool(&id, tool_input(r#"{"name":"report.fetch","risk":"low"}"#))
+            .unwrap();
+        k.grant_permission_to_agent(&prime, def.permission).unwrap();
+        // A low-risk auto-approve tool needs no grant — refused (a grant is meaningless).
+        let err = k
+            .grant_persistent_tool_invocation("operator", &prime, &id, "report.fetch")
+            .unwrap_err();
+        assert!(matches!(err, KernelError::ToolDoesNotRequireApproval { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn granting_without_the_permission_or_for_unknown_tool_is_refused() {
+        let (mut k, _prime, id) = primed_with_gated_tool();
+        let ns = NamespaceId::new("workspace");
+        let adapter = PluginId::new("relux-adapter-local-prime");
+        let weak = k
+            .create_agent("weak", "Weak", "no perms", &adapter, &ns, None, vec![])
+            .unwrap();
+        // Subject lacks the permission → denied (no boundary widening).
+        let err = k
+            .grant_persistent_tool_invocation("operator", &weak, &id, "deploy.run")
+            .unwrap_err();
+        assert!(matches!(err, KernelError::PermissionDenied { .. }), "got {err:?}");
+        // An unknown tool cannot be granted (malformed grant rejected).
+        let err = k
+            .grant_persistent_tool_invocation("operator", &weak, &id, "nope.missing")
+            .unwrap_err();
+        assert!(matches!(err, KernelError::ToolNotFound { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn creating_an_identical_grant_is_idempotent() {
+        let (mut k, prime, id) = primed_with_gated_tool();
+        let a = k
+            .grant_persistent_tool_invocation("operator", &prime, &id, "deploy.run")
+            .unwrap();
+        let b = k
+            .grant_persistent_tool_invocation("operator", &prime, &id, "deploy.run")
+            .unwrap();
+        // Same row returned; no duplicate.
+        assert_eq!(a.id, b.id);
+        assert_eq!(k.persistent_grants().len(), 1);
+    }
+
+    #[test]
+    fn allow_always_from_approval_approves_and_persists() {
+        let (mut k, prime, id) = primed_with_gated_tool_and_runtime();
+        let appr_id = k
+            .request_tool_invocation_approval(
+                "operator",
+                &prime,
+                &id,
+                "deploy.run",
+                serde_json::json!({ "env": "prod" }),
+            )
+            .unwrap();
+        // "Allow always": approves this pending approval AND creates a standing grant.
+        let grant = k.allow_always_from_approval(&appr_id, "operator").unwrap();
+        assert_eq!(grant.tool_name, "deploy.run");
+        // The pending approval is approved (so its bound one-shot can still run).
+        assert_eq!(k.approval(&appr_id).unwrap().status, ApprovalStatus::Approved);
+        assert!(!k.pending_tool_invocation(&appr_id).unwrap().consumed);
+
+        // And a FUTURE direct invoke of the same tool now bypasses the prompt via the
+        // grant and actually runs (the one-shot fixture serves this single request).
+        let result = k
+            .invoke_tool(&prime, &id, "deploy.run", serde_json::json!({ "env": "prod" }))
+            .expect("grant bypasses the prompt on a later call");
+        assert_eq!(result.output, serde_json::json!({ "ran": 1 }));
+    }
+
+    #[test]
+    fn allow_always_requires_a_tool_invocation_binding() {
+        let mut k = KernelState::new();
+        // A generic approval (no bound tool invocation) cannot be "allow always".
+        let appr_id = k.request_approval("operator", "do thing", "because", RiskLevel::High, None);
+        let err = k.allow_always_from_approval(&appr_id, "operator").unwrap_err();
+        assert!(matches!(err, KernelError::NoBoundToolInvocation(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn grants_survive_a_snapshot_roundtrip() {
+        let (mut k, prime, id) = primed_with_gated_tool();
+        let grant = k
+            .grant_persistent_tool_invocation("operator", &prime, &id, "deploy.run")
+            .unwrap();
+        let restored = KernelState::from_snapshot(k.snapshot());
+        let g = restored.persistent_grant(&grant.id).expect("grant persisted");
+        assert_eq!(g.tool_name, "deploy.run");
+        assert_eq!(g.subject_agent.as_str(), "prime");
+        assert_eq!(g.risk, RiskLevel::High);
     }
 
     #[test]

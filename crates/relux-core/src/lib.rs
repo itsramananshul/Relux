@@ -14,6 +14,7 @@ pub mod audit;
 pub mod namespace;
 pub mod orchestration;
 pub mod permission;
+pub mod persistent_grant;
 pub mod plugin;
 pub mod prime;
 pub mod proposed_change;
@@ -46,6 +47,7 @@ pub use orchestration::{
     StepOutcome,
 };
 pub use permission::{ApprovalRequirement, Permission, PermissionError, RiskLevel, ToolDefinition};
+pub use persistent_grant::PersistentGrant;
 pub use plugin::{
     InstalledPlugin, ManifestError, PluginCapability, PluginHealth, PluginId, PluginKind,
     PluginManifest, PluginSourceKind, TrustLevel,

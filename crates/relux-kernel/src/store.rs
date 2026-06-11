@@ -126,6 +126,7 @@ impl SqliteStore {
             pending_tool_invocations: self
                 .load_meta_json("pending_tool_invocations")?
                 .unwrap_or_default(),
+            persistent_grants: self.load_meta_json("persistent_grants")?.unwrap_or_default(),
             counters: self.load_counters()?,
         })
     }
@@ -180,6 +181,7 @@ impl SqliteStore {
         put_counter(&tx, "next_audit", c.next_audit)?;
         put_counter(&tx, "next_event", c.next_event)?;
         put_counter(&tx, "next_orchestration", c.next_orchestration)?;
+        put_counter(&tx, "next_grant", c.next_grant)?;
         put_meta_json(&tx, "prime_autonomy_config", &snapshot.prime_autonomy_config)?;
         put_meta_json(&tx, "orchestrations", &snapshot.orchestrations)?;
         put_meta_json(
@@ -202,6 +204,7 @@ impl SqliteStore {
             "pending_tool_invocations",
             &snapshot.pending_tool_invocations,
         )?;
+        put_meta_json(&tx, "persistent_grants", &snapshot.persistent_grants)?;
         put_meta_json(&tx, "tool_runtime_configs", &snapshot.tool_runtime_configs)?;
         put_meta_json(
             &tx,
@@ -260,6 +263,7 @@ impl SqliteStore {
                 "next_audit" => counters.next_audit = value,
                 "next_event" => counters.next_event = value,
                 "next_orchestration" => counters.next_orchestration = value,
+                "next_grant" => counters.next_grant = value,
                 _ => {}
             }
         }

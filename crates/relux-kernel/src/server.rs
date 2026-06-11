@@ -205,6 +205,10 @@ async fn serve() -> Result<(), KernelError> {
     println!("   POST   /v1/relux/tools/invoke              {{ \"plugin_id\":\"...\", \"tool_name\":\"...\", \"input\":{{}} }}");
     println!("   POST   /v1/relux/tools/request-approval    {{ \"plugin_id\":\"...\", \"tool_name\":\"...\", \"input\":{{}} }} (per-call approval for a gated tool)");
     println!("   POST   /v1/relux/approvals/:id/execute     (run an approved per-call tool invocation once)");
+    println!("   POST   /v1/relux/approvals/:id/allow-always (approve + persist a standing allow-always grant)");
+    println!("   GET    /v1/relux/grants                    (persistent allow-always grants)");
+    println!("   POST   /v1/relux/grants                    {{ \"plugin_id\":\"...\", \"tool_name\":\"...\", \"agent_id\"? }}");
+    println!("   DELETE /v1/relux/grants/:id                (revoke a persistent grant)");
     println!("   GET    /v1/relux/plugins");
     println!("   POST   /v1/relux/plugins/install-github   {{ \"url\": \"https://github.com/...\" }}");
     println!("   POST   /v1/relux/plugins/install-zip      (multipart field: file)");
@@ -506,6 +510,16 @@ fn protected_router() -> Router<AppState> {
             "/v1/relux/approvals/:id/execute",
             post(execute_approved_tool_invocation),
         )
+        .route(
+            "/v1/relux/approvals/:id/allow-always",
+            post(allow_always_from_approval),
+        )
+        // Persistent allow-always grants (list / create / revoke).
+        .route(
+            "/v1/relux/grants",
+            get(list_persistent_grants).post(create_persistent_grant),
+        )
+        .route("/v1/relux/grants/:id", delete(revoke_persistent_grant))
         .route("/v1/relux/permissions", get(list_permissions))
         .route(
             "/v1/relux/agents/:id/permissions",
@@ -1546,6 +1560,132 @@ async fn decide_approval(
         Ok(approval_record(kernel, approval))
     })?;
     Ok(Json(record))
+}
+
+/// The wire form of a persistent allow-always grant, for the Approvals/Governance UI.
+/// Never the bare core type so the risk renders as a `snake_case` wire label.
+#[derive(Debug, Serialize)]
+struct ReluxPersistentGrantRecord {
+    id: String,
+    created_by: String,
+    agent_id: String,
+    plugin_id: String,
+    tool_name: String,
+    permission: String,
+    /// `snake_case` wire form (`low`/`medium`/`high`/`critical`).
+    risk: String,
+    created_at: String,
+    last_used_at: Option<String>,
+}
+
+fn grant_record(g: &relux_core::PersistentGrant) -> ReluxPersistentGrantRecord {
+    ReluxPersistentGrantRecord {
+        id: g.id.clone(),
+        created_by: g.created_by.clone(),
+        agent_id: g.subject_agent.as_str().to_string(),
+        plugin_id: g.plugin_id.clone(),
+        tool_name: g.tool_name.clone(),
+        permission: g.permission.clone(),
+        risk: wire_label(&g.risk),
+        created_at: g.created_at.clone(),
+        last_used_at: g.last_used_at.clone(),
+    }
+}
+
+/// POST `/v1/relux/approvals/:id/allow-always` — "Allow always" on a pending
+/// per-tool-call approval: create a standing grant from its bound invocation AND
+/// approve the pending approval (so the bound one-shot can still run once). Future
+/// matching direct invocations then bypass the per-call prompt. A generic approval
+/// (no tool-invocation binding) is a 404.
+async fn allow_always_from_approval(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<ReluxApprovalRecord>, ApiError> {
+    let approval_id = relux_core::ApprovalId::new(id);
+    let record = locked_save(&state, |kernel| {
+        kernel.allow_always_from_approval(&approval_id, "dashboard_user")?;
+        let approval = kernel
+            .approval(&approval_id)
+            .cloned()
+            .ok_or_else(|| KernelError::UnknownApproval(approval_id.to_string()))?;
+        Ok(approval_record(kernel, approval))
+    })?;
+    Ok(Json(record))
+}
+
+async fn list_persistent_grants(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<ReluxPersistentGrantRecord>>, ApiError> {
+    let grants = locked_read(&state, |kernel| {
+        Ok(kernel
+            .persistent_grants()
+            .into_iter()
+            .map(grant_record)
+            .collect::<Vec<_>>())
+    })?;
+    Ok(Json(grants))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateGrantReq {
+    /// The permission subject the grant applies to. Optional — defaults to Prime.
+    agent_id: Option<String>,
+    plugin_id: String,
+    tool_name: String,
+}
+
+/// POST `/v1/relux/grants` — create a persistent allow-always grant directly (the
+/// Governance affordance). Validates the tool exists, the subject holds its
+/// permission, and the tool actually gates; a directly-runnable tool is refused.
+async fn create_persistent_grant(
+    State(state): State<AppState>,
+    Json(req): Json<CreateGrantReq>,
+) -> Result<Json<ReluxPersistentGrantRecord>, ApiError> {
+    let plugin_id = req.plugin_id.trim().to_string();
+    if plugin_id.is_empty() {
+        return Err(ApiError::bad_request("plugin_id is required"));
+    }
+    let tool_name = req.tool_name.trim().to_string();
+    if tool_name.is_empty() {
+        return Err(ApiError::bad_request("tool_name is required"));
+    }
+    let requested_agent = req
+        .agent_id
+        .as_ref()
+        .map(|a| a.trim())
+        .filter(|a| !a.is_empty())
+        .map(|a| a.to_string());
+
+    let record = locked_save(&state, |kernel| {
+        let subject = match requested_agent {
+            Some(a) => relux_core::AgentId::new(a),
+            None => kernel.prime_agent_id().ok_or_else(|| {
+                KernelError::UnknownAgent(
+                    "no agent_id supplied and Prime is not available".to_string(),
+                )
+            })?,
+        };
+        let grant = kernel.grant_persistent_tool_invocation(
+            "dashboard_user",
+            &subject,
+            &relux_core::PluginId::new(plugin_id.clone()),
+            &tool_name,
+        )?;
+        Ok(grant_record(&grant))
+    })?;
+    Ok(Json(record))
+}
+
+/// DELETE `/v1/relux/grants/:id` — revoke a persistent allow-always grant. After
+/// this the covered invocation requires per-call approval again. Unknown id is 404.
+async fn revoke_persistent_grant(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    locked_save(&state, |kernel| {
+        kernel.revoke_persistent_grant(&id, "dashboard_user")
+    })?;
+    Ok(Json(serde_json::json!({ "revoked": true })))
 }
 
 #[derive(Debug, Serialize)]
@@ -6171,7 +6311,8 @@ fn status_for(err: &KernelError) -> StatusCode {
         // Revoking a permission the agent never held: the target capability is not
         // present, so a 404 (not a 400) is the honest shape.
         | KernelError::PermissionNotGranted(..)
-        | KernelError::UnknownOrchestration(_) => StatusCode::NOT_FOUND,
+        | KernelError::UnknownOrchestration(_)
+        | KernelError::UnknownPersistentGrant(_) => StatusCode::NOT_FOUND,
         // A configured tool that requires approval cannot be invoked directly yet:
         // a conflict the operator resolves by lowering risk / enabling auto-approve,
         // or by requesting a per-call approval.

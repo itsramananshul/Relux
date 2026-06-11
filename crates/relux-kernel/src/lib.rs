@@ -311,6 +311,8 @@ pub enum KernelError {
     ToolInvocationConsumed(String),
     #[error("approval {0} is bound to a tool invocation whose stored arguments failed their integrity check")]
     ToolInvocationArgsTampered(String),
+    #[error("persistent grant {0} does not exist")]
+    UnknownPersistentGrant(String),
     #[error("unsafe plugin path rejected: {0}")]
     UnsafePluginPath(String),
 }

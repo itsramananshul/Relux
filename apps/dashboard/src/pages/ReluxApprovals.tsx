@@ -7,6 +7,8 @@ import {
   reluxPermissions,
   ReluxAgent,
   reluxWork,
+  ReluxPersistentGrant,
+  reluxGrants,
 } from "../api";
 import { Link } from "react-router-dom";
 
@@ -14,6 +16,7 @@ const ReluxApprovals: React.FC = () => {
   const [approvals, setApprovals] = useState<ReluxApproval[]>([]);
   const [agentPermissions, setAgentPermissions] = useState<ReluxAgentPermissions[]>([]);
   const [agents, setAgents] = useState<ReluxAgent[]>([]);
+  const [grants, setGrants] = useState<ReluxPersistentGrant[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -62,14 +65,26 @@ const ReluxApprovals: React.FC = () => {
     }
   };
 
+  const fetchGrants = async () => {
+    try {
+      const data = await reluxGrants.list();
+      setGrants(data);
+    } catch (err) {
+      console.error("Failed to fetch persistent grants:", err);
+      setError("Failed to load persistent grants.");
+    }
+  };
+
   useEffect(() => {
     fetchApprovals();
     fetchAgentPermissions();
     fetchAgents();
+    fetchGrants();
     // Poll for updates every 5 seconds
     const interval = setInterval(() => {
       fetchApprovals();
       fetchAgentPermissions();
+      fetchGrants();
     }, 5000);
     return () => clearInterval(interval);
   }, []);
@@ -103,6 +118,33 @@ const ReluxApprovals: React.FC = () => {
         ...m,
         [approvalId]: err?.message || "Execution failed.",
       }));
+    }
+  };
+
+  const handleAllowAlways = async (approvalId: string) => {
+    setExecError((m) => ({ ...m, [approvalId]: "" }));
+    setExecResult((m) => ({ ...m, [approvalId]: "" }));
+    try {
+      await reluxApprovals.allowAlways(approvalId);
+      // Refresh both: the approval is now approved, and a new grant exists.
+      fetchApprovals();
+      fetchGrants();
+    } catch (err: any) {
+      console.error(`Failed to allow-always approval ${approvalId}:`, err);
+      setExecError((m) => ({
+        ...m,
+        [approvalId]: err?.message || "Allow-always failed.",
+      }));
+    }
+  };
+
+  const handleRevokeGrant = async (grantId: string) => {
+    try {
+      await reluxGrants.revoke(grantId);
+      fetchGrants();
+    } catch (err) {
+      console.error(`Failed to revoke grant ${grantId}:`, err);
+      setError("Failed to revoke grant.");
     }
   };
 
@@ -246,8 +288,21 @@ const ReluxApprovals: React.FC = () => {
                             onClick={() => handleDecideApproval(approval.id, "approved")}
                             className="text-green-500 hover:text-green-700 mr-2"
                           >
-                            Approve
+                            {ti ? "Approve once" : "Approve"}
                           </button>
+                          {/* "Allow always" is offered ONLY for a gated tool-invocation
+                              approval: it approves this call AND persists a standing grant
+                              so future calls of THIS tool by THIS agent skip the prompt.
+                              Scope is narrow on purpose — not a blanket trust. */}
+                          {ti && (
+                            <button
+                              onClick={() => handleAllowAlways(approval.id)}
+                              title={`Allow ${ti.tool_name} for ${ti.agent_id} without asking again`}
+                              className="text-amber-400 hover:text-amber-600 mr-2"
+                            >
+                              Allow always
+                            </button>
+                          )}
                           <button
                             onClick={() => handleDecideApproval(approval.id, "rejected")}
                             className="text-red-500 hover:text-red-700"
@@ -274,6 +329,68 @@ const ReluxApprovals: React.FC = () => {
                   </tr>
                   );
                 })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* Persistent allow-always grants Panel */}
+      <div className="bg-gray-800 p-6 rounded-lg shadow-md mb-8">
+        <h3 className="text-xl font-semibold mb-1 text-white">Allow-always grants</h3>
+        <p className="text-xs text-gray-400 mb-4">
+          A grant lets one agent run one specific gated tool without asking each time.
+          It only matches that exact tool, agent, and risk level — revoke it to require
+          approval again.
+        </p>
+        {grants.length === 0 ? (
+          <p className="text-gray-400">No persistent grants. Use “Allow always” on a tool approval to add one.</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="min-w-full divide-y divide-gray-700">
+              <thead className="bg-gray-700">
+                <tr>
+                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider">
+                    Tool
+                  </th>
+                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider">
+                    Agent
+                  </th>
+                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider">
+                    Risk
+                  </th>
+                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider">
+                    Last used
+                  </th>
+                  <th scope="col" className="px-6 py-3 text-right text-xs font-medium text-gray-300 uppercase tracking-wider">
+                    Actions
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="bg-gray-800 divide-y divide-gray-700">
+                {grants.map((g) => (
+                  <tr key={g.id}>
+                    <td className="px-6 py-4 align-top text-sm text-gray-300">
+                      <div className="font-mono">{g.tool_name}</div>
+                      <div className="text-xs text-gray-500 font-mono">{g.plugin_id}</div>
+                    </td>
+                    <td className="px-6 py-4 align-top text-sm text-gray-400 font-mono">
+                      {g.agent_id}
+                    </td>
+                    <td className="px-6 py-4 align-top text-sm text-gray-400">{g.risk}</td>
+                    <td className="px-6 py-4 align-top text-sm text-gray-500">
+                      {g.last_used_at ? new Date(g.last_used_at).toLocaleString() : "never"}
+                    </td>
+                    <td className="px-6 py-4 align-top text-right text-sm font-medium">
+                      <button
+                        onClick={() => handleRevokeGrant(g.id)}
+                        className="text-red-500 hover:text-red-700"
+                      >
+                        Revoke
+                      </button>
+                    </td>
+                  </tr>
+                ))}
               </tbody>
             </table>
           </div>
