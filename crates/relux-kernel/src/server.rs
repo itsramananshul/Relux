@@ -184,6 +184,7 @@ async fn serve() -> Result<(), KernelError> {
     println!("   GET    /v1/relux/audit");
     println!("   GET    /v1/relux/health");
     println!("   POST   /v1/relux/prime                     {{ \"message\": \"...\" }}");
+    println!("   POST   /v1/relux/prime/reset               (clear this conversation's bounded memory)");
     println!("   POST   /v1/relux/tasks                     {{ \"title\": \"...\" }}");
     println!("   POST   /v1/relux/tasks/:id/start");
     println!("   POST   /v1/relux/tasks/:id/execute-assigned");
@@ -377,6 +378,7 @@ fn protected_router() -> Router<AppState> {
         )
         .route("/v1/relux/agents", get(list_agents).post(create_agent))
         .route("/v1/relux/prime", post(run_prime))
+        .route("/v1/relux/prime/reset", post(reset_prime_conversation))
         .route("/v1/relux/prime/autonomy", get(get_autonomy_config).put(update_autonomy_config).patch(update_autonomy_config))
         .route("/v1/relux/prime/autonomy/tick", post(run_autonomy_tick))
         // Multi-agent orchestration (Prime as orchestrator).
@@ -1856,7 +1858,7 @@ async fn run_prime(
     // not the bare answer. The board summary grounds an assignment/update against real ids. The
     // kernel re-decides the continuation authoritatively under its own lock; this preview only
     // steers which message the (slow, off-lock) brain is asked about.
-    let (continuation, board_summary, context_snapshot) = {
+    let (continuation, board_summary, context_snapshot, recent_history) = {
         let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut kernel = {
             let store = SqliteStore::open(&state.db_path)?;
@@ -1868,7 +1870,11 @@ async fn run_prime(
         // Snapshot the read-only context the governed tool loop reads from (the whole board,
         // bounded), taken under THIS lock so the loop's brain rounds run lock-free below.
         let snapshot = kernel.context_snapshot(&ctx);
-        (preview, summary, snapshot)
+        // The bounded, secret-redacted recent-conversation context, so the (slow, off-lock) brain
+        // can interpret a follow-up in context. Advisory BACKGROUND only — it is injected into the
+        // decision prompt and never reaches the deterministic classifier or any gate.
+        let history = kernel.recent_conversation_context(&ctx);
+        (preview, summary, snapshot, history)
     };
     let is_continuation = continuation.is_some();
     // The message the brain reasons about: the COMBINED message on a continuation, else raw.
@@ -1898,6 +1904,7 @@ async fn run_prime(
         &context_snapshot,
         &decision_message,
         &board_summary,
+        &recent_history,
     )
     .await;
 
@@ -2355,6 +2362,33 @@ async fn run_prime(
         .filter(|wt| relux_kernel::is_actionful(&final_turn) && wt.intent == final_turn.intent)
         .map(|wt| wt.tool.clone());
 
+    // 5. Record a bounded, secret-redacted slice of THIS turn into the per-conversation memory so
+    // the NEXT turn's brain can interpret a follow-up in context. Done AFTER the reply is shaped
+    // and the read-only context gathered, so the stored reply + tool-read names match what the
+    // user actually saw. A short lock of its own (after the turn's own save); it stores only
+    // advisory grounding (the grounded reply, the ids the turn created, and the NAMES of the
+    // read-only tools consulted — never a raw provider envelope or full tool JSON), and grants no
+    // authority (`docs/prime-processing-audit.md` "Bounded conversation memory").
+    {
+        let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut store = SqliteStore::open(&state.db_path)?;
+        let mut kernel = store.load()?;
+        let ctx = crate::ensure_bootstrapped(&mut kernel)?;
+        let read_names: Vec<String> = final_turn
+            .context_reads
+            .iter()
+            .map(|r| r.tool.clone())
+            .collect();
+        // The combined message on a continuation (what the turn actually answered), else the raw
+        // user message.
+        let recorded_message = match continuation.as_ref() {
+            Some((combined, _)) => combined.clone(),
+            None => message.clone(),
+        };
+        kernel.record_conversation_turn(&ctx, &recorded_message, &final_turn, &read_names);
+        store.save(&kernel)?;
+    }
+
     Ok(Json(PrimeResponse {
         turn: final_turn,
         state: summary,
@@ -2368,6 +2402,31 @@ async fn run_prime(
         requested_tool,
         after_action_source,
     }))
+}
+
+/// The JSON body returned by the conversation-reset endpoint.
+#[derive(Debug, Serialize)]
+struct ResetPrimeResponse {
+    /// True when there was advisory memory (history and/or a pending clarification) to clear.
+    cleared: bool,
+}
+
+/// Clear the caller's Prime conversation memory — the bounded recent-turn history and any
+/// pending clarification (`docs/prime-processing-audit.md` "Bounded conversation memory"). This
+/// drops ONLY advisory context so a fresh conversation starts clean; no durable entity
+/// (task / run / agent / approval) is touched, so a reset can never lose real work.
+async fn reset_prime_conversation(
+    State(state): State<AppState>,
+) -> Result<Json<ResetPrimeResponse>, ApiError> {
+    let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut store = SqliteStore::open(&state.db_path)?;
+    let mut kernel = store.load()?;
+    let ctx = crate::ensure_bootstrapped(&mut kernel)?;
+    let cleared = kernel.clear_conversation(&ctx);
+    if cleared {
+        store.save(&kernel)?;
+    }
+    Ok(Json(ResetPrimeResponse { cleared }))
 }
 
 /// Cap on a CLI brain's reply, mirroring the OpenRouter reply cap.
@@ -2917,12 +2976,13 @@ async fn decide_prime_via_cli(
     status: Option<relux_core::AdapterRuntimeStatus>,
     message: &str,
     summary: &relux_core::StateSummary,
+    history: &str,
     observations: &str,
 ) -> Option<relux_kernel::PrimeBrainDecision> {
     let (stdout, kind) = cli_brain_json(
         brain,
         status,
-        relux_kernel::build_decision_prompt(message, summary, observations),
+        relux_kernel::build_decision_prompt(message, summary, history, observations),
     )
     .await?;
     parse_cli_decision(&stdout, kind)
@@ -2950,6 +3010,7 @@ async fn decide_prime_with_observation(
     snapshot: &relux_kernel::ContextSnapshot,
     message: &str,
     summary: &relux_core::StateSummary,
+    history: &str,
 ) -> (Option<relux_kernel::PrimeBrainDecision>, Vec<relux_kernel::ContextRead>) {
     if matches!(brain, relux_kernel::PrimeBrain::Local) {
         return (None, Vec::new());
@@ -2959,11 +3020,25 @@ async fn decide_prime_with_observation(
     loop {
         let decision = match brain {
             relux_kernel::PrimeBrain::Openrouter => {
-                relux_kernel::decide_prime_via_openrouter(ai_config, message, summary, &observations)
-                    .await
+                relux_kernel::decide_prime_via_openrouter(
+                    ai_config,
+                    message,
+                    summary,
+                    history,
+                    &observations,
+                )
+                .await
             }
             relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli => {
-                decide_prime_via_cli(brain, cli_status.clone(), message, summary, &observations).await
+                decide_prime_via_cli(
+                    brain,
+                    cli_status.clone(),
+                    message,
+                    summary,
+                    history,
+                    &observations,
+                )
+                .await
             }
             relux_kernel::PrimeBrain::Local => None,
         };
@@ -7326,6 +7401,33 @@ mod tests {
             call(&state, "GET", "/v1/relux/state", None, None).await;
         assert_eq!(state_status, StatusCode::UNAUTHORIZED);
         assert!(body.contains("\"needs_setup\":true"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn prime_turn_records_history_and_reset_clears_it() {
+        // Auth-disabled dev bypass so the call needs no session. A Prime turn (Local brain, no AI
+        // configured) records a bounded conversation-history record; the reset endpoint then finds
+        // and clears it, and a second reset has nothing left to drop. This pins both that
+        // `run_prime` records the turn and that the reset endpoint works end-to-end.
+        let (state, _dir) = auth_state(true);
+        let (prime_status, _, _) = call(
+            &state,
+            "POST",
+            "/v1/relux/prime",
+            None,
+            Some("{\"message\":\"what is going on?\"}"),
+        )
+        .await;
+        assert_eq!(prime_status, StatusCode::OK);
+
+        let (reset_status, _, reset_body) =
+            call(&state, "POST", "/v1/relux/prime/reset", None, None).await;
+        assert_eq!(reset_status, StatusCode::OK);
+        assert!(reset_body.contains("\"cleared\":true"), "got: {reset_body}");
+
+        // Nothing left after the first reset.
+        let (_, _, again) = call(&state, "POST", "/v1/relux/prime/reset", None, None).await;
+        assert!(again.contains("\"cleared\":false"), "got: {again}");
     }
 
     #[tokio::test]

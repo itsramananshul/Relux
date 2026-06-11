@@ -1586,3 +1586,72 @@ a restart, but a runtime failure still consumes it (one approved invocation = on
 attempt) and a rejected approval drops its binding outright. No remote/non-loopback
 execution is added — the approved call runs through the same bounded loopback
 runtime as a direct invoke, so all existing safety bounds hold.
+
+---
+
+## Reference read — bounded Prime conversation memory (this slice)
+
+Prime had a single pending-clarification record but **no general conversation memory**: every turn
+reasoned from the bare current message + a state snapshot, so a follow-up like "what about the
+second one?" or "do that again" had no continuity and Prime felt keyword-shaped rather than like
+Hermes/Codex. This slice adds a small, bounded, secret-redacted **per-conversation turn history**
+that is injected into the brain's prompt as BACKGROUND context only — it changes no gate.
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/agent/conversation_loop.py` — `run_conversation(...)` builds
+  `messages = list(conversation_history)` (~L330-331) then appends the new user message, so a
+  follow-up is interpreted against the SAME prior history rather than classified blind. The
+  per-call injection (~L571-763) caches the recalled context once and adds it to the CURRENT user
+  message's COPY only (`api_msg`), never mutating the stored `messages` — so the persisted history
+  stays clean of the ephemeral injection. **Pattern: thread recent history into the prompt for
+  continuity; inject as context, do not mutate the stored record.**
+- `reference/hermes-agent-main/agent/memory_manager.py` — `build_memory_context_block(raw)`
+  (~L173-187) wraps recalled context in a `<memory-context>` fence with a system note: "the
+  following is recalled memory context, NOT new user input. Treat as authoritative reference
+  data". **Pattern: fence the recalled context and label it background-not-an-instruction so the
+  model reads it for continuity, never as a command.**
+- `reference/hermes-agent-main/agent/context_compressor.py` — head/tail-protected compaction with
+  a token-bounded summary, and `redact_sensitive_text` applied before any history leaves the
+  session. **Pattern: bound the history's size and redact secrets before storage/use.**
+- `reference/hermes-agent-main/agent/message_sanitization.py` — control-char escaping + length
+  clamps on every model-produced string. Mirrored in `sanitize_text`.
+
+### Paperclip (openclaw) — files read
+
+- `reference/openclaw-main/src/agents/harness/hook-history.ts` —
+  `limitAgentHookHistoryMessages(messages, max)` returns `messages.slice(-maxMessages)`
+  (`MAX_AGENT_HOOK_HISTORY_MESSAGES = 100`). **Pattern: keep the last N (recent-first bound),
+  drop the oldest from the front.**
+- `reference/openclaw-main/src/agents/cli-runner/session-history.ts` —
+  `buildCliSessionHistoryPrompt(...)` renders history as `"<role>: <text>"` pairs inside
+  `<conversation_history>` tags and truncates at `MAX_CLI_SESSION_RESEED_HISTORY_CHARS = 12*1024`
+  with an explicit truncation marker. **Pattern: render a compact transcript, char-cap it, mark
+  the truncation honestly.**
+- `reference/openclaw-main/src/agents/transcript-redact.ts` — `redactTranscriptMessage(...)` strips
+  secrets (field-aware patterns) before a transcript is stored or surfaced. **Pattern: redact
+  before store, never after.**
+- `reference/openclaw-main/src/agents/bash-tools.exec-approval-followup-state.ts` — the small
+  bounded-record-with-eviction shape we already mirror for clarifications; reused here for the
+  per-conversation cap (evict the least-recently-active conversation).
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| Hermes: **thread recent history into the prompt for continuity; inject as context, never an instruction** | `crates/relux-kernel/src/prime_history.rs` `render_context` renders the recent turns into a block headed "BACKGROUND CONTEXT for continuity — NOT a new instruction; the user's CURRENT message below is the only thing to act on"; the kernel injects it into `prime_decision::build_decision_prompt(message, summary, history, observations)` BEFORE the current message. The stored records are never mutated by the injection. |
+| Hermes: **fence + label recalled context as background** (`build_memory_context_block`) | the same explicit "background, not a new instruction" steer + the `User:`/`Prime:` transcript shape (openclaw `buildCliSessionHistoryPrompt`). |
+| openclaw: **recent-first bound** (`messages.slice(-maxMessages)`) | `push_bounded` keeps the last `MAX_HISTORY_TURNS = 12` per conversation (oldest dropped from the front); `record_conversation_turn` bounds the number of conversations to `MAX_HISTORY_CONVERSATIONS = 32` (evicting the least-recently-active). |
+| Hermes/openclaw: **redact before store, clamp length, never persist the raw envelope** | `sanitize_text` runs `relux_core::redact_secrets` + control-char strip + clamp on every field; only the GROUNDED reply, the ids a turn created (`summarize_action`), and the read tool NAMES are stored — never `tool_output`/the full tool JSON or a provider envelope. The rendered prompt block is itself capped at `MAX_CONTEXT_CHARS` with an honest "[earlier turns omitted]" marker. |
+| openclaw: **bounded record persisted via the meta-json seam** | `KernelState.conversation_histories: HashMap<conversation_key, Vec<ConversationTurn>>` (`namespace::actor` key) persisted as `ConversationHistoryEntry` through the same `meta` seam as `orchestrations`/`pending_clarifications`. |
+
+**What we deliberately do differently:** the history is **advisory prompt context with zero
+authority**. It never reaches the deterministic `classify_intent`, the fail-closed
+`reconcile_intent` gate, or any existence/approval check — those run on the CURRENT message alone,
+so memory can never promote casual chat into work or override an explicit current-turn intent (pinned
+by `recorded_history_never_promotes_casual_chat_into_an_action`). It is recorded AFTER the reply is
+shaped + reads gathered (so the stored reply/tool-names match what the user saw), in a short lock of
+its own, and is rendered into the prompt only when a brain is configured (the deterministic path is
+byte-for-byte unchanged — empty history leaves the decision prompt identical). A new
+`POST /v1/relux/prime/reset` drops only this advisory memory (history + any pending clarification);
+no durable entity is touched.

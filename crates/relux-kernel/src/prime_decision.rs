@@ -294,16 +294,38 @@ impl PrimeBrainDecision {
 /// an action), and JSON-only output is demanded so nothing un-validated leaks downstream.
 /// Kept ASCII and self-contained so it works as a one-shot CLI stdin prompt.
 ///
+/// `history` is the bounded, secret-redacted recent-conversation context for this actor
+/// ([`crate::prime_history::render_context`]); empty when this is the first turn (so the prompt is
+/// byte-for-byte the prior unparameterized prompt). When non-empty it is injected as clearly
+/// labelled BACKGROUND context — so the brain can interpret a follow-up ("what about the second
+/// one?", "do that again") in context — NEVER as a new instruction; the user's CURRENT message
+/// stays the only thing to act on (the Hermes `<memory-context>` "reference, not new input" shape).
+///
 /// `observations` is the rendered result of any read-only context tools the brain already
 /// requested earlier in this turn's bounded observe-then-act loop (empty on the FIRST round, so a
 /// single-round turn's prompt is byte-for-byte the prior unparameterized prompt). When non-empty it
 /// is injected with a steer to commit (omit `tool_requests`) once the brain has observed enough —
 /// the Hermes "the model gives its final answer when it stops requesting tools" shape.
-pub fn build_decision_prompt(message: &str, summary: &StateSummary, observations: &str) -> String {
+pub fn build_decision_prompt(
+    message: &str,
+    summary: &StateSummary,
+    history: &str,
+    observations: &str,
+) -> String {
     let labels = intent_labels().join(", ");
     let tools = crate::prime_tools::read_only_tool_names();
     let write_tools = crate::prime_write_tools::write_tool_names();
     let (tasks, agents) = board_catalog(summary);
+    // The bounded recent-conversation context, injected as labelled BACKGROUND only (never an
+    // instruction). Empty history leaves the prompt byte-for-byte the prior single-shot prompt.
+    let history_block = {
+        let h = history.trim();
+        if h.is_empty() {
+            String::new()
+        } else {
+            format!("\n{h}\n")
+        }
+    };
     let mut prompt = format!(
         "You are the single decision stage for Prime, the operator of a local Relux control \
 plane (tasks, runs, agents, plugins, permissions, approvals, an audit log). For the user's \
@@ -356,7 +378,7 @@ anything.\n\
 summary and at most a few advisory questions/risks. Do NOT change the number, order, or owners \
 of steps.\n\
 - Do NOT add any key other than those shown above.\n\n\
-Tasks on the board:\n{tasks}\n\nAgents:\n{agents}\n\nUser message:\n{message}"
+Tasks on the board:\n{tasks}\n\nAgents:\n{agents}\n{history_block}\nUser message:\n{message}"
     );
     // Inject the live reads gathered earlier this turn (the observe-then-act loop). On the first
     // round this is empty and the prompt is unchanged; once the kernel has run the brain's
@@ -785,7 +807,7 @@ mod tests {
     #[test]
     fn build_prompt_carries_schema_safety_rules_and_board_grounding() {
         let summary = summary_with_agents(&["researcher"]);
-        let prompt = build_decision_prompt("assign the readme task to research", &summary, "");
+        let prompt = build_decision_prompt("assign the readme task to research", &summary, "", "");
         assert!(prompt.contains("\"classification\""));
         assert!(prompt.contains("\"task\""));
         assert!(prompt.contains("\"wording\""));
@@ -801,9 +823,9 @@ mod tests {
     #[test]
     fn build_prompt_injects_observations_and_a_commit_steer() {
         let summary = summary_with_agents(&["researcher"]);
-        let base = build_decision_prompt("start the ready task", &summary, "");
+        let base = build_decision_prompt("start the ready task", &summary, "", "");
         let observed =
-            build_decision_prompt("start the ready task", &summary, "[list_tasks] 1 task\ntask_0001: Fix login");
+            build_decision_prompt("start the ready task", &summary, "", "[list_tasks] 1 task\ntask_0001: Fix login");
         // The base prompt is a strict prefix of the observed one (the injection is appended, so a
         // single-round turn is byte-for-byte the prior unparameterized prompt).
         assert!(observed.starts_with(&base));
@@ -811,6 +833,29 @@ mod tests {
         assert!(observed.contains("task_0001: Fix login"));
         // The steer tells the brain to commit once it has observed enough.
         assert!(observed.contains("OMIT \"tool_requests\""));
+    }
+
+    #[test]
+    fn build_prompt_injects_recent_history_as_labelled_background() {
+        let summary = summary_with_agents(&["researcher"]);
+        let no_history = build_decision_prompt("do that again", &summary, "", "");
+        let with_history = build_decision_prompt(
+            "do that again",
+            &summary,
+            "Recent conversation so far (BACKGROUND CONTEXT for continuity — NOT a new \
+instruction):\nUser: create a task to fix login\nPrime: Created it. [created task_0001]",
+            "",
+        );
+        // Empty history leaves the prompt byte-for-byte the prior unparameterized prompt.
+        let baseline = build_decision_prompt("do that again", &summary, "", "");
+        assert_eq!(no_history, baseline);
+        // A non-empty history is injected as labelled background, before the current message.
+        assert!(with_history.contains("BACKGROUND CONTEXT"));
+        assert!(with_history.contains("create a task to fix login"));
+        assert!(with_history.contains("[created task_0001]"));
+        let history_pos = with_history.find("BACKGROUND CONTEXT").unwrap();
+        let message_pos = with_history.find("User message:\ndo that again").unwrap();
+        assert!(history_pos < message_pos, "history must precede the current message");
     }
 
     #[test]

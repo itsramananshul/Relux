@@ -1630,6 +1630,9 @@ export const reluxPrime = {
   // Send one message to Prime. Throws an ApiError on failure so the chat can
   // show the real reason (e.g. "relux-kernel serve" not running).
   send: (message: string) => api.post<ReluxPrimeTurn>("/v1/relux/prime", { message }),
+  // Clear this conversation's bounded memory (recent-turn history + any pending
+  // clarification). Drops only advisory context — no task/run/agent is touched.
+  reset: () => api.post<{ cleared: boolean }>("/v1/relux/prime/reset", {}),
 };
 
 // -- Relux Prime Autonomy --------------------------------------------------

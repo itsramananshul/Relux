@@ -113,6 +113,23 @@ export function Prime() {
     }
   }
 
+  // Clear the conversation: drop the on-screen log AND the kernel's bounded memory
+  // for this conversation (recent-turn history + any pending clarification), so the
+  // next message starts fresh with no carried context. Advisory only — no task, run,
+  // or agent is touched (`docs/prime-processing-audit.md` "Bounded conversation memory").
+  async function clearConversation() {
+    if (busy) return;
+    try {
+      await reluxPrime.reset();
+    } catch {
+      // Even if the server reset fails (e.g. kernel down), clear the local view so the
+      // user still gets a fresh start; the next turn re-syncs.
+    }
+    setLog([]);
+    setText("");
+    inputRef.current?.focus();
+  }
+
   // Act on a suggested next action (RELUX_MASTER_PLAN §11.1). A `send` suggestion
   // is dispatched immediately; otherwise we pre-fill the input so the user
   // completes or confirms the command (e.g. naming the task) before sending —
@@ -198,6 +215,14 @@ export function Prime() {
         />
         <button className="btn" onClick={() => void send()} disabled={busy || !text.trim()}>
           Send
+        </button>
+        <button
+          className="btn ghost"
+          onClick={() => void clearConversation()}
+          disabled={busy || log.length === 0}
+          title="Clear this conversation's memory (history + any pending question). No tasks, runs, or agents are affected."
+        >
+          Clear
         </button>
       </div>
 

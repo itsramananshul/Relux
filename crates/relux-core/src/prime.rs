@@ -768,6 +768,51 @@ pub struct PrimeContext {
 /// stale, cancelled, or superseded clarification is dropped and the follow-up is
 /// handled fresh, so a pending question can never silently steer a much later,
 /// unrelated message.
+/// One bounded record of a completed Prime turn, kept per conversation so the NEXT
+/// turn's brain can interpret a follow-up ("what about the second one?", "do that
+/// again") in context instead of reasoning from the bare current message + state
+/// snapshot (`docs/prime-processing-audit.md` "Bounded conversation memory",
+/// `docs/RELUX_MASTER_PLAN.md` §10.1 Intent Layer, §10.5 Conversation Rules,
+/// §17.1 "Prime must understand conversational intent").
+///
+/// ## The safety contract (binding)
+///
+/// This record carries ONLY bounded, secret-redacted text and a small set of
+/// labels/ids — never a raw provider envelope, the full tool-result JSON, or an
+/// executable action. The stored `reply` is Prime's GROUNDED reply (already
+/// validated, never an overclaim), `tool_reads` holds only the NAMES of the
+/// read-only context tools consulted (never their result bodies), and
+/// `action_summary` names the ids a turn created. It is advisory context, not
+/// authority: it is injected into the brain's prompt as background only — the
+/// deterministic classifier, the fail-closed intent gate, and every existence /
+/// approval check still run on the CURRENT message, so history can never promote
+/// casual chat into work or override an explicit current-turn intent. The record
+/// is bounded in count + size per conversation and overall.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationTurn {
+    /// The user's message this turn answered (the combined message on a clarification
+    /// continuation). Bounded + secret-redacted by the kernel before storage; plain
+    /// user text, never a raw envelope or secret.
+    pub user_message: String,
+    /// Prime's grounded reply (bounded + secret-redacted). The deterministic / validated
+    /// reply the user saw — never a raw provider or tool envelope.
+    pub reply: String,
+    /// The resolved intent label for this turn.
+    pub intent: PrimeIntent,
+    /// The turn's disposition (answered / executed / awaiting_approval / needs_clarification).
+    pub disposition: PrimeDisposition,
+    /// A short, bounded summary of what the turn did (e.g. `"created task_0001"`,
+    /// `"started run_0002"`). Empty for a pure conversational reply.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub action_summary: String,
+    /// The NAMES of the read-only context tools Prime consulted before answering (never
+    /// their result bodies / JSON). Empty when none ran. Bounded in count + length.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_reads: Vec<String>,
+    /// The logical-clock second this turn was recorded.
+    pub created_at_secs: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingClarification {
     /// The original (or accumulated) user message that produced the clarifying
@@ -801,6 +846,42 @@ mod tests {
         assert_eq!(json, "\"task_creation\"");
         let back: PrimeIntent = serde_json::from_str(&json).unwrap();
         assert_eq!(back, PrimeIntent::TaskCreation);
+    }
+
+    #[test]
+    fn conversation_turn_round_trips_and_omits_empty_optionals() {
+        // A pure conversational reply: empty action_summary + tool_reads must be omitted on the
+        // wire, so the record stays compact and older clients are unaffected.
+        let plain = ConversationTurn {
+            user_message: "what is going on?".to_string(),
+            reply: "There are two tasks ready.".to_string(),
+            intent: PrimeIntent::StatusQuestion,
+            disposition: PrimeDisposition::Answered,
+            action_summary: String::new(),
+            tool_reads: vec![],
+            created_at_secs: 7,
+        };
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(!json.contains("action_summary"));
+        assert!(!json.contains("tool_reads"));
+        let back: ConversationTurn = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, plain);
+
+        // A turn that created work + consulted reads carries both.
+        let acted = ConversationTurn {
+            user_message: "create a task to fix login".to_string(),
+            reply: "Created it.".to_string(),
+            intent: PrimeIntent::TaskCreation,
+            disposition: PrimeDisposition::Executed,
+            action_summary: "created task_0001".to_string(),
+            tool_reads: vec!["list_tasks".to_string()],
+            created_at_secs: 8,
+        };
+        let json = serde_json::to_string(&acted).unwrap();
+        assert!(json.contains("action_summary"));
+        assert!(json.contains("tool_reads"));
+        let back: ConversationTurn = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, acted);
     }
 
     #[test]

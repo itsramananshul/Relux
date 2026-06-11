@@ -33,6 +33,7 @@ pub mod prime_assign_slots;
 pub mod prime_clarify;
 pub mod prime_clarify_memory;
 pub mod prime_decision;
+pub mod prime_history;
 pub mod prime_intent;
 pub mod prime_orchestration_slots;
 pub mod prime_slots;
@@ -101,6 +102,10 @@ pub use prime_clarify_memory::{
 pub use prime_decision::{
     build_decision_prompt, parse_decision, run_decision_loop, DecisionLoop, DecisionStep,
     PrimeBrainDecision, MAX_DECISION_ROUNDS,
+};
+pub use prime_history::{
+    build_turn as build_history_turn, render_context as render_history_context, MAX_CONTEXT_CHARS,
+    MAX_HISTORY_CONVERSATIONS, MAX_HISTORY_TURNS,
 };
 pub use prime_intent::{
     build_intent_prompt, parse_intent_proposal, reconcile_intent, BrainIntentProposal,

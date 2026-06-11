@@ -45,7 +45,8 @@ pub use plugin::{
     PluginManifest, PluginSourceKind, TrustLevel,
 };
 pub use prime::{
-    PendingClarification, PrimeAction, PrimeAdminSlots, PrimeAgentSlots, PrimeAssignSlots,
+    ConversationTurn, PendingClarification, PrimeAction, PrimeAdminSlots, PrimeAgentSlots,
+    PrimeAssignSlots,
     PrimeAutonomyConfig, PrimeAutonomyTickResult, PrimeContext, PrimeContextRead, PrimeDisposition,
     PrimeIntent,
     PrimePlan, PrimePolishedStep, PrimeProposal, PrimeProposalPolish, PrimeProposalStep,

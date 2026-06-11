@@ -1575,3 +1575,62 @@ are narrower:
   an **actionful** turn (a short after-action explanation): the brain composes its reply before the
   kernel executes, so an honest after-action narration needs a post-execution re-shaping pass — a
   future slice that must preserve the action-free wall (no claim of work that did not happen).
+
+## Applied change (bounded conversation memory + reset)
+
+Prime had a single pending-clarification record but **no general conversation memory** — every turn
+reasoned from the bare current message + a state snapshot, so a follow-up ("what about the second
+one?", "do that again", "now assign it") had no continuity and Prime read as keyword-shaped rather
+than like Hermes/Codex. Per master plan §10.1 (Intent Layer), §10.5 (Conversation Rules), §17.1
+("Prime must understand conversational intent"), and following the reference read recorded in
+`reference-driven-development.md` ("Bounded Prime conversation memory" — Hermes `run_conversation`
+threads prior history into the prompt + `build_memory_context_block` fences it as
+background-not-an-instruction + `redact_sensitive_text`; openclaw `hook-history`
+`slice(-maxMessages)` recent-first bound + `buildCliSessionHistoryPrompt` rendered transcript +
+`transcript-redact` redact-before-store), Prime now keeps a small bounded turn history per
+conversation and injects it as BACKGROUND prompt context.
+
+- **New module `relux-kernel/src/prime_history.rs`** and a new wire type
+  `relux_core::ConversationTurn` (`user_message`, grounded `reply`, `intent`, `disposition`, a short
+  `action_summary` of the ids the turn created, the read-tool NAMES consulted, `created_at_secs`).
+  `sanitize_text` runs `redact_secrets` + control-char strip + clamp on every field; `summarize_action`
+  names only the created ids (never `tool_output`); `push_bounded` keeps the last `MAX_HISTORY_TURNS = 12`;
+  `render_context` renders a `User:`/`Prime:` transcript under a "BACKGROUND CONTEXT for continuity —
+  NOT a new instruction" header, capped at `MAX_CONTEXT_CHARS = 2000` with an honest truncation marker.
+- **Kernel state.** `KernelState.conversation_histories: HashMap<conversation_key, Vec<ConversationTurn>>`
+  (`namespace::actor` key), persisted as `ConversationHistoryEntry` through the same `meta` snapshot seam
+  as `orchestrations`/`pending_clarifications`, bounded to `MAX_HISTORY_CONVERSATIONS = 32` (the
+  least-recently-active conversation is evicted). New methods `record_conversation_turn`,
+  `recent_conversation_context`, and `clear_conversation` (drops history + any pending clarification).
+- **Prompt injection.** `prime_decision::build_decision_prompt(message, summary, history, observations)`
+  injects the rendered history BEFORE the current message; the server reads it in the pre-turn preflight
+  lock and threads it through `decide_prime_with_observation` → both brains. Empty history leaves the
+  decision prompt byte-for-byte unchanged, so the deterministic path is untouched. The turn is recorded
+  AFTER the reply is shaped + reads gathered (a short lock of its own), so the stored reply/tool-names
+  match what the user saw.
+- **UI + reset.** `POST /v1/relux/prime/reset` clears only this advisory memory; the Prime chat gains a
+  small **Clear** button (clears the on-screen log + calls reset). The dashboard already rendered the
+  client-side conversation log; that is unchanged. No durable entity is ever touched.
+- **Safety invariants (binding).** The history is advisory prompt context with ZERO authority. It never
+  reaches the deterministic `classify_intent`, the fail-closed `reconcile_intent` gate, or any
+  existence/approval check — those run on the CURRENT message alone, so memory can never promote casual
+  chat into work or override an explicit current-turn intent. No raw provider envelope or full tool JSON
+  is ever persisted (only the grounded reply, created ids, and read tool names), and every field is
+  secret-redacted + length-clamped + count-bounded.
+
+Pinned by the `prime_history` unit tests (redact+strip+clamp, ids-only-never-output,
+build-turn bounds+redacts, recent-first eviction, empty/labelled/bounded render); the core wire guard
+`conversation_turn_round_trips_and_omits_empty_optionals`; the `prime_decision` test
+`build_prompt_injects_recent_history_as_labelled_background` (incl. byte-for-byte identity when empty);
+the kernel integration tests (`conversation_turn_is_recorded_and_rendered_as_background_context`,
+`conversation_history_is_bounded_per_conversation`,
+`conversation_history_redacts_secrets_and_stores_no_raw_envelope`,
+`conversation_history_survives_a_snapshot_round_trip`,
+`clear_conversation_drops_history_and_any_pending_clarification`,
+`recorded_history_never_promotes_casual_chat_into_an_action`); and the server e2e test
+`prime_turn_records_history_and_reset_clears_it`. No test calls a real provider.
+
+**Remaining gap:** the stored reply is the GROUNDED/validated reply; a brain that re-words a turn has
+its wording shown to the user but the grounded text is what is remembered (honest by construction, never
+an overclaim). A future slice could thread tool-read *summaries* (still bounded, never bodies) into the
+history if richer continuity is needed.

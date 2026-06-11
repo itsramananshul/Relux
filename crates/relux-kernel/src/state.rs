@@ -99,6 +99,11 @@ pub struct KernelSnapshot {
     /// key. Defaulted so older snapshots (which never wrote it) load cleanly.
     #[serde(default)]
     pub pending_clarifications: Vec<PendingClarificationEntry>,
+    /// Bounded conversation history, one entry per conversation key, sorted by key.
+    /// Defaulted so older snapshots (which never wrote it) load cleanly
+    /// (`docs/prime-processing-audit.md` "Bounded conversation memory").
+    #[serde(default)]
+    pub conversation_histories: Vec<ConversationHistoryEntry>,
     pub counters: KernelCounters,
 }
 
@@ -117,6 +122,18 @@ pub struct PendingClarificationEntry {
     pub key: String,
     /// The bounded pending-clarification record.
     pub pending: relux_core::PendingClarification,
+}
+
+/// One persisted conversation's bounded turn history, paired with the conversation key it
+/// belongs to (`namespace::actor`). A flat, serializable export of one entry of the kernel's
+/// `conversation_histories` map (`docs/prime-processing-audit.md` "Bounded conversation
+/// memory"; see [`crate::prime_history`]). The turns are already secret-redacted + bounded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationHistoryEntry {
+    /// The conversation key (`namespace::actor`) this history belongs to.
+    pub key: String,
+    /// The bounded, most-recent-first-evicted list of recorded turns.
+    pub turns: Vec<relux_core::ConversationTurn>,
 }
 
 /// The hard cap on the serialized size of a single tool invocation's arguments
@@ -201,6 +218,15 @@ pub struct KernelState {
     /// "Multi-turn clarify memory"; see [`crate::prime_clarify_memory`]). Bounded:
     /// the latest record per conversation, with a hard cap on total entries.
     pending_clarifications: HashMap<String, relux_core::PendingClarification>,
+    /// Bounded conversation history: the last few recorded turns per conversation (keyed by
+    /// namespace + actor), so the NEXT turn's brain can interpret a follow-up in context
+    /// instead of reasoning only from the bare current message (`docs/prime-processing-audit.md`
+    /// "Bounded conversation memory"; see [`crate::prime_history`]). Advisory grounding only —
+    /// it is rendered into the brain's prompt as background, never consulted by the deterministic
+    /// classifier, the fail-closed intent gate, or any existence/approval check. Bounded:
+    /// [`crate::prime_history::MAX_HISTORY_TURNS`] per conversation,
+    /// [`crate::prime_history::MAX_HISTORY_CONVERSATIONS`] overall, every field secret-redacted.
+    conversation_histories: HashMap<String, Vec<relux_core::ConversationTurn>>,
     clock: Clock,
     next_task: u64,
     next_run: u64,
@@ -314,6 +340,18 @@ impl KernelState {
                 out.sort_by(|a, b| a.key.cmp(&b.key));
                 out
             },
+            conversation_histories: {
+                let mut out: Vec<ConversationHistoryEntry> = self
+                    .conversation_histories
+                    .iter()
+                    .map(|(key, turns)| ConversationHistoryEntry {
+                        key: key.clone(),
+                        turns: turns.clone(),
+                    })
+                    .collect();
+                out.sort_by(|a, b| a.key.cmp(&b.key));
+                out
+            },
             counters: KernelCounters {
                 clock_secs: self.clock.secs(),
                 next_task: self.next_task,
@@ -379,6 +417,9 @@ impl KernelState {
         }
         for entry in snapshot.pending_clarifications {
             state.pending_clarifications.insert(entry.key, entry.pending);
+        }
+        for entry in snapshot.conversation_histories {
+            state.conversation_histories.insert(entry.key, entry.turns);
         }
         state.run_events = snapshot.run_events;
         state.audit_log = snapshot.audit_events;
@@ -4812,6 +4853,75 @@ impl KernelState {
             }
         }
         self.pending_clarifications.insert(key.to_string(), pending);
+    }
+
+    /// Record one completed Prime turn into the conversation's bounded history, so the NEXT
+    /// turn's brain can interpret a follow-up in context (`docs/prime-processing-audit.md`
+    /// "Bounded conversation memory"; see [`crate::prime_history`]).
+    ///
+    /// `user_message` is the message the turn answered (the COMBINED message on a clarification
+    /// continuation), `turn` is the finished turn (its grounded reply is what the user saw), and
+    /// `tool_reads` are the NAMES of the read-only context tools consulted (never their bodies).
+    /// The record is built secret-redacted + clamped by [`crate::prime_history::build_turn`], the
+    /// per-conversation list is bounded to [`crate::prime_history::MAX_HISTORY_TURNS`] (oldest
+    /// evicted), and the number of conversations is bounded to
+    /// [`crate::prime_history::MAX_HISTORY_CONVERSATIONS`] (the conversation whose most-recent turn
+    /// is oldest is evicted when a NEW conversation would exceed the cap). This stores advisory
+    /// context only; it grants no authority and is never consulted by an action/gate path.
+    pub fn record_conversation_turn(
+        &mut self,
+        ctx: &PrimeContext,
+        user_message: &str,
+        turn: &PrimeTurn,
+        tool_reads: &[String],
+    ) {
+        let key = Self::conversation_key(ctx);
+        let now_secs = self.clock.secs();
+        let record = crate::prime_history::build_turn(user_message, turn, tool_reads, now_secs);
+        // Bound the number of distinct conversations: when recording into a NEW conversation would
+        // exceed the cap, evict the conversation whose most-recent turn is the oldest (the least
+        // recently active), so the live conversations are the ones kept.
+        if !self.conversation_histories.contains_key(&key)
+            && self.conversation_histories.len() >= crate::prime_history::MAX_HISTORY_CONVERSATIONS
+        {
+            if let Some(stalest) = self
+                .conversation_histories
+                .iter()
+                .min_by(|a, b| {
+                    let a_last = a.1.last().map(|t| t.created_at_secs).unwrap_or(0);
+                    let b_last = b.1.last().map(|t| t.created_at_secs).unwrap_or(0);
+                    a_last.cmp(&b_last).then_with(|| a.0.cmp(b.0))
+                })
+                .map(|(k, _)| k.clone())
+            {
+                self.conversation_histories.remove(&stalest);
+            }
+        }
+        let history = self.conversation_histories.entry(key).or_default();
+        crate::prime_history::push_bounded(history, record);
+    }
+
+    /// Render the conversation's recent history into a bounded, clearly-labelled BACKGROUND
+    /// context block for the brain's prompt, or `""` when there is none. Read-only; the server
+    /// calls this in the pre-turn preflight lock and threads the string into the decision prompt
+    /// (see [`crate::prime_history::render_context`]). Advisory context only — never an instruction.
+    pub fn recent_conversation_context(&self, ctx: &PrimeContext) -> String {
+        let key = Self::conversation_key(ctx);
+        match self.conversation_histories.get(&key) {
+            Some(history) => crate::prime_history::render_context(history),
+            None => String::new(),
+        }
+    }
+
+    /// Clear a conversation's memory — both its bounded turn history and any pending
+    /// clarification — for the "clear conversation" / reset action. Returns `true` when anything
+    /// was actually cleared. Drops only advisory memory; no durable entity (task/run/agent) is
+    /// touched, so a reset can never lose real work.
+    pub fn clear_conversation(&mut self, ctx: &PrimeContext) -> bool {
+        let key = Self::conversation_key(ctx);
+        let had_history = self.conversation_histories.remove(&key).is_some();
+        let had_pending = self.pending_clarifications.remove(&key).is_some();
+        had_history || had_pending
     }
 
     /// Apply a brain-suggested, already-clamped priority to a freshly created task.
@@ -9942,6 +10052,136 @@ mod tests {
         assert_ne!(t.intent, relux_core::PrimeIntent::TaskUpdate);
         assert!(t.update.is_none());
         assert_eq!(k.task(&id).unwrap().priority, before);
+    }
+
+    #[test]
+    fn conversation_turn_is_recorded_and_rendered_as_background_context() {
+        // A completed turn is remembered, and the next turn's prompt context renders it as
+        // clearly-labelled BACKGROUND (the continuity the brain reads, never an instruction).
+        let (mut k, ctx) = prime_chat_kernel();
+        assert_eq!(k.recent_conversation_context(&ctx), "");
+        let turn = k
+            .prime_turn(&ctx, "create a task to summarize the README")
+            .unwrap();
+        k.record_conversation_turn(
+            &ctx,
+            "create a task to summarize the README",
+            &turn,
+            &["list_tasks".to_string()],
+        );
+        let context = k.recent_conversation_context(&ctx);
+        assert!(context.contains("BACKGROUND CONTEXT"));
+        assert!(context.contains("NOT a new instruction"));
+        assert!(context.contains("create a task to summarize the README"));
+        // The created id is summarized into the rendered context.
+        assert!(context.contains("created "));
+    }
+
+    #[test]
+    fn conversation_history_is_bounded_per_conversation() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let turn = k.prime_turn(&ctx, "what is going on?").unwrap();
+        for i in 0..(crate::prime_history::MAX_HISTORY_TURNS + 6) {
+            k.record_conversation_turn(&ctx, &format!("message number {i}"), &turn, &[]);
+        }
+        let snap = k.snapshot();
+        let entry = snap
+            .conversation_histories
+            .iter()
+            .find(|e| e.key == KernelState::conversation_key(&ctx))
+            .expect("a history entry");
+        assert_eq!(entry.turns.len(), crate::prime_history::MAX_HISTORY_TURNS);
+        // Only the most recent turns survive (the oldest were evicted from the front).
+        assert_eq!(
+            entry.turns.last().unwrap().user_message,
+            format!("message number {}", crate::prime_history::MAX_HISTORY_TURNS + 5)
+        );
+    }
+
+    #[test]
+    fn conversation_history_redacts_secrets_and_stores_no_raw_envelope() {
+        // A secret in the message / reply is masked before storage, and only tool NAMES are
+        // kept — never the tool's result body (the no-raw-envelope rule).
+        let (mut k, ctx) = prime_chat_kernel();
+        let mut turn = k.prime_turn(&ctx, "what is going on?").unwrap();
+        turn.reply = "Here is the answer with token=sk-ABCDEFGHIJKLMNOP0123456789".to_string();
+        turn.tool_output = Some(serde_json::json!({ "leak": "sk-SHOULDNEVERPERSIST0001" }));
+        k.record_conversation_turn(
+            &ctx,
+            "what is going on? api_key=sk-LEAKLEAKLEAKLEAK00012345",
+            &turn,
+            &["list_tasks".to_string()],
+        );
+        let snap = k.snapshot();
+        let entry = snap
+            .conversation_histories
+            .iter()
+            .find(|e| e.key == KernelState::conversation_key(&ctx))
+            .expect("a history entry");
+        let rec = entry.turns.last().unwrap();
+        assert!(!rec.reply.contains("sk-ABCDEFGHIJKLMNOP0123456789"));
+        assert!(!rec.user_message.contains("sk-LEAKLEAKLEAKLEAK00012345"));
+        // The tool output body is NEVER persisted — only the read tool's name.
+        assert_eq!(rec.tool_reads, vec!["list_tasks".to_string()]);
+        let serialized = serde_json::to_string(&snap.conversation_histories).unwrap();
+        assert!(!serialized.contains("SHOULDNEVERPERSIST"));
+    }
+
+    #[test]
+    fn conversation_history_survives_a_snapshot_round_trip() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let turn = k.prime_turn(&ctx, "what is going on?").unwrap();
+        k.record_conversation_turn(&ctx, "what is going on?", &turn, &[]);
+        let before = k.recent_conversation_context(&ctx);
+        assert!(!before.is_empty());
+        let restored = KernelState::from_snapshot(k.snapshot());
+        assert_eq!(restored.recent_conversation_context(&ctx), before);
+    }
+
+    #[test]
+    fn clear_conversation_drops_history_and_any_pending_clarification() {
+        let (mut k, ctx) = prime_chat_kernel();
+        // Leave a pending clarification (an actionable, resolvable clarify).
+        let t = k.prime_turn(&ctx, "assign this to the researcher").unwrap();
+        assert_eq!(t.disposition, PrimeDisposition::NeedsClarification);
+        assert!(k.pending_clarification_for(&ctx).is_some());
+        // And some history.
+        k.record_conversation_turn(&ctx, "assign this to the researcher", &t, &[]);
+        assert!(!k.recent_conversation_context(&ctx).is_empty());
+
+        assert!(k.clear_conversation(&ctx));
+        assert!(k.pending_clarification_for(&ctx).is_none());
+        assert_eq!(k.recent_conversation_context(&ctx), "");
+        // A second clear has nothing left to drop.
+        assert!(!k.clear_conversation(&ctx));
+    }
+
+    #[test]
+    fn recorded_history_never_promotes_casual_chat_into_an_action() {
+        // CURRENT-TURN SAFETY WINS OVER HISTORY: even after a prior turn created work, a casual
+        // musing on the next turn stays a conversation and creates nothing. History is only
+        // advisory prompt context; the deterministic classifier + fail-closed gate run on the
+        // CURRENT message alone, so memory can never turn chat into an action.
+        let (mut k, ctx) = prime_chat_kernel();
+        let created = k
+            .prime_turn(&ctx, "create a task to summarize the README")
+            .unwrap();
+        assert_eq!(created.disposition, PrimeDisposition::Executed);
+        k.record_conversation_turn(
+            &ctx,
+            "create a task to summarize the README",
+            &created,
+            &[],
+        );
+        let tasks_before = k.snapshot().tasks.len();
+
+        let musing = k
+            .prime_turn(&ctx, "i wonder if we should also clean up the docs someday")
+            .unwrap();
+        assert_eq!(musing.disposition, PrimeDisposition::Answered);
+        assert_ne!(musing.intent, relux_core::PrimeIntent::TaskCreation);
+        assert!(musing.created_task.is_none());
+        assert_eq!(k.snapshot().tasks.len(), tasks_before);
     }
 
     #[test]

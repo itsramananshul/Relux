@@ -117,6 +117,9 @@ impl SqliteStore {
             pending_clarifications: self
                 .load_meta_json("pending_clarifications")?
                 .unwrap_or_default(),
+            conversation_histories: self
+                .load_meta_json("conversation_histories")?
+                .unwrap_or_default(),
             pending_tool_invocations: self
                 .load_meta_json("pending_tool_invocations")?
                 .unwrap_or_default(),
@@ -180,6 +183,11 @@ impl SqliteStore {
             &tx,
             "pending_clarifications",
             &snapshot.pending_clarifications,
+        )?;
+        put_meta_json(
+            &tx,
+            "conversation_histories",
+            &snapshot.conversation_histories,
         )?;
         put_meta_json(
             &tx,

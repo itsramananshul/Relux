@@ -868,11 +868,12 @@ pub async fn decide_prime_via_openrouter(
     cfg: &AiConfig,
     message: &str,
     summary: &relux_core::StateSummary,
+    history: &str,
     observations: &str,
 ) -> Option<crate::prime_decision::PrimeBrainDecision> {
     let text = complete_json_only(
         cfg,
-        crate::prime_decision::build_decision_prompt(message, summary, observations),
+        crate::prime_decision::build_decision_prompt(message, summary, history, observations),
     )
     .await?;
     crate::prime_decision::parse_decision(&text).ok()
