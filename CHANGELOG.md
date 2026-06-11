@@ -9,6 +9,33 @@ once a stable release is cut.
 
 ### Added
 
+- **Live session-file reconcile — `reset-admin` no longer needs a `serve` restart
+  to revoke sessions (auth v1.3).** A **running** `relux-kernel serve` now picks up an
+  out-of-band change to the persisted session file without a restart. Before every
+  session operation the store cheaply re-`stat`s its backing file (a fingerprint of
+  mtime + length, plus a "file absent" state) and only when that differs from what it
+  last wrote does it reconcile its in-memory table with disk: a **deleted** file (what
+  `reset-admin` does) drops all in-memory sessions — fail-closed — and an external
+  **rewrite** is reloaded so the running process adopts it instead of overwriting it on
+  its next persist. The fast path (the process is the only writer) is a single `stat`,
+  no per-request read/parse. `create`/`refresh` reconcile *before* they persist, so a
+  fresh login right after a delete cannot rewrite the just-revoked sessions back to
+  disk. **Net effect:** `relux-kernel reset-admin` now invalidates old cookies on a
+  running server on the **next request** — the previous "restart `serve` to finish
+  revocation" step is gone (a restart is only still needed to load a new credential
+  into a *stopped* process, or as a fallback for a wedged one). Sliding-refresh,
+  logout, password-change invalidation, restart-persistence, and the
+  `RELUX_AUTH_DISABLED` dev bypass are all unchanged. Proven by `relux-kernel` unit
+  tests (external delete revokes a live session on the same handle with no restart;
+  delete + new login does not resurrect old sessions and persists only the new one; an
+  external rewrite is adopted; an unchanged file is never reloaded so own writes are
+  not lost) and an in-process HTTP test (one running server: login → protected route
+  200 → delete the session file out of band → next request 401 → fresh login still
+  works). `cargo test -p relux-kernel` green; clippy clean. *Caveat:* detection is
+  per-operation `stat` granularity (revocation bites on the next session-touching
+  request, not instantly); a same-mtime-and-same-length external *rewrite* could be
+  missed, but *deletion* — the recovery case — flips present→absent and is always
+  detected. See `docs/RELUX_MASTER_PLAN.md` → *Local operator login v1*.
 - **Relux local release v0.1.5 (Windows bundle).** The `relux-kernel` /
   `relux-core` crates move from `0.1.4` to `0.1.5` for the first build that puts a
   **single-admin local operator login** in front of the standalone dashboard/API.

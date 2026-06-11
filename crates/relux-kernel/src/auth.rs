@@ -25,8 +25,15 @@
 //! middleware hashes the incoming id to look it up. Expired records are pruned on
 //! load and on use. There is no network/unauthenticated reset path — recovery is
 //! the local `relux-kernel reset-admin` CLI ([`reset_admin_credential`]), which
-//! also clears the persisted session file so a recovery invalidates old sessions
-//! on the next restart.
+//! also clears the persisted session file so a recovery invalidates old sessions.
+//!
+//! A **running** `serve` does not have to be restarted for that revocation to bite:
+//! before each session operation a file-backed store cheaply re-`stat`s its backing
+//! file ([`SessionStore::reconcile_if_changed`]) and, if the file was deleted or
+//! rewritten out of band, drops/reloads its in-memory table to match. So a
+//! `reset-admin` (which deletes the file) makes the live process reject every old
+//! cookie on its next request. The fast path is a single `stat`; the file is only
+//! re-read when its fingerprint actually changed.
 //!
 //! **Honest scope:** this is a local-first single-admin console guard, not an
 //! internet auth system. The cookie omits `Secure` because the operator console
@@ -102,6 +109,36 @@ fn now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// A cheap fingerprint of the session file used to detect **out-of-band** changes
+/// (an external `reset-admin` deleting it, or another process rewriting it) without
+/// re-reading and re-parsing the file on every request. A `None` fingerprint means
+/// the file is currently absent — distinct from any present fingerprint, so a
+/// delete is always detected. `mtime` plus `len` is enough to catch a rewrite; on
+/// filesystems with coarse mtime resolution two same-second, same-length rewrites
+/// could collide, but the case that matters here — recovery *deleting* the file —
+/// is detected unconditionally because it flips present→absent.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileSig {
+    mtime_nanos: u128,
+    len: u64,
+}
+
+/// Fingerprint `path`, or `None` if it does not exist / cannot be stat-ed. This is
+/// a single `stat` — the only filesystem cost paid on the fast (unchanged) path.
+fn file_sig(path: &Path) -> Option<FileSig> {
+    let md = std::fs::metadata(path).ok()?;
+    let mtime_nanos = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Some(FileSig {
+        mtime_nanos,
+        len: md.len(),
+    })
 }
 
 /// Hash an opaque session id to the value stored on disk and used as the in-memory
@@ -285,10 +322,12 @@ pub fn read_admin_username(admin_path: &Path) -> Option<String> {
 /// Because sessions are now restart-persistent, recovery also **clears the
 /// persisted session file** next to the admin file (`dashboard-sessions.json`),
 /// so the next `serve` start comes up with zero sessions and every previously
-/// minted cookie is dead. (A `serve` already running keeps its in-memory
-/// sessions until restarted — the longstanding "restart serve to finish
-/// recovery" step is unchanged; clearing the file just ensures the restart drops
-/// them for good instead of reloading them.)
+/// minted cookie is dead. A `serve` **already running** also picks this up without
+/// a restart: its session store re-`stat`s the file before each operation
+/// ([`SessionStore::reconcile_if_changed`]), sees the file vanish, and drops its
+/// in-memory sessions — so old cookies are rejected on the very next request. The
+/// restart is no longer required for revocation; it only matters if the running
+/// process is wedged and cannot service a request.
 pub fn reset_admin_credential(
     admin_path: &Path,
     username: &str,
@@ -391,6 +430,14 @@ struct SessionStore {
     /// Durable backing file. `None` keeps the table purely in-memory (used by the
     /// `new()` seam); `Some` mirrors every mutation to disk atomically.
     path: Option<Arc<PathBuf>>,
+    /// Fingerprint of the backing file as this store last observed it — set after
+    /// every own write and after each reconcile. A running `serve` compares the
+    /// live file's [`file_sig`] against this before each session operation; a
+    /// mismatch means an external process (a `reset-admin` deleting the file, or
+    /// another `serve` rewriting it) touched it, so the in-memory table is
+    /// reconciled with disk before it is trusted. `None` until first observed and
+    /// for an in-memory-only store.
+    sig: Arc<RwLock<Option<FileSig>>>,
 }
 
 impl SessionStore {
@@ -424,13 +471,83 @@ impl SessionStore {
         let store = Self {
             inner: Arc::new(RwLock::new(map)),
             path: path.map(Arc::new),
+            sig: Arc::new(RwLock::new(None)),
         };
         if pruned {
+            // Rewriting the file refreshes the fingerprint to the pruned image.
             if let Ok(m) = store.inner.read() {
                 store.persist_locked(&m);
             }
+        } else if let Some(p) = store.path.as_deref() {
+            // Record the fingerprint of the file exactly as we loaded it so a later
+            // out-of-band change (delete / external rewrite) is detected as a diff.
+            if let Ok(mut sig) = store.sig.write() {
+                *sig = file_sig(p);
+            }
         }
         store
+    }
+
+    /// Cheap out-of-band change detector, run before each session operation on a
+    /// file-backed store. A single `stat` compares the live file's fingerprint with
+    /// the one this store last observed; on the fast path (we are the only writer)
+    /// they match and nothing else happens. On a mismatch the in-memory table is
+    /// reconciled with disk **under the write lock**:
+    ///
+    /// - **File gone** (an external `reset-admin` cleared it): every in-memory
+    ///   session is dropped, so a still-running `serve` stops honoring cookies
+    ///   minted before recovery — no restart required. This fails *closed*: when in
+    ///   doubt the running process forgets sessions rather than keeping stale ones.
+    /// - **File rewritten** by another process: the table is replaced with the
+    ///   file's still-live rows (expired rows pruned), so the running process picks
+    ///   up the external view instead of clobbering it on its next persist.
+    ///
+    /// The store's own writes call [`Self::persist_locked`], which refreshes the
+    /// fingerprint, so this never fires for a change the running process itself
+    /// made — only genuinely external ones. No-op for an in-memory-only store.
+    fn reconcile_if_changed(&self) {
+        let Some(path) = self.path.as_deref() else {
+            return;
+        };
+        let current = file_sig(path);
+        // Fast path: the file looks exactly as we last left it.
+        if self.sig.read().map(|s| *s == current).unwrap_or(false) {
+            return;
+        }
+        // Something changed (or this is the first observation). Reconcile under the
+        // write lock so a concurrent persist cannot interleave, and re-stat under
+        // the lock for a consistent (fingerprint, contents) pair.
+        let Ok(mut map) = self.inner.write() else {
+            return;
+        };
+        let sig_now = file_sig(path);
+        match sig_now {
+            // Absent → external recovery cleared it: revoke every in-memory session.
+            None => map.clear(),
+            // Present → adopt the external file's live rows as the new table.
+            Some(_) => {
+                let now = now_secs();
+                let mut fresh = HashMap::new();
+                if let Ok(bytes) = std::fs::read(path) {
+                    if let Ok(file) = serde_json::from_slice::<SessionFile>(&bytes) {
+                        for rec in file.sessions {
+                            let s = Session {
+                                username: rec.username,
+                                expires_at: rec.expires_at,
+                                absolute_deadline: rec.absolute_deadline,
+                            };
+                            if Self::is_live(&s, now) {
+                                fresh.insert(rec.sid_hash, s);
+                            }
+                        }
+                    }
+                }
+                *map = fresh;
+            }
+        }
+        if let Ok(mut sig) = self.sig.write() {
+            *sig = sig_now;
+        }
     }
 
     /// Atomically mirror the live rows of `map` to the backing file. Called while
@@ -459,11 +576,21 @@ impl SessionStore {
             sessions,
         };
         if let Ok(body) = serde_json::to_vec_pretty(&file) {
-            let _ = atomic_write_restricted(path, &body);
+            if atomic_write_restricted(path, &body).is_ok() {
+                // Record the fingerprint of the image WE just wrote so the next
+                // reconcile does not mistake our own write for an external change.
+                if let Ok(mut sig) = self.sig.write() {
+                    *sig = file_sig(path);
+                }
+            }
         }
     }
 
     fn create(&self, username: &str) -> String {
+        // Adopt any external change first: otherwise the persist below would
+        // rewrite the whole in-memory map — including sessions an external
+        // `reset-admin` just revoked — straight back onto disk, resurrecting them.
+        self.reconcile_if_changed();
         let mut buf = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut buf);
         let sid = hex::encode(buf);
@@ -496,6 +623,8 @@ impl SessionStore {
     /// reads (`/v1/auth/status`, `/v1/auth/me`) so polling never slides the idle
     /// window; only real control-plane activity refreshes it (see [`Self::refresh`]).
     fn validate(&self, sid: &str) -> Option<String> {
+        // Pick up an out-of-band reset/rewrite before admitting on a stale table.
+        self.reconcile_if_changed();
         let key = hash_sid(sid);
         let now = now_secs();
         if let Ok(m) = self.inner.read() {
@@ -519,6 +648,8 @@ impl SessionStore {
     /// session, so the Account modal can poll it without keeping an idle console
     /// alive. The deadlines returned are the current pre-refresh values.
     fn meta(&self, sid: &str) -> Option<SessionMeta> {
+        // Pick up an out-of-band reset/rewrite before reporting on a stale table.
+        self.reconcile_if_changed();
         let key = hash_sid(sid);
         let now = now_secs();
         if let Ok(m) = self.inner.read() {
@@ -550,6 +681,10 @@ impl SessionStore {
     /// that case no cookie should be sent. The session id itself is unchanged
     /// (the window slides; the opaque id is not rotated).
     fn refresh(&self, sid: &str) -> Option<i64> {
+        // Reconcile first: a slide persists the whole map, so a revoked session
+        // must be dropped before we rewrite the file (and a vanished session must
+        // not be refreshed/resurrected).
+        self.reconcile_if_changed();
         let key = hash_sid(sid);
         let now = now_secs();
         if let Ok(mut m) = self.inner.write() {
@@ -573,6 +708,7 @@ impl SessionStore {
     }
 
     fn remove(&self, sid: &str) {
+        self.reconcile_if_changed();
         let key = hash_sid(sid);
         if let Ok(mut m) = self.inner.write() {
             if m.remove(&key).is_some() {
@@ -585,6 +721,7 @@ impl SessionStore {
     /// password change so any OTHER live session is invalidated immediately while
     /// the operator who just changed their password stays signed in.
     fn retain_only(&self, keep: &str) {
+        self.reconcile_if_changed();
         let keep_key = hash_sid(keep);
         if let Ok(mut m) = self.inner.write() {
             let before = m.len();
@@ -1216,6 +1353,99 @@ mod tests {
         assert_eq!(
             a2.verify_login("ops", "newpassword1").as_deref(),
             Some("ops")
+        );
+    }
+
+    #[test]
+    fn external_session_file_delete_revokes_live_sessions_without_restart() {
+        // The reset-admin / no-restart guarantee: the SAME running handle (no
+        // reload) must stop honoring a cookie once the session file is deleted out
+        // of band, because it re-stats the file before each operation.
+        let (auth, _admin, sessions, _tmp) = auth_with_session_file();
+        let sid = auth.create_session("ops");
+        assert_eq!(auth.validate_session(&sid).as_deref(), Some("ops"));
+        // Simulate `reset-admin` clearing the persisted session file underneath the
+        // running process.
+        std::fs::remove_file(&sessions).unwrap();
+        assert!(
+            auth.validate_session(&sid).is_none(),
+            "a running serve must reject the old cookie once the file is deleted — no restart"
+        );
+        // session_meta (the Account-modal poll path) honors the revocation too.
+        assert!(auth.session_meta(&sid).is_none());
+    }
+
+    #[test]
+    fn external_delete_then_new_login_does_not_resurrect_old_sessions() {
+        // After an external delete, minting a fresh session must persist ONLY the
+        // new one — the reconcile drops the stale in-memory rows first, so the
+        // create's whole-map persist cannot write the revoked sessions back.
+        let (auth, _admin, sessions, _tmp) = auth_with_session_file();
+        let old = auth.create_session("ops");
+        std::fs::remove_file(&sessions).unwrap();
+        let new = auth.create_session("ops");
+        assert!(
+            auth.validate_session(&old).is_none(),
+            "a session minted before recovery must not come back after a new login"
+        );
+        assert_eq!(auth.validate_session(&new).as_deref(), Some("ops"));
+        // On disk: only the new session's hash, never the revoked one.
+        let raw = std::fs::read_to_string(&sessions).unwrap();
+        assert!(raw.contains(&hash_sid(&new)));
+        assert!(
+            !raw.contains(&hash_sid(&old)),
+            "the persist after a new login must not rewrite the revoked session"
+        );
+    }
+
+    #[test]
+    fn external_rewrite_is_adopted_by_a_running_store() {
+        // A different process rewriting the file (e.g. another serve) is adopted by
+        // the running store: it reloads the external rows instead of clobbering
+        // them on its next persist.
+        let (auth, _admin, sessions, _tmp) = auth_with_session_file();
+        let mine = auth.create_session("ops");
+        assert_eq!(auth.validate_session(&mine).as_deref(), Some("ops"));
+        // Hand-write a clearly different file (distinct length via a longer
+        // username) holding a single, different live session.
+        let now = now_secs();
+        let file = SessionFile {
+            version: SESSION_FILE_VERSION,
+            sessions: vec![PersistedSession {
+                sid_hash: hash_sid("external"),
+                username: "operator-two".into(),
+                expires_at: now + 1000,
+                absolute_deadline: now + SESSION_ABSOLUTE_MAX_SECS,
+            }],
+        };
+        std::fs::write(&sessions, serde_json::to_vec_pretty(&file).unwrap()).unwrap();
+        // The running store adopts the external view: its own session is gone, the
+        // externally-written one is honored.
+        assert_eq!(
+            auth.validate_session("external").as_deref(),
+            Some("operator-two"),
+            "an external rewrite must be reloaded by the running store"
+        );
+        assert!(
+            auth.validate_session(&mine).is_none(),
+            "the running store must not keep a session the external rewrite dropped"
+        );
+    }
+
+    #[test]
+    fn unchanged_file_is_not_reloaded_so_own_writes_are_not_lost() {
+        // Fast path: when the store is the only writer, repeated operations must not
+        // trip the reconcile and lose in-memory state. Mint two sessions and slide
+        // one; both must remain valid (no spurious reload wiped them).
+        let (auth, _admin, _sessions, _tmp) = auth_with_session_file();
+        let a = auth.create_session("ops");
+        let b = auth.create_session("ops");
+        assert!(auth.refresh_session(&a).is_some());
+        assert_eq!(auth.validate_session(&a).as_deref(), Some("ops"));
+        assert_eq!(
+            auth.validate_session(&b).as_deref(),
+            Some("ops"),
+            "an own write must never be mistaken for an external change"
         );
     }
 

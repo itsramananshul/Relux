@@ -890,9 +890,11 @@ fn run_reset_local() -> Result<(), KernelError> {
 ///
 /// This is a local CLI/filesystem operation only — there is NO network or
 /// unauthenticated reset path. It does not weaken session auth or touch any other
-/// state. In-memory sessions are not invalidated here; **restart
-/// `relux-kernel serve`** to drop live sessions (a restart also reloads this new
-/// credential).
+/// state. It clears the persisted session file, and a **running** `relux-kernel
+/// serve` notices the file vanish and drops its in-memory sessions on its next
+/// request — so old cookies stop working without a restart. (A restart is still the
+/// way to load the new credential into a stopped process, and the fallback if a
+/// running process is wedged.)
 fn run_reset_admin(args: &[String]) -> Result<(), KernelError> {
     let path = admin_path();
 
@@ -936,9 +938,10 @@ fn run_reset_admin(args: &[String]) -> Result<(), KernelError> {
         println!("   password: (set from the value you provided)");
     }
     println!();
-    println!("Persisted sessions were cleared. Restart `relux-kernel serve` to drop any");
-    println!("still-running in-memory sessions and load this credential, then sign in to");
-    println!("the dashboard with the new password.");
+    println!("Persisted sessions were cleared. A running `relux-kernel serve` drops its");
+    println!("in-memory sessions on its next request (old cookies stop working without a");
+    println!("restart). Restart serve only to load this new credential into a stopped or");
+    println!("wedged process, then sign in to the dashboard with the new password.");
     Ok(())
 }
 

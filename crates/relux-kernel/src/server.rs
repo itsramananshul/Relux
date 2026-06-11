@@ -486,6 +486,12 @@ fn auth_disabled_from_env() -> bool {
 /// times out. The refreshed cookie is attached **only** when the request was
 /// authenticated AND the handler returned a success status — a 401 from this
 /// guard, or a 4xx/5xx from the handler, never carries a session cookie.
+///
+/// **Out-of-band revocation:** the `validate_session` call here reconciles the
+/// session table with its backing file first ([`relux_kernel`]'s
+/// `SessionStore::reconcile_if_changed`), so if `reset-admin` cleared the session
+/// file underneath a running `serve`, this guard rejects the old cookie on the next
+/// request — no restart required.
 async fn require_session(
     State(state): State<AppState>,
     req: axum::extract::Request,
@@ -5136,6 +5142,63 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "logout must persist across a restart"
         );
+    }
+
+    #[tokio::test]
+    async fn deleting_the_session_file_revokes_cookies_without_a_restart() {
+        // End-to-end proof of the reset-admin / no-restart guarantee: ONE running
+        // AppState (never rebuilt). Login, confirm a protected route is open, then
+        // delete the session file out of band — as `reset-admin` does — and the very
+        // next request through the real auth middleware must 401.
+        let (state, dir) = auth_state(false);
+        let sessions = dir.path().join("dashboard-sessions.json");
+        let (_, _, _) = call(
+            &state,
+            "POST",
+            "/v1/auth/setup",
+            None,
+            Some(r#"{"username":"ops","password":"hunter2pass"}"#),
+        )
+        .await;
+        let (login, set_cookie, _) = call(
+            &state,
+            "POST",
+            "/v1/auth/login",
+            None,
+            Some(r#"{"username":"ops","password":"hunter2pass"}"#),
+        )
+        .await;
+        assert_eq!(login, StatusCode::OK);
+        let cookie = session_pair(&set_cookie.expect("login sets a cookie"));
+        // The cookie unlocks a protected route.
+        let (ok, _, _) = call(&state, "GET", "/v1/relux/state", Some(&cookie), None).await;
+        assert_eq!(ok, StatusCode::OK);
+        assert!(sessions.exists(), "a live session writes the file");
+
+        // Out-of-band revocation (what `reset-admin` does): delete the file. No
+        // restart, no new AppState — the same process must notice on the next call.
+        std::fs::remove_file(&sessions).unwrap();
+        let (revoked, _, _) =
+            call(&state, "GET", "/v1/relux/state", Some(&cookie), None).await;
+        assert_eq!(
+            revoked,
+            StatusCode::UNAUTHORIZED,
+            "the running server must reject the old cookie once the session file is cleared"
+        );
+        // A fresh login still works on the same running process, and persists only
+        // the new session (no resurrected rows from before the delete).
+        let (relogin, new_cookie, _) = call(
+            &state,
+            "POST",
+            "/v1/auth/login",
+            None,
+            Some(r#"{"username":"ops","password":"hunter2pass"}"#),
+        )
+        .await;
+        assert_eq!(relogin, StatusCode::OK);
+        let fresh = session_pair(&new_cookie.expect("re-login sets a cookie"));
+        let (ok2, _, _) = call(&state, "GET", "/v1/relux/state", Some(&fresh), None).await;
+        assert_eq!(ok2, StatusCode::OK);
     }
 
     #[tokio::test]

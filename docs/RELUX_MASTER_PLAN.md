@@ -1837,10 +1837,32 @@ stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
   sessions on the next restart. Proven by `relux-kernel` unit tests (restart
   survives, expired not loaded, no raw sid on disk, logout/password-change/reset
   persist) + an in-process HTTP test (login → rebuild the server state from the same
-  files → same cookie still authenticates → logout persists removal). *Remaining
-  caveat:* a `serve` process already running keeps its in-memory sessions until
-  restarted, so out-of-band `reset-admin` still needs the documented restart to fully
-  take effect.
+  files → same cookie still authenticates → logout persists removal). *(This slice's
+  "running serve needs a restart for out-of-band recovery" caveat is closed by the
+  live-reconcile slice below.)*
+- **post-v0.1.5 (unreleased)** — **live session-file reconcile / no-restart
+  revocation (auth v1.3).** A **running** `relux-kernel serve` now picks up an
+  out-of-band session-file change without a restart. Before every session operation
+  the store cheaply re-`stat`s its backing file (fingerprint = mtime + length, plus a
+  "file absent" state) and, only when that fingerprint differs from what it last
+  wrote, reconciles its in-memory table with disk: a **deleted** file (what
+  `reset-admin` does) drops all in-memory sessions (fail-closed), and an external
+  **rewrite** is reloaded so the running process adopts it instead of clobbering it on
+  its next persist. The fast path — the running process is the only writer — is a
+  single `stat` with no read/parse. The critical ordering: `create`/`refresh`
+  reconcile *before* they persist, so a fresh login after a delete cannot rewrite the
+  revoked sessions back to disk. **Effect:** `reset-admin` now invalidates old cookies
+  on a running server on the **next request** — no restart required (the restart only
+  still matters to load a new credential into a stopped process, or for a wedged one).
+  Sliding refresh, logout, password-change invalidation, and `RELUX_AUTH_DISABLED` are
+  unchanged. Proven by `relux-kernel` unit tests (external delete revokes on the same
+  handle; delete + new login doesn't resurrect; external rewrite adopted; unchanged
+  file not reloaded) + an in-process HTTP test (one running server: login → 200 →
+  delete the session file → next request 401 → fresh login works). *Remaining caveat:*
+  detection is `stat`-granularity, so revocation bites on the next session-touching
+  request rather than instantly; a same-mtime-and-same-length external *rewrite* could
+  be missed, but *deletion* (the recovery case) flips present→absent and is always
+  caught.
 - **v0.1.5** (2026-06-10) — first build on top of v0.1.4 that puts a **single-admin
   local operator login** in front of the standalone dashboard/API; the surface is no
   longer open by default. **First-run admin setup + login:** on first launch the
@@ -2720,8 +2742,9 @@ The API never returns the key. The dashboard shows the current AI provider/mode.
   browsers/devices but not the current tab). Password recovery when the current
   password is *unknown* stays the **local** `relux-kernel reset-admin`
   CLI (filesystem-only, no network/unauthenticated reset; it also clears the persisted
-  session file, so restart `serve` to drop any still-running live sessions and come up
-  with none). A dev/test-only escape hatch `RELUX_AUTH_DISABLED` leaves the API
+  session file, and a **running** `serve` reconciles against that deleted file and
+  drops its in-memory sessions on the next request — so old cookies stop working
+  without a restart). A dev/test-only escape hatch `RELUX_AUTH_DISABLED` leaves the API
   open (OFF by default, flagged loudly by `serve` and `doctor`). The CLI
   (`prime`, `task run-assigned`, `tools`, autonomy, …) talks to the durable store
   directly and is unaffected by HTTP auth.
