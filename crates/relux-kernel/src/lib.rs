@@ -129,7 +129,8 @@ pub use prime_update_slots::{
 };
 pub use prime_write_tools::{
     classify_write_tool, parse_write_tool_request, reconcile_run_start, write_tool_names,
-    BrainRunStart, ParsedWriteTool, WriteTool, WriteToolSlot, WRITE_TOOLS, WRITE_TOOL_CONFIDENCE,
+    BrainRunOrchestration, BrainRunStart, ParsedWriteTool, WriteTool, WriteToolSlot, WRITE_TOOLS,
+    WRITE_TOOL_CONFIDENCE,
 };
 pub use runtime::{invoke_http_loopback, RuntimeClientError};
 pub use state::{

@@ -155,6 +155,13 @@ pub const WRITE_TOOLS: &[WriteTool] = &[
         args_hint: "{\"goal\":\"<the multi-step goal>\",\"steps\":[\"<optional distinct step>\", ...]}",
     },
     WriteTool {
+        name: "orchestration.start",
+        intent: PrimeIntent::OrchestrationRun,
+        gated: false,
+        summary: "Run (or continue) the governed batch for an EXISTING orchestration. Maps to the existing RunOrchestration action; the kernel validates the id against the live records and each brief still gates at run time.",
+        args_hint: "{\"orchestration_id\":\"<existing orchestration id, e.g. orch_0001>\"}",
+    },
+    WriteTool {
         name: "plugin.install",
         intent: PrimeIntent::PluginInstallation,
         gated: true,
@@ -185,6 +192,14 @@ pub struct BrainRunStart {
     pub task_id: String,
 }
 
+/// A validated orchestration-run reference (the `orchestration.start` tool's only arg). The
+/// `orchestration_id` is sanitized but NOT existence-checked here; the kernel chokepoint
+/// validates it against the live orchestration records (it must EXIST) before any batch runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrainRunOrchestration {
+    pub orchestration_id: String,
+}
+
 /// The validated slot a write tool produced, one variant per mapped action. Each inner
 /// value is built by the EXISTING per-action validator (no weaker duplicate parsing), so it
 /// carries the same allowlist/sanitization/clamping guarantees as the specialized slot path.
@@ -204,6 +219,10 @@ pub enum WriteToolSlot {
     Permission(crate::prime_admin_slots::BrainPermissionSlots),
     /// `task.start` → [`BrainRunStart`] (StartRun).
     RunStart(BrainRunStart),
+    /// `orchestration.start` → [`BrainRunOrchestration`] (RunOrchestration). The validated id
+    /// flows to the kernel chokepoint, which honors it ONLY when it names an EXISTING
+    /// orchestration; the existing governed `run_orchestration` batch then runs the ready briefs.
+    RunOrchestration(BrainRunOrchestration),
     /// `orchestration.create` → [`crate::prime_orchestration_slots::BrainOrchestrationSlots`]
     /// (OrchestrateGoal). The validated goal flows into the EXISTING deterministic planner +
     /// orchestration-creation path; the brain proposes only the goal text.
@@ -315,6 +334,9 @@ pub fn parse_write_tool_request(value: &serde_json::Value) -> Option<ParsedWrite
             crate::prime_admin_slots::parse_permission_slots(&args_json).ok()?,
         ),
         PrimeIntent::RunStart => WriteToolSlot::RunStart(parse_run_start(&args)?),
+        PrimeIntent::OrchestrationRun => {
+            WriteToolSlot::RunOrchestration(parse_run_orchestration(&args)?)
+        }
         PrimeIntent::Orchestration => WriteToolSlot::Orchestration(
             crate::prime_orchestration_slots::parse_orchestration_slots(&args_json).ok()?,
         ),
@@ -339,6 +361,21 @@ fn parse_run_start(args: &serde_json::Map<String, serde_json::Value>) -> Option<
         None
     } else {
         Some(BrainRunStart { task_id })
+    }
+}
+
+/// Read the required `orchestration_id` arg for `orchestration.start` (openclaw
+/// `readStringParam(required)`): trim, sanitize, length-clamp; a missing/empty id fails the
+/// request closed. Existence is validated by the kernel chokepoint against the live records.
+fn parse_run_orchestration(
+    args: &serde_json::Map<String, serde_json::Value>,
+) -> Option<BrainRunOrchestration> {
+    let raw = args.get("orchestration_id").and_then(|v| v.as_str())?;
+    let orchestration_id = sanitize_line(raw, MAX_ID_CHARS);
+    if orchestration_id.is_empty() {
+        None
+    } else {
+        Some(BrainRunOrchestration { orchestration_id })
     }
 }
 
@@ -405,6 +442,7 @@ mod tests {
         assert!(classify_write_tool("task.start").is_some());
         assert!(classify_write_tool("agent.create").is_some());
         assert!(classify_write_tool("orchestration.create").is_some());
+        assert!(classify_write_tool("orchestration.start").is_some());
         assert!(classify_write_tool("plugin.install").is_some());
         assert!(classify_write_tool("permission.grant").is_some());
         // Anything off the allowlist is refused — including a plausible-sounding write.
@@ -469,6 +507,10 @@ mod tests {
                 PrimeIntent::Orchestration,
             ),
             (
+                serde_json::json!({"tool":"orchestration.start","args":{"orchestration_id":"orch_0001"}}),
+                PrimeIntent::OrchestrationRun,
+            ),
+            (
                 serde_json::json!({"tool":"plugin.install","args":{"plugin_id":"relux-tools-github"}}),
                 PrimeIntent::PluginInstallation,
             ),
@@ -513,6 +555,34 @@ mod tests {
         assert!(parse_write_tool_request(&serde_json::json!({
             "tool": "orchestration.create",
             "args": {"goal": "do it", "agent_id": "researcher"}
+        }))
+        .is_none());
+    }
+
+    #[test]
+    fn parses_orchestration_start_and_fails_closed_without_an_id() {
+        let v = serde_json::json!({
+            "tool": "orchestration.start",
+            "args": {"orchestration_id": "orch_0001"}
+        });
+        let parsed = parse_write_tool_request(&v).expect("a valid orchestration.start");
+        assert_eq!(parsed.tool, "orchestration.start");
+        assert_eq!(parsed.intent, PrimeIntent::OrchestrationRun);
+        assert!(!parsed.gated);
+        match parsed.slot {
+            WriteToolSlot::RunOrchestration(s) => assert_eq!(s.orchestration_id, "orch_0001"),
+            other => panic!("expected a run-orchestration slot, got {other:?}"),
+        }
+        // A missing required orchestration_id fails the request closed.
+        assert!(parse_write_tool_request(&serde_json::json!({
+            "tool": "orchestration.start",
+            "args": {}
+        }))
+        .is_none());
+        // An empty id fails closed.
+        assert!(parse_write_tool_request(&serde_json::json!({
+            "tool": "orchestration.start",
+            "args": {"orchestration_id": "   "}
         }))
         .is_none());
     }

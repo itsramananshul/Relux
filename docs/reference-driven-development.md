@@ -1360,3 +1360,80 @@ an orchestration is unchanged: each brief is a normal task assigned to an agent 
 separate governed `run_orchestration` batch (no paid CLI is spawned at create time), so a protected
 adapter/permission still gates at run time exactly as before. The mutating-tool surface stays small;
 a multi-action orchestration loop and richer per-brief tools stay deferred.
+
+---
+
+## Reference read — a governed ORCHESTRATION RUN write tool + run-start memory (this slice)
+
+The [`orchestration.create` slice](#reference-read--a-governed-orchestration-write-tool-this-slice)
+let Prime mint a multi-agent orchestration, but the briefs sat `Planned` — the only way to RUN them
+was the dashboard button, the blocking `/run` API, or the `prime orchestration run` CLI. A user who
+asked Prime to "run the orchestration" got nothing actionable. This slice adds `orchestration.start`
+to the same governed write allowlist, mapping it to the EXISTING `run_orchestration` batch, plus the
+new `OrchestrationRun` intent/action and a resolvable run-start clarification the multi-turn memory
+continues ("run the orchestration" → "which one?" → "orch_0001").
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/agent/conversation_loop.py` `run_conversation(...)` (L3114-3162) — a
+  SINGLE assistant message carries both the answer and the structured `tool_calls`, and the chosen
+  tool name is **validated against `agent.valid_tool_names` BEFORE execution**; an off-list name is
+  fed back, never run. **Pattern: one response carries the action; the tool name is allowlist-validated.**
+  Mirrored: `orchestration.start` joins [`crate::prime_write_tools`] `WRITE_TOOLS`, and
+  `classify_write_tool` is the name-allowlist gate — a made-up `orchestration.run`/`orchestration.cancel`
+  is refused at parse time; the validated slot is `WriteToolSlot::RunOrchestration(BrainRunOrchestration)`.
+- `reference/hermes-agent-main/model_tools.py` `coerce_tool_args` (L535-616) +
+  `agent/message_sanitization.py` — coerce/sanitize each model-produced string. Mirrored in
+  `parse_run_orchestration` (the required `orchestration_id` is sanitized + length-clamped; a missing
+  or empty id fails the request closed).
+
+### Paperclip (openclaw) — files read
+
+- `reference/openclaw-main/src/agents/subagent-control.ts` `resolveControlledSubagentTarget`
+  (L707-729) + `src/auto-reply/reply/subagents-utils.ts` `resolveSubagentTargetFromRuns` (the
+  `isActive` runnability filter) — a control action lands ONLY on a target that **EXISTS and is
+  runnable**; an unknown/inactive target is an error, never coerced. **Pattern: act only on a target
+  that both exists AND is in a runnable state.** Mirrored: `KernelState::runnable_orchestration_id`
+  honors an id ONLY when it names an EXISTING orchestration with at least one PENDING brief; an
+  unknown id, or one whose briefs are all terminal, fails closed (an honest reply, never a faked run).
+- `reference/openclaw-main/src/agents/tool-policy.ts`
+  `applyOwnerOnlyToolPolicy` / `wrapOwnerOnlyToolExecution` — running work is ONE explicit, GATED
+  capability, never inferred from chat. **Pattern: minting/running work is an explicit capability,
+  never auto-run from casual chat.** Mirrored: `OrchestrationRun` is `is_sensitive_intent`, so
+  `reconcile_intent` keeps guarded chat deterministic; the deterministic classifier itself routes a
+  guarded "should we run the orchestration?" to `Brainstorming` (the conversation guard runs BEFORE
+  the run-verb check), so no extra `!is_chat_guarded` rail is needed here (unlike `orchestration.create`).
+- `reference/openclaw-main/src/agents/tool-mutation.ts` `isMutatingToolCall` — a single fail-closed
+  classifier defaulting an unknown action to *mutating*. Informs treating the run as an explicit
+  mutating action validated before execution.
+- `reference/openclaw-main/src/agents/bash-tools.exec-approval-followup-state.ts`
+  (`consumeExecApprovalFollowupRuntimeHandoff`, TTL + consume-and-clear) +
+  `.exec-approval-followup.ts` (`sendExecApprovalFollowup` continue-by-fresh-turn) — the
+  consume-and-continue shape the clarify memory already mirrors; recording an `OrchestrationRun`
+  clarify is now legitimate because the continuation has a real by-id action to resolve into
+  (`is_resolvable_clarify_intent` gains `OrchestrationRun`, `clarify_needs_label` → `"orchestration id"`).
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| Hermes: **one response carries the action; the tool name is allowlist-validated** | `orchestration.start` joins `prime_write_tools::WRITE_TOOLS` (intent `OrchestrationRun`, `gated:false`); `classify_write_tool` admits ONLY allowlisted names; `parse_run_orchestration` requires a non-empty `orchestration_id` (fail closed otherwise). |
+| openclaw: **act only on a target that EXISTS and is runnable** (`resolveControlledSubagentTarget`) | `KernelState::runnable_orchestration_id` resolves a candidate id ONLY to an existing orchestration with a pending brief; `prime_execute`'s `RunOrchestration` arm re-checks existence and runs the EXISTING `run_orchestration` batch; an unknown id is an honest, action-free reply. |
+| openclaw: **running work is one explicit, gated capability — never from chat** (`tool-policy`) | the mapped intent is sensitive (`is_sensitive_intent`), so `reconcile_intent` keeps guarded chat deterministic; a question ("should we run it?") is routed to `Brainstorming` by the conversation guard before the run-verb classifier, so casual chat can never start a batch. |
+| openclaw: **consume-and-continue only when a real action backs it** (`exec-approval-followup`) | `is_resolvable_clarify_intent` includes `OrchestrationRun`, so "run the orchestration" → "which one?" → "orch_0001" continues into a `RunOrchestration` `Act`; the bare-id follow-up reclassifies to `OrchestrationRun` (the combined message carries the verb + the id). |
+| openclaw/Hermes: **no raw-envelope leak; deterministic fallback always exists** | the `orchestration.start` args ride the unified `action_request`, lifted by `parse_adapter_result` FIRST on the CLI path; ANY failure (no brain, unknown id, off-allowlist name, missing id) leaves the deterministic outcome — a clarify or an honest reply — in place. Provenance is the existing generic `🛠 requested tool: orchestration.start` chip (no new wire field, no dashboard change). |
+
+**What we deliberately do differently:** unlike Hermes (where the model runs the tool), the Relux brain
+runs NOTHING — `orchestration.start` is *desugared* into the existing `OrchestrationRun` intent + a
+validated id slot, so the batch is always run by the SAME governed `run_orchestration` engine the
+blocking `/run` API and the CLI use, behind the unchanged fail-closed gate. The run is mapped to the
+**synchronous** `run_orchestration` (bounded by the blocking endpoint's own defaults — max 25,
+concurrency 2), the existing governed path for the CLI/blocking-API surfaces; the dashboard's
+non-blocking background **job** (`run-async` + `drive_orchestration_job`) stays the polling-optimized
+server path and is unchanged. Each brief still gates at run time through its assigned agent's adapter
+(a disabled/unconfigured runtime or a missing permission is recorded `blocked`, never faked), so
+`orchestration.start` adds no new run-time authority — it only lets Prime *start* a batch the user
+explicitly asked to run. The run turn's reply is the real, grounded batch result, so it is kept
+deterministic (excluded from `prime_after_action`, like a tool result), and the brain can never
+re-narrate (and overclaim) a per-brief outcome. A multi-action orchestration loop, a `run-async`
+(non-blocking) Prime path, and per-brief retry/cancel tools stay deferred.

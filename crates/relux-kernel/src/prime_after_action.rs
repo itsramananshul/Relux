@@ -218,6 +218,12 @@ pub fn after_action_kind(turn: &PrimeTurn) -> Option<ActionResultKind> {
     {
         return None;
     }
+    // An orchestration RUN turn's reply is the real, grounded batch result (per-brief
+    // ran/completed/failed/blocked + the next action) — like a tool result, it is honest
+    // kernel output the brain must not re-narrate and possibly overclaim. Keep it deterministic.
+    if matches!(turn.action, Some(PrimeAction::RunOrchestration { .. })) {
+        return None;
+    }
     match turn.disposition {
         PrimeDisposition::AwaitingApproval => Some(ActionResultKind::Proposed),
         PrimeDisposition::Executed => {

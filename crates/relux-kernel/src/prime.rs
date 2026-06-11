@@ -242,6 +242,20 @@ pub fn classify_intent(message: &str) -> PrimeIntent {
     if is_question(&m) && !is_explicit_command(&m) {
         return PrimeIntent::Brainstorming;
     }
+    // Orchestration RUN/continue: the user wants Prime to START (or continue) the
+    // governed batch for an EXISTING orchestration — distinct from CREATING one above
+    // (which is keyed on "orchestrate"/"coordinate"/…). Keyed on a run/continue verb
+    // together with the orchestration noun, or an explicit `orch_` id reference. Checked
+    // AFTER the conversation guard (so "should we run the orchestration?" stays a
+    // conversation) and BEFORE the task-creation / run-start catches (so the batch verb
+    // is never read as new work or a single-task run). The kernel validates the id
+    // against the live records before running anything.
+    let run_verb = has(&[
+        "run ", "start ", "continue", "resume", "execute", "kick off", "go ahead",
+    ]);
+    if run_verb && (extract_orchestration_id(&m).is_some() || m.contains("orchestration")) {
+        return PrimeIntent::OrchestrationRun;
+    }
     // By-id task UPDATE: a message that names a SPECIFIC existing-looking task
     // (`task_…`) and a field to change is an edit, not new work — checked BEFORE the
     // broad task-creation catch so "rename task_0001 to Fix the login page" is not
@@ -650,6 +664,25 @@ pub fn decide(message: &str, intent: &PrimeIntent, summary: &StateSummary) -> Pr
                 }
             }
         }
+        // Orchestration RUN/continue: start the governed batch for an EXISTING
+        // orchestration. When the user named an `orch_…` id it becomes a `RunOrchestration`
+        // `Act` (the kernel validates the id against the live records at execute time, the
+        // same way `OrchestrateGoal` defers the multi-agent check); when no id was named it
+        // is a resolvable `Clarify` that the multi-turn memory + a bare-id follow-up
+        // continue. Running is a SAFE, in-scope action (the same governed batch the blocking
+        // `/run` API and the CLI drive); each brief still gates at run time (section 10.4).
+        PrimeIntent::OrchestrationRun => match extract_orchestration_id(message) {
+            Some(id) => PrimePlan::Act {
+                action: PrimeAction::RunOrchestration {
+                    orchestration_id: id.clone(),
+                },
+                text: format!("Running orchestration {id}."),
+            },
+            None => PrimePlan::Clarify {
+                text: "Which orchestration should I run? Name it by id (for example orch_0001); ask me to list the orchestrations if you're not sure."
+                    .to_string(),
+            },
+        },
         // Plan request: lay the idea out as a REVIEWABLE plan that creates nothing
         // (section 10 planning layer, section 11.1). The pure planner decides whether
         // the goal genuinely splits: a multi-step goal becomes a plan preview the user
@@ -1646,6 +1679,27 @@ pub(crate) fn extract_task_id(message: &str) -> Option<String> {
     None
 }
 
+/// Extract an explicit orchestration id (`orch_…`) referenced in the message, if any.
+/// Mirrors [`extract_task_id`] for the `orch_` prefix: it finds the first `orch_` token
+/// and reads the trailing id characters. Used to honor a named orchestration on a
+/// run/continue request and to continue a "which orchestration?" clarification with a
+/// bare id. Existence is validated by the kernel against the live records — this only
+/// recovers the reference text.
+pub(crate) fn extract_orchestration_id(message: &str) -> Option<String> {
+    let m = message.to_lowercase();
+    if let Some(start_idx) = m.find("orch_") {
+        let remainder = &m[start_idx + "orch_".len()..];
+        let id: String = remainder
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
+        if !id.is_empty() {
+            return Some(format!("orch_{}", id));
+        }
+    }
+    None
+}
+
 fn extract_agent_id_from_assignment(message: &str) -> Option<String> {
     let m = message.to_lowercase();
     if let Some(to_idx) = m.find(" to ") {
@@ -1838,6 +1892,7 @@ pub fn is_standalone_request(message: &str) -> bool {
             | I::PluginInstallation
             | I::PermissionChange
             | I::Orchestration
+            | I::OrchestrationRun
             | I::PlanRequest
             | I::ToolInvocation
             | I::StatusQuestion
@@ -1863,6 +1918,7 @@ pub fn clarify_needs_label(intent: &PrimeIntent, message: &str) -> String {
         }
         PrimeIntent::TaskCreation | PrimeIntent::CreateAndRunTask => "task description".to_string(),
         PrimeIntent::RunStart => "task id".to_string(),
+        PrimeIntent::OrchestrationRun => "orchestration id".to_string(),
         PrimeIntent::TaskUpdate => {
             let has_task = extract_task_id(message).is_some();
             let has_field = update_change_phrase(message).is_some();
@@ -2293,6 +2349,70 @@ mod tests {
         );
         // A greeting never becomes orchestration.
         assert_eq!(classify_intent("hey"), PrimeIntent::Greeting);
+    }
+
+    #[test]
+    fn classifies_orchestration_run_distinct_from_create() {
+        // Running/continuing an EXISTING orchestration is its own intent, distinct from
+        // creating one. Keyed on a run/continue verb + the orchestration noun or an `orch_` id.
+        assert_eq!(
+            classify_intent("run the orchestration"),
+            PrimeIntent::OrchestrationRun
+        );
+        assert_eq!(
+            classify_intent("run orch_0001"),
+            PrimeIntent::OrchestrationRun
+        );
+        assert_eq!(
+            classify_intent("continue orch_0002"),
+            PrimeIntent::OrchestrationRun
+        );
+        assert_eq!(
+            classify_intent("start the orchestration batch"),
+            PrimeIntent::OrchestrationRun
+        );
+        // Creating one is still the create intent (keyed on "orchestrate"/…).
+        assert_eq!(
+            classify_intent("orchestrate research, build, and test"),
+            PrimeIntent::Orchestration
+        );
+        // A QUESTION about running stays a conversation, never an action.
+        assert_eq!(
+            classify_intent("should we run the orchestration?"),
+            PrimeIntent::Brainstorming
+        );
+        // A bare "run it" (no orchestration noun / id) is still single-task run control.
+        assert_eq!(classify_intent("run it"), PrimeIntent::RunStart);
+    }
+
+    #[test]
+    fn extract_orchestration_id_recovers_an_explicit_reference() {
+        assert_eq!(
+            extract_orchestration_id("please run orch_0007 now"),
+            Some("orch_0007".to_string())
+        );
+        assert_eq!(extract_orchestration_id("run the orchestration"), None);
+        assert_eq!(extract_orchestration_id("start task_0001"), None);
+    }
+
+    #[test]
+    fn orchestration_run_acts_on_a_named_id_and_clarifies_without_one() {
+        // A named id becomes a RunOrchestration Act (the kernel validates existence at run time).
+        let plan = decide("run orch_0003", &PrimeIntent::OrchestrationRun, &empty_summary());
+        match plan {
+            PrimePlan::Act {
+                action: PrimeAction::RunOrchestration { orchestration_id },
+                ..
+            } => assert_eq!(orchestration_id, "orch_0003"),
+            other => panic!("expected Act/RunOrchestration, got {other:?}"),
+        }
+        // No id named → a resolvable clarify (the memory + a bare-id follow-up continue it).
+        let plan = decide(
+            "run the orchestration",
+            &PrimeIntent::OrchestrationRun,
+            &empty_summary(),
+        );
+        assert!(matches!(plan, PrimePlan::Clarify { .. }));
     }
 
     #[test]

@@ -93,6 +93,12 @@ pub enum PrimeIntent {
     /// into role-typed briefs and assigns them; running is a separate governed step.
     /// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 10.4 (Delegation Rules).
     Orchestration,
+    /// The user asked Prime to RUN/continue an EXISTING orchestration batch ("run the
+    /// orchestration", "continue orch_0001", "start the orchestration batch"). Distinct
+    /// from [`PrimeIntent::Orchestration`] (which CREATES the briefs): this starts the
+    /// separate governed `run_orchestration` batch for briefs that already exist.
+    /// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 10.4 (Delegation Rules).
+    OrchestrationRun,
     /// The user asked Prime to lay an idea out as a reviewable PLAN before any
     /// work is created ("plan this out", "draft a plan for X", "make a plan").
     /// This is the explicit "idea -> plan -> tasks" rung: Prime previews the
@@ -142,6 +148,14 @@ pub enum PrimeAction {
     /// running is a separate governed batch (`docs/RELUX_MASTER_PLAN.md` section 10.4).
     OrchestrateGoal {
         goal: String,
+    },
+    /// Run (or continue) the governed multi-agent batch for an EXISTING orchestration,
+    /// executing the briefs that are ready this round. Maps to the same governed
+    /// `run_orchestration` batch the blocking `/run` API and the CLI use; the kernel
+    /// validates the id against the live records (it must EXIST) before running anything
+    /// (`docs/RELUX_MASTER_PLAN.md` section 10.4).
+    RunOrchestration {
+        orchestration_id: String,
     },
     UpdateTask {
         task_id: String,
@@ -829,6 +843,7 @@ mod tests {
             PrimeIntent::DashboardNavigation,
             PrimeIntent::Brainstorming,
             PrimeIntent::Orchestration,
+            PrimeIntent::OrchestrationRun,
             PrimeIntent::ToolDiscovery,
             PrimeIntent::ToolInvocation,
             PrimeIntent::DirectAnswer,

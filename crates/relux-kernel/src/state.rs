@@ -1340,6 +1340,26 @@ impl KernelState {
         self.orchestrations.len()
     }
 
+    /// Resolve a candidate orchestration id against the live records for a RUN request,
+    /// returning the canonical id ONLY when it names an EXISTING orchestration that has at
+    /// least one PENDING brief left to run. Mirrors openclaw's `resolveControlledSubagentTarget`
+    /// (`reference/openclaw-main/src/agents/subagent-control.ts`): a control action lands only
+    /// on a target that exists AND is runnable. A non-existent id, or one whose briefs are all
+    /// terminal, returns `None` (the caller fails closed — an honest reply, never a faked run).
+    pub fn runnable_orchestration_id(&self, candidate: &str) -> Option<String> {
+        let oid = OrchestrationId::new(candidate.to_string());
+        let o = self.orchestrations.get(&oid)?;
+        let has_pending = o
+            .steps
+            .iter()
+            .any(|s| s.outcome == relux_core::StepOutcome::Pending);
+        if has_pending {
+            Some(o.id.0.clone())
+        } else {
+            None
+        }
+    }
+
     /// Decompose a goal into role-typed briefs, assign each to a fitting agent (or
     /// Prime when no specialist exists), and record the durable goal -> brief ->
     /// agent link. Creates and assigns work but does NOT run it - running is the
@@ -3846,6 +3866,38 @@ impl KernelState {
             plan
         };
 
+        // Brain-assisted orchestration RUN (the `orchestration.start` write tool): when the
+        // intent is `OrchestrationRun` but the deterministic plan named no id (it clarified),
+        // a validated brain slot — the orchestration existence- AND runnability-checked against
+        // the live records (`runnable_orchestration_id`) — promotes the turn to the SAME safe
+        // `RunOrchestration` action. The id is taken verbatim from the live records, so a run can
+        // start only for an orchestration that genuinely exists and has pending briefs; on
+        // no/unvalidated proposal the deterministic clarify stands. Durable state still flows
+        // through `decide` → `prime_execute`, which runs the EXISTING governed batch.
+        let plan = if intent == relux_core::PrimeIntent::OrchestrationRun
+            && !matches!(
+                &plan,
+                PrimePlan::Act {
+                    action: PrimeAction::RunOrchestration { .. },
+                    ..
+                }
+            ) {
+            match slots
+                .run_orchestration
+                .and_then(|proposal| self.runnable_orchestration_id(&proposal.orchestration_id))
+            {
+                Some(oid) => PrimePlan::Act {
+                    action: PrimeAction::RunOrchestration {
+                        orchestration_id: oid.clone(),
+                    },
+                    text: format!("Running orchestration {oid}."),
+                },
+                None => plan,
+            }
+        } else {
+            plan
+        };
+
         self.record_audit(
             "agent",
             ctx.agent.as_str(),
@@ -4712,6 +4764,68 @@ impl KernelState {
                 }),
                 Err(e) => Err(e),
             },
+            PrimeAction::RunOrchestration { orchestration_id } => {
+                // Run (or continue) the EXISTING governed batch for this orchestration — the
+                // SAME `run_orchestration` engine the blocking `/run` API and the CLI drive
+                // (`docs/RELUX_MASTER_PLAN.md` §10.4). The id is validated against the live
+                // records first: an unknown id is an honest, action-free reply (fail closed,
+                // never a faked run), exactly like an unknown task on `StartRun`. Bounded by
+                // the same defaults the blocking endpoint uses (max 25, concurrency 2); each
+                // brief still gates at run time through its assigned agent's adapter.
+                let oid = OrchestrationId::new(orchestration_id.clone());
+                if self.orchestration(&oid).is_none() {
+                    return Ok(PrimeTurn {
+                        intent,
+                        reply: format!(
+                            "There is no orchestration with id '{orchestration_id}'. Ask me to list the orchestrations to see what exists."
+                        ),
+                        disposition: PrimeDisposition::Answered,
+                        action: None,
+                        created_task: None,
+                        started_run: None,
+                        created_agent: None,
+                        approval: None,
+                        invoked_tool: None,
+                        tool_output: None,
+                        tool_error: None,
+                        suggested_actions: Vec::new(),
+                        proposal: None,
+                        slots: None,
+                        agent_slots: None,
+                        admin_slots: None,
+                        assign_slots: None,
+                        update: None,
+                        context_reads: vec![],
+                    });
+                }
+                match self.run_orchestration(&oid, 25, 2) {
+                    Ok(result) => {
+                        let reply = format!("{text} {} {}", result.summary, result.next_action);
+                        Ok(PrimeTurn {
+                            intent,
+                            reply,
+                            disposition: PrimeDisposition::Executed,
+                            action: Some(action),
+                            created_task: None,
+                            started_run: None,
+                            created_agent: None,
+                            approval: None,
+                            invoked_tool: None,
+                            tool_output: None,
+                            tool_error: None,
+                            suggested_actions: Vec::new(),
+                            proposal: None,
+                            slots: None,
+                            agent_slots: None,
+                            admin_slots: None,
+                            assign_slots: None,
+                            update: None,
+                            context_reads: vec![],
+                        })
+                    }
+                    Err(e) => Err(e),
+                }
+            }
             other => Ok(PrimeTurn {
                 intent,
                 reply: format!(
@@ -6683,6 +6797,11 @@ pub struct BrainSlotProposals<'a> {
     /// action; the deterministic planner still owns the decomposition, agent grounding, the
     /// step cap, the DAG, and the multi-agent gate (a goal that does not split is dropped).
     pub orchestration: Option<&'a crate::prime_orchestration_slots::BrainOrchestrationSlots>,
+    /// An `orchestration.start` write-tool reference for an `OrchestrationRun` turn the
+    /// deterministic path could not complete (the message named no id). Validated against the
+    /// live orchestration records (it must EXIST with at least one pending brief) before
+    /// promoting to the SAME safe `RunOrchestration` action.
+    pub run_orchestration: Option<&'a crate::prime_write_tools::BrainRunOrchestration>,
     /// Whether this bundle was computed by the caller on the COMBINED message of a
     /// multi-turn *continuation* (vs. the raw message of a fresh turn). The kernel keeps
     /// the bundle only when this matches the turn it actually produced — continuation
@@ -6780,6 +6899,9 @@ fn describe_action(action: &PrimeAction) -> String {
         PrimeAction::DiscoverTools => "list the installed tools".to_string(),
         PrimeAction::OrchestrateGoal { goal } => {
             format!("orchestrate \"{goal}\" across multiple agents")
+        }
+        PrimeAction::RunOrchestration { orchestration_id } => {
+            format!("run orchestration {orchestration_id}")
         }
         PrimeAction::InvokeTool {
             plugin_id,
@@ -12465,6 +12587,167 @@ mod tests {
             .audit_log()
             .iter()
             .any(|e| e.action == "orchestration:batch"));
+    }
+
+    #[test]
+    fn prime_run_orchestration_runs_an_existing_batch_by_id() {
+        // The `RunOrchestration` Prime action runs the EXISTING governed batch: create an
+        // orchestration, then ask Prime to run it by id → the briefs run and the record
+        // moves to completed (the same `run_orchestration` engine the CLI/API use).
+        let (mut k, ctx) = orchestration_kernel();
+        let id = k
+            .prime_orchestrate(&ctx, "implement the feature and document the result")
+            .unwrap()
+            .id
+            .clone();
+        assert_eq!(k.run_count(), 0, "nothing ran at create time");
+
+        let turn = k.prime_turn(&ctx, &format!("run {id}")).unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::OrchestrationRun);
+        assert_eq!(turn.disposition, PrimeDisposition::Executed);
+        match turn.action {
+            Some(PrimeAction::RunOrchestration { orchestration_id }) => {
+                assert_eq!(orchestration_id, id.0)
+            }
+            other => panic!("expected RunOrchestration, got {other:?}"),
+        }
+        // The durable record really advanced — both briefs completed.
+        let stored = k.orchestration(&id).unwrap();
+        assert_eq!(stored.status, OrchestrationStatus::Completed);
+        assert!(stored.steps.iter().all(|s| s.outcome == StepOutcome::Completed));
+    }
+
+    #[test]
+    fn prime_run_orchestration_unknown_id_is_an_honest_reply() {
+        // An explicit id that names no orchestration fails closed: an honest, action-free
+        // reply — never a faked run.
+        let (mut k, ctx) = orchestration_kernel();
+        let turn = k.prime_turn(&ctx, "run orch_9999").unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::OrchestrationRun);
+        assert_eq!(turn.disposition, PrimeDisposition::Answered);
+        assert!(turn.action.is_none(), "no action runs for an unknown id");
+        assert!(turn.reply.to_lowercase().contains("no orchestration"));
+    }
+
+    #[test]
+    fn prime_run_orchestration_without_an_id_clarifies() {
+        // No id named → a resolvable clarify the multi-turn memory can continue.
+        let (mut k, ctx) = orchestration_kernel();
+        let _ = k
+            .prime_orchestrate(&ctx, "implement the feature and document the result")
+            .unwrap();
+        let turn = k.prime_turn(&ctx, "run the orchestration").unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::OrchestrationRun);
+        assert_eq!(turn.disposition, PrimeDisposition::NeedsClarification);
+        assert!(turn.action.is_none());
+    }
+
+    #[test]
+    fn an_orchestration_run_clarification_is_resolved_by_an_id_follow_up() {
+        // The canonical multi-turn dialogue: "run the orchestration" → "which one?" →
+        // "orch_0001" continues the original request into a real batch run.
+        let (mut k, ctx) = orchestration_kernel();
+        let id = k
+            .prime_orchestrate(&ctx, "implement the feature and document the result")
+            .unwrap()
+            .id
+            .clone();
+
+        let clarify = k.prime_turn(&ctx, "run the orchestration").unwrap();
+        assert_eq!(clarify.disposition, PrimeDisposition::NeedsClarification);
+
+        let resolved = k.prime_turn(&ctx, id.as_str()).unwrap();
+        assert_eq!(resolved.intent, relux_core::PrimeIntent::OrchestrationRun);
+        assert_eq!(resolved.disposition, PrimeDisposition::Executed);
+        match resolved.action {
+            Some(PrimeAction::RunOrchestration { orchestration_id }) => {
+                assert_eq!(orchestration_id, id.0)
+            }
+            other => panic!("expected RunOrchestration, got {other:?}"),
+        }
+        assert_eq!(
+            k.orchestration(&id).unwrap().status,
+            OrchestrationStatus::Completed
+        );
+    }
+
+    #[test]
+    fn write_tool_orchestration_start_promotes_a_validated_id() {
+        use crate::prime_write_tools::{parse_write_tool_request, WriteToolSlot};
+        // The `orchestration.start` write tool promotes an under-specified run request: the
+        // message named no id (deterministic clarify), but a validated brain slot — the id
+        // existence- AND runnability-checked against the live records — promotes it to the
+        // SAME safe `RunOrchestration` action.
+        let (mut k, ctx) = orchestration_kernel();
+        let id = k
+            .prime_orchestrate(&ctx, "implement the feature and document the result")
+            .unwrap()
+            .id
+            .clone();
+        let req = parse_write_tool_request(&serde_json::json!({
+            "tool": "orchestration.start",
+            "args": {"orchestration_id": id.0}
+        }))
+        .unwrap();
+        let intent = req.intent_proposal();
+        let WriteToolSlot::RunOrchestration(run) = &req.slot else {
+            panic!("expected a run-orchestration slot");
+        };
+        let (turn, _) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "run the orchestration",
+                Some(&intent),
+                BrainSlotProposals {
+                    run_orchestration: Some(run),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(turn.disposition, PrimeDisposition::Executed);
+        match turn.action {
+            Some(PrimeAction::RunOrchestration { orchestration_id }) => {
+                assert_eq!(orchestration_id, id.0)
+            }
+            other => panic!("expected RunOrchestration, got {other:?}"),
+        }
+        assert_eq!(
+            k.orchestration(&id).unwrap().status,
+            OrchestrationStatus::Completed
+        );
+    }
+
+    #[test]
+    fn write_tool_orchestration_start_fails_closed_on_an_unknown_id() {
+        use crate::prime_write_tools::{parse_write_tool_request, WriteToolSlot};
+        // A brain-proposed id that names no orchestration never resolves — the deterministic
+        // clarify stands and nothing runs (fail closed).
+        let (mut k, ctx) = orchestration_kernel();
+        let _ = k
+            .prime_orchestrate(&ctx, "implement the feature and document the result")
+            .unwrap();
+        let req = parse_write_tool_request(&serde_json::json!({
+            "tool": "orchestration.start",
+            "args": {"orchestration_id": "orch_9999"}
+        }))
+        .unwrap();
+        let intent = req.intent_proposal();
+        let WriteToolSlot::RunOrchestration(run) = &req.slot else {
+            panic!("expected a run-orchestration slot");
+        };
+        let (turn, _) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "run the orchestration",
+                Some(&intent),
+                BrainSlotProposals {
+                    run_orchestration: Some(run),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(turn.disposition, PrimeDisposition::NeedsClarification);
+        assert!(turn.action.is_none());
     }
 
     #[test]

@@ -1186,6 +1186,31 @@ mod tests {
     }
 
     #[test]
+    fn carries_an_orchestration_start_write_tool_request() {
+        // The unified envelope may request the governed `orchestration.start` write tool; it
+        // validates through the write allowlist + the run-orchestration-slot parser and maps to
+        // the OrchestrationRun intent (a safe Act, not approval-gated).
+        let d = parse_decision(
+            r#"{
+                "classification":{"intent":"orchestration_run","confidence":0.9},
+                "action_request":{"tool":"orchestration.start",
+                  "args":{"orchestration_id":"orch_0001"}}
+            }"#,
+        )
+        .unwrap();
+        let wt = d.action_request.as_ref().expect("a validated write tool");
+        assert_eq!(wt.tool, "orchestration.start");
+        assert_eq!(wt.intent, PrimeIntent::OrchestrationRun);
+        assert!(!wt.gated, "orchestration.start is a safe Act");
+        match &wt.slot {
+            crate::prime_write_tools::WriteToolSlot::RunOrchestration(s) => {
+                assert_eq!(s.orchestration_id, "orch_0001");
+            }
+            other => panic!("expected a run-orchestration slot, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn tool_call_is_accepted_as_an_alias_and_gated_tools_are_marked() {
         // `tool_call` is an alias for `action_request`.
         let d =

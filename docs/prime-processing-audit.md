@@ -1454,6 +1454,60 @@ the kernel integration tests (`write_tool_orchestration_create_maps_to_the_exist
 `write_tool_orchestration_promotes_brain_named_steps`, `write_tool_orchestration_drops_a_single_
 clause_goal`, `casual_chat_never_triggers_orchestration`). No test calls a real provider.
 
+## Applied change (a governed orchestration RUN write tool + run-start memory)
+
+The `orchestration.create` write tool let Prime mint a multi-agent orchestration, but the briefs sat
+`Planned` — the only way to RUN them was the dashboard button, the blocking `/run` API, or the
+`prime orchestration run` CLI. Per master plan §10.2/§10.4 and the reference read recorded in
+`reference-driven-development.md` (Hermes name-allowlist-before-execute + `coerce_tool_args`; openclaw
+`subagent-control.ts` act-only-on-an-existing-runnable-target, `tool-policy` work-is-a-gated-capability,
+`tool-mutation` mutating-action classifier, `exec-approval-followup` consume-and-continue), this slice
+wires `PrimeAction::RunOrchestration { orchestration_id }` as a REAL, safe mutating action and adds
+`orchestration.start` to the SAME governed write allowlist.
+
+- **New intent `PrimeIntent::OrchestrationRun`** (`relux-core`) and action
+  `PrimeAction::RunOrchestration` — distinct from `Orchestration`/`OrchestrateGoal` (which CREATE the
+  briefs): this RUNS an existing batch. `classify_intent` recognizes a run/continue verb + the
+  orchestration noun (or an explicit `orch_…` id), placed AFTER the conversation guard (so "should we
+  run the orchestration?" stays `Brainstorming`) and BEFORE the task-creation / run-start catches (so
+  the batch verb is never read as new work or a single-task run). The new `extract_orchestration_id`
+  recovers an explicit reference.
+- **`decide` arm** — a named id becomes a `RunOrchestration` `Act` (existence validated at execute
+  time, like `OrchestrateGoal` defers the multi-agent check); no id named is a resolvable `Clarify`.
+- **`prime_execute` arm** — validates the id against the live records (an unknown id is an honest,
+  action-free reply — fail closed, never a faked run), then runs the EXISTING governed
+  `run_orchestration` batch (bounded by the blocking endpoint's defaults: max 25, concurrency 2). The
+  reply is the real, grounded batch result (`summary` + `next_action`).
+- **`orchestration.start` joins `prime_write_tools::WRITE_TOOLS`** (intent `OrchestrationRun`,
+  `gated:false`, slot `WriteToolSlot::RunOrchestration`). The kernel chokepoint
+  (`BrainSlotProposals.run_orchestration`) PROMOTES an under-specified run clarify to the SAME action
+  ONLY when `KernelState::runnable_orchestration_id` validates the brain's id (it must EXIST with a
+  pending brief); on no/unvalidated proposal the deterministic clarify stands.
+- **Multi-turn memory** — `is_resolvable_clarify_intent` includes `OrchestrationRun` and
+  `clarify_needs_label` is `"orchestration id"`, so "run the orchestration" → "which one?" →
+  "orch_0001" continues into a real batch run.
+- **Safety invariants (binding).** The brain runs nothing — `orchestration.start` desugars into the
+  existing intent + a validated id slot, and the batch is always run by the SAME governed
+  `run_orchestration` engine behind the unchanged fail-closed gate. The mapped intent is sensitive, so
+  guarded chat stays deterministic; an unknown/all-terminal orchestration fails closed. Each brief
+  still gates at run time through its assigned agent's adapter (a disabled runtime / missing permission
+  is recorded `blocked`, never faked), so this adds no new run-time authority. The run reply is real
+  kernel output, so it is kept deterministic (excluded from `prime_after_action`, like a tool result).
+  The dashboard's non-blocking `run-async` job path is unchanged; this maps Prime to the synchronous
+  governed batch (the CLI/blocking-API surface). Provenance is the existing generic
+  `🛠 requested tool: orchestration.start` chip (no new wire field, no dashboard change).
+
+Pinned by the `prime_write_tools` parse tests (`parses_orchestration_start_and_fails_closed_without_an_id`
++ the extended allowlist/each-tool tests); the `prime_decision` unified-envelope test
+(`carries_an_orchestration_start_write_tool_request`); the `prime` unit tests
+(`classifies_orchestration_run_distinct_from_create`, `extract_orchestration_id_recovers_an_explicit_reference`,
+`orchestration_run_acts_on_a_named_id_and_clarifies_without_one`); the `prime_clarify_memory`
+`only_resolvable_intents_are_recorded` update; and the kernel integration tests
+(`prime_run_orchestration_runs_an_existing_batch_by_id`, `prime_run_orchestration_unknown_id_is_an_honest_reply`,
+`prime_run_orchestration_without_an_id_clarifies`, `an_orchestration_run_clarification_is_resolved_by_an_id_follow_up`,
+`write_tool_orchestration_start_promotes_a_validated_id`, `write_tool_orchestration_start_fails_closed_on_an_unknown_id`).
+No test calls a real provider.
+
 ## Next recommended slice
 
 The **read-only context tools** now cover the local control plane: on an inspection/explanation/
@@ -1474,7 +1528,10 @@ before answering. The obvious next rungs build on it:
   the fail-closed gate (unknown ⇒ refused), and the SAME `reconcile_intent` gate keeps a mutating
   tool off guarded chat. The first half of the next rung — a **bounded observe-then-act loop**
   (observe read-only → act INSIDE the one envelope flow, the decision call itself looping) — is now
-  DONE (see below). **Richer write tools** (e.g. `run.retry`, an `orchestration` tool) remain.
+  DONE (see below). The orchestration write tools are now DONE too — `orchestration.create` (mint the
+  briefs) and `orchestration.start` (run the EXISTING batch, mapped to the governed `run_orchestration`
+  engine, with a resolvable run-start clarification). **Richer write tools** (e.g. `run.retry`, a
+  per-brief retry/cancel, a non-blocking `run-async` Prime path) remain.
 - **~~After-action narration~~ (DONE)** — a brain reply on an ACTIONFUL turn, the post-execution
   re-shaping pass that preserves the action-free wall (`prime_after_action`). After the kernel has
   ALREADY executed (or proposed) the action, the brain re-words the confirmation grounded ONLY in a

@@ -265,6 +265,7 @@ fn is_sensitive_intent(intent: &PrimeIntent) -> bool {
             | PrimeIntent::PermissionChange
             | PrimeIntent::ApprovalResponse
             | PrimeIntent::Orchestration
+            | PrimeIntent::OrchestrationRun
             | PrimeIntent::ToolInvocation
     )
 }

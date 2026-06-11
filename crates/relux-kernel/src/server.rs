@@ -1745,6 +1745,7 @@ async fn run_prime(
     let mut update_slots: Option<relux_kernel::BrainUpdateSlots> = None;
     let mut run_slots: Option<relux_kernel::BrainRunStart> = None;
     let mut orchestration_slots: Option<relux_kernel::BrainOrchestrationSlots> = None;
+    let mut run_orchestration_slots: Option<relux_kernel::BrainRunOrchestration> = None;
     if let Some(d) = decision.as_ref() {
         if let Some(wt) = d.action_request.as_ref() {
             // A WRITE tool request is the authority for this turn's intent + its one slot. Its
@@ -1764,6 +1765,9 @@ async fn run_prime(
                 relux_kernel::WriteToolSlot::RunStart(s) => run_slots = Some(s.clone()),
                 relux_kernel::WriteToolSlot::Orchestration(s) => {
                     orchestration_slots = Some(s.clone())
+                }
+                relux_kernel::WriteToolSlot::RunOrchestration(s) => {
+                    run_orchestration_slots = Some(s.clone())
                 }
             }
         } else {
@@ -1925,6 +1929,7 @@ async fn run_prime(
                 update: update_slots.as_ref(),
                 run: run_slots.as_ref(),
                 orchestration: orchestration_slots.as_ref(),
+                run_orchestration: run_orchestration_slots.as_ref(),
                 continuation: is_continuation,
             },
         )?;

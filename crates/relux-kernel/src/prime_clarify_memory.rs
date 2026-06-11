@@ -137,6 +137,7 @@ pub fn is_resolvable_clarify_intent(intent: &PrimeIntent) -> bool {
             | PrimeIntent::CreateAndRunTask
             | PrimeIntent::RunStart
             | PrimeIntent::TaskUpdate
+            | PrimeIntent::OrchestrationRun
     )
 }
 
@@ -276,6 +277,9 @@ mod tests {
         // A task update clarify is now resolvable too (the `UpdateTask` action is wired),
         // so "raise the priority" → "task_0001 to 8" continues the original request.
         assert!(is_resolvable_clarify_intent(&PrimeIntent::TaskUpdate));
+        // An orchestration-run clarify is resolvable by an orchestration id (the
+        // `RunOrchestration` action is wired): "run the orchestration" → "orch_0001".
+        assert!(is_resolvable_clarify_intent(&PrimeIntent::OrchestrationRun));
         // A non-actionable conversational intent is never recorded.
         assert!(!is_resolvable_clarify_intent(&PrimeIntent::Brainstorming));
     }
