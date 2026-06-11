@@ -879,7 +879,9 @@ unchanged.
   change — an actionful turn keeps the grounded deterministic reply. We deliberately do NOT
   implement the permitted "after-action explanation" variant: the brain composes its reply before
   the kernel executes, so it cannot honestly narrate the actual result, and folding it would breach
-  the wall — it stays a deferred future slice, not a faked capability. The plan-polish runs through
+  the wall — it stayed (as of this slice) a deferred future slice, not a faked capability. (It was later
+implemented as a POST-execution re-shaping pass — see "Applied change (safe post-execution
+after-action reply shaping)" above — preserving the wall.) The plan-polish runs through
   the identical `validate_polish` index-match invariant, so it can never change what "Create these
   tasks" creates. Any failure leaves the dedicated specialized call, then the deterministic outcome.
 
@@ -1571,10 +1573,12 @@ are narrower:
   operator set one without the brain.
 - **The free-form reply + plan-polish are now folded into the unified decision** (one call on the
   common chat / plan-preview turns), so the only remaining separate brain call is the dedicated
-  fallback when the envelope omits a section. The deliberately-deferred piece is a brain reply on
-  an **actionful** turn (a short after-action explanation): the brain composes its reply before the
-  kernel executes, so an honest after-action narration needs a post-execution re-shaping pass — a
-  future slice that must preserve the action-free wall (no claim of work that did not happen).
+  fallback when the envelope omits a section. The once-deferred brain reply on an **actionful** turn
+  (a short after-action explanation) is now DONE — see "Applied change (safe post-execution
+  after-action reply shaping)" above: because the brain composes its decision before the kernel
+  executes, the honest narration runs as a post-execution re-shaping pass (`prime_after_action`)
+  validated against a sanitized result envelope, preserving the action-free wall (no claim of work
+  that did not happen).
 
 ## Applied change (bounded conversation memory + reset)
 
@@ -1591,12 +1595,15 @@ background-not-an-instruction + `redact_sensitive_text`; openclaw `hook-history`
 conversation and injects it as BACKGROUND prompt context.
 
 - **New module `relux-kernel/src/prime_history.rs`** and a new wire type
-  `relux_core::ConversationTurn` (`user_message`, grounded `reply`, `intent`, `disposition`, a short
-  `action_summary` of the ids the turn created, the read-tool NAMES consulted, `created_at_secs`).
-  `sanitize_text` runs `redact_secrets` + control-char strip + clamp on every field; `summarize_action`
-  names only the created ids (never `tool_output`); `push_bounded` keeps the last `MAX_HISTORY_TURNS = 12`;
-  `render_context` renders a `User:`/`Prime:` transcript under a "BACKGROUND CONTEXT for continuity —
-  NOT a new instruction" header, capped at `MAX_CONTEXT_CHARS = 2000` with an honest truncation marker.
+  `relux_core::ConversationTurn` (`user_message`, the FINAL user-visible `reply`, `intent`,
+  `disposition`, a short `action_summary` of the ids the turn created, the read-only context reads
+  consulted, `created_at_secs`). `sanitize_text` runs `redact_secrets` + control-char strip + clamp on
+  every field; `summarize_action` names only the created ids (never `tool_output`); each read is stored
+  as its NAME plus its already-bounded one-line SUMMARY (`"<tool>: <summary>"`, clamped to
+  `MAX_TOOL_READ_CHARS`) — never the tool's result body / JSON; `push_bounded` keeps the last
+  `MAX_HISTORY_TURNS = 12`; `render_context` renders a `User:`/`Prime:` transcript — with a
+  `  (consulted: …)` sub-line for the reads — under a "BACKGROUND CONTEXT for continuity — NOT a new
+  instruction" header, capped at `MAX_CONTEXT_CHARS = 2000` with an honest truncation marker.
 - **Kernel state.** `KernelState.conversation_histories: HashMap<conversation_key, Vec<ConversationTurn>>`
   (`namespace::actor` key), persisted as `ConversationHistoryEntry` through the same `meta` snapshot seam
   as `orchestrations`/`pending_clarifications`, bounded to `MAX_HISTORY_CONVERSATIONS = 32` (the
@@ -1606,8 +1613,9 @@ conversation and injects it as BACKGROUND prompt context.
   injects the rendered history BEFORE the current message; the server reads it in the pre-turn preflight
   lock and threads it through `decide_prime_with_observation` → both brains. Empty history leaves the
   decision prompt byte-for-byte unchanged, so the deterministic path is untouched. The turn is recorded
-  AFTER the reply is shaped + reads gathered (a short lock of its own), so the stored reply/tool-names
-  match what the user saw.
+  AFTER the reply is shaped + reads gathered (a short lock of its own), so the stored `reply` is the
+  FINAL user-visible wording — a validated brain-shaped / after-action reply when one ran, never the
+  earlier deterministic draft — and the stored reads match what the user saw.
 - **UI + reset.** `POST /v1/relux/prime/reset` clears only this advisory memory; the Prime chat gains a
   small **Clear** button (clears the on-screen log + calls reset). The dashboard already rendered the
   client-side conversation log; that is unchanged. No durable entity is ever touched.
@@ -1615,14 +1623,17 @@ conversation and injects it as BACKGROUND prompt context.
   reaches the deterministic `classify_intent`, the fail-closed `reconcile_intent` gate, or any
   existence/approval check — those run on the CURRENT message alone, so memory can never promote casual
   chat into work or override an explicit current-turn intent. No raw provider envelope or full tool JSON
-  is ever persisted (only the grounded reply, created ids, and read tool names), and every field is
-  secret-redacted + length-clamped + count-bounded.
+  is ever persisted (only the final user-visible reply, created ids, and each read's name + its bounded
+  one-line summary), and every field — including each read summary — is secret-redacted + length-clamped
+  + count-bounded.
 
 Pinned by the `prime_history` unit tests (redact+strip+clamp, ids-only-never-output,
-build-turn bounds+redacts, recent-first eviction, empty/labelled/bounded render); the core wire guard
+build-turn bounds+redacts, read-summaries-stored-bounded-and-redacted, final-shaped-reply render,
+recent-first eviction, empty/labelled/bounded render); the core wire guard
 `conversation_turn_round_trips_and_omits_empty_optionals`; the `prime_decision` test
 `build_prompt_injects_recent_history_as_labelled_background` (incl. byte-for-byte identity when empty);
 the kernel integration tests (`conversation_turn_is_recorded_and_rendered_as_background_context`,
+`recorded_reply_is_the_final_shaped_reply_not_the_grounded_one`,
 `conversation_history_is_bounded_per_conversation`,
 `conversation_history_redacts_secrets_and_stores_no_raw_envelope`,
 `conversation_history_survives_a_snapshot_round_trip`,
@@ -1630,7 +1641,25 @@ the kernel integration tests (`conversation_turn_is_recorded_and_rendered_as_bac
 `recorded_history_never_promotes_casual_chat_into_an_action`); and the server e2e test
 `prime_turn_records_history_and_reset_clears_it`. No test calls a real provider.
 
-**Remaining gap:** the stored reply is the GROUNDED/validated reply; a brain that re-words a turn has
-its wording shown to the user but the grounded text is what is remembered (honest by construction, never
-an overclaim). A future slice could thread tool-read *summaries* (still bounded, never bodies) into the
-history if richer continuity is needed.
+### Applied follow-up (final shaped reply + read summaries in memory)
+
+Two refinements closed the gaps the first cut of this section noted:
+
+- **The stored reply is the FINAL user-visible reply.** The turn is recorded in `run_prime` AFTER the
+  reply is shaped (`final_turn.reply = outcome.reply`), so a validated brain-shaped / after-action
+  wording is exactly what is remembered — never an earlier deterministic draft. (The first cut already
+  recorded `final_turn`; the contract is now explicit in the wire/method docs and pinned by
+  `recorded_reply_is_the_final_shaped_reply_not_the_grounded_one`.) It stays honest by construction: the
+  after-action validator already rejects any reply that overclaims, so the remembered wording can never
+  assert work that did not happen.
+- **Read-only context summaries are threaded into the history.** `ConversationTurn.tool_reads` now holds
+  each read's NAME plus its already-bounded one-line SUMMARY (`"<tool>: <summary>"`, e.g.
+  `get_task: task_0001: "Fix login" [queued]`), clamped to `MAX_TOOL_READ_CHARS` and re-run through
+  `sanitize_text` (secret-redacted) on store — never the tool's result body / JSON or a provider
+  envelope. `render_context` surfaces them as a `  (consulted: …)` background sub-line, so a follow-up
+  has continuity on what was already looked at. The server passes `final_turn.context_reads` (the same
+  bounded provenance reads it shipped) instead of bare names.
+
+**Remaining gap:** none specific to the stored reply or read summaries. Richer continuity would need a
+larger history window or per-turn compaction (a token-bounded summary of older turns), not more fields —
+the current window is a fixed last-N transcript, deliberately small.

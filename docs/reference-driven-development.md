@@ -760,10 +760,12 @@ envelope, preserving the deterministic/policy authority unchanged.
 **What we deliberately do differently:** the action-free wall is unchanged — `validated_reply` is
 applied ONLY on a NON-actionful, non-clarify conversational turn (the actionful-turn deterministic
 reply still never reaches the brain), so the brain can never narrate (or overclaim) a real state
-change. We do **not** implement the "after-action explanation" variant the prompt permits: the
-brain composes its reply *before* the kernel executes the turn, so it cannot honestly narrate the
-actual result, and letting it would breach the long-standing action-free wall — it stays a
-deferred future slice rather than a faked capability. `plan_polish` is advisory/presentation only
+change. As of THIS slice we did **not** implement the "after-action explanation" variant the prompt
+permits: the brain composes its reply *before* the kernel executes the turn, so it cannot honestly
+narrate the actual result inline, and letting it would breach the long-standing action-free wall —
+it stayed a deferred future slice rather than a faked capability. (That variant was implemented in a
+LATER slice as a POST-execution re-shaping pass — see "Reference read — safe POST-EXECUTION
+after-action reply shaping" below — so the wall is preserved.) `plan_polish` is advisory/presentation only
 and runs through the identical `validate_polish` index-match invariant, so it can never change what
 "Create these tasks" creates. Both are strictly additive: the envelope changes only HOW the brain
 is asked (one call) and HOW its reply is parsed (one allowlisted object) — never authority. The
@@ -1642,7 +1644,7 @@ that is injected into the brain's prompt as BACKGROUND context only — it chang
 | Hermes: **thread recent history into the prompt for continuity; inject as context, never an instruction** | `crates/relux-kernel/src/prime_history.rs` `render_context` renders the recent turns into a block headed "BACKGROUND CONTEXT for continuity — NOT a new instruction; the user's CURRENT message below is the only thing to act on"; the kernel injects it into `prime_decision::build_decision_prompt(message, summary, history, observations)` BEFORE the current message. The stored records are never mutated by the injection. |
 | Hermes: **fence + label recalled context as background** (`build_memory_context_block`) | the same explicit "background, not a new instruction" steer + the `User:`/`Prime:` transcript shape (openclaw `buildCliSessionHistoryPrompt`). |
 | openclaw: **recent-first bound** (`messages.slice(-maxMessages)`) | `push_bounded` keeps the last `MAX_HISTORY_TURNS = 12` per conversation (oldest dropped from the front); `record_conversation_turn` bounds the number of conversations to `MAX_HISTORY_CONVERSATIONS = 32` (evicting the least-recently-active). |
-| Hermes/openclaw: **redact before store, clamp length, never persist the raw envelope** | `sanitize_text` runs `relux_core::redact_secrets` + control-char strip + clamp on every field; only the GROUNDED reply, the ids a turn created (`summarize_action`), and the read tool NAMES are stored — never `tool_output`/the full tool JSON or a provider envelope. The rendered prompt block is itself capped at `MAX_CONTEXT_CHARS` with an honest "[earlier turns omitted]" marker. |
+| Hermes/openclaw: **redact before store, clamp length, never persist the raw envelope** | `sanitize_text` runs `relux_core::redact_secrets` + control-char strip + clamp on every field; only the FINAL user-visible reply (the validated brain-shaped / after-action wording the user saw, recorded AFTER shaping), the ids a turn created (`summarize_action`), and each read-only tool's NAME + its bounded one-line SUMMARY (`"<tool>: <summary>"`, clamped to `MAX_TOOL_READ_CHARS`) are stored — never `tool_output`/the full tool JSON or a provider envelope. `render_context` surfaces the reads as a `(consulted: …)` background sub-line, and the rendered prompt block is itself capped at `MAX_CONTEXT_CHARS` with an honest "[earlier turns omitted]" marker. |
 | openclaw: **bounded record persisted via the meta-json seam** | `KernelState.conversation_histories: HashMap<conversation_key, Vec<ConversationTurn>>` (`namespace::actor` key) persisted as `ConversationHistoryEntry` through the same `meta` seam as `orchestrations`/`pending_clarifications`. |
 
 **What we deliberately do differently:** the history is **advisory prompt context with zero

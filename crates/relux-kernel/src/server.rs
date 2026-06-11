@@ -2364,28 +2364,33 @@ async fn run_prime(
 
     // 5. Record a bounded, secret-redacted slice of THIS turn into the per-conversation memory so
     // the NEXT turn's brain can interpret a follow-up in context. Done AFTER the reply is shaped
-    // and the read-only context gathered, so the stored reply + tool-read names match what the
-    // user actually saw. A short lock of its own (after the turn's own save); it stores only
-    // advisory grounding (the grounded reply, the ids the turn created, and the NAMES of the
-    // read-only tools consulted — never a raw provider envelope or full tool JSON), and grants no
-    // authority (`docs/prime-processing-audit.md` "Bounded conversation memory").
+    // (`final_turn.reply` is now the FINAL user-visible reply — a validated brain-shaped /
+    // after-action wording when one ran, never the earlier deterministic draft) and the read-only
+    // context gathered, so the stored reply + reads match what the user actually saw. A short lock
+    // of its own (after the turn's own save); it stores only advisory grounding (the final reply,
+    // the ids the turn created, and the read-only tools consulted as name + their bounded one-line
+    // summary — never a raw provider envelope or full tool JSON), and grants no authority
+    // (`docs/prime-processing-audit.md` "Bounded conversation memory").
     {
         let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut store = SqliteStore::open(&state.db_path)?;
         let mut kernel = store.load()?;
         let ctx = crate::ensure_bootstrapped(&mut kernel)?;
-        let read_names: Vec<String> = final_turn
-            .context_reads
-            .iter()
-            .map(|r| r.tool.clone())
-            .collect();
         // The combined message on a continuation (what the turn actually answered), else the raw
         // user message.
         let recorded_message = match continuation.as_ref() {
             Some((combined, _)) => combined.clone(),
             None => message.clone(),
         };
-        kernel.record_conversation_turn(&ctx, &recorded_message, &final_turn, &read_names);
+        // The bounded context reads (name + already-redacted/clamped summary) the turn shipped as
+        // provenance; `build_turn` re-redacts + clamps each entry. The full result bodies stayed
+        // server-side grounding and are never persisted.
+        kernel.record_conversation_turn(
+            &ctx,
+            &recorded_message,
+            &final_turn,
+            &final_turn.context_reads,
+        );
         store.save(&kernel)?;
     }
 

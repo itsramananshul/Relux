@@ -4860,8 +4860,11 @@ impl KernelState {
     /// "Bounded conversation memory"; see [`crate::prime_history`]).
     ///
     /// `user_message` is the message the turn answered (the COMBINED message on a clarification
-    /// continuation), `turn` is the finished turn (its grounded reply is what the user saw), and
-    /// `tool_reads` are the NAMES of the read-only context tools consulted (never their bodies).
+    /// continuation), `turn` is the finished turn (its `reply` is the FINAL user-visible reply —
+    /// the server records AFTER shaping, so a brain-shaped / after-action wording is what is
+    /// stored, never an earlier draft), and `context_reads` are the read-only context reads
+    /// consulted ([`relux_core::PrimeContextRead`]) — each stored as its name plus its bounded
+    /// one-line summary, never the tool's result body.
     /// The record is built secret-redacted + clamped by [`crate::prime_history::build_turn`], the
     /// per-conversation list is bounded to [`crate::prime_history::MAX_HISTORY_TURNS`] (oldest
     /// evicted), and the number of conversations is bounded to
@@ -4873,11 +4876,11 @@ impl KernelState {
         ctx: &PrimeContext,
         user_message: &str,
         turn: &PrimeTurn,
-        tool_reads: &[String],
+        context_reads: &[relux_core::PrimeContextRead],
     ) {
         let key = Self::conversation_key(ctx);
         let now_secs = self.clock.secs();
-        let record = crate::prime_history::build_turn(user_message, turn, tool_reads, now_secs);
+        let record = crate::prime_history::build_turn(user_message, turn, context_reads, now_secs);
         // Bound the number of distinct conversations: when recording into a NEW conversation would
         // exceed the cap, evict the conversation whose most-recent turn is the oldest (the least
         // recently active), so the live conversations are the ones kept.
@@ -10060,21 +10063,55 @@ mod tests {
         // clearly-labelled BACKGROUND (the continuity the brain reads, never an instruction).
         let (mut k, ctx) = prime_chat_kernel();
         assert_eq!(k.recent_conversation_context(&ctx), "");
-        let turn = k
+        let mut turn = k
             .prime_turn(&ctx, "create a task to summarize the README")
             .unwrap();
+        // The server records AFTER shaping; simulate the brain-shaped final reply the user saw.
+        turn.reply = "Done — I created that task for you.".to_string();
         k.record_conversation_turn(
             &ctx,
             "create a task to summarize the README",
             &turn,
-            &["list_tasks".to_string()],
+            &[relux_core::PrimeContextRead {
+                tool: "list_tasks".to_string(),
+                ok: true,
+                summary: "2 task(s)".to_string(),
+            }],
         );
         let context = k.recent_conversation_context(&ctx);
         assert!(context.contains("BACKGROUND CONTEXT"));
         assert!(context.contains("NOT a new instruction"));
         assert!(context.contains("create a task to summarize the README"));
+        // The FINAL shaped reply (not an earlier draft) is what is remembered.
+        assert!(context.contains("Prime: Done — I created that task for you."));
         // The created id is summarized into the rendered context.
         assert!(context.contains("created "));
+        // The consulted read-only context (name + bounded summary) is rendered as background.
+        assert!(context.contains("consulted: list_tasks: 2 task(s)"));
+    }
+
+    #[test]
+    fn recorded_reply_is_the_final_shaped_reply_not_the_grounded_one() {
+        // The server replaces `turn.reply` with the FINAL user-visible reply (a validated
+        // brain-shaped / after-action wording) BEFORE recording, so the memory remembers what the
+        // user actually saw — not the earlier deterministic draft. This pins that contract at the
+        // record layer: whatever reply is on the turn at record time is stored and rendered.
+        let (mut k, ctx) = prime_chat_kernel();
+        let mut turn = k.prime_turn(&ctx, "what is going on?").unwrap();
+        let grounded = turn.reply.clone();
+        let shaped = format!("{grounded} (re-worded by the brain for you)");
+        assert_ne!(grounded, shaped);
+        turn.reply = shaped.clone();
+        k.record_conversation_turn(&ctx, "what is going on?", &turn, &[]);
+        let snap = k.snapshot();
+        let entry = snap
+            .conversation_histories
+            .iter()
+            .find(|e| e.key == KernelState::conversation_key(&ctx))
+            .expect("a history entry");
+        let rec = entry.turns.last().unwrap();
+        assert_eq!(rec.reply, shaped);
+        assert!(k.recent_conversation_context(&ctx).contains("re-worded by the brain"));
     }
 
     #[test]
@@ -10100,8 +10137,8 @@ mod tests {
 
     #[test]
     fn conversation_history_redacts_secrets_and_stores_no_raw_envelope() {
-        // A secret in the message / reply is masked before storage, and only tool NAMES are
-        // kept — never the tool's result body (the no-raw-envelope rule).
+        // A secret in the message / reply / read summary is masked before storage, and the tool's
+        // raw result BODY is never persisted — only its name + bounded summary (no-raw-envelope).
         let (mut k, ctx) = prime_chat_kernel();
         let mut turn = k.prime_turn(&ctx, "what is going on?").unwrap();
         turn.reply = "Here is the answer with token=sk-ABCDEFGHIJKLMNOP0123456789".to_string();
@@ -10110,7 +10147,11 @@ mod tests {
             &ctx,
             "what is going on? api_key=sk-LEAKLEAKLEAKLEAK00012345",
             &turn,
-            &["list_tasks".to_string()],
+            &[relux_core::PrimeContextRead {
+                tool: "list_tasks".to_string(),
+                ok: true,
+                summary: "5 task(s) token=sk-SUMMARYLEAK00099988877".to_string(),
+            }],
         );
         let snap = k.snapshot();
         let entry = snap
@@ -10121,8 +10162,11 @@ mod tests {
         let rec = entry.turns.last().unwrap();
         assert!(!rec.reply.contains("sk-ABCDEFGHIJKLMNOP0123456789"));
         assert!(!rec.user_message.contains("sk-LEAKLEAKLEAKLEAK00012345"));
-        // The tool output body is NEVER persisted — only the read tool's name.
-        assert_eq!(rec.tool_reads, vec!["list_tasks".to_string()]);
+        // The read is stored as name + its bounded summary, with any secret in the summary masked.
+        assert_eq!(rec.tool_reads.len(), 1);
+        assert!(rec.tool_reads[0].starts_with("list_tasks: 5 task(s)"));
+        assert!(!rec.tool_reads[0].contains("sk-SUMMARYLEAK00099988877"));
+        // The tool output body is NEVER persisted (no raw envelope / JSON).
         let serialized = serde_json::to_string(&snap.conversation_histories).unwrap();
         assert!(!serialized.contains("SHOULDNEVERPERSIST"));
     }

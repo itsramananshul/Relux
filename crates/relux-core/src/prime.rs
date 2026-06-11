@@ -794,8 +794,9 @@ pub struct ConversationTurn {
     /// continuation). Bounded + secret-redacted by the kernel before storage; plain
     /// user text, never a raw envelope or secret.
     pub user_message: String,
-    /// Prime's grounded reply (bounded + secret-redacted). The deterministic / validated
-    /// reply the user saw — never a raw provider or tool envelope.
+    /// Prime's FINAL user-visible reply (bounded + secret-redacted) — the same text shown in
+    /// the chat, including a validated brain-shaped / after-action wording when one was used,
+    /// never an earlier pre-shaping draft and never a raw provider or tool envelope.
     pub reply: String,
     /// The resolved intent label for this turn.
     pub intent: PrimeIntent,
@@ -805,8 +806,11 @@ pub struct ConversationTurn {
     /// `"started run_0002"`). Empty for a pure conversational reply.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub action_summary: String,
-    /// The NAMES of the read-only context tools Prime consulted before answering (never
-    /// their result bodies / JSON). Empty when none ran. Bounded in count + length.
+    /// The read-only context tools Prime consulted before answering, each rendered as its
+    /// name plus the same bounded one-line summary the turn shipped as provenance
+    /// (`"<tool>: <summary>"`, e.g. `get_task: task_0001: "Fix login" [queued]`) — never the
+    /// tool's full result body / JSON or a raw envelope. Empty when none ran; bounded in count,
+    /// and each entry secret-redacted + length-clamped by the kernel before storage.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_reads: Vec<String>,
     /// The logical-clock second this turn was recorded.

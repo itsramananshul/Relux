@@ -20,9 +20,11 @@
 //!   all run on the CURRENT message only. So history can never promote casual chat into work,
 //!   override an explicit current-turn intent, or invent an id.
 //! - Every stored field is **secret-redacted** ([`relux_core::redact_secrets`]), control-char
-//!   stripped, and **length-clamped**; the record holds only Prime's GROUNDED reply (never a
-//!   raw provider envelope), the NAMES of any read-only tools consulted (never their result
-//!   bodies / JSON), and the ids a turn created. No raw tool/provider JSON is ever persisted.
+//!   stripped, and **length-clamped**; the record holds only Prime's FINAL user-visible reply
+//!   (the same text the user saw, including a validated brain-shaped / after-action wording —
+//!   never a raw provider envelope), each read-only tool's NAME plus its already-bounded one-line
+//!   SUMMARY (never the tool's result body / JSON), and the ids a turn created. No raw
+//!   tool/provider JSON is ever persisted.
 //! - It is **bounded** in count + size: at most [`MAX_HISTORY_TURNS`] turns per conversation
 //!   (oldest evicted) and [`MAX_HISTORY_CONVERSATIONS`] conversations overall, and the rendered
 //!   context handed to the brain is itself capped at [`MAX_CONTEXT_CHARS`].
@@ -48,7 +50,7 @@
 //!   [`relux_core::redact_secrets`]) — sized far smaller because the kernel only needs a short
 //!   continuity window, not a full reseed transcript.
 
-use relux_core::{redact_secrets, ConversationTurn, PrimeAction, PrimeTurn};
+use relux_core::{redact_secrets, ConversationTurn, PrimeAction, PrimeContextRead, PrimeTurn};
 
 /// The maximum number of recent turns kept per conversation. A short window — enough for
 /// Hermes/Codex-style "what about the second one?" continuity without holding a transcript.
@@ -64,9 +66,11 @@ pub const MAX_HISTORY_CONVERSATIONS: usize = 32;
 pub const MAX_USER_MESSAGE_CHARS: usize = 480;
 pub const MAX_REPLY_CHARS: usize = 600;
 pub const MAX_ACTION_SUMMARY_CHARS: usize = 200;
-/// Bounds on the recorded read-only tool names (count + each name's length).
+/// Bounds on the recorded read-only context reads (count + each rendered `"name: summary"`
+/// entry's length). The summary is already a short, deterministic one-liner; the per-entry clamp
+/// keeps a long task title from bloating the stored history regardless.
 pub const MAX_TOOL_READS: usize = 8;
-pub const MAX_TOOL_NAME_CHARS: usize = 60;
+pub const MAX_TOOL_READ_CHARS: usize = 160;
 /// The hard cap on the rendered context string handed to the brain's prompt, so a long
 /// conversation can never bloat the request (mirrors openclaw's reseed-history char cap, sized
 /// for a short continuity window).
@@ -124,18 +128,33 @@ pub fn summarize_action(turn: &PrimeTurn) -> String {
 /// Build a bounded, secret-redacted [`ConversationTurn`] record from a completed turn.
 ///
 /// `user_message` is the message the turn answered (the combined message on a continuation),
-/// `turn` is the finished turn (its `reply` is the grounded reply the user saw), and
-/// `tool_reads` are the NAMES of the read-only context tools consulted (never their bodies).
-/// Every text field is redacted + clamped; the tool-name list is bounded in count + length.
+/// `turn` is the finished turn (its `reply` is the FINAL user-visible reply — the same text the
+/// user saw, including a validated brain-shaped / after-action wording), and `context_reads` are
+/// the read-only context reads the turn consulted ([`PrimeContextRead`]): each stored as its
+/// NAME plus its already-bounded one-line SUMMARY (`"<tool>: <summary>"`), never the tool's
+/// result body / JSON. Every text field — including each read entry — is run through
+/// [`sanitize_text`] (secret-redacted + control-stripped + clamped), and the read list is
+/// bounded in count.
 pub fn build_turn(
     user_message: &str,
     turn: &PrimeTurn,
-    tool_reads: &[String],
+    context_reads: &[PrimeContextRead],
     now_secs: u64,
 ) -> ConversationTurn {
-    let mut reads: Vec<String> = tool_reads
+    let mut reads: Vec<String> = context_reads
         .iter()
-        .map(|t| sanitize_text(t, MAX_TOOL_NAME_CHARS))
+        .map(|r| {
+            // Name + the already-bounded summary the turn shipped as provenance; the summary is a
+            // short deterministic one-liner, never the tool's result body. `sanitize_text`
+            // redacts secrets and clamps regardless, so even a task title carrying a pasted token
+            // is masked before storage.
+            let entry = if r.summary.trim().is_empty() {
+                r.tool.clone()
+            } else {
+                format!("{}: {}", r.tool, r.summary)
+            };
+            sanitize_text(&entry, MAX_TOOL_READ_CHARS)
+        })
         .filter(|t| !t.is_empty())
         .collect();
     reads.truncate(MAX_TOOL_READS);
@@ -183,6 +202,12 @@ pub fn render_context(history: &[ConversationTurn]) -> String {
             prime_line.push_str(&format!(" [{}]", turn.action_summary));
         }
         lines.push(prime_line);
+        // The bounded read-only context the turn consulted, rendered as a background sub-line so
+        // the brain has continuity on what was already looked at ("consulted: get_task:
+        // task_0001 …"). Names + their bounded summaries only — never a result body.
+        if !turn.tool_reads.is_empty() {
+            lines.push(format!("  (consulted: {})", turn.tool_reads.join("; ")));
+        }
     }
     let mut body = lines.join("\n");
     // Bound the rendered block; keep the MOST RECENT text (drop from the front) so the freshest
@@ -208,6 +233,10 @@ the user's CURRENT message below is the only thing to act on):\n{body}"
 mod tests {
     use super::*;
     use relux_core::{PrimeDisposition, PrimeIntent, TaskId};
+
+    fn read(tool: &str, summary: &str) -> PrimeContextRead {
+        PrimeContextRead { tool: tool.to_string(), ok: true, summary: summary.to_string() }
+    }
 
     fn reply_turn(reply: &str) -> PrimeTurn {
         PrimeTurn {
@@ -259,13 +288,37 @@ mod tests {
     fn build_turn_bounds_reads_and_redacts() {
         let mut t = reply_turn("here is your answer with a token=sk-ABCDEFGHIJKLMNOP012345678");
         t.created_task = Some(TaskId::new("task_0002"));
-        let reads: Vec<String> = (0..20).map(|i| format!("list_tasks_{i}")).collect();
+        let reads: Vec<PrimeContextRead> =
+            (0..20).map(|i| read("list_tasks", &format!("{i} task(s)"))).collect();
         let rec = build_turn("what is going on with token=sk-LEAKLEAKLEAKLEAKLEAK0001", &t, &reads, 42);
         assert!(!rec.reply.contains("sk-ABCDEFGHIJKLMNOP012345678"));
         assert!(!rec.user_message.contains("sk-LEAKLEAKLEAKLEAKLEAK0001"));
         assert_eq!(rec.tool_reads.len(), MAX_TOOL_READS);
+        // Each read is stored as "name: summary", not just the bare name.
+        assert!(rec.tool_reads[0].starts_with("list_tasks: "));
         assert_eq!(rec.action_summary, "created task_0002");
         assert_eq!(rec.created_at_secs, 42);
+    }
+
+    #[test]
+    fn build_turn_stores_read_summaries_bounded_and_redacted() {
+        // The bounded one-line summary is stored alongside the tool name — but a secret that
+        // leaked into a summary (e.g. via a task title) is masked, and the entry is clamped. The
+        // raw tool body is never involved (only the shipped summary is).
+        let t = reply_turn("done");
+        let reads = vec![
+            read("get_task", "task_0001: \"Fix the login redirect\" [queued]"),
+            read("get_agent", "secret in title token=sk-SUMMARYLEAK000111222333"),
+            read("board_summary", &"y".repeat(500)),
+        ];
+        let rec = build_turn("what is going on?", &t, &reads, 7);
+        assert_eq!(rec.tool_reads.len(), 3);
+        assert!(rec.tool_reads[0].contains("get_task: task_0001:"));
+        assert!(rec.tool_reads[0].contains("[queued]"));
+        // Secret redacted, never stored verbatim.
+        assert!(!rec.tool_reads[1].contains("sk-SUMMARYLEAK000111222333"));
+        // Per-entry clamp holds even for a long summary.
+        assert!(rec.tool_reads[2].chars().count() <= MAX_TOOL_READ_CHARS);
     }
 
     #[test]
@@ -289,13 +342,26 @@ mod tests {
     fn render_context_labels_background_and_renders_turns() {
         let mut t = reply_turn("There are three tasks ready.");
         t.created_task = Some(TaskId::new("task_0007"));
-        let history = vec![build_turn("what is going on?", &t, &["list_tasks".to_string()], 1)];
+        let history = vec![build_turn("what is going on?", &t, &[read("list_tasks", "3 task(s)")], 1)];
         let rendered = render_context(&history);
         assert!(rendered.contains("BACKGROUND CONTEXT"));
         assert!(rendered.contains("NOT a new instruction"));
         assert!(rendered.contains("User: what is going on?"));
         assert!(rendered.contains("Prime: There are three tasks ready."));
         assert!(rendered.contains("[created task_0007]"));
+        // The consulted read-only context is rendered as a background sub-line (name + summary).
+        assert!(rendered.contains("consulted: list_tasks: 3 task(s)"));
+    }
+
+    #[test]
+    fn render_context_carries_the_final_shaped_reply() {
+        // Whatever reply is on the turn at record time (the server sets it to the FINAL shaped
+        // reply before recording) is exactly what is rendered back as continuity — never an
+        // earlier draft.
+        let shaped = reply_turn("Done — I created task_0007 and it's queued.");
+        let history = vec![build_turn("make that task", &shaped, &[], 1)];
+        let rendered = render_context(&history);
+        assert!(rendered.contains("Prime: Done — I created task_0007 and it's queued."));
     }
 
     #[test]
