@@ -370,6 +370,69 @@ state. Reference grounding (openclaw `HealthStore`/onboarding, Hermes
 `status`/`doctor`/`setup.status`) is recorded in
 `docs/reference-driven-development.md`.
 
+### 15.1 The Doctor panel (IMPLEMENTED)
+
+> **STATUS: shipped.** The actionable, kernel-backed companion to the readiness
+> guide on the Health page (`apps/dashboard/src/components/DoctorPanel.tsx`),
+> grounded in a single read-only kernel endpoint.
+
+**The goal:** the readiness guide derives pass/warn/fail *in the frontend* from
+the reads Home already makes; the Doctor is the **kernel-side** diagnostic — the
+kernel itself reports structured checks, so the operator gets a deeper, honest
+"what's wrong and how to fix it" without leaving the dashboard.
+
+**Backend — `GET /v1/relux/doctor` (read-only).** A new session-protected endpoint
+(`relux_kernel::doctor::build_doctor_report`, handler `get_doctor` in
+`crates/relux-kernel/src/server.rs`) reuses the SAME cheap reads as
+`/v1/relux/health` (store open/load, dashboard bundle, AI status, adapter + tool
+readiness, agent + approval counts) and returns structured rows. It does **no
+heavy work** (no cargo build/test), no network beyond what health already does
+(none), and no mutation. Each row carries an `id`, `label`, a `severity`
+(`ok`/`info`/`warn`/`fail`), a secret-free `message`, and — where there is a
+concrete fix — a `remediation` line and an in-app `action_link`
+(`/health`, `/crew`, `/plugins`, `/approvals`). The report also carries an
+`overall` severity (worst-of) and an `ok`/`info`/`warn`/`fail` `summary`.
+
+The checks (and their severity rules, which match `readiness.ts` so the two
+surfaces never disagree): **kernel.store** (fail if the store can't open/load —
+the endpoint still returns an honest failing row rather than 500ing),
+**dashboard.bundle** (warn when absent: the API works, only `/dashboard` shows a
+build notice), **prime.brain** (a SELECTED-but-broken brain — OpenRouter without a
+key, or a Claude/Codex CLI brain whose adapter is not runnable — is the failure; a
+local deterministic brain is healthy `info`), **adapters.real_work** (optional, so
+`info`/`ok`, never a blocker), **plugins.tools** (tools needing a loopback runtime
+are `warn`; ready tools `ok`; approval-gated tools noted, never counted as ready),
+**crew**, and **approvals.pending** (`warn` only when something waits).
+
+**Redaction.** The Doctor takes NO filesystem paths as input (`DoctorInputs`
+carries booleans/counts/states only), so a db path or a resolved binary path can
+never reach a check message — structural redaction, mirroring openclaw's
+admin-only `includeSensitive` path surfacing. The AI model **name** is shown (safe,
+never the key).
+
+**UI.** A compact, scan-friendly card on Health, directly below the readiness
+guide (so it is reachable the moment the guide reports degraded). It shows the
+`overall` badge, a one-line headline (`N fail, M warn, …`), and the rows sorted
+worst-first, each with a severity badge, the message, the remediation, and a
+**Fix →** link to the action route. A **Refresh** button re-runs the bounded read.
+If the doctor read fails it shows an honest error (never a blank panel, never a
+faked-green report). Presentation helpers are pure (`apps/dashboard/src/doctor.ts`:
+`severityBadgeClass`/`severityLabel`/`sortChecksBySeverity`/`doctorHeadline`).
+
+**Tests.** `crates/relux-kernel/src/doctor.rs` unit tests pin every severity rule
+(local→info, OpenRouter-no-key→fail, disabled→warn, Claude CLI available→ok /
+missing→fail, tools-need-runtime→warn, store-fail→fail, pending-approvals→warn,
+missing-bundle→warn, overall aggregation) **and the redaction** (a path-shaped
+adapter value never appears in the serialized report);
+`server.rs::doctor_requires_a_session_and_returns_structured_checks` proves the
+endpoint is session-gated, returns the expected rows over a bootstrapped store, and
+never echoes the db path. Frontend: `apps/dashboard/test/doctor.test.ts` pins the
+pure helpers; `apps/dashboard/test/doctor-render.test.mjs` renders the panel's
+ok/warn/fail/error/loading states, proves Health mounts it, and asserts the
+committed bundle carries it. Reference grounding (Hermes `hermes_cli/doctor.py`
+`check_*`/`_fail_and_issue`; openclaw `gateway/server/health-state.ts`
+`includeSensitive`) is recorded in `docs/reference-driven-development.md`.
+
 ---
 
 *This is the dashboard-and-companion design. With the company model (`relix-company-model.md`), the execution spine (`relix-execution-and-issue-design.md`), and this, the three docs cover the product, the engine, and the surface — all grounded in the complete Paperclip read, all ideas-only. The next concrete step is to pick the first build slice (Phase 0/1) and design its exact data shape against Relix's coordinator schema.*

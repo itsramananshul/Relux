@@ -23,6 +23,7 @@ pub mod ai;
 pub mod auth;
 pub mod builtin;
 pub mod clock;
+pub mod doctor;
 pub mod event;
 pub mod loader;
 pub mod plugin_install;

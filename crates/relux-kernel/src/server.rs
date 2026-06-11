@@ -171,6 +171,7 @@ async fn serve() -> Result<(), KernelError> {
     println!("   POST   /v1/auth/change-password            {{ \"current_password\":\"...\", \"new_password\":\"...\" }} (requires session)");
     println!("   GET    /v1/relux/health                    (public liveness; no session required)");
     println!("   GET    /v1/relux/state");
+    println!("   GET    /v1/relux/doctor                     (read-only structured diagnostics report)");
     println!("   GET    /v1/relux/ai/status");
     println!("   PUT    /v1/relux/ai/config                 {{ \"provider\":\"openrouter\", \"api_key\":\"...\", \"model\"?, \"disabled\"? }}");
     println!("   DELETE /v1/relux/ai/config                 (clear the stored AI key/config)");
@@ -371,6 +372,7 @@ fn protected_router() -> Router<AppState> {
         .route("/v1/auth/change-password", post(auth_change_password))
         // The /v1/relux control-plane API the dashboard calls on the same origin.
         .route("/v1/relux/state", get(get_state))
+        .route("/v1/relux/doctor", get(get_doctor))
         .route("/v1/relux/ai/status", get(get_ai_status))
         .route(
             "/v1/relux/ai/config",
@@ -5264,6 +5266,61 @@ async fn get_health(State(state): State<AppState>) -> Result<Json<HealthResponse
     }))
 }
 
+/// GET `/v1/relux/doctor` — a read-only, structured operator diagnostics report
+/// (`docs/relix-dashboard-design.md` §15). It reuses the SAME cheap reads as
+/// `/v1/relux/health` (store open/load, dashboard bundle, AI status, adapter +
+/// tool readiness, agent + approval counts) and turns them into severity rows via
+/// [`relux_kernel::doctor::build_doctor_report`]. No heavy work (no cargo
+/// build/test), no network, no mutation; the report carries no secrets or paths.
+async fn get_doctor(
+    State(state): State<AppState>,
+) -> Result<Json<relux_kernel::doctor::DoctorReport>, ApiError> {
+    let dashboard_bundle_present = state.dashboard_dir.is_some();
+    let ai = resolve_ai(&state).status();
+
+    // One serialized read of the store; on any open/load failure we still produce
+    // an honest report whose `kernel.store` row fails (rather than 500ing).
+    let (db_ok, adapters, tools, agent_count, pending_approvals) = {
+        let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
+        match SqliteStore::open(&state.db_path).and_then(|store| store.load()) {
+            Ok(kernel) => {
+                let tools = kernel
+                    .discover_tools(None)
+                    .into_iter()
+                    .filter(|t| !relux_kernel::is_internal_plugin(&t.plugin_id))
+                    .collect::<Vec<_>>();
+                (
+                    true,
+                    kernel.adapter_runtime_status(),
+                    tools,
+                    kernel.agent_count(),
+                    kernel.pending_approval_count(),
+                )
+            }
+            Err(_) => (false, Vec::new(), Vec::new(), 0, 0),
+        }
+    };
+
+    let generated_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let report = relux_kernel::doctor::build_doctor_report(
+        &relux_kernel::doctor::DoctorInputs {
+            db_ok,
+            dashboard_bundle_present,
+            ai: &ai,
+            adapters: &adapters,
+            tools: &tools,
+            agent_count,
+            pending_approvals,
+        },
+        generated_at,
+    );
+    Ok(Json(report))
+}
+
 /// One task, flattened for the dashboard table.
 #[derive(Debug, Serialize)]
 struct TaskRecord {
@@ -7604,6 +7661,52 @@ mod tests {
             call(&state, "GET", "/v1/relux/state", None, None).await;
         assert_eq!(state_status, StatusCode::UNAUTHORIZED);
         assert!(body.contains("\"needs_setup\":true"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn doctor_requires_a_session_and_returns_structured_checks() {
+        // Protected like /v1/relux/state: no session → 401.
+        let (gated, _g) = auth_state(false);
+        let (status, _, _) = call(&gated, "GET", "/v1/relux/doctor", None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // Dev bypass: the report is served over a bootstrapped store.
+        let (state, _dir) = auth_state(true);
+        let (status, _, body) = call(&state, "GET", "/v1/relux/doctor", None, None).await;
+        assert_eq!(status, StatusCode::OK, "got: {body}");
+        let report: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        // The expected check rows are present and the store loaded cleanly.
+        let ids: Vec<&str> = report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap())
+            .collect();
+        for want in [
+            "kernel.store",
+            "dashboard.bundle",
+            "prime.brain",
+            "adapters.real_work",
+            "plugins.tools",
+            "crew",
+            "approvals.pending",
+        ] {
+            assert!(ids.contains(&want), "missing check {want}; got {ids:?}");
+        }
+        let store_row = report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == "kernel.store")
+            .unwrap();
+        assert_eq!(store_row["severity"], "ok");
+        assert!(report["overall"].is_string());
+        assert!(report["summary"]["fail"].is_number());
+
+        // Redaction: the report never carries the on-disk db path or temp dir.
+        let db_path = state.db_path.display().to_string();
+        assert!(!body.contains(&db_path), "db path leaked into doctor report");
     }
 
     #[tokio::test]

@@ -1953,3 +1953,52 @@ create is kept for API clients and exercised by a server test, but it is advisor
 way: it can only ever produce a config the operator could have typed by hand, and it grants nothing.
 Presets are offered in **create** mode only — they seed a new member, they never silently reshape an
 existing one.
+
+---
+
+## Reference read — read-only operator Doctor report (this slice)
+
+The Home/Health readiness guide turns the live `/v1/relux` reads into an honest pass/warn/fail
+checklist *in the frontend*, but there was no deeper kernel-side diagnostic the operator could run.
+This slice adds a single, cheap, **read-only** `GET /v1/relux/doctor` endpoint: the kernel itself
+reports structured severity rows (with a message + remediation + in-app action link) from the SAME
+inexpensive reads `/v1/relux/health` already makes — no heavy work, no mutation, no path/secret leak.
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/hermes_cli/doctor.py` — `check_ok` / `check_warn` / `check_fail` /
+  `check_info` (L185-194) each emit one severity row with a `text` + `detail` string, and
+  `_fail_and_issue(text, detail, fix, issues)` (L204-207) pairs a failure with a concrete `fix`
+  remediation appended to an issues list. `run_doctor` (L337+) walks a fixed sequence of cheap
+  environment/config probes and tallies them. **Pattern: a doctor is an ordered set of cheap checks,
+  each a {severity, message} row, and a failure carries a concrete fix — not free-form prose.**
+- `reference/hermes-agent-main/hermes_cli/doctor.py` `_PROVIDER_ENV_HINTS` (L33-57) /
+  `_has_provider_env_config` — provider readiness is decided by whether auth is *configured*, not by
+  making a live call where a cheap signal suffices. Mirrors our "configured?" brain check.
+
+### Paperclip (openclaw) — files read
+
+- `reference/openclaw-main/src/gateway/server/health-state.ts` — `buildGatewaySnapshot({ includeSensitive })`
+  (L21-54): the default snapshot omits resolved filesystem paths; `configPath` / `stateDir` /
+  `authMode` are attached **only** when `includeSensitive === true` (an admin caller that already has
+  broader access). `refreshGatewayHealthSnapshot` caches the health summary rather than recomputing it
+  per request. **Pattern: a status surface defaults to NO resolved paths, and the diagnostic is a
+  cheap cached/derived read, never heavy work per call.**
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| Hermes: **a doctor is an ordered set of cheap {severity, message} rows** (`check_*`) | `crates/relux-kernel/src/doctor.rs` `build_doctor_report` returns a fixed-order `Vec<DoctorCheck>` (store → bundle → brain → real-work → tools → crew → approvals), each with a `DoctorSeverity` (`ok`/`info`/`warn`/`fail`) + secret-free `message`. |
+| Hermes: **a failure carries a concrete fix** (`_fail_and_issue`) | every non-ok row carries an optional `remediation` string + an in-app `action_link` (`/health`, `/crew`, `/plugins`, `/approvals`) — the dashboard's equivalent of the `fix`. |
+| openclaw: **default snapshot omits resolved paths; sensitive only for admins** (`includeSensitive`) | stricter, unconditional: `DoctorInputs` carries NO path at all (booleans/counts/states only), so a db path or resolved binary path can NEVER reach a check message. A redaction test feeds a path-shaped adapter `resolved_path`/`command` and asserts it is absent from the serialized report. |
+| openclaw: **cheap derived/cached read, never heavy work** (`refreshGatewayHealthSnapshot`) | `get_doctor` reuses the existing `/v1/relux/health` reads (one serialized store load + already-computed adapter/tool status); no cargo build/test, no network, no mutation. A store open/load failure still returns an honest failing `kernel.store` row instead of a 500. |
+| `readiness.ts` parity (no two-surfaces disagreement) | the severity rules mirror the frontend guide exactly: selected-but-broken brain = fail; local brain = healthy info; real-work adapter = optional info/ok; tool needing a runtime = warn. |
+
+**What we deliberately do differently:** the Doctor is **read-only and authoritative on the kernel
+side** — it computes severities in Rust from real state and the frontend renders them verbatim
+(`apps/dashboard/src/doctor.ts` only maps severity→badge and sorts rows). This is the inverse of the
+readiness guide (which derives status in the browser): the guide stays the first-run teacher; the
+Doctor is the deeper "what's broken, how to fix it" the operator runs on demand. It never executes a
+remediation — every `action_link` is a navigation to the page that fixes it, behind the existing
+session gate; nothing here mutates state or runs a tool.

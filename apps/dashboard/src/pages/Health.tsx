@@ -16,6 +16,7 @@ import {
 import { PrimeBrainPanel } from "../components/PrimeBrainPanel";
 import { buildReadiness } from "../readiness";
 import { ReadinessGuide } from "../components/ReadinessGuide";
+import { DoctorPanel } from "../components/DoctorPanel";
 
 // Relux Health / diagnostics (RELUX_MASTER_PLAN §11.9, §22). The local
 // readiness surface for the standalone product: state counts, plugin/tool/
@@ -161,6 +162,10 @@ export function Health() {
   return (
     <div className="grid">
       <ReadinessGuide report={report} loading={loading} onRefresh={reload} />
+      {/* Deeper read-only diagnostics from the kernel doctor — the actionable
+          companion to the readiness guide above (relix-dashboard-design.md §15).
+          It runs its own bounded /v1/relux/doctor read and degrades honestly. */}
+      <DoctorPanel />
       {!healthData && (
         <div className={loading ? "loading" : "empty"}>
           {loading ? "Loading health status..." : "No health data available."}

@@ -1915,6 +1915,37 @@ export interface ReluxAiStatus {
   reason: string;
 }
 
+// The read-only operator Doctor report (relix-dashboard-design.md §15). Mirrors
+// the kernel's `relux_kernel::doctor` types: structured severity rows with a
+// message and, where there is a concrete fix, a remediation line + in-app action
+// link. Carries no secrets or filesystem paths.
+export type ReluxDoctorSeverity = "ok" | "info" | "warn" | "fail";
+
+export interface ReluxDoctorCheck {
+  id: string;
+  label: string;
+  severity: ReluxDoctorSeverity;
+  message: string;
+  // Present only when there is a concrete next step.
+  remediation?: string | null;
+  // An in-app route that fixes/inspects this (e.g. "/health", "/crew").
+  action_link?: string | null;
+}
+
+export interface ReluxDoctorReport {
+  // Unix seconds the report was produced.
+  generated_at: number;
+  // The worst severity across all checks.
+  overall: ReluxDoctorSeverity;
+  summary: { ok: number; info: number; warn: number; fail: number };
+  checks: ReluxDoctorCheck[];
+}
+
+export const reluxDoctor = {
+  // Run the cheap, read-only diagnostics and return the structured report.
+  get: () => api.get<ReluxDoctorReport>("/v1/relux/doctor"),
+};
+
 export const reluxAi = {
   // Current AI configuration/status (key-free; never returns the API key).
   status: () => api.get<ReluxAiStatus>("/v1/relux/ai/status"),
