@@ -1904,6 +1904,105 @@ impl KernelState {
         result
     }
 
+    /// A manager agent revokes an explicit permission from one of its (transitive)
+    /// subordinates, authorized by a manager-subtree scope
+    /// (`agent:<manager>:subtree:revoke_permission`) it holds over its OWN Branch and
+    /// `target` actually sitting in that Branch. The **third** real subtree-authority path
+    /// (after `grant_permission` and `assign_task`) that consults `reports_to` for
+    /// *authority* — the SAME `manager_subtree_authorizes` gate, only the `action` differs.
+    ///
+    /// The revoke removes EXACTLY the stored grant through the unchanged
+    /// [`Self::revoke_permission_from_agent`] (`matches_exact` bookkeeping, audited
+    /// `agent:revoke_permission`); it NEVER pattern-expands (a `tool:<plugin>:*` scope is
+    /// only ever removed by revoking that exact scope row, not a concrete tool). If the
+    /// target does NOT hold the exact permission it is the honest
+    /// [`KernelError::PermissionNotGranted`] the operator revoke already returns (fail
+    /// closed — never a silent no-op success). Authorization is checked FIRST, so an
+    /// unauthorized manager never learns whether the target holds the permission.
+    ///
+    /// It does NOT widen the operator-console revoke ([`Self::revoke_permission_from_agent`]
+    /// stays a kernel/operator action with no actor gate). It adds a strictly *narrower*
+    /// agent-authority path: a manager can only reach operatives inside its own subtree,
+    /// only for the `revoke_permission` action it was scoped, and only while Active. An
+    /// unauthorized manager (no scope / not Active / target outside its Branch / unknown
+    /// target) is denied + audited and revokes nothing.
+    pub fn manager_revoke_permission_from_subordinate(
+        &mut self,
+        manager_id: &AgentId,
+        target_id: &AgentId,
+        permission: &Permission,
+    ) -> Result<(), KernelError> {
+        if !self.manager_subtree_authorizes(manager_id, "revoke_permission", target_id) {
+            let namespace = self.agents.get(target_id).map(|a| a.namespace_id.clone());
+            self.record_audit(
+                "agent",
+                manager_id.as_str(),
+                "agent:manager_revoke_permission",
+                Some("agent"),
+                Some(target_id.as_str()),
+                namespace.as_ref(),
+                AuditResult::Denied,
+                serde_json::json!({
+                    "permission": permission.as_str(),
+                    "reason": "manager-subtree authorization failed (not a live manager of the target's Branch)"
+                }),
+            );
+            return Err(KernelError::PermissionDenied {
+                agent: manager_id.to_string(),
+                permission: format!("agent:{}:subtree:revoke_permission", manager_id),
+            });
+        }
+        // Authorized: perform the revoke (audited as `agent:revoke_permission` inside; an
+        // unheld permission is the honest PermissionNotGranted, never a silent no-op).
+        self.revoke_permission_from_agent(target_id, permission)
+    }
+
+    /// **Per-agent-authenticated** permission revoke: the same real manager-subtree
+    /// authorization as [`Self::manager_revoke_permission_from_subordinate`], driven by a
+    /// manager that authenticated its OWN request with a per-agent access token (no
+    /// operator in the loop). The token-actor analogue of
+    /// [`Self::manager_grant_permission_to_subordinate_as_agent`] for the
+    /// `revoke_permission` action.
+    ///
+    /// `token_ref` is the **public, non-secret** token handle (`agt_<hex>`) that
+    /// authenticated the request — recorded for provenance only; the raw token is NEVER
+    /// passed here or logged. Authority is unchanged (own-Branch + `Active` +
+    /// `agent:<id>:subtree:revoke_permission` scope). On top of the inner agent-actor audit
+    /// (`agent:revoke_permission` on success / `agent:manager_revoke_permission` on a
+    /// denial) this adds one `agent:token_authenticated_manager_revoke_permission` row
+    /// (Success/Denied) marking that a per-agent token — not an operator — drove the revoke.
+    pub fn manager_revoke_permission_from_subordinate_as_agent(
+        &mut self,
+        token_ref: &str,
+        manager_id: &AgentId,
+        target_id: &AgentId,
+        permission: &Permission,
+    ) -> Result<(), KernelError> {
+        let result =
+            self.manager_revoke_permission_from_subordinate(manager_id, target_id, permission);
+        let namespace = self.agents.get(target_id).map(|a| a.namespace_id.clone());
+        self.record_audit(
+            "agent",
+            manager_id.as_str(),
+            "agent:token_authenticated_manager_revoke_permission",
+            Some("agent"),
+            Some(target_id.as_str()),
+            namespace.as_ref(),
+            if result.is_ok() {
+                AuditResult::Success
+            } else {
+                AuditResult::Denied
+            },
+            serde_json::json!({
+                "permission": permission.as_str(),
+                "auth_source": "agent_token",
+                "token_ref": token_ref,
+                "trust_boundary": "a per-agent access token authenticated the manager directly (no operator in the loop); the manager-subtree authorization was NOT bypassed",
+            }),
+        );
+        result
+    }
+
     /// Record that the operator minted a per-agent access token for `agent_id`. The
     /// token store ([`crate::agent_auth`]) lives outside the kernel (an auth-layer
     /// concern, like operator sessions), but its lifecycle is recorded in the SAME
@@ -13225,6 +13324,136 @@ mod tests {
         // A token-authenticated denial was audited.
         assert!(k.audit_log().iter().any(|e| {
             e.action == "agent:token_authenticated_manager_assign_task"
+                && e.result == AuditResult::Denied
+        }));
+    }
+
+    #[test]
+    fn agent_authenticated_manager_revoke_permission_enforces_authority_and_holding() {
+        // The third subtree action (`revoke_permission`): a manager that authenticated its
+        // OWN request via a token revokes an explicit permission from one of its Branch
+        // subordinates. Authority is the SAME `manager_subtree_authorizes` gate as the
+        // grant/assign paths; here the action is `revoke_permission` and the inner revoke
+        // removes EXACTLY the stored grant (honest PermissionNotGranted when not held).
+        let (mut k, _prime, _task, _run, _echo) = primed_kernel();
+        let ns = NamespaceId::new("workspace");
+        let adapter = PluginId::new("relux-adapter-local-prime");
+        let mk = |k: &mut KernelState, id: &str, lead: Option<AgentId>| {
+            k.create_agent_with_skills(id, id, "", &adapter, &ns, None, vec![], vec![], lead)
+                .unwrap()
+        };
+        // director <- lead <- ic ; peer reports to director (lead's sibling); outsider unrelated.
+        let director = mk(&mut k, "director", None);
+        let lead = mk(&mut k, "lead", Some(director.clone()));
+        let ic = mk(&mut k, "ic", Some(lead.clone()));
+        let peer = mk(&mut k, "peer", Some(director.clone()));
+        let outsider = mk(&mut k, "outsider", None);
+
+        // lead is scoped ONLY for revoke_permission over its own Branch.
+        let scope = Permission::new("agent:lead:subtree:revoke_permission").unwrap();
+        k.grant_permission_to_agent(&lead, scope).unwrap();
+        let perm = Permission::new("tool:relux-tools-github:create_pr").unwrap();
+        // ic and peer both hold the concrete permission (granted via the operator path).
+        k.grant_permission_to_agent(&ic, perm.clone()).unwrap();
+        k.grant_permission_to_agent(&peer, perm.clone()).unwrap();
+
+        // (1) Authorized: the token-authenticated lead revokes from its own subordinate ic.
+        k.manager_revoke_permission_from_subordinate_as_agent("agt_r1", &lead, &ic, &perm)
+            .expect("lead may revoke from its subordinate ic");
+        assert!(
+            !k.agent_holds_permission(&ic, &perm),
+            "ic should no longer hold the revoked permission"
+        );
+        // Both the inner `agent:revoke_permission` and the token-provenance row are recorded.
+        assert!(k.audit_log().iter().any(|e| {
+            e.action == "agent:revoke_permission" && e.result == AuditResult::Success
+        }));
+        let prov = k
+            .audit_log()
+            .iter()
+            .find(|e| {
+                e.action == "agent:token_authenticated_manager_revoke_permission"
+                    && e.result == AuditResult::Success
+            })
+            .expect("a token-provenance audit row");
+        assert_eq!(prov.actor_type, "agent");
+        assert_eq!(prov.actor_id, "lead");
+        assert_eq!(prov.metadata["token_ref"], "agt_r1");
+        assert_eq!(prov.metadata["auth_source"], "agent_token");
+        assert_eq!(prov.metadata["permission"], "tool:relux-tools-github:create_pr");
+
+        // (2) Sibling / ancestor / self / unrelated targets are all denied — authority is
+        // checked FIRST, so peer keeps the permission it actually holds.
+        for bad in [&peer, &director, &lead, &outsider] {
+            let err = k
+                .manager_revoke_permission_from_subordinate_as_agent("agt_r1", &lead, bad, &perm)
+                .unwrap_err();
+            assert!(
+                matches!(err, KernelError::PermissionDenied { .. }),
+                "target {bad:?} must be denied: {err:?}"
+            );
+        }
+        assert!(
+            k.agent_holds_permission(&peer, &perm),
+            "a denied revoke must not touch peer's permission"
+        );
+
+        // (3) A manager WITHOUT a revoke_permission scope is denied even over a real
+        // subordinate (director has subordinate lead but holds no subtree scope).
+        let err = k
+            .manager_revoke_permission_from_subordinate_as_agent("agt_r1", &director, &lead, &perm)
+            .unwrap_err();
+        assert!(matches!(err, KernelError::PermissionDenied { .. }), "no scope => denied: {err:?}");
+
+        // (4) Permission NOT held: after authority passes, revoking a permission ic does not
+        // hold is the honest PermissionNotGranted (the inner revoke's fail-closed contract),
+        // never a silent success.
+        let err = k
+            .manager_revoke_permission_from_subordinate_as_agent("agt_r1", &lead, &ic, &perm)
+            .unwrap_err();
+        assert!(
+            matches!(err, KernelError::PermissionNotGranted(..)),
+            "revoking an unheld permission must fail closed: {err:?}"
+        );
+
+        // (5) No pattern expansion: a `tool:<plugin>:*` scope held by ic is only revoked by
+        // revoking that exact scope row, not a concrete tool inside it.
+        let wildcard = Permission::new("tool:relux-tools-echo:*").unwrap();
+        let concrete = Permission::new("tool:relux-tools-echo:say").unwrap();
+        k.grant_permission_to_agent(&ic, wildcard.clone()).unwrap();
+        let err = k
+            .manager_revoke_permission_from_subordinate_as_agent("agt_r1", &lead, &ic, &concrete)
+            .unwrap_err();
+        assert!(
+            matches!(err, KernelError::PermissionNotGranted(..)),
+            "revoking a concrete tool ic only holds via a scope must fail closed: {err:?}"
+        );
+        assert!(
+            k.agent_holds_permission(&ic, &concrete),
+            "the scope still authorizes the concrete tool after a failed exact revoke"
+        );
+        k.manager_revoke_permission_from_subordinate_as_agent("agt_r1", &lead, &ic, &wildcard)
+            .expect("revoking the exact scope row succeeds");
+        assert!(!k.agent_holds_permission(&ic, &concrete));
+
+        // (6) Liveness: a paused manager wields no subtree authority. Re-grant a live
+        // permission to ic, pause lead, and confirm the revoke is denied on authority
+        // (checked before holding) — ic keeps the permission.
+        k.grant_permission_to_agent(&ic, perm.clone()).unwrap();
+        k.update_agent(&lead, None, None, None, None, Some(AgentStatus::Paused))
+            .unwrap();
+        let err = k
+            .manager_revoke_permission_from_subordinate_as_agent("agt_r1", &lead, &ic, &perm)
+            .unwrap_err();
+        assert!(matches!(err, KernelError::PermissionDenied { .. }), "paused manager denied: {err:?}");
+        assert!(
+            k.agent_holds_permission(&ic, &perm),
+            "a paused manager's denied revoke must not touch ic's permission"
+        );
+
+        // A token-authenticated denial was audited.
+        assert!(k.audit_log().iter().any(|e| {
+            e.action == "agent:token_authenticated_manager_revoke_permission"
                 && e.result == AuditResult::Denied
         }));
     }

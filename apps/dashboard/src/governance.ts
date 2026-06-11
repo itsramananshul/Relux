@@ -231,18 +231,20 @@ export function managerGrantAvailability(
 //
 // A per-agent access token authenticates a request AS its subject on the tiny agent-self
 // route subset (`/v1/relux/agents/me/*`) and NOTHING else — it never touches the operator
-// console. Two manager-subtree actions are reachable today, each requiring the matching
+// console. Three manager-subtree actions are reachable today, each requiring the matching
 // `agent:<manager-id>:subtree:<action>` scope on the acting manager (own-Branch + Active):
 //   - `manager-grant`  → `POST /v1/relux/agents/me/manager-grant`  (grant_permission)
 //   - `assign-task`    → `POST /v1/relux/agents/me/assign-task`    (assign_task)
+//   - `manager-revoke` → `POST /v1/relux/agents/me/manager-revoke` (revoke_permission)
 // These helpers build copy-paste snippets and validate the local test form. The raw token
 // is NEVER inlined into a snippet (it is referenced as a shell variable) and is never
 // stored — only the operator who just minted it (copy-once) can paste it.
-// docs/HERMES_OPENCLAW_DEEP_AUDIT.md §20 / §21.
+// docs/HERMES_OPENCLAW_DEEP_AUDIT.md §20 / §21 / §22.
 
 /** The agent-self manager-action routes a per-agent token unlocks (the ONLY routes it reaches). */
 export const AGENT_SELF_MANAGER_GRANT_ROUTE = "/v1/relux/agents/me/manager-grant";
 export const AGENT_SELF_ASSIGN_TASK_ROUTE = "/v1/relux/agents/me/assign-task";
+export const AGENT_SELF_MANAGER_REVOKE_ROUTE = "/v1/relux/agents/me/manager-revoke";
 
 // The raw per-agent token shape (`relux_agt_<hex>`), mirrored from
 // `crates/relux-kernel/src/agent_auth.rs`. Used only to reject an obviously-wrong paste
@@ -298,6 +300,23 @@ export function managerGrantFormReason(
 }
 
 /**
+ * Honest reason the token-authenticated manager-revoke test form is not ready to submit,
+ * or null when every field is present and well-shaped. The sibling of
+ * `managerGrantFormReason` for the `revoke_permission` action: same token-shape + target +
+ * capability-grammar checks. A UI gate only — the kernel re-checks own-Branch + Active +
+ * the `agent:<id>:subtree:revoke_permission` scope, removes EXACTLY the stored grant, and
+ * 404s an unheld permission; it never widens anything.
+ */
+export function managerRevokeFormReason(
+  token: string,
+  targetAgentId: string,
+  permission: string,
+): string | null {
+  // Identical field discipline to the grant form (token shape, target, permission grammar).
+  return managerGrantFormReason(token, targetAgentId, permission);
+}
+
+/**
  * A copy-paste curl snippet for the token-authenticated assign-task call. The token is
  * referenced as the `$RELUX_AGENT_TOKEN` shell variable and is NEVER embedded, so the
  * snippet carries no secret and is safe to display/copy. Blank ids fall back to angle-
@@ -323,6 +342,22 @@ export function managerGrantCurlSnippet(targetAgentId: string, permission: strin
   const p = permission.trim() || "<permission>";
   return [
     `curl -sS -X POST http://127.0.0.1:19891${AGENT_SELF_MANAGER_GRANT_ROUTE} \\`,
+    `  -H "Authorization: Bearer $RELUX_AGENT_TOKEN" \\`,
+    `  -H "content-type: application/json" \\`,
+    `  -d '{"target_id":"${a}","permission":"${p}"}'`,
+  ].join("\n");
+}
+
+/**
+ * A copy-paste curl snippet for the token-authenticated manager-revoke call (the third
+ * action). Same no-secret discipline: the token is the `$RELUX_AGENT_TOKEN` variable, and
+ * the body carries only the target + the exact permission to revoke.
+ */
+export function managerRevokeCurlSnippet(targetAgentId: string, permission: string): string {
+  const a = targetAgentId.trim() || "<target_agent_id>";
+  const p = permission.trim() || "<permission>";
+  return [
+    `curl -sS -X POST http://127.0.0.1:19891${AGENT_SELF_MANAGER_REVOKE_ROUTE} \\`,
     `  -H "Authorization: Bearer $RELUX_AGENT_TOKEN" \\`,
     `  -H "content-type: application/json" \\`,
     `  -d '{"target_id":"${a}","permission":"${p}"}'`,

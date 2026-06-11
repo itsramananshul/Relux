@@ -5,6 +5,7 @@ import {
   reluxAdapters,
   agentSelfAssignTask,
   agentSelfManagerGrant,
+  agentSelfManagerRevoke,
   type ReluxAgent,
   type ReluxAgentConfig,
   type ReluxAgentPermissions,
@@ -25,10 +26,13 @@ import {
   parseTokenTtlSecs,
   assignTaskFormReason,
   managerGrantFormReason,
+  managerRevokeFormReason,
   assignTaskCurlSnippet,
   managerGrantCurlSnippet,
+  managerRevokeCurlSnippet,
   AGENT_SELF_ASSIGN_TASK_ROUTE,
   AGENT_SELF_MANAGER_GRANT_ROUTE,
+  AGENT_SELF_MANAGER_REVOKE_ROUTE,
   type ManagerGrantAgent,
 } from "../governance";
 import { parseSkillsInput, formatSkillsInput } from "../skills";
@@ -937,17 +941,17 @@ function AgentTokenPanel({ agentId }: { agentId: string }) {
 }
 
 // A compact, HONEST manager-actions panel for the per-agent token path. It documents the
-// two agent-self routes a token unlocks (`manager-grant` / `assign-task`), shows copy-paste
-// curl snippets that embed NO secret (the token is the `$RELUX_AGENT_TOKEN` shell var), and
-// offers a local test form for EACH action (`assign-task` and `manager-grant`). Both forms
+// three agent-self routes a token unlocks (`manager-grant` / `assign-task` /
+// `manager-revoke`), shows copy-paste curl snippets that embed NO secret (the token is the
+// `$RELUX_AGENT_TOKEN` shell var), and offers a local test form for EACH action. The forms
 // require the operator to PASTE the raw token deliberately — the dashboard cannot reuse a
 // minted token (only its hash is stored, copy-once), so it never fakes the credential, and
-// each drives the bearer path (`agentSelfAssignTask` / `agentSelfManagerGrant`,
-// `credentials: "omit"`) so the operator session is NOT used to bypass the token. The acting
-// manager is always the token subject; the kernel re-checks own-Branch + Active + the
-// matching `agent:<id>:subtree:<action>` scope. Each form keeps its OWN pasted token and
-// clears it the moment the request returns.
-// docs/HERMES_OPENCLAW_DEEP_AUDIT.md §19 / §20 / §21.
+// each drives the bearer path (`agentSelfAssignTask` / `agentSelfManagerGrant` /
+// `agentSelfManagerRevoke`, `credentials: "omit"`) so the operator session is NOT used to
+// bypass the token. The acting manager is always the token subject; the kernel re-checks
+// own-Branch + Active + the matching `agent:<id>:subtree:<action>` scope. Each form keeps its
+// OWN pasted token and clears it the moment the request returns.
+// docs/HERMES_OPENCLAW_DEEP_AUDIT.md §19 / §20 / §21 / §22.
 export function ManagerTokenActionsPanel({
   agentId,
   targets,
@@ -976,11 +980,24 @@ export function ManagerTokenActionsPanel({
   const [grantResult, setGrantResult] = useState<ReluxAgentPermissions | null>(null);
   const [grantSnippetCopied, setGrantSnippetCopied] = useState(false);
 
+  // manager-revoke form state (its own token + fields, same copy-once discipline).
+  const [revokeOpen, setRevokeOpen] = useState(false);
+  const [revokeToken, setRevokeToken] = useState("");
+  const [revokeTarget, setRevokeTarget] = useState("");
+  const [revokePermission, setRevokePermission] = useState("");
+  const [revokeBusy, setRevokeBusy] = useState(false);
+  const [revokeError, setRevokeError] = useState<string | null>(null);
+  const [revokeResult, setRevokeResult] = useState<ReluxAgentPermissions | null>(null);
+  const [revokeSnippetCopied, setRevokeSnippetCopied] = useState(false);
+
   const notReady = assignTaskFormReason(token, taskId, target);
   const snippet = assignTaskCurlSnippet(taskId, target);
 
   const grantNotReady = managerGrantFormReason(grantToken, grantTarget, permission);
   const grantSnippet = managerGrantCurlSnippet(grantTarget, permission);
+
+  const revokeNotReady = managerRevokeFormReason(revokeToken, revokeTarget, revokePermission);
+  const revokeSnippet = managerRevokeCurlSnippet(revokeTarget, revokePermission);
 
   async function copySnippet() {
     try {
@@ -997,6 +1014,15 @@ export function ManagerTokenActionsPanel({
       setGrantSnippetCopied(true);
     } catch {
       setGrantSnippetCopied(false);
+    }
+  }
+
+  async function copyRevokeSnippet() {
+    try {
+      await navigator.clipboard.writeText(revokeSnippet);
+      setRevokeSnippetCopied(true);
+    } catch {
+      setRevokeSnippetCopied(false);
     }
   }
 
@@ -1047,6 +1073,31 @@ export function ManagerTokenActionsPanel({
     }
   }
 
+  async function runRevoke() {
+    const reason = managerRevokeFormReason(revokeToken, revokeTarget, revokePermission);
+    if (reason) {
+      setRevokeError(reason);
+      return;
+    }
+    setRevokeBusy(true);
+    setRevokeError(null);
+    setRevokeResult(null);
+    try {
+      const updated = await agentSelfManagerRevoke(
+        revokeToken.trim(),
+        revokeTarget.trim(),
+        revokePermission.trim(),
+      );
+      setRevokeResult(updated);
+      // Same copy-once discipline — clear the pasted token immediately.
+      setRevokeToken("");
+    } catch (e) {
+      setRevokeError(e instanceof Error ? e.message : "Revoke failed.");
+    } finally {
+      setRevokeBusy(false);
+    }
+  }
+
   return (
     <div
       className="manager-token-actions-panel"
@@ -1067,6 +1118,10 @@ export function ManagerTokenActionsPanel({
         <li>
           <span className="mono">POST {AGENT_SELF_ASSIGN_TASK_ROUTE}</span> — assign a live task to
           a Branch operative (<span className="mono">assign_task</span>).
+        </li>
+        <li>
+          <span className="mono">POST {AGENT_SELF_MANAGER_REVOKE_ROUTE}</span> — revoke an explicit
+          permission from a Branch operative (<span className="mono">revoke_permission</span>).
         </li>
       </ul>
       <p className="muted" style={{ fontSize: 11, marginTop: 0 }}>
@@ -1304,6 +1359,125 @@ export function ManagerTokenActionsPanel({
             }}
           >
             {grantSnippet}
+          </pre>
+        </div>
+      </details>
+
+      <details
+        open={revokeOpen}
+        onToggle={(e) => setRevokeOpen((e.currentTarget as HTMLDetailsElement).open)}
+        style={{ marginTop: 6 }}
+      >
+        <summary style={{ cursor: "pointer", fontSize: 12 }}>
+          Test <span className="mono">manager-revoke</span> with a token
+        </summary>
+
+        <div className="form-group" style={{ marginTop: 8 }}>
+          <label htmlFor={`mta-${agentId}-revoke-token`}>Raw agent token (paste once):</label>
+          <input
+            id={`mta-${agentId}-revoke-token`}
+            type="password"
+            autoComplete="off"
+            value={revokeToken}
+            onChange={(e) => setRevokeToken(e.target.value)}
+            placeholder="relux_agt_…"
+            style={{ width: "100%" }}
+          />
+        </div>
+        <div className="form-group" style={{ marginTop: 6 }}>
+          <label htmlFor={`mta-${agentId}-revoke-target`}>Target subordinate id:</label>
+          {targets.length > 0 ? (
+            <select
+              id={`mta-${agentId}-revoke-target`}
+              value={revokeTarget}
+              onChange={(e) => setRevokeTarget(e.target.value)}
+              style={{ width: "100%" }}
+            >
+              <option value="">— choose a Branch operative —</option>
+              {targets.map((id) => (
+                <option key={id} value={id}>{id}</option>
+              ))}
+            </select>
+          ) : (
+            <input
+              id={`mta-${agentId}-revoke-target`}
+              type="text"
+              className="mono"
+              value={revokeTarget}
+              onChange={(e) => setRevokeTarget(e.target.value)}
+              placeholder="a subordinate in this agent's Branch"
+              style={{ width: "100%" }}
+            />
+          )}
+        </div>
+        <div className="form-group" style={{ marginTop: 6 }}>
+          <label htmlFor={`mta-${agentId}-revoke-permission`}>Permission to revoke (exact):</label>
+          <input
+            id={`mta-${agentId}-revoke-permission`}
+            type="text"
+            className="mono"
+            value={revokePermission}
+            onChange={(e) => setRevokePermission(e.target.value)}
+            placeholder="e.g. tool:relux-tools-echo:say"
+            style={{ width: "100%" }}
+          />
+        </div>
+
+        {revokeError && <div className="error-message">{revokeError}</div>}
+        {revokeResult && (
+          <div
+            className="revoke-result"
+            style={{ margin: "6px 0", fontSize: 12, color: "var(--ok, #2aa198)" }}
+          >
+            Revoked from <span className="mono">{revokeResult.agent_id}</span> · now holds{" "}
+            <span className="mono">{revokeResult.permissions.length}</span> explicit permission
+            {revokeResult.permissions.length === 1 ? "" : "s"}.
+          </div>
+        )}
+
+        <button
+          type="button"
+          className="btn sm"
+          onClick={() => void runRevoke()}
+          disabled={revokeBusy || !!revokeNotReady}
+          style={{ marginTop: 4 }}
+        >
+          {revokeBusy ? "…" : "Revoke as manager (token)"}
+        </button>
+        {revokeNotReady && (
+          <p className="muted" style={{ fontSize: 11, marginTop: 2 }}>{revokeNotReady}</p>
+        )}
+
+        <p className="muted" style={{ fontSize: 11, marginTop: 8 }}>
+          The <strong>token subject</strong> is the acting manager — the kernel reads it from
+          the bearer token, never the form — and re-checks own Branch · live ·{" "}
+          <span className="mono">agent:{agentId}:subtree:revoke_permission</span>. It removes the{" "}
+          <strong>exact</strong> stored permission only (no pattern expansion); a permission the
+          operative does not hold is an honest 404.
+        </p>
+
+        <div style={{ marginTop: 6 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span className="muted" style={{ fontSize: 11 }}>
+              Or call it yourself (no secret in this snippet):
+            </span>
+            <button type="button" className="btn ghost sm" onClick={() => void copyRevokeSnippet()}>
+              {revokeSnippetCopied ? "Copied" : "Copy curl"}
+            </button>
+          </div>
+          <pre
+            className="mono"
+            style={{
+              fontSize: 11,
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-all",
+              background: "var(--code-bg, #111)",
+              padding: 8,
+              borderRadius: 4,
+              marginTop: 4,
+            }}
+          >
+            {revokeSnippet}
           </pre>
         </div>
       </details>

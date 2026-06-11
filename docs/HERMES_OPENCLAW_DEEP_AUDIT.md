@@ -283,7 +283,8 @@ safe (adds no authority), bounded, feasible in one commit, and reuses existing v
   *live* manager grant a permission to an operative inside its OWN Branch (and only there). **Still
   missing**: budgets/spend enforcement (runs record `cost`/`usage` but nothing enforces a ceiling), the
   *broader* scope vocabulary (project / namespace scopes; more subtree *actions* — `grant_permission`
-  SHIPPED §19/§20, `assign_task` SHIPPED §21, others e.g. `revoke` still open).
+  SHIPPED §19/§20, `assign_task` SHIPPED §21, `revoke_permission` SHIPPED §22, others e.g. status
+  changes still open).
   The **agent-actor surface that invokes the manager-grant path now exists** (SHIPPED — see §20: a
   per-agent access token authenticates the manager directly on `POST /v1/relux/agents/me/manager-grant`,
   no operator in the loop); the operator-assisted HTTP/UI path (§19) remains as the operator-console
@@ -955,9 +956,10 @@ section for the full reference read + applied-change record. In brief:
   grant without an operator in the loop) **SHIPPED in §20** (a bounded per-agent access token authenticates
   the manager directly on `POST /v1/relux/agents/me/manager-grant`). The operator-assisted path above
   remains as the operator-console affordance. The **second** subtree action, `assign_task`, **SHIPPED in §21**
-  (`POST /v1/relux/agents/me/assign-task`). Still open: more subtree *actions* than `grant_permission` /
-  `assign_task` (e.g. revoke), project / namespace scopes, governed budgets, persistent `allow-always`
-  grants, agent-driven token enrollment, and Board-style oversight.
+  (`POST /v1/relux/agents/me/assign-task`); the **third**, `revoke_permission`, **SHIPPED in §22**
+  (`POST /v1/relux/agents/me/manager-revoke`). Still open: more subtree *actions* than `grant_permission` /
+  `assign_task` / `revoke_permission` (e.g. status changes), project / namespace scopes, governed budgets,
+  persistent `allow-always` grants, agent-driven token enrollment, and Board-style oversight.
 
 ---
 
@@ -1170,11 +1172,109 @@ section for the full reference read + applied-change record. In brief:
   `relux_agt_<chars>` token in the markup**) and asserts the committed bundle carries both panel buttons (no
   stale dist). Dashboard typecheck + tests (305) + bundle rebuild green.
 
-- **Still missing (honest).** More subtree *actions* still open (`revoke`, status changes, …); agent-driven
-  token enrollment/rotation; project / namespace scopes; governed budgets; persistent `allow-always` grants;
-  a richer agent self-service surface; a *full* manager console (Board-style oversight, live task pickers) —
-  the §21 UI now exercises BOTH token-authenticated routes (assign-task + manager-grant) from compact honest
-  test affordances, but it is still not a Board-style console; that oversight surface remains open.
+- **Still missing (honest).** More subtree *actions* still open (`revoke_permission` SHIPPED §22; status
+  changes, … still open); agent-driven token enrollment/rotation; project / namespace scopes; governed
+  budgets; persistent `allow-always` grants; a richer agent self-service surface; a *full* manager console
+  (Board-style oversight, live task pickers) — the §21 UI now exercises BOTH token-authenticated routes
+  (assign-task + manager-grant) from compact honest test affordances, but it is still not a Board-style
+  console; that oversight surface remains open.
+
+## 22. Implemented this round — a third manager-subtree action: token-authenticated `revoke_permission` (§21 follow-up / §5 P1)
+
+- **Reference read (BINDING).** Same target as §21 — Paperclip's `principal_permission_grants` with scope =
+  `managerAgentId-subtree`, resolved by `authorization.ts` `scopeAllows` + `agentIsInSubtree` — only here the
+  `permissionKey` is the **revoke** capability rather than grant/assign. A manager's authority over its Branch
+  stays *per-action*: the same bounded `reportsTo` walk, a distinct action segment. Per-agent-actor attribution
+  is `references/paperclip/server/src/middleware/auth.ts` (`req.actor = { type: "agent", agentId: claims.sub }`,
+  the actor read from the verified token subject, never the body). Narrow-by-default discipline stays grounded
+  in **vendored** OpenClaw `reference/openclaw-main/src/acp/session-lineage-meta.ts`
+  (`subagentControlScope: "children" | "none"`) and `reference/openclaw-main/src/acp/permission-relay.ts`
+  (deny-by-default). Relux files read/mapped: `crates/relux-core/src/permission.rs` (the
+  `manager_subtree_authorizes` matcher is action-generic), `crates/relux-core/src/hierarchy.rs`
+  (`is_in_subtree`), `crates/relux-kernel/src/state.rs` (`manager_subtree_authorizes` chokepoint, the existing
+  `revoke_permission_from_agent` primitive, the §19/§20/§21 manager primitives the new pair mirrors),
+  `crates/relux-kernel/src/agent_auth.rs` (the per-agent token identity), `crates/relux-kernel/src/server.rs`
+  (the `agent_router` bearer surface + the §20/§21 `agent_self_*` handlers), `crates/relux-kernel/src/lib.rs`
+  (`KernelError`).
+
+- **No new grammar.** The manager-subtree scope grammar (`agent:<manager-id>:subtree:<action>`) is
+  **action-generic**, so `agent:<id>:subtree:revoke_permission` parses/stores/revokes exactly like
+  `…:grant_permission` / `…:assign_task` with **zero** change to `permission.rs`. A `…:revoke_permission`
+  scope authorizes ONLY `revoke_permission` — no cross-action bleed (pinned by
+  `permission.rs::subtree_grant_action_is_exact_and_generic_over_the_action_name`).
+
+- **Enforcement (the third real subtree-authority path).**
+  `KernelState::manager_revoke_permission_from_subordinate(manager, target, permission)` consults `reports_to`
+  for *authority* through the SAME chokepoint `manager_subtree_authorizes(manager, "revoke_permission",
+  target)` — own-Branch + **Active** manager + the exact `agent:<manager>:subtree:revoke_permission` scope.
+  Authorization is checked **first** (an unauthorized manager never learns whether the target holds the
+  permission). On success it revokes through the unchanged `revoke_permission_from_agent` (audited
+  `agent:revoke_permission`). It does **not** widen the operator-console revoke
+  (`DELETE /v1/relux/agents/:id/permissions`) — it is a strictly *narrower* agent-authority path.
+
+- **Revoke semantics (exact-only, fail-closed).** The revoke removes EXACTLY the stored grant via
+  `matches_exact` — **no pattern expansion** (a `tool:<plugin>:*` scope is only ever removed by revoking that
+  exact scope row, never a concrete tool inside it). If the target does NOT hold the exact permission it is the
+  honest `KernelError::PermissionNotGranted` → **404** the operator revoke already returns (never a silent
+  no-op success). An unauthorized manager / unknown-or-out-of-Branch target is a **403** that revokes nothing;
+  a malformed permission is a **400**. Every denial is audited.
+
+- **Per-agent-authenticated surface.** `POST /v1/relux/agents/me/manager-revoke` (body `{ "target_id",
+  "permission" }`) rides the §20 `require_agent_token` bearer middleware on the tiny `agent_router` allowlist.
+  The acting manager is **always the token subject** (`AgentTokenIdentity.agent_id`), read from the validated
+  token and NEVER from the body, so a token can only ever revoke *as itself*. The handler calls
+  `KernelState::manager_revoke_permission_from_subordinate_as_agent(token_ref, manager, target, permission)`,
+  which drives the unchanged authority gate and adds one `agent:token_authenticated_manager_revoke_permission`
+  audit row (Success/Denied) carrying the **public** `token_ref` (the raw token never reaches the kernel or any
+  log). An agent token is **never** accepted on an operator route, and the new route is itself bearer-gated
+  (401 without a token, pinned in the HTTP test). On success it returns the **target's** updated explicit
+  permission list.
+
+- **HONEST trust boundary (unchanged from §20/§21).** This adds a third *action* to the per-agent-authenticated
+  manager surface; it grants no new authority shape. The token is operator-MINTED (an agent cannot enrol
+  itself), opaque-hashed (not a JWT), loopback-only, single-operator. Authority is still own-Branch + Active +
+  the exact scope; the only change is that a manager may now exercise **revocation** over its Branch, each
+  scoped and individually revocable as its own capability row.
+
+- **UI (SHIPPED).** The Crew `ManagerTokenActionsPanel` (`apps/dashboard/src/pages/Crew.tsx`) gains a third
+  compact collapsible **Test `manager-revoke` with a token** form alongside the §21 assign-task + manager-grant
+  forms (and the panel header `<ul>` now documents all three routes). The revoke form mirrors the grant form: a
+  `type="password"` paste-once token field of its own, a Branch target picker, an **exact** permission input
+  validated against the same backend grammar (`managerRevokeFormReason` → `permissionInvalidReason`), and a
+  no-secret `$RELUX_AGENT_TOKEN` curl snippet (`managerRevokeCurlSnippet`). It drives the bearer helper
+  `agentSelfManagerRevoke(token, target_id, permission)` (`apps/dashboard/src/api.ts`) with
+  `Authorization: Bearer <token>` + **`credentials: "omit"`** so the operator cookie plays no part; a 404
+  (unheld permission) / 403 (no authority) throws an honest `ApiError` WITHOUT firing the session-expired
+  signal. The trust-boundary copy spells out the token subject is the acting manager and the revoke is
+  exact-only (no pattern expansion; a 404 if not held). Pure helpers live in
+  `apps/dashboard/src/governance.ts` (`managerRevokeFormReason`, `managerRevokeCurlSnippet`,
+  `AGENT_SELF_MANAGER_REVOKE_ROUTE`). The panel never widens authority — it is a thin client over the
+  documented route; the kernel remains the sole authority.
+
+- **Tests.** `state.rs::agent_authenticated_manager_revoke_permission_enforces_authority_and_holding`: a
+  token-auth lead revokes a held permission from its subordinate (target loses it, `agent:revoke_permission` +
+  token-provenance audit with the public handle); sibling / ancestor / self / unrelated all denied (the
+  sibling keeps its permission — authority checked first); a no-scope manager denied; an unheld permission is
+  `PermissionNotGranted`; a `tool:<plugin>:*` scope is only removed by the exact scope row (no pattern
+  expansion); a paused manager wields no authority; the token-authenticated denial is audited.
+  `server.rs::agent_token_manager_revoke_permission_over_http`: the end-to-end HTTP path — no-bearer 401,
+  self-revoke success (200, permission gone), sibling/ancestor/self/unrelated 403, no-scope manager 403,
+  unknown target 403, unheld permission 404, malformed permission 400, paused manager 403, and the
+  `agent:token_authenticated_manager_revoke_permission` + inner `agent:revoke_permission` audit rows present
+  with the raw token absent. Full `relux-core` + `relux-kernel` lib + bin/server suites green; clippy clean on
+  both crates. **Frontend:** `governance.test.ts` pins `managerRevokeFormReason` and the revoke curl snippet
+  (real route + body field names, `$RELUX_AGENT_TOKEN` var only). `manager-token-actions.test.ts` pins the
+  `agentSelfManagerRevoke` request shape (`POST` agent-self route, `credentials: "omit"`, `Bearer` header,
+  body of only `{target_id,permission}`) and that a 404 throws an `ApiError` WITHOUT firing the session-expired
+  signal. `manager-token-actions-render.test.mjs` server-renders the panel (all three routes documented, the
+  revoke form's exact-permission field + revoke_permission scope + exact-only trust-boundary note, **no raw
+  `relux_agt_<chars>` token in the markup**) and asserts the committed bundle carries all three panel buttons.
+  Dashboard typecheck + tests (309) + bundle rebuild green.
+
+- **Still missing (honest).** More subtree *actions* still open (status changes, …); agent-driven token
+  enrollment/rotation; project / namespace scopes; governed budgets; persistent `allow-always` grants; a
+  *full* manager console (Board-style oversight, live task pickers) — the panel now exercises all three
+  token-authenticated routes from compact honest test affordances, but it is still not a Board-style console.
 
 ---
 

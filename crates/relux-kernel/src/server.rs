@@ -539,6 +539,7 @@ fn agent_router() -> Router<AppState> {
         .route("/v1/relux/agents/me", get(agent_self_info))
         .route("/v1/relux/agents/me/manager-grant", post(agent_self_manager_grant))
         .route("/v1/relux/agents/me/assign-task", post(agent_self_assign_task))
+        .route("/v1/relux/agents/me/manager-revoke", post(agent_self_manager_revoke))
 }
 
 /// Whether the dev/test auth bypass is requested via `RELUX_AUTH_DISABLED`.
@@ -1934,6 +1935,56 @@ async fn agent_self_assign_task(
             .ok_or_else(|| KernelError::UnknownTask(task_id.to_string()))?;
         let agent = task.assigned_agent.as_ref().and_then(|id| kernel.agent(id));
         Ok(task_record(task, agent))
+    })?;
+    Ok(Json(updated))
+}
+
+#[derive(Debug, Deserialize)]
+struct ManagerRevokeReq {
+    target_id: String,
+    permission: String,
+}
+
+/// `POST /v1/relux/agents/me/manager-revoke` — the **per-agent-authenticated**
+/// manager-subtree permission revoke (the §22 follow-up that adds a third subtree action
+/// beyond `grant_permission` and `assign_task`). The manager that authenticated the
+/// request with its own token revokes an explicit permission from one of its own-Branch
+/// subordinates, with NO operator in the loop. The acting manager is the token subject —
+/// inferred from the validated token, NOT from the request body — so a token can only ever
+/// revoke as itself.
+///
+/// Authority is the same gate as the manager-grant/assign paths: own-Branch + Active +
+/// `agent:<id>:subtree:revoke_permission` scope. An unauthorized manager (no scope / not
+/// Active / target outside its Branch / unknown target) → 403, revoking nothing. A
+/// malformed permission → 400. The revoke removes EXACTLY the stored grant (no pattern
+/// expansion); if the target does not hold it, that is the honest `PermissionNotGranted`
+/// → 404 the operator revoke already returns. On success it returns the **target's**
+/// updated explicit permission list.
+async fn agent_self_manager_revoke(
+    State(state): State<AppState>,
+    axum::Extension(identity): axum::Extension<relux_kernel::AgentTokenIdentity>,
+    Json(req): Json<ManagerRevokeReq>,
+) -> Result<Json<AgentPermissionsRecord>, ApiError> {
+    let manager_id = relux_core::AgentId::new(identity.agent_id.clone());
+    let target_id = relux_core::AgentId::new(req.target_id);
+    let permission = relux_core::Permission::new(&req.permission)
+        .map_err(|e| ApiError::bad_request(format!("invalid permission string: {e}")))?;
+    let token_ref = identity.token_id.clone();
+
+    let updated = locked_save(&state, |kernel| {
+        kernel.manager_revoke_permission_from_subordinate_as_agent(
+            &token_ref,
+            &manager_id,
+            &target_id,
+            &permission,
+        )?;
+        let agent = kernel
+            .agent(&target_id)
+            .ok_or_else(|| KernelError::UnknownAgent(target_id.to_string()))?;
+        Ok(AgentPermissionsRecord {
+            agent_id: agent.id.to_string(),
+            permissions: agent.permissions.iter().map(|p| p.to_string()).collect(),
+        })
     })?;
     Ok(Json(updated))
 }
@@ -8895,6 +8946,169 @@ mod tests {
             "token-authenticated assign audit missing: {audit}"
         );
         assert!(audit.contains("task:assign"), "inner task:assign audit missing: {audit}");
+        assert!(!audit.contains(&lead_tok), "raw token leaked into audit: {audit}");
+    }
+
+    /// End-to-end HTTP for the per-agent-authenticated manager-subtree permission REVOKE
+    /// (`POST /v1/relux/agents/me/manager-revoke`). Exercises the real authority gate (the
+    /// acting manager is the token subject, never the body) + the exact-match holding rule,
+    /// and confirms success/denials are audited under
+    /// `agent:token_authenticated_manager_revoke_permission`.
+    #[tokio::test]
+    async fn agent_token_manager_revoke_permission_over_http() {
+        let (state, _dir) = auth_state(true);
+
+        // Topology: director <- lead <- ic ; peer <- director (lead's sibling); outsider unrelated.
+        for (id, reports_to) in [
+            ("director", None),
+            ("lead", Some("director")),
+            ("ic", Some("lead")),
+            ("peer", Some("director")),
+            ("outsider", None),
+        ] {
+            let body = match reports_to {
+                Some(r) => format!(r#"{{"id":"{id}","name":"{id}","reports_to":"{r}"}}"#),
+                None => format!(r#"{{"id":"{id}","name":"{id}"}}"#),
+            };
+            let (status, _, b) = call(&state, "POST", "/v1/relux/agents", None, Some(&body)).await;
+            assert_eq!(status, StatusCode::OK, "create {id} failed: {b}");
+        }
+        // Scope the lead ONLY for the revoke_permission subtree action.
+        let (status, _, _) = call(
+            &state,
+            "POST",
+            "/v1/relux/agents/lead/permissions",
+            None,
+            Some(r#"{"permission":"agent:lead:subtree:revoke_permission"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // ic and peer both hold a concrete permission (granted via the operator path).
+        for who in ["ic", "peer"] {
+            let (status, _, _) = call(
+                &state,
+                "POST",
+                &format!("/v1/relux/agents/{who}/permissions"),
+                None,
+                Some(r#"{"permission":"tool:relux-tools-github:create_pr"}"#),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "grant to {who} failed");
+        }
+
+        // Mint a token for the lead and one for the director (who has a subordinate but no scope).
+        let mint = |id: &str| {
+            let st = state.clone();
+            let id = id.to_string();
+            async move {
+                let (s, b) =
+                    call_bearer(&st, "POST", &format!("/v1/relux/agents/{id}/tokens"), None, Some("{}")).await;
+                assert_eq!(s, StatusCode::OK, "mint {id} failed: {b}");
+                let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+                v["token"].as_str().unwrap().to_string()
+            }
+        };
+        let lead_tok = mint("lead").await;
+        let director_tok = mint("director").await;
+
+        let revoke = |tok: &str, target: &str, perm: &str| {
+            let st = state.clone();
+            let (tok, target, perm) = (tok.to_string(), target.to_string(), perm.to_string());
+            async move {
+                call_bearer(
+                    &st,
+                    "POST",
+                    "/v1/relux/agents/me/manager-revoke",
+                    Some(&tok),
+                    Some(&format!(r#"{{"target_id":"{target}","permission":"{perm}"}}"#)),
+                )
+                .await
+            }
+        };
+        let github_pr = "tool:relux-tools-github:create_pr";
+
+        // (0) NO BEARER: the agent-self route is bearer-gated — without a token it is 401.
+        let (status, _) = call_bearer(
+            &state,
+            "POST",
+            "/v1/relux/agents/me/manager-revoke",
+            None,
+            Some(&format!(r#"{{"target_id":"ic","permission":"{github_pr}"}}"#)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "manager-revoke must require a bearer token");
+
+        // (1) SUCCESS: the lead revokes the permission from its subordinate ic.
+        let (status, b) = revoke(&lead_tok, "ic", github_pr).await;
+        assert_eq!(status, StatusCode::OK, "self manager-revoke failed: {b}");
+        assert!(!b.contains(github_pr), "ic should no longer hold the permission: {b}");
+
+        // (2) DENIALS: sibling / ancestor / self / unrelated targets are all 403. The
+        // sibling `peer` still holds the permission — a denied revoke mutates nothing.
+        for bad in ["peer", "director", "lead", "outsider"] {
+            let (status, _) = revoke(&lead_tok, bad, github_pr).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "target {bad} must be denied");
+        }
+
+        // (3) NO SCOPE: the director holds no subtree scope — denied even over subordinate lead.
+        let (status, _) = revoke(&director_tok, "lead", github_pr).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "manager without scope must be denied");
+
+        // (4) INVALID TARGET: an unknown target folds into the fail-closed authority check → 403.
+        let (status, _) = revoke(&lead_tok, "ghost", github_pr).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "unknown target must be denied");
+
+        // (5) PERMISSION NOT HELD: after authority passes, revoking a permission ic does not
+        // hold is the honest PermissionNotGranted → 404 (the operator revoke's contract).
+        let (status, _) = revoke(&lead_tok, "ic", github_pr).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "revoking an unheld permission must be a 404");
+
+        // (6) MALFORMED permission → 400 before any authority check.
+        let (status, _) = call_bearer(
+            &state,
+            "POST",
+            "/v1/relux/agents/me/manager-revoke",
+            Some(&lead_tok),
+            Some(r#"{"target_id":"ic","permission":"not-a-valid-prefix"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // (7) PAUSED MANAGER: pause the lead — its token now wields no subtree authority,
+        // even over a real subordinate that still holds the permission (peer still holds it
+        // too, but lead never had Branch authority over peer).
+        let (status, _, _) = call(
+            &state,
+            "PATCH",
+            "/v1/relux/agents/lead",
+            None,
+            Some(r#"{"status":"paused"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "pause lead failed");
+        // Re-grant the permission to ic so the only failing rule is liveness.
+        let (status, _, _) = call(
+            &state,
+            "POST",
+            "/v1/relux/agents/ic/permissions",
+            None,
+            Some(r#"{"permission":"tool:relux-tools-github:create_pr"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = revoke(&lead_tok, "ic", github_pr).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "paused manager must be denied");
+
+        // (8) AUDIT: the token-authenticated revoke is recorded; the raw token never leaks.
+        let (status, _, audit) =
+            call(&state, "GET", "/v1/relux/audit?limit=500", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            audit.contains("agent:token_authenticated_manager_revoke_permission"),
+            "token-authenticated revoke audit missing: {audit}"
+        );
+        assert!(audit.contains("agent:revoke_permission"), "inner agent:revoke_permission audit missing: {audit}");
         assert!(!audit.contains(&lead_tok), "raw token leaked into audit: {audit}");
     }
 

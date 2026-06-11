@@ -2491,3 +2491,57 @@ agent-authority path); assignment keeps the simple single-pointer model (re-poin
 terminal one); no dedicated manager-token *assignment* UI affordance this round (API + docs, scope
 grantable through the existing governance form) rather than a faked control. More subtree actions
 (`revoke`, …), project/namespace scopes, and agent-driven enrollment remain future work.
+
+## Reference read — a third manager-subtree action: token-authenticated `revoke_permission` (this slice)
+
+The follow-up that exercises the per-agent-authenticated manager surface for a **third** subtree action
+beyond `grant_permission` and `assign_task`: a manager that authenticated its own request (the §20 token)
+may **revoke an explicit permission** from one of its own-Branch subordinates, with no operator in the loop.
+Audit ref: `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §22 (and the §21 "more subtree *actions*" open item).
+
+### Paperclip — files read (VENDORED — `references/paperclip/`)
+
+- `references/paperclip/server/src/services/authorization.ts` (`scopeAllows` + `agentIsInSubtree`) +
+  `references/paperclip/packages/db/src/schema/principal_permission_grants.ts` — a manager's authority over
+  its Branch is keyed **per `permissionKey`**: the revoke capability is a distinct grant from grant/assign,
+  resolved by the same subtree walk. The "third action" reuses the identical shape with a new action segment.
+- `references/paperclip/server/src/middleware/auth.ts` — `req.actor = { type: "agent", agentId: claims.sub }`:
+  the acting agent is the verified token subject, never the body — Relux's `agent_self_manager_revoke` reads
+  the manager id from `AgentTokenIdentity`, target/permission from the body.
+
+### openclaw — files read
+
+- `reference/openclaw-main/src/acp/session-lineage-meta.ts` — `subagentControlScope: "children" | "none"`:
+  a node's authority is its children subtree or nothing; the `revoke_permission` scope is narrow the same way
+  (own-Branch proper descendants only, the exact action only, Active manager only).
+- `reference/openclaw-main/src/acp/permission-relay.ts` — deny-by-default: an unauthorized revoke is a clean
+  403 that mutates nothing; authority is checked before the target's holdings are even consulted.
+
+### Relux files read / mapped
+
+- `crates/relux-core/src/permission.rs` — `manager_subtree_authorizes` is **action-generic**; an
+  `agent:<id>:subtree:revoke_permission` scope parses/stores/revokes with no grammar change and authorizes
+  only its own action. `Permission::matches_exact` is the exact-only revoke comparison (no pattern expansion).
+- `crates/relux-kernel/src/state.rs` — the `manager_subtree_authorizes` kernel chokepoint (Active-manager
+  liveness), the existing `revoke_permission_from_agent` primitive (audited `agent:revoke_permission`,
+  fail-closed `PermissionNotGranted`), and the §19/§20/§21 manager primitives the new pair mirrors.
+- `crates/relux-kernel/src/agent_auth.rs` — the per-agent `AgentTokenIdentity`.
+- `crates/relux-kernel/src/server.rs` — the `agent_router` bearer allowlist + the §21 `agent_self_assign_task`
+  handler shape; `crates/relux-kernel/src/lib.rs` — `KernelError` (`PermissionDenied`→403,
+  `PermissionNotGranted`→404).
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| **per-action subtree authority** (Paperclip `permissionKey` per grant) | The action-generic matcher needed NO change; `KernelState::manager_revoke_permission_from_subordinate` calls the same `manager_subtree_authorizes(manager, "revoke_permission", target)` chokepoint. A `…:revoke_permission` scope never authorizes grant/assign and vice-versa. |
+| **actor from the verified token subject** (Paperclip `claims.sub`) | `POST /v1/relux/agents/me/manager-revoke` reads the acting manager from `AgentTokenIdentity.agent_id`; the body carries only `target_id` + `permission`. `manager_revoke_permission_from_subordinate_as_agent` adds an `agent:token_authenticated_manager_revoke_permission` provenance row (public `token_ref` only). |
+| **deny-by-default; reject invalid targets** (openclaw relay) | Authorization is checked **first** (an unauthorized manager never learns whether the target holds the permission): no-scope / not-Active / out-of-Branch / unknown target → 403, nothing mutated. The exact-only revoke means a permission not held → honest `PermissionNotGranted` → 404; a malformed permission → 400. |
+| **narrow, auditable, revocable** | The scope is one explicit `agent:<id>:subtree:revoke_permission` capability row, granted/revoked through the unchanged operator governance path; the per-agent token surface stays a tiny allowlist that never opens an operator route (the new route is itself bearer-gated). |
+
+**What we deliberately do differently / leave out:** no new permission grammar (the subtree scope is already
+action-generic); no change to the operator-console revoke (`DELETE /v1/relux/agents/:id/permissions` stays a
+kernel/operator action); the revoke is exact-only (`matches_exact`, no pattern expansion — a `tool:<plugin>:*`
+scope is removed only by revoking that exact row); no operator-assisted manager-revoke route this round (the
+token-auth path + UI form cover it). More subtree actions (status changes, …), project/namespace scopes, and
+agent-driven enrollment remain future work.

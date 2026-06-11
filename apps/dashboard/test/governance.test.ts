@@ -22,10 +22,13 @@ import {
   agentTokenLooksValid,
   assignTaskFormReason,
   managerGrantFormReason,
+  managerRevokeFormReason,
   assignTaskCurlSnippet,
   managerGrantCurlSnippet,
+  managerRevokeCurlSnippet,
   AGENT_SELF_ASSIGN_TASK_ROUTE,
   AGENT_SELF_MANAGER_GRANT_ROUTE,
+  AGENT_SELF_MANAGER_REVOKE_ROUTE,
   type ManagerGrantAgent,
 } from "../src/governance.ts";
 
@@ -240,6 +243,18 @@ test("managerGrantFormReason gates the token grant form, validating the permissi
   assert.equal(managerGrantFormReason("relux_agt_abc", "ic", "tool:relux-tools-echo:say"), null);
 });
 
+test("managerRevokeFormReason gates the token revoke form, validating the permission grammar, null when ready", () => {
+  // Same field discipline as the grant form (token shape, target, permission grammar).
+  assert.match(managerRevokeFormReason("", "ic", "tool:relux-tools-echo:say")!, /raw token/);
+  assert.match(managerRevokeFormReason("not-a-token", "ic", "tool:relux-tools-echo:say")!, /relux_agt_/);
+  assert.match(managerRevokeFormReason("relux_agt_abc", "", "tool:relux-tools-echo:say")!, /target/);
+  assert.match(managerRevokeFormReason("relux_agt_abc", "ic", "")!, /Enter a permission/);
+  assert.match(managerRevokeFormReason("relux_agt_abc", "ic", "not-a-prefix")!, /Must start with/);
+  assert.match(managerRevokeFormReason("relux_agt_abc", "ic", "tool:*")!, /wildcard/);
+  // All present + a well-formed capability → ready.
+  assert.equal(managerRevokeFormReason("relux_agt_abc", "ic", "tool:relux-tools-echo:say"), null);
+});
+
 test("the curl snippets embed NO secret (token is the $RELUX_AGENT_TOKEN var) and hit the real routes", () => {
   const assign = assignTaskCurlSnippet("task_0001", "ic");
   // The real route + body field names, never the operator console.
@@ -261,6 +276,13 @@ test("the curl snippets embed NO secret (token is the $RELUX_AGENT_TOKEN var) an
   assert.match(grant, /"permission":"tool:relux-tools-echo:say"/);
   assert.match(grant, /Bearer \$RELUX_AGENT_TOKEN/);
   assert.ok(!grant.includes("relux_agt_"), "snippet must not inline a raw token");
+
+  const revoke = managerRevokeCurlSnippet("ic", "tool:relux-tools-echo:say");
+  assert.ok(revoke.includes(AGENT_SELF_MANAGER_REVOKE_ROUTE));
+  assert.match(revoke, /"target_id":"ic"/);
+  assert.match(revoke, /"permission":"tool:relux-tools-echo:say"/);
+  assert.match(revoke, /Bearer \$RELUX_AGENT_TOKEN/);
+  assert.ok(!revoke.includes("relux_agt_"), "snippet must not inline a raw token");
 });
 
 test("parseTokenTtlSecs converts days→secs and treats blank/invalid as unspecified", () => {

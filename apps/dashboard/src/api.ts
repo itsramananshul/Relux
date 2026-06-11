@@ -164,6 +164,44 @@ export async function agentSelfManagerGrant(
   return data as ReluxAgentPermissions;
 }
 
+// `agentSelfManagerRevoke` is the sibling bearer path for the `revoke_permission`
+// action (docs/HERMES_OPENCLAW_DEEP_AUDIT.md §22): the manager that owns the token
+// revokes an explicit permission FROM one of its own-Branch subordinates, with NO
+// operator in the loop. Identical trust boundary to `agentSelfManagerGrant` — the acting
+// manager is the TOKEN SUBJECT (the kernel reads it from the bearer token, never from the
+// body), `credentials: "omit"` so the operator's `relux_session` cookie plays no part, and
+// a 401/403 means a bad/expired TOKEN (not an operator-session lapse), so it throws an
+// honest ApiError WITHOUT firing the session-expired signal. The revoke removes EXACTLY
+// the stored grant; a permission the target does not hold is an honest 404. The body
+// carries only the target + permission. Returns the TARGET's updated explicit permission
+// list.
+export async function agentSelfManagerRevoke(
+  token: string,
+  targetAgentId: string,
+  permission: string,
+): Promise<ReluxAgentPermissions> {
+  const res = await fetch("/v1/relux/agents/me/manager-revoke", {
+    method: "POST",
+    credentials: "omit",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ target_id: targetAgentId, permission }),
+  });
+  const data = await parse(res);
+  if (!res.ok) {
+    const msg =
+      (data && typeof data === "object" && "error" in data
+        ? String((data as Record<string, unknown>).error)
+        : typeof data === "string" && data
+          ? data
+          : `HTTP ${res.status}`) || `HTTP ${res.status}`;
+    throw new ApiError(res.status, msg);
+  }
+  return data as ReluxAgentPermissions;
+}
+
 // ── Current session metadata (`GET /v1/auth/me`) ──────────────────────────
 // The signed-in operator + safe session-expiry metadata for the Account control
 // (idle/absolute deadlines + remaining seconds; never the session id or hash).

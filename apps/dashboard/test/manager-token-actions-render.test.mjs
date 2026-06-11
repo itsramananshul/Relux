@@ -1,8 +1,8 @@
 // Render/DOM verification for the token-authenticated manager-actions panel
-// (docs/HERMES_OPENCLAW_DEEP_AUDIT.md §20 / §21). It server-renders the REAL exported
+// (docs/HERMES_OPENCLAW_DEEP_AUDIT.md §20 / §21 / §22). It server-renders the REAL exported
 // `ManagerTokenActionsPanel` through the same esbuild + react-dom/server harness the Crew
 // render test uses, and asserts the HONEST surface:
-//   - it documents both agent-self routes (manager-grant + assign-task),
+//   - it documents all three agent-self routes (manager-grant + assign-task + manager-revoke),
 //   - the raw-token field is a password input the operator must paste (the dashboard never
 //     reuses a minted token — only its hash is stored),
 //   - the curl snippet embeds NO secret (the token is the $RELUX_AGENT_TOKEN shell var),
@@ -62,11 +62,12 @@ after(() => {
   if (tmp) rmSync(tmp, { recursive: true, force: true });
 });
 
-test("the panel documents both token-authenticated manager routes", () => {
+test("the panel documents all three token-authenticated manager routes", () => {
   const html = render();
   assert.match(html, /Manager actions \(token-authenticated\)/);
   assert.match(html, /\/v1\/relux\/agents\/me\/manager-grant/);
   assert.match(html, /\/v1\/relux\/agents\/me\/assign-task/);
+  assert.match(html, /\/v1\/relux\/agents\/me\/manager-revoke/);
   // The required scope is spelled out for THIS agent.
   assert.match(html, /agent:lead-1:subtree/);
 });
@@ -98,13 +99,15 @@ test("the target picker lists the manager's Branch operatives", () => {
   assert.match(html, /ic-2/);
 });
 
-test("the panel offers BOTH token test forms (assign-task and manager-grant)", () => {
+test("the panel offers ALL THREE token test forms (assign-task, manager-grant, manager-revoke)", () => {
   const html = render();
   // Each action has its own collapsible test form summary + submit button.
   assert.match(html, /Test <[^>]*>assign-task<\/[^>]*> with a token/);
   assert.match(html, /Test <[^>]*>manager-grant<\/[^>]*> with a token/);
+  assert.match(html, /Test <[^>]*>manager-revoke<\/[^>]*> with a token/);
   assert.match(html, /Assign as manager \(token\)/);
   assert.match(html, /Grant as manager \(token\)/);
+  assert.match(html, /Revoke as manager \(token\)/);
 });
 
 test("the manager-grant form has a permission field and an honest token-subject trust-boundary note", () => {
@@ -120,6 +123,17 @@ test("the manager-grant form has a permission field and an honest token-subject 
   assert.match(html, /id="mta-lead-1-grant-token"/);
 });
 
+test("the manager-revoke form has an exact-permission field and an honest exact-revoke trust-boundary note", () => {
+  const html = render();
+  // A dedicated permission input drives the revoke action (its own paste-once token field).
+  assert.match(html, /Permission to revoke \(exact\):/);
+  assert.match(html, /id="mta-lead-1-revoke-token"/);
+  assert.match(html, /id="mta-lead-1-revoke-permission"/);
+  // The trust boundary spells out the revoke_permission scope + the exact-only / 404 rule.
+  assert.match(html, /agent:lead-1:subtree:revoke_permission/);
+  assert.match(html, /exact<\/strong> stored permission only|no pattern expansion/);
+});
+
 test("the committed dashboard bundle carries the manager-actions panel copy (no stale dist)", () => {
   const assetsDir = join(distDir, "assets");
   const jsFiles = readdirSync(assetsDir).filter((f) => f.endsWith(".js"));
@@ -127,5 +141,6 @@ test("the committed dashboard bundle carries the manager-actions panel copy (no 
   assert.match(bundle, /Manager actions \(token-authenticated\)/);
   assert.match(bundle, /Assign as manager \(token\)/);
   assert.match(bundle, /Grant as manager \(token\)/);
+  assert.match(bundle, /Revoke as manager \(token\)/);
   assert.match(bundle, /RELUX_AGENT_TOKEN/);
 });
