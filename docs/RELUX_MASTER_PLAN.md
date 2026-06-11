@@ -1836,6 +1836,36 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.14** (2026-06-11) — a **manual Crew configuration + permissions governance** slice
+  on top of v0.1.13 (`relix-dashboard-design.md` §9 / §9.1). Every new surface is
+  operator-driven and fails closed; no master-plan safety property is weakened, and
+  `create_agent` still grants only the minimal echo tool. **Manual create/edit:** a shared
+  Crew create/edit form (name, id, role, persona, adapter/runtime, status) backed by
+  `agent_config.rs` (pure, unit-tested validation/sanitization — strict id, id+name
+  uniqueness, adapter-must-resolve, status allowlist, persona bounded + secret-redacted),
+  field-granular audited `KernelState::update_agent`, persona-accepting `POST
+  /v1/relux/agents`, and a new `PATCH|PUT /v1/relux/agents/:id`; honest `400`/`404`.
+  **Explicit-permission view + safe revoke:** Crew cards list explicit permissions (elevated
+  control-plane grants flagged), `revoke_permission_from_agent` audits + fails closed
+  (`PermissionNotGranted` → `404`) via `DELETE /v1/relux/agents/:id/permissions`, and a pure
+  `governance.ts` mirrors `VALID_PREFIXES` to gate elevated grants behind a deliberate
+  confirm; Prime's own `GrantPermission` stays approval-gated. **Skills/tags + skill-aware
+  assignment:** a bounded specialty-tag list on `relux_core::Agent` (serde-default,
+  snapshot-compatible) drives Prime fuzzy assignee resolution (sole holder routes,
+  shared-skill is ambiguous, exact id/name wins); skills are specialty for routing only,
+  never a capability gate. **Safe role presets:** read-only `GET /v1/relux/agent-presets`
+  (pure, unit-tested `agent_presets.rs`) seeds create-form role/persona/skills; `POST
+  /v1/relux/agents` accepts an optional preset id that fills only omitted fields and flows
+  through the same validators (unknown preset → `400`); the `AgentPreset` type has no
+  permission/adapter field, so it cannot widen power. Built reference-first per
+  `docs/reference-driven-development.md` (openclaw sessions-spawn-tool / approval-classifier
+  / tool-policy, Hermes system_prompt + message_sanitization). Proven by new
+  `agent_config` / `agent_presets` / `governance` unit tests, extended
+  `agent_create_and_edit_workflow_over_http` and
+  `agent_presets_list_and_create_with_preset_over_http` kernel tests, dashboard
+  `governance.test.ts` / `presets.test.ts`, and the `crew-render` harness; the tracked
+  `dashboard-dist` bundle was rebuilt and committed in sync. Every safety property from
+  v0.1.13 still holds.
 - **v0.1.13** (2026-06-11) — an **in-app first-run / operational readiness guide +
   dashboard build hygiene** slice on top of v0.1.12. Entirely dashboard-side: no new
   product surface, no new endpoint, and no master-plan safety property weakened.

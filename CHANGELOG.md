@@ -9,6 +9,58 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.14 (Windows bundle).** The `relux-kernel` /
+  `relux-core` crates move from `0.1.13` to `0.1.14`, bundling the post-v0.1.13
+  **manual Crew configuration + permissions governance** slice (`relix-dashboard-design.md`
+  §9 / §9.1) into a fresh Windows release. No master-plan safety property is weakened:
+  every new surface is operator-driven, fails closed, and `create_agent` still grants only
+  the minimal echo tool. Headlines:
+  - **Manual create/edit of crew.** The Crew page gains a shared create/edit form (name,
+    id, role, persona, adapter/runtime, status) backed by a validated kernel edit path, so
+    the manual surface matches what the brain could already seed. New
+    `agent_config.rs` does pure, unit-tested validation/sanitization (name required, strict
+    id shape, id+name uniqueness, adapter must resolve to a known/installed adapter, status
+    allowlist, persona bounded + secret-redacted); `KernelState::update_agent` is
+    field-granular (absent = unchanged, `Some(None)` clears persona) and audited;
+    `POST /v1/relux/agents` now accepts persona and runs the validator, and a new
+    `PATCH|PUT /v1/relux/agents/:id` edits name/role/persona/adapter/status. Validation
+    failures are honest `400`s; a missing agent on edit is `404`.
+  - **Explicit-permission view + safe revoke.** Crew cards now list explicit permissions
+    (elevated control-plane grants flagged) instead of just a count, and the edit card gains
+    a Governance section to grant/revoke. `KernelState::revoke_permission_from_agent`
+    removes an explicit permission, audits it, and fails closed
+    (`KernelError::PermissionNotGranted` → `404`) when the agent does not hold it, exposed
+    via `DELETE /v1/relux/agents/:id/permissions`. A pure, unit-tested `governance.ts`
+    mirrors the relux-core `VALID_PREFIXES` for client-side validation and classifies
+    control-plane prefixes as elevated → a deliberate confirm before granting; nothing
+    dangerous is auto-granted, and Prime's own `GrantPermission` stays approval-gated.
+  - **Model-backed skills/tags + skill-aware assignment.** A bounded specialty-tag list is
+    added to `relux_core::Agent` (serde-default, snapshot backwards-compatible) and used in
+    Prime fuzzy assignee resolution: a skill held by exactly one agent routes work to that
+    specialist; a shared skill is ambiguous (Prime asks, never guesses); an exact id/name
+    still wins. Skills are validated/sanitized/clamped (strict slug, dedup, bounded count)
+    on the manual create/edit path and surfaced as chips in the Crew UI. Skills are
+    specialty for routing only, never a capability gate.
+  - **Safe role presets for Crew create.** Curated role-preset bundles (researcher, builder,
+    reviewer, planner, operator) seed the create form's role/persona/skills via a read-only
+    `GET /v1/relux/agent-presets` (single source of truth, pure + unit-tested in
+    `agent_presets.rs`). `POST /v1/relux/agents` accepts an optional preset id that fills
+    only the role/persona/skills the request omitted (request value wins) and flows through
+    the SAME validators; an unknown preset is an honest `400`. The `AgentPreset` type carries
+    no permission/adapter field, so a preset SUGGESTS configuration only and cannot widen an
+    agent's power.
+
+  Built reference-first per `docs/reference-driven-development.md` (openclaw
+  sessions-spawn-tool / approval-classifier / tool-policy, Hermes system_prompt +
+  message_sanitization) and conforms to `docs/relix-dashboard-design.md` §9 / §9.1. Proven by
+  new `agent_config` / `agent_presets` / `governance` unit tests, extended
+  `agent_create_and_edit_workflow_over_http` (grant/revoke/`404`/`400`) and
+  `agent_presets_list_and_create_with_preset_over_http` kernel tests, dashboard
+  `governance.test.ts` / `presets.test.ts`, and the `crew-render` harness; the tracked
+  `dashboard-dist` bundle was rebuilt and committed in sync. Build the bundle with
+  `scripts\relux-package-local.ps1 -FullE2E`. This version line is the `relux-kernel` crate
+  version (separate from the legacy Relix workspace versions in the dated sections below).
+  See `docs/RELUX_MASTER_PLAN.md` → *Release history*.
 - **Relux local release v0.1.13 (Windows bundle).** The `relux-kernel` /
   `relux-core` crates move from `0.1.12` to `0.1.13`, bundling the post-v0.1.12
   **in-app first-run / operational readiness guide + dashboard build hygiene**
