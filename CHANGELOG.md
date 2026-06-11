@@ -9,6 +9,44 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.12 (Windows bundle).** The `relux-kernel` /
+  `relux-core` crates move from `0.1.11` to `0.1.12`, bundling the post-v0.1.11
+  **source-checkout launcher + bounded Prime conversation memory** slice into a fresh
+  Windows release. No new product surface and no master-plan safety property is weakened;
+  this line makes the documented one-command boot actually work from a cloned repo and
+  gives Prime's brain a small, fenced sense of recent context. Headlines: a **root
+  source-checkout `Start-Relux.ps1`** (separate from the prebuilt bundle launcher of the
+  same name) so the documented
+  `powershell -NoProfile -ExecutionPolicy Bypass -File .\Start-Relux.ps1` works from the
+  repo root — it locates the workspace root via `$PSScriptRoot` with a guard, builds or
+  reuses `target\{debug,release}\relux-kernel.exe` (cold builds capped via
+  `scripts\cargo-jobs.ps1`), points the kernel at the committed `dashboard-dist` and the
+  gitignored `dev-data\` store, runs the same loopback port preflight as the bundle
+  launcher, prints the dashboard URL, and serves in the foreground (flags `-Port`,
+  `-Release`, `-DryRun`, `-Doctor`, `-Help`). The product change is **bounded conversation
+  memory**: a small, bounded, secret-redacted per-conversation turn history
+  (`relux_core::ConversationTurn`; `relux-kernel/prime_history.rs` with
+  `MAX_HISTORY_TURNS=12`, `MAX_HISTORY_CONVERSATIONS=32`, `MAX_CONTEXT_CHARS=2000`) lets
+  Prime's brain interpret follow-ups ("what about the second one?", "do that again") in
+  context instead of reasoning from the bare current message + a state snapshot. It is
+  persisted via the meta-snapshot seam (like `pending_clarifications`), injected into
+  `build_decision_prompt` as a labelled BACKGROUND block BEFORE the current message (empty
+  history leaves the decision prompt byte-for-byte unchanged), and recorded AFTER the reply
+  is shaped — so the stored reply is the FINAL user-visible reply (pinned by
+  `recorded_reply_is_the_final_shaped_reply_not_the_grounded_one`), with each read-only
+  context tool surfaced as a bounded "(consulted: …)" sub-line and **never** raw tool JSON
+  or a provider envelope. Crucially the history is **advisory prompt context with zero
+  authority** — it never reaches the deterministic `classify_intent`, the fail-closed
+  `reconcile_intent` gate, or any existence/approval check (those run on the current message
+  alone), so it can never promote casual chat into work or override an explicit current-turn
+  intent; a new `POST /v1/relux/prime/reset` (and a small in-UI Clear button) wipes only
+  this advisory memory. Built reference-first per
+  `docs/reference-driven-development.md` (Hermes `run_conversation` history threading +
+  `build_memory_context_block` fence + redact; openclaw hook-history slice +
+  `buildCliSessionHistoryPrompt` + transcript-redact). Build the bundle with
+  `scripts\relux-package-local.ps1 -FullE2E`. This version line is the `relux-kernel` crate
+  version (separate from the legacy Relix workspace versions in the dated sections below).
+  See `docs/RELUX_MASTER_PLAN.md` → *Release history*.
 - **Relux local release v0.1.11 (Windows bundle).** The `relux-kernel` /
   `relux-core` crates move from `0.1.10` to `0.1.11`, bundling the post-v0.1.10 **plugin
   tool-invocation** slice into a fresh Windows release. v0.1.10 closed the Prime

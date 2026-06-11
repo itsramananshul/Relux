@@ -1836,6 +1836,36 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.12** (2026-06-11) — a **source-checkout launcher + bounded Prime conversation
+  memory** slice on top of v0.1.11. No new product surface and no master-plan safety
+  property weakened; this line makes the documented one-command boot actually work from a
+  cloned repo and gives Prime's brain a small, fenced sense of recent context.
+  **Root source launcher:** a repo-root `Start-Relux.ps1` (separate from the prebuilt
+  bundle launcher of the same name) locates the workspace root via `$PSScriptRoot` with a
+  guard, builds or reuses `target\{debug,release}\relux-kernel.exe` (cold builds capped via
+  `scripts\cargo-jobs.ps1`), points the kernel at the committed `dashboard-dist` and the
+  gitignored `dev-data\` store, runs the same loopback port preflight as the bundle
+  launcher, prints the dashboard URL, and serves in the foreground; flags `-Port`,
+  `-Release`, `-DryRun`, `-Doctor`, `-Help`. **Bounded conversation memory:** a small,
+  bounded, secret-redacted per-conversation turn history (`relux_core::ConversationTurn`;
+  `relux-kernel/prime_history.rs` with `MAX_HISTORY_TURNS=12`,
+  `MAX_HISTORY_CONVERSATIONS=32`, `MAX_CONTEXT_CHARS=2000`) lets the brain interpret
+  follow-ups ("what about the second one?", "do that again") in context. It is persisted via
+  the meta-snapshot seam, injected into `build_decision_prompt` as a labelled BACKGROUND
+  block BEFORE the current message (empty history leaves the prompt byte-for-byte
+  unchanged), and recorded AFTER the reply is shaped so the stored reply is the FINAL
+  user-visible one, with read-only context summaries surfaced as a "(consulted: …)" sub-line
+  (never raw tool JSON / provider envelopes). The history is **advisory prompt context with
+  zero authority** — it never reaches `classify_intent`, the fail-closed `reconcile_intent`
+  gate, or any existence/approval check (those run on the current message alone), so it can
+  never promote chat into work or override an explicit current-turn intent; a new
+  `POST /v1/relux/prime/reset` (and an in-UI Clear button) wipes only this advisory memory.
+  Built reference-first per `docs/reference-driven-development.md` (Hermes
+  `run_conversation` history threading + `build_memory_context_block` fence + redact;
+  openclaw hook-history slice + `buildCliSessionHistoryPrompt` + transcript-redact). Proven
+  by `relux-kernel` / `relux-core` unit + integration tests (including
+  `recorded_reply_is_the_final_shaped_reply_not_the_grounded_one`); every safety property
+  from v0.1.11 still holds.
 - **v0.1.11** (2026-06-11) — a **plugin tool-invocation** slice on top of v0.1.10. Where
   v0.1.10 closed the Prime observe-then-act + governed-orchestration line, this line makes
   the ToolSet-plugin tool-invocation surface honest and usable end-to-end on the
