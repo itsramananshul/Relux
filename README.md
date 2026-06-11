@@ -43,7 +43,18 @@ It serves on `http://127.0.0.1:19891` by default. If that port is already taken
 the exact command to pick another port — set `RELUX_HTTP_ADDR=127.0.0.1:<port>`
 for a source checkout, or use `.\Start-Relux.ps1 -Port <port>` with the bundle.
 
-#### Run from a source checkout (Windows, one command)
+There are three ways to launch Relux, depending on your platform:
+
+1. **Prebuilt Windows zip** — no Rust/npm, Windows-x64 only (see "Run the
+   packaged release" below).
+2. **Source checkout on Windows** — `.\Start-Relux.ps1` from the repo root.
+3. **Source checkout on macOS / Linux** — `./start-relux.sh` from the repo root.
+
+There is **no prebuilt macOS/Linux zip** — the packaged release is Windows-x64
+only. On macOS/Linux you run from a source checkout with `./start-relux.sh`,
+which is the documented equivalent of the Windows source launcher.
+
+#### Run from a source checkout on Windows (one command)
 
 From the **root of a cloned repo**, the `Start-Relux.ps1` launcher does the
 source-checkout boot for you: it builds (or reuses) the `relux-kernel` binary,
@@ -66,11 +77,39 @@ launcher; the same-named `Start-Relux.ps1` inside an extracted release bundle is
 **different**, prebuilt launcher (see "Run the packaged release" below) — run that
 one from inside the extracted folder, this one from the repo root.
 
-#### Run the packaged release (v0.1.14, no build needed)
+#### Run from a source checkout on macOS / Linux (one command)
+
+From the **root of a cloned repo**, `start-relux.sh` is the macOS/Linux
+counterpart of `Start-Relux.ps1`. It mirrors the same semantics: it builds (or
+reuses) the `target/debug/relux-kernel` binary, points it at the committed
+dashboard bundle and the gitignored `dev-data/` store, sets the same
+`RELUX_HTTP_ADDR` / `RELUX_DB` / `RELUX_DASHBOARD_DIST` env vars, preflights the
+port, prints the dashboard URL, and runs the server in the foreground (Ctrl+C to
+stop):
+
+```bash
+# from the repo root
+./start-relux.sh
+# override the port if 19891 is taken:  ./start-relux.sh --port 20000
+```
+
+Flags: `--release` (build/use `target/release`), `--dry-run` (check
+prereqs/port/paths and print the plan without building or starting anything),
+`--doctor` (run the kernel health check and exit), and `--help`. The first build
+can take a few minutes; later runs reuse the built binary. If `cargo` is missing
+the launcher prints the [rustup](https://rustup.rs) install step and stops. Set
+`RELUX_CARGO_JOBS=<n>` to cap build parallelism (`-j n`) on a constrained box;
+unset means cargo's default. The port preflight uses `nc` when present and falls
+back to bash's `/dev/tcp`; if neither is available it skips the probe and the
+kernel still reports a clear bind error on a real conflict.
+
+#### Run the packaged release (v0.1.14, Windows-x64 only, no build needed)
 
 Prefer a prebuilt Windows bundle over building from source? Grab the latest
 [**Relux local release**](https://github.com/itsramananshul/Relux/releases) zip
-(`relux-local-0.1.14-windows-x64.zip`), extract it, and launch it - no Rust, no npm:
+(`relux-local-0.1.14-windows-x64.zip`), extract it, and launch it - no Rust, no npm.
+(The packaged zip is **Windows-x64 only**; on macOS/Linux use `./start-relux.sh`
+from a source checkout, above.)
 
 ```powershell
 # inside the extracted relux-local-0.1.14-windows-x64 folder

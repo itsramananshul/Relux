@@ -1,0 +1,4 @@
+# Shell scripts must always check out with LF endings so the shebang and the
+# script work on macOS/Linux regardless of a contributor's core.autocrlf setting.
+# A CRLF shebang (`#!/usr/bin/env bash\r`) fails to launch on Unix.
+*.sh text eol=lf
