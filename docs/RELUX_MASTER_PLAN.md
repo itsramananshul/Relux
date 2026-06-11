@@ -1836,6 +1836,36 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.16** (2026-06-11) — an **agentic run recovery + durable session/handoff** slice on
+  top of v0.1.15, driven by the new `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` (§1/§3/§7/§15). Every
+  new path stays fail-closed, governed, and bounded; no new authority is granted and no
+  master-plan safety property is weakened. **Durable run session / safe Claude resume
+  (§3/§15):** a CLI adapter's reported provider session id (the Claude `--output-format json`
+  `session_id`) is captured as a bounded, redacted `RunSession` on the `Run`
+  (`sanitize_session_id` rejects argv injection; `plan_resume` is the single source of truth),
+  and a governed `POST /v1/relux/runs/:id/resume` continues that session for the one adapter
+  that supports safe non-interactive resume (Claude `-p --resume <id>`), refusing honestly
+  elsewhere (`RunResumeNotSupported`, 422); re-run stays a distinct lineage. The dashboard Work
+  run-detail gains a copyable Session row, an honest Handoff label, and a Resume button (maps
+  OpenClaw `acp-spawn` `resumeSessionId` / `runCliWithSession`). **Structured failure +
+  bounded transient retry (§7):** `run_failure.rs` adds a priority-ordered `RunFailureClass`
+  with `retryable` / `needs_operator_action` / `remediation`, a bounded backoff schedule
+  (`[2m, 10m, 30m, 2h]`), and a redact+clamp `safe_public_message`; only
+  `transient_provider`/`timeout` auto-retry (`unknown` stays manual since a run can mutate a
+  workspace), with **no background scheduler** — `not_before` is real wall-clock consumed
+  manually or on an autonomy tick through the unchanged governed `retry_run` path. Doctor gains
+  a `runs.recovery` row; the Work page shows a failure-class chip + remediation (grounded in
+  Hermes `error_classifier.py`, Paperclip `run-liveness.ts` / `heartbeat.ts`). **Bounded Prime
+  self-correction (§1/§7):** the observe-then-act `DecisionLoop` re-asks a malformed-but-
+  correctable brain reply **once** (`MAX_DECISION_CORRECTIONS=1`) with `parse_decision`'s own
+  error injected, instead of silently falling back; a corrected decision grants no authority
+  and still flows through the unchanged fail-closed gate, and the legacy
+  `step` / `run_decision_loop` are preserved byte-for-byte (mirrors Hermes
+  `_invalid_json_retries` / openclaw retry instructions). Built reference-first per
+  `docs/reference-driven-development.md`; `cargo test` + `clippy` clean on
+  `relux-core`/`relux-kernel`, dashboard tests + typecheck + build green, the tracked
+  `dashboard-dist` bundle rebuilt and committed in sync. Every safety property from v0.1.15
+  still holds.
 - **v0.1.15** (2026-06-11) — a **cross-platform source launcher + read-only kernel Doctor**
   slice on top of v0.1.14. Both surfaces are read-only / launch-only and leak no paths or
   secrets; no master-plan safety property is weakened. **Cross-platform launcher:** a Bash

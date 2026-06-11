@@ -9,6 +9,63 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.16 (Windows bundle).** The `relux-kernel` /
+  `relux-core` crates move from `0.1.15` to `0.1.16`, bundling the post-v0.1.15
+  **agentic run recovery + durable session/handoff** slice (driven by
+  `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §1/§3/§7/§15) into a fresh Windows release.
+  No master-plan safety property is weakened: every new path stays fail-closed,
+  governed, and bounded, and no new authority is granted. Headlines:
+  - **Durable run session identity / handoff + safe Claude resume
+    (`HERMES_OPENCLAW_DEEP_AUDIT.md` §3/§15).** A CLI adapter's reported provider
+    session id (the Claude `--output-format json` envelope `session_id`) is now
+    captured and persisted as a bounded, redacted `RunSession` on the `Run`
+    (`run_session.rs`: `sanitize_session_id` rejects leading-dash/over-length argv
+    injection; `plan_resume` is the single source of truth). A new governed
+    `POST /v1/relux/runs/:id/resume` continues that session for the one adapter
+    that supports safe non-interactive resume (Claude `-p --resume <id>`, threaded
+    through the unchanged safe argv only when `resumed_from` is set), refusing
+    honestly everywhere else with `RunResumeNotSupported` (422); re-run/fresh retry
+    stays a distinct lineage. The dashboard Work run-detail gains a copyable Session
+    row, an honest Handoff label, and a Resume button. Maps OpenClaw `acp-spawn`
+    `resumeSessionId` / `attempt-execution` `runCliWithSession`.
+  - **Structured run-failure classifier + bounded transient retry
+    (`HERMES_OPENCLAW_DEEP_AUDIT.md` §7).** `run_failure.rs` adds a priority-ordered
+    `RunFailureClass` (transient_provider / auth_required / adapter_missing /
+    permission_denied / invalid_prompt / timeout / cancelled / output_validation /
+    unknown) with `retryable` / `needs_operator_action` / `remediation`, a bounded
+    `RETRY_BACKOFF_SECS` schedule (`[2m, 10m, 30m, 2h]`), and `safe_public_message`
+    (redact + clamp). Only `transient_provider`/`timeout` auto-retry; `unknown`
+    stays manual since a run can mutate a workspace. There is **no background
+    scheduler**: `not_before` is real wall-clock consumed manually or on an
+    autonomy tick, which re-attempts eligible transients through the unchanged
+    governed `retry_run` path (re-checks runtime/PATH/permission, grows the backoff).
+    Doctor gains a `runs.recovery` row; the Work page shows a failure-class chip +
+    honest recovery line + remediation. Grounded in Hermes `error_classifier.py`
+    and Paperclip `run-liveness.ts` / `heartbeat.ts`.
+  - **Bounded Prime self-correction on a malformed brain decision
+    (`HERMES_OPENCLAW_DEEP_AUDIT.md` §1/§7).** The unified observe-then-act
+    `DecisionLoop` no longer collapses a malformed-but-correctable brain reply into
+    the same silent deterministic fallback as a hard provider failure. New
+    `DecisionOutcome` (Decision / Malformed / ProviderError) + `DecisionStep::Retry`
+    with `MAX_DECISION_CORRECTIONS=1`: a Malformed reply is re-asked **once** with
+    `parse_decision`'s own error injected
+    (`build_decision_prompt_with_correction`); a ProviderError stops immediately.
+    The correction only fixes output format and grants no authority — a corrected
+    decision still flows through the unchanged fail-closed gate (`reconcile_intent`
+    → slot validators → decide → `prime_execute` / approval), the correction
+    message is kernel-authored, total brain calls stay bounded, and the legacy
+    `step` / `run_decision_loop` are preserved byte-for-byte. Mirrors Hermes
+    `_invalid_json_retries` and openclaw retry instructions.
+
+  Built reference-first per `docs/reference-driven-development.md`, with the exact
+  reference files read and the Relux mapping recorded there and in
+  `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` (the new deep 12-dimension audit added in
+  this slice). `cargo test` + `clippy` clean on `relux-core`/`relux-kernel`;
+  dashboard tests + typecheck + build green; the tracked `dashboard-dist` bundle
+  was rebuilt and committed in sync. Build the bundle with
+  `scripts\relux-package-local.ps1 -FullE2E`. This version line is the
+  `relux-kernel` crate version (separate from the legacy Relix workspace versions
+  in the dated sections below). See `docs/RELUX_MASTER_PLAN.md` → *Release history*.
 - **Relux local release v0.1.15 (Windows bundle).** The `relux-kernel` /
   `relux-core` crates move from `0.1.14` to `0.1.15`, bundling the post-v0.1.14
   **cross-platform source launcher + read-only kernel Doctor** slice into a fresh
