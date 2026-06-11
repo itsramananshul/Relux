@@ -1836,6 +1836,31 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.15** (2026-06-11) — a **cross-platform source launcher + read-only kernel Doctor**
+  slice on top of v0.1.14. Both surfaces are read-only / launch-only and leak no paths or
+  secrets; no master-plan safety property is weakened. **Cross-platform launcher:** a Bash
+  `start-relux.sh` counterpart to `Start-Relux.ps1` for macOS/Linux source checkouts —
+  locates the repo root, checks `cargo` (rustup guidance if missing), builds/reuses
+  `target/debug/relux-kernel` (`--release` optional, `RELUX_CARGO_JOBS` cap), sets the same
+  `RELUX_HTTP_ADDR` / `RELUX_DB` / `RELUX_DASHBOARD_DIST` env vars, preflights the loopback
+  port (`nc`, falling back to bash `/dev/tcp`) with an actionable busy-port error, and runs
+  `serve` in the foreground; flags `--port` / `--release` / `--dry-run` / `--doctor` /
+  `--help`. The README separates the three launch paths (prebuilt Windows zip; Windows
+  source; macOS/Linux source) and is explicit that the packaged zip is Windows-x64 only;
+  `.gitattributes` pins `*.sh` to LF. **Read-only Doctor (`relix-dashboard-design.md`
+  §15.1):** a session-protected `GET /v1/relux/doctor` emits a structured diagnostics report
+  reusing the same cheap reads as `/v1/relux/health` (store, dashboard bundle, AI status,
+  adapter + tool readiness, agent + approval counts) as `ok`/`info`/`warn`/`fail` rows with
+  message, remediation, and an in-app action link — no heavy work, no mutation, and no
+  paths/secrets (`DoctorInputs` carries no filesystem path; severity rules mirror
+  `readiness.ts`). The dashboard gains a compact worst-first Doctor panel on Health with Fix
+  links, a Refresh, and an honest error state; pure helpers in `doctor.ts`. Built
+  reference-first per `docs/reference-driven-development.md` (Hermes `doctor.py`
+  check_*/_fail_and_issue; openclaw `health-state.ts` includeSensitive). Proven by
+  `doctor.rs` unit tests (every severity rule + redaction), a server test pinning
+  session-gating / the row set / no db-path leak, frontend `doctor.test.ts`, and
+  `doctor-render.test.mjs`; the tracked `dashboard-dist` bundle was rebuilt and committed in
+  sync. Every safety property from v0.1.14 still holds.
 - **v0.1.14** (2026-06-11) — a **manual Crew configuration + permissions governance** slice
   on top of v0.1.13 (`relix-dashboard-design.md` §9 / §9.1). Every new surface is
   operator-driven and fails closed; no master-plan safety property is weakened, and

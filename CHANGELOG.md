@@ -9,6 +9,46 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.15 (Windows bundle).** The `relux-kernel` /
+  `relux-core` crates move from `0.1.14` to `0.1.15`, bundling the post-v0.1.14
+  **cross-platform source launcher + read-only kernel Doctor** slice into a fresh
+  Windows release. No master-plan safety property is weakened: both surfaces are
+  read-only / launch-only and leak no paths or secrets. Headlines:
+  - **Cross-platform `start-relux.sh` source launcher (macOS/Linux).** A Bash
+    counterpart to `Start-Relux.ps1` for Unix-like source checkouts: it locates the
+    repo root, checks `cargo` (printing the [rustup](https://rustup.rs) install step
+    if missing), builds/reuses `target/debug/relux-kernel` (`--release` optional,
+    `RELUX_CARGO_JOBS` cap), sets the same `RELUX_HTTP_ADDR` / `RELUX_DB` /
+    `RELUX_DASHBOARD_DIST` env vars, preflights the loopback port with an actionable
+    busy-port error (`nc`, falling back to bash `/dev/tcp`), and runs `serve` in the
+    foreground (Ctrl+C to stop). Flags: `--port`, `--release`, `--dry-run`,
+    `--doctor`, `--help`. The README now separates the three launch paths (prebuilt
+    Windows zip; Windows source via `Start-Relux.ps1`; macOS/Linux source via
+    `./start-relux.sh`) and is explicit that the packaged zip is Windows-x64 only;
+    `.gitattributes` pins `*.sh` to LF so the shebang works on Unix regardless of
+    `core.autocrlf`.
+  - **Read-only kernel Doctor report + dashboard panel (`relix-dashboard-design.md`
+    §15.1).** A new session-protected `GET /v1/relux/doctor` emits a structured,
+    read-only diagnostics report. It reuses the same cheap reads as
+    `/v1/relux/health` (store open/load, dashboard bundle, AI status, adapter + tool
+    readiness, agent + approval counts) and returns `ok`/`info`/`warn`/`fail` rows
+    each with a message, remediation, and an in-app action link. No heavy work, no
+    mutation, and no paths/secrets — `DoctorInputs` carries no filesystem path
+    (structural redaction), and the severity rules mirror `readiness.ts` so the two
+    surfaces agree. The dashboard gains a compact Doctor panel on Health below the
+    readiness guide, sorted worst-first, with Fix links and a Refresh and an honest
+    error state (never a blank panel); pure helpers live in `doctor.ts`. Proven by
+    `doctor.rs` unit tests (every severity rule + redaction), a server test pinning
+    session-gating / the row set / no db-path leak, frontend `doctor.test.ts`, and
+    `doctor-render.test.mjs` (ok/warn/fail/error/loading render states + the
+    committed bundle).
+
+  Built reference-first per `docs/reference-driven-development.md` (Hermes
+  `doctor.py` check_*/_fail_and_issue; openclaw `health-state.ts` includeSensitive).
+  The tracked `dashboard-dist` bundle was rebuilt and committed in sync. Build the
+  bundle with `scripts\relux-package-local.ps1 -FullE2E`. This version line is the
+  `relux-kernel` crate version (separate from the legacy Relix workspace versions in
+  the dated sections below). See `docs/RELUX_MASTER_PLAN.md` → *Release history*.
 - **Relux local release v0.1.14 (Windows bundle).** The `relux-kernel` /
   `relux-core` crates move from `0.1.13` to `0.1.14`, bundling the post-v0.1.13
   **manual Crew configuration + permissions governance** slice (`relix-dashboard-design.md`
