@@ -9,6 +9,44 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.5 (Windows bundle).** The `relux-kernel` /
+  `relux-core` crates move from `0.1.4` to `0.1.5` for the first build that puts a
+  **single-admin local operator login** in front of the standalone dashboard/API.
+  This release bundles the post-v0.1.4 auth work (detailed in the entries below):
+  **First-run admin setup + login** — on first launch the dashboard shows a one-time
+  setup screen to set the local admin password; thereafter a sign-in screen gates
+  the dashboard and the `/v1/relux/*` API, with the session carried in an HTTP-only
+  `relux_session` cookie. The credential lives next to the DB (Argon2-hashed, never
+  the plaintext); `relux-kernel reset-admin [user] [pw]` is the password-recovery
+  path when the current one is unknown, and `RELUX_AUTH_DISABLED=1` is a documented
+  dev/test bypass that `serve` warns about loudly. **Password change in-console** —
+  the dashboard **Account** panel changes the admin password (verifies the current
+  one, enforces the length floor) without touching the session. **Sliding session
+  refresh** — an active session slides forward on each authenticated request up to a
+  hard **absolute** ceiling; idle past the rolling window signs out. The public,
+  **non-sliding** `GET /v1/auth/me` exposes safe, secret-free session metadata
+  (idle/absolute deadlines + seconds remaining, the policy windows, server clock —
+  never the session id, cookie, or hash). **Account session readout + expiry
+  warning + one-click re-auth** — the Account panel shows the idle/absolute policy
+  with live countdowns; the shell topbar shows a quiet expiry chip (amber for idle,
+  red for the absolute ceiling) that opens Account; and Account offers a *"Sign out
+  and sign back in"* re-auth action — promoted to the primary action inside the
+  absolute warning window — that ends the session via `POST /v1/auth/logout` and
+  re-shows sign-in (never auto-submits credentials, never weakens auth). Proven by
+  `relux-kernel` unit + in-process HTTP tests (setup/login/logout, sliding refresh,
+  old-cookie server-side invalidation on re-auth, the `/v1/auth/me` no-secret
+  contract), dashboard decision-helper tests (`sessionWarning` / `reauthCallout` /
+  the local countdown basis), render/static proofs of the chip + Account promotion,
+  and the standalone `scripts\relux-e2e-smoke.ps1` full E2E over HTTP against the
+  real release binary. *Known caveats:* one admin only (no multi-user, roles, or
+  per-operator audit); sessions are **in-memory** and do not survive a `serve`
+  restart (everyone re-signs-in); the loopback API has **no transport TLS**; the
+  absolute ceiling can only be cleared by a fresh sign-in (no console action extends
+  it); and `RELUX_AUTH_DISABLED` leaves the surface fully open by design. This
+  version line is the `relux-kernel` crate version (separate from the Relix
+  workspace version below); build the bundle with
+  `scripts\relux-package-local.ps1 -FullE2E`. See `docs/RELUX_MASTER_PLAN.md` →
+  *Release history*.
 - **End-to-end proof of the re-auth / session-reset flow.** Two complementary
   checks pin the Account *"Sign out and sign back in"* path — the only way to clear
   the hard **absolute** 7-day ceiling. A deterministic in-process HTTP test

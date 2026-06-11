@@ -31,21 +31,26 @@ It serves on `http://127.0.0.1:19891` by default. If that port is already taken
 the exact command to pick another port — set `RELUX_HTTP_ADDR=127.0.0.1:<port>`
 for a source checkout, or use `.\Start-Relux.ps1 -Port <port>` with the bundle.
 
-#### Run the packaged release (v0.1.4, no build needed)
+#### Run the packaged release (v0.1.5, no build needed)
 
 Prefer a prebuilt Windows bundle over building from source? Grab the latest
 [**Relux local release**](https://github.com/itsramananshul/Relux/releases) zip
-(`relux-local-0.1.4-windows-x64.zip`), extract it, and launch it - no Rust, no npm:
+(`relux-local-0.1.5-windows-x64.zip`), extract it, and launch it - no Rust, no npm:
 
 ```powershell
-# inside the extracted relux-local-0.1.4-windows-x64 folder
+# inside the extracted relux-local-0.1.5-windows-x64 folder
 powershell -NoProfile -ExecutionPolicy Bypass -File .\Start-Relux.ps1
 # override the port if 19891 is taken:  .\Start-Relux.ps1 -Port 20000
 ```
 
 Then, in your browser:
 
-1. Open **http://127.0.0.1:19891/dashboard** (the launcher prints this URL).
+1. Open **http://127.0.0.1:19891/dashboard** (the launcher prints this URL). On
+   first launch you set the single local **admin** password (one-time setup), then
+   sign in; the session slides on activity, signs out after inactivity, and has a
+   hard re-sign-in ceiling. Forgot it? `relux-kernel.exe reset-admin` clears the
+   credential so you can set a new one. (Set `RELUX_AUTH_DISABLED=1` only for a
+   throwaway local dev box.)
 2. Go to **Health → Prime Brain / AI Runtime** and click **"Use Claude CLI for
    Prime"**. If `claude` is not yet on your PATH the panel shows the exact install
    + sign-in step (`npm i -g @anthropic-ai/claude-code`, then run `claude` once to

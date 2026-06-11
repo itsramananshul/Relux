@@ -268,8 +268,11 @@ What's in this bundle
 
 Notes
 -----
-  - Local-first by design: the API binds loopback and is unauthenticated. It is
-    not a multi-user or production surface.
+  - Local-first by design: the API binds loopback and is gated by a single-admin
+    local operator login (set the admin password on first launch; recover with
+    "relux-kernel.exe reset-admin"). It is not a multi-user or production surface,
+    and the loopback transport has no TLS. Set RELUX_AUTH_DISABLED=1 only for a
+    throwaway local dev box.
   - Data is stored under .\data\local.db inside this bundle.
   - Relux never auto-runs downloaded plugin code and never passes any CLI
     permission-bypass flag.
