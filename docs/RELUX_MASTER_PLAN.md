@@ -1836,6 +1836,32 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.19** (2026-06-11) — a **second token-authenticated manager-subtree action** slice on
+  top of v0.1.18, driven by `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` (§21). Building on the §20
+  per-agent identity, a manager that authenticated its OWN request with a per-agent access token
+  may now do a second self-driven action — assign an existing task to one of its own-Branch
+  subordinates — with no operator in the loop, and no master-plan safety property is weakened.
+  **Token-authenticated `assign_task` (§21):** no new permission grammar
+  (`agent:<id>:subtree:<action>` was already action-generic, so `:assign_task`
+  parses/stores/revokes unchanged and the pure `manager_subtree_authorizes` matcher takes the
+  action with no cross-action bleed); `KernelState::manager_assign_task_to_subordinate` routes
+  through the same own-Branch + Active-manager + exact-scope chokepoint, checked first, keeps the
+  single-pointer model (`assigned_agent` → `Queued`), and adds one assignability guard (terminal
+  task → 409 `TaskNotAssignable`, missing task → `UnknownTask` 400, unauthorized/out-of-Branch/
+  unknown target → 403), every denial audited. **Agent-authenticated surface:**
+  `POST /v1/relux/agents/me/assign-task` on the bearer `agent_router` where the acting manager is
+  the token subject (never the body), with an `agent:token_authenticated_manager_assign_task`
+  provenance audit (public `token_ref` only); operator routes stay closed to bearer tokens.
+  **Manager-actions UI:** a compact Crew Governance "Manager actions (token-authenticated)" panel
+  documents both agent-self routes (manager-grant / assign-task) with the required scope, shows
+  secret-free curl snippets (`$RELUX_AGENT_TOKEN`), and offers a local assign-task test form that
+  requires the operator to paste the copy-once raw token deliberately (`type=password`, cleared
+  after) and drives the `agentSelfAssignTask` bearer helper (`credentials: omit`) so the operator
+  session never bypasses the token path. Built reference-first per
+  `docs/reference-driven-development.md`; `cargo test` + `clippy` clean on
+  `relux-core`/`relux-kernel`, dashboard tests + typecheck + build green, the tracked
+  `dashboard-dist` bundle rebuilt and committed in sync. Every safety property from v0.1.18 still
+  holds.
 - **v0.1.18** (2026-06-11) — a **first per-agent identity** slice on top of v0.1.17, driven by
   `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` (§20). It closes — for the `grant_permission` action —
   the §19 operator-assisted gap: a manager can now authenticate its OWN request and drive the
