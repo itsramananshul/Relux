@@ -180,6 +180,8 @@ async fn serve() -> Result<(), KernelError> {
     println!("   GET    /v1/relux/runs");
     println!("   GET    /v1/relux/runs/:id");
     println!("   GET    /v1/relux/runs/:id/events            (optional ?since=<event_id> tail)");
+    println!("   POST   /v1/relux/runs/:id/retry");
+    println!("   POST   /v1/relux/runs/:id/resume            (continue the captured provider session; 422 if unsupported)");
     println!("   POST   /v1/relux/runs/:id/proposed-changes/:index/review {{ \"decision\": \"approve|reject\" }}");
     println!("   POST   /v1/relux/runs/:id/proposed-changes/:index/apply");
     println!("   GET    /v1/relux/audit");
@@ -422,6 +424,7 @@ fn protected_router() -> Router<AppState> {
         .route("/v1/relux/runs/:id", get(get_run))
         .route("/v1/relux/runs/:id/events", get(get_run_events))
         .route("/v1/relux/runs/:id/retry", post(retry_run))
+        .route("/v1/relux/runs/:id/resume", post(resume_run))
         .route(
             "/v1/relux/runs/:id/proposed-changes/:index/review",
             post(review_proposed_change),
@@ -1819,6 +1822,22 @@ async fn retry_run(
     let run_id = relux_core::RunId::new(id);
     // Persist even if the retry's fresh run fails, so the new attempt is durable.
     let new_run_id = locked_save_persisting(&state, |kernel| kernel.retry_run(&run_id))?;
+    Ok(Json(RetryRunResponse { run_id: new_run_id }))
+}
+
+/// Resume a prior run's provider session (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md`
+/// §3). Distinct from retry: it continues the recorded adapter session (threading
+/// its captured session id through the governed `--resume` gate) instead of
+/// starting cold. Refuses honestly with 422 when the run carries no resumable
+/// session (no captured session id, an adapter without safe non-interactive
+/// resume, or a run still in flight) — never a faked continuation. The new run is
+/// persisted even if the resume attempt itself fails honestly.
+async fn resume_run(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<RetryRunResponse>, ApiError> {
+    let run_id = relux_core::RunId::new(id);
+    let new_run_id = locked_save_persisting(&state, |kernel| kernel.resume_run(&run_id))?;
     Ok(Json(RetryRunResponse { run_id: new_run_id }))
 }
 
@@ -5410,6 +5429,12 @@ struct RunRecord {
     /// Whether the dashboard should offer a Retry action: a failed run whose task
     /// still exists and is still assigned.
     retryable: bool,
+    /// Whether the dashboard should offer a Resume action: a terminal run whose
+    /// task is still assigned AND that captured a resumable provider session
+    /// (`session.resume_supported`). Distinct from `retryable` — resume continues
+    /// the recorded adapter session, retry starts cold (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md`
+    /// §3). Mirrors the pure [`relux_core::plan_resume`] decision.
+    resumable: bool,
 }
 
 /// The maximum number of characters of adapter output surfaced in a run header
@@ -5439,6 +5464,15 @@ fn build_run_record(kernel: &KernelState, run: relux_core::Run) -> RunRecord {
     let failure_remediation = run.failure_class.map(|c| c.remediation().to_string());
     let retryable = run.status == relux_core::RunStatus::Failed
         && task.map(|t| t.assigned_agent.is_some()).unwrap_or(false);
+    // Resume is offered when the task is still assigned AND the run captured a
+    // resumable provider session and is terminal (the pure core decision is the
+    // single source of truth — the UI label and the action agree).
+    let terminal = matches!(
+        run.status,
+        relux_core::RunStatus::Completed | relux_core::RunStatus::Failed
+    );
+    let resumable = task.map(|t| t.assigned_agent.is_some()).unwrap_or(false)
+        && relux_core::plan_resume(run.session.as_ref(), terminal).is_supported();
     RunRecord {
         run,
         task_title,
@@ -5447,6 +5481,7 @@ fn build_run_record(kernel: &KernelState, run: relux_core::Run) -> RunRecord {
         failure_reason,
         failure_remediation,
         retryable,
+        resumable,
     }
 }
 
@@ -5657,6 +5692,10 @@ fn status_for(err: &KernelError) -> StatusCode {
         KernelError::AdapterRuntimeDisabled { .. } => StatusCode::CONFLICT,
         // Retrying a run that is not in a failed state is a resolvable conflict.
         KernelError::RunNotRetryable { .. } => StatusCode::CONFLICT,
+        // An honest "this run cannot be resumed" (no captured session, an adapter
+        // without safe non-interactive resume, or a run still in flight): the
+        // request is well-formed but the action does not apply — unprocessable.
+        KernelError::RunResumeNotSupported { .. } => StatusCode::UNPROCESSABLE_ENTITY,
         // Proposed-change apply outcomes, mapped honestly: an unknown change is a
         // 404; a not-approved change or a baseline conflict is a resolvable
         // conflict (409); a structurally inapplicable change (no baseline hash, no
@@ -5756,6 +5795,8 @@ mod tests {
             usage: None,
             cost: None,
             retried_from: None,
+            resumed_from: None,
+            session: None,
             artifacts,
             proposed_changes: Vec::new(),
             failure_class: None,
@@ -5772,6 +5813,7 @@ mod tests {
             failure_reason: None,
             failure_remediation: None,
             retryable: false,
+            resumable: false,
         }
     }
 

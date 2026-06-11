@@ -2115,3 +2115,53 @@ and exhausts). Auto-retry is restricted to the two unambiguously-safe, upstream-
 (`TransientProvider`, `Timeout`); every other failure — including the `unknown` catch-all —
 surfaces a remediation and waits for an operator. There is no faked timer: eligibility is a
 real-wall-clock not-before checked only when an operator/cron invokes a tick.
+
+## Reference read — session identity / handoff / resume (this slice)
+
+The audit's §3 P1: Relux had durable agents but **no session/handoff/resume concept beyond a
+cold fresh-run retry**. A finished run recorded its output + metrics but threw away the
+provider's session id, so there was no handoff record and no way to *continue* a session
+(only to start over). This slice captures + persists the adapter session identity, exposes it
+on the run detail, and adds a real, governed `run.resume` for the one adapter that supports
+safe non-interactive resume (Claude CLI) — refusing honestly everywhere else (no faked resume).
+
+### openclaw — files read
+
+- `reference/openclaw-main/src/agents/acp-spawn.ts` — `resumeSessionId` param;
+  `validateAcpResumeSessionOwnership(...)` (a resume is allowed ONLY for a session previously
+  recorded for this requester — ownership-gated); `sessionEntryMatchesAcpResumeSessionId`
+  (match by `agentSessionId`/`acpxSessionId`); `spawnAcp` modes `"run" | "session"`.
+  **Pattern: a session id is a first-class, ownership-checked handle; resume threads it back
+  through the same spawn, and is refused when it cannot be validated.**
+- `reference/openclaw-main/src/agents/command/attempt-execution.ts` —
+  `getCliSessionBinding(sessionEntry, "claude-cli")?.sessionId` (a **per-provider CLI session
+  binding**); `runCliWithSession(nextCliSessionId, activeCliSessionBinding)` (threads the
+  session id into the CLI invocation); `claudeCliSessionTranscriptHasContent({ sessionId })`
+  → **reset to a fresh session when the recorded transcript is missing** rather than fake a
+  resume; `FailoverError.reason === "session_expired"` is treated as non-retryable-with-same-
+  session. **Pattern: capture the provider session id, resume by passing it back through the
+  unchanged gate, and degrade honestly (reset → fresh) when the session is gone.**
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/tools/delegate_tool.py` — `DELEGATE_BLOCKED_TOOLS`, `MAX_DEPTH=1`,
+  synchronous subagents **cancelled on interrupt with work discarded**. **Confirms the contrast:**
+  Hermes subagents are explicitly *non-durable* and have no resume — so Relux's durable-run +
+  captured-session model is the right place to add resume, not a delegate clone.
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| openclaw: **per-provider CLI session binding (`getCliSessionBinding(...).sessionId`)** | `relux_core::RunSession { adapter_session_id, source, resume_supported }` captured from the Claude `--output-format json` envelope's `session_id` (`parse_adapter_result` → `AdapterResultSummary.session_id` → `RunSession::from_envelope`), stamped on the `Run` by `KernelState::set_run_session`. Bounded + redacted: `sanitize_session_id` (argv-safe charset, leading-dash rejected, `MAX_SESSION_ID_LEN`). We store ONLY id + source + capability — never a raw envelope/token/log. |
+| openclaw: **resume threads the session id back through the same spawn (`runCliWithSession`)** | `build_resume_adapter_args(kind, session_id)` = the unchanged safe Claude argv (`-p --permission-mode default --output-format json`) **plus** `--resume <session_id>`; `prepare_cli_run` threads it ONLY when the run's `resumed_from` lineage is set, so a cold run never gets `--resume`. `resume_run` runs through the SAME governed gate (enabled runtime + PATH probe + permission check + bounded, non-bypass spawn) as a normal run. |
+| openclaw: **resume is refused when it cannot be validated/owned** | `relux_core::plan_resume(session, terminal) → ResumeDisposition` (pure, the single source of truth): `Supported` only for a terminal run with a `resume_supported` session; otherwise `NotSupported { reason }` → `KernelError::RunResumeNotSupported` (HTTP 422). `AdapterKind::resume_supported()` is the honest per-kind capability — only the Claude CLI. |
+| openclaw: **degrade honestly (reset → fresh) when the session is gone** | Relux does not pre-validate the upstream session (no equivalent of `claudeCliSessionTranscriptHasContent`); instead an invalid/expired `--resume` fails honestly through the existing `finalize_cli_run` classifier (`is_error`/non-zero exit → `OutputValidation`/`TransientProvider`), never a fabricated success. A fresh **retry** (§7) remains the distinct cold-start path. |
+| openclaw: **session id is a first-class handle** | `Run.resumed_from` is a distinct lineage field (≠ `retried_from`); the run wire (flattened `RunRecord`) carries `session` + `resumed_from` + a derived `resumable`; the Work page shows a copyable Session id, an honest Handoff label, a Resume-of link, and a **Resume session** button (`canResumeRun`). |
+
+**What we deliberately do differently:** we do not claim a process resume the adapter cannot
+do. Only the Claude CLI (`-p --resume <id>`) is wired; Codex `exec` (no captured session id),
+a generic `Command`, and the local echo path all return `ResumeNotSupported` with a specific
+reason and the operator re-runs fresh. The capability flag, the UI label, and the action all
+read from the single `plan_resume` decision, so they can never disagree. No new authority is
+granted — resume reuses the unchanged argv-only, non-bypass, bounded, redacted adapter gate.

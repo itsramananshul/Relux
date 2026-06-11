@@ -49,8 +49,8 @@ pub mod store;
 
 
 pub use adapter::{
-    build_adapter_args, compose_prompt, find_on_path, run_adapter_command, AdapterCommandSpec,
-    AdapterRunOutcome,
+    build_adapter_args, build_resume_adapter_args, compose_prompt, find_on_path,
+    run_adapter_command, AdapterCommandSpec, AdapterRunOutcome,
 };
 pub use agent_config::{
     validate_agent_update, validate_new_agent, AgentConfigError, CreateAgentInput,
@@ -195,6 +195,8 @@ pub enum KernelError {
     NoActiveRun(String),
     #[error("run {run} is not retryable (status {status}); only failed runs can be retried")]
     RunNotRetryable { run: String, status: String },
+    #[error("run {run} cannot be resumed: {reason}")]
+    RunResumeNotSupported { run: String, reason: String },
     #[error("run {run} has no proposed change at index {index}")]
     UnknownProposedChange { run: String, index: usize },
     #[error("proposed change {index} on run {run} is not approved (status {status}); approve it before applying")]

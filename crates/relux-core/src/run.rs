@@ -5,6 +5,7 @@ use crate::artifact::RunArtifact;
 use crate::plugin::PluginId;
 use crate::proposed_change::ProposedChange;
 use crate::run_failure::{RunFailureClass, RunRetryState};
+use crate::run_session::RunSession;
 use crate::task::TaskId;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -79,6 +80,23 @@ pub struct Run {
     /// partial CLI run (master plan section 10.2 `prime.retry_run`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retried_from: Option<RunId>,
+    /// When this run was created by **resuming** an earlier run's provider session
+    /// (`run.resume`), the id of that run. Distinct from `retried_from`: a resume
+    /// continues the prior adapter session (threading its `session.adapter_session_id`
+    /// through the governed `--resume` gate), whereas a retry is a cold fresh run on
+    /// the same task. `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §3. The kernel also reads
+    /// this as the "this is a resume" marker when composing the adapter argv. Never
+    /// both `resumed_from` and `retried_from` are set on one run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_from: Option<RunId>,
+    /// The durable, bounded, redacted **session identity / handoff** captured for
+    /// this run from its adapter's structured result envelope (the Claude CLI
+    /// `session_id`). Records who the provider session was, its source, and whether
+    /// Relux can safely resume it (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §3). `None`
+    /// when the adapter emitted no session id (e.g. the local echo path, Codex
+    /// plain-text, or a generic command). Never a token, raw envelope, or full log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<RunSession>,
     /// Read-only **artifact references** the adapter declared in its structured
     /// result envelope (master plan section 9.6 / section 15). Each is a bounded,
     /// redacted, path-sanitized reference (name/type/summary/source) — NOT a
@@ -135,6 +153,8 @@ mod tests {
             usage: None,
             cost: None,
             retried_from: None,
+            resumed_from: None,
+            session: None,
             artifacts: Vec::new(),
             proposed_changes: Vec::new(),
             failure_class: None,
@@ -150,6 +170,34 @@ mod tests {
             json.get("proposed_changes").is_none(),
             "empty proposed_changes must be omitted"
         );
+        // Absent session/resume metadata stays off the wire (no fabricated nulls).
+        assert!(json.get("session").is_none(), "absent session must be omitted");
+        assert!(json.get("resumed_from").is_none(), "absent resumed_from must be omitted");
+    }
+
+    #[test]
+    fn session_and_resume_lineage_round_trip_on_the_wire() {
+        use crate::run_session::RunSession;
+        let mut run = sample_run();
+        run.session = Some(RunSession {
+            adapter_session_id: "sess-abc-123".into(),
+            source: "claude-cli".into(),
+            resume_supported: true,
+        });
+        run.resumed_from = Some(RunId::new("run_0000"));
+        let json = serde_json::to_value(&run).unwrap();
+        assert_eq!(
+            json.pointer("/session/adapter_session_id").and_then(|v| v.as_str()),
+            Some("sess-abc-123")
+        );
+        assert_eq!(
+            json.pointer("/session/resume_supported").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(json.get("resumed_from").and_then(|v| v.as_str()), Some("run_0000"));
+        let back: Run = serde_json::from_value(json).unwrap();
+        assert_eq!(back.session, run.session);
+        assert_eq!(back.resumed_from, run.resumed_from);
     }
 
     #[test]

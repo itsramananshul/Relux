@@ -91,6 +91,36 @@ impl AdapterKind {
     pub fn is_cli(&self) -> bool {
         !matches!(self, AdapterKind::LocalPrime)
     }
+
+    /// A short, stable source label for this adapter kind, used to tag captured
+    /// artifact references and session identity ("from claude-cli").
+    pub fn source_label(&self) -> &'static str {
+        match self {
+            AdapterKind::LocalPrime => "local-prime",
+            AdapterKind::ClaudeCli => "claude-cli",
+            AdapterKind::CodexCli => "codex-cli",
+            AdapterKind::Command => "command",
+        }
+    }
+
+    /// Whether Relux can perform a **safe, non-interactive provider-session
+    /// resume** for this adapter kind in the current adapter code path
+    /// (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §3 — OpenClaw `resumeSessionId` /
+    /// `runCliWithSession`).
+    ///
+    /// Only the Claude CLI qualifies: `claude -p --resume <session_id>` continues a
+    /// prior session non-interactively, and the kernel threads that session id
+    /// through the same governed, non-bypass spawn gate (argv-only, bounded,
+    /// redacted). The Codex CLI's `exec` path emits no session id we capture and
+    /// has no safe non-interactive resume here; a generic `Command` and the
+    /// in-memory `LocalPrime` echo have no provider session at all. For those a
+    /// "resume" is honestly refused — the operator re-runs fresh instead (a fresh
+    /// retry is a distinct, separate action). This is a per-kind *capability* flag,
+    /// not a claim that a specific session still exists upstream; an invalid or
+    /// expired session id simply fails honestly when the CLI rejects it.
+    pub fn resume_supported(&self) -> bool {
+        matches!(self, AdapterKind::ClaudeCli)
+    }
 }
 
 /// Recognize a well-known adapter kind from a plugin id. Returns `None` for an

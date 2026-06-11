@@ -12,6 +12,9 @@ import {
   runStatusTone,
   formatRunDuration,
   canRetryRun,
+  canResumeRun,
+  runSession,
+  sessionHandoffLabel,
   runMetricsLine,
   phaseLabel,
   isRunInFlight,
@@ -436,6 +439,7 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
   const [lastActivityAt, setLastActivityAt] = useState<number | null>(null);
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
   const [retrying, setRetrying] = useState(false);
+  const [resuming, setResuming] = useState(false);
   // Copy-link state: the shareable absolute `/work?run=` URL is the same one a
   // deep link restores, so an operator can hand a run to a teammate. Reset when
   // the panel switches runs so a stale "copied" note never sticks.
@@ -539,6 +543,21 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
       alert(e instanceof Error ? e.message : "Retry failed");
     } finally {
       setRetrying(false);
+    }
+  }
+
+  // Resume continues the run's captured provider session (distinct from retry's
+  // cold re-run). An honest 422 refusal (no resumable session) surfaces its real
+  // reason here rather than silently doing nothing.
+  async function resume() {
+    setResuming(true);
+    try {
+      const res = await reluxWork.resumeRun(runId);
+      onRetried(res.run_id);
+    } catch (e) {
+      alert(e instanceof Error ? e.message : "Resume failed");
+    } finally {
+      setResuming(false);
     }
   }
 
@@ -679,6 +698,16 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
               {retrying ? "Retrying…" : "Retry"}
             </button>
           )}
+          {run && canResumeRun(run) && (
+            <button
+              className="btn sm"
+              title="Continue this run's captured provider session (threads --resume through the governed adapter gate). Distinct from Retry, which starts a fresh run."
+              onClick={() => void resume()}
+              disabled={resuming}
+            >
+              {resuming ? "Resuming…" : "Resume session"}
+            </button>
+          )}
           <button className="btn ghost sm" onClick={onClose}>Close</button>
         </div>
       </div>
@@ -715,6 +744,41 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
               </a>
             </div>
           )}
+          {run.resumed_from && (
+            <div className="kv"><span>Resume of:</span>
+              <a
+                className="link mono"
+                href={`?run=${encodeURIComponent(run.resumed_from)}`}
+                onClick={(e) => { e.preventDefault(); onOpenRun(run.resumed_from!); }}
+              >
+                {run.resumed_from}
+              </a>
+            </div>
+          )}
+          {/* Durable session identity / handoff captured from the adapter envelope
+              (HERMES_OPENCLAW_DEEP_AUDIT §3). The id is mono + copyable; the label
+              is honest about whether resume is supported here. */}
+          {(() => {
+            const session = runSession(run);
+            if (!session) return null;
+            return (
+              <>
+                <div className="kv"><span>Session:</span>
+                  <span
+                    className="mono"
+                    title="Copy the provider session id"
+                    style={{ cursor: "copy", wordBreak: "break-all" }}
+                    onClick={() => void navigator.clipboard?.writeText(session.adapter_session_id)}
+                  >
+                    {session.adapter_session_id}
+                  </span>
+                </div>
+                <div className="kv"><span>Handoff:</span>
+                  <span className="muted">{sessionHandoffLabel(run)}</span>
+                </div>
+              </>
+            );
+          })()}
           {/* Logical-sequence timestamps (ordering, not wall-clock). Real timing is "Duration" above. */}
           <div className="kv"><span>Sequence:</span><span className="mono">{run.started_at ?? "—"} → {run.ended_at ?? "(in progress)"}</span></div>
           {run.failure_class && (

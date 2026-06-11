@@ -2599,6 +2599,8 @@ impl KernelState {
             usage: None,
             cost: None,
             retried_from: None,
+            resumed_from: None,
+            session: None,
             artifacts: Vec::new(),
             proposed_changes: Vec::new(),
             failure_class: None,
@@ -3097,6 +3099,28 @@ impl KernelState {
             if cost.is_some() {
                 run.cost = cost;
             }
+        }
+    }
+
+    /// Persist the bounded, redacted **session identity / handoff** an adapter
+    /// declared in its structured result envelope onto the durable run record
+    /// (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §3). The raw `session_id` is sanitized,
+    /// bounded, and tagged with the adapter source and a per-kind `resume_supported`
+    /// capability by [`relux_core::RunSession::from_envelope`]. Best-effort: an
+    /// unknown run id, or an envelope that declared no (safe) session id, is a no-op
+    /// (we never write an empty session and never fabricate one). Stores only the
+    /// session id, source, and capability — never a token, raw envelope, or full log.
+    fn set_run_session(
+        &mut self,
+        run_id: &RunId,
+        session_id: Option<&str>,
+        kind: relux_core::AdapterKind,
+    ) {
+        let Some(session) = relux_core::RunSession::from_envelope(session_id, &kind) else {
+            return;
+        };
+        if let Some(run) = self.runs.get_mut(run_id) {
+            run.session = Some(session);
         }
     }
 
@@ -3838,6 +3862,114 @@ impl KernelState {
         }
 
         result
+    }
+
+    /// Resume a prior run's provider session through the governed adapter gate
+    /// (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §3 — OpenClaw `resumeSessionId` /
+    /// `runCliWithSession`). **Distinct from [`Self::retry_run`]**: a retry is a
+    /// cold fresh run on the same task; a resume *continues* the recorded adapter
+    /// session by threading its captured `session.adapter_session_id` into
+    /// `--resume` on the same non-bypass spawn.
+    ///
+    /// Honest by construction — it never fakes a continuation. The prior run must be
+    /// terminal (completed or failed) and carry a session whose adapter
+    /// `resume_supported` is set ([`relux_core::plan_resume`] is the single source of
+    /// truth). Otherwise it refuses with [`KernelError::RunResumeNotSupported`] and a
+    /// specific, secret-free reason (no captured session, an adapter without safe
+    /// non-interactive resume, or a run still in flight) — the operator re-runs fresh
+    /// (a distinct action). When supported, it dispatches through the SAME governed
+    /// CLI path a normal run uses (enabled runtime + PATH probe + permission gate +
+    /// bounded, non-bypass spawn), creating a new run stamped `resumed_from`. If the
+    /// upstream session is invalid/expired the adapter rejects it and the run fails
+    /// honestly — never a fabricated success.
+    pub fn resume_run(&mut self, run_id: &RunId) -> Result<RunId, KernelError> {
+        // 1. Read the prior run's terminal state + captured session, then let the
+        //    pure core decision say whether a resume is honestly possible.
+        let (task_id, status, session) = {
+            let run = self
+                .runs
+                .get(run_id)
+                .ok_or_else(|| KernelError::UnknownRun(run_id.to_string()))?;
+            (run.task_id.clone(), run.status.clone(), run.session.clone())
+        };
+        let terminal = matches!(status, RunStatus::Completed | RunStatus::Failed);
+        let adapter_session_id = match relux_core::plan_resume(session.as_ref(), terminal) {
+            relux_core::ResumeDisposition::Supported { adapter_session_id, .. } => adapter_session_id,
+            relux_core::ResumeDisposition::NotSupported { reason } => {
+                return Err(KernelError::RunResumeNotSupported {
+                    run: run_id.to_string(),
+                    reason,
+                });
+            }
+        };
+        // Supported implies a session is present.
+        let session = session.expect("a supported resume carries a session");
+
+        // 2. Same bar as a retry: the task must still exist and be assigned.
+        let (namespace, adapter) = {
+            let task = self
+                .tasks
+                .get(&task_id)
+                .ok_or_else(|| KernelError::UnknownTask(task_id.to_string()))?;
+            let agent_id = task
+                .assigned_agent
+                .clone()
+                .ok_or_else(|| KernelError::TaskNotAssigned(task_id.to_string()))?;
+            let adapter = self
+                .agents
+                .get(&agent_id)
+                .ok_or_else(|| KernelError::UnknownAgent(agent_id.to_string()))?
+                .adapter_plugin
+                .clone();
+            (task.namespace_id.clone(), adapter)
+        };
+
+        // 3. Re-queue the task and start the fresh run that will carry the resume.
+        if let Some(task) = self.tasks.get_mut(&task_id) {
+            task.status = TaskStatus::Queued;
+            task.updated_at = self.clock.tick();
+        }
+        let new_run_id = self.start_run(&task_id)?;
+
+        // 4. Stamp the new run as a resume BEFORE dispatch: record its lineage and
+        //    carry the prior session forward, so `prepare_cli_run` threads
+        //    `--resume <session_id>` (a normal run has no `resumed_from`, so resume
+        //    never leaks onto a cold run). A successful resume's own envelope will
+        //    overwrite `session` with the freshest reported one in `finalize_cli_run`.
+        if let Some(run) = self.runs.get_mut(&new_run_id) {
+            run.resumed_from = Some(run_id.clone());
+            run.session = Some(session);
+        }
+        self.push_run_event(
+            &new_run_id,
+            "run_resumed_from",
+            "kernel",
+            &format!("resume of run {run_id}"),
+            serde_json::json!({
+                "resumed_from": run_id.as_str(),
+                "adapter_session_id": adapter_session_id,
+            }),
+        );
+
+        // 5. Dispatch through the governed CLI path (a resumable session is a Claude
+        //    CLI session, which runs via the CLI path). Capture the outcome so the
+        //    lineage is durable even when this attempt also fails honestly.
+        let result = self.execute_cli_run(&task_id, &adapter);
+        self.record_audit(
+            "user",
+            "founder",
+            "run:resume",
+            Some("run"),
+            Some(new_run_id.as_str()),
+            Some(&namespace),
+            if result.is_ok() {
+                AuditResult::Success
+            } else {
+                AuditResult::Failed
+            },
+            serde_json::json!({ "resumed_from": run_id.as_str(), "task": task_id.as_str() }),
+        );
+        result.map(|_| new_run_id)
     }
 
     /// Mark a task completed (`docs/RELUX_MASTER_PLAN.md` section 9.5).
@@ -6199,7 +6331,22 @@ impl KernelState {
             &task_title,
             &task_input,
         );
-        let args = crate::adapter::build_adapter_args(&config.kind);
+        // If this run is a resume (its `resumed_from` lineage is set) and carries a
+        // resumable provider session, thread `--resume <session_id>` so the adapter
+        // continues that session instead of starting fresh (the session id is
+        // already sanitized + argv-safe). A normal run has no `resumed_from`, so it
+        // always gets the fresh args — resume never leaks onto a cold run.
+        let resume_session_id = self
+            .runs
+            .get(&run_id)
+            .filter(|r| r.resumed_from.is_some())
+            .and_then(|r| r.session.as_ref())
+            .filter(|s| s.resume_supported)
+            .map(|s| s.adapter_session_id.clone());
+        let args = match resume_session_id.as_deref() {
+            Some(sid) => crate::adapter::build_resume_adapter_args(&config.kind, sid),
+            None => crate::adapter::build_adapter_args(&config.kind),
+        };
         let spec = crate::adapter::AdapterCommandSpec {
             program: program.clone(),
             args,
@@ -6268,7 +6415,7 @@ impl KernelState {
                 // Parse a structured result envelope when the CLI emitted one
                 // (Claude `--output-format json`); otherwise surface plain text.
                 // Never fabricate a tool call or success.
-                let parsed = relux_core::parse_adapter_result(&outcome.stdout, config_kind);
+                let parsed = relux_core::parse_adapter_result(&outcome.stdout, config_kind.clone());
                 let summary = render_adapter_summary(&binary, &outcome, &parsed);
                 self.push_run_event(
                     &run_id,
@@ -6312,6 +6459,9 @@ impl KernelState {
                     // an explicit approval + action and is never automatic).
                     self.set_run_artifacts(&run_id, parsed.artifacts.clone());
                     self.set_run_proposed_changes(&run_id, parsed.proposed_changes.clone());
+                    // An errored run may still have established a provider session
+                    // before failing — capture its identity for handoff/audit.
+                    self.set_run_session(&run_id, parsed.session_id.as_deref(), config_kind.clone());
                     // Classify from the model's own error text: a transient cause
                     // (rate limit, overload) becomes a retryable TransientProvider;
                     // any other error result is OutputValidation (operator review).
@@ -6344,6 +6494,9 @@ impl KernelState {
                 );
                 self.set_run_artifacts(&run_id, parsed.artifacts.clone());
                 self.set_run_proposed_changes(&run_id, parsed.proposed_changes.clone());
+                // Capture the provider session identity for durable handoff/resume
+                // metadata (Claude `--output-format json` emits a `session_id`).
+                self.set_run_session(&run_id, parsed.session_id.as_deref(), config_kind);
                 self.complete_task(task_id)?;
                 let agent = self
                     .runs
@@ -12565,6 +12718,110 @@ mod tests {
             None,
         )
         .unwrap();
+    }
+
+    /// Write a fake CLI that echoes its own argv back to stdout (prefixed so the
+    /// test can find it). Used to confirm the kernel threaded `--resume <id>` into
+    /// the resume spawn — the fake ignores stdin and just reflects the args.
+    fn write_fake_args_cli(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            let path = dir.join(format!("{name}.cmd"));
+            std::fs::write(&path, "@echo off\r\necho ARGV: %*\r\n").unwrap();
+            path
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.join(name);
+            std::fs::write(&path, "#!/bin/sh\necho \"ARGV: $*\"\n").unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+            path
+        }
+    }
+
+    #[test]
+    fn cli_run_captures_provider_session_identity() {
+        // A Claude-style envelope with a `session_id` records a bounded, resumable
+        // RunSession on the run (the durable handoff metadata).
+        let dir = tempfile::tempdir().unwrap();
+        let body = r#"{"type":"result","is_error":false,"result":"did it","session_id":"sess-ABC-123"}"#;
+        let fake = write_fake_json_cli(dir.path(), "fake-claude-sess", body);
+        let mut k = adapter_kernel();
+        enable_claude_with(&mut k, &fake);
+        let (_agent, task) = cli_task(&mut k);
+        let run_id = k.execute_assigned_run(&task).expect("adapter run ok");
+
+        let session = k.run(&run_id).unwrap().session.clone().expect("session captured");
+        assert_eq!(session.adapter_session_id, "sess-ABC-123");
+        assert_eq!(session.source, "claude-cli");
+        assert!(session.resume_supported);
+    }
+
+    #[test]
+    fn resume_run_refuses_a_run_without_a_session() {
+        // A completed run that captured no provider session cannot be resumed —
+        // refused honestly (no faked continuation), not turned into a silent run.
+        let dir = tempfile::tempdir().unwrap();
+        let fake = write_fake_cli(dir.path(), "fake-plain", "plain done");
+        let mut k = adapter_kernel();
+        enable_claude_with(&mut k, &fake);
+        let (_agent, task) = cli_task(&mut k);
+        let run_id = k.execute_assigned_run(&task).expect("adapter run ok");
+        assert!(k.run(&run_id).unwrap().session.is_none());
+
+        let err = k.resume_run(&run_id).unwrap_err();
+        match err {
+            KernelError::RunResumeNotSupported { reason, .. } => {
+                assert!(reason.contains("no provider session"));
+            }
+            other => panic!("expected RunResumeNotSupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resume_run_continues_a_captured_session_and_threads_the_resume_flag() {
+        // First run captures a Claude session; resume then continues it through the
+        // SAME governed gate, threading `--resume <session_id>` into the spawn and
+        // stamping `resumed_from` lineage (distinct from a fresh retry).
+        let dir = tempfile::tempdir().unwrap();
+        let body = r#"{"type":"result","is_error":false,"result":"first","session_id":"sess-XYZ-9"}"#;
+        let fake_json = write_fake_json_cli(dir.path(), "fake-claude-sess2", body);
+        let mut k = adapter_kernel();
+        enable_claude_with(&mut k, &fake_json);
+        let (_agent, task) = cli_task(&mut k);
+        let first = k.execute_assigned_run(&task).expect("first run ok");
+        assert!(k.run(&first).unwrap().session.is_some());
+
+        // Swap the binary for one that reflects its argv, so we can prove the
+        // kernel threaded `--resume sess-XYZ-9` (still the claude_cli kind).
+        let fake_args = write_fake_args_cli(dir.path(), "fake-claude-args");
+        enable_claude_with(&mut k, &fake_args);
+
+        let second = k.resume_run(&first).expect("resume ok");
+        assert_ne!(second, first);
+        let run2 = k.run(&second).unwrap();
+        assert_eq!(run2.resumed_from.as_ref(), Some(&first));
+        assert!(run2.retried_from.is_none(), "resume is not a retry");
+
+        // The argv the kernel actually spawned contains `--resume <id>`.
+        let stdout = k
+            .run_events(&second)
+            .iter()
+            .rev()
+            .find(|e| e.kind == "adapter_output")
+            .and_then(|e| e.payload.get("stdout"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(stdout.contains("--resume"), "argv missing --resume: {stdout}");
+        assert!(stdout.contains("sess-XYZ-9"), "argv missing session id: {stdout}");
+
+        // The resume is recorded on the transcript + audit (honest provenance).
+        assert!(k.run_events(&second).iter().any(|e| e.kind == "run_resumed_from"));
+        assert!(k.audit_log().iter().any(|e| e.action == "run:resume"));
     }
 
     #[test]

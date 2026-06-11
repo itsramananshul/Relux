@@ -19,6 +19,7 @@ pub mod proposed_change;
 pub mod redact;
 pub mod run;
 pub mod run_failure;
+pub mod run_session;
 pub mod runtime;
 pub mod task;
 pub mod tool;
@@ -63,6 +64,9 @@ pub use run::{Run, RunId, RunStatus};
 pub use run_failure::{
     classify_failure, retry_delay_secs, safe_public_message, RunFailureClass, RunRetryState,
     MAX_PUBLIC_MESSAGE_CHARS, MAX_TRANSIENT_RETRIES, RETRY_BACKOFF_SECS,
+};
+pub use run_session::{
+    plan_resume, sanitize_session_id, ResumeDisposition, RunSession, MAX_SESSION_ID_LEN,
 };
 pub use runtime::{
     clamp_runtime_timeout, parse_loopback_url, validate_loopback_url, LoopbackUrl, LoopbackUrlError,

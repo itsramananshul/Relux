@@ -12,6 +12,7 @@ import type {
   ReluxRunArtifact,
   ReluxRunDetail,
   ReluxRunEvent,
+  ReluxRunSession,
 } from "./api";
 
 // The badge tone for a run status. `failed` maps to the shared error-red chip
@@ -52,6 +53,53 @@ export function canRetryRun(run: ReluxRun | ReluxRunDetail): boolean {
   return run.status === "failed";
 }
 
+// The durable session-identity / handoff metadata a run captured from its
+// adapter result envelope (HERMES_OPENCLAW_DEEP_AUDIT §3). Defensive: only accepts
+// a well-formed object (string `adapter_session_id` + `source`, boolean
+// `resume_supported`), so a malformed payload renders nothing rather than
+// throwing. Never invents a session — returns null when none was captured.
+export function runSession(
+  run: ReluxRun | ReluxRunDetail | null | undefined,
+): ReluxRunSession | null {
+  const raw = (run as unknown as { session?: unknown } | null | undefined)?.session;
+  if (!raw || typeof raw !== "object") return null;
+  const rec = raw as Record<string, unknown>;
+  if (typeof rec.adapter_session_id !== "string" || typeof rec.source !== "string") return null;
+  return {
+    adapter_session_id: rec.adapter_session_id,
+    source: rec.source,
+    resume_supported: rec.resume_supported === true,
+  };
+}
+
+// Whether the UI should offer a Resume action for a run. Prefer the backend's
+// derived `resumable` flag (run detail); fall back to the honest local rule (a
+// terminal run that captured a resumable session) for the list view, which only
+// carries the base run shape. Distinct from `canRetryRun` — resume continues the
+// captured provider session; retry starts cold.
+export function canResumeRun(run: ReluxRun | ReluxRunDetail): boolean {
+  const detail = run as ReluxRunDetail;
+  if (typeof detail.resumable === "boolean") return detail.resumable;
+  const session = runSession(run);
+  const terminal = run.status === "completed" || run.status === "failed";
+  return terminal && !!session?.resume_supported;
+}
+
+// An honest one-line label for a run's session handoff: the source + whether
+// Relux can resume it. When a session was captured but is NOT resumable, the id is
+// still kept for handoff/audit/manual continuation — we say so rather than imply a
+// resume that would be refused. Returns null when no session was captured.
+export function sessionHandoffLabel(
+  run: ReluxRun | ReluxRunDetail | null | undefined,
+): string | null {
+  const session = runSession(run);
+  if (!session) return null;
+  if (session.resume_supported) {
+    return `${session.source} session — resume supported (continues this session)`;
+  }
+  return `${session.source} session — resume not supported here (kept for handoff/audit; use Re-run for a fresh attempt)`;
+}
+
 // A one-line, honest metrics summary (cost / turns) for the run header, or null
 // when the adapter reported no structured metrics. Never fabricates numbers.
 export function runMetricsLine(run: ReluxRunDetail): string | null {
@@ -77,6 +125,7 @@ export function phaseLabel(
     run_completed: "Completed",
     run_failed: "Failed",
     run_retried_from: "Retry started",
+    run_resumed_from: "Resume started",
     tool_call: "Tool call",
   };
   if (phase && map[phase]) return map[phase];

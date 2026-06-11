@@ -2147,6 +2147,14 @@ export interface ReluxRun {
   cost?: number;
   // When this run was created by retrying an earlier run, that run's id.
   retried_from?: string;
+  // When this run was created by RESUMING an earlier run's provider session
+  // (run.resume), that run's id. Distinct from `retried_from`: a resume continues
+  // the recorded adapter session; a retry starts cold. Never both at once.
+  resumed_from?: string;
+  // Durable, bounded, redacted session identity / handoff captured from the
+  // adapter's result envelope (the Claude CLI `session_id`). Absent when the
+  // adapter emitted no session id. Never a token, raw envelope, or full log.
+  session?: ReluxRunSession;
   // Read-only artifact references the adapter declared. Absent/empty when none.
   artifacts?: ReluxRunArtifact[];
   // Reviewable proposed file changes the adapter declared (full-content
@@ -2164,6 +2172,17 @@ export interface ReluxRun {
   // [2m,10m,30m,2h] budget is spent. There is no background scheduler — the retry
   // is consumed by a manual Retry or the next autonomy tick.
   retry?: ReluxRunRetry;
+}
+
+// Durable session identity / handoff metadata captured for a run from its
+// adapter's structured result envelope (HERMES_OPENCLAW_DEEP_AUDIT §3). Carries
+// no secrets — just the sanitized session id, the adapter source, and whether
+// Relux can safely resume it. `resume_supported` is honest: when false, the id is
+// still kept for handoff/audit/manual continuation but `run.resume` is refused.
+export interface ReluxRunSession {
+  adapter_session_id: string;
+  source: string;
+  resume_supported: boolean;
 }
 
 // The bounded transient-retry state stamped on a failed, auto-retryable run.
@@ -2218,6 +2237,10 @@ export interface ReluxRunDetail extends ReluxRun {
   failure_remediation?: string;
   // Whether the dashboard should offer a Retry action.
   retryable?: boolean;
+  // Whether the dashboard should offer a Resume action: a terminal run whose task
+  // is still assigned AND that captured a resumable provider session. Distinct
+  // from `retryable` — resume continues the recorded adapter session.
+  resumable?: boolean;
 }
 
 export const reluxWork = {
@@ -2284,6 +2307,14 @@ export const reluxWork = {
   // prime.retry_run). Returns the new run's id.
   retryRun: (id: string) =>
     api.post<{ run_id: string }>(`/v1/relux/runs/${encodeURIComponent(id)}/retry`),
+
+  // Resume a run's captured provider session (HERMES_OPENCLAW_DEEP_AUDIT §3):
+  // continues the recorded adapter session via the governed `--resume` gate.
+  // Distinct from retry (which starts cold). Throws an ApiError (422) when the run
+  // carries no resumable session — the message is the honest reason. Returns the
+  // new run's id.
+  resumeRun: (id: string) =>
+    api.post<{ run_id: string }>(`/v1/relux/runs/${encodeURIComponent(id)}/resume`),
 
   // Record an operator accept/reject of a proposed change (master plan §15).
   // Returns the updated run detail so the panel can refresh in one round trip.

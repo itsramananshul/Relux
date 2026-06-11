@@ -47,6 +47,7 @@ Relux roots audited: `crates/relux-core/src/`, `crates/relux-kernel/src/`, `apps
 | 5 | **Memory compaction / cross-session recall** — Relux keeps a bounded 12-turn ring with no summarization; Hermes/OpenClaw compact + summarize + (Hermes) FTS5 cross-session search. Low urgency at current turn volume but blocks long-running Prime sessions. | 6 | P1/P2 | backend, tests |
 | 6 | **`execute_code` (RPC-from-script deterministic glue)** — the cheapest multi-step primitive; routes back through the same tool gate. Big, but high-leverage. | 2, 4 | P1 | backend, tests, docs |
 | 7 | **Goal/issue hierarchy + monitor/recovery** — Relux orchestration is a flat ≤6-step DAG; Paperclip has Goal→Project→Issue→Run with monitor scheduling + stranded-issue recovery. | 4 | P2 | backend, frontend, docs, tests |
+| 8 | **Session identity / handoff + safe resume** — Relux threw away the provider session id, so a run had no handoff record and could only be re-run cold; OpenClaw captures a per-provider CLI session binding and resumes it (`resumeSessionId` / `runCliWithSession`). | 3 | **P1** *(shipped — see §15)* | backend, frontend, docs, tests |
 
 Slice #1 is the one chosen for this round (see §1, §13) because it is a true agentic-loop gap,
 safe (adds no authority), bounded, feasible in one commit, and reuses existing validators.
@@ -170,24 +171,35 @@ safe (adds no authority), bounded, feasible in one commit, and reuses existing v
   (indexed `(companyId, reportsTo)`), roles, capabilities, per-agent budget, `lastHeartbeatAt`;
   `authorization.ts` `agentIsInSubtree` (50-depth walk). The **durable, outlive-the-turn** model.
 
-### Relux mapping — **partial**
+### Relux mapping — **partial** *(session identity / handoff + Claude resume now implemented — see §15)*
 
 - `crates/relux-core/src/agent.rs` — `Agent` (id/name/description/adapter/persona/skills/status/
   permissions/namespace), `AgentStatus`. `crates/relux-kernel/src/agent_config.rs`,
   `agent_presets.rs` — manual crew config + role presets.
 - Assignment/target resolution: `crates/relux-core/src/orchestration.rs` `resolve_assignee`
   (exact→prefix→substring against the live roster); skill-aware matching.
-- **Durable agents** exist (they outlive the turn and run via the orchestration batch). **Missing**:
-  an explicit `reports_to` org tree / chain-of-command, a session/handoff/resume concept beyond
-  task-level fresh-run retry, and subagent spawn-depth/children caps (orchestration has step/concurrency
-  caps instead).
+- **Session identity / handoff / resume**: `crates/relux-core/src/run_session.rs` — `RunSession`
+  (bounded, redacted `adapter_session_id` + `source` + per-kind `resume_supported`),
+  `sanitize_session_id` (argv-safe, leading-dash-rejected, length-bounded), `plan_resume` →
+  `ResumeDisposition`. The Claude `--output-format json` envelope's `session_id` is lifted by
+  `parse_adapter_result`, stamped on the `Run` (`session`), and a real `run.resume` continues that
+  session through the governed gate (Claude `-p --resume <id>`, `build_resume_adapter_args`,
+  threaded in `prepare_cli_run` only when `resumed_from` is set); Codex/Command honestly refuse.
+  Maps OpenClaw `getCliSessionBinding(...).sessionId` + `runCliWithSession(nextCliSessionId, ...)`.
+- **Durable agents** exist (they outlive the turn and run via the orchestration batch). **Still
+  missing**: an explicit `reports_to` org tree / chain-of-command, subagent spawn-depth/children caps
+  (orchestration has step/concurrency caps instead), and resume of a Codex session / mid-run partial
+  resume (no provider session id is captured on the Codex plain-text path).
 
 ### Priority & slices
 
 - **P2 — `reports_to` chain-of-command + manager-subtree authority** (Paperclip): pairs with scoped
   grants (§5). The lexicon already reserves `reports_to` as a stable internal id. *(backend, tests, docs.)*
-- **P2 — run resume/continuation** (OpenClaw `resumeSessionId`): resume a failed run from its prior
-  session instead of a cold fresh run. Pairs with the error classifier (§7). *(backend, tests.)*
+- **P1 — session identity / handoff + safe Claude resume (SHIPPED THIS ROUND, §15).** Capture +
+  persist the adapter session id (bounded/redacted), expose it on the run detail (copyable, honest
+  resume-supported label), and a real `run.resume` for the Claude CLI through the existing governed
+  adapter gate; everything else refuses honestly (`ResumeNotSupported`). Maps OpenClaw
+  `resumeSessionId` / `runCliWithSession`. Re-run/fresh retry (§7) stays distinct.
 
 ---
 
@@ -557,6 +569,61 @@ read + mapping. In brief:
   every other failure — including, stricter than Hermes, the `unknown` catch-all (a Relux run can
   mutate a workspace) — surfaces a remediation and waits for an operator. A retry never bypasses the
   adapter/approval gates. Surfaced strings are redacted + clamped (`safe_public_message`).
+
+---
+
+## 15. Implemented this round — durable session identity / handoff + safe Claude resume (§3 P1)
+
+See the matching "Reference read — session identity / handoff / resume" entry in
+[`reference-driven-development.md`](reference-driven-development.md) for the full reference read +
+mapping. In brief:
+
+- **Reference read (BINDING).** OpenClaw `src/agents/acp-spawn.ts` (`resumeSessionId`,
+  `validateAcpResumeSessionOwnership`, `sessionEntryMatchesAcpResumeSessionId`) and
+  `src/agents/command/attempt-execution.ts` (`getCliSessionBinding(sessionEntry, "claude-cli").sessionId`,
+  `runCliWithSession(nextCliSessionId, activeCliSessionBinding)`,
+  `claudeCliSessionTranscriptHasContent` → reset-on-missing, `FailoverReason::session_expired`):
+  a per-provider CLI **session binding** is captured, then optionally **resumed** through the same
+  spawn gate; an expired/empty session resets to fresh rather than being faked. Hermes
+  `tools/delegate_tool.py` confirms the contrast (synchronous, **non-durable** subagents, no resume).
+  Paperclip `packages/db/src/schema/agents.ts` confirms the durable-agent baseline (already present in
+  Relux). Relux files read/mapped: `crates/relux-core/src/{run.rs,adapter.rs,adapter_result.rs}`,
+  `crates/relux-kernel/src/{adapter.rs,state.rs,server.rs}`,
+  `apps/dashboard/src/{api.ts,runview.ts,pages/Work.tsx}`.
+
+- **What.** The Claude CLI `--output-format json` envelope carries a top-level `session_id`.
+  `parse_adapter_result` lifts it (`AdapterResultSummary.session_id`);
+  `relux_core::RunSession::from_envelope` sanitizes it (argv-safe charset, leading-dash rejected,
+  `MAX_SESSION_ID_LEN`-bounded) and records a bounded, redacted `RunSession { adapter_session_id,
+  source, resume_supported }` on the `Run` (`set_run_session`, both the success and error-envelope
+  paths). `AdapterKind::resume_supported()` is the honest per-kind capability — **only** the Claude CLI
+  qualifies. We store ONLY the session id + source + capability — never a raw envelope, token, or full log.
+
+- **Resume (real, not faked).** `Run.resumed_from` is a distinct lineage field (separate from
+  `retried_from`). `KernelState::resume_run` uses the pure `relux_core::plan_resume` decision: a
+  terminal run carrying a `resume_supported` session is resumed through the SAME governed CLI gate
+  (enabled runtime + PATH probe + permission check + bounded, non-bypass spawn), threading
+  `--resume <session_id>` via `build_resume_adapter_args` (only when `resumed_from` is set, so resume
+  never leaks onto a cold run); everything else returns `RunResumeNotSupported` with a specific reason
+  (422 on the wire). An invalid/expired session simply fails honestly when the CLI rejects it. The new
+  run is stamped `resumed_from`, audited (`run:resume`), and recorded on the transcript
+  (`run_resumed_from`). Re-run/fresh retry (§7) stays a distinct action.
+
+- **Where it surfaces.** The `session` + `resumed_from` fields flow onto the run wire (flattened
+  `RunRecord`), plus a derived `resumable` flag. The Work page Run Detail shows a copyable Session id,
+  an honest Handoff label (`sessionHandoffLabel` — "resume supported" vs "resume not supported here;
+  kept for handoff/audit"), a "Resume of" lineage link, and a **Resume session** button (distinct from
+  Retry) gated by `canResumeRun`. `POST /v1/relux/runs/:id/resume` backs it.
+
+- **Why it is safe / honest.** Resume reuses the unchanged governed adapter path (argv-only,
+  non-bypass, bounded, redacted); it grants no new authority. It is never represented as a process
+  resume the adapter cannot do — Codex/Command/local-prime refuse with a clear reason. The capability
+  flag, the UI label, and the action all read from the single `plan_resume` source of truth, so they
+  cannot disagree.
+
+- **Still missing (honest).** Codex-session resume and mid-run *partial* resume (the Codex `exec`
+  plain-text path emits no session id we capture); no cross-session search over stored session ids
+  (pairs with §6 cross-session recall).
 
 ---
 

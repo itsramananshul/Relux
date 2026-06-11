@@ -42,6 +42,12 @@ pub struct AdapterResultSummary {
     pub usage: Option<serde_json::Value>,
     /// The envelope's self-reported duration in milliseconds, when present.
     pub duration_ms: Option<u64>,
+    /// The provider's session id (the Claude CLI envelope's top-level
+    /// `session_id`), when present. Captured raw here; sanitized + bounded at the
+    /// run boundary by [`crate::RunSession::from_envelope`]. Drives the durable
+    /// session-identity / handoff / resume metadata (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md`
+    /// §3). Never a token or secret — just the session id.
+    pub session_id: Option<String>,
     /// Read-only artifact references the envelope declared (`artifacts: [...]`).
     /// Bounded, redacted, path-sanitized references — never the file contents, a
     /// diff, or an apply plan (master plan section 9.6 / section 15). Empty when
@@ -66,20 +72,10 @@ impl AdapterResultSummary {
             num_turns: None,
             usage: None,
             duration_ms: None,
+            session_id: None,
             artifacts: Vec::new(),
             proposed_changes: Vec::new(),
         }
-    }
-}
-
-/// A short, stable adapter-source label for an [`AdapterKind`], used to tag
-/// captured artifact references ("from claude-cli").
-fn adapter_source_label(kind: AdapterKind) -> &'static str {
-    match kind {
-        AdapterKind::LocalPrime => "local-prime",
-        AdapterKind::ClaudeCli => "claude-cli",
-        AdapterKind::CodexCli => "codex-cli",
-        AdapterKind::Command => "command",
     }
 }
 
@@ -128,10 +124,17 @@ pub fn parse_adapter_result(stdout: &str, kind: AdapterKind) -> AdapterResultSum
     let num_turns = obj.get("num_turns").and_then(|v| v.as_u64());
     let usage = obj.get("usage").cloned();
     let duration_ms = obj.get("duration_ms").and_then(|v| v.as_u64());
+    // The provider's session id (Claude `--output-format json` emits a top-level
+    // `session_id`), captured for the durable session-identity / handoff / resume
+    // metadata. Stored raw here; sanitized + bounded at the run boundary.
+    let session_id = obj
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     // Capture any declared artifact references read-only (bounded, redacted,
     // path-sanitized). Only from a recognized envelope - an arbitrary JSON blob
     // never reaches here. Never reads the filesystem.
-    let source_label = adapter_source_label(kind);
+    let source_label = kind.source_label();
     let artifacts = capture_run_artifacts(obj.get("artifacts"), source_label);
     // Capture any declared reviewable proposed file changes (full-content
     // replacements with a baseline hash). Pure: never touches the filesystem.
@@ -145,6 +148,7 @@ pub fn parse_adapter_result(stdout: &str, kind: AdapterKind) -> AdapterResultSum
         num_turns,
         usage,
         duration_ms,
+        session_id,
         artifacts,
         proposed_changes,
     }
@@ -177,6 +181,42 @@ mod tests {
             s.usage.as_ref().and_then(|u| u.get("output_tokens")).and_then(|v| v.as_u64()),
             Some(340)
         );
+    }
+
+    #[test]
+    fn captures_session_id_from_claude_envelope() {
+        let stdout = r#"{
+            "type": "result",
+            "is_error": false,
+            "result": "Did the work.",
+            "session_id": "9f3c1e2a-7b6d-4c8e-9a01-abc123",
+            "total_cost_usd": 0.01
+        }"#;
+        let s = parse_adapter_result(stdout, AdapterKind::ClaudeCli);
+        assert!(s.structured);
+        assert_eq!(s.session_id.as_deref(), Some("9f3c1e2a-7b6d-4c8e-9a01-abc123"));
+        // The captured id sanitizes + builds a resumable RunSession for Claude.
+        let session = crate::RunSession::from_envelope(s.session_id.as_deref(), &AdapterKind::ClaudeCli)
+            .expect("session captured");
+        assert_eq!(session.adapter_session_id, "9f3c1e2a-7b6d-4c8e-9a01-abc123");
+        assert_eq!(session.source, "claude-cli");
+        assert!(session.resume_supported);
+    }
+
+    #[test]
+    fn envelope_without_session_id_has_none() {
+        let stdout = r#"{"type":"result","result":"ok"}"#;
+        let s = parse_adapter_result(stdout, AdapterKind::ClaudeCli);
+        assert!(s.structured);
+        assert_eq!(s.session_id, None);
+        assert!(crate::RunSession::from_envelope(s.session_id.as_deref(), &AdapterKind::ClaudeCli).is_none());
+    }
+
+    #[test]
+    fn plain_text_has_no_session_id() {
+        let s = parse_adapter_result("just prose", AdapterKind::CodexCli);
+        assert!(!s.structured);
+        assert_eq!(s.session_id, None);
     }
 
     #[test]

@@ -31,6 +31,9 @@ import {
   failureClassLabel,
   failureClassTone,
   recoveryStatusLine,
+  runSession,
+  canResumeRun,
+  sessionHandoffLabel,
 } from "../src/runview.ts";
 
 // The Work page's run-depth view must read HONESTLY: it only formats/classifies
@@ -66,6 +69,57 @@ test("canRetryRun prefers the backend retryable flag, falls back to failed", () 
   // List shape (no flag): only a failed run is retryable.
   assert.equal(canRetryRun({ id: "r1", task_id: "t", agent_id: "a", adapter_plugin: "p", status: "failed" } as any), true);
   assert.equal(canRetryRun({ id: "r1", task_id: "t", agent_id: "a", adapter_plugin: "p", status: "completed" } as any), false);
+});
+
+test("runSession defensively parses captured session identity", () => {
+  const base = { id: "r1", task_id: "t", agent_id: "a", adapter_plugin: "p", status: "completed" };
+  // No session → null (never fabricated).
+  assert.equal(runSession({ ...base } as any), null);
+  // Malformed payloads render nothing rather than throwing.
+  assert.equal(runSession({ ...base, session: "nope" } as any), null);
+  assert.equal(runSession({ ...base, session: { source: "claude-cli" } } as any), null);
+  // Well-formed session round-trips; a missing resume_supported reads false.
+  assert.deepEqual(
+    runSession({ ...base, session: { adapter_session_id: "sess-1", source: "claude-cli", resume_supported: true } } as any),
+    { adapter_session_id: "sess-1", source: "claude-cli", resume_supported: true },
+  );
+  assert.equal(
+    runSession({ ...base, session: { adapter_session_id: "sess-2", source: "codex-cli" } } as any)?.resume_supported,
+    false,
+  );
+});
+
+test("canResumeRun prefers backend resumable flag, falls back honestly", () => {
+  const base = { id: "r1", task_id: "t", agent_id: "a", adapter_plugin: "p" };
+  // Run detail carries the server-derived flag — trust it exactly.
+  assert.equal(canResumeRun({ ...base, status: "completed", resumable: true } as any), true);
+  assert.equal(canResumeRun({ ...base, status: "completed", resumable: false } as any), false);
+  // List shape (no flag): a terminal run with a resumable session qualifies.
+  assert.equal(
+    canResumeRun({ ...base, status: "completed", session: { adapter_session_id: "s", source: "claude-cli", resume_supported: true } } as any),
+    true,
+  );
+  // A non-resumable session, or a still-running run, does not qualify.
+  assert.equal(
+    canResumeRun({ ...base, status: "completed", session: { adapter_session_id: "s", source: "codex-cli", resume_supported: false } } as any),
+    false,
+  );
+  assert.equal(
+    canResumeRun({ ...base, status: "running", session: { adapter_session_id: "s", source: "claude-cli", resume_supported: true } } as any),
+    false,
+  );
+  // No session at all → not resumable.
+  assert.equal(canResumeRun({ ...base, status: "failed" } as any), false);
+});
+
+test("sessionHandoffLabel is honest about resume support", () => {
+  const base = { id: "r1", task_id: "t", agent_id: "a", adapter_plugin: "p", status: "completed" };
+  assert.equal(sessionHandoffLabel({ ...base } as any), null);
+  const supported = sessionHandoffLabel({ ...base, session: { adapter_session_id: "s", source: "claude-cli", resume_supported: true } } as any);
+  assert.match(supported ?? "", /resume supported/);
+  const unsupported = sessionHandoffLabel({ ...base, session: { adapter_session_id: "s", source: "codex-cli", resume_supported: false } } as any);
+  assert.match(unsupported ?? "", /resume not supported/);
+  assert.match(unsupported ?? "", /handoff\/audit/);
 });
 
 test("runMetricsLine only shows metrics the adapter actually reported", () => {

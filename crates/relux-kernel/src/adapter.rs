@@ -101,6 +101,34 @@ pub fn build_adapter_args(kind: &AdapterKind) -> Vec<String> {
     }
 }
 
+/// Build the argv for a **resume** of a prior provider session: the same safe,
+/// non-bypass invocation as [`build_adapter_args`] plus `--resume <session_id>`,
+/// which continues the recorded Claude CLI session non-interactively
+/// (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §3 — OpenClaw `runCliWithSession`). The
+/// session id is the already-sanitized, argv-safe value from the run's captured
+/// [`relux_core::RunSession`]; it is passed as a single positional argv element
+/// (no shell), so there is no injection surface.
+///
+/// Only the Claude CLI supports this here ([`AdapterKind::resume_supported`]); for
+/// any other kind we fall back to the fresh-run args — the kernel never reaches
+/// this for an unsupported kind because `run.resume` is refused upstream, but the
+/// fallback keeps the function total and honest (a "resume" of a non-resumable
+/// adapter is just a fresh run, never a faked continuation).
+pub fn build_resume_adapter_args(kind: &AdapterKind, session_id: &str) -> Vec<String> {
+    match kind {
+        AdapterKind::ClaudeCli => vec![
+            "-p".to_string(),
+            "--resume".to_string(),
+            session_id.to_string(),
+            "--permission-mode".to_string(),
+            CLAUDE_PERMISSION_MODE.to_string(),
+            "--output-format".to_string(),
+            "json".to_string(),
+        ],
+        _ => build_adapter_args(kind),
+    }
+}
+
 /// Compose the task prompt handed to a CLI adapter. It states who the agent is
 /// (name + persona), the task title and JSON input, and asks the CLI to do the
 /// work and report concisely. Kept conservative for v1.
@@ -356,6 +384,23 @@ mod tests {
         assert!(args.iter().any(|a| a == "default"));
         assert!(!args.iter().any(|a| a.contains("dangerously")));
         assert!(!args.iter().any(|a| a == "bypassPermissions"));
+    }
+
+    #[test]
+    fn resume_args_thread_session_id_through_safe_mode() {
+        let args = build_resume_adapter_args(&AdapterKind::ClaudeCli, "sess-abc-123");
+        // `--resume <id>` is present, the safe permission mode + JSON envelope are
+        // kept, and there is never a bypass/danger flag. The session id is a single
+        // positional argv element (no shell), so there is no injection surface.
+        assert!(args.windows(2).any(|w| w == ["--resume", "sess-abc-123"]));
+        assert!(args.windows(2).any(|w| w == ["--permission-mode", "default"]));
+        assert!(args.windows(2).any(|w| w == ["--output-format", "json"]));
+        assert!(!args.iter().any(|a| a.contains("dangerously")));
+        // A non-Claude kind has no resume here — it degrades to the fresh args.
+        assert_eq!(
+            build_resume_adapter_args(&AdapterKind::CodexCli, "sess-x"),
+            build_adapter_args(&AdapterKind::CodexCli)
+        );
     }
 
     #[test]
