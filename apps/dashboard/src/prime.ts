@@ -1,4 +1,4 @@
-import type { ReluxPendingClarification, ReluxPrimeProposal, ReluxPrimeProposalStep, ReluxPrimeTaskSlots, ReluxPrimeTaskUpdate, ReluxReplyPolish } from "./api";
+import type { ReluxPendingClarification, ReluxPrimeContextRead, ReluxPrimeProposal, ReluxPrimeProposalStep, ReluxPrimeTaskSlots, ReluxPrimeTaskUpdate, ReluxReplyPolish } from "./api";
 
 // Pure helpers for rendering Prime's reviewable plan proposal as a card
 // (RELUX_MASTER_PLAN §10 planning layer, §11.1 "Prime Chat"). The proposal is a
@@ -137,6 +137,61 @@ export function replyPolishLabel(rp: ReluxReplyPolish | undefined): string | nul
 export function decisionSourceLabel(source: string | undefined): string | null {
   const trimmed = source?.trim();
   return trimmed ? `one brain decision · ${trimmed}` : null;
+}
+
+// Compact provenance for the READ-ONLY context tools Prime consulted before answering
+// this turn (the governed read-only tool loop). Returns a short "used: get_task,
+// list_agents" label naming the DISTINCT tools in look order, bounded so a long loop
+// never floods the chip (the overflow collapses into "+N more"). Returns null when no
+// tool was consulted, so the chip only ever appears on a turn that genuinely inspected
+// live state. Provenance only — every read was a fabricate-nothing inspection that
+// changed nothing (§10.1, §17.1).
+const MAX_TOOLS_IN_LABEL = 4;
+export function contextReadsUsedLabel(reads: ReluxPrimeContextRead[] | undefined): string | null {
+  if (!reads || reads.length === 0) return null;
+  const tools: string[] = [];
+  for (const r of reads) {
+    const t = r.tool?.trim();
+    if (t && !tools.includes(t)) tools.push(t);
+  }
+  if (tools.length === 0) return null;
+  const shown = tools.slice(0, MAX_TOOLS_IN_LABEL);
+  const extra = tools.length - shown.length;
+  return `used: ${shown.join(", ")}${extra > 0 ? `, +${extra} more` : ""}`;
+}
+
+// Whether ANY consulted read was an honest MISS (`ok === false`) — e.g. a task id that
+// did not exist or an empty result. The chip uses this for a subtle ok/partial indicator
+// so the operator can see at a glance that not every lookup found what Prime asked for.
+// Prime never fabricates a record, so a miss is reported, never hidden (§17.1).
+export function contextReadsHadMiss(reads: ReluxPrimeContextRead[] | undefined): boolean {
+  return !!reads && reads.some((r) => r.ok === false);
+}
+
+// A bounded one-line detail string for a single context read, for the expandable detail
+// list. The summary is already short and server-clamped; we clamp again defensively so
+// the UI never renders an unbounded blob and never dumps raw JSON (§17.1). The ok/miss
+// status is the caller's to render as an icon — this returns only the text, with an
+// honest fallback when a read carried no summary.
+const MAX_DETAIL_CHARS = 160;
+export function contextReadDetail(read: ReluxPrimeContextRead): string {
+  const summary = (read.summary ?? "").trim();
+  const clamped = summary.length > MAX_DETAIL_CHARS ? summary.slice(0, MAX_DETAIL_CHARS - 1) + "…" : summary;
+  return clamped || (read.ok ? "(no detail)" : "(not found)");
+}
+
+// The reads to SHOW in the expandable detail, bounded so even a pathological loop never
+// floods the card. Returns the first `max` reads plus the count hidden, for an honest
+// "+N more" note. The loop is already server-bounded (MAX_TOOL_ROUNDS), so this is a
+// defensive second cap on the client.
+export const MAX_CONTEXT_READS_SHOWN = 8;
+export function boundedContextReads(
+  reads: ReluxPrimeContextRead[] | undefined,
+  max: number = MAX_CONTEXT_READS_SHOWN,
+): { shown: ReluxPrimeContextRead[]; hidden: number } {
+  if (!reads || reads.length === 0) return { shown: [], hidden: 0 };
+  const shown = reads.slice(0, max);
+  return { shown, hidden: reads.length - shown.length };
 }
 
 // The label for the small "waiting for: …" chip shown while Prime is still expecting an

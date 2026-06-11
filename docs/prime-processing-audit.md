@@ -954,6 +954,43 @@ bounded_and_provenance_only`, `no_brain_gathers_nothing`); the kernel integratio
 `interpret_reply`); and the core wire guard `prime_context_read_round_trips_as_bounded_provenance`
 plus the extended omission assertion. No test calls a real provider.
 
+## Applied change (dashboard provenance for the read-only context loop)
+
+The read-only tool loop (above) shipped the `PrimeTurn.context_reads` wire field but left it
+invisible: the operator could not see what live state Prime inspected before answering, so a brain
+that drilled into a task / the crew / the runs read as a hidden action rather than visible
+provenance. Per master plan §10.1/§17.1 and §11.1 (Prime Chat surfaces what the brain did), and
+following the reference read recorded in `reference-driven-development.md` (open-webui
+`ToolCallDisplay.svelte` — collapsed-by-default summary + per-tool status icon + tool-named label +
+a BOUNDED, expand-to-see result), the inspection is now visible as compact, bounded provenance.
+
+- **Wire type on the dashboard.** `apps/dashboard/src/api.ts` gains `ReluxPrimeContextRead`
+  (`tool` / `ok` / `summary`) and `ReluxPrimeTurn.context_reads?: ReluxPrimeContextRead[]`, mirroring
+  the `relux_core::PrimeContextRead` the kernel already serializes — provenance only, omitted on
+  every turn that consulted no tool.
+- **Pure helpers** (`apps/dashboard/src/prime.ts`): `contextReadsUsedLabel` names the DISTINCT tools
+  in look order, itself bounded (`used: a, b, c, d, +N more`); `contextReadsHadMiss` flags an honest
+  miss (an `ok:false` read — a missing id, never fabricated) for a subtle ok/partial indicator;
+  `contextReadDetail` clamps each read's summary to 160 chars (never an unbounded blob / raw JSON);
+  `boundedContextReads` caps the detail list (`MAX_CONTEXT_READS_SHOWN = 8`) with an honest `+N more`.
+- **UI.** The Prime turn card renders a `<details>` whose `<summary>` is the always-on chip
+  `🔎 used: get_task, list_agents`; expanding it shows a bounded per-read list with a `✓`/`!`
+  ok/miss icon, the tool name, and the clamped one-line summary. Collapsed by default so the chat
+  stays primary and the input composer is untouched; no new panel.
+
+Safety/invariants (binding): this is **presentation/provenance only**. The chip renders ONLY what
+the kernel returned, attributes no authority, and appears only on a turn that genuinely ran the
+(already governed, fail-closed, read-only) loop. Unlike open-webui — which renders the tool's full
+raw arguments/result JSON — Relux ships **no raw JSON / provider envelope to the UI**, only the
+short, server-clamped `summary` (the full result body stayed server-side grounding): the same
+no-leak posture as the two CLI-output shaping seams. A turn that consulted no tool omits the field
+and renders nothing, so existing turns are unaffected.
+
+Pinned by the `apps/dashboard/test/prime.test.ts` cases (`contextReadsUsedLabel` distinct/ordered/
+bounded/null, `contextReadsHadMiss` honest-miss, `contextReadDetail` clamp + honest-fallback,
+`boundedContextReads` cap + hidden-count). No backend change (the wire was already produced by the
+read-only loop slice); the dashboard bundle was rebuilt.
+
 ## Current Prime brain stack
 
 The end-to-end shape of one Prime turn, with the brain strictly additive and the
@@ -1038,10 +1075,6 @@ The **first safe Prime tool loop** now ships (READ-ONLY context tools): on an in
 question turn the brain inspects live state (a task, the crew, the runs) through a governed,
 fail-closed, bounded read-only loop before answering. The obvious next rungs build on it:
 
-- **Dashboard provenance for `context_reads`** — the wire field is present and bounded; a compact
-  B&W "🔎 looked at: <tool> · <summary>" chip on the Prime chat (the read-only-tools counterpart of
-  the existing slot/decision chips) would make the inspection visible. Pure presentation; no new
-  authority. (Deferred from this slice to keep it backend-only and avoid a dist rebuild.)
 - **More read-only tools** — `get_run` (a single run's status/summary/error), `list_plugins` /
   `get_plugin` (installed tools + executable status, reusing `discover_tools`), and `list_approvals`
   are natural next reads, each a pure projection added to the snapshot + an allowlist entry.

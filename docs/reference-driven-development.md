@@ -844,3 +844,52 @@ non-actionful inspection/explanation/question turn (`turn_wants_context` ∧ `!i
 brain authors no intent, no slot, and no action; `Local` (no brain) gathers nothing and is
 byte-for-byte the prior reply path. This is the first rung — read before you speak — with the
 write-capable tool surface deliberately deferred until the read-only loop is proven.
+
+---
+
+## Reference read — dashboard provenance for `context_reads` (this slice)
+
+The read-only tool loop above ships the `PrimeTurn.context_reads` wire field but no UI: the
+operator could not *see* what live state Prime inspected before answering, so a brain that
+drilled into a task / the crew / the runs read as a hidden, magical action rather than visible
+provenance. This slice surfaces it — a compact, bounded provenance chip + a collapsed,
+expandable detail — without dumping raw JSON or any provider envelope. This is a
+presentation-only change; it adds NO authority and does not touch Prime's behavior, so the
+binding "read Hermes/openclaw before changing Prime" rule applies only insofar as the wire it
+renders was already produced by the (already reference-grounded) read-only loop. Per the prompt,
+the read this time targets the chat-UI result-visibility references.
+
+### open-webui — files read (the closest UI analogue)
+
+- `reference/open-webui-main/src/lib/components/common/ToolCallDisplay.svelte` — the canonical
+  "show what a tool did" component:
+  - **Collapsed-by-default, click-to-expand** (`export let open = false;` L33; the header
+    `on:pointerup={() => { open = !open; }}` L117) — the tool row is a compact summary until the
+    user opens it. **Pattern: the provenance is one always-on summary line; the detail is behind a
+    disclosure so the chat is never flooded.**
+  - **A per-tool STATUS ICON** (L127-139): a spinner while `isExecuting`, an emerald `CheckCircle`
+    when `isDone`, a neutral wrench otherwise — the ok/in-flight indicator. **Pattern: a small
+    icon distinguishes a succeeded read from one that did not (yet) complete.**
+  - **Names the tool** in the label (`Executing **{{NAME}}**...` / `View Result from **{{NAME}}**`,
+    L150-160). **Pattern: the summary names the tool(s) that ran.**
+  - **The result body is BOUNDED**: `const RESULT_PREVIEW_LIMIT = 10000;` (L37) clamps the output
+    `pre` to the first N chars with a `Show all ({{COUNT}} characters)` expander (L230-246).
+    **Pattern: never render an unbounded result blob; clamp and offer an explicit expand.**
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| open-webui: **collapsed summary line, detail behind a disclosure** | the Prime turn card renders a `<details>` whose `<summary>` is the always-on chip `🔎 used: <tool>, <tool>` (`contextReadsUsedLabel`); the per-read detail list is collapsed until the operator expands it (`apps/dashboard/src/pages/Prime.tsx`). |
+| open-webui: **per-tool status icon (done vs. in-flight)** | a per-read `✓`/`!` icon colored ok/err, plus a subtle "some lookups found nothing" note driven by `contextReadsHadMiss` — the read-only loop's `ok` flag (an honest miss, never fabricated) is the ok/error indicator. |
+| open-webui: **the label names the tool(s)** | `contextReadsUsedLabel` lists the DISTINCT tool names in look order, itself bounded (`MAX_TOOLS_IN_LABEL = 4`, the rest collapse into `+N more`) so a long loop never floods the chip. |
+| open-webui: **clamp the result body, offer an explicit expand** | the detail is doubly bounded: each read's summary is clamped (`contextReadDetail`, 160 chars + ellipsis) and the list is capped (`boundedContextReads`, `MAX_CONTEXT_READS_SHOWN = 8`, honest `+N more`). |
+
+**What we deliberately do differently:** open-webui renders the tool's **full raw arguments and
+result JSON** in the expanded `pre` blocks (clamped only at 10k chars). Relux deliberately ships
+**no raw JSON / provider envelope to the UI at all** — only the short, server-clamped `summary`
+the kernel already attached to each `PrimeContextRead` (the full result body stayed server-side
+grounding, per the read-only-loop slice). So the disclosure shows a bounded one-line provenance
+per read, never the raw record — the same no-leak posture as the two CLI-output shaping seams. The
+chip is pure presentation: it renders only what the kernel returned, attributes no authority, and
+appears only on a turn that genuinely ran the (already governed, fail-closed, read-only) loop.

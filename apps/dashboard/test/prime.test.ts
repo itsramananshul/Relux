@@ -15,8 +15,12 @@ import {
   pendingClarificationLabel,
   updateChangeSummary,
   updateProvenance,
+  contextReadsUsedLabel,
+  contextReadsHadMiss,
+  contextReadDetail,
+  boundedContextReads,
 } from "../src/prime.ts";
-import type { ReluxPendingClarification, ReluxPrimeProposal, ReluxPrimeTaskSlots, ReluxPrimeTaskUpdate } from "../src/api.ts";
+import type { ReluxPendingClarification, ReluxPrimeContextRead, ReluxPrimeProposal, ReluxPrimeTaskSlots, ReluxPrimeTaskUpdate } from "../src/api.ts";
 
 // The plan proposal card must read HONESTLY: the summary reflects the actual step
 // and agent counts, a single-step proposal is steered to the one-task path (not
@@ -235,4 +239,75 @@ test("updateChangeSummary renders the applied change rows and updateProvenance g
   // An unstamped source still reads as the generic brain label, never blank.
   assert.equal(updateProvenance(update({ source: "brain" })), "brain");
   assert.equal(updateProvenance(undefined), null);
+});
+
+// READ-ONLY context provenance: when a configured brain inspected live state through the
+// governed read-only tool loop before answering, the chip names the DISTINCT tools used,
+// flags an honest miss, and the detail list is clamped and bounded so the chat is never
+// flooded and no raw JSON is dumped (§10.1, §17.1). These pin that the chip never appears
+// without a real read and never fabricates a tool the loop did not run.
+function read(extra: Partial<ReluxPrimeContextRead> = {}): ReluxPrimeContextRead {
+  return { tool: "get_task", ok: true, summary: 'task_0001: "Fix the login redirect" [queued]', ...extra };
+}
+
+test("contextReadsUsedLabel names the distinct tools consulted, in order, else null", () => {
+  assert.equal(
+    contextReadsUsedLabel([read({ tool: "list_tasks" }), read({ tool: "get_task" })]),
+    "used: list_tasks, get_task",
+  );
+  // Duplicate tool names collapse to one entry (the brain may look at the same tool twice).
+  assert.equal(
+    contextReadsUsedLabel([read({ tool: "get_task" }), read({ tool: "get_task" }), read({ tool: "list_agents" })]),
+    "used: get_task, list_agents",
+  );
+  // A long loop is bounded — only the first four distinct tools are named, the rest collapse.
+  assert.equal(
+    contextReadsUsedLabel([
+      read({ tool: "board_summary" }),
+      read({ tool: "list_tasks" }),
+      read({ tool: "get_task" }),
+      read({ tool: "list_agents" }),
+      read({ tool: "get_agent" }),
+      read({ tool: "list_runs" }),
+    ]),
+    "used: board_summary, list_tasks, get_task, list_agents, +2 more",
+  );
+  // No reads (or only blank tool names) -> no chip.
+  assert.equal(contextReadsUsedLabel(undefined), null);
+  assert.equal(contextReadsUsedLabel([]), null);
+  assert.equal(contextReadsUsedLabel([read({ tool: "   " })]), null);
+});
+
+test("contextReadsHadMiss flags an honest miss, never hides one", () => {
+  assert.equal(contextReadsHadMiss([read()]), false);
+  assert.equal(contextReadsHadMiss([read(), read({ ok: false, summary: "no task task_9999" })]), true);
+  assert.equal(contextReadsHadMiss(undefined), false);
+  assert.equal(contextReadsHadMiss([]), false);
+});
+
+test("contextReadDetail clamps a long summary and is honest about a miss", () => {
+  // A normal short summary passes through trimmed.
+  assert.equal(contextReadDetail(read()), 'task_0001: "Fix the login redirect" [queued]');
+  // An over-long summary is clamped with an ellipsis (never an unbounded blob / raw JSON).
+  const long = "x".repeat(300);
+  const detail = contextReadDetail(read({ summary: long }));
+  assert.ok(detail.length <= 160, `detail must be bounded, got ${detail.length}`);
+  assert.ok(detail.endsWith("…"), "a clamped summary ends with an ellipsis");
+  // An empty summary falls back to an honest placeholder per ok/miss — never blank.
+  assert.equal(contextReadDetail(read({ summary: "" })), "(no detail)");
+  assert.equal(contextReadDetail(read({ ok: false, summary: "" })), "(not found)");
+});
+
+test("boundedContextReads caps the detail list and reports the hidden count", () => {
+  const many = Array.from({ length: 11 }, (_, i) => read({ summary: `read ${i}` }));
+  const { shown, hidden } = boundedContextReads(many);
+  assert.equal(shown.length, 8, "the detail list is capped at the client bound");
+  assert.equal(hidden, 3, "the overflow is reported honestly");
+  // A short list shows everything with nothing hidden.
+  const few = boundedContextReads([read(), read({ tool: "list_runs" })]);
+  assert.equal(few.shown.length, 2);
+  assert.equal(few.hidden, 0);
+  // Empty / absent -> nothing shown, nothing hidden.
+  assert.deepEqual(boundedContextReads(undefined), { shown: [], hidden: 0 });
+  assert.deepEqual(boundedContextReads([]), { shown: [], hidden: 0 });
 });

@@ -8,7 +8,7 @@ import {
   type ReluxPrimeSuggestion,
   type ReluxPrimeTurn,
 } from "../api";
-import { brainSourceLabel, decisionSourceLabel, hasSteps, intentProvenance, pendingClarificationLabel, polishProvenance, proposalDisplaySummary, replyPolishLabel, slotProvenance, stepDisplayTitle, updateProvenance } from "../prime";
+import { boundedContextReads, brainSourceLabel, contextReadDetail, contextReadsHadMiss, contextReadsUsedLabel, decisionSourceLabel, hasSteps, intentProvenance, pendingClarificationLabel, polishProvenance, proposalDisplaySummary, replyPolishLabel, slotProvenance, stepDisplayTitle, updateProvenance } from "../prime";
 import { workTaskHref, workRunHref } from "../routing";
 import { PrimeAutonomyPanel } from "../components/PrimeAutonomyPanel";
 import { OrchestrationPanel } from "../components/OrchestrationPanel";
@@ -610,6 +610,62 @@ function PrimeTurnCard({
             ))}
           </div>
         </div>
+      )}
+
+      {/* READ-ONLY context provenance: when a configured brain inspected live state
+          through the governed read-only tool loop before answering (a task, the crew,
+          the runs), surface what it looked at. The summary chip is the lone always-on
+          part; the detail is collapsed and bounded so the chat is never flooded and no
+          raw JSON / provider envelope is dumped. Every read changed nothing — this is
+          pure provenance (RELUX_MASTER_PLAN §10.1, §17.1). */}
+      {contextReadsUsedLabel(turn.context_reads) && (
+        <details
+          style={{
+            marginTop: 10,
+            border: "1px solid var(--border)",
+            borderRadius: 6,
+            padding: "6px 10px",
+            fontSize: 11,
+          }}
+        >
+          <summary style={{ cursor: "pointer" }} title="Prime inspected live state through the governed READ-ONLY tool loop before answering — nothing was changed">
+            <span
+              className={"badge " + (contextReadsHadMiss(turn.context_reads) ? "blocked" : "done")}
+              style={{ fontSize: 9 }}
+            >
+              🔎 {contextReadsUsedLabel(turn.context_reads)}
+            </span>
+            {contextReadsHadMiss(turn.context_reads) && (
+              <span className="muted" style={{ fontSize: 9, marginLeft: 6 }}>some lookups found nothing</span>
+            )}
+          </summary>
+          <div className="col" style={{ gap: 2, marginTop: 6 }}>
+            {(() => {
+              const { shown, hidden } = boundedContextReads(turn.context_reads);
+              return (
+                <>
+                  {shown.map((r, i) => (
+                    <div key={i} className="row" style={{ gap: 6, alignItems: "baseline" }}>
+                      <span
+                        title={r.ok ? "found" : "not found"}
+                        style={{ color: r.ok ? "var(--ok)" : "var(--err)", fontSize: 10, width: 10, flex: "0 0 auto" }}
+                      >
+                        {r.ok ? "✓" : "!"}
+                      </span>
+                      <span className="mono" style={{ fontSize: 10, flex: "0 0 auto" }}>{r.tool}</span>
+                      <span className="muted">{contextReadDetail(r)}</span>
+                    </div>
+                  ))}
+                  {hidden > 0 && (
+                    <div className="muted" style={{ fontSize: 10 }}>
+                      +{hidden} more read{hidden === 1 ? "" : "s"}
+                    </div>
+                  )}
+                </>
+              );
+            })()}
+          </div>
+        </details>
       )}
 
       {(turn.created_task || turn.started_run || turn.created_agent || turn.approval) && (

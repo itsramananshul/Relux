@@ -1502,6 +1502,22 @@ export interface ReluxPrimeTaskUpdate {
   source?: string;
 }
 
+// A bounded, provenance-only record of one READ-ONLY context tool Prime consulted
+// before answering this turn (the governed read-only tool loop in `prime_tools`). The
+// brain could only ever REQUEST an allowlisted read-only tool, never a mutating one (an
+// off-allowlist name is refused, never executed). `ok` is false for an honest MISS (an
+// unknown id / empty result) — Prime never fabricates a record. The full result body
+// stays server-side grounding; only this short summary ships. Present on a turn ONLY
+// when a configured brain ran the loop and gathered at least one read.
+export interface ReluxPrimeContextRead {
+  // The read-only tool that ran, e.g. "get_task" / "list_agents" / "board_summary".
+  tool: string;
+  // Whether the read found what was asked. false is an honest miss, never fabricated.
+  ok: boolean;
+  // A short, human one-line summary of what was read.
+  summary: string;
+}
+
 // A small, bounded record of a clarifying question Prime is still waiting on the user
 // to answer for an actionable request (multi-turn clarify memory). Present on the
 // response ONLY while a clarification is pending; the chat shows a "waiting for: <needs>"
@@ -1554,6 +1570,12 @@ export interface ReluxPrimeTurn {
   // configured brain re-worded this turn's wording through the validated path. The turn
   // stays action-free; this is advisory provenance for the small chip. Omitted otherwise.
   reply_polish?: ReluxReplyPolish;
+  // The READ-ONLY context tools Prime consulted before answering, in the order it looked
+  // (the governed read-only tool loop). Present ONLY when a configured brain ran the loop
+  // and gathered at least one read; omitted on every other turn, so existing clients see
+  // the same JSON they did before. Provenance only — every read was a deterministic,
+  // fabricate-nothing inspection of live state, and none of it is an action.
+  context_reads?: ReluxPrimeContextRead[];
   // Tool fields: present only when Prime ran (or honestly refused) a tool this
   // turn. `invoked_tool` is "<plugin_id>/<tool_name>"; `tool_output` carries the
   // real kernel output; `tool_error` is an honest reason a tool did NOT run.
