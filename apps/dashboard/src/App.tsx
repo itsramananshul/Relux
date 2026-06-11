@@ -4,6 +4,7 @@ import { useAuth } from "./auth";
 import { Login } from "./pages/Login";
 import { Layout } from "./components/Layout";
 import { ReluxShell } from "./components/ReluxShell";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { ReluxHome } from "./pages/ReluxHome";
 import { Prime } from "./pages/Prime";
 import { Overview } from "./pages/Overview";
@@ -81,16 +82,21 @@ export function App() {
   // in-shell "not found" so no path is ever blank.
   return (
     <ReluxShell>
-      <Routes>
-        <Route path="/" element={<ReluxHome />} />
-        <Route path="/prime" element={<Prime />} />
-        <Route path="/work" element={<Work />} />
-        <Route path="/plugins" element={<Plugins />} />
-        <Route path="/crew" element={<Crew />} />
-        <Route path="/approvals" element={<ReluxApprovals />} />
-        <Route path="/health" element={<Health />} />
-        <Route path="*" element={<ReluxNotFound />} />
-      </Routes>
+      {/* A render crash in any one page renders an error card inside the shell
+          instead of white-screening the whole SPA (§17.6; the reported blank
+          pages). Keyed on the path so navigating away clears the error. */}
+      <ErrorBoundary resetKey={loc.pathname}>
+        <Routes>
+          <Route path="/" element={<ReluxHome />} />
+          <Route path="/prime" element={<Prime />} />
+          <Route path="/work" element={<Work />} />
+          <Route path="/plugins" element={<Plugins />} />
+          <Route path="/crew" element={<Crew />} />
+          <Route path="/approvals" element={<ReluxApprovals />} />
+          <Route path="/health" element={<Health />} />
+          <Route path="*" element={<ReluxNotFound />} />
+        </Routes>
+      </ErrorBoundary>
     </ReluxShell>
   );
 }
@@ -101,6 +107,7 @@ export function App() {
 // `relux-kernel serve`), these pages degrade honestly — but the user never lands
 // here first.
 function LegacyDashboard() {
+  const loc = useLocation();
   const { loading, status } = useAuth();
 
   if (loading) {
@@ -114,7 +121,8 @@ function LegacyDashboard() {
 
   return (
     <Layout>
-      <Routes>
+      <ErrorBoundary resetKey={loc.pathname}>
+        <Routes>
         <Route path="/overview" element={<Overview />} />
         <Route path="/mandates" element={<Mandates />} />
         <Route path="/briefs" element={<Briefs />} />
@@ -127,9 +135,10 @@ function LegacyDashboard() {
         <Route path="/approvals" element={<Approvals />} />
         <Route path="/chat" element={<Chat />} />
         <Route path="/scheduled" element={<Scheduled />} />
-        <Route path="/settings" element={<Settings />} />
-        <Route path="*" element={<Navigate to="/overview" replace />} />
-      </Routes>
+          <Route path="/settings" element={<Settings />} />
+          <Route path="*" element={<Navigate to="/overview" replace />} />
+        </Routes>
+      </ErrorBoundary>
     </Layout>
   );
 }

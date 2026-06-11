@@ -35,6 +35,18 @@ Mirror Paperclip's proven shell:
 
 Global singletons mounted once in the shell: the command palette (⌘K), the New-Issue / New-Agent / New-Project / New-Goal dialogs, a toast viewport, and the keyboard-shortcuts cheatsheet.
 
+**Never blank (RELUX_MASTER_PLAN §17.6).** The routed workspace is wrapped, *inside*
+the shell, by a route-level **ErrorBoundary** (`apps/dashboard/src/components/ErrorBoundary.tsx`):
+a render-time throw in any one page renders a readable error card (with the honest
+message, a "Try again", and a "Reload") instead of white-screening the whole SPA.
+The sidebar/topbar stay usable, and the boundary resets on navigation (keyed on the
+pathname), so a bad page never strands the operator. This is the structural backstop
+behind the per-page loading/error/empty states — together they make a blank page
+impossible regardless of API state or an unanticipated data shape. The pure
+message formatter (`errorBoundaryMessage`) is unit-tested; each Relux page also has
+a server-render test (e.g. `test/work-render.test.mjs`, `test/crew-render.test.mjs`)
+that fails if the page throws on mount under the app's declarative router.
+
 ---
 
 ## 3. Navigation (grouped around work objects) + where the 22 panels go
