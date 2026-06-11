@@ -3617,6 +3617,42 @@ impl KernelState {
             plan
         };
 
+        // Brain-assisted by-id update resolution: when the intent is `TaskUpdate` but the
+        // deterministic rail could only CLARIFY (it could not find the task and/or field),
+        // a VALIDATED brain proposal — task existence-checked, fields sanitized/clamped,
+        // status allowlisted, assignee resolved to an existing agent — promotes the turn
+        // to the SAME safe `UpdateTask` action. Gated on a `Clarify` so an explicit-but-
+        // wrong id/agent (an honest `Reply`) or a refused status is never silently
+        // "corrected"; on no/low-confidence/unvalidated proposal the deterministic clarify
+        // stands (the fallback always exists). The kernel still validates everything again
+        // and enforces the terminal-state guard at apply time.
+        let mut update_brain_assisted = false;
+        let plan = if intent == relux_core::PrimeIntent::TaskUpdate
+            && matches!(&plan, PrimePlan::Clarify { .. })
+        {
+            match slots.update.and_then(|proposal| {
+                crate::prime_update_slots::reconcile_update_slots(
+                    crate::prime::extract_task_id(message).as_deref(),
+                    proposal,
+                    &summary,
+                )
+            }) {
+                Some(resolved) => {
+                    update_brain_assisted = true;
+                    PrimePlan::Act {
+                        action: PrimeAction::UpdateTask {
+                            task_id: resolved.task_id.clone(),
+                            patch: resolved.patch.to_patch_string(),
+                        },
+                        text: format!("Updating {}.", resolved.task_id),
+                    }
+                }
+                None => plan,
+            }
+        } else {
+            plan
+        };
+
         self.record_audit(
             "agent",
             ctx.agent.as_str(),
@@ -3653,6 +3689,7 @@ impl KernelState {
                 agent_slots: None,
                 admin_slots: None,
                 assign_slots: None,
+                update: None,
             },
             PrimePlan::Clarify { text } => PrimeTurn {
                 intent,
@@ -3672,6 +3709,7 @@ impl KernelState {
                 agent_slots: None,
                 admin_slots: None,
                 assign_slots: None,
+                update: None,
             },
             PrimePlan::Act { action, text } => {
                 // Brain-assisted slot sharpening (validated): a create action takes
@@ -3750,12 +3788,23 @@ impl KernelState {
                     agent_slots: None,
                     admin_slots,
                     assign_slots: None,
+                    update: None,
                 }
             }
         };
         // Attach the brain-assisted assignment provenance when the promotion above
         // produced the `AssignTask` action (a deterministic assignment carries none).
         turn.assign_slots = assign_provenance;
+        // Mark the by-id update card as brain-resolved when the promotion above produced
+        // the `UpdateTask` action. `prime_execute` always builds `turn.update` with
+        // `source: None` (the change card); the server later replaces a present-and-marked
+        // source with the real model/CLI label. A deterministically-parsed update is left
+        // unmarked, so its card shows no brain chip.
+        if update_brain_assisted {
+            if let Some(u) = turn.update.as_mut() {
+                u.source = Some("brain".to_string());
+            }
+        }
         // Multi-turn clarification memory: record a NEW pending clarification when this
         // turn asked an actionable, resolvable clarifying question, or clear any existing
         // one when the turn resolved/changed it. The combined message is stored as the new
@@ -3850,6 +3899,7 @@ impl KernelState {
             agent_slots: None,
             admin_slots: None,
             assign_slots: None,
+            update: None,
         }
     }
 
@@ -3928,6 +3978,38 @@ impl KernelState {
         }
     }
 
+    /// Build the honest, action-free turn returned when a by-id `UpdateTask` cannot be
+    /// applied (the task vanished, is already terminal, or there was nothing safe to
+    /// change). It changes no durable state and asks the operator to refine — never a
+    /// fake "updated" claim.
+    fn prime_update_refused(
+        &self,
+        intent: relux_core::PrimeIntent,
+        action: PrimeAction,
+        reply: String,
+    ) -> PrimeTurn {
+        PrimeTurn {
+            intent,
+            reply,
+            disposition: PrimeDisposition::NeedsClarification,
+            action: Some(action),
+            created_task: None,
+            started_run: None,
+            created_agent: None,
+            approval: None,
+            invoked_tool: None,
+            tool_output: None,
+            tool_error: None,
+            suggested_actions: Vec::new(),
+            proposal: None,
+            slots: None,
+            agent_slots: None,
+            admin_slots: None,
+            assign_slots: None,
+            update: None,
+        }
+    }
+
     /// Execute the safe `Act` actions Prime is allowed to perform directly.
     ///
     /// `decide` only ever emits `CreateTask` and `StartRun` as `Act`s; any other
@@ -4002,6 +4084,7 @@ impl KernelState {
                     agent_slots: None,
                     admin_slots: None,
                     assign_slots: None,
+                    update: None,
                 })
             }
             PrimeAction::CreateAndRunTask { title } => {
@@ -4067,6 +4150,7 @@ impl KernelState {
                     agent_slots: None,
                     admin_slots: None,
                     assign_slots: None,
+                    update: None,
                 })
             }
             PrimeAction::StartRun { task_id } => {
@@ -4094,6 +4178,7 @@ impl KernelState {
                     agent_slots: None,
                     admin_slots: None,
                     assign_slots: None,
+                    update: None,
                 })
             }
             PrimeAction::CreateAgent {
@@ -4165,6 +4250,7 @@ impl KernelState {
                     agent_slots: provenance,
                     admin_slots: None,
                     assign_slots: None,
+                    update: None,
                 })
             }
             PrimeAction::AssignTask { task_id, agent_id } => {
@@ -4190,6 +4276,149 @@ impl KernelState {
                     agent_slots: None,
                     admin_slots: None,
                     assign_slots: None,
+                    update: None,
+                })
+            }
+            PrimeAction::UpdateTask { task_id, patch } => {
+                // A by-id update is a SAFE mutating action: edit an existing, non-terminal
+                // task in place. Every field in `patch` was validated before it reached
+                // here (decide's rail or the brain-promotion chokepoint); this re-checks
+                // existence, enforces the terminal-state guard, and applies only the
+                // allowlisted fields — so even a stale/forged patch can never edit a
+                // finished task or set a machine-driven status.
+                let task_id = task_id.clone();
+                let tid = TaskId::new(task_id.clone());
+                let patch = crate::prime_update_slots::TaskUpdatePatch::from_patch_str(patch)
+                    .unwrap_or_default();
+
+                let Some((status, namespace)) = self
+                    .tasks
+                    .get(&tid)
+                    .map(|t| (t.status.clone(), t.namespace_id.clone()))
+                else {
+                    return Ok(self.prime_update_refused(
+                        intent,
+                        action,
+                        format!("Task with ID '{task_id}' does not exist. Please provide a valid task ID."),
+                    ));
+                };
+                if crate::prime_update_slots::is_terminal_status(&status) {
+                    return Ok(self.prime_update_refused(
+                        intent,
+                        action,
+                        format!(
+                            "Task {task_id} is already {} — I won't change a finished task.",
+                            crate::prime_update_slots::status_label(&status)
+                        ),
+                    ));
+                }
+                if patch.is_empty() {
+                    return Ok(self.prime_update_refused(
+                        intent,
+                        action,
+                        "There was nothing to change on that task.".to_string(),
+                    ));
+                }
+
+                let now = self.clock.tick();
+                let mut applied: Vec<relux_core::PrimeTaskChange> = Vec::new();
+
+                // Reassignment goes through `assign_task` (validates the agent exists and
+                // moves the task to Queued). Applied first so a co-requested status wins.
+                if let Some(agent) = &patch.assignee {
+                    self.assign_task(&tid, &AgentId::new(agent.clone()))?;
+                    applied.push(relux_core::PrimeTaskChange {
+                        field: "assignee".to_string(),
+                        value: agent.clone(),
+                    });
+                }
+                if let Some(t) = self.tasks.get_mut(&tid) {
+                    if let Some(title) = &patch.title {
+                        t.title = title.clone();
+                        applied.push(relux_core::PrimeTaskChange {
+                            field: "title".to_string(),
+                            value: title.clone(),
+                        });
+                    }
+                    if let Some(details) = &patch.details {
+                        t.input["details"] = serde_json::Value::String(details.clone());
+                        applied.push(relux_core::PrimeTaskChange {
+                            field: "details".to_string(),
+                            value: details.clone(),
+                        });
+                    }
+                    if let Some(priority) = patch.priority {
+                        t.priority = priority;
+                        applied.push(relux_core::PrimeTaskChange {
+                            field: "priority".to_string(),
+                            value: priority.to_string(),
+                        });
+                    }
+                    if let Some(st) = &patch.status {
+                        // Defense in depth: only the operator-settable allowlist is honored.
+                        if crate::prime_update_slots::is_settable_status(st) {
+                            t.status = st.clone();
+                            applied.push(relux_core::PrimeTaskChange {
+                                field: "status".to_string(),
+                                value: crate::prime_update_slots::status_label(st).to_string(),
+                            });
+                        }
+                    }
+                    t.updated_at = now;
+                }
+
+                if applied.is_empty() {
+                    return Ok(self.prime_update_refused(
+                        intent,
+                        action,
+                        "There was nothing I could safely change on that task.".to_string(),
+                    ));
+                }
+
+                let change_pairs: std::collections::BTreeMap<String, String> = applied
+                    .iter()
+                    .map(|c| (c.field.clone(), c.value.clone()))
+                    .collect();
+                self.record_audit(
+                    "agent",
+                    ctx.agent.as_str(),
+                    "task:update",
+                    Some("task"),
+                    Some(task_id.as_str()),
+                    Some(&namespace),
+                    AuditResult::Success,
+                    serde_json::json!({ "changes": change_pairs }),
+                );
+
+                let summary_line = applied
+                    .iter()
+                    .map(|c| format!("{} → {}", c.field, c.value))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let reply = format!("{text} Updated {task_id}: {summary_line}.");
+                Ok(PrimeTurn {
+                    intent,
+                    reply,
+                    disposition: PrimeDisposition::Executed,
+                    action: Some(action),
+                    created_task: None,
+                    started_run: None,
+                    created_agent: None,
+                    approval: None,
+                    invoked_tool: None,
+                    tool_output: None,
+                    tool_error: None,
+                    suggested_actions: Vec::new(),
+                    proposal: None,
+                    slots: None,
+                    agent_slots: None,
+                    admin_slots: None,
+                    assign_slots: None,
+                    update: Some(relux_core::PrimeTaskUpdate {
+                        task_id,
+                        changes: applied,
+                        source: None,
+                    }),
                 })
             }
             PrimeAction::DiscoverTools => {
@@ -4219,6 +4448,7 @@ impl KernelState {
                     agent_slots: None,
                     admin_slots: None,
                     assign_slots: None,
+                    update: None,
                 })
             }
             PrimeAction::InvokeTool {
@@ -4250,6 +4480,7 @@ impl KernelState {
                         agent_slots: None,
                         admin_slots: None,
                         assign_slots: None,
+                        update: None,
                     })
                 }
                 Err(KernelError::OrchestrationNotMultiAgent) => Ok(PrimeTurn {
@@ -4270,6 +4501,7 @@ impl KernelState {
                     agent_slots: None,
                     admin_slots: None,
                     assign_slots: None,
+                    update: None,
                 }),
                 Err(e) => Err(e),
             },
@@ -4294,6 +4526,7 @@ impl KernelState {
                 agent_slots: None,
                 admin_slots: None,
                 assign_slots: None,
+                update: None,
             }),
         }
     }
@@ -4357,6 +4590,7 @@ impl KernelState {
                 agent_slots: None,
                 admin_slots: None,
                 assign_slots: None,
+                update: None,
             }
         };
 
@@ -6131,6 +6365,9 @@ pub struct BrainSlotProposals<'a> {
     /// Resolved assignment slots for an `AssignTask` turn the deterministic extractors
     /// could not complete (validated against the live state before promoting to an Act).
     pub assign: Option<&'a crate::prime_assign_slots::BrainAssignSlots>,
+    /// Resolved by-id update slots for a `TaskUpdate` turn the deterministic rail could
+    /// not resolve (validated against the live state before promoting to an Act).
+    pub update: Option<&'a crate::prime_update_slots::BrainUpdateSlots>,
     /// Whether this bundle was computed by the caller on the COMBINED message of a
     /// multi-turn *continuation* (vs. the raw message of a fresh turn). The kernel keeps
     /// the bundle only when this matches the turn it actually produced — continuation
@@ -7292,6 +7529,202 @@ mod tests {
         assert!(k.pending_clarification_for(&ctx).is_none());
     }
 
+    /// Create one task assigned to Prime and return its id, for the update tests.
+    fn make_task(k: &mut KernelState, ctx: &PrimeContext) -> relux_core::TaskId {
+        k.prime_turn(ctx, "create a task to summarize the README")
+            .unwrap()
+            .created_task
+            .expect("a task was created")
+    }
+
+    fn update_proposal(confidence: f32) -> crate::prime_update_slots::BrainUpdateSlots {
+        crate::prime_update_slots::BrainUpdateSlots {
+            task_id: None,
+            title: None,
+            details: None,
+            priority: None,
+            status: None,
+            assignee: None,
+            confidence,
+            rationale: String::new(),
+        }
+    }
+
+    #[test]
+    fn task_update_applies_each_supported_field() {
+        let (mut k, ctx) = prime_chat_kernel();
+        add_agent(&mut k, &ctx, "researcher");
+        let id = make_task(&mut k, &ctx);
+        let tid = id.as_str().to_string();
+
+        // Title (rename).
+        let t = k
+            .prime_turn(&ctx, &format!("rename {tid} to Fix the login blank page"))
+            .unwrap();
+        assert_eq!(t.disposition, PrimeDisposition::Executed);
+        assert_eq!(k.task(&id).unwrap().title, "Fix the login blank page");
+        let card = t.update.expect("an update card");
+        assert_eq!(card.task_id, tid);
+        assert!(card.changes.iter().any(|c| c.field == "title"));
+        // A deterministic update shows no brain chip.
+        assert!(card.source.is_none());
+
+        // Priority (clamped range).
+        k.prime_turn(&ctx, &format!("set {tid} priority to 8")).unwrap();
+        assert_eq!(k.task(&id).unwrap().priority, 8);
+
+        // Details (folded into the task input).
+        k.prime_turn(&ctx, &format!("set {tid} details to Users see a blank page after SSO"))
+            .unwrap();
+        assert_eq!(
+            k.task(&id).unwrap().input["details"],
+            serde_json::json!("Users see a blank page after SSO")
+        );
+
+        // Assignee (reassignment, validated against the roster).
+        k.prime_turn(&ctx, &format!("reassign {tid} to researcher")).unwrap();
+        assert_eq!(
+            k.task(&id).unwrap().assigned_agent.as_ref(),
+            Some(&AgentId::new("researcher"))
+        );
+
+        // Status (operator-settable: blocked).
+        let t = k.prime_turn(&ctx, &format!("mark {tid} as blocked")).unwrap();
+        assert_eq!(t.disposition, PrimeDisposition::Executed);
+        assert_eq!(k.task(&id).unwrap().status, TaskStatus::Blocked);
+    }
+
+    #[test]
+    fn task_update_fails_closed_on_unknown_task_and_agent() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let id = make_task(&mut k, &ctx);
+
+        // Unknown task id → honest reply (an answer, not a guessed edit), no change.
+        let t = k.prime_turn(&ctx, "set task_9999 priority to 8").unwrap();
+        assert_eq!(t.disposition, PrimeDisposition::Answered);
+        assert!(t.reply.contains("does not exist"));
+        assert!(t.update.is_none());
+
+        // Unknown assignee → honest reply, the task is untouched.
+        let t = k.prime_turn(&ctx, &format!("reassign {} to nobody-here", id.as_str())).unwrap();
+        assert!(t.reply.contains("does not exist"), "got {:?}", t.reply);
+        assert_eq!(
+            k.task(&id).unwrap().assigned_agent.as_ref(),
+            Some(&AgentId::new("prime"))
+        );
+        assert!(t.update.is_none());
+    }
+
+    #[test]
+    fn task_update_refuses_completion_and_terminal_tasks() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let id = make_task(&mut k, &ctx);
+
+        // "mark it done" is honestly refused — Prime never fakes a completion.
+        let t = k.prime_turn(&ctx, &format!("mark {} as done", id.as_str())).unwrap();
+        assert!(t.reply.contains("run lifecycle"), "got {:?}", t.reply);
+        assert_ne!(k.task(&id).unwrap().status, TaskStatus::Completed);
+
+        // Cancel the task (a real terminal transition), then a later edit is refused.
+        k.prime_turn(&ctx, &format!("cancel {}", id.as_str())).unwrap();
+        assert_eq!(k.task(&id).unwrap().status, TaskStatus::Cancelled);
+        let t = k.prime_turn(&ctx, &format!("set {} priority to 9", id.as_str())).unwrap();
+        assert_eq!(t.disposition, PrimeDisposition::NeedsClarification);
+        assert!(t.reply.contains("finished task"), "got {:?}", t.reply);
+        // Priority was NOT changed on the terminal task.
+        assert_eq!(k.task(&id).unwrap().priority, 5);
+    }
+
+    #[test]
+    fn brain_update_slots_resolve_an_under_specified_update() {
+        // "change task priority" names no task → the deterministic rail clarifies; a
+        // validated brain proposal of {task_id, priority} promotes it to a real update.
+        let (mut k, ctx) = prime_chat_kernel();
+        let id = make_task(&mut k, &ctx);
+
+        // "change task priority" names no task → the deterministic rail clarifies; the
+        // validated brain proposal of {task_id, priority} promotes it to a real update.
+        let mut proposal = update_proposal(0.9);
+        proposal.task_id = Some(id.as_str().to_string());
+        proposal.priority = Some(8);
+        let (turn, _) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "change task priority",
+                None,
+                BrainSlotProposals {
+                    update: Some(&proposal),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(turn.disposition, PrimeDisposition::Executed);
+        assert_eq!(k.task(&id).unwrap().priority, 8);
+        // The card carries the brain marker (the server later stamps the real label).
+        let card = turn.update.expect("an update card");
+        assert_eq!(card.source.as_deref(), Some("brain"));
+    }
+
+    #[test]
+    fn brain_update_slots_fail_closed_on_an_unknown_task() {
+        // A brain proposal naming a task that does not exist is rejected; the
+        // deterministic clarify stands and nothing changes.
+        let (mut k, ctx) = prime_chat_kernel();
+        let id = make_task(&mut k, &ctx);
+        let before = k.task(&id).unwrap().priority;
+
+        let mut proposal = update_proposal(0.9);
+        proposal.task_id = Some("task_9999".to_string());
+        proposal.priority = Some(8);
+        let (turn, _) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "change task priority",
+                None,
+                BrainSlotProposals {
+                    update: Some(&proposal),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(turn.disposition, PrimeDisposition::NeedsClarification);
+        assert!(turn.update.is_none());
+        assert_eq!(k.task(&id).unwrap().priority, before);
+    }
+
+    #[test]
+    fn task_update_clarification_is_resolved_by_a_follow_up() {
+        // "change task priority" → "which / what value?" → "task_0001 to 8" continues the
+        // original request through the multi-turn memory (TaskUpdate is now resolvable).
+        let (mut k, ctx) = prime_chat_kernel();
+        let id = make_task(&mut k, &ctx);
+
+        let turn1 = k.prime_turn(&ctx, "change task priority").unwrap();
+        assert_eq!(turn1.disposition, PrimeDisposition::NeedsClarification);
+        assert_eq!(turn1.intent, relux_core::PrimeIntent::TaskUpdate);
+        assert!(k.pending_clarification_for(&ctx).is_some());
+
+        let turn2 = k.prime_turn(&ctx, &format!("{} to 8", id.as_str())).unwrap();
+        assert_eq!(turn2.disposition, PrimeDisposition::Executed);
+        assert_eq!(k.task(&id).unwrap().priority, 8);
+        assert!(k.pending_clarification_for(&ctx).is_none());
+    }
+
+    #[test]
+    fn casual_chat_never_triggers_a_task_update() {
+        // A musing that merely mentions a task must NOT edit it (the conversation guard /
+        // anchored classify keep it a Brainstorming reply).
+        let (mut k, ctx) = prime_chat_kernel();
+        let id = make_task(&mut k, &ctx);
+        let before = k.task(&id).unwrap().priority;
+        let t = k
+            .prime_turn(&ctx, "should we bump the priority on the readme work at some point?")
+            .unwrap();
+        assert_ne!(t.intent, relux_core::PrimeIntent::TaskUpdate);
+        assert!(t.update.is_none());
+        assert_eq!(k.task(&id).unwrap().priority, before);
+    }
+
     #[test]
     fn an_explicit_cancellation_clears_the_pending_clarification() {
         let (mut k, ctx) = prime_chat_kernel();
@@ -7776,15 +8209,9 @@ mod tests {
         use crate::prime_clarify::{clarify_polish_kind, ClarifyKind};
         let (mut k, ctx) = prime_chat_kernel();
 
-        // A TaskUpdate turn always clarifies → eligible for Clarify wording, and it
-        // created nothing (action-free).
-        let (update, _) = k
-            .prime_turn_with_brain(&ctx, "update task_42 priority", None, BrainSlotProposals::default())
-            .unwrap();
-        assert_eq!(clarify_polish_kind(&update), Some(ClarifyKind::Clarify));
-        assert!(update.created_task.is_none() && update.action.is_none());
-
-        // A musing turn → eligible for Brainstorm wording, and mints no task.
+        // A musing turn → eligible for Brainstorm wording, and mints no task. Run first,
+        // because a musing leaves no pending clarification behind (so the under-specified
+        // update turn below is read fresh, not as a continuation of this one).
         let (muse, _) = k
             .prime_turn_with_brain(
                 &ctx,
@@ -7795,6 +8222,14 @@ mod tests {
             .unwrap();
         assert_eq!(clarify_polish_kind(&muse), Some(ClarifyKind::Brainstorm));
         assert!(muse.created_task.is_none());
+
+        // An under-specified TaskUpdate turn (no task named) clarifies → eligible for
+        // Clarify wording, and it created nothing (action-free).
+        let (update, _) = k
+            .prime_turn_with_brain(&ctx, "reassign a task", None, BrainSlotProposals::default())
+            .unwrap();
+        assert_eq!(clarify_polish_kind(&update), Some(ClarifyKind::Clarify));
+        assert!(update.created_task.is_none() && update.action.is_none());
 
         // A real create is ACTIONFUL → the wording path never touches it (the brain is
         // never near an action).

@@ -1,4 +1,4 @@
-import type { ReluxPendingClarification, ReluxPrimeProposal, ReluxPrimeProposalStep, ReluxPrimeTaskSlots, ReluxReplyPolish } from "./api";
+import type { ReluxPendingClarification, ReluxPrimeProposal, ReluxPrimeProposalStep, ReluxPrimeTaskSlots, ReluxPrimeTaskUpdate, ReluxReplyPolish } from "./api";
 
 // Pure helpers for rendering Prime's reviewable plan proposal as a card
 // (RELUX_MASTER_PLAN §10 planning layer, §11.1 "Prime Chat"). The proposal is a
@@ -94,6 +94,24 @@ export function slotProvenance(slots: ReluxPrimeTaskSlots | undefined): string |
 export function brainSourceLabel(source: string | undefined): string {
   const trimmed = source?.trim();
   return trimmed ? trimmed : "AI brain";
+}
+
+// A one-line summary of what a by-id task update changed, e.g.
+// "priority → 8, status → blocked". The kernel attaches `update` ONLY on a successful
+// TaskUpdate turn and already validated every change, so this just renders the applied
+// rows — it never fabricates a field. Returns "" for an (impossible) empty change set.
+export function updateChangeSummary(update: ReluxPrimeTaskUpdate | undefined): string {
+  if (!update || update.changes.length === 0) return "";
+  return update.changes.map((c) => `${c.field} → ${c.value}`).join(", ");
+}
+
+// The brain-provenance chip label for a by-id update, present ONLY when a configured
+// brain resolved the change the deterministic extractors missed (the kernel stamped
+// `source`). Returns null for a deterministically-parsed update (no chip), so the chip
+// only ever appears on a genuine, validated brain contribution.
+export function updateProvenance(update: ReluxPrimeTaskUpdate | undefined): string | null {
+  if (!update || !update.source) return null;
+  return brainSourceLabel(update.source);
 }
 
 // Honest provenance for a brain-polished clarify / brainstorm REPLY. The server attaches

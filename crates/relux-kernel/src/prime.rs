@@ -242,6 +242,29 @@ pub fn classify_intent(message: &str) -> PrimeIntent {
     if is_question(&m) && !is_explicit_command(&m) {
         return PrimeIntent::Brainstorming;
     }
+    // By-id task UPDATE: a message that names a SPECIFIC existing-looking task
+    // (`task_…`) and a field to change is an edit, not new work — checked BEFORE the
+    // broad task-creation catch so "rename task_0001 to Fix the login page" is not
+    // misread as creating a task off the embedded verb "fix". Anchored on a real
+    // `task_…` reference + an update-field word so it never swallows casual chat; a
+    // question ("should I cancel task_0001?") was already routed to Brainstorming by the
+    // conversation guard above.
+    if extract_task_id(&m).is_some()
+        && (m.contains("priority")
+            || m.contains("rename")
+            || m.contains("retitle")
+            || m.contains("title")
+            || m.contains("reassign")
+            || m.contains("assignee")
+            || m.contains("cancel")
+            || m.contains("block")
+            || m.contains("status")
+            || m.contains("detail")
+            || m.contains("description")
+            || m.contains("notes"))
+    {
+        return PrimeIntent::TaskUpdate;
+    }
     // Task creation: the broad "this is work" catch. A work verb counts only as a
     // WHOLE WORD ("please fix the login bug"), never a substring - so "the prefix
     // is wrong" (fix), "show me a preview" (review), "the building plan" (build),
@@ -552,8 +575,45 @@ pub fn decide(message: &str, intent: &PrimeIntent, summary: &StateSummary) -> Pr
                 },
             }
         },
-        PrimeIntent::TaskUpdate => PrimePlan::Clarify {
-            text: task_update_clarify(message),
+        // A by-id task update is a real, SAFE mutating action: the deterministic rail
+        // parses a simple command ("rename task_0001 to X", "set task_0001 priority to
+        // 8", "cancel task_0001"), validates every piece against the live state, and
+        // produces an `UpdateTask` `Act`. An unknown task / agent fails closed with an
+        // honest reply; a non-settable status (e.g. "mark it done") is honestly refused
+        // (never faked into a completion); a missing task/field asks one concrete
+        // question (a resolvable clarify the memory + brain can continue). The kernel
+        // applies the validated patch and enforces the terminal-state guard.
+        PrimeIntent::TaskUpdate => match crate::prime_update_slots::deterministic_update(message, summary) {
+            crate::prime_update_slots::DeterministicUpdate::Resolved(resolved) => PrimePlan::Act {
+                action: PrimeAction::UpdateTask {
+                    task_id: resolved.task_id.clone(),
+                    patch: resolved.patch.to_patch_string(),
+                },
+                text: format!("Updating {}.", resolved.task_id),
+            },
+            crate::prime_update_slots::DeterministicUpdate::UnknownTask(id) => PrimePlan::Reply {
+                text: format!("Task with ID '{id}' does not exist. Please provide a valid task ID."),
+            },
+            crate::prime_update_slots::DeterministicUpdate::AmbiguousAssignee { phrase, matches } => {
+                PrimePlan::Clarify {
+                    text: format!(
+                        "More than one agent matches \"{}\": {}. Which one should I reassign it to?",
+                        phrase,
+                        matches.join(", "),
+                    ),
+                }
+            }
+            crate::prime_update_slots::DeterministicUpdate::UnknownAssignee(phrase) => PrimePlan::Reply {
+                text: format!("Agent with ID '{phrase}' does not exist. Please provide a valid agent name."),
+            },
+            crate::prime_update_slots::DeterministicUpdate::RejectedStatus(label) => PrimePlan::Reply {
+                text: format!(
+                    "I can't set a task to {label} from chat — that happens through the run lifecycle. I can cancel or block a task, or change its priority, title, details, or assignee."
+                ),
+            },
+            crate::prime_update_slots::DeterministicUpdate::NeedsClarification => PrimePlan::Clarify {
+                text: task_update_clarify(message),
+            },
         },
         PrimeIntent::DashboardNavigation => PrimePlan::Reply {
             text: "The board, runs, approvals, and audit log are the operating surfaces. The dashboard UI is a later slice; for now I can summarize any of them."
@@ -1013,14 +1073,15 @@ fn orchestration_clarify(goal: &str) -> String {
     }
 }
 
-/// Build the clarify for a `TaskUpdate` request (section 10.5).
+/// Build the clarify for an under-specified `TaskUpdate` request (section 10.5).
 ///
-/// `TaskUpdate` always clarifies today — there is no `UpdateTask` action wired, so
-/// this never claims to apply an edit. But instead of the old fixed "Which task
-/// should I update, and what should change?", it reflects whatever the message
-/// already named — the target task id ([`extract_task_id`]) and/or the field being
-/// changed ([`update_change_phrase`]) — and asks only for the piece that is still
-/// missing. Same reflect-and-clarify shape as [`brainstorm_reply`].
+/// Reached only when the deterministic rail could not resolve a concrete update (a
+/// missing task id and/or no recognizable field) — a real `UpdateTask` action IS now
+/// wired ([`crate::prime_update_slots`]), so this is the ask-one-question fallback, a
+/// *resolvable* clarify the multi-turn memory + brain can continue. It reflects
+/// whatever the message already named — the target task id ([`extract_task_id`])
+/// and/or the field being changed ([`update_change_phrase`]) — and asks only for the
+/// piece that is still missing. Same reflect-and-clarify shape as [`brainstorm_reply`].
 fn task_update_clarify(message: &str) -> String {
     let task_id = extract_task_id(message);
     let field = update_change_phrase(message);
@@ -1802,6 +1863,15 @@ pub fn clarify_needs_label(intent: &PrimeIntent, message: &str) -> String {
         }
         PrimeIntent::TaskCreation | PrimeIntent::CreateAndRunTask => "task description".to_string(),
         PrimeIntent::RunStart => "task id".to_string(),
+        PrimeIntent::TaskUpdate => {
+            let has_task = extract_task_id(message).is_some();
+            let has_field = update_change_phrase(message).is_some();
+            match (has_task, has_field) {
+                (false, true) => "task id".to_string(),
+                (true, false) => "the field to change".to_string(),
+                _ => "task id and change".to_string(),
+            }
+        }
         _ => "more detail".to_string(),
     }
 }
@@ -2386,46 +2456,83 @@ mod tests {
         assert_eq!(committed, goal, "preview and commit must share the goal");
     }
 
-    #[test]
-    fn task_update_clarify_reflects_target_and_field() {
-        // The update arm always clarifies (no UpdateTask action wired), but it now
-        // reflects whatever the message already named and asks only for the missing
-        // piece (section 10.5).
-        let cases = [
-            // (message, must-contain substrings)
-            (
-                "update task_42 priority to high",
-                vec!["task_42", "priority"],
-            ),
-            ("set priority on the onboarding task", vec!["priority"]),
-            ("rename task_7", vec!["task_7", "title"]),
-            ("reassign task_9", vec!["task_9", "assignee"]),
-        ];
-        for (msg, needles) in cases {
-            let plan = decide(msg, &PrimeIntent::TaskUpdate, &empty_summary());
-            let text = match plan {
-                PrimePlan::Clarify { text } => text,
-                other => panic!("{msg:?} must clarify, got {other:?}"),
-            };
-            for needle in needles {
-                assert!(
-                    text.contains(needle),
-                    "clarify for {msg:?} must reflect {needle:?}, got {text:?}"
-                );
-            }
-            assert!(text.contains('?'), "clarify for {msg:?} must ask, got {text:?}");
-        }
+    /// A summary with the given task ids (queued) and agent ids, for the by-id update
+    /// decide tests.
+    fn summary_with(task_ids: &[&str], agent_ids: &[&str]) -> StateSummary {
+        let mut s = empty_summary();
+        s.all_task_ids = task_ids.iter().map(|t| t.to_string()).collect();
+        s.all_agent_ids = agent_ids.iter().map(|a| a.to_string()).collect();
+        s.tasks_total = task_ids.len();
+        s.agents = agent_ids.len();
+        s.queued = task_ids
+            .iter()
+            .map(|id| brief(id, &format!("title for {id}"), TaskStatus::Queued))
+            .collect();
+        s
+    }
 
-        // Names neither a task nor a field: improved generic that still enumerates
-        // the editable fields instead of the old bare two-part question.
-        let plan = decide("change task somehow", &PrimeIntent::TaskUpdate, &empty_summary());
-        match plan {
-            PrimePlan::Clarify { text } => assert!(
-                text.contains("priority") && text.contains("status"),
-                "generic clarify enumerates the editable fields, got {text:?}"
+    #[test]
+    fn task_update_decide_applies_a_simple_command() {
+        // The deterministic rail turns a simple, grounded command into a real
+        // `UpdateTask` Act (the action is finally wired).
+        let s = summary_with(&["task_0001"], &[]);
+        match decide("set task_0001 priority to 8", &PrimeIntent::TaskUpdate, &s) {
+            PrimePlan::Act {
+                action: PrimeAction::UpdateTask { task_id, patch },
+                ..
+            } => {
+                assert_eq!(task_id, "task_0001");
+                assert!(patch.contains("\"priority\":8"), "patch carries priority: {patch}");
+            }
+            other => panic!("expected an UpdateTask Act, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_update_decide_fails_closed_and_refuses_completion() {
+        let s = summary_with(&["task_0001"], &[]);
+        // An unknown task id fails closed with an honest reply (never a guessed edit).
+        match decide("set task_9999 priority to 8", &PrimeIntent::TaskUpdate, &s) {
+            PrimePlan::Reply { text } => assert!(text.contains("does not exist"), "got {text:?}"),
+            other => panic!("expected a Reply, got {other:?}"),
+        }
+        // "mark it done" is honestly refused — Prime never fakes a completion.
+        match decide("mark task_0001 as done", &PrimeIntent::TaskUpdate, &s) {
+            PrimePlan::Reply { text } => assert!(
+                text.contains("run lifecycle"),
+                "completion is refused honestly, got {text:?}"
             ),
+            other => panic!("expected a Reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_update_decide_clarifies_when_underspecified() {
+        let s = summary_with(&["task_0001"], &[]);
+        // A field but no task id reflects the field and asks for the task.
+        match decide("set the priority", &PrimeIntent::TaskUpdate, &s) {
+            PrimePlan::Clarify { text } => {
+                assert!(text.contains("priority"), "reflects the field, got {text:?}");
+                assert!(text.contains('?'), "asks a question, got {text:?}");
+            }
             other => panic!("expected Clarify, got {other:?}"),
         }
+        // A task but no field clarifies too.
+        assert!(matches!(
+            decide("update task_0001", &PrimeIntent::TaskUpdate, &s),
+            PrimePlan::Clarify { .. }
+        ));
+    }
+
+    #[test]
+    fn task_update_is_classified_for_by_id_field_commands() {
+        // The classify rail recognizes a task-anchored field command as a by-id update,
+        // so the deterministic fallback reaches the right arm without a brain.
+        assert_eq!(classify_intent("set task_0001 priority to 8"), PrimeIntent::TaskUpdate);
+        assert_eq!(classify_intent("cancel task_0001"), PrimeIntent::TaskUpdate);
+        assert_eq!(classify_intent("rename task_0001 to Fix the login page"), PrimeIntent::TaskUpdate);
+        // A question about a task is still a conversation, never a silent edit.
+        assert_eq!(classify_intent("should I cancel task_0001?"), PrimeIntent::Brainstorming);
     }
 
     #[test]

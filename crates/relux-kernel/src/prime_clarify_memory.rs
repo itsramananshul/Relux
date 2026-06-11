@@ -123,10 +123,11 @@ pub fn is_cancellation(message: &str) -> bool {
 /// Whether a clarifying turn for `intent` is one this memory can later RESOLVE with a
 /// follow-up answer. Only the intents whose `decide` arm produces a concrete action when
 /// the missing field is supplied are eligible — assignment (needs a task id / agent), task
-/// creation (needs a description), and run start (needs a task id, now that the `StartRun`
-/// action is wired to honor an explicit, ready task id). A task update is still NOT
-/// recorded because no `UpdateTask` action is wired, so the memory never sets up a loop
-/// that cannot resolve and never fakes an unsupported action
+/// creation (needs a description), run start (needs a task id, now that the `StartRun`
+/// action honors an explicit, ready task id), and task UPDATE (needs a task id and/or a
+/// field, now that the `UpdateTask` action is wired). So "raise the priority" → "task_0001
+/// to 8" continues the original request instead of being read blind. The memory never sets
+/// up a loop that cannot resolve, and never fakes an unsupported action
 /// (`docs/reference-driven-development.md`: no faked capability).
 pub fn is_resolvable_clarify_intent(intent: &PrimeIntent) -> bool {
     matches!(
@@ -135,6 +136,7 @@ pub fn is_resolvable_clarify_intent(intent: &PrimeIntent) -> bool {
             | PrimeIntent::TaskCreation
             | PrimeIntent::CreateAndRunTask
             | PrimeIntent::RunStart
+            | PrimeIntent::TaskUpdate
     )
 }
 
@@ -271,8 +273,10 @@ mod tests {
         assert!(is_resolvable_clarify_intent(&PrimeIntent::CreateAndRunTask));
         // Run start is now resolvable by a task id (the `StartRun` by-id action is wired).
         assert!(is_resolvable_clarify_intent(&PrimeIntent::RunStart));
-        // A task update clarify still has no `UpdateTask` action wired, so it is not
-        // recorded (no faked, unresolvable continuation).
-        assert!(!is_resolvable_clarify_intent(&PrimeIntent::TaskUpdate));
+        // A task update clarify is now resolvable too (the `UpdateTask` action is wired),
+        // so "raise the priority" → "task_0001 to 8" continues the original request.
+        assert!(is_resolvable_clarify_intent(&PrimeIntent::TaskUpdate));
+        // A non-actionable conversational intent is never recorded.
+        assert!(!is_resolvable_clarify_intent(&PrimeIntent::Brainstorming));
     }
 }

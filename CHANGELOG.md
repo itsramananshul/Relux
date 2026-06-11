@@ -9,6 +9,32 @@ once a stable release is cut.
 
 ### Added
 
+- **Safe by-id task UPDATE for Prime (post-v0.1.7).** `PrimeAction::UpdateTask
+  { task_id, patch }` is now a REAL, safe mutating action instead of an always-clarify
+  dead end (`crates/relux-kernel/src/prime_update_slots.rs`). A deterministic rail
+  parses simple commands ("rename task_0001 to Fix the login blank page", "set
+  task_0001 priority to 8", "cancel task_0001", "reassign task_0001 to the researcher")
+  and a configured brain resolves the references the extractors miss ("change task
+  priority" → a validated `{task_id, priority}`), both validated hard before any
+  mutation. **Supported fields:** title, details (folded into the task input),
+  priority (clamped 1-9), status (operator-settable **blocked / cancelled** only),
+  assignee (resolved to an existing agent). Safety: the `task_id` must exist; field
+  names are allowlisted; values are sanitized/clamped; an assignee must match the live
+  roster; a **terminal-state guard** refuses editing a completed/failed/cancelled/
+  expired task; and Prime **never decrees a fake completion** — "mark it done" is
+  honestly refused (completion flows through the run lifecycle). The brain may promote
+  an under-specified `TaskUpdate` clarify to the same safe action ONLY when both the
+  task and the change validate against the live state; any failure leaves the
+  deterministic clarify/honest-reply in place. The multi-turn clarify memory now
+  records a `TaskUpdate` clarify ("change task priority" → "task_0001 to 8" continues
+  it), the chat shows a "what changed" card with a `🧠 <source>` chip when a brain
+  resolved the change, and the classifier recognizes a task-anchored field command as
+  an update (a *question* about a task stays a conversation). Reference-grounded in
+  openclaw's `update-plan-tool` (schema + status allowlist), `tool-mutation`
+  (mutating-action classifier), `sessions-spawn-tool`/`common.ts` (reject unsupported
+  keys, require/clamp), and Hermes' `coerce_tool_args` / sanitization
+  (`docs/reference-driven-development.md`, `docs/prime-processing-audit.md`).
+
 - **Brain-mediated Prime intent classification (post-v0.1.7).** Prime's intent is
   no longer decided by the keyword cascade alone. When a real brain is configured
   (OpenRouter, or the local Claude / Codex CLI) it now *proposes* the intent of a

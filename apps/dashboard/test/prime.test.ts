@@ -12,8 +12,10 @@ import {
   brainSourceLabel,
   replyPolishLabel,
   pendingClarificationLabel,
+  updateChangeSummary,
+  updateProvenance,
 } from "../src/prime.ts";
-import type { ReluxPendingClarification, ReluxPrimeProposal, ReluxPrimeTaskSlots } from "../src/api.ts";
+import type { ReluxPendingClarification, ReluxPrimeProposal, ReluxPrimeTaskSlots, ReluxPrimeTaskUpdate } from "../src/api.ts";
 
 // The plan proposal card must read HONESTLY: the summary reflects the actual step
 // and agent counts, a single-step proposal is steered to the one-task path (not
@@ -194,4 +196,30 @@ test("pendingClarificationLabel names the missing field while a clarification is
   assert.equal(pendingClarificationLabel(undefined), null);
   // A pending record with an empty `needs` still reads sensibly, never blank.
   assert.equal(pendingClarificationLabel(pending({ needs: "   " })), "waiting for your answer");
+});
+
+// By-id task update card: the change summary renders the applied rows honestly, and the
+// brain provenance chip appears ONLY when a configured brain resolved the change.
+function update(extra: Partial<ReluxPrimeTaskUpdate> = {}): ReluxPrimeTaskUpdate {
+  return {
+    task_id: "task_0001",
+    changes: [
+      { field: "priority", value: "8" },
+      { field: "status", value: "blocked" },
+    ],
+    ...extra,
+  };
+}
+
+test("updateChangeSummary renders the applied change rows and updateProvenance gates the chip", () => {
+  assert.equal(updateChangeSummary(update()), "priority → 8, status → blocked");
+  // No update -> nothing to render.
+  assert.equal(updateChangeSummary(undefined), "");
+  // A deterministically-parsed update shows the card but NO brain chip.
+  assert.equal(updateProvenance(update()), null);
+  // A brain-resolved update surfaces the stamped provenance label.
+  assert.equal(updateProvenance(update({ source: "anthropic/claude-3.5-haiku" })), "anthropic/claude-3.5-haiku");
+  // An unstamped source still reads as the generic brain label, never blank.
+  assert.equal(updateProvenance(update({ source: "brain" })), "brain");
+  assert.equal(updateProvenance(undefined), null);
 });

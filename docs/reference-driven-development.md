@@ -558,3 +558,71 @@ freely) and BOTH ids are validated against the live state first. The brain autho
 and can name nothing that is not real; a risky intent still becomes an approval-gated `Propose`,
 and any failure (no brain, low confidence, unknown id, mismatched continuation flag) leaves the
 deterministic clarify in place.
+
+---
+
+## Reference read — safe by-id task UPDATE (this slice)
+
+`TaskUpdate` was the last resolvable-looking clarify with no action behind it: `decide`
+could only ask "which task, what field?" and the multi-turn memory deliberately refused to
+record it (no faked capability). This slice wires `PrimeAction::UpdateTask { task_id, patch }`
+as a REAL, safe mutating action — a deterministic rail for the simple commands plus a
+brain-assisted fallback for the references the extractors miss — validated hard before any
+mutation, and makes the `TaskUpdate` clarify resolvable.
+
+### Paperclip (openclaw) — files read
+
+- `reference/openclaw-main/src/agents/tools/update-plan-tool.ts` — `readPlanSteps` (L39-74):
+  validate a structured UPDATE payload field-by-field, check `status` against the
+  `PLAN_STEP_STATUSES` **allowlist** (L9), and clamp ("at most one `in_progress`"). The
+  canonical "validate an update against a schema + a status allowlist" shape.
+- `reference/openclaw-main/src/agents/tool-mutation.ts` — `isMutatingToolCall(toolName, args)`
+  (L140-181): a single fail-closed classifier that maps a tool+action to read-only vs.
+  **mutating**, defaulting an UNKNOWN action to *mutating*. Informs treating the update as an
+  explicit mutating action that is applied only after validation (and never auto-inferred from
+  chat).
+- `reference/openclaw-main/src/agents/tools/common.ts` — `readStringParam` (L91-122) /
+  `ToolInputError` (L57-64): typed extraction that *throws* on bad input rather than coercing
+  silently; and `sessions-spawn-tool.ts` `UNSUPPORTED_SESSIONS_SPAWN_PARAM_KEYS` (rejected
+  before any param is read) + the `Math.max(0, Math.floor(...))` clamp.
+- `reference/openclaw-main/src/auto-reply/reply/subagents-utils.ts`
+  `resolveSubagentTargetFromRuns` — resolve a fuzzy reference only to an EXISTING target,
+  reused via `crate::prime::resolve_assignee` for the assignee, with the `task_id` honored
+  only when it exists.
+- `reference/openclaw-main/src/shared/balanced-json.ts` `extractBalancedJsonPrefix` — lift the
+  JSON object out of a noisy reply, reused via `crate::prime_intent::extract_json_object`.
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/model_tools.py` `coerce_tool_args` (L535-616) / `_coerce_number`
+  (L672-728) — coerce each model arg to its registered schema type before dispatch; a
+  non-coercible value is dropped, not fatal. Mirrored in `parse_update_slots` (priority coerced
+  and clamped; a non-settable status DROPPED, not fatal; an unsupported field fails closed).
+- `reference/hermes-agent-main/agent/message_sanitization.py` — sanitize control chars and
+  CLAMP length on every model-produced string. Mirrored in the update title/details sanitizers.
+- `reference/hermes-agent-main/agent/conversation_loop.py` (`run_conversation`,
+  `messages = list(conversation_history)` then append the new user message) — a follow-up is
+  interpreted against prior context; reused via the existing clarify memory, now that a
+  `TaskUpdate` clarify is recordable.
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| openclaw: **validate an UPDATE against a schema + a status ALLOWLIST** (`readPlanSteps`, `PLAN_STEP_STATUSES`) | `crates/relux-kernel/src/prime_update_slots.rs`: `parse_update_slots` accepts ONLY `ALLOWED_KEYS` (task_id/title/details/priority/status/assignee/confidence/rationale) — any other key fails closed; `parse_settable_status` honors ONLY the `SETTABLE_STATUSES` allowlist (`blocked`/`cancelled`). |
+| openclaw: **unknown action defaults to mutating, applied after validation** (`isMutatingToolCall`) | `UpdateTask` is a real `PrimePlan::Act`; `prime_execute` re-checks task existence, enforces a **terminal-state guard** (a completed/failed/cancelled/expired task is never edited), and applies only allowlisted fields (defense in depth) — so even a stale/forged patch can never edit a finished task or set a machine-driven status. |
+| openclaw: **reject unsupported keys, require/trim strings, clamp ranges** (`sessions-spawn-tool`/`common.ts`) | `parse_update_slots` sanitizes/clamps title & details, coerces+clamps priority to `[1,9]`, and rejects any unsupported field; the deterministic rail parses a SIMPLE command ("rename task_0001 to X", "set task_0001 priority to 8", "cancel task_0001") and validates it the same way. |
+| openclaw: **resolve a reference only to an EXISTING target** (`resolveSubagentTargetFromRuns`) | the `task_id` is honored only when it is in `summary.all_task_ids`; an `assignee` change resolves through `crate::prime::resolve_assignee` and is ALWAYS an existing agent (ambiguity asked, unknown refused). |
+| Hermes: **coerce-or-drop, fail closed on the unsupported** (`coerce_tool_args`) | a brain proposal's bad priority / non-settable status / unknown assignee is dropped; an unsupported key fails the whole proposal; on no/low-confidence/unvalidated proposal the deterministic clarify stands. |
+
+**What we deliberately do differently:** like the assignment slot (and unlike the create slot),
+a validated update can PROMOTE an under-specified `TaskUpdate` clarify into a real `UpdateTask`
+action — but ONLY because a by-id update is a SAFE, in-scope action (it edits the operator's own
+task; it is never risk-gated) and every field is validated against the live state, with a
+terminal-state guard the brain can never bypass. The promotion is gated on the deterministic path
+having genuinely CLARIFIED (not on an honest "task does not exist" / refused-status `Reply`), so an
+explicit-but-wrong reference is never silently "corrected". Prime never decrees a `completed` /
+`running` status from chat (those flow through the run lifecycle) — that is honestly refused, never
+faked. Status synonyms (cancel→cancelled, block→blocked) and the priority/title/details parsing stay
+deterministic string helpers: they are the grounding the brain reconciles against and the fallback
+when no brain is live.

@@ -48,7 +48,8 @@ pub use prime::{
     PendingClarification, PrimeAction, PrimeAdminSlots, PrimeAgentSlots, PrimeAssignSlots,
     PrimeAutonomyConfig, PrimeAutonomyTickResult, PrimeContext, PrimeDisposition, PrimeIntent,
     PrimePlan, PrimePolishedStep, PrimeProposal, PrimeProposalPolish, PrimeProposalStep,
-    PrimeSuggestion, PrimeTaskSlots, PrimeTurn, StateSummary, TaskBrief,
+    PrimeSuggestion, PrimeTaskChange, PrimeTaskSlots, PrimeTaskUpdate, PrimeTurn, StateSummary,
+    TaskBrief,
 };
 pub use proposed_change::{
     capture_proposed_changes, sha256_hex, ProposedChange, ProposedChangeAction,

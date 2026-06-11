@@ -1486,6 +1486,22 @@ export interface ReluxPrimeAssignSlots {
   source?: string;
 }
 
+// One field a by-id task update changed (field name + applied display value).
+export interface ReluxPrimeTaskChange {
+  field: string;
+  value: string;
+}
+
+// The summary of a by-id task UPDATE Prime applied this turn, present on every
+// successful TaskUpdate turn so the chat can show a clean "what changed" card. `source`
+// is present ONLY when a configured brain resolved the change (the chip); a
+// deterministically-parsed update omits it. Every field was validated by the kernel.
+export interface ReluxPrimeTaskUpdate {
+  task_id: string;
+  changes: ReluxPrimeTaskChange[];
+  source?: string;
+}
+
 // A small, bounded record of a clarifying question Prime is still waiting on the user
 // to answer for an actionable request (multi-turn clarify memory). Present on the
 // response ONLY while a clarification is pending; the chat shows a "waiting for: <needs>"
@@ -1530,6 +1546,10 @@ export interface ReluxPrimeTurn {
   // Brain-resolved assignment slots, present ONLY on an AssignTask turn the brain
   // resolved (both ids validated against the live state). Omitted on every other turn.
   assign_slots?: ReluxPrimeAssignSlots;
+  // The summary of a by-id task update this turn applied, present ONLY on a successful
+  // TaskUpdate turn (carries a brain `source` chip when the brain resolved the change).
+  // Omitted on every other turn.
+  update?: ReluxPrimeTaskUpdate;
   // Provenance for a brain-polished clarify / brainstorm reply, present ONLY when a
   // configured brain re-worded this turn's wording through the validated path. The turn
   // stays action-free; this is advisory provenance for the small chip. Omitted otherwise.

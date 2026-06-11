@@ -8,7 +8,7 @@ import {
   type ReluxPrimeSuggestion,
   type ReluxPrimeTurn,
 } from "../api";
-import { brainSourceLabel, hasSteps, intentProvenance, pendingClarificationLabel, polishProvenance, proposalDisplaySummary, replyPolishLabel, slotProvenance, stepDisplayTitle } from "../prime";
+import { brainSourceLabel, hasSteps, intentProvenance, pendingClarificationLabel, polishProvenance, proposalDisplaySummary, replyPolishLabel, slotProvenance, stepDisplayTitle, updateProvenance } from "../prime";
 import { workTaskHref, workRunHref } from "../routing";
 import { PrimeAutonomyPanel } from "../components/PrimeAutonomyPanel";
 import { OrchestrationPanel } from "../components/OrchestrationPanel";
@@ -561,6 +561,41 @@ function PrimeTurnCard({
           <div>
             assign <span className="mono">{turn.assign_slots.task_id}</span> to{" "}
             <span className="mono">{turn.assign_slots.agent_id}</span>
+          </div>
+        </div>
+      )}
+
+      {turn.update && (
+        <div
+          style={{
+            marginTop: 10,
+            border: "1px solid var(--border)",
+            borderRadius: 6,
+            padding: "8px 10px",
+            fontSize: 12,
+          }}
+        >
+          <div className="row wrap" style={{ gap: 6, alignItems: "center", marginBottom: 4 }}>
+            <span className="muted" style={{ fontSize: 9 }}>updated</span>
+            <Link to={workTaskHref(turn.update.task_id)} className="mono" title="Open this task on the Work board">
+              {turn.update.task_id}
+            </Link>
+            {updateProvenance(turn.update) && (
+              <span
+                className="badge done"
+                style={{ fontSize: 9 }}
+                title="Prime's brain resolved this change from your request — validated against the live board"
+              >
+                🧠 {updateProvenance(turn.update)}
+              </span>
+            )}
+          </div>
+          <div className="col" style={{ gap: 2 }}>
+            {turn.update.changes.map((c) => (
+              <div key={c.field}>
+                <span className="muted">{c.field}</span> → <span className="mono">{c.value}</span>
+              </div>
+            ))}
           </div>
         </div>
       )}

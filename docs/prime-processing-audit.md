@@ -691,6 +691,75 @@ falls-back-to-deterministic, prompt grounding); the kernel integration tests
 `cli_assign_slots_unsupported_field_fails_closed`); and the core wire guard (the extended
 omission assertion). No test calls a real provider.
 
+## Applied change (safe by-id task update)
+
+`TaskUpdate` was the one resolvable-looking clarify with no action wired: `decide` could
+only ask, the multi-turn memory deliberately refused to record it, and
+`task_update_clarify` reflected the parsed field but never applied it. Per master plan
+§10.1/§10.2 and §17.1, and following the reference read recorded in
+`reference-driven-development.md` (openclaw `update-plan-tool` schema + status allowlist,
+`tool-mutation` mutating-action classifier, `sessions-spawn-tool`/`common.ts`
+unsupported-key rejection + required string + clamp, `subagents-utils`
+resolve-to-an-existing-target; Hermes `coerce_tool_args` + sanitization), `PrimeAction::
+UpdateTask { task_id, patch }` is now a REAL, safe mutating action.
+
+- **New module `relux-kernel/src/prime_update_slots.rs`.** `TaskUpdatePatch` is the validated
+  change set (title / details / priority / status / assignee), serialized into the action's
+  `patch` string and parsed back at apply time. `deterministic_update` is the rail: it parses a
+  SIMPLE command ("rename task_0001 to Fix the login blank page", "set task_0001 priority to 8",
+  "cancel task_0001", "reassign task_0001 to the researcher"), validates the task against
+  `summary.all_task_ids`, resolves a fuzzy assignee against the roster, clamps priority to
+  `[1,9]`, and honors ONLY the operator-settable status allowlist (`blocked`/`cancelled`). A
+  named-but-unknown task / agent fails closed with an honest reply; a non-settable status
+  ("mark it done") is honestly refused (Prime never fakes a completion — that flows through the
+  run lifecycle); a missing task/field asks one concrete, *resolvable* clarifying question.
+  `build_update_slots_prompt` / `parse_update_slots` / `reconcile_update_slots` are the
+  brain-assisted fallback (allowlist fields, sanitize/clamp, drop a non-settable status,
+  fail closed on an unsupported field), validated against the live state.
+- **Supported fields:** `title`, `details` (folded into the task input), `priority` (1-9
+  clamp), `status` (operator-settable `blocked`/`cancelled` only), `assignee` (resolved to an
+  existing agent). `deadline`/due-date and labels are deliberately NOT exposed: a label field
+  does not exist on the `Task` model, and a free-text deadline has no date-validation
+  infrastructure yet — surfaced as a future slice rather than faked.
+- **Kernel chokepoint.** `decide`'s `TaskUpdate` arm runs the deterministic rail; the
+  `prime_turn_with_brain` chokepoint promotes a validated brain proposal ONLY when the
+  deterministic path CLARIFIED (an explicit-but-wrong id / refused status is never silently
+  corrected) and `continuation` matches the turn. `prime_execute`'s `UpdateTask` arm re-checks
+  existence, enforces a **terminal-state guard** (a completed/failed/cancelled/expired task is
+  never edited), applies only allowlisted fields, audits `task:update`, and attaches a
+  `PrimeTaskUpdate` change card.
+- **Classify.** The classifier recognizes a task-anchored field command ("set task_0001
+  priority to 8", "cancel task_0001", "rename task_0001 to …") as a by-id update BEFORE the
+  broad task-creation catch (so an embedded "fix"/"build" verb does not mint a new task), while
+  a *question* about a task ("should I cancel task_0001?") stays a `Brainstorming` conversation.
+- **Memory.** `is_resolvable_clarify_intent` now includes `TaskUpdate`, so "change task
+  priority" → "task_0001 to 8" continues the original request; `clarify_needs_label(TaskUpdate)`
+  names what is missing ("task id" / "the field to change").
+- **UI.** Every successful `TaskUpdate` turn carries a `PrimeTurn.update` card (the changed
+  fields, the task linked to Work) with a small `🧠 <source>` provenance chip ONLY when a brain
+  resolved the change (`apps/dashboard/src/pages/Prime.tsx` + the pure `updateChangeSummary` /
+  `updateProvenance` helpers in `src/prime.ts`).
+
+Safety invariants (binding): a by-id update is a SAFE, in-scope action (it edits the operator's
+own task; it is never risk-gated), validated against the live state, with a terminal-state guard
+the brain can never bypass and a status allowlist that keeps Prime from decreeing a fake
+completion. Any failure (no brain, low confidence, unknown task/agent, unsupported field,
+non-settable status) leaves the deterministic outcome — a clarify or an honest reply — in place.
+
+Pinned by the `prime_update_slots` unit tests (deterministic rename/priority/cancel/block/
+reassign, ambiguous/unknown assignee, unknown task, under-specified clarify, brain parse/
+reconcile, status allowlist, patch round-trip); the `prime` decide + classify tests
+(`task_update_decide_applies_a_simple_command`, `task_update_decide_fails_closed_and_refuses_
+completion`, `task_update_decide_clarifies_when_underspecified`,
+`task_update_is_classified_for_by_id_field_commands`); the kernel integration tests
+(`task_update_applies_each_supported_field`, `task_update_fails_closed_on_unknown_task_and_agent`,
+`task_update_refuses_completion_and_terminal_tasks`, `brain_update_slots_resolve_an_under_
+specified_update`, `brain_update_slots_fail_closed_on_an_unknown_task`,
+`task_update_clarification_is_resolved_by_a_follow_up`, `casual_chat_never_triggers_a_task_update`);
+the server seam tests (`cli_update_slots_*`); the core wire guard
+(`prime_task_update_round_trips_and_omits_source_when_absent` + the extended omission assertion);
+and the dashboard `updateChangeSummary` / `updateProvenance` test. No test calls a real provider.
+
 ## Current Prime brain stack
 
 The end-to-end shape of one Prime turn, with the brain strictly additive and the
@@ -726,6 +795,11 @@ deterministic kernel always the authority:
      (`prime_assign_slots`): `task_id` honored only when it exists, `agent_id` resolved via
      `resolve_assignee` to an existing agent, BOTH required — then it PROMOTES the turn to the
      same safe `AssignTask` action (safe + fully validated, so no approval needed).
+   - a **`TaskUpdate`** the deterministic rail could only clarify → update slots
+     (`prime_update_slots`): `task_id` existence-checked, fields sanitized/clamped, status held
+     to the operator-settable allowlist, assignee resolved to an existing agent — then it
+     PROMOTES the clarify to the same safe `UpdateTask` action (the terminal-state guard is
+     enforced at apply time; Prime never decrees a fake completion).
    Any failure (no brain, low confidence, invalid JSON, unsupported field/kind,
    duplicate id, unknown adapter/subject/task) → the deterministic slot stands.
 3. **Deterministic / policy execution** — `decide` → `prime_execute` is the SOLE
@@ -751,21 +825,20 @@ deterministic kernel always the authority:
 
 ## Next recommended slice
 
-Multi-turn clarification continuation is now smart on three fronts: a **fuzzy assignee** resolves
+Multi-turn clarification continuation is now smart on four fronts: a **fuzzy assignee** resolves
 against the live roster (deterministic), a **by-id run start** is wired and its clarify is
-remembered, and a **brain-assisted continuation** can resolve the `{task_id, agent_id}` the
-extractors miss (validated against live state, deterministic combine as the fallback). The
-remaining surfaces are narrower:
+remembered, a **brain-assisted continuation** can resolve the `{task_id, agent_id}` the
+extractors miss, and a **by-id task update** is now a real, validated mutating action whose
+clarify the memory continues ("change task priority" → "task_0001 to 8"). The remaining surfaces
+are narrower:
 
-- **By-id task update** — `TaskUpdate` is still the one resolvable-looking clarify NOT remembered,
-  because no `UpdateTask` action is wired (no faked capability). Wiring a `PrimeAction::UpdateTask
-  { task_id, change }` (priority/title/status/assignee, each validated) would let the same memory
-  resolve "raise the priority" → "task_0001 to 8", and would extend the brain-assisted-slot
-  pattern to the update path.
+- **More update fields** — the by-id update supports title/details/priority/status/assignee.
+  A **due date** (`Task.deadline`) and **labels** are the obvious next fields, but a label field
+  does not exist on the `Task` model yet and a free-text deadline needs date-validation
+  infrastructure; both should be added to the data model first rather than faked into the patch.
 - **The remaining slot field-extractors** (`update_change_phrase`, `orchestration_goal`,
   `plan_goal`) are still deterministic string-slicing. They are the *grounding* the brain
-  reconciles against and the fallback when no brain is live, so they should stay — but the update
-  path is the next candidate for the validated-slot treatment.
+  reconciles against and the fallback when no brain is live, so they should stay.
 - **A persona for the manual Crew create form** — today persona is brain-seeded only; a
   small optional persona input on the Crew form (validated/clamped the same way) would let an
   operator set one without the brain.

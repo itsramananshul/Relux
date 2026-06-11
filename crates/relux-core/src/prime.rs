@@ -568,6 +568,55 @@ pub struct PrimeAssignSlots {
     pub source: Option<String>,
 }
 
+/// One field a by-id task update changed, as a card row the dashboard renders.
+///
+/// Descriptive only: the field name (`"title"` / `"details"` / `"priority"` /
+/// `"status"` / `"assignee"`) and the new value as display text. The kernel already
+/// validated every change before applying it, so this just reports what was applied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrimeTaskChange {
+    /// The supported task field that changed.
+    pub field: String,
+    /// The applied new value, rendered for display.
+    pub value: String,
+}
+
+/// The summary of a by-id task UPDATE Prime applied, present on every successful
+/// `TaskUpdate` turn so the dashboard can render a clean "what changed" card
+/// (`docs/RELUX_MASTER_PLAN.md` section 10.2 Action Layer, section 11.1).
+///
+/// ## The safety contract (binding)
+///
+/// A task update is a real mutating action, but a SAFE, in-scope one (it edits an
+/// existing task in the operator's own namespace; it is never risk-gated). Every
+/// field here was validated by the kernel before it was applied
+/// (`crates/relux-kernel/src/prime_update_slots.rs`):
+///
+/// - the `task_id` names an EXISTING task; a terminal task (completed/failed/
+///   cancelled/expired) is never edited;
+/// - `title`/`details` are sanitized and length-clamped;
+/// - `priority` is clamped to the supported range;
+/// - `status` is honored ONLY for the operator-settable allowlist
+///   (`blocked` / `cancelled`) — Prime never decrees a task `running`/`completed`
+///   (those flow through the run lifecycle);
+/// - an `assignee` change is honored ONLY when it resolves to an EXISTING agent.
+///
+/// `source` is brain provenance: present ONLY when a configured brain *resolved* the
+/// update (the deterministic extractors could not), so the card shows a small
+/// brain chip. A deterministically-parsed update carries `source: None`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrimeTaskUpdate {
+    /// The existing task the update was applied to.
+    pub task_id: String,
+    /// The fields that changed, in a stable display order.
+    pub changes: Vec<PrimeTaskChange>,
+    /// The model id / CLI brain label that resolved the update, for provenance.
+    /// Present ONLY when a brain supplied the change the extractors missed; a
+    /// deterministically-parsed update omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
 /// The full result of Prime handling one user message.
 ///
 /// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 10 (Prime Behavior Specification).
@@ -635,6 +684,14 @@ pub struct PrimeTurn {
     /// they did before. Provenance/presentation only; the kernel validated both ids.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assign_slots: Option<PrimeAssignSlots>,
+    /// The summary of a by-id task UPDATE this turn applied (see [`PrimeTaskUpdate`]),
+    /// present on every successful `TaskUpdate` turn so the chat can render a clean
+    /// "what changed" card. Carries a brain `source` chip ONLY when a configured brain
+    /// resolved the change the deterministic extractors missed. Omitted on every turn
+    /// that did not apply an update, so existing clients see the same JSON they did
+    /// before. The kernel validated every field before applying it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<PrimeTaskUpdate>,
 }
 
 /// The scope a Prime turn runs in: which namespace work lands in, which agent
@@ -772,6 +829,7 @@ mod tests {
             agent_slots: None,
             admin_slots: None,
             assign_slots: None,
+            update: None,
         };
         let json = serde_json::to_string(&turn).unwrap();
         assert!(
@@ -797,6 +855,12 @@ mod tests {
         assert!(
             !json.contains("assign_slots"),
             "a turn with no brain-resolved assignment slots must omit the field: {json}"
+        );
+        // The by-id update card is present ONLY on a TaskUpdate turn; a plain turn must
+        // omit `update` on the wire so existing clients are unaffected.
+        assert!(
+            !json.contains("update"),
+            "a turn that applied no task update must omit the field: {json}"
         );
         // The plan preview is present ONLY on a PlanRequest turn: a normal turn must
         // not carry `proposal` on the wire, so existing clients are unaffected (§11.1).
@@ -1010,6 +1074,43 @@ mod tests {
         }
         let back: PrimeAdminSlots = serde_json::from_str(&json).unwrap();
         assert_eq!(back, plugin);
+    }
+
+    #[test]
+    fn prime_task_update_round_trips_and_omits_source_when_absent() {
+        // A deterministically-parsed update carries the change rows but no brain chip:
+        // `source` is omitted from the wire.
+        let det = PrimeTaskUpdate {
+            task_id: "task_0001".to_string(),
+            changes: vec![PrimeTaskChange {
+                field: "priority".to_string(),
+                value: "8".to_string(),
+            }],
+            source: None,
+        };
+        let json = serde_json::to_string(&det).unwrap();
+        assert!(!json.contains("source"), "unset source must be omitted: {json}");
+        let back: PrimeTaskUpdate = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, det);
+
+        // A brain-resolved update carries the provenance chip.
+        let brain = PrimeTaskUpdate {
+            task_id: "task_0002".to_string(),
+            changes: vec![
+                PrimeTaskChange {
+                    field: "title".to_string(),
+                    value: "Fix the login blank page".to_string(),
+                },
+                PrimeTaskChange {
+                    field: "status".to_string(),
+                    value: "blocked".to_string(),
+                },
+            ],
+            source: Some("anthropic/claude-3.5-haiku".to_string()),
+        };
+        let back: PrimeTaskUpdate =
+            serde_json::from_str(&serde_json::to_string(&brain).unwrap()).unwrap();
+        assert_eq!(back, brain);
     }
 
     #[test]

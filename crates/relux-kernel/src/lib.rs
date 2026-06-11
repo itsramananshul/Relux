@@ -32,6 +32,7 @@ pub mod prime_clarify;
 pub mod prime_clarify_memory;
 pub mod prime_intent;
 pub mod prime_slots;
+pub mod prime_update_slots;
 pub mod runtime;
 pub mod state;
 pub mod store;
@@ -45,7 +46,8 @@ pub use ai::{
     classify_intent_via_openrouter, clear_stored_config, compose_chat_prompt, compose_polish_prompt,
     extract_agent_slots_via_openrouter, extract_assign_slots_via_openrouter,
     extract_permission_slots_via_openrouter,
-    extract_plugin_ref_via_openrouter, extract_task_slots_via_openrouter, is_actionful,
+    extract_plugin_ref_via_openrouter, extract_task_slots_via_openrouter,
+    extract_update_slots_via_openrouter, is_actionful,
     polish_clarify_via_openrouter, polish_from_cli_text, polish_proposal, proposal_wants_polish,
     read_stored_config, shape_reply, write_stored_config, AiConfig, AiMode, AiOutcome, AiStatus,
     PrimeBrain, StoredAiConfig,
@@ -95,6 +97,11 @@ pub use prime_assign_slots::{
 pub use prime_slots::{
     build_task_slots_prompt, parse_task_slots, reconcile_task_slots, BrainTaskSlots,
     ResolvedTaskSlots,
+};
+pub use prime_update_slots::{
+    build_update_slots_prompt, deterministic_update, parse_settable_status, parse_update_slots,
+    reconcile_update_slots, BrainUpdateSlots, DeterministicUpdate, ResolvedTaskUpdate,
+    TaskUpdatePatch,
 };
 pub use runtime::{invoke_http_loopback, RuntimeClientError};
 pub use state::{
