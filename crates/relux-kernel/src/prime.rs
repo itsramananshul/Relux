@@ -473,39 +473,55 @@ pub fn decide(message: &str, intent: &PrimeIntent, summary: &StateSummary) -> Pr
         }
         PrimeIntent::AssignTask => {
             let parsed_task_id = extract_task_id(message);
-            let parsed_agent_id = extract_agent_id_from_assignment(message);
+            // The first-word extractor is kept ONLY as the "did the user name an agent?"
+            // presence signal for the clarify branches; the actual resolution uses the
+            // full phrase matched against the live roster (so a fuzzy "the researcher"
+            // resolves where the bare first word "the" never could).
+            let agent_phrase_present = extract_agent_id_from_assignment(message).is_some();
 
-            match (parsed_task_id, parsed_agent_id) {
-                (Some(task_id_str), Some(agent_id_str)) => {
-                    // Validate task and agent existence using summary
-                    let task_exists = summary.all_task_ids.contains(&task_id_str);
-                    let agent_exists = summary.all_agent_ids.contains(&agent_id_str);
-
-                    if !task_exists {
+            match (parsed_task_id, agent_phrase_present) {
+                (Some(task_id_str), true) => {
+                    if !summary.all_task_ids.contains(&task_id_str) {
                         PrimePlan::Reply {
                             text: format!("Task with ID '{}' does not exist. Please provide a valid task ID.", task_id_str),
                         }
-                    } else if !agent_exists {
-                        PrimePlan::Reply {
-                            text: format!("Agent with ID '{}' does not exist. Please provide a valid agent name.", agent_id_str),
-                        }
                     } else {
-                        PrimePlan::Act {
-                            action: PrimeAction::AssignTask {
-                                task_id: task_id_str.clone(),
-                                agent_id: agent_id_str.clone(),
+                        // Roster-aware fuzzy resolution of the named assignee: exact →
+                        // unique prefix → unique substring, ambiguity asked not guessed,
+                        // and a resolved id is always one that exists (fail closed).
+                        let phrase = extract_assignee_phrase(message).unwrap_or_default();
+                        match resolve_assignee(&phrase, &summary.all_agent_ids) {
+                            AssigneeResolution::Resolved(agent_id) => PrimePlan::Act {
+                                action: PrimeAction::AssignTask {
+                                    task_id: task_id_str.clone(),
+                                    agent_id: agent_id.clone(),
+                                },
+                                text: format!("Assigning task {} to agent {}.", task_id_str, agent_id),
                             },
-                            text: format!("Assigning task {} to agent {}.", task_id_str, agent_id_str),
+                            AssigneeResolution::Ambiguous(mut matches) => {
+                                matches.sort();
+                                PrimePlan::Clarify {
+                                    text: format!(
+                                        "More than one agent matches \"{}\": {}. Which one should I assign {} to?",
+                                        phrase,
+                                        matches.join(", "),
+                                        task_id_str,
+                                    ),
+                                }
+                            }
+                            AssigneeResolution::Unresolved => PrimePlan::Reply {
+                                text: format!("Agent with ID '{}' does not exist. Please provide a valid agent name.", phrase),
+                            },
                         }
                     }
                 }
-                (None, Some(_)) => PrimePlan::Clarify {
+                (None, true) => PrimePlan::Clarify {
                     text: "I couldn't find a task ID in your request. Please specify the task to assign.".to_string(),
                 },
-                (Some(_), None) => PrimePlan::Clarify {
+                (Some(_), false) => PrimePlan::Clarify {
                     text: "I couldn't find an agent name in your request. Please specify which agent to assign the task to.".to_string(),
                 },
-                (None, None) => PrimePlan::Clarify {
+                (None, false) => PrimePlan::Clarify {
                     text: "I need both a task ID and an agent name to assign a task. Please rephrase your request.".to_string(),
                 },
             }
@@ -1580,6 +1596,132 @@ fn extract_agent_id_from_assignment(message: &str) -> Option<String> {
     None
 }
 
+/// Lead-in words that are never part of an agent's name. Dropped before resolving an
+/// assignee phrase against the roster so "the researcher" / "our research agent" match
+/// the agent `researcher` / `research-agent` rather than the literal first word.
+const ASSIGNEE_STOPWORDS: &[&str] = &[
+    "the", "a", "an", "to", "this", "that", "it", "them", "agent", "operative", "our",
+    "named", "called", "please", "task", "for",
+];
+
+/// The full trailing assignment phrase a user named ("the researcher",
+/// "research-agent"), with any `task_…` id token removed, or `None` when no assignment
+/// cue is present.
+///
+/// This is the phrase [`resolve_assignee`] matches against the live agent roster. Unlike
+/// [`extract_agent_id_from_assignment`] (which takes only the FIRST word, kept as the
+/// deterministic "did the user name an agent?" presence signal the clarify branches
+/// still use), this keeps the whole multi-word phrase so a fuzzy reference can resolve.
+fn extract_assignee_phrase(message: &str) -> Option<String> {
+    let m = message.to_lowercase();
+    let remainder = if let Some(i) = m.find(" to ") {
+        &m[i + " to ".len()..]
+    } else if let Some(i) = m.find("agent named ") {
+        &m[i + "agent named ".len()..]
+    } else {
+        return None;
+    };
+    let phrase = remainder
+        .split_whitespace()
+        .filter(|w| !w.starts_with("task_"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let phrase = phrase.trim().to_string();
+    if phrase.is_empty() {
+        None
+    } else {
+        Some(phrase)
+    }
+}
+
+/// The outcome of resolving an assignment target phrase against the live agent roster.
+///
+/// Reference-grounded (`docs/reference-driven-development.md`): mirrors openclaw's
+/// `resolveSubagentTargetFromRuns` (exact → unique-prefix → ambiguous-is-an-error,
+/// never resolving to a target that does not exist) and Hermes' `repair_tool_call`
+/// (normalize/strip, then match against the KNOWN set). A `Resolved` id is ALWAYS one
+/// already on the roster — the resolver can never invent an assignee (fail closed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AssigneeResolution {
+    /// Exactly one existing agent matched the phrase.
+    Resolved(String),
+    /// The phrase matched more than one existing agent — ask which one.
+    Ambiguous(Vec<String>),
+    /// No usable phrase, or it matched no agent on the roster.
+    Unresolved,
+}
+
+/// Resolve a named assignee `phrase` against the live agent `roster`, returning a single
+/// EXISTING agent id, an ambiguity, or nothing.
+///
+/// The match runs in fail-closed priority order (the openclaw target-resolution shape):
+/// exact (case-insensitive) → unique prefix → unique substring. A tier with more than one
+/// distinct match is `Ambiguous` (asked about, never guessed); a tier with exactly one is
+/// `Resolved`. Stopwords and sub-2-char noise are dropped first (the Hermes normalize
+/// step), and a returned id is always taken verbatim from the roster — so a fuzzy phrase
+/// can only ever name an agent that actually exists.
+pub(crate) fn resolve_assignee(phrase: &str, roster: &[String]) -> AssigneeResolution {
+    let toks: Vec<String> = phrase
+        .to_lowercase()
+        .split_whitespace()
+        .map(|w| {
+            w.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+                .to_string()
+        })
+        .filter(|w| w.len() >= 2 && !ASSIGNEE_STOPWORDS.contains(&w.as_str()))
+        .collect();
+    if toks.is_empty() {
+        return AssigneeResolution::Unresolved;
+    }
+
+    // Candidates: the whole phrase joined (hyphen and space forms, so "research agent"
+    // matches the id "research-agent"), then each significant token.
+    let mut candidates: Vec<String> = Vec::new();
+    if toks.len() > 1 {
+        candidates.push(toks.join("-"));
+        candidates.push(toks.join(" "));
+    }
+    candidates.extend(toks.iter().cloned());
+
+    let roster_lc: Vec<(String, String)> = roster
+        .iter()
+        .map(|id| (id.to_lowercase(), id.clone()))
+        .collect();
+
+    let collect = |pred: &dyn Fn(&str, &str) -> bool| -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for (lc, orig) in &roster_lc {
+            if candidates.iter().any(|c| pred(lc, c)) && !out.contains(orig) {
+                out.push(orig.clone());
+            }
+        }
+        out
+    };
+
+    let exact = collect(&|lc, c| lc == c);
+    match exact.len() {
+        1 => return AssigneeResolution::Resolved(exact[0].clone()),
+        n if n > 1 => return AssigneeResolution::Ambiguous(exact),
+        _ => {}
+    }
+
+    let prefix = collect(&|lc, c| c.len() >= 2 && lc.starts_with(c));
+    match prefix.len() {
+        1 => return AssigneeResolution::Resolved(prefix[0].clone()),
+        n if n > 1 => return AssigneeResolution::Ambiguous(prefix),
+        _ => {}
+    }
+
+    let contains = collect(&|lc, c| c.len() >= 3 && lc.contains(c));
+    match contains.len() {
+        1 => return AssigneeResolution::Resolved(contains[0].clone()),
+        n if n > 1 => return AssigneeResolution::Ambiguous(contains),
+        _ => {}
+    }
+
+    AssigneeResolution::Unresolved
+}
+
 /// True when a message stands on its OWN as a fresh request — a complete actionable
 /// command, an explicit command phrase, or a question — rather than reading as a bare
 /// answer to an earlier clarifying question (e.g. a lone `task_0001` or `researcher`).
@@ -1665,6 +1807,114 @@ mod tests {
             title: title.to_string(),
             status,
             assigned_agent: None,
+        }
+    }
+
+    fn roster(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn resolve_assignee_matches_exact_prefix_and_substring_against_the_roster() {
+        let r = roster(&["prime", "researcher", "research-bot"]);
+        // Exact (case-insensitive).
+        assert_eq!(
+            resolve_assignee("researcher", &r),
+            AssigneeResolution::Resolved("researcher".to_string())
+        );
+        assert_eq!(
+            resolve_assignee("Researcher", &r),
+            AssigneeResolution::Resolved("researcher".to_string())
+        );
+        // Stopwords are dropped: "the researcher" still resolves.
+        assert_eq!(
+            resolve_assignee("the researcher", &r),
+            AssigneeResolution::Resolved("researcher".to_string())
+        );
+        // A multi-word phrase joins to the hyphenated id.
+        assert_eq!(
+            resolve_assignee("research bot", &r),
+            AssigneeResolution::Resolved("research-bot".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_assignee_reports_ambiguity_and_never_invents() {
+        let r = roster(&["prime", "researcher", "research-bot"]);
+        // "research" prefixes BOTH researcher and research-bot -> ambiguous, never guessed.
+        match resolve_assignee("research", &r) {
+            AssigneeResolution::Ambiguous(mut m) => {
+                m.sort();
+                assert_eq!(m, vec!["research-bot".to_string(), "researcher".to_string()]);
+            }
+            other => panic!("expected ambiguity, got {other:?}"),
+        }
+        // An unknown name matches nothing on the roster (fail closed).
+        assert_eq!(
+            resolve_assignee("missing-agent", &r),
+            AssigneeResolution::Unresolved
+        );
+        // A phrase of only stopwords/noise resolves to nothing.
+        assert_eq!(resolve_assignee("the agent", &r), AssigneeResolution::Unresolved);
+    }
+
+    #[test]
+    fn assign_decide_resolves_a_fuzzy_assignee_against_the_roster() {
+        let mut s = empty_summary();
+        s.all_task_ids = roster(&["task_0001"]);
+        s.all_agent_ids = roster(&["prime", "researcher"]);
+        // The motivating dialogue's combined message: a fuzzy "the researcher" + a task id.
+        let plan = decide(
+            "assign this to the researcher task_0001",
+            &PrimeIntent::AssignTask,
+            &s,
+        );
+        match plan {
+            PrimePlan::Act {
+                action: PrimeAction::AssignTask { task_id, agent_id },
+                ..
+            } => {
+                assert_eq!(task_id, "task_0001");
+                assert_eq!(agent_id, "researcher");
+            }
+            other => panic!("expected an AssignTask Act, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assign_decide_clarifies_an_ambiguous_assignee() {
+        let mut s = empty_summary();
+        s.all_task_ids = roster(&["task_0001"]);
+        s.all_agent_ids = roster(&["researcher", "research-bot"]);
+        let plan = decide(
+            "assign task_0001 to research",
+            &PrimeIntent::AssignTask,
+            &s,
+        );
+        match plan {
+            PrimePlan::Clarify { text } => {
+                assert!(text.contains("More than one agent matches"), "got: {text}");
+                assert!(text.contains("researcher") && text.contains("research-bot"));
+            }
+            other => panic!("expected a Clarify, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assign_decide_still_rejects_an_unknown_agent() {
+        let mut s = empty_summary();
+        s.all_task_ids = roster(&["task_0001"]);
+        s.all_agent_ids = roster(&["prime"]);
+        let plan = decide(
+            "assign task_0001 to missing-agent",
+            &PrimeIntent::AssignTask,
+            &s,
+        );
+        match plan {
+            PrimePlan::Reply { text } => {
+                assert!(text.contains("Agent with ID 'missing-agent' does not exist."));
+            }
+            other => panic!("expected a does-not-exist Reply, got {other:?}"),
         }
     }
 

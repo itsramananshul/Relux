@@ -399,3 +399,61 @@ actually turn into an action are recorded (`AssignTask` / `TaskCreation` / `Crea
 a run-start or task-update clarify is NOT recorded, because no by-id action is wired for them and
 we never set up a loop that cannot resolve (no faked capability). The record holds only bounded,
 non-secret user text and a deterministic intent label — never a provider envelope or a secret.
+
+---
+
+## Reference read — roster-aware fuzzy assignee resolution (this slice)
+
+The multi-turn memory above carries "assign this to the researcher" → "which task?" →
+"task_0001" into one combined message, but the assignee extractor then failed it: the
+deterministic `extract_agent_id_from_assignment` takes only the FIRST word after "to", so
+"the researcher" became the agent id `the`, which exists on no roster — the canonical
+continuation dialogue still dead-ended. This slice resolves a *fuzzy* assignee phrase
+against the live agent roster so a natural reference ("the researcher", "research bot",
+"research") resolves to the existing agent, while a resolved id can only ever be one that
+actually exists.
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/agent/conversation_loop.py` (L3114-3162) — the tool-call
+  **name** path: a model-chosen tool name not in `agent.valid_tool_names` is first
+  *repaired* (`agent._repair_tool_call(name)`); only a name that still fails the allowlist
+  after repair is rejected and fed back for self-correction — **an off-allowlist name is
+  normalized/fuzzed against the KNOWN set before it is refused, never executed as-is.**
+- `reference/hermes-agent-main/agent/agent_runtime_helpers.py` `repair_tool_call`
+  (L1566-1636) — the repair itself: lowercase direct match → separator-normalized match →
+  CamelCase→snake → suffix-strip (twice) → finally `difflib.get_close_matches(lowered,
+  valid_tool_names, n=1, cutoff=0.7)`, **returning a name only when it is in
+  `valid_tool_names`, else `None`.** Pattern: normalize/strip, then match against the
+  known set in priority order, and resolve only to a member of that set.
+
+### Paperclip (openclaw) — files read
+
+- `reference/openclaw-main/src/auto-reply/reply/subagents-utils.ts`
+  `resolveSubagentTargetFromRuns` (L44-145) — the canonical fuzzy-target resolver: numeric
+  index → session-key → **exact alias → exact label → alias prefix → label prefix → runId
+  prefix**, where a tier with exactly one match RESOLVES, a tier with more than one is an
+  **ambiguity error** (`ambiguousLabel*`), and no match anywhere is `unknownTarget`. Pattern:
+  exact → unique-prefix → ambiguous-is-an-error, and the result is always an existing run.
+- `reference/openclaw-main/src/agents/subagent-control.ts` `resolveControlledSubagentTarget`
+  (L707-729) — wires that resolver to the live run set with the user-facing error strings, so
+  a control action only ever lands on a target that EXISTS.
+- `reference/openclaw-main/src/acp/approval-classifier.ts` `normalizeToolName` (L57-63) — a
+  subject is lowercased, length-bounded, and accepted only against a strict
+  `^[a-z0-9._-]+$` shape (else `undefined`). Pattern: normalize a fuzzy subject to a strict
+  id shape before matching.
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| Hermes: **normalize/strip, then match the known set** (`repair_tool_call`) | `crates/relux-kernel/src/prime.rs` `resolve_assignee` lowercases the phrase, drops `ASSIGNEE_STOPWORDS` (`the`/`a`/`agent`/`our`/…) and sub-2-char noise, and builds candidates (the hyphen/space-joined phrase + each token) before matching. |
+| openclaw: **exact → unique-prefix → substring, ambiguity is an error** (`resolveSubagentTargetFromRuns`) | `resolve_assignee` runs the same priority tiers against `summary.all_agent_ids`: exact (case-insensitive) → prefix → substring; exactly one distinct match → `Resolved`, more than one → `Ambiguous` (the decide arm asks "which one?"), none → `Unresolved`. |
+| openclaw: **resolve only to a target that EXISTS** (`resolveControlledSubagentTarget`) | a `Resolved` id is taken verbatim from the roster, so the fuzzy phrase can never invent an assignee; an unknown phrase keeps the existing "Agent with ID '…' does not exist" reply (fail closed). |
+| openclaw: **normalize a subject to a strict shape** (`normalizeToolName`) | the new `extract_assignee_phrase` keeps the FULL trailing phrase (task-id token stripped) so a multi-word reference resolves, while `extract_agent_id_from_assignment` is kept ONLY as the "did the user name an agent?" presence signal the clarify branches use. |
+
+**What we deliberately do differently:** this is a deterministic change with NO brain in the
+loop — it is the fallback the later brain-assisted assignment slot will reconcile against, and
+the safety shape (resolve only to an existing agent, ambiguity asked not guessed) holds whether
+or not a brain is configured. The `AssignTask` decide arm still produces a `PrimePlan::Act`
+through the unchanged `decide` → `prime_execute` path; only the assignee *resolution* got smarter.

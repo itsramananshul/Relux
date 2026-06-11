@@ -7115,6 +7115,40 @@ mod tests {
     }
 
     #[test]
+    fn a_fuzzy_assignee_continuation_resolves_against_the_roster() {
+        // The motivating dialogue end-to-end: "assign this to the researcher" (a fuzzy
+        // reference, no task id) -> "which task?" -> "task_0001" continues the original
+        // request, and the fuzzy "the researcher" resolves to the existing `researcher`
+        // agent. Deterministic — no brain involved.
+        let (mut k, ctx) = prime_chat_kernel();
+        add_agent(&mut k, &ctx, "researcher");
+        let created = k
+            .prime_turn(&ctx, "create a task to summarize the README")
+            .unwrap();
+        let task_id = created.created_task.expect("a task was created");
+
+        // Turn 1: a fuzzy assignee with no task id -> Clarify (records the pending request).
+        let turn1 = k.prime_turn(&ctx, "assign this to the researcher").unwrap();
+        assert_eq!(turn1.disposition, PrimeDisposition::NeedsClarification);
+        assert_eq!(turn1.intent, relux_core::PrimeIntent::AssignTask);
+
+        // Turn 2: a bare task id continues, and "the researcher" resolves fuzzily.
+        let turn2 = k.prime_turn(&ctx, task_id.as_str()).unwrap();
+        assert_eq!(turn2.disposition, PrimeDisposition::Executed);
+        match turn2.action {
+            Some(relux_core::PrimeAction::AssignTask { task_id: t, agent_id }) => {
+                assert_eq!(t, task_id.as_str());
+                assert_eq!(agent_id, "researcher");
+            }
+            other => panic!("expected the fuzzy assignment to resolve, got {other:?}"),
+        }
+        assert_eq!(
+            k.task(&task_id).unwrap().assigned_agent.as_ref(),
+            Some(&AgentId::new("researcher"))
+        );
+    }
+
+    #[test]
     fn an_explicit_cancellation_clears_the_pending_clarification() {
         let (mut k, ctx) = prime_chat_kernel();
         let turn1 = k.prime_turn(&ctx, "assign this to researcher").unwrap();

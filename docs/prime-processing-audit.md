@@ -575,6 +575,45 @@ only-resolvable-intents); the kernel integration tests
 `pending_clarification_survives_a_snapshot_round_trip`); and the dashboard
 `pendingClarificationLabel` test. No test calls a real provider.
 
+## Applied change (roster-aware fuzzy assignee resolution)
+
+Multi-turn memory carried "assign this to the researcher" → "which task?" → "task_0001"
+into one combined message, but the assignee extractor then failed it: the deterministic
+`extract_agent_id_from_assignment` takes only the FIRST word after "to", so "the
+researcher" became the agent id `the` — which exists on no roster, so the canonical
+continuation dialogue still dead-ended on "Agent with ID 'the' does not exist". Per master
+plan §10.1/§10.2 and §17.1, and following the reference read recorded in
+`reference-driven-development.md` (Hermes `repair_tool_call` normalize/strip-then-match;
+openclaw `resolveSubagentTargetFromRuns` exact→prefix→ambiguous-is-an-error,
+`resolveControlledSubagentTarget` resolve-only-to-an-existing-target), the `AssignTask`
+decide arm now resolves a fuzzy assignee against the live roster.
+
+- **New helpers in `relux-kernel/src/prime.rs`.** `extract_assignee_phrase` keeps the FULL
+  trailing phrase ("the researcher"), task-id token stripped (vs. the first-word
+  `extract_agent_id_from_assignment`, kept only as the "did the user name an agent?"
+  presence signal the clarify branches use). `resolve_assignee(phrase, roster) ->
+  AssigneeResolution` drops stopwords + sub-2-char noise, then matches the roster in
+  fail-closed priority order — exact (case-insensitive) → unique prefix → unique substring;
+  exactly one distinct match `Resolved`, more than one `Ambiguous`, none `Unresolved`. A
+  `Resolved` id is taken verbatim from `summary.all_agent_ids`, so the resolver can never
+  invent an assignee.
+- **The `AssignTask` arm** keys its clarify branches on phrase *presence* (unchanged
+  wording), but a present task id + named agent now runs through `resolve_assignee`:
+  `Resolved` → the existing `AssignTask` `Act`; `Ambiguous` → a `Clarify` that lists the
+  candidates and asks which (still a resolvable clarify, so the memory can continue it);
+  `Unresolved` → the existing "Agent with ID '…' does not exist" `Reply`.
+- **Safety (binding).** Deterministic, no brain in the loop — this is the fallback the
+  later brain-assisted assignment slot reconciles against. Durable state still flows only
+  through `decide` → `prime_execute`; only the assignee *resolution* got smarter, and a
+  fuzzy phrase can only ever name an agent that already exists.
+
+Pinned by the `prime` unit tests (`resolve_assignee_matches_exact_prefix_and_substring_…`,
+`resolve_assignee_reports_ambiguity_and_never_invents`,
+`assign_decide_resolves_a_fuzzy_assignee_against_the_roster`,
+`assign_decide_clarifies_an_ambiguous_assignee`, `assign_decide_still_rejects_an_unknown_agent`)
+and the kernel integration test `a_fuzzy_assignee_continuation_resolves_against_the_roster`
+(the motivating dialogue end-to-end). No test calls a real provider.
+
 ## Current Prime brain stack
 
 The end-to-end shape of one Prime turn, with the brain strictly additive and the
