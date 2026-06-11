@@ -43,6 +43,52 @@ pub enum ToolExecutability {
     /// A specific agent context was supplied and that agent lacks the tool's
     /// required permission. Only reported when discovery is scoped to an agent.
     MissingPermission,
+    /// The tool declares an approval requirement that is not satisfied for a
+    /// direct invocation (e.g. an operator-configured non-low-risk tool whose
+    /// `approval` is `Required`). The tool stays discoverable but the kernel
+    /// refuses to run it through the direct call/invoke path until the
+    /// requirement is removed (or, in future, a per-call approval is granted).
+    /// This is what keeps a freshly-configured risky tool from being runnable
+    /// just because a loopback runtime is enabled.
+    NeedsApproval,
+}
+
+/// Whether a tool's declared [`ApprovalRequirement`] blocks a direct
+/// (no-approval-flow) invocation given its [`RiskLevel`].
+///
+/// The kernel does not yet wire a per-tool-call approval flow, so a tool that
+/// requires approval cannot be run through the direct call/invoke path. This is
+/// the single, fail-closed predicate behind both the [`ToolExecutability::NeedsApproval`]
+/// discovery status and the runtime refusal in `call_tool`/`invoke_tool`:
+///
+/// - `Never` → never blocked.
+/// - `Required` → always blocked.
+/// - `RequiredWhenRisk(threshold)` → blocked when the tool's risk is at or above
+///   the threshold.
+///
+/// All bundled fixtures declare `Never`, so this never changes their behavior.
+pub fn approval_blocks_direct_invocation(
+    approval: &crate::permission::ApprovalRequirement,
+    risk: &RiskLevel,
+) -> bool {
+    use crate::permission::ApprovalRequirement;
+    match approval {
+        ApprovalRequirement::Never => false,
+        ApprovalRequirement::Required => true,
+        ApprovalRequirement::RequiredWhenRisk(threshold) => {
+            risk_rank(risk) >= risk_rank(threshold)
+        }
+    }
+}
+
+/// Ordinal rank for a [`RiskLevel`] so thresholds can be compared.
+fn risk_rank(risk: &RiskLevel) -> u8 {
+    match risk {
+        RiskLevel::Low => 0,
+        RiskLevel::Medium => 1,
+        RiskLevel::High => 2,
+        RiskLevel::Critical => 3,
+    }
 }
 
 /// One installed plugin tool discovered through the kernel, with its current
@@ -84,4 +130,39 @@ pub struct ToolInvocationResult {
     pub permission: String,
     /// The deterministic tool output.
     pub output: serde_json::Value,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::permission::{ApprovalRequirement, RiskLevel};
+
+    #[test]
+    fn never_is_never_blocked() {
+        for risk in [RiskLevel::Low, RiskLevel::Critical] {
+            assert!(!approval_blocks_direct_invocation(
+                &ApprovalRequirement::Never,
+                &risk
+            ));
+        }
+    }
+
+    #[test]
+    fn required_always_blocks() {
+        for risk in [RiskLevel::Low, RiskLevel::Medium, RiskLevel::High] {
+            assert!(approval_blocks_direct_invocation(
+                &ApprovalRequirement::Required,
+                &risk
+            ));
+        }
+    }
+
+    #[test]
+    fn required_when_risk_compares_against_threshold() {
+        let gate = ApprovalRequirement::RequiredWhenRisk(RiskLevel::High);
+        assert!(!approval_blocks_direct_invocation(&gate, &RiskLevel::Low));
+        assert!(!approval_blocks_direct_invocation(&gate, &RiskLevel::Medium));
+        assert!(approval_blocks_direct_invocation(&gate, &RiskLevel::High));
+        assert!(approval_blocks_direct_invocation(&gate, &RiskLevel::Critical));
+    }
 }

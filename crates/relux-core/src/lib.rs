@@ -64,4 +64,6 @@ pub use runtime::{
     MIN_RUNTIME_TIMEOUT_MS,
 };
 pub use task::{Task, TaskId, TaskStatus};
-pub use tool::{ToolDescriptor, ToolExecutability, ToolInvocationResult};
+pub use tool::{
+    approval_blocks_direct_invocation, ToolDescriptor, ToolExecutability, ToolInvocationResult,
+};

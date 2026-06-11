@@ -1437,3 +1437,51 @@ explicitly asked to run. The run turn's reply is the real, grounded batch result
 deterministic (excluded from `prime_after_action`, like a tool result), and the brain can never
 re-narrate (and overclaim) a per-brief outcome. A multi-action orchestration loop, a `run-async`
 (non-blocking) Prime path, and per-brief retry/cancel tools stay deferred.
+
+---
+
+## Reference read — safe in-UI tool configuration for a metadata-only wrapper (this slice)
+
+A source installed without a `relux-plugin.json` is scaffolded as a **metadata-only wrapper**
+that declares ZERO tools (`crate::plugin_install::scaffold_manifest`). That is safe but useless:
+with no tool definitions, even an enabled HTTP loopback runtime surfaces nothing
+(`crates/relux-kernel/src/server.rs` `enabling_a_runtime_on_a_wrapper_surfaces_no_tools`). The only
+prior way to add tools was to hand-edit the on-disk manifest and re-install. This slice adds the first
+safe **in-UI** path: the operator describes ONE tool and the kernel validates it hard before it enters
+the manifest (`docs/RELUX_MASTER_PLAN.md` §7.4 Plugin Kernel Layer, §8.2 ToolSet Plugins).
+
+### Paperclip (openclaw) — files read
+
+- `reference/openclaw-main/src/agents/tools/update-plan-tool.ts` — `readPlanSteps` (L39-74): validate a
+  structured payload **field-by-field**, check an enum (`status`) against the `PLAN_STEP_STATUSES`
+  **allowlist** (L9), and fail closed on a bad value. The canonical "validate a structured payload
+  against a schema + an allowlist" shape.
+- `reference/openclaw-main/src/agents/tools/sessions-spawn-tool.ts` —
+  `UNSUPPORTED_SESSIONS_SPAWN_PARAM_KEYS` (L46-55), rejected **before any param is read**; the
+  `Math.max(0, Math.floor(...))` numeric clamp (L355); the default-the-rest pattern (L302). **Pattern:
+  reject unsupported keys up front, require/trim the mandatory string, clamp ranges, default the rest.**
+- `reference/openclaw-main/src/agents/tools/common.ts` — `readStringParam` required-throws (L91-122) +
+  `ToolInputError` (L57-64): a required string THROWS on bad input rather than coercing silently.
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| openclaw: **validate field-by-field against a schema + an enum allowlist** (`readPlanSteps`, `PLAN_STEP_STATUSES`) | `crates/relux-kernel/src/plugin_tool_config.rs` `parse_plugin_tool_input` accepts ONLY `ALLOWED_KEYS` (`name`/`description`/`risk`/`auto_approve`/`timeout_secs`) and validates `risk` against `RISK_LEVELS` (the `RiskLevel` allowlist); anything else fails closed. |
+| openclaw: **reject unsupported keys, require/trim the mandatory string, clamp** (`sessions-spawn-tool`, `common.ts`) | any other key fails the whole payload closed (a smuggled raw `permission`/`approval` cannot bypass the derived-permission / risk-driven-approval rules); `name` is required and sanitized to a safe dotted id; the timeout is coerced + clamped to `[1, 300]`s; description is control-char-stripped and length-clamped. |
+| openclaw: **a required field THROWS, never coerces silently** (`readStringParam` required) | an empty/missing `name`, a non-allowlist `risk`, or a non-numeric `timeout_secs` is a hard, operator-facing error (the form never silently does the wrong thing). |
+| openclaw: **act only on a target that is in the right state** (the bundled/protected refusals across the tool surface) | `KernelState::configure_plugin_tool` refuses a plugin that is not INSTALLED, a BUNDLED/protected fixture, or a non-`ToolSet`; the manifest is mutated transactionally on a clone and re-validated with `relux_core::validate_manifest` before it stands. |
+
+**What we deliberately do differently — and the honesty fix it forced:** the operator **never** supplies a
+raw permission; the kernel DERIVES it as `tool:<plugin-id>:<verb>`, so a configured tool can only ever gate
+on this plugin's own `tool:` namespace. The mission's "a newly configured tool remains disabled / requires
+explicit enable if risk is not low" required a *risk-sensitive, load-bearing* gate — but the manifest's
+`approval` field was, until this slice, **decorative** (never enforced at tool execution). We made it
+load-bearing: `relux_core::approval_blocks_direct_invocation(approval, risk)` is the single fail-closed
+predicate behind both a new `ToolExecutability::NeedsApproval` discovery status and a refusal in
+`call_tool`/`invoke_tool` (a non-low-risk tool is `Required` → never runnable just because a loopback
+runtime is enabled; a low-risk tool is auto-approved only when the operator opts in). All bundled fixtures
+declare `approval: never`, so this changes none of their behavior (verified by the unchanged suite). The
+loopback **runtime** stays the separate, explicit run-enabling step, and Relux still never infers a tool or
+runs downloaded code — the operator authors the tool, points it at a local server they run, and only then
+can it run.

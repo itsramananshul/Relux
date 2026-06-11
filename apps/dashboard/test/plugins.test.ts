@@ -5,6 +5,7 @@ import {
   pluginKindLabel,
   pluginStatus,
   pluginNextStep,
+  canConfigureTools,
   installResultSummary,
   visibleTools,
   isRunnableTool,
@@ -67,11 +68,19 @@ test("real adapters and toolsets keep their honest kind labels", () => {
   assert.equal(pluginKindLabel(plugin({ kind: "ToolSet" })), "ToolSet");
 });
 
-test("a metadata-only wrapper is NEVER shown as ready/enabled", () => {
-  const s = pluginStatus(plugin({ generated: true, enabled: true }));
+test("a metadata-only wrapper with NO tools is NEVER shown as ready/enabled", () => {
+  const s = pluginStatus(plugin({ generated: true, enabled: true, tool_count: 0 }));
   assert.equal(s.label, "Needs configuration");
   assert.equal(s.variant, "warn");
   assert.notEqual(s.variant, "ok");
+});
+
+test("a wrapper the operator has added tools to behaves like a toolset", () => {
+  // Once tools exist (tool_count > 0), the wrapper is no longer a dead-end: it
+  // shows the plain enabled/disabled status like any ToolSet.
+  const s = pluginStatus(plugin({ generated: true, enabled: true, tool_count: 1 }));
+  assert.equal(s.label, "enabled");
+  assert.equal(s.variant, "ok");
 });
 
 test("a real enabled toolset shows enabled; a disabled one shows disabled", () => {
@@ -81,12 +90,19 @@ test("a real enabled toolset shows enabled; a disabled one shows disabled", () =
   assert.equal(pluginStatus(plugin({ enabled: false })).variant, "muted");
 });
 
-test("a wrapper's next step is add-manifest, and it explains the runtime dead-end", () => {
-  const step = pluginNextStep(plugin({ generated: true }));
+test("a 0-tool wrapper's next step is add-manifest, and it explains the dead-end", () => {
+  const step = pluginNextStep(plugin({ generated: true, tool_count: 0 }));
   assert.equal(step.kind, "add-manifest");
-  assert.equal(step.cta, "Set up");
+  assert.equal(step.cta, "Configure");
   assert.match(step.detail, /declares no tools/i);
-  assert.match(step.detail, /relux-plugin\.json/);
+  assert.match(step.detail, /tool definition/i);
+});
+
+test("a wrapper with tools added now points at the loopback runtime step", () => {
+  const step = pluginNextStep(plugin({ generated: true, tool_count: 2 }));
+  assert.equal(step.kind, "configure-runtime");
+  assert.equal(step.cta, "Runtime");
+  assert.match(step.detail, /2 tools/);
 });
 
 test("a real non-bundled toolset keeps the runtime call-to-action", () => {
@@ -94,6 +110,14 @@ test("a real non-bundled toolset keeps the runtime call-to-action", () => {
   assert.equal(step.kind, "configure-runtime");
   assert.equal(step.cta, "Runtime");
   assert.match(step.detail, /3 tools/);
+});
+
+test("canConfigureTools: wrappers + non-bundled toolsets yes; bundled + adapters no", () => {
+  assert.equal(canConfigureTools(plugin({ generated: true, tool_count: 0 })), true);
+  assert.equal(canConfigureTools(plugin({ kind: "ToolSet" })), true);
+  // Bundled/protected fixtures and adapters are refused (kernel rejects them too).
+  assert.equal(canConfigureTools(plugin({ protected: true, bundled: true })), false);
+  assert.equal(canConfigureTools(plugin({ kind: "Adapter" })), false);
 });
 
 test("a bundled toolset has no next step (built-in, runnable)", () => {

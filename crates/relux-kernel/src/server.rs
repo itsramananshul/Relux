@@ -196,6 +196,8 @@ async fn serve() -> Result<(), KernelError> {
     println!("   PUT    /v1/relux/plugins/:id/runtime      {{ \"base_url\":\"http://127.0.0.1:<port>\", \"enabled\"?, \"timeout_ms\"? }}");
     println!("   DELETE /v1/relux/plugins/:id/runtime      (clear runtime config)");
     println!("   GET    /v1/relux/plugins/:id/manifest-template  (starter relux-plugin.json)");
+    println!("   POST   /v1/relux/plugins/:id/tools         {{ \"name\":\"report.fetch\", \"description\"?, \"risk\"?, \"auto_approve\"?, \"timeout_secs\"? }}");
+    println!("   DELETE /v1/relux/plugins/:id/tools/:tool   (remove a configured tool)");
     println!("   DELETE /v1/relux/plugins/:id");
     println!("   GET    /v1/relux/adapters                  (adapter plugins + CLI runtime status)");
     println!("   POST   /v1/relux/prime/orchestrations/:id/run-async  (start a background job; returns job + status_url)");
@@ -441,6 +443,12 @@ fn protected_router() -> Router<AppState> {
         .route(
             "/v1/relux/plugins/:id/manifest-template",
             get(plugin_manifest_template),
+        )
+        // Operator-configured tool definitions for a user-installed ToolSet/wrapper.
+        .route("/v1/relux/plugins/:id/tools", post(configure_plugin_tool))
+        .route(
+            "/v1/relux/plugins/:id/tools/:tool",
+            delete(remove_plugin_tool),
         )
         .route("/v1/relux/plugins/:id", delete(remove))
         // Adapter runtime controls (local coding-agent CLIs).
@@ -4473,6 +4481,65 @@ async fn plugin_manifest_template(
     Ok(Json(resp))
 }
 
+/// POST `/v1/relux/plugins/:id/tools` - add or replace ONE operator-configured
+/// tool on a user-installed ToolSet/wrapper plugin (`docs/RELUX_MASTER_PLAN.md`
+/// §7.4, §8.2). This is the in-UI alternative to hand-editing a `relux-plugin.json`
+/// and re-installing: the operator describes a tool and the kernel validates it
+/// hard (allowlist fields, derived permission, risk-driven approval) before it
+/// enters the manifest. Returns the updated plugin record so the page can refresh
+/// the tool count + status. Bundled/protected and non-ToolSet plugins are refused.
+async fn configure_plugin_tool(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<PluginRecord>, ApiError> {
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err(ApiError::bad_request("plugin id is required"));
+    }
+    // Validate + sanitize the operator payload BEFORE taking the lock; a bad
+    // payload is an honest 400 and never touches the store.
+    let input = relux_kernel::parse_plugin_tool_input(&body).map_err(ApiError::bad_request)?;
+    let plugin_id = relux_core::PluginId::new(id.clone());
+    let record = locked_save(&state, |kernel| {
+        kernel.configure_plugin_tool(&plugin_id, input)?;
+        let installed = kernel
+            .installed_plugin(&plugin_id)
+            .ok_or_else(|| KernelError::PluginNotInstalled(id.clone()))?
+            .clone();
+        Ok(record_for(kernel, &installed))
+    })?;
+    Ok(Json(record))
+}
+
+/// DELETE `/v1/relux/plugins/:id/tools/:tool` - remove one operator-configured
+/// tool from a user-installed ToolSet plugin by name. Symmetric with
+/// [`configure_plugin_tool`]: bundled plugins are refused and an unknown tool is a
+/// 404. Returns the updated plugin record.
+async fn remove_plugin_tool(
+    State(state): State<AppState>,
+    AxumPath((id, tool)): AxumPath<(String, String)>,
+) -> Result<Json<PluginRecord>, ApiError> {
+    let id = id.trim().to_string();
+    let tool = tool.trim().to_string();
+    if id.is_empty() {
+        return Err(ApiError::bad_request("plugin id is required"));
+    }
+    if tool.is_empty() {
+        return Err(ApiError::bad_request("tool name is required"));
+    }
+    let plugin_id = relux_core::PluginId::new(id.clone());
+    let record = locked_save(&state, |kernel| {
+        kernel.remove_plugin_tool(&plugin_id, &tool)?;
+        let installed = kernel
+            .installed_plugin(&plugin_id)
+            .ok_or_else(|| KernelError::PluginNotInstalled(id.clone()))?
+            .clone();
+        Ok(record_for(kernel, &installed))
+    })?;
+    Ok(Json(record))
+}
+
 // --- Adapter runtime (local coding-agent CLIs) -----------------------------
 
 /// GET `/v1/relux/adapters` - every installed Adapter plugin with its honest
@@ -4996,9 +5063,16 @@ fn status_for(err: &KernelError) -> StatusCode {
     match err {
         KernelError::PluginNotInstalled(_)
         | KernelError::ToolNotFound { .. }
+        | KernelError::PluginToolNotFound { .. }
         | KernelError::UnknownPlugin(_)
         | KernelError::UnknownAgent(_)
         | KernelError::UnknownOrchestration(_) => StatusCode::NOT_FOUND,
+        // A configured tool that requires approval cannot be invoked directly yet:
+        // a conflict the operator resolves by lowering risk / enabling auto-approve.
+        KernelError::ToolRequiresApproval { .. } => StatusCode::CONFLICT,
+        // Configuring a tool on a non-ToolSet / malformed definition: honest 400s.
+        KernelError::PluginNotToolConfigurable { .. }
+        | KernelError::InvalidToolDefinition { .. } => StatusCode::BAD_REQUEST,
         // A goal that does not split into multiple briefs: honest unprocessable
         // input, not a server fault.
         KernelError::OrchestrationNotMultiAgent => StatusCode::UNPROCESSABLE_ENTITY,
@@ -5362,6 +5436,75 @@ mod tests {
         assert!(
             !tools.iter().any(|t| t.plugin_id == "relux-plugin-empty"),
             "a wrapper with no tool definitions yields no tools even with a runtime"
+        );
+    }
+
+    /// The resolution of that dead-end: configuring a tool ON the wrapper makes a
+    /// tool appear (and the record's tool_count tracks it), so the in-UI "add a
+    /// tool" path genuinely turns a metadata-only wrapper into something usable.
+    #[test]
+    fn configuring_a_tool_on_a_wrapper_makes_it_appear_and_bumps_the_record() {
+        let mut kernel = KernelState::new();
+        let id = PluginId::new("relux-plugin-empty");
+        let installed = kernel.install_plugin(
+            generated_wrapper_manifest("relux-plugin-empty"),
+            PluginSourceKind::Github,
+            "https://github.com/owner/empty".to_string(),
+            "/data/relux-plugin-empty".to_string(),
+            true,
+        );
+        // Before: a generated wrapper with zero tools.
+        assert!(relux_kernel::is_generated_manifest(kernel.plugin(&id).unwrap()));
+        assert_eq!(record_for(&kernel, &installed).tool_count, 0);
+
+        // Add a low-risk tool the same way the HTTP handler validates it.
+        let body = serde_json::json!({ "name": "report.fetch", "risk": "low" });
+        let input = relux_kernel::parse_plugin_tool_input(&body).expect("valid input");
+        let def = kernel.configure_plugin_tool(&id, input).expect("configure tool");
+        assert_eq!(def.permission.as_str(), "tool:relux-plugin-empty:fetch");
+
+        // After: the tool is discoverable, and the record's tool_count tracks it.
+        let tools = kernel.discover_tools(None);
+        assert!(tools
+            .iter()
+            .any(|t| t.plugin_id == "relux-plugin-empty" && t.tool_name == "report.fetch"));
+        let installed = kernel.installed_plugin(&id).unwrap().clone();
+        assert_eq!(record_for(&kernel, &installed).tool_count, 1);
+
+        // It is still honestly NOT runnable until a loopback runtime is enabled.
+        let t = tools.iter().find(|t| t.tool_name == "report.fetch").unwrap();
+        assert_eq!(t.executable, relux_core::ToolExecutability::RuntimeNotConfigured);
+    }
+
+    /// The HTTP-layer status mapping for the new errors is honest: a bundled plugin
+    /// is a 409 conflict, an unknown plugin a 404, and a tool that requires approval
+    /// a 409 (the operator resolves it by lowering risk).
+    #[test]
+    fn tool_config_error_status_codes_are_honest() {
+        assert_eq!(
+            status_for(&KernelError::BundledPluginProtected("x".into())),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            status_for(&KernelError::PluginToolNotFound {
+                plugin: "x".into(),
+                tool: "y".into()
+            }),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            status_for(&KernelError::ToolRequiresApproval {
+                plugin: "x".into(),
+                tool: "y".into()
+            }),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            status_for(&KernelError::PluginNotToolConfigurable {
+                plugin: "x".into(),
+                message: "m".into()
+            }),
+            StatusCode::BAD_REQUEST
         );
     }
 

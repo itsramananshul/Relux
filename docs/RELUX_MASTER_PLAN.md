@@ -2574,16 +2574,16 @@ actionable instead of leaving the operator to wonder:
   never the green "enabled" a real plugin shows. Its row carries an inline banner
   stating the dead-end plainly: it declares no tools, so a runtime alone runs
   nothing.
-- **The honest next step is a manifest, not a runtime.** Because `discover_tools`
-  only surfaces manifest-declared tools, a wrapper with no tool definitions stays
-  empty even with an enabled loopback runtime (pinned by the kernel test
-  `enabling_a_runtime_on_a_wrapper_surfaces_no_tools`). So the wrapper's call to
-  action is **Set up → add tool definitions**, not "configure a runtime". The Set
-  up panel hands the operator a ready-to-edit `relux-plugin.json` (copy or
-  download), keyed to the plugin's id, plus the exact install directory, and the
-  three-step path: add the manifest → re-install (Local folder) → point a loopback
-  runtime at a local server. Relux still never infers tools from repo content and
-  never runs downloaded code.
+- **The honest next step is a tool definition, not a runtime.** Because
+  `discover_tools` only surfaces manifest-declared tools, a wrapper with no tool
+  definitions stays empty even with an enabled loopback runtime (pinned by the
+  kernel test `enabling_a_runtime_on_a_wrapper_surfaces_no_tools`). So the wrapper's
+  call to action is **Configure → add a tool definition**, not "configure a
+  runtime". The Configure panel now offers an **in-UI add-a-tool form** (see *Plugin
+  Tool Config v1* below) as the default; the prior copy/download
+  `relux-plugin.json` + re-install path is kept as an "Advanced" fallback. Once a
+  tool exists the row also exposes the loopback **Runtime** panel. Relux still never
+  infers tools from repo content and never runs downloaded code.
 - **Plugin categories are distinct.** The Kind column distinguishes **Adapter**
   (configured on the Crew page), **ToolSet** (with its declared tool count and a
   loopback **Runtime** panel), **Metadata-only wrapper** (Set up → manifest), and
@@ -2614,6 +2614,64 @@ nothing and runs nothing — it is guidance the operator fills in. Covered by ke
 tests `generated_wrapper_record_is_flagged_and_has_zero_tools`,
 `real_toolset_record_reports_its_tool_count`, and
 `manifest_template_is_valid_json_keyed_to_the_plugin`.
+
+### Plugin Tool Config v1 (in-UI tool definitions for a wrapper)
+
+The first **safe in-UI path to make a metadata-only wrapper useful**: instead of
+hand-editing `relux-plugin.json` and re-installing, the operator opens **Configure**
+on a user-installed ToolSet/wrapper row and adds ONE tool at a time through a small,
+validated form. See `docs/reference-driven-development.md` → *Reference read — safe
+in-UI tool configuration for a metadata-only wrapper* for the openclaw patterns this
+mirrors (`readPlanSteps` field-by-field + status-allowlist validation,
+`sessions-spawn-tool` unsupported-key rejection + clamps, `readStringParam`
+required-throws).
+
+```text
+POST   /v1/relux/plugins/:id/tools        { name, description?, risk?, auto_approve?, timeout_secs? }
+DELETE /v1/relux/plugins/:id/tools/:tool
+```
+
+Safety contract (all fail-closed, validated in
+`crates/relux-kernel/src/plugin_tool_config.rs` + `state.rs`
+`configure_plugin_tool`/`remove_plugin_tool`):
+
+- **Only an installed, non-bundled `ToolSet`** (a generated wrapper is a ToolSet) is
+  editable. A bundled/protected fixture and a non-ToolSet plugin (adapter, …) are
+  refused (409 / 400). The manifest is mutated transactionally on a clone and
+  re-validated with `validate_manifest` before it stands, then persisted through the
+  install store (authoritative for a user plugin; the bundled refresh never touches
+  it).
+- **The operator never supplies a raw permission.** The kernel DERIVES it as
+  `tool:<plugin-id>:<verb>` from the (sanitized, dotted) tool name, so a configured
+  tool can only ever gate on this plugin's own `tool:` namespace. Allowlist fields
+  only (`name`/`description`/`risk`/`auto_approve`/`timeout_secs`); any other key
+  fails the whole payload closed. `risk` is validated against the `RiskLevel`
+  allowlist; the timeout is clamped to `[1, 300]`s.
+- **Risk-driven, load-bearing approval.** `risk == low` → auto-approvable (the
+  operator opts in); any non-low risk is `approval: Required`. That approval is now
+  ENFORCED at tool execution (previously the field was decorative):
+  `relux_core::approval_blocks_direct_invocation` backs a new
+  `ToolExecutability::NeedsApproval` discovery status and a refusal in
+  `call_tool`/`invoke_tool`, so a non-low-risk tool is never runnable just because a
+  loopback runtime is enabled. All bundled fixtures declare `approval: never`, so
+  their behavior is unchanged.
+- **A tool is still not runnable until the operator enables a loopback runtime**
+  (the separate, explicit run-enabling step) and the calling agent holds the derived
+  permission. Adding a tool only makes it *discoverable* + honestly statused
+  (`runtime_not_configured` until a runtime is enabled; `needs_approval` for a
+  gated risky tool).
+
+Covered by kernel tests `configure_plugin_tool_adds_a_validated_tool_to_a_wrapper`,
+`a_non_low_risk_tool_needs_approval_and_is_refused_directly`,
+`configure_plugin_tool_refuses_bundled_and_unknown_plugins`,
+`remove_plugin_tool_drops_the_tool_and_its_unused_permission`,
+`configuring_a_tool_on_a_wrapper_makes_it_appear_and_bumps_the_record`,
+`tool_config_error_status_codes_are_honest`, the `plugin_tool_config` parser tests,
+and the `relux-core` `tool::tests` (approval predicate). The dashboard form lives in
+`apps/dashboard/src/pages/Plugins.tsx` (`ManifestPanel` → `AddToolForm` /
+`ConfiguredToolsList`); the `canConfigureTools` derivation + tool-count-aware status
+live in `apps/dashboard/src/plugins.ts`, unit-tested in
+`apps/dashboard/test/plugins.test.ts`.
 
 ### Adapter Runtime v1 (local coding-agent CLIs)
 

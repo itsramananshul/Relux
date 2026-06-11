@@ -24,6 +24,7 @@ pub mod clock;
 pub mod event;
 pub mod loader;
 pub mod plugin_install;
+pub mod plugin_tool_config;
 pub mod prime;
 pub mod prime_after_action;
 pub mod prime_admin_slots;
@@ -72,6 +73,7 @@ pub use plugin_install::{
     install_from_dir, install_from_github, install_from_zip, is_generated_manifest, list_installed,
     refresh_bundled_plugins, remove_plugin, GENERATED_MANIFEST_AUTHOR,
 };
+pub use plugin_tool_config::{parse_plugin_tool_input, PluginToolInput};
 pub use prime::{
     clarify_needs_label, classify_intent, decide, is_chat_guarded, is_standalone_request,
 };
@@ -255,6 +257,14 @@ pub enum KernelError {
     PluginNotInstalled(String),
     #[error("plugin {0} is bundled and cannot be removed")]
     BundledPluginProtected(String),
+    #[error("plugin {plugin} cannot have tools configured this way: {message}")]
+    PluginNotToolConfigurable { plugin: String, message: String },
+    #[error("invalid tool definition for plugin {plugin}: {message}")]
+    InvalidToolDefinition { plugin: String, message: String },
+    #[error("plugin {plugin} has no configured tool named {tool}")]
+    PluginToolNotFound { plugin: String, tool: String },
+    #[error("tool {tool} on plugin {plugin} requires approval and cannot be invoked directly yet")]
+    ToolRequiresApproval { plugin: String, tool: String },
     #[error("unsafe plugin path rejected: {0}")]
     UnsafePluginPath(String),
 }

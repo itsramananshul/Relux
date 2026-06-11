@@ -53,22 +53,34 @@ export interface PluginStatus {
   title: string;
 }
 
-// The status badge. The ONE rule the mission pins: a metadata-only wrapper must
-// NOT read as ready/enabled — it shows "Needs configuration" (warn), because
-// nothing about it can run yet. Everything else keeps the plain enabled/disabled.
+// The status badge. The ONE rule the mission pins: a metadata-only wrapper with
+// NO tools must NOT read as ready/enabled — it shows "Needs configuration" (warn),
+// because nothing about it can run yet. Once the operator has configured tools
+// (tool_count > 0) it behaves like a ToolSet (enabled/disabled). Everything else
+// keeps the plain enabled/disabled.
 export function pluginStatus(p: ReluxPlugin): PluginStatus {
-  if (pluginCategory(p) === "wrapper") {
+  if (pluginCategory(p) === "wrapper" && (p.tool_count ?? 0) === 0) {
     return {
       label: "Needs configuration",
       variant: "warn",
       title:
-        "Installed as metadata only — Relux generated a wrapper manifest because the source had no relux-plugin.json. No tools are runnable yet.",
+        "Installed as metadata only — Relux generated a wrapper manifest because the source had no relux-plugin.json. No tools are configured yet.",
     };
   }
   if (!p.enabled) {
     return { label: "disabled", variant: "muted", title: "This plugin is disabled." };
   }
   return { label: "enabled", variant: "ok", title: "This plugin is enabled." };
+}
+
+// Whether the operator can configure tool definitions on this plugin in-UI. The
+// kernel allows it for any INSTALLED, NON-bundled ToolSet — including a generated
+// metadata-only wrapper (which is a ToolSet). Bundled fixtures and non-ToolSet
+// plugins (adapters, …) are refused.
+export function canConfigureTools(p: ReluxPlugin): boolean {
+  if (p.protected || p.bundled) return false;
+  const category = pluginCategory(p);
+  return category === "wrapper" || category === "toolset";
 }
 
 export type NextStepKind =
@@ -90,14 +102,16 @@ export interface PluginNextStep {
 export function pluginNextStep(p: ReluxPlugin): PluginNextStep {
   const category = pluginCategory(p);
 
-  // A generated wrapper: the honest next step is to ADD a manifest with tool
-  // definitions. A loopback runtime alone would surface nothing.
-  if (category === "wrapper") {
+  // A generated wrapper with NO tools: the honest next step is to ADD tool
+  // definitions (a loopback runtime alone would surface nothing). Once tools exist
+  // the next step becomes pointing a runtime at a local server (handled below by
+  // the shared toolset branch).
+  if (category === "wrapper" && (p.tool_count ?? 0) === 0) {
     return {
       kind: "add-manifest",
-      cta: "Set up",
+      cta: "Configure",
       detail:
-        "This wrapper declares no tools, so a runtime alone runs nothing. Add a relux-plugin.json with tool definitions, re-install, then point a loopback runtime at your local server.",
+        "This wrapper declares no tools, so a runtime alone runs nothing. Add a tool definition (it stays disabled until you enable a loopback runtime), then point that runtime at your local server.",
     };
   }
 
@@ -122,8 +136,9 @@ export function pluginNextStep(p: ReluxPlugin): PluginNextStep {
     return { kind: "none", cta: "", detail: "Bundled plugin; built-in and runnable." };
   }
 
-  // A real ToolSet with tools: point Relux at a loopback server to run them.
-  if (category === "toolset") {
+  // A ToolSet with tools — including a wrapper the operator has now added tools to:
+  // point Relux at a loopback server to run them.
+  if (category === "toolset" || category === "wrapper") {
     const n = p.tool_count ?? 0;
     return {
       kind: "configure-runtime",

@@ -2231,7 +2231,33 @@ export const reluxPlugins = {
     api.get<ReluxManifestTemplate>(
       `/v1/relux/plugins/${encodeURIComponent(id)}/manifest-template`,
     ),
+  // Add or replace ONE operator-configured tool on a user-installed ToolSet/
+  // wrapper plugin. The kernel derives the permission (`tool:<id>:<verb>`) and the
+  // approval requirement from the risk - the form never sends a raw permission.
+  // Bundled/protected and non-ToolSet plugins are refused. Returns the updated
+  // plugin record so the table can refresh its tool count + status.
+  configureTool: (id: string, body: ReluxToolConfigInput) =>
+    api.post<ReluxPlugin>(
+      `/v1/relux/plugins/${encodeURIComponent(id)}/tools`,
+      body,
+    ),
+  // Remove a previously configured tool by name. Returns the updated record.
+  removeTool: (id: string, tool: string) =>
+    api.del<ReluxPlugin>(
+      `/v1/relux/plugins/${encodeURIComponent(id)}/tools/${encodeURIComponent(tool)}`,
+    ),
 };
+
+// The operator-supplied fields for a configured tool. The permission and approval
+// are DERIVED server-side from the id + risk; the form never sends them.
+export interface ReluxToolConfigInput {
+  name: string;
+  description?: string;
+  risk?: "low" | "medium" | "high" | "critical";
+  // Only honored for low risk (a non-low-risk tool is always approval-required).
+  auto_approve?: boolean;
+  timeout_secs?: number;
+}
 
 export interface ReluxManifestTemplate {
   plugin_id: string;
@@ -2361,13 +2387,15 @@ export interface ReluxToolDescriptor {
   // "runtime_not_configured" → installed, but needs a loopback endpoint set;
   // "runtime_disabled" → has a loopback runtime configured but it is disabled;
   // "not_implemented" → no supported runtime exists at all;
-  // "missing_permission" → the scoped agent lacks the permission.
+  // "missing_permission" → the scoped agent lacks the permission;
+  // "needs_approval" → a higher-risk configured tool gated behind approval.
   executable:
     | "ready"
     | "runtime_not_configured"
     | "runtime_disabled"
     | "not_implemented"
-    | "missing_permission";
+    | "missing_permission"
+    | "needs_approval";
 }
 
 // The structured result of a successful tool invocation.

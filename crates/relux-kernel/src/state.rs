@@ -24,14 +24,14 @@ use relux_core::agent::AgentStatus;
 use relux_core::namespace::NamespaceKind;
 use relux_core::plugin::PluginKind;
 use relux_core::{
-    clamp_runtime_timeout, plan_orchestration, validate_loopback_url, Agent, AgentId, Approval,
-    ApprovalId, ApprovalStatus, AuditEvent, AuditResult, InstalledPlugin, Namespace, NamespaceId,
-    Orchestration, OrchestrationBatchResult, OrchestrationId, OrchestrationStatus,
-    OrchestrationStep, Permission, PluginId, PluginManifest, PluginSourceKind, PrimeAction,
-    PrimeAutonomyConfig, PrimeAutonomyTickResult, PrimeContext, PrimeDisposition, PrimePlan,
-    PrimeTurn, RiskLevel, RuntimeKind, Run, RunId, RunStatus, StateSummary, StepOutcome, Task,
-    TaskBrief, TaskId, TaskStatus, ToolDescriptor, ToolExecutability, ToolInvocationResult,
-    ToolRuntimeConfig,
+    approval_blocks_direct_invocation, clamp_runtime_timeout, plan_orchestration,
+    validate_loopback_url, Agent, AgentId, Approval, ApprovalId, ApprovalStatus, AuditEvent,
+    AuditResult, InstalledPlugin, Namespace, NamespaceId, Orchestration, OrchestrationBatchResult,
+    OrchestrationId, OrchestrationStatus, OrchestrationStep, Permission, PluginId, PluginManifest,
+    PluginSourceKind, PrimeAction, PrimeAutonomyConfig, PrimeAutonomyTickResult, PrimeContext,
+    PrimeDisposition, PrimePlan, PrimeTurn, RiskLevel, RuntimeKind, Run, RunId, RunStatus,
+    StateSummary, StepOutcome, Task, TaskBrief, TaskId, TaskStatus, ToolDefinition, ToolDescriptor,
+    ToolExecutability, ToolInvocationResult, ToolRuntimeConfig,
 };
 use serde::{Deserialize, Serialize};
 
@@ -524,6 +524,190 @@ impl KernelState {
                 }
             }
         }
+    }
+
+    // --- Operator-configured plugin tools ----------------------------------
+
+    /// Add or replace ONE operator-configured tool on a user-installed ToolSet
+    /// plugin manifest (`docs/RELUX_MASTER_PLAN.md` §7.4 Plugin Kernel Layer, §8.2
+    /// ToolSet Plugins). This is the kernel half of the in-UI "add a tool" form
+    /// that makes a metadata-only wrapper useful without re-installing.
+    ///
+    /// Fail-closed by construction:
+    /// - the plugin must be INSTALLED (`PluginNotInstalled`);
+    /// - a BUNDLED/protected plugin is refused (its tools are built-in);
+    /// - only a `ToolSet` may be configured (an Adapter is configured through the
+    ///   adapter-runtime path, not here);
+    /// - the [`ToolDefinition`] is built by [`crate::plugin_tool_config`], so the
+    ///   permission is DERIVED (`tool:<plugin-id>:<verb>`), never operator-supplied,
+    ///   and the approval requirement is risk-driven;
+    /// - the whole manifest is re-validated before the change stands (so a
+    ///   configured tool can never leave the manifest malformed).
+    ///
+    /// The change is applied transactionally on a clone: a validation failure
+    /// leaves the live manifest untouched. The mutated manifest persists through
+    /// the store like any other manifest (the install store is authoritative for a
+    /// user plugin; the bundled refresh never touches it). Returns the stored
+    /// [`ToolDefinition`].
+    pub fn configure_plugin_tool(
+        &mut self,
+        plugin_id: &PluginId,
+        input: crate::plugin_tool_config::PluginToolInput,
+    ) -> Result<ToolDefinition, KernelError> {
+        // 1. Must be installed, and must not be a protected bundled fixture.
+        let installed = self
+            .installed_plugins
+            .get(plugin_id)
+            .ok_or_else(|| KernelError::PluginNotInstalled(plugin_id.to_string()))?;
+        if installed.source_kind == PluginSourceKind::Bundled {
+            return Err(KernelError::BundledPluginProtected(plugin_id.to_string()));
+        }
+
+        // 2. Build the tool definition (this derives the plugin-scoped permission).
+        let tool = input.into_tool_definition(plugin_id.as_str()).map_err(|message| {
+            KernelError::InvalidToolDefinition {
+                plugin: plugin_id.to_string(),
+                message,
+            }
+        })?;
+
+        // 3. Apply on a clone so a validation failure never leaves the live
+        //    manifest mutated. Only a ToolSet may carry tools.
+        let mut updated = self
+            .plugins
+            .get(plugin_id)
+            .cloned()
+            .ok_or_else(|| KernelError::PluginNotInstalled(plugin_id.to_string()))?;
+        if updated.kind != PluginKind::ToolSet {
+            return Err(KernelError::PluginNotToolConfigurable {
+                plugin: plugin_id.to_string(),
+                message: format!(
+                    "only ToolSet plugins can have tools configured here; this plugin is a {:?}",
+                    updated.kind
+                ),
+            });
+        }
+
+        // Upsert the tool by name, and ensure its derived permission is declared.
+        if let Some(existing) = updated
+            .capabilities
+            .tools
+            .iter_mut()
+            .find(|t| t.name == tool.name)
+        {
+            *existing = tool.clone();
+        } else {
+            updated.capabilities.tools.push(tool.clone());
+        }
+        if !updated
+            .capabilities
+            .permissions
+            .iter()
+            .any(|p| p.matches_exact(&tool.permission))
+        {
+            updated.capabilities.permissions.push(tool.permission.clone());
+        }
+
+        // 4. Re-validate the WHOLE manifest before committing (defense in depth).
+        relux_core::plugin::validate_manifest(&updated).map_err(|source| {
+            KernelError::ManifestInvalid {
+                path: plugin_id.to_string(),
+                source,
+            }
+        })?;
+
+        self.plugins.insert(plugin_id.clone(), updated);
+        self.record_audit(
+            "kernel",
+            "kernel",
+            "plugin:tool_configure",
+            Some("plugin"),
+            Some(plugin_id.as_str()),
+            None,
+            AuditResult::Success,
+            serde_json::json!({
+                "tool": tool.name,
+                "permission": tool.permission.as_str(),
+                "risk": format!("{:?}", tool.risk),
+                "approval": format!("{:?}", tool.approval),
+            }),
+        );
+        Ok(tool)
+    }
+
+    /// Remove ONE operator-configured tool from a user-installed ToolSet plugin
+    /// manifest by name. Symmetric with [`configure_plugin_tool`]: bundled plugins
+    /// are refused, an unknown tool is a clear error, and the manifest is mutated
+    /// transactionally on a clone and re-validated before it stands. The tool's
+    /// derived permission is dropped too when no other tool still references it.
+    pub fn remove_plugin_tool(
+        &mut self,
+        plugin_id: &PluginId,
+        tool_name: &str,
+    ) -> Result<(), KernelError> {
+        let installed = self
+            .installed_plugins
+            .get(plugin_id)
+            .ok_or_else(|| KernelError::PluginNotInstalled(plugin_id.to_string()))?;
+        if installed.source_kind == PluginSourceKind::Bundled {
+            return Err(KernelError::BundledPluginProtected(plugin_id.to_string()));
+        }
+
+        let mut updated = self
+            .plugins
+            .get(plugin_id)
+            .cloned()
+            .ok_or_else(|| KernelError::PluginNotInstalled(plugin_id.to_string()))?;
+
+        let before = updated.capabilities.tools.len();
+        let removed_permission = updated
+            .capabilities
+            .tools
+            .iter()
+            .find(|t| t.name == tool_name)
+            .map(|t| t.permission.clone());
+        updated.capabilities.tools.retain(|t| t.name != tool_name);
+        if updated.capabilities.tools.len() == before {
+            return Err(KernelError::PluginToolNotFound {
+                plugin: plugin_id.to_string(),
+                tool: tool_name.to_string(),
+            });
+        }
+
+        // Drop the tool's permission only when no remaining tool still needs it.
+        if let Some(perm) = removed_permission {
+            let still_used = updated
+                .capabilities
+                .tools
+                .iter()
+                .any(|t| t.permission.matches_exact(&perm));
+            if !still_used {
+                updated
+                    .capabilities
+                    .permissions
+                    .retain(|p| !p.matches_exact(&perm));
+            }
+        }
+
+        relux_core::plugin::validate_manifest(&updated).map_err(|source| {
+            KernelError::ManifestInvalid {
+                path: plugin_id.to_string(),
+                source,
+            }
+        })?;
+
+        self.plugins.insert(plugin_id.clone(), updated);
+        self.record_audit(
+            "kernel",
+            "kernel",
+            "plugin:tool_remove",
+            Some("plugin"),
+            Some(plugin_id.as_str()),
+            None,
+            AuditResult::Success,
+            serde_json::json!({ "tool": tool_name }),
+        );
+        Ok(())
     }
 
     // --- Tool runtime config (HTTP loopback) -------------------------------
@@ -2174,6 +2358,33 @@ impl KernelState {
             });
         }
 
+        // A tool whose declared approval blocks a direct invocation (a non-low-risk
+        // operator-configured tool) is refused here - it is never run just because a
+        // runtime is enabled. Recorded honestly on the transcript + audit log.
+        if self.tool_needs_approval(plugin_id, tool_name) {
+            self.push_run_event(
+                run_id,
+                "tool_call_denied",
+                "kernel",
+                &format!("denied {tool_name}: requires approval"),
+                serde_json::json!({ "tool": tool_name, "plugin": plugin_id.as_str() }),
+            );
+            self.record_audit(
+                "agent",
+                agent_id.as_str(),
+                required.as_str(),
+                Some("tool"),
+                Some(tool_name),
+                Some(&namespace),
+                AuditResult::Denied,
+                serde_json::json!({ "run": run_id.as_str(), "reason": "requires approval" }),
+            );
+            return Err(KernelError::ToolRequiresApproval {
+                plugin: plugin_id.to_string(),
+                tool: tool_name.to_string(),
+            });
+        }
+
         // Execute via a built-in deterministic handler or the plugin's configured
         // HTTP loopback runtime. Any failure (unconfigured, disabled, or a
         // loopback error) is audited and recorded on the transcript - no
@@ -2257,6 +2468,29 @@ impl KernelState {
             });
         }
 
+        // Refuse a tool whose declared approval blocks a direct invocation (a
+        // non-low-risk operator-configured tool); audited as a denial.
+        if self.tool_needs_approval(plugin_id, tool_name) {
+            self.record_audit(
+                "agent",
+                agent_id.as_str(),
+                required.as_str(),
+                Some("tool"),
+                Some(tool_name),
+                Some(&namespace),
+                AuditResult::Denied,
+                serde_json::json!({
+                    "via": "invoke",
+                    "plugin": plugin_id.as_str(),
+                    "reason": "requires approval"
+                }),
+            );
+            return Err(KernelError::ToolRequiresApproval {
+                plugin: plugin_id.to_string(),
+                tool: tool_name.to_string(),
+            });
+        }
+
         let output = match self.execute_tool_runtime(plugin_id, tool_name, &input) {
             Ok(output) => output,
             Err(e) => {
@@ -2318,11 +2552,21 @@ impl KernelState {
                 // status is honest about WHY it cannot run.
                 let runnable = builtin || runtime.map(|c| c.enabled).unwrap_or(false);
                 let executable = if runnable {
-                    match agent_for_permission {
-                        Some(agent_id) if !self.agent_holds_permission(agent_id, &tool.permission) => {
-                            ToolExecutability::MissingPermission
+                    // A tool whose declared approval blocks a direct invocation
+                    // (any non-low-risk operator-configured tool) is NOT runnable
+                    // just because a runtime is enabled - it is honestly gated.
+                    // Bundled tools all declare `Never`, so this never changes them.
+                    if approval_blocks_direct_invocation(&tool.approval, &tool.risk) {
+                        ToolExecutability::NeedsApproval
+                    } else {
+                        match agent_for_permission {
+                            Some(agent_id)
+                                if !self.agent_holds_permission(agent_id, &tool.permission) =>
+                            {
+                                ToolExecutability::MissingPermission
+                            }
+                            _ => ToolExecutability::Ready,
                         }
-                        _ => ToolExecutability::Ready,
                     }
                 } else if runtime.is_some() {
                     // Configured but disabled.
@@ -2385,6 +2629,20 @@ impl KernelState {
             .permission
             .clone();
         Ok((namespace, required))
+    }
+
+    /// Whether an installed tool's declared approval requirement blocks a direct
+    /// (no-approval-flow) invocation. The kernel does not yet wire a per-tool-call
+    /// approval flow, so a tool that requires approval is honestly refused here
+    /// rather than run. An unknown plugin/tool returns `false` (the caller's own
+    /// resolution already failed it). Bundled tools declare `Never`, so this never
+    /// changes their behavior.
+    fn tool_needs_approval(&self, plugin_id: &PluginId, tool_name: &str) -> bool {
+        self.plugins
+            .get(plugin_id)
+            .and_then(|m| m.capabilities.tools.iter().find(|t| t.name == tool_name))
+            .map(|t| approval_blocks_direct_invocation(&t.approval, &t.risk))
+            .unwrap_or(false)
     }
 
     /// True when `agent_id` exists and holds `permission` exactly.
@@ -5003,6 +5261,18 @@ impl KernelState {
                     Some(note),
                 ))
             }
+            Some(ToolExecutability::NeedsApproval) => {
+                let note = format!(
+                    "{label} is configured as a higher-risk tool that requires approval, so I will not run it directly; lower its risk (or mark it low-risk + auto-approve) to make it directly callable"
+                );
+                Ok(turn(
+                    with_prose(note.clone()),
+                    PrimeDisposition::NeedsClarification,
+                    None,
+                    None,
+                    Some(note),
+                ))
+            }
             Some(ToolExecutability::Ready) => {
                 let input: serde_json::Value =
                     serde_json::from_str(input_json).unwrap_or_else(|_| serde_json::json!({}));
@@ -6970,6 +7240,7 @@ fn render_tool_catalog(intro: &str, tools: &[ToolDescriptor]) -> String {
             ToolExecutability::RuntimeDisabled => "installed, runtime disabled",
             ToolExecutability::NotImplemented => "installed, runtime not implemented yet",
             ToolExecutability::MissingPermission => "needs permission",
+            ToolExecutability::NeedsApproval => "needs approval (higher-risk tool)",
         };
         let disabled = if t.enabled { "" } else { ", disabled" };
         lines.push(format!(
@@ -7712,6 +7983,183 @@ mod tests {
         // Removing the installed plugin clears its runtime config.
         k.remove_installed_plugin(&ghost).unwrap();
         assert!(k.tool_runtime_config(&ghost).is_none());
+    }
+
+    // --- Operator-configured plugin tools ----------------------------------
+
+    /// A generated metadata-only wrapper (no tools) installed as a user plugin,
+    /// mirroring `plugin_install::scaffold_manifest`.
+    fn wrapper_manifest(id: &str) -> PluginManifest {
+        PluginManifest {
+            id: PluginId::new(id),
+            name: format!("{id} (metadata only)"),
+            version: "0.0.0".to_string(),
+            kind: PluginKind::ToolSet,
+            description: "Installed as metadata: no runnable tools yet.".to_string(),
+            author: crate::plugin_install::GENERATED_MANIFEST_AUTHOR.to_string(),
+            trust_level: TrustLevel::Unverified,
+            capabilities: PluginCapability {
+                tools: Vec::new(),
+                permissions: Vec::new(),
+            },
+            health: PluginHealth::Unknown,
+        }
+    }
+
+    fn primed_with_wrapper() -> (KernelState, AgentId, PluginId) {
+        let (mut k, prime, _task, _run, _echo) = primed_kernel();
+        let id = PluginId::new("relux-plugin-my-repo");
+        k.install_plugin(
+            wrapper_manifest("relux-plugin-my-repo"),
+            PluginSourceKind::LocalDir,
+            "/tmp/my-repo".to_string(),
+            "/data/my-repo".to_string(),
+            true,
+        );
+        (k, prime, id)
+    }
+
+    fn tool_input(json: &str) -> crate::plugin_tool_config::PluginToolInput {
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        crate::plugin_tool_config::parse_plugin_tool_input(&v).unwrap()
+    }
+
+    #[test]
+    fn configure_plugin_tool_adds_a_validated_tool_to_a_wrapper() {
+        let (mut k, prime, id) = primed_with_wrapper();
+        // The wrapper starts with no tools at all.
+        assert!(k.plugin(&id).unwrap().capabilities.tools.is_empty());
+
+        let def = k
+            .configure_plugin_tool(&id, tool_input(r#"{"name":"report.fetch","risk":"low"}"#))
+            .expect("configure tool");
+        // Permission is DERIVED, never operator-supplied.
+        assert_eq!(def.permission.as_str(), "tool:relux-plugin-my-repo:fetch");
+        assert_eq!(def.approval, ApprovalRequirement::Never);
+
+        // The manifest now declares the tool + its permission.
+        let manifest = k.plugin(&id).unwrap();
+        assert_eq!(manifest.capabilities.tools.len(), 1);
+        assert_eq!(manifest.capabilities.tools[0].name, "report.fetch");
+        assert!(manifest
+            .capabilities
+            .permissions
+            .iter()
+            .any(|p| p.as_str() == "tool:relux-plugin-my-repo:fetch"));
+
+        // Discovery: with no runtime it is honestly not-yet-runnable.
+        let tools = k.discover_tools(None);
+        let t = tools.iter().find(|t| t.tool_name == "report.fetch").unwrap();
+        assert_eq!(t.executable, ToolExecutability::RuntimeNotConfigured);
+
+        // After enabling a runtime + granting the permission it becomes Ready and
+        // is actually invocable through the loopback path.
+        let base = one_shot_http(
+            "HTTP/1.1 200 OK\r\nContent-Length: 24\r\nConnection: close\r\n\r\n{\"output\":{\"ok\":true}}\n\n\n\n",
+        );
+        k.configure_tool_runtime(&id, &base, true, Some(2_000)).unwrap();
+        k.grant_permission_to_agent(&prime, def.permission.clone()).unwrap();
+        let t = k
+            .discover_tools(Some(&prime))
+            .into_iter()
+            .find(|t| t.tool_name == "report.fetch")
+            .unwrap();
+        assert_eq!(t.executable, ToolExecutability::Ready);
+        let result = k
+            .invoke_tool(&prime, &id, "report.fetch", serde_json::json!({}))
+            .expect("invocable");
+        assert_eq!(result.output, serde_json::json!({ "ok": true }));
+    }
+
+    #[test]
+    fn configure_plugin_tool_upserts_by_name_and_persists_across_snapshot() {
+        let (mut k, _prime, id) = primed_with_wrapper();
+        k.configure_plugin_tool(&id, tool_input(r#"{"name":"report.fetch","description":"v1"}"#))
+            .unwrap();
+        k.configure_plugin_tool(&id, tool_input(r#"{"name":"report.fetch","description":"v2"}"#))
+            .unwrap();
+        // Upsert, not duplicate.
+        assert_eq!(k.plugin(&id).unwrap().capabilities.tools.len(), 1);
+        assert_eq!(k.plugin(&id).unwrap().capabilities.tools[0].description, "v2");
+
+        // The mutated manifest survives a snapshot roundtrip (the store is
+        // authoritative for a user plugin).
+        let restored = KernelState::from_snapshot(k.snapshot());
+        assert_eq!(restored.plugin(&id).unwrap().capabilities.tools.len(), 1);
+    }
+
+    #[test]
+    fn a_non_low_risk_tool_needs_approval_and_is_refused_directly() {
+        let (mut k, prime, id) = primed_with_wrapper();
+        let def = k
+            .configure_plugin_tool(&id, tool_input(r#"{"name":"deploy.run","risk":"high"}"#))
+            .unwrap();
+        // A risky tool is approval-Required regardless of any auto-approve attempt.
+        assert_eq!(def.approval, ApprovalRequirement::Required);
+
+        // Even with a runtime enabled and the permission held, it is gated.
+        k.configure_tool_runtime(&id, "http://127.0.0.1:19999", true, None).unwrap();
+        k.grant_permission_to_agent(&prime, def.permission.clone()).unwrap();
+        let t = k
+            .discover_tools(Some(&prime))
+            .into_iter()
+            .find(|t| t.tool_name == "deploy.run")
+            .unwrap();
+        assert_eq!(t.executable, ToolExecutability::NeedsApproval);
+
+        let err = k
+            .invoke_tool(&prime, &id, "deploy.run", serde_json::json!({}))
+            .unwrap_err();
+        assert!(matches!(err, KernelError::ToolRequiresApproval { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn configure_plugin_tool_refuses_bundled_and_unknown_plugins() {
+        let (mut k, _prime, _id) = primed_with_wrapper();
+        // The bundled echo fixture cannot have tools configured this way.
+        k.install_plugin(
+            echo_manifest(),
+            PluginSourceKind::Bundled,
+            "bundled".to_string(),
+            "examples/relux-plugins/relux-tools-echo".to_string(),
+            true,
+        );
+        let err = k
+            .configure_plugin_tool(
+                &PluginId::new("relux-tools-echo"),
+                tool_input(r#"{"name":"x.run"}"#),
+            )
+            .unwrap_err();
+        assert!(matches!(err, KernelError::BundledPluginProtected(_)), "got {err:?}");
+
+        // An uninstalled plugin is a clear not-installed error.
+        let err = k
+            .configure_plugin_tool(
+                &PluginId::new("relux-plugin-nope"),
+                tool_input(r#"{"name":"x.run"}"#),
+            )
+            .unwrap_err();
+        assert!(matches!(err, KernelError::PluginNotInstalled(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn remove_plugin_tool_drops_the_tool_and_its_unused_permission() {
+        let (mut k, _prime, id) = primed_with_wrapper();
+        let def = k
+            .configure_plugin_tool(&id, tool_input(r#"{"name":"report.fetch"}"#))
+            .unwrap();
+        k.remove_plugin_tool(&id, "report.fetch").unwrap();
+        let manifest = k.plugin(&id).unwrap();
+        assert!(manifest.capabilities.tools.is_empty());
+        assert!(!manifest
+            .capabilities
+            .permissions
+            .iter()
+            .any(|p| p.matches_exact(&def.permission)));
+
+        // Removing a tool that is not there is a clear error.
+        let err = k.remove_plugin_tool(&id, "nope.run").unwrap_err();
+        assert!(matches!(err, KernelError::PluginToolNotFound { .. }), "got {err:?}");
     }
 
     #[test]

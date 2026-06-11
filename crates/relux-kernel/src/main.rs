@@ -1409,6 +1409,7 @@ fn executability_label(e: &ToolExecutability) -> &'static str {
         ToolExecutability::RuntimeDisabled => "runtime_disabled",
         ToolExecutability::NotImplemented => "not_implemented",
         ToolExecutability::MissingPermission => "missing_permission",
+        ToolExecutability::NeedsApproval => "needs_approval",
     }
 }
 
