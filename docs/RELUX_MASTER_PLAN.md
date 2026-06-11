@@ -1836,6 +1836,28 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.18** (2026-06-11) — a **first per-agent identity** slice on top of v0.1.17, driven by
+  `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` (§20). It closes — for the `grant_permission` action —
+  the §19 operator-assisted gap: a manager can now authenticate its OWN request and drive the
+  manager-subtree grant with no operator in the loop, and no master-plan safety property is
+  weakened. **Bounded, hash-only agent token (§20):** a new `AgentTokenStore` mints an opaque
+  `relux_agt_` token bound to one agent, stored only as its SHA-256 hash in a gitignored,
+  atomic, permission-restricted file, with a bounded/clamped TTL and individual revocation; the
+  raw token is shown once at mint, mapping Paperclip's `agent-auth-jwt.ts` (`sub`/`exp`,
+  timing-safe) to a local hashed opaque token and reusing the `auth.rs` hashed-store discipline.
+  **Agent-authenticated surface:** a `require_agent_token` bearer middleware gates a two-route
+  allowlist (`GET /v1/relux/agents/me`, `POST /v1/relux/agents/me/manager-grant`) where the
+  acting agent is always the token subject (never the body); there is no `RELUX_AUTH_DISABLED`
+  bypass on the agent surface, an agent token is never accepted on an operator route, and
+  operator-only mint/list/revoke lives under `/v1/relux/agents/:id/tokens`.
+  **Token-authenticated manager-grant:** `manager_grant_permission_to_subordinate_as_agent`
+  runs the unchanged own-Branch + Active + scope gate and audits token provenance (public id
+  only), `redact` masks the `relux_agt_` prefix, and a Crew Governance "Access tokens" panel
+  mints (copy-once), lists metadata, and revokes. Built reference-first per
+  `docs/reference-driven-development.md`; `cargo test` + `clippy` clean on
+  `relux-core`/`relux-kernel`, dashboard tests + typecheck + build green, the tracked
+  `dashboard-dist` bundle rebuilt and committed in sync. Every safety property from v0.1.17
+  still holds.
 - **v0.1.17** (2026-06-11) — a **scoped-permission + chain-of-command governance** slice on
   top of v0.1.16, driven by `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` (§3/§5/§6/§16–§19). Every new
   path stays fail-closed, governed, and bounded; no new authority is granted that the holder

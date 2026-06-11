@@ -9,6 +9,44 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.18 (Windows bundle).** The `relux-kernel` /
+  `relux-core` crates move from `0.1.17` to `0.1.18`, bundling the post-v0.1.17
+  **first per-agent identity** slice (driven by `docs/HERMES_OPENCLAW_DEEP_AUDIT.md`
+  §20) into a fresh Windows release. This closes — for the `grant_permission`
+  action — the §19 operator-assisted gap: a manager can now authenticate its OWN
+  request and drive the manager-subtree grant with no operator in the loop. No
+  master-plan safety property is weakened: the grant still runs the unchanged
+  own-Branch + Active + scope gate, the acting agent is always the token subject
+  (never the request body), and no new authority is granted that the holder did
+  not already have. Headlines:
+  - **Bounded, hash-only per-agent access token (`HERMES_OPENCLAW_DEEP_AUDIT.md`
+    §20).** A new `AgentTokenStore` mints an opaque `relux_agt_` token bound to one
+    agent, stored only as its SHA-256 hash in a gitignored, atomic,
+    permission-restricted file, with a bounded/clamped TTL and individual
+    revocation; the raw token is shown exactly once at mint. This maps Paperclip's
+    `agent-auth-jwt.ts` (`sub`/`exp`, timing-safe compare) to a local hashed opaque
+    token and reuses the proven `auth.rs` hashed-store discipline.
+  - **Agent-authenticated request surface.** A `require_agent_token` bearer
+    middleware gates a two-route allowlist (`GET /v1/relux/agents/me`,
+    `POST /v1/relux/agents/me/manager-grant`); the acting agent is always the token
+    subject, never the body. There is **no `RELUX_AUTH_DISABLED` bypass on the
+    agent surface**, and an agent token is never accepted on an operator route.
+    Operator-only mint/list/revoke lives under `/v1/relux/agents/:id/tokens`.
+  - **Token-authenticated manager-grant.**
+    `manager_grant_permission_to_subordinate_as_agent` runs the unchanged
+    own-Branch + Active + scope gate and audits token provenance (public id only;
+    `audit_agent_token_minted` / `audit_agent_token_revoked`), and `redact` masks
+    the `relux_agt_` prefix. A Crew Governance "Access tokens" panel mints
+    (copy-once), lists metadata, and revokes.
+
+  Built reference-first per `docs/reference-driven-development.md`, with the exact
+  reference files read and the Relux mapping recorded there and in
+  `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §20. `cargo test` + `clippy` clean on
+  `relux-core`/`relux-kernel`; dashboard tests + typecheck + build green; the
+  tracked `dashboard-dist` bundle was rebuilt and committed in sync. Build the
+  bundle with `scripts\relux-package-local.ps1 -FullE2E`. This version line is the
+  `relux-kernel` crate version (separate from the legacy Relix workspace versions
+  in the dated sections below). See `docs/RELUX_MASTER_PLAN.md` → *Release history*.
 - **Relux local release v0.1.17 (Windows bundle).** The `relux-kernel` /
   `relux-core` crates move from `0.1.16` to `0.1.17`, bundling the post-v0.1.16
   **scoped-permission + chain-of-command governance** slice (driven by
