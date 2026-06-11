@@ -2679,3 +2679,70 @@ false positive just yields a friendlier, button-free reply); it is explicitly no
 
 See `docs/prime-processing-audit.md` "Hermes-first general agent" for the per-case behavior table and the
 remaining gaps.
+
+## Reference read — bounded run-log / tail surface (this slice)
+
+Runs captured their final, already-redacted, byte-capped stdout/stderr into a single `adapter_output`
+transcript event, but there was no dedicated, line-classified, **pollable** log/tail surface — the
+operator could not watch a run's stdout/stderr/system output as a first-class, bounded, redacted tail.
+This slice adds the first run-log model: a bounded `RunLog` of per-line entries classified
+`stdout`/`stderr`/`system`, captured at finalize, served at `GET /v1/relux/runs/:id/logs?since=<seq>`,
+and shown in the Work Run Detail. Live per-chunk streaming during the run stays out of scope (the
+synchronous spawn has no `onLog` callback yet) and is documented as the remaining gap.
+
+### Paperclip — files read (vendored under `references/paperclip/`)
+
+- `references/paperclip/server/src/services/run-log-store.ts` — the run-log store contract:
+  `append(handle, { stream: "stdout" | "stderr" | "system", chunk, ts })` (the **three-stream
+  classification**), NDJSON `{ ts, stream, chunk }` per line, and `read({ offset, limitBytes })` →
+  `{ content, nextOffset }` with a default `limitBytes: 256_000`. **Pattern: a run log is per-line,
+  source-classified, and read as a BOUNDED, OFFSET-CURSORED slice (a pollable tail), not an unbounded
+  blob; `nextOffset` is the cursor for the next poll.** `safeSegments` + `resolveWithin` confirm the
+  path-safety discipline (not needed here — Relux stores in-process, not on a per-run file).
+- `references/paperclip/server/src/adapters/process/execute.ts` — `runChildProcess(runId, command,
+  args, { …, onLog })` streams stdout/stderr/system chunks via the `onLog` callback during the run, and
+  the result still carries `resultJson: { stdout, stderr }`. **Pattern: LIVE tailing uses an `onLog`
+  stream; the final captured stdout/stderr is the fallback.** Relux's synchronous spawn has no `onLog`,
+  so Relux captures the FINAL output only — the honest reason the tail is polled, not streamed.
+
+### OpenClaw — files read (vendored under `reference/openclaw-main/`)
+
+- `reference/openclaw-main/src/process/exec.ts` — `runExec`/`execFile` with a `maxBuffer` bound on
+  captured output. **Pattern: captured process output is ALWAYS bounded (a hard buffer cap), never
+  unlimited** — the discipline behind Relux's per-line and total-line caps.
+
+### The exact logic learned
+
+A run log is (1) per-line, (2) classified into exactly three streams (stdout/stderr/system), (3) bounded
+at capture (a byte/line cap, oldest dropped), and (4) read as an offset-cursored slice so a client polls
+only the tail past its cursor. LIVE liveness comes from an `onLog` stream during the run; without it, the
+honest surface is the captured-at-finalize tail, polled — never a faked live stream.
+
+### How Relux maps it
+
+| Paperclip/OpenClaw pattern | Relux adaptation |
+|---|---|
+| `stream: "stdout" \| "stderr" \| "system"` per line | `relux_core::RunLogSource { Stdout, Stderr, System }`; each `RunLogLine` carries its source. Stdout/stderr come from the adapter's captured output split per line; `system` lines are kernel-authored (spawn + exit/timeout / spawn-error). |
+| NDJSON `{ ts, stream, chunk }` appended per line | `RunLogLine { seq, source, text, truncated }`; `seq` is a dense 1-based cursor (the analogue of the byte `offset`). Built once at finalize by the pure `RunLogBuilder` (no clock, no IO). |
+| `read({ offset, limitBytes })` → `{ content, nextOffset }` (bounded, cursored) | `GET /v1/relux/runs/:id/logs?since=<seq>` → `RunLog::since(seq)` returns only lines past the cursor; `latest_seq()` is the next cursor. Bounds are line-based: `MAX_LOG_LINES = 200` (oldest dropped, `dropped_lines` recorded) + `MAX_LOG_LINE_CHARS = 2_000` per line (`truncated` marker). |
+| `maxBuffer` (output always bounded) | Two caps (per-line + total-line) plus the upstream adapter byte-cap flags (`stdout_truncated`/`stderr_truncated`) carried onto the log so the UI shows honest truncation markers. Every line is **re-redacted** (`redact_secrets`) on its own account. |
+| `onLog` LIVE stream during the run | **Not adopted this round** — the synchronous spawn captures FINAL output only, so the tail is captured at `finalize_cli_run` and POLLED (the in-flight UI re-fetches `?since=<seq>` on the same 1.5s cadence as the transcript). Live streaming is the documented remaining gap. |
+
+**What we deliberately do differently:** Paperclip streams chunks to a per-run NDJSON file via `onLog`;
+Relux captures the run's final, already-redacted, byte-capped stdout/stderr at finalize into one bounded
+in-process `RunLog` per run (snapshot-persisted). So Relux's tail is honest but POLLED, not streamed, and
+stdout lines are grouped then stderr (not interleaved by real time) — both stated plainly in the UI copy
+and the audit. A run with no captured log returns an EMPTY tail (not an error), so "No logs" is honest.
+
+### Files read / changed in Relux (the surface being added)
+
+- `crates/relux-core/src/run_log.rs` (new) — `RunLog`/`RunLogLine`/`RunLogSource`/`RunLogBuilder` + the
+  bounds + pure tests; exported from `crates/relux-core/src/lib.rs`.
+- `crates/relux-kernel/src/state.rs` — `run_logs` store, `capture_cli_run_log` /
+  `capture_spawn_error_log` (in `finalize_cli_run`), the `run_log` reader, snapshot export/restore.
+- `crates/relux-kernel/src/store.rs` — `run_logs` meta persistence.
+- `crates/relux-kernel/src/server.rs` — `GET /v1/relux/runs/:id/logs` (`get_run_logs` + `RunLogsQuery`).
+- `apps/dashboard/src/reluxrunlog.ts` (new), `apps/dashboard/src/api.ts` (`getRunLogs` + types),
+  `apps/dashboard/src/pages/Work.tsx` (the Logs/Tail section + poll).
+
+See `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §24 for the applied-change record and the remaining streaming gap.

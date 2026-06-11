@@ -6,7 +6,14 @@ import {
   mergeReluxRunEvents,
   noActivityLabel,
 } from "../reluxruntranscript";
-import { reluxWork, reluxAudit, type ReluxTask, type ReluxRun, type ReluxAgent, type ReluxTaskDetail, type ReluxRunDetail, type ReluxAuditEntry, type ReluxRunEvent } from "../api";
+import {
+  latestRunLogSeq,
+  mergeRunLog,
+  runLogIsEmpty,
+  runLogSourceLabel,
+  runLogTruncationNote,
+} from "../reluxrunlog";
+import { reluxWork, reluxAudit, type ReluxTask, type ReluxRun, type ReluxAgent, type ReluxTaskDetail, type ReluxRunDetail, type ReluxAuditEntry, type ReluxRunEvent, type ReluxRunLog } from "../api";
 import { useAsync } from "../components/common";
 import {
   runStatusTone,
@@ -432,6 +439,14 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
   const [eventsLoading, setEventsLoading] = useState(true);
   const [eventsError, setEventsError] = useState<string | null>(null);
   const cursorRef = useRef<string | null>(null);
+  // Bounded, redacted run-log tail (stdout/stderr/system). Same incremental
+  // pattern as the transcript: keep the accumulated lines and re-fetch only the
+  // tail past `logCursorRef` (the highest line seq we hold), merging on. The
+  // first load (and Refresh) fetches the full bounded tail with no cursor.
+  const [runLog, setRunLog] = useState<ReluxRunLog | null>(null);
+  const [logsLoading, setLogsLoading] = useState(true);
+  const [logsError, setLogsError] = useState<string | null>(null);
+  const logCursorRef = useRef<number | null>(null);
   // Wall-clock instant of the last observed activity (a new transcript event or
   // a run phase/status change). Drives the honest "no activity" stalled signal —
   // the Relux event `ts` is a logical clock, so staleness must be measured here
@@ -488,6 +503,50 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
     };
   }, [runId]);
 
+  // First load (and on run switch): fetch the FULL bounded log tail and seed the
+  // log cursor. Resets accumulated lines so a different run never shows the
+  // prior run's logs. A run with no captured log returns an empty tail (the
+  // honest "No logs" state) — not an error.
+  useEffect(() => {
+    let on = true;
+    setRunLog(null);
+    setLogsLoading(true);
+    setLogsError(null);
+    logCursorRef.current = null;
+    reluxWork
+      .getRunLogs(runId)
+      .then((log) => {
+        if (!on) return;
+        setRunLog(log);
+        logCursorRef.current = latestRunLogSeq(log);
+      })
+      .catch((e) => {
+        if (on) setLogsError(e instanceof Error ? e.message : String(e));
+      })
+      .finally(() => {
+        if (on) setLogsLoading(false);
+      });
+    return () => {
+      on = false;
+    };
+  }, [runId]);
+
+  // Manual Refresh / Poll for the log tail: fetch only the lines past our cursor
+  // and merge them on (a full re-fetch when we hold no cursor yet). Pollable, not
+  // streamed — live token streaming is a future backend seam (no `onLog` on the
+  // synchronous spawn). Never clears the last good tail on a transient error.
+  async function refreshLogs() {
+    setLogsError(null);
+    try {
+      const tail = await reluxWork.getRunLogs(runId, logCursorRef.current ?? undefined);
+      setRunLog((prev) => mergeRunLog(prev, tail));
+      const next = latestRunLogSeq(tail);
+      if (next != null) logCursorRef.current = next;
+    } catch (e) {
+      setLogsError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
   // Light incremental polling while the run is still in flight. Execution is
   // synchronous, so a run is usually already terminal when this panel opens;
   // this only keeps a panel left open during a long CLI run fresh. The run
@@ -509,6 +568,18 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
         .catch(() => {
           // Transient poll error: keep the last good transcript rather than
           // clearing it. The next tick retries from the same cursor.
+        });
+      // Poll the log tail on the same cadence (only the lines past our cursor).
+      reluxWork
+        .getRunLogs(runId, logCursorRef.current ?? undefined)
+        .then((tail) => {
+          if (tail.lines.length === 0) return; // nothing new
+          setRunLog((prev) => mergeRunLog(prev, tail));
+          const next = latestRunLogSeq(tail);
+          if (next != null) logCursorRef.current = next;
+        })
+        .catch(() => {
+          // Transient: keep the last good tail; the next tick retries.
         });
     }, 1500);
     return () => clearInterval(t);
@@ -868,6 +939,82 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
             </div>
           ) : (
             <div className="empty sm">No events found for this run.</div>
+          )}
+          {/* Bounded, redacted run-log / tail: the adapter's captured
+              stdout/stderr split into per-line entries, framed by kernel
+              `system` lines (spawn/exit/timeout). Pollable, not streamed — live
+              token streaming is a future backend seam. Shows truncation +
+              redaction markers honestly and never blanks when there are no logs
+              (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §8/§10). */}
+          <h5 style={{ marginTop: 16, marginBottom: 8 }}>
+            Logs / Tail
+            <button
+              type="button"
+              className="btn xs ghost"
+              style={{ marginLeft: 8, fontSize: 10, verticalAlign: "middle" }}
+              onClick={() => { void refreshLogs(); }}
+              title="Re-fetch the bounded log tail (pollable; live streaming is a future backend capability)"
+            >
+              ↻ Refresh
+            </button>
+            {(() => {
+              const note = runLogTruncationNote(runLog);
+              return note ? (
+                <span
+                  className="badge in_progress"
+                  style={{ fontSize: 9, fontWeight: 600, marginLeft: 8, verticalAlign: "middle" }}
+                  title="this tail is a bounded, redacted excerpt — earlier lines and/or byte-capped streams are not shown in full"
+                >
+                  {note}
+                </span>
+              ) : null;
+            })()}
+          </h5>
+          <div className="muted" style={{ fontSize: 10, marginBottom: 6 }}>
+            stdout/stderr/system lines — already secret-redacted and bounded. Pollable tail
+            (live streaming during a run is a future capability).
+          </div>
+          {logsLoading && !runLog ? (
+            <div className="loading">Loading logs...</div>
+          ) : logsError ? (
+            <div className="banner err" style={{ fontSize: 12 }}>
+              Error loading logs: {String(logsError)}
+            </div>
+          ) : !runLogIsEmpty(runLog) ? (
+            <div className="table-scroll" style={{ maxHeight: 300 }}>
+              <table className="table sm">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>Source</th>
+                    <th>Line</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {runLog!.lines.map((line) => (
+                    <tr key={line.seq}>
+                      <td className="mono" style={{ fontSize: 10 }}>{line.seq}</td>
+                      <td>
+                        <span
+                          className={`badge ${line.source === "stderr" ? "failed" : line.source === "system" ? "in_progress" : "queued"}`}
+                          style={{ fontSize: 9 }}
+                        >
+                          {runLogSourceLabel(line.source)}
+                        </span>
+                      </td>
+                      <td className="mono" style={{ fontSize: 11, whiteSpace: "pre-wrap" }}>
+                        {line.text}
+                        {line.truncated && (
+                          <span className="muted" title="this line was clamped to the per-line length cap"> …[line truncated]</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <div className="empty sm">No logs captured for this run.</div>
           )}
           {/* Read-only artifact references the adapter declared in its result
               envelope. References only (name/type/summary/source) — no diff, no

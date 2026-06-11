@@ -190,6 +190,7 @@ async fn serve() -> Result<(), KernelError> {
     println!("   GET    /v1/relux/runs");
     println!("   GET    /v1/relux/runs/:id");
     println!("   GET    /v1/relux/runs/:id/events            (optional ?since=<event_id> tail)");
+    println!("   GET    /v1/relux/runs/:id/logs              (bounded redacted stdout/stderr/system tail; optional ?since=<seq>)");
     println!("   POST   /v1/relux/runs/:id/retry");
     println!("   POST   /v1/relux/runs/:id/resume            (continue the captured provider session; 422 if unsupported)");
     println!("   POST   /v1/relux/runs/:id/proposed-changes/:index/review {{ \"decision\": \"approve|reject\" }}");
@@ -448,6 +449,7 @@ fn protected_router() -> Router<AppState> {
         .route("/v1/relux/runs", get(list_runs))
         .route("/v1/relux/runs/:id", get(get_run))
         .route("/v1/relux/runs/:id/events", get(get_run_events))
+        .route("/v1/relux/runs/:id/logs", get(get_run_logs))
         .route("/v1/relux/runs/:id/retry", post(retry_run))
         .route("/v1/relux/runs/:id/resume", post(resume_run))
         .route(
@@ -1387,6 +1389,44 @@ async fn get_run_events(
             .collect())
     })?;
     Ok(Json(events))
+}
+
+/// Query params for `GET /v1/relux/runs/:id/logs`.
+#[derive(Debug, Deserialize)]
+struct RunLogsQuery {
+    /// Optional exclusive 1-based sequence cursor: return ONLY log lines strictly
+    /// after this `seq` (the pollable incremental tail — the analogue of
+    /// Paperclip's byte `offset`). Absent/empty/unparseable returns the full
+    /// bounded tail, so a first load (or a client that lost its place) still gets
+    /// everything (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §8/§10).
+    #[serde(default)]
+    since: Option<u32>,
+}
+
+/// The bounded, redacted run-log tail for one run. A run with no captured log
+/// (the deterministic local-echo path, or a not-yet-executed run) returns an
+/// empty `lines` array with `dropped_lines: 0` and no truncation — never an
+/// error for a real run — so the UI renders an honest "No logs" state instead of
+/// blanking. An unknown run id is the kernel's existing `UnknownRun` 400 (the
+/// same mapping every other run route uses).
+async fn get_run_logs(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    query: axum::extract::Query<RunLogsQuery>,
+) -> Result<Json<relux_core::RunLog>, ApiError> {
+    let run_id = relux_core::RunId::new(id);
+    // A `since=0` cursor degrades to a full tail (lines are 1-based, so nothing
+    // is ever filtered by 0 anyway, but treat it as "no cursor" explicitly).
+    let since = query.since.filter(|s| *s > 0);
+    let log = locked_read(&state, |kernel| {
+        // 404 only for an unknown run; a real run with no captured log returns
+        // the empty tail.
+        kernel
+            .run(&run_id)
+            .ok_or_else(|| KernelError::UnknownRun(run_id.to_string()))?;
+        Ok(kernel.run_log(&run_id, since))
+    })?;
+    Ok(Json(log))
 }
 
 #[derive(Debug, Deserialize)]
@@ -8447,6 +8487,112 @@ mod tests {
             .next()
             .map(|s| s.trim().to_string())
             .unwrap_or_default()
+    }
+
+    /// Write a fake CLI that prints `output` and exits 0 (cross-platform), used to
+    /// seed a real captured run-log without a real coding-agent CLI.
+    fn write_fake_cli(dir: &std::path::Path, name: &str, output: &str) -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            let path = dir.join(format!("{name}.cmd"));
+            std::fs::write(&path, format!("@echo off\r\necho {output}\r\n")).unwrap();
+            path
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\necho '{output}'\n")).unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+            path
+        }
+    }
+
+    /// Seed a completed CLI run (with a captured log) into the state's store and
+    /// return its run id. Reuses the bundled claude adapter that bootstrap installs.
+    fn seed_cli_run_with_log(state: &AppState, dir: &std::path::Path, body: &str) -> String {
+        let fake = write_fake_cli(dir, "fake-claude", body);
+        let mut store = SqliteStore::open(&state.db_path).expect("open");
+        let mut kernel = store.load().expect("load");
+        let ns = relux_core::NamespaceId::new("workspace");
+        let adapter = relux_core::PluginId::new("relux-adapter-claude-cli");
+        kernel
+            .configure_adapter_runtime(
+                &adapter,
+                Some(true),
+                Some(fake.to_string_lossy().to_string()),
+                Some(30),
+                Some(8192),
+                None,
+            )
+            .expect("configure adapter");
+        let agent = kernel
+            .create_agent(
+                "coder",
+                "Coder",
+                "writes code",
+                &adapter,
+                &ns,
+                Some("careful".to_string()),
+                vec![],
+            )
+            .expect("agent");
+        let task = kernel.create_task(
+            "Summarize",
+            serde_json::json!({ "path": "." }),
+            "founder",
+            &ns,
+            vec![],
+        );
+        kernel.assign_task(&task, &agent).expect("assign");
+        let run = kernel.execute_assigned_run(&task).expect("run");
+        store.save(&kernel).expect("save");
+        run.to_string()
+    }
+
+    #[tokio::test]
+    async fn run_logs_route_returns_bounded_tail_since_cursor_and_404() {
+        let (state, dir) = auth_state(true); // auth disabled for the read
+        let run_id = seed_cli_run_with_log(&state, dir.path(), "RAN_LOG_77");
+
+        // Full tail: 200 with classified stdout + system lines.
+        let (status, _c, body) =
+            call(&state, "GET", &format!("/v1/relux/runs/{run_id}/logs"), None, None).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let log: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(log["run_id"], run_id);
+        let lines = log["lines"].as_array().expect("lines array");
+        assert!(
+            lines.iter().any(|l| l["source"] == "stdout"
+                && l["text"].as_str().unwrap_or_default().contains("RAN_LOG_77")),
+            "stdout body line must be present: {body}"
+        );
+        assert!(
+            lines.iter().any(|l| l["source"] == "system"),
+            "a system framing line must be present"
+        );
+        let last_seq = lines.last().unwrap()["seq"].as_u64().unwrap();
+
+        // Incremental ?since=<last>: 200, no new lines (the pollable tail).
+        let (status2, _c, body2) = call(
+            &state,
+            "GET",
+            &format!("/v1/relux/runs/{run_id}/logs?since={last_seq}"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status2, StatusCode::OK);
+        let log2: serde_json::Value = serde_json::from_str(&body2).unwrap();
+        assert!(log2["lines"].as_array().unwrap().is_empty(), "no new lines past the cursor");
+
+        // Unknown run: the kernel's existing `UnknownRun` 400 (a real run with no
+        // log would instead be an empty 200, not an error).
+        let (status3, _c, _b) =
+            call(&state, "GET", "/v1/relux/runs/run_does_not_exist/logs", None, None).await;
+        assert_eq!(status3, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

@@ -98,6 +98,10 @@ pub struct KernelSnapshot {
     pub persistent_grants: Vec<PersistentGrant>,
     /// Run transcripts, in emission order.
     pub run_events: Vec<RunEvent>,
+    /// Bounded, redacted per-run log tails, sorted by run id. Defaulted so older
+    /// snapshots (which never wrote it) load cleanly.
+    #[serde(default)]
+    pub run_logs: Vec<relux_core::RunLog>,
     /// The append-only audit log, in emission order.
     pub audit_events: Vec<AuditEvent>,
     pub prime_autonomy_config: PrimeAutonomyConfig,
@@ -242,6 +246,12 @@ pub struct KernelState {
     orchestrations: HashMap<OrchestrationId, Orchestration>,
     /// Per-run transcripts, in emission order.
     run_events: Vec<RunEvent>,
+    /// Bounded, redacted per-run log tails, keyed by run id. Captured at run
+    /// finalize from the adapter's already-redacted, byte-capped stdout/stderr
+    /// plus kernel-authored `system` lines (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md`
+    /// §8/§10 — the live run-log/tail surface). One bounded [`relux_core::RunLog`]
+    /// per run; read-only projection via [`KernelState::run_log`].
+    run_logs: HashMap<RunId, relux_core::RunLog>,
     /// The append-only audit log, in emission order.
     audit_log: Vec<AuditEvent>,
     pub prime_autonomy_config: PrimeAutonomyConfig,
@@ -370,6 +380,7 @@ impl KernelState {
             }),
             persistent_grants: sorted(&self.persistent_grants, |g| g.id.as_str()),
             run_events: self.run_events.clone(),
+            run_logs: sorted(&self.run_logs, |l| l.run_id.as_str()),
             audit_events: self.audit_log.clone(),
             prime_autonomy_config: self.prime_autonomy_config.clone(),
             orchestrations: sorted(&self.orchestrations, |o| o.id.as_str()),
@@ -486,6 +497,9 @@ impl KernelState {
             state.conversation_summaries.insert(entry.key, entry.summary);
         }
         state.run_events = snapshot.run_events;
+        for log in snapshot.run_logs {
+            state.run_logs.insert(log.run_id.clone(), log);
+        }
         state.audit_log = snapshot.audit_events;
         state.clock = Clock::from_secs(snapshot.counters.clock_secs);
         state.next_task = snapshot.counters.next_task;
@@ -7323,6 +7337,9 @@ impl KernelState {
                         "proposed_changes": parsed.proposed_changes.len(),
                     }),
                 );
+                // Capture the bounded, redacted run-log tail (stdout/stderr split
+                // into lines + system framing) for the live logs/tail surface.
+                self.capture_cli_run_log(&run_id, &config_kind, &binary, &outcome);
 
                 // An exit code of 0 is not always success: a structured envelope
                 // can report `is_error: true` (e.g. a rate limit). Honour that so
@@ -7430,6 +7447,9 @@ impl KernelState {
                         "duration_ms": outcome.duration_ms,
                     }),
                 );
+                // Capture the bounded, redacted run-log tail for the logs surface
+                // (a failed run still has stdout/stderr worth showing).
+                self.capture_cli_run_log(&run_id, &config_kind, &binary, &outcome);
                 self.set_run_metrics(&run_id, outcome.duration_ms, None, None);
                 // A wall-clock timeout is a safe-to-retry transient; a non-zero
                 // exit is genuinely unclassifiable (the cause could be anything) so
@@ -7455,6 +7475,9 @@ impl KernelState {
             }
             Err(e) => {
                 let reason = format!("failed to spawn adapter '{binary}': {e}");
+                // Capture a system-only run-log tail so the logs surface honestly
+                // shows the spawn failure (there is no process stdout/stderr).
+                self.capture_spawn_error_log(&run_id, &config_kind, &binary, &reason);
                 // A spawn failure on a binary that resolved on PATH is an
                 // environment/exec fault — classify from the text (Unknown unless
                 // the OS error names a transient cause).
@@ -7506,6 +7529,63 @@ impl KernelState {
             AuditResult::Failed,
             serde_json::json!({ "run": run_id.as_str(), "reason": reason }),
         );
+    }
+
+    /// Capture a bounded, redacted **run-log tail** from a finished CLI adapter
+    /// run (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §8/§10). Built from the adapter's
+    /// already-redacted, byte-capped stdout/stderr (each split into per-line
+    /// entries) framed by kernel-authored `system` lines (spawn + outcome). The
+    /// builder re-redacts every line, clamps line length, and clamps the total to
+    /// [`relux_core::MAX_LOG_LINES`] (oldest dropped, count recorded), so the
+    /// record is always bounded. One log per run id; a resume/retry is a distinct
+    /// run id, so this never overwrites a prior run's log.
+    ///
+    /// Honest note: Relux captures the run's FINAL output (the synchronous spawn
+    /// does not stream chunks during the run), so stdout lines are grouped, then
+    /// stderr lines — not interleaved by real time. Live, interleaved streaming is
+    /// a future seam (there is no `onLog` callback on the spawn yet).
+    fn capture_cli_run_log(
+        &mut self,
+        run_id: &RunId,
+        kind: &AdapterKind,
+        binary: &str,
+        outcome: &crate::adapter::AdapterRunOutcome,
+    ) {
+        let mut builder = relux_core::RunLogBuilder::new();
+        builder.mark_stream_truncation(outcome.stdout_truncated, outcome.stderr_truncated);
+        builder.push_system(format!("spawned {} adapter '{}'", kind.as_str(), binary));
+        builder.push_output(relux_core::RunLogSource::Stdout, &outcome.stdout);
+        builder.push_output(relux_core::RunLogSource::Stderr, &outcome.stderr);
+        let outcome_line = if outcome.timed_out {
+            format!("adapter timed out after {} ms", outcome.duration_ms)
+        } else {
+            format!(
+                "adapter exited with code {} in {} ms",
+                outcome
+                    .exit_code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                outcome.duration_ms
+            )
+        };
+        builder.push_system(outcome_line);
+        self.run_logs.insert(run_id.clone(), builder.build(run_id.clone()));
+    }
+
+    /// Capture a system-only run-log tail for a run whose adapter process never
+    /// started (a spawn error), so the logs surface honestly shows the failure
+    /// rather than blanking. There is no process stdout/stderr in this case.
+    fn capture_spawn_error_log(
+        &mut self,
+        run_id: &RunId,
+        kind: &AdapterKind,
+        binary: &str,
+        message: &str,
+    ) {
+        let mut builder = relux_core::RunLogBuilder::new();
+        builder.push_system(format!("failed to spawn {} adapter '{}'", kind.as_str(), binary));
+        builder.push_system(message);
+        self.run_logs.insert(run_id.clone(), builder.build(run_id.clone()));
     }
 
     /// Mark a run failed with an error message and record it on the transcript.
@@ -7732,6 +7812,21 @@ impl KernelState {
                 None => true,
             })
             .collect()
+    }
+
+    /// The bounded, redacted **run-log tail** for one run, optionally only the
+    /// lines strictly AFTER `since` (an exclusive 1-based sequence cursor) — the
+    /// pollable analogue of Paperclip's byte-`offset` read
+    /// (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §8/§10). A run with no captured log
+    /// (the deterministic local-echo path, or a run that has not executed)
+    /// returns an EMPTY [`relux_core::RunLog`] — never an error — so the UI never
+    /// blanks. The run-level truncation/dropped markers survive an incremental
+    /// (`since`) fetch.
+    pub fn run_log(&self, run_id: &RunId, since: Option<u32>) -> relux_core::RunLog {
+        match self.run_logs.get(run_id) {
+            Some(log) => log.since(since),
+            None => relux_core::RunLog::empty(run_id.clone()),
+        }
     }
 
     /// The full append-only audit log, in emission order.
@@ -14545,6 +14640,98 @@ mod tests {
         let completed = k.execute_assigned_run(&task).expect("echo path ok");
         assert_eq!(completed, run);
         assert_eq!(k.task(&task).unwrap().status, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn cli_run_captures_a_bounded_redacted_stdout_log_tail() {
+        // A successful CLI run captures a bounded run-log tail: a system spawn
+        // line, the stdout line(s), and a system outcome line — all redacted.
+        let dir = tempfile::tempdir().unwrap();
+        let fake = write_fake_cli(dir.path(), "fake-claude", "RAN_OK_42");
+        let mut k = adapter_kernel();
+        enable_claude_with(&mut k, &fake);
+        let (_agent, task) = cli_task(&mut k);
+        let run_id = k.execute_assigned_run(&task).expect("adapter run ok");
+
+        let log = k.run_log(&run_id, None);
+        assert!(!log.is_empty(), "a CLI run must capture a log tail");
+        // The stdout body is present and classified as stdout.
+        assert!(log
+            .lines
+            .iter()
+            .any(|l| l.source == relux_core::RunLogSource::Stdout && l.text.contains("RAN_OK_42")));
+        // The kernel framed it with system spawn + outcome lines.
+        let system: Vec<&str> = log
+            .lines
+            .iter()
+            .filter(|l| l.source == relux_core::RunLogSource::System)
+            .map(|l| l.text.as_str())
+            .collect();
+        assert!(system.iter().any(|t| t.contains("spawned")));
+        assert!(system.iter().any(|t| t.contains("exited with code")));
+    }
+
+    #[test]
+    fn cli_run_log_classifies_stderr_on_a_failing_run() {
+        // A non-zero exit still captures a log; the "boom" line is on stderr.
+        let dir = tempfile::tempdir().unwrap();
+        let fake = write_failing_cli(dir.path(), "fake-fail");
+        let mut k = adapter_kernel();
+        enable_claude_with(&mut k, &fake);
+        let (_agent, task) = cli_task(&mut k);
+        let _ = k.execute_assigned_run(&task); // expected to fail
+        let run_id = k
+            .runs()
+            .iter()
+            .find(|r| r.task_id == task)
+            .map(|r| r.id.clone())
+            .expect("a run exists");
+
+        let log = k.run_log(&run_id, None);
+        assert!(log
+            .lines
+            .iter()
+            .any(|l| l.source == relux_core::RunLogSource::Stderr && l.text.contains("boom")));
+    }
+
+    #[test]
+    fn run_log_since_cursor_returns_only_the_tail_and_empty_for_no_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = write_fake_cli(dir.path(), "fake-claude", "LINE_BODY");
+        let mut k = adapter_kernel();
+        enable_claude_with(&mut k, &fake);
+        let (_agent, task) = cli_task(&mut k);
+        let run_id = k.execute_assigned_run(&task).expect("adapter run ok");
+
+        let full = k.run_log(&run_id, None);
+        let last = full.latest_seq().expect("non-empty log");
+        // A cursor at the last seq returns no new lines but keeps the markers.
+        let tail = k.run_log(&run_id, Some(last));
+        assert!(tail.lines.is_empty());
+        assert_eq!(tail.run_id, run_id);
+        // A real run with NO captured log (the local-prime echo path) returns an
+        // empty tail, never an error — the UI's "No logs" state.
+        let (mut k2, _prime, echo_task, echo_run, _echo) = primed_kernel();
+        let _ = k2.execute_assigned_run(&echo_task).expect("echo ok");
+        let echo_log = k2.run_log(&echo_run, None);
+        assert!(echo_log.is_empty());
+        assert_eq!(echo_log.dropped_lines, 0);
+    }
+
+    #[test]
+    fn captured_run_logs_survive_a_snapshot_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = write_fake_cli(dir.path(), "fake-claude", "PERSIST_ME");
+        let mut k = adapter_kernel();
+        enable_claude_with(&mut k, &fake);
+        let (_agent, task) = cli_task(&mut k);
+        let run_id = k.execute_assigned_run(&task).expect("adapter run ok");
+
+        let before = k.run_log(&run_id, None);
+        assert!(!before.is_empty());
+        let restored = KernelState::from_snapshot(k.snapshot());
+        let after = restored.run_log(&run_id, None);
+        assert_eq!(after, before, "run log must survive a snapshot round-trip");
     }
 
     /// Write a fake CLI that prints a fixed body verbatim (no shell escaping of

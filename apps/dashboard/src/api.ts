@@ -2357,6 +2357,32 @@ export interface ReluxRunEvent {
   payload?: Record<string, unknown> | null;
 }
 
+// The stream a captured run-log line came from. Mirrors the backend
+// `relux_core::RunLogSource` (`stdout` | `stderr` | `system`).
+export type ReluxRunLogSource = "stdout" | "stderr" | "system";
+
+// One bounded, redacted line in a run's log tail (backend
+// `relux_core::RunLogLine`). `seq` is a 1-based monotonic cursor; `truncated`
+// marks a single line that was clamped (omitted when false).
+export interface ReluxRunLogLine {
+  seq: number;
+  source: ReluxRunLogSource;
+  text: string;
+  truncated?: boolean;
+}
+
+// The bounded, redacted run-log tail for one run (backend `relux_core::RunLog`).
+// `dropped_lines`/`stdout_truncated`/`stderr_truncated` are omitted by the wire
+// when zero/false, so they are optional here. A run with no captured log returns
+// an empty `lines` array — the honest "No logs" state, never an error.
+export interface ReluxRunLog {
+  run_id: string;
+  lines: ReluxRunLogLine[];
+  dropped_lines?: number;
+  stdout_truncated?: boolean;
+  stderr_truncated?: boolean;
+}
+
 export interface ReluxAuditEntry {
   id: string;
   ts: string; // Assuming timestamp as string for now, could be number
@@ -2409,6 +2435,15 @@ export const reluxWork = {
   getRunEvents: (id: string, since?: string) => {
     const q = since ? `?since=${encodeURIComponent(since)}` : "";
     return api.get<ReluxRunEvent[]>(`/v1/relux/runs/${encodeURIComponent(id)}/events${q}`);
+  },
+  // Get the bounded, redacted run-log tail (stdout/stderr/system lines) for a
+  // run. With `since` (a 1-based line `seq`), fetches only the lines STRICTLY
+  // AFTER that cursor — the pollable incremental tail the Work Run Detail merges
+  // on. Omitting `since` returns the full bounded tail (first load / recovery).
+  // A run with no captured log returns an empty `lines` array, never an error.
+  getRunLogs: (id: string, since?: number) => {
+    const q = since && since > 0 ? `?since=${encodeURIComponent(String(since))}` : "";
+    return api.get<ReluxRunLog>(`/v1/relux/runs/${encodeURIComponent(id)}/logs${q}`);
   },
   // All agents, sorted by id.
   listAgents: () => api.get<ReluxAgent[]>("/v1/relux/agents"),

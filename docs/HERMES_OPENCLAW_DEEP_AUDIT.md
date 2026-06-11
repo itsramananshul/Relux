@@ -437,12 +437,19 @@ safe (adds no authority), bounded, feasible in one commit, and reuses existing v
 - **argv-only (no shell injection), non-bypass** (Claude `--permission-mode default`, never
   `--dangerously-skip-permissions`), bounded timeout + output cap, secret-redacted output, read-only
   PATH probe (`find_on_path`). Two CLI-stdout shaping seams both go through `parse_adapter_result`.
-- **Missing (deliberate/deferred)**: serverless/sandboxed backends, streaming token output to the UI,
-  mid-run cancellation.
+- **Partial/missing**: serverless/sandboxed backends and mid-run cancellation are missing. A bounded,
+  redacted **run-log / tail** of the captured stdout/stderr/system output is now persisted + served +
+  shown (SHIPPED — see §24); LIVE per-chunk streaming during the run (Paperclip `onLog`) is still
+  missing — the synchronous spawn captures only the final output.
 
 ### Priority & slices
 
-- **P2 — streaming run-log tails to the UI** (Paperclip `onLog`): see §10. *(backend, frontend, tests.)*
+- **P2 — bounded run-log / tail surface (SHIPPED THIS ROUND, §24).** Persist the captured (already-
+  redacted, byte-capped) stdout/stderr split into classified per-line entries + kernel `system` lines,
+  serve a pollable `GET /v1/relux/runs/:id/logs?since=<seq>`, and show a Logs/Tail section. Maps
+  Paperclip `run-log-store.ts` (`stream: stdout|stderr|system`, offset-cursored bounded read).
+- **P2 — LIVE streaming run-log tails** (Paperclip `onLog` during the run): the synchronous spawn has no
+  per-chunk callback yet, so the tail is captured at finalize and POLLED, not streamed. *(backend, frontend, tests.)*
 - **P2 — mid-run cancellation** (`AbortSignal`-style) for a long adapter spawn. *(backend, tests.)*
 - **Deferred — serverless backends** (Hermes Modal/Daytona): the "execution workspaces" phase.
 
@@ -498,12 +505,15 @@ safe (adds no authority), bounded, feasible in one commit, and reuses existing v
   config + role presets, approvals view, runs/tasks views, plugins tab, **Doctor panel** (read-only
   health). Dashboard bundle is the git-tracked build output in
   `crates/relix-web-bridge/dashboard-dist`.
-- **Partial/missing**: live streaming run-log tails (two run-transcript surfaces exist but tailing is
-  limited), an org chart, issue-as-conversation threading.
+- **Partial/missing**: a bounded, redacted **run-log / tail** (stdout/stderr/system) is now shown in the
+  Work run detail with truncation/redaction markers + a Refresh/poll (SHIPPED — see §24); LIVE-streamed
+  (vs polled) tailing, an org chart, and issue-as-conversation threading remain.
 
 ### Priority & slices
 
-- **P2 — live run-log tail in the runs view** (pairs with §8 streaming). *(frontend, backend, tests.)*
+- **P2 — run-log / tail in the run detail (SHIPPED THIS ROUND, §24).** A compact Logs/Tail section with
+  stdout/stderr/system entries, honest truncation/redaction markers, an empty "No logs" state, and a
+  Refresh/poll. LIVE streaming (vs the current poll) pairs with §8. *(frontend, backend, tests.)*
 - **P2 — crew org-chart view** once `reports_to` (§3) lands. *(frontend.)*
 
 ---
@@ -1351,6 +1361,80 @@ section for the full reference read + applied-change record. In brief:
   scoped to one concrete tool first; optional args-policy binding; project / namespace grant scopes; broader
   grant subjects (manager-subtree-issued allow-always); and Board-style multi-party oversight of standing
   grants.
+
+---
+
+## 24. Implemented this round — the first bounded run-log / tail surface (§8/§10 P2)
+
+- **Reference read (BINDING).** The run-log target is **Paperclip, which IS vendored** under
+  `references/paperclip/`: `references/paperclip/server/src/services/run-log-store.ts` — the run-log
+  store appends per-line events `{ ts, stream, chunk }` where `stream` is one of
+  `"stdout" | "stderr" | "system"`, and `read({ offset, limitBytes })` returns a **bounded,
+  offset-cursored** slice `{ content, nextOffset }` (default `limitBytes: 256_000`). The three-stream
+  classification, the per-line shape, and the bounded **pollable** read are the model mirrored here.
+  `references/paperclip/server/src/adapters/process/execute.ts` (`runChildProcess(runId, …, { onLog })`
+  streams stdout/stderr chunks) confirms the source taxonomy and that LIVE streaming uses an `onLog`
+  callback Relux's synchronous spawn does not yet have. **Vendored** OpenClaw
+  `reference/openclaw-main/src/process/exec.ts` (`maxBuffer` bound) confirms captured output is always
+  bounded, never unlimited. Relux files read/mapped: `crates/relux-core/src/{run.rs,redact.rs,lib.rs}`,
+  `crates/relux-kernel/src/{adapter.rs,state.rs,store.rs,server.rs}`,
+  `apps/dashboard/src/{api.ts,reluxruntranscript.ts,pages/Work.tsx}`.
+
+- **Model (bounded, redacted, deterministic).** New `crates/relux-core/src/run_log.rs` —
+  `RunLog { run_id, lines, dropped_lines, stdout_truncated, stderr_truncated }`,
+  `RunLogLine { seq, source, text, truncated }`, and `RunLogSource = Stdout | Stderr | System`
+  (Paperclip's three streams). A pure `RunLogBuilder` accumulates classified lines and produces a
+  bounded log: each line is **re-redacted** (`redact_secrets`) defensively, clamped to
+  `MAX_LOG_LINE_CHARS = 2_000` (per-line `truncated` marker), and the total is clamped to
+  `MAX_LOG_LINES = 200` by dropping the OLDEST (a tail) with `dropped_lines` recorded. `seq` is a dense
+  1-based cursor; `RunLog::since(Some(seq))` returns only lines past it (the pollable analogue of
+  Paperclip's byte `offset`) while preserving the run-level markers. Fully unit-tested in `run_log.rs`.
+
+- **Capture (at finalize, both paths).** The kernel's `capture_cli_run_log` runs in `finalize_cli_run`
+  for every CLI outcome (success, non-zero/timeout, and a system-only `capture_spawn_error_log` for a
+  spawn failure), building the tail from the adapter's already-redacted, byte-capped `stdout`/`stderr`
+  (each split into per-line entries) framed by kernel-authored `system` lines (spawn + exit/timeout).
+  Because `finalize_cli_run` is shared by the sequential and parallel-orchestration paths, both capture
+  a log. Stored as one `RunLog` per run id in `KernelState.run_logs` (snapshotted via `meta`/
+  `run_logs`, SQLite-persisted, survives a round-trip). **Honest:** Relux captures the run's FINAL
+  output (the synchronous spawn has no `onLog`), so stdout lines are grouped then stderr — not
+  interleaved by real time — and there is no live per-chunk stream yet.
+
+- **API (pollable, honest 404-vs-empty).** `GET /v1/relux/runs/:id/logs?since=<seq>`
+  (`crates/relux-kernel/src/server.rs` `get_run_logs`) returns the bounded `RunLog`. `since` returns
+  only the lines strictly after the cursor (the incremental tail); absent/0 returns the full bounded
+  tail. A real run with NO captured log (the local-prime echo path, or a not-yet-executed run) returns
+  an **empty** `lines` array — never an error — so the UI's "No logs" state is honest; only an unknown
+  run id is the kernel's existing `UnknownRun` 400.
+
+- **UI.** `apps/dashboard/src/reluxrunlog.ts` (pure helpers: `latestRunLogSeq`, `mergeRunLog`,
+  `runLogIsEmpty`, `runLogSourceLabel`, `runLogTruncationNote`) + `reluxWork.getRunLogs` and the
+  `ReluxRunLog`/`ReluxRunLogLine`/`ReluxRunLogSource` types (`api.ts`). The Work Run Detail
+  (`pages/Work.tsx`) adds a **Logs / Tail** section under the Transcript: a per-line table (seq · a
+  source badge · the redacted line) with an honest header note (`runLogTruncationNote` — "N earlier
+  lines dropped; stdout byte-capped"), a per-line `…[line truncated]` marker, a **Refresh** button, an
+  in-flight poll on the same 1.5s cadence as the transcript (incremental `?since=<seq>` merge), an
+  empty "No logs captured for this run" state that never blanks, and an error banner. The copy states
+  the tail is pollable and that live streaming is a future capability — no fabricated liveness.
+
+- **Tests.** `run_log.rs`: source classification, empty/whitespace blobs, trailing-newline, per-line
+  clamp + marker, line-count cap (oldest dropped + counted + seq re-densified), per-line re-redaction,
+  stream-truncation markers, `since` cursor (exclusive tail + preserved markers), wire round-trip
+  (empty markers omitted). `state.rs`: a successful CLI run captures a classified stdout + system
+  tail; a failing run classifies the `boom` line as stderr; the `since` cursor returns the tail and the
+  local-prime echo path yields an empty (not errored) log; the captured log survives a snapshot
+  round-trip. `server.rs`: the HTTP route returns the full tail (classified lines), an empty incremental
+  tail past the cursor, and a 400 for an unknown run. **Frontend:** `reluxrunlog.test.ts` pins the pure
+  helpers (labels, empty/no-logs, cursor, dedup+sort merge, freshest-markers, truncation note), the
+  `getRunLogs` request shape (route + `since` cursor, zero degrades to a full fetch), and the committed
+  bundle's Logs/Tail copy (no stale dist). Full `relux-core` (170) + `relux-kernel` lib (663) +
+  bin/server (115) suites green; clippy clean on both crates; dashboard typecheck + tests (330) +
+  bundle rebuild green.
+
+- **Still missing (honest).** LIVE per-chunk streaming during a run (Paperclip `onLog` / SSE/WebSocket —
+  the synchronous spawn captures only the final output, so the tail is captured at finalize and
+  POLLED), mid-run cancellation, a per-run log byte/retention budget beyond the line cap, and
+  cross-run log search all remain open.
 
 ---
 

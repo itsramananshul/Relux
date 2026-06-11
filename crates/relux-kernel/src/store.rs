@@ -103,6 +103,7 @@ impl SqliteStore {
             runs: self.load_json("runs")?,
             approvals: self.load_json("approvals")?,
             run_events: self.load_json("run_events")?,
+            run_logs: self.load_meta_json("run_logs")?.unwrap_or_default(),
             audit_events: self.load_json("audit_events")?,
             prime_autonomy_config: self
                 .load_meta_json("prime_autonomy_config")?
@@ -205,6 +206,7 @@ impl SqliteStore {
             &snapshot.pending_tool_invocations,
         )?;
         put_meta_json(&tx, "persistent_grants", &snapshot.persistent_grants)?;
+        put_meta_json(&tx, "run_logs", &snapshot.run_logs)?;
         put_meta_json(&tx, "tool_runtime_configs", &snapshot.tool_runtime_configs)?;
         put_meta_json(
             &tx,

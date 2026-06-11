@@ -21,6 +21,7 @@ pub mod proposed_change;
 pub mod redact;
 pub mod run;
 pub mod run_failure;
+pub mod run_log;
 pub mod run_session;
 pub mod runtime;
 pub mod task;
@@ -68,6 +69,9 @@ pub use proposed_change::{
 };
 pub use redact::redact_secrets;
 pub use run::{Run, RunId, RunStatus};
+pub use run_log::{
+    RunLog, RunLogBuilder, RunLogLine, RunLogSource, MAX_LOG_LINES, MAX_LOG_LINE_CHARS,
+};
 pub use run_failure::{
     classify_failure, retry_delay_secs, safe_public_message, RunFailureClass, RunRetryState,
     MAX_PUBLIC_MESSAGE_CHARS, MAX_TRANSIENT_RETRIES, RETRY_BACKOFF_SECS,
