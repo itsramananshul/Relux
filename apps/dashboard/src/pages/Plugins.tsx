@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import {
+  reluxAdapters,
   reluxPluginRuntime,
   reluxPlugins,
   reluxTools,
+  type ReluxAdapterStatus,
   type ReluxManifestTemplate,
   type ReluxPlugin,
   type ReluxPluginRuntime,
@@ -12,7 +14,9 @@ import {
 } from "../api";
 import { useAsync } from "../components/common";
 import {
+  adapterStatusBadge,
   installResultSummary,
+  pluginCategory,
   pluginKindLabel,
   pluginNextStep,
   pluginStatus,
@@ -46,13 +50,31 @@ export function Plugins() {
   const plugins = data ?? [];
   const [open, setOpen] = useState(false);
 
+  // Live adapter runtime state, from the SAME probe the Crew adapters section
+  // uses. Adapter rows show this inline so an operator sees whether Claude/Codex/
+  // Local Prime is actually available — not just the plugin record's enabled flag.
+  // A failed/loading probe is surfaced honestly (never faked as ready) per row.
+  const adaptersAsync = useAsync<ReluxAdapterStatus[]>(
+    () => reluxAdapters.list(),
+    [],
+  );
+  const adapterByPlugin = new Map(
+    (adaptersAsync.data ?? []).map((a) => [a.plugin_id, a] as const),
+  );
+  const adaptersLoading = adaptersAsync.loading && adaptersAsync.data == null;
+
+  function reloadAll() {
+    reload();
+    adaptersAsync.reload();
+  }
+
   return (
     <div className="grid">
       <div className="card">
         <div className="row" style={{ marginBottom: 8, alignItems: "center" }}>
           <h3 style={{ margin: 0 }}>Installed plugins</h3>
           <div className="spacer" style={{ flex: 1 }} />
-          <button className="btn ghost sm" onClick={() => reload()} disabled={loading}>
+          <button className="btn ghost sm" onClick={() => reloadAll()} disabled={loading}>
             {loading ? "Loading..." : "Refresh"}
           </button>
           <button
@@ -108,7 +130,13 @@ export function Plugins() {
               </thead>
               <tbody>
                 {plugins.map((p) => (
-                  <PluginRow key={p.id} plugin={p} onChanged={reload} />
+                  <PluginRow
+                    key={p.id}
+                    plugin={p}
+                    onChanged={reloadAll}
+                    adapterRuntime={adapterByPlugin.get(p.id)}
+                    adapterRuntimeLoading={adaptersLoading}
+                  />
                 ))}
               </tbody>
             </table>
@@ -359,7 +387,17 @@ function InvokeTool({ tool }: { tool: ReluxToolDescriptor }) {
   );
 }
 
-function PluginRow({ plugin, onChanged }: { plugin: ReluxPlugin; onChanged: () => void }) {
+function PluginRow({
+  plugin,
+  onChanged,
+  adapterRuntime,
+  adapterRuntimeLoading,
+}: {
+  plugin: ReluxPlugin;
+  onChanged: () => void;
+  adapterRuntime: ReluxAdapterStatus | undefined;
+  adapterRuntimeLoading: boolean;
+}) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [runtimeOpen, setRuntimeOpen] = useState(false);
@@ -368,6 +406,9 @@ function PluginRow({ plugin, onChanged }: { plugin: ReluxPlugin; onChanged: () =
   const status = pluginStatus(plugin);
   const next = pluginNextStep(plugin);
   const isWrapper = next.kind === "add-manifest";
+  // Adapter rows show LIVE runtime state (available/disabled/missing-binary/…),
+  // not the static plugin-record enabled flag. Non-adapter rows keep pluginStatus.
+  const isAdapter = pluginCategory(plugin) === "adapter";
 
   async function remove() {
     setBusy(true);
@@ -438,9 +479,29 @@ function PluginRow({ plugin, onChanged }: { plugin: ReluxPlugin; onChanged: () =
           </div>
         </td>
         <td>
-          <span className={"badge " + BADGE_CLASS[status.variant]} title={status.title}>
-            {status.label}
-          </span>
+          {isAdapter ? (
+            adapterRuntimeLoading ? (
+              <span className="badge backlog" title="Reading live adapter runtime status…">
+                checking…
+              </span>
+            ) : (
+              // `adapterRuntime` is undefined when the probe errored or no row
+              // matched; adapterStatusBadge renders that as an honest muted
+              // "status unavailable" — never a faked "ready".
+              (() => {
+                const live = adapterStatusBadge(adapterRuntime);
+                return (
+                  <span className={"badge " + BADGE_CLASS[live.variant]} title={live.title}>
+                    {live.label}
+                  </span>
+                );
+              })()
+            )
+          ) : (
+            <span className={"badge " + BADGE_CLASS[status.variant]} title={status.title}>
+              {status.label}
+            </span>
+          )}
           {plugin.protected && (
             <span className="badge" style={{ marginLeft: 6 }} title="Bundled fixture; cannot be removed">
               protected

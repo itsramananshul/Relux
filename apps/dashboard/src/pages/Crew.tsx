@@ -9,6 +9,7 @@ import {
   type ReluxAdapterStatus,
 } from "../api";
 import { useAsync } from "../components/common";
+import { ADAPTER_STATE_LABEL } from "../plugins";
 
 type Agent = ReluxAgent;
 
@@ -226,13 +227,9 @@ function AdapterCard({
   const [error, setError] = useState<string | null>(null);
   const isLocal = adapter.state === "local_deterministic";
 
-  const stateLabel: Record<ReluxAdapterStatus["state"], string> = {
-    local_deterministic: "Local (deterministic)",
-    available: "Enabled — ready",
-    missing_binary: "Enabled — binary missing",
-    disabled: "Configured — disabled",
-    needs_configuration: "Disabled (default)",
-  };
+  // Shared with the Plugins page (single source of truth) so the two adapter
+  // surfaces never disagree on what each runtime state is called.
+  const stateLabel = ADAPTER_STATE_LABEL;
 
   async function enable() {
     setBusy(true);

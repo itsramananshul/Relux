@@ -8,6 +8,8 @@ import {
   installResultSummary,
   visibleTools,
   isRunnableTool,
+  adapterStatusBadge,
+  ADAPTER_STATE_LABEL,
 } from "../src/plugins.ts";
 
 // The Plugins page must read HONESTLY: a generated metadata-only wrapper is never
@@ -157,4 +159,82 @@ test("isRunnableTool is true only for ready tools", () => {
   assert.equal(isRunnableTool(tool({ executable: "ready" })), true);
   assert.equal(isRunnableTool(tool({ executable: "runtime_disabled" })), false);
   assert.equal(isRunnableTool(tool({ executable: "missing_permission" })), false);
+});
+
+// ── Live adapter runtime badge (Plugins page) ─────────────────────────────────
+// An adapter row must surface its LIVE runtime state, not the static plugin
+// record. These pin the label vocabulary (shared with Crew) and the honest
+// fail-closed behavior: an unresolved probe is NEVER shown as ready/available.
+
+function adapterRuntime(over = {}) {
+  return {
+    plugin_id: "relux-adapter-claude-cli",
+    adapter_name: "Claude CLI",
+    kind: "claude",
+    configured: true,
+    enabled: true,
+    command: "claude",
+    available_on_path: true,
+    resolved_path: "/usr/local/bin/claude",
+    timeout_seconds: 600,
+    max_output_bytes: 1048576,
+    working_dir: null,
+    state: "available",
+    detail: "Enabled. Relux will run 'claude' for assigned tasks.",
+    ...over,
+  };
+}
+
+test("an enabled, on-PATH adapter reads as available (ok), with the live detail", () => {
+  const b = adapterStatusBadge(adapterRuntime({ state: "available" }));
+  assert.equal(b.label, "Enabled — ready");
+  assert.equal(b.variant, "ok");
+  assert.match(b.title, /Relux will run/);
+});
+
+test("the local deterministic adapter reads as available (ok)", () => {
+  const b = adapterStatusBadge(adapterRuntime({ state: "local_deterministic" }));
+  assert.equal(b.label, "Local (deterministic)");
+  assert.equal(b.variant, "ok");
+});
+
+test("an enabled adapter whose binary is missing reads as warn, not ok", () => {
+  const b = adapterStatusBadge(adapterRuntime({ state: "missing_binary" }));
+  assert.equal(b.label, "Enabled — binary missing");
+  assert.equal(b.variant, "warn");
+  assert.notEqual(b.variant, "ok");
+});
+
+test("a default/unconfigured CLI adapter reads as needs-configuration (warn)", () => {
+  const b = adapterStatusBadge(adapterRuntime({ state: "needs_configuration" }));
+  assert.equal(b.label, "Disabled (default)");
+  assert.equal(b.variant, "warn");
+});
+
+test("a deliberately disabled adapter reads as muted, never ready", () => {
+  const b = adapterStatusBadge(adapterRuntime({ state: "disabled" }));
+  assert.equal(b.label, "Configured — disabled");
+  assert.equal(b.variant, "muted");
+  assert.notEqual(b.variant, "ok");
+});
+
+test("an unresolved adapter probe is honest 'status unavailable', NOT ready", () => {
+  // undefined = the /v1/relux/adapters probe failed or no row matched this plugin.
+  const b = adapterStatusBadge(undefined);
+  assert.equal(b.label, "status unavailable");
+  assert.equal(b.variant, "muted");
+  assert.notEqual(b.variant, "ok");
+  assert.match(b.title, /could not read/i);
+});
+
+test("every adapter state has a shared label (single source of truth with Crew)", () => {
+  for (const state of [
+    "local_deterministic",
+    "available",
+    "missing_binary",
+    "disabled",
+    "needs_configuration",
+  ]) {
+    assert.ok(ADAPTER_STATE_LABEL[state], `missing label for ${state}`);
+  }
 });

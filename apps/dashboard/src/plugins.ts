@@ -13,7 +13,7 @@
 // the guidance without a DOM. The page renders whatever this returns; it invents
 // nothing.
 
-import type { ReluxPlugin, ReluxToolDescriptor } from "./api";
+import type { ReluxAdapterStatus, ReluxPlugin, ReluxToolDescriptor } from "./api";
 
 // What the plugin actually is, for an honest one-word category in the UI.
 //   "wrapper"  — generated metadata-only manifest (no tools, not runnable yet)
@@ -136,6 +136,67 @@ export function pluginNextStep(p: ReluxPlugin): PluginNextStep {
   }
 
   return { kind: "none", cta: "", detail: "" };
+}
+
+// ── Live adapter runtime status (Plugins page) ────────────────────────────────
+// An Adapter plugin row's enabled/disabled flag is just the plugin RECORD; it
+// does NOT say whether the local CLI can actually run. The truth lives in the
+// kernel's runtime probe (`GET /v1/relux/adapters`, the SAME endpoint the Crew
+// adapters section uses) which reports `state`:
+//   local_deterministic | available | missing_binary | disabled | needs_configuration
+// We surface that live state inline on the Plugins page so an operator sees, at a
+// glance, whether Claude/Codex/Local Prime is available, enabled, disabled,
+// missing its binary, or needs configuration — without re-probing or faking it.
+
+// The human label for an adapter runtime state. Single source of truth, shared
+// with the Crew adapters section so the two surfaces never disagree on what
+// "available" vs "disabled" means.
+export const ADAPTER_STATE_LABEL: Record<ReluxAdapterStatus["state"], string> = {
+  local_deterministic: "Local (deterministic)",
+  available: "Enabled — ready",
+  missing_binary: "Enabled — binary missing",
+  disabled: "Configured — disabled",
+  needs_configuration: "Disabled (default)",
+};
+
+// The live runtime badge for an adapter plugin row. `runtime` is the matching
+// ReluxAdapterStatus from /v1/relux/adapters, or `undefined` when it could not be
+// resolved (the adapters probe failed, or no row matched this plugin id). We never
+// fake "ready": an unresolved runtime reads as an honest muted "status unavailable"
+// badge, never as available/enabled.
+//
+//   available / local_deterministic → ok   (runnable now)
+//   missing_binary / needs_configuration → warn (action needed before it can run)
+//   disabled → muted (deliberately off)
+//   unresolved → muted "status unavailable" (honest, not "ready")
+export function adapterStatusBadge(
+  runtime: ReluxAdapterStatus | undefined,
+): PluginStatus {
+  if (!runtime) {
+    return {
+      label: "status unavailable",
+      variant: "muted",
+      title:
+        "Could not read this adapter's live runtime status from /v1/relux/adapters.",
+    };
+  }
+  const label = ADAPTER_STATE_LABEL[runtime.state] ?? runtime.state;
+  let variant: StatusVariant;
+  switch (runtime.state) {
+    case "available":
+    case "local_deterministic":
+      variant = "ok";
+      break;
+    case "missing_binary":
+    case "needs_configuration":
+      variant = "warn";
+      break;
+    default:
+      // disabled (and any unknown future state) is muted, never ready-looking.
+      variant = "muted";
+      break;
+  }
+  return { label, variant, title: runtime.detail };
 }
 
 export interface InstallSummary {
