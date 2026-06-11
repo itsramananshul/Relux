@@ -1902,3 +1902,54 @@ it is the fallback the brain-assisted assignment slot already reconciles against
 configured. Skills are validated/sanitized identically on the manual HTTP path and would be on any
 future brain-proposed path, and they never widen authority: an agent's effective power still equals
 exactly its explicit permissions.
+
+---
+
+## Reference read — safe role-preset bundles for Crew create (this slice)
+
+The last remaining §9.1 Crew gap: **role-preset bundles**. An operator should be able to spin up a
+common crew type (researcher, builder, reviewer, planner, operator) without retyping role/persona/
+skills each time — but a convenience template must **never** become a backdoor that auto-grants
+capability. This slice adds a curated preset list that *suggests* role/persona/skills only, expands
+through the existing `agent_config` validators, and grants nothing.
+
+### Paperclip (openclaw) — files read
+
+- `reference/openclaw-main/src/agents/tools/sessions-spawn-tool.ts` — the closest analogue to
+  "spin up a worker of a named kind". When a spawn names a role it becomes a pure context label
+  (`const roleContext = requestedAgentId ? { role: requestedAgentId } : {}`, ~L323) attached to the
+  reply; the role **never expands the worker's toolset** — capability is governed *separately* by the
+  inherited tool allow/deny list. The same file rejects `UNSUPPORTED_SESSIONS_SPAWN_PARAM_KEYS` before
+  any param is read (L46-55, L277-284) and **defaults an unknown enum to a safe fixed value**
+  (`params.cleanup === "keep" || params.cleanup === "delete" ? … : "keep"`, ~L301). **Pattern: a role
+  is descriptive metadata, not a grant; an unknown selector is rejected/defaulted, a known one expands
+  to a fixed shape.**
+- `reference/openclaw-main/src/acp/approval-classifier.ts` `normalizeToolName` (L57-63) — lowercase +
+  length-bound + accept only a strict id shape, else `undefined`. **Pattern: resolve a selector by a
+  strict, case-insensitive id against a fixed allowlist.**
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/agent/system_prompt.py` / `agent/prompt_builder.py` — a persona/role
+  steers the model's **system prompt** (operating style) on one axis; the available **tools**
+  (capability) are configured on a *separate* axis. **Pattern: persona ≠ permission.** Mirrored: a
+  preset contributes a persona/role/skills bundle (the "how it operates" axis) and touches the
+  permission grant on no axis at all.
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| openclaw: **a named role is descriptive metadata, never a capability grant** (`sessions-spawn-tool` `roleContext`) | `crates/relux-kernel/src/agent_presets.rs` `AgentPreset` holds ONLY `{id,label,summary,role,persona,skills}` — there is no permission/adapter field, so a preset *cannot* widen power by construction. `create_agent` still grants only `tool:relux-tools-echo:say` regardless of preset. |
+| openclaw: **resolve a selector by strict id against a fixed allowlist; unknown is rejected** (`normalizeToolName`, `UNSUPPORTED_*` keys) | `find_agent_preset` resolves the id case-insensitively/trimmed against the fixed `AGENT_PRESETS`; an unknown id is an honest `400 unknown preset '…'` (fail closed), never an invented bundle. |
+| openclaw/Hermes: **expand to a fixed shape, then validate through the ONE existing path** | the optional `preset` field on `POST /v1/relux/agents` fills only the role/persona/skills the request omitted (the request's own value always wins) and the **merged** input flows through the unchanged `validate_new_agent` — no duplicate validation; a unit test asserts every curated preset passes those validators and its skills survive `validate_skills` unchanged. |
+| Hermes: **persona ≠ permission** (system-prompt axis vs. toolset axis) | the preset persona is applied through the same bounded + secret-redacted `agent_config::sanitize_persona` as a hand-typed persona; the UI fills the (still editable) fields and submits the normal create — the operator reviews every field before save. |
+
+**What we deliberately do differently:** the backend is the single source of truth (a read-only
+`GET /v1/relux/agent-presets`), and the dashboard *fills the form* from it rather than sending a
+`preset` field — so the field a user actually submits is the same validated role/persona/skills any
+manual create uses, and Apply confirms before overwriting in-progress edits. The `preset` field on
+create is kept for API clients and exercised by a server test, but it is advisory in exactly the same
+way: it can only ever produce a config the operator could have typed by hand, and it grants nothing.
+Presets are offered in **create** mode only — they seed a new member, they never silently reshape an
+existing one.

@@ -377,6 +377,7 @@ fn protected_router() -> Router<AppState> {
             put(set_ai_config).patch(set_ai_config).delete(clear_ai_config),
         )
         .route("/v1/relux/agents", get(list_agents).post(create_agent))
+        .route("/v1/relux/agent-presets", get(list_agent_presets))
         .route(
             "/v1/relux/agents/:id",
             put(update_agent).patch(update_agent),
@@ -1516,6 +1517,38 @@ struct CreateTaskReq {
     title: String,
 }
 
+/// One read-only role preset (an operator-convenience suggestion bundle). Carries only
+/// advisory fields — never a permission or adapter — so it can never widen an agent's
+/// power. `docs/relix-dashboard-design.md` §9.1.
+#[derive(Debug, Serialize)]
+struct AgentPresetRecord {
+    id: String,
+    label: String,
+    summary: String,
+    role: String,
+    persona: String,
+    skills: Vec<String>,
+}
+
+/// `GET /v1/relux/agent-presets` — the curated role presets the Crew create form
+/// offers. Read-only and non-sensitive: it only describes default role/persona/skills
+/// text; applying one fills the (still editable) form and is created through the normal
+/// validated path, which grants no extra permission.
+async fn list_agent_presets() -> Json<Vec<AgentPresetRecord>> {
+    let presets = relux_kernel::AGENT_PRESETS
+        .iter()
+        .map(|p| AgentPresetRecord {
+            id: p.id.to_string(),
+            label: p.label.to_string(),
+            summary: p.summary.to_string(),
+            role: p.role.to_string(),
+            persona: p.persona.to_string(),
+            skills: p.skills.iter().map(|s| s.to_string()).collect(),
+        })
+        .collect();
+    Json(presets)
+}
+
 #[derive(Debug, Deserialize)]
 struct CreateAgentReq {
     id: Option<String>,
@@ -1526,12 +1559,47 @@ struct CreateAgentReq {
     /// Optional specialty tags/skills (each a short word/slug); validated and bounded
     /// server-side. Absent => no skills.
     skills: Option<Vec<String>>,
+    /// Optional role-preset id (`researcher`/`builder`/…). When present and recognised,
+    /// it fills any role/persona/skills the request itself did NOT supply (the request's
+    /// own value always wins), then the MERGED input flows through the same
+    /// `validate_new_agent` validators. A preset never grants a permission or picks an
+    /// adapter — the create below still grants only the minimal echo tool. An unknown
+    /// preset id is an honest 400.
+    preset: Option<String>,
 }
 
 async fn create_agent(
     State(state): State<AppState>,
     Json(req): Json<CreateAgentReq>,
 ) -> Result<Json<AgentRecord>, ApiError> {
+    // Expand a role preset (if any) BEFORE the lock: resolve it against the fixed
+    // allowlist and fill only the advisory fields the request omitted. The request's
+    // own non-blank value always wins; an unknown preset fails closed with a 400.
+    let preset = match req.preset.as_deref() {
+        Some(p) if !p.trim().is_empty() => Some(
+            relux_kernel::find_agent_preset(p).ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "unknown preset '{}'; choose one of the listed presets",
+                    p.trim()
+                ))
+            })?,
+        ),
+        _ => None,
+    };
+    // request field (non-blank) wins; else the preset default; else absent.
+    let merged_role: Option<String> = match req.role.as_deref() {
+        Some(s) if !s.trim().is_empty() => Some(s.to_string()),
+        _ => preset.map(|p| p.role.to_string()),
+    };
+    let merged_persona: Option<String> = match req.persona.as_deref() {
+        Some(s) if !s.trim().is_empty() => Some(s.to_string()),
+        _ => preset.map(|p| p.persona.to_string()),
+    };
+    let merged_skills: Option<Vec<String>> = match req.skills.as_deref() {
+        Some(s) if !s.is_empty() => Some(s.to_vec()),
+        _ => preset.map(|p| p.skills.iter().map(|s| s.to_string()).collect()),
+    };
+
     let agent = locked_save(&state, |kernel| {
         let ctx = crate::ensure_bootstrapped(kernel)?;
 
@@ -1552,10 +1620,10 @@ async fn create_agent(
             relux_kernel::CreateAgentInput {
                 id: req.id.as_deref(),
                 name: &req.name,
-                role: req.role.as_deref(),
-                persona: req.persona.as_deref(),
+                role: merged_role.as_deref(),
+                persona: merged_persona.as_deref(),
                 adapter_plugin: req.adapter_plugin.as_deref(),
-                skills: req.skills.as_deref(),
+                skills: merged_skills.as_deref(),
             },
             &known_adapters,
             &existing_ids,
@@ -7694,6 +7762,66 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn agent_presets_list_and_create_with_preset_over_http() {
+        let (state, _dir) = auth_state(true);
+
+        // The read-only presets endpoint lists the curated bundles (advisory text only).
+        let (status, _, body) = call(&state, "GET", "/v1/relux/agent-presets", None, None).await;
+        assert_eq!(status, StatusCode::OK, "presets list failed: {body}");
+        assert!(body.contains("\"id\":\"researcher\""), "researcher preset missing: {body}");
+        assert!(body.contains("\"id\":\"builder\""), "builder preset missing: {body}");
+        // A preset is advisory only — it carries no permission/adapter field on the wire.
+        assert!(!body.contains("permission"), "preset must not expose permissions: {body}");
+        assert!(!body.contains("adapter"), "preset must not pick an adapter: {body}");
+
+        // Create from a preset id alone: role/persona/skills are filled from the bundle
+        // and validated through the normal path.
+        let (status, _, body) = call(
+            &state,
+            "POST",
+            "/v1/relux/agents",
+            None,
+            Some(r#"{"name":"Scout","preset":"researcher"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "preset create failed: {body}");
+        assert!(body.contains("\"id\":\"scout\""), "got: {body}");
+        assert!(body.contains("\"skills\":[\"research\",\"analysis\",\"writing\"]"), "preset skills: {body}");
+        // CRITICAL: a preset grants NOTHING beyond the minimal echo tool — it never
+        // auto-grants an elevated capability.
+        assert!(body.contains("tool:relux-tools-echo:say"), "echo grant expected: {body}");
+        assert!(!body.contains("\"permissions\":[\"tool:relux-tools-echo:say\",\""), "preset over-granted: {body}");
+        // The default (local Prime) adapter is used — a preset picks no runtime.
+        assert!(body.contains("relux-adapter-local-prime"), "preset must not pick adapter: {body}");
+
+        // An explicit field overrides the preset default (request value wins).
+        let (status, _, body) = call(
+            &state,
+            "POST",
+            "/v1/relux/agents",
+            None,
+            Some(r#"{"name":"Custom Scout","preset":"researcher","role":"my own role"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "override create failed: {body}");
+        assert!(body.contains("\"description\":\"my own role\""), "override ignored: {body}");
+        // Skills still come from the preset (not overridden here).
+        assert!(body.contains("\"skills\":[\"research\",\"analysis\",\"writing\"]"), "preset skills: {body}");
+
+        // An unknown preset id is an honest 400 (fail closed) — no agent created.
+        let (status, _, body) = call(
+            &state,
+            "POST",
+            "/v1/relux/agents",
+            None,
+            Some(r#"{"name":"Ghost","preset":"evil-overlord"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "unknown preset should 400: {body}");
+        assert!(body.contains("unknown preset"), "got: {body}");
     }
 
     #[tokio::test]

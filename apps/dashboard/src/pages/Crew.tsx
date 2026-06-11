@@ -5,6 +5,7 @@ import {
   reluxAdapters,
   type ReluxAgent,
   type ReluxAgentConfig,
+  type ReluxAgentPreset,
   type ReluxTask,
   type ReluxAdapterStatus,
 } from "../api";
@@ -15,6 +16,7 @@ import {
   permissionInvalidReason,
 } from "../governance";
 import { parseSkillsInput, formatSkillsInput } from "../skills";
+import { applyPreset, presetFieldsDirty } from "../presets";
 
 type Agent = ReluxAgent;
 
@@ -209,10 +211,42 @@ function CrewMemberForm({
   const [skillsText, setSkillsText] = useState(formatSkillsInput(agent?.skills));
   const [adapter, setAdapter] = useState(agent?.adapter_plugin ?? "");
   const [status, setStatus] = useState((agent?.status ?? "active").toLowerCase());
+  const [presetId, setPresetId] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Curated role presets for the create form (read-only, advisory). Edit mode never
+  // offers presets — they seed a NEW member, they don't reshape an existing one.
+  const { data: presetsData } = useAsync<ReluxAgentPreset[]>(
+    () => (mode === "create" ? reluxWork.listAgentPresets() : Promise.resolve([])),
+    [mode],
+  );
+  const presets = presetsData ?? [];
+
   const idPrefix = mode === "edit" && agent ? `edit-${agent.id}` : "create";
+
+  // Apply the chosen preset: fill role/persona/skills (still editable). An explicit
+  // action — never on render — and it confirms before overwriting fields the operator
+  // already typed, so it cannot clobber work unexpectedly. It touches only these three
+  // fields; name/id/adapter/status/permissions are never changed by a preset.
+  function applyChosenPreset() {
+    const preset = presets.find((p) => p.id === presetId);
+    if (!preset) return;
+    if (
+      presetFieldsDirty({ role, persona, skills: skillsText }) &&
+      !window.confirm(
+        `Apply the "${preset.label}" preset? This replaces the current role, persona, ` +
+          `and skills fields (you can still edit them before saving).`,
+      )
+    ) {
+      return;
+    }
+    const filled = applyPreset(preset);
+    setRole(filled.role);
+    setPersona(filled.persona);
+    setSkillsText(filled.skills);
+    setError(null);
+  }
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -233,6 +267,7 @@ function CrewMemberForm({
         setPersona("");
         setSkillsText("");
         setAdapter("");
+        setPresetId("");
       } else if (agent) {
         // Send every field so an empty value is a deliberate clear (persona/skills) or
         // keeps the current value. The backend leaves absent fields unchanged; a present
@@ -252,6 +287,38 @@ function CrewMemberForm({
   return (
     <form onSubmit={submit} className="create-agent-form">
       {error && <div className="error-message">{error}</div>}
+      {mode === "create" && presets.length > 0 && (
+        <div className="form-group">
+          <label htmlFor={`${idPrefix}-preset`}>Role preset (optional):</label>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <select
+              id={`${idPrefix}-preset`}
+              value={presetId}
+              onChange={(e) => setPresetId(e.target.value)}
+              style={{ flex: 1 }}
+            >
+              <option value="">Start from scratch</option>
+              {presets.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.label}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              className="btn sm"
+              onClick={applyChosenPreset}
+              disabled={!presetId}
+            >
+              Apply
+            </button>
+          </div>
+          <p className="muted" style={{ fontSize: 11, marginTop: 2 }}>
+            {presets.find((p) => p.id === presetId)?.summary ??
+              "Fills role, persona, and skills with a common crew type — still editable, and grants no permissions."}
+          </p>
+        </div>
+      )}
       <div className="form-group">
         <label htmlFor={`${idPrefix}-name`}>Name:</label>
         <input

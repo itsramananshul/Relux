@@ -127,6 +127,10 @@ test("the committed dashboard bundle carries the Crew copy (no stale dist)", () 
   // The skills/tags field copy must be in the shipped bundle (catches a stale dist
   // after the skills slice landed in source).
   assert.match(bundle, /Skills \/ Tags \(comma-separated/);
+  // The role-preset selector copy must ship too (catches a stale dist after the
+  // role-preset slice landed in source). The selector only renders once presets load
+  // (an effect), so the render path above can't assert it — the bundle path does.
+  assert.match(bundle, /Role preset \(optional\)/);
 });
 
 test("the committed bundle points the rail's Crew entry at /crew, not legacy /agents", () => {

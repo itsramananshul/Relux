@@ -1993,6 +1993,24 @@ export interface ReluxAgentConfig {
   // whole list (an empty array clears it); absent => leave unchanged. The backend
   // re-validates/sanitizes/bounds each entry.
   skills?: string[];
+  // Optional role-preset id (create only). When set, the backend fills any
+  // role/persona/skills the request omitted from the curated bundle, then validates
+  // the merged input through the same path. A preset grants NO permission and picks no
+  // adapter. The Crew form fills the fields client-side instead of sending this, but
+  // the field is honored for API clients.
+  preset?: string;
+}
+
+// One curated role preset (operator-convenience suggestion bundle) from
+// GET /v1/relux/agent-presets. Advisory fields ONLY — there is deliberately no
+// permission/adapter field, so a preset can never widen an agent's power.
+export interface ReluxAgentPreset {
+  id: string;
+  label: string;
+  summary: string;
+  role: string;
+  persona: string;
+  skills: string[];
 }
 
 // One read-only artifact reference captured from an adapter's structured result
@@ -2167,6 +2185,9 @@ export const reluxWork = {
   },
   // All agents, sorted by id.
   listAgents: () => api.get<ReluxAgent[]>("/v1/relux/agents"),
+  // The curated role presets the create form offers. Read-only and advisory: applying
+  // one fills the (still editable) role/persona/skills fields; it grants no permission.
+  listAgentPresets: () => api.get<ReluxAgentPreset[]>("/v1/relux/agent-presets"),
   // Create a new crew member (agent). The backend sanitizes/validates and derives
   // the id from the name when one is not supplied; an unknown adapter / duplicate
   // id or name is an honest 400.
