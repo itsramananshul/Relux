@@ -636,6 +636,40 @@ pub async fn classify_intent_via_openrouter(
     }
 }
 
+/// Extract a task's structured slots from one user message via the OpenRouter
+/// brain, as VALIDATED [`crate::prime_slots::BrainTaskSlots`], or `None` on ANY
+/// failure (no key, disabled, network error, unparseable/unsupported reply).
+///
+/// This is the slot counterpart of [`classify_intent_via_openrouter`]: the model
+/// only *proposes* the slots; the kernel still reconciles them against the
+/// deterministic title and the live agent roster behind the fail-closed gate
+/// ([`crate::prime_slots::reconcile_task_slots`]) before any task is created. The
+/// raw model text is parsed by [`crate::prime_slots::parse_task_slots`]; nothing
+/// un-validated escapes, and every failure lands on the deterministic slots so the
+/// brain stays strictly additive (§10.1, §10.2, §17.1).
+pub async fn extract_task_slots_via_openrouter(
+    cfg: &AiConfig,
+    message: &str,
+) -> Option<crate::prime_slots::BrainTaskSlots> {
+    if !cfg.enabled() || cfg.api_key.is_none() {
+        return None;
+    }
+    let messages = vec![
+        ChatMessage {
+            role: "system",
+            content: "You output only compact JSON. No prose, no code fences.".to_string(),
+        },
+        ChatMessage {
+            role: "user",
+            content: crate::prime_slots::build_task_slots_prompt(message),
+        },
+    ];
+    match request_completion(cfg, messages).await {
+        Ok(text) => crate::prime_slots::parse_task_slots(&text).ok(),
+        Err(_) => None,
+    }
+}
+
 /// Combine an LLM result with the deterministic fallback into a final outcome.
 /// Pure, so both the success and failure (fallback + note) paths are testable
 /// without a network.
@@ -1152,6 +1186,7 @@ mod tests {
             tool_error: None,
             suggested_actions: Vec::new(),
             proposal: None,
+            slots: None,
         }
     }
 

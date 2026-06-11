@@ -1646,16 +1646,56 @@ async fn run_prime(
         relux_kernel::PrimeBrain::Local => None,
     };
 
+    // 0c. Brain-assisted task SLOT extraction (OUTSIDE the lock — another slow
+    // network/process call). Only when the RESOLVED intent (deterministic
+    // classification reconciled with the brain's proposal, exactly as the kernel
+    // will redo it) is a create intent: there is no point asking for task slots on
+    // a chat/status/plan turn. The brain only *proposes* slots; the kernel
+    // validates them against the deterministic title + the live agent roster behind
+    // the fail-closed gate. ANY failure yields `None` and the deterministic slots
+    // stand — strictly additive (§10.1, §10.2, §17.1).
+    let slot_proposal = {
+        let deterministic_intent = relux_kernel::classify_intent(&message);
+        let resolved_intent = match intent_proposal.as_ref() {
+            Some(p) => {
+                relux_kernel::reconcile_intent(deterministic_intent.clone(), p, &message).0
+            }
+            None => deterministic_intent,
+        };
+        let wants_slots = matches!(
+            resolved_intent,
+            relux_core::PrimeIntent::TaskCreation | relux_core::PrimeIntent::CreateAndRunTask
+        );
+        if wants_slots {
+            match brain {
+                relux_kernel::PrimeBrain::Openrouter => {
+                    relux_kernel::extract_task_slots_via_openrouter(&ai_config, &message).await
+                }
+                relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli => {
+                    extract_task_slots_via_cli(brain, cli_status.clone(), &message).await
+                }
+                relux_kernel::PrimeBrain::Local => None,
+            }
+        } else {
+            None
+        }
+    };
+
     // 1. Run the deterministic kernel turn (must happen under the lock), passing
-    // the optional brain proposal so the kernel reconciles + audits the final
-    // intent at its single chokepoint. `intent_source` records who decided.
+    // the optional brain intent proposal AND slot proposal so the kernel reconciles
+    // + audits the final intent and validates the slots at its single chokepoint.
+    // `intent_source` records who decided.
     let (turn, summary, intent_source) = {
         let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut store = SqliteStore::open(&state.db_path)?;
         let mut kernel = store.load()?;
         let ctx = crate::ensure_bootstrapped(&mut kernel)?;
-        let (turn, intent_source) =
-            kernel.prime_turn_with_intent(&ctx, &message, intent_proposal.as_ref())?;
+        let (turn, intent_source) = kernel.prime_turn_with_intent_and_slots(
+            &ctx,
+            &message,
+            intent_proposal.as_ref(),
+            slot_proposal.as_ref(),
+        )?;
         let summary = state_response(&kernel, &state.db_path);
         store.save(&kernel)?;
         (turn, summary, intent_source)
@@ -1708,6 +1748,15 @@ async fn run_prime(
                 }
             }
         }
+    }
+
+    // Stamp the slot provenance label (the OpenRouter model id / CLI brain label
+    // that produced the validated slots) so the card can attribute them, exactly as
+    // the intent and polish provenance do. The kernel left `source` unset (it knows
+    // only that the brain assisted); the server, which knows the brain + model,
+    // fills it in. Present only when the kernel attached brain-assisted slots.
+    if let Some(slots) = final_turn.slots.as_mut() {
+        slots.source = Some(slot_source_label(brain, &ai_config));
     }
 
     // Surface intent provenance only when the brain genuinely drove the intent (a
@@ -2030,6 +2079,87 @@ fn parse_cli_intent(
         return None;
     }
     relux_kernel::parse_intent_proposal(&parsed.text).ok()
+}
+
+/// Extract a task's structured slots from one message via a local CLI brain, as
+/// VALIDATED [`relux_kernel::BrainTaskSlots`], or `None`.
+///
+/// The slot counterpart of [`classify_intent_via_cli`]: the CLI is spawned in the
+/// same bounded, non-bypass mode (argv-only, prompt on stdin, wall-clock timeout,
+/// output cap, secret redaction), its stdout is lifted by
+/// [`parse_adapter_result`] FIRST so the raw `--output-format json` envelope never
+/// reaches the parser or the UI, and only the lifted text is handed to
+/// [`relux_kernel::parse_task_slots`], which rejects any unsupported field and
+/// clamps/sanitizes every value. It performs NO durable action: it only proposes
+/// slots the kernel then reconciles against the live agent roster behind the
+/// fail-closed gate. Any failure → `None` and the deterministic slots stand.
+async fn extract_task_slots_via_cli(
+    brain: relux_kernel::PrimeBrain,
+    status: Option<relux_core::AdapterRuntimeStatus>,
+    message: &str,
+) -> Option<relux_kernel::BrainTaskSlots> {
+    let kind = match brain {
+        relux_kernel::PrimeBrain::ClaudeCli => relux_core::AdapterKind::ClaudeCli,
+        relux_kernel::PrimeBrain::CodexCli => relux_core::AdapterKind::CodexCli,
+        _ => return None,
+    };
+    let st = status?;
+    if st.state != relux_core::AdapterRuntimeState::Available {
+        return None;
+    }
+    let program = st.resolved_path.clone()?;
+
+    let prompt = relux_kernel::build_task_slots_prompt(message);
+    let spec = relux_kernel::AdapterCommandSpec {
+        program,
+        args: relux_kernel::build_adapter_args(&kind),
+        stdin: prompt,
+        working_dir: st.working_dir.clone(),
+        timeout: std::time::Duration::from_secs(
+            st.timeout_seconds
+                .unwrap_or(relux_core::DEFAULT_ADAPTER_TIMEOUT_SECONDS),
+        ),
+        max_output_bytes: st
+            .max_output_bytes
+            .unwrap_or(relux_core::DEFAULT_ADAPTER_MAX_OUTPUT_BYTES) as usize,
+    };
+
+    let run = tokio::task::spawn_blocking(move || relux_kernel::run_adapter_command(&spec)).await;
+    let outcome = match run {
+        Ok(Ok(outcome)) if outcome.success && !outcome.stdout.trim().is_empty() => outcome,
+        _ => return None,
+    };
+
+    parse_cli_task_slots(&outcome.stdout, kind)
+}
+
+/// Lift validated task slots out of a CLI brain's captured `stdout`, or `None`.
+/// The no-leak parse boundary, kept pure so it is pinned without spawning a
+/// process: [`parse_adapter_result`] lifts the human text out of the result
+/// envelope (degrading to raw prose otherwise, exactly as the intent/polish paths
+/// do), an envelope that reported an error is dropped, and the lifted text is
+/// validated by [`relux_kernel::parse_task_slots`]. The raw envelope never escapes.
+fn parse_cli_task_slots(
+    stdout: &str,
+    kind: relux_core::AdapterKind,
+) -> Option<relux_kernel::BrainTaskSlots> {
+    let parsed = relux_core::parse_adapter_result(stdout, kind);
+    if parsed.is_error == Some(true) {
+        return None;
+    }
+    relux_kernel::parse_task_slots(&parsed.text).ok()
+}
+
+/// The provenance label for brain-extracted slots: the OpenRouter model id, or the
+/// CLI brain's display label. Surfaced on the slot card the way the intent/polish
+/// provenance is. `Local` never produces slots, so it degrades to a neutral label.
+fn slot_source_label(brain: relux_kernel::PrimeBrain, cfg: &relux_kernel::AiConfig) -> String {
+    match brain {
+        relux_kernel::PrimeBrain::Openrouter => cfg.model.clone(),
+        relux_kernel::PrimeBrain::ClaudeCli => "Claude CLI".to_string(),
+        relux_kernel::PrimeBrain::CodexCli => "Codex CLI".to_string(),
+        relux_kernel::PrimeBrain::Local => "AI brain".to_string(),
+    }
 }
 
 /// Validate a CLI brain's captured `stdout` into an advisory proposal polish, or
@@ -4460,6 +4590,7 @@ mod tests {
             tool_error: None,
             suggested_actions: Vec::new(),
             proposal: None,
+            slots: None,
         }
     }
 
@@ -5295,6 +5426,65 @@ mod tests {
         );
     }
 
+    // --- Brain-assisted task slot extraction: the no-leak parse boundary -------
+    //
+    // These pin `parse_cli_task_slots` — the composition `extract_task_slots_via_cli`
+    // runs after the spawn — WITHOUT spawning a real CLI. The raw `--output-format
+    // json` envelope must never reach the validated slots, an unsupported field
+    // fails the whole proposal closed, and an error/prose envelope yields nothing.
+
+    #[test]
+    fn cli_slots_lifted_from_a_result_envelope() {
+        let inner = r#"{\"title\":\"Fix the login redirect bug\",\"assignee\":\"code-agent\",\"priority\":8,\"confidence\":0.9}"#;
+        let stdout = format!(r#"{{"type":"result","is_error":false,"result":"{inner}","session_id":"abc","duration_ms":12}}"#);
+        let s = parse_cli_task_slots(&stdout, relux_core::AdapterKind::ClaudeCli)
+            .expect("a valid envelope yields validated slots");
+        assert_eq!(s.title, "Fix the login redirect bug");
+        assert_eq!(s.assignee.as_deref(), Some("code-agent"));
+        assert_eq!(s.priority, Some(8));
+        // No envelope scaffolding leaks into the validated slots.
+        assert!(!s.title.contains("session_id") && !s.title.contains("\"type\""));
+    }
+
+    #[test]
+    fn cli_slots_plain_json_from_codex_text_mode() {
+        let stdout = r#"{"title":"Summarize the README","confidence":0.8}"#;
+        let s = parse_cli_task_slots(stdout, relux_core::AdapterKind::CodexCli)
+            .expect("raw JSON prose still validates");
+        assert_eq!(s.title, "Summarize the README");
+        assert!(s.details.is_none());
+    }
+
+    #[test]
+    fn cli_slots_error_envelope_yields_nothing() {
+        let stdout = r#"{"type":"result","is_error":true,"result":"rate limited","session_id":"x"}"#;
+        assert!(
+            parse_cli_task_slots(stdout, relux_core::AdapterKind::ClaudeCli).is_none(),
+            "an error envelope must yield no slots"
+        );
+    }
+
+    #[test]
+    fn cli_slots_prose_with_no_json_yields_nothing() {
+        let stdout = r#"{"type":"result","is_error":false,"result":"Sure, I will make that task for you."}"#;
+        assert!(
+            parse_cli_task_slots(stdout, relux_core::AdapterKind::ClaudeCli).is_none(),
+            "prose with no JSON object must not produce slots"
+        );
+    }
+
+    #[test]
+    fn cli_slots_unsupported_field_fails_closed() {
+        // A brain that tries to smuggle an executable key fails the whole proposal
+        // closed at the seam, so the create falls back to deterministic slots.
+        let inner = r#"{\"title\":\"x\",\"run_tool\":\"relux-tools-shell\",\"confidence\":0.9}"#;
+        let stdout = format!(r#"{{"type":"result","is_error":false,"result":"{inner}"}}"#);
+        assert!(
+            parse_cli_task_slots(&stdout, relux_core::AdapterKind::ClaudeCli).is_none(),
+            "an unsupported field must fail closed"
+        );
+    }
+
     #[test]
     fn cli_polish_rejects_error_envelope() {
         // An envelope reporting an error is never used as a polish, even though it
@@ -5367,6 +5557,7 @@ mod tests {
             tool_error: None,
             suggested_actions: Vec::new(),
             proposal: None,
+            slots: None,
         };
         let wire = serde_json::to_value(&turn).expect("PrimeTurn serializes");
         assert!(

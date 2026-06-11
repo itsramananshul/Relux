@@ -207,7 +207,10 @@ pub fn parse_intent_proposal(raw: &str) -> Result<BrainIntentProposal, String> {
 /// (leading prose, code fences). Mirrors openclaw's balanced-JSON extraction
 /// (`src/agents/cli-output.ts`) so a brain that wraps its JSON in chatter still
 /// parses — and a reply with no balanced object is rejected, never shown.
-fn extract_json_object(raw: &str) -> Option<String> {
+///
+/// Shared with [`crate::prime_slots`], which lifts a brain's slot JSON out of the
+/// same kind of noisy reply through this one balanced-brace scanner.
+pub(crate) fn extract_json_object(raw: &str) -> Option<String> {
     let start = raw.find('{')?;
     let mut depth = 0usize;
     let mut in_str = false;

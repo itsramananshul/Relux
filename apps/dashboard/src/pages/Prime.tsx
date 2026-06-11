@@ -8,7 +8,7 @@ import {
   type ReluxPrimeSuggestion,
   type ReluxPrimeTurn,
 } from "../api";
-import { hasSteps, intentProvenance, polishProvenance, proposalDisplaySummary, stepDisplayTitle } from "../prime";
+import { hasSteps, intentProvenance, polishProvenance, proposalDisplaySummary, slotProvenance, stepDisplayTitle } from "../prime";
 import { workTaskHref, workRunHref } from "../routing";
 import { PrimeAutonomyPanel } from "../components/PrimeAutonomyPanel";
 import { OrchestrationPanel } from "../components/OrchestrationPanel";
@@ -353,6 +353,53 @@ function PrimeTurnCard({
           showing it. The explicit commit is the "Create these tasks" button below
           (from suggested_actions), so the card never acts on its own (§10.5, §17.1). */}
       {turn.proposal && <ProposalCard proposal={turn.proposal} />}
+
+      {/* Brain-assisted task slots (RELUX_MASTER_PLAN §10.1 Intent Layer, §10.2
+          Action Layer, §17.1). A compact, B&W card surfacing the normalized title,
+          optional details, the honored assignee/priority, and a small provenance
+          chip — present ONLY when a configured brain genuinely sharpened the slots
+          and the kernel validated them. It is informational: the task was already
+          created through the deterministic execute path; this just shows what the
+          brain contributed, never a fresh authority. */}
+      {turn.slots && (
+        <div
+          style={{
+            marginTop: 10,
+            border: "1px solid var(--border)",
+            borderRadius: 6,
+            padding: "8px 10px",
+            fontSize: 12,
+          }}
+        >
+          <div className="row wrap" style={{ gap: 6, alignItems: "center", marginBottom: 4 }}>
+            <span
+              className="badge done"
+              style={{ fontSize: 9 }}
+              title="Prime's brain extracted and normalized these task slots — not keyword slicing"
+            >
+              🧠 {slotProvenance(turn.slots)}
+            </span>
+            <span className="muted" style={{ fontSize: 9 }}>brain-extracted slots</span>
+          </div>
+          <div>
+            <strong>{turn.slots.title}</strong>
+          </div>
+          {turn.slots.details && (
+            <div className="muted" style={{ marginTop: 2 }}>{turn.slots.details}</div>
+          )}
+          {(turn.slots.assignee || turn.slots.priority != null) && (
+            <div className="muted" style={{ marginTop: 4, fontSize: 11 }}>
+              {turn.slots.assignee && (
+                <span>
+                  assignee <span className="mono">{turn.slots.assignee}</span>
+                </span>
+              )}
+              {turn.slots.assignee && turn.slots.priority != null && <span> · </span>}
+              {turn.slots.priority != null && <span>priority {turn.slots.priority}</span>}
+            </div>
+          )}
+        </div>
+      )}
 
       {(turn.created_task || turn.started_run || turn.created_agent || turn.approval) && (
         <div className="row wrap" style={{ gap: 10, marginTop: 10, fontSize: 11 }}>

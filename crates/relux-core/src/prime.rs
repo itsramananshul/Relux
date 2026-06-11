@@ -407,6 +407,54 @@ pub struct PrimePolishedStep {
     pub title: String,
 }
 
+/// The brain-assisted, VALIDATED task slots that produced a created task, attached
+/// to a `TaskCreation` / `CreateAndRunTask` turn ONLY when a configured brain
+/// actually sharpened the slots (`docs/RELUX_MASTER_PLAN.md` section 10.1 Intent
+/// Layer, section 10.2 Action Layer, section 17.1 "Prime must be smart and
+/// grounded"). It is provenance/presentation only — every field here was already
+/// validated by the kernel before the task was created, so this just reports what
+/// the brain contributed, never a fresh authority.
+///
+/// ## The safety contract (binding)
+///
+/// The brain only ever *proposes* these slots; the kernel validates each one
+/// against a strict schema and the live control-plane state before any task is
+/// created (`crates/relux-kernel/src/prime_slots.rs`):
+///
+/// - `title` is sanitized (control chars stripped, single line) and length-clamped;
+/// - `assignee` is honored ONLY when it names an EXISTING agent — an unknown id is
+///   dropped and the task stays assigned to Prime (the brain can never invent an
+///   assignee or smuggle a plugin/tool name in as one);
+/// - `priority` is clamped to the supported range;
+/// - a low-confidence, malformed, unknown-field, or empty-title proposal is
+///   rejected wholesale and the deterministic slots stand (this struct is absent).
+///
+/// Omitted from the wire on every turn the brain did not sharpen, so existing
+/// clients see exactly the JSON they did before.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrimeTaskSlots {
+    /// The normalized task title the brain produced and the kernel accepted. This
+    /// is the title the created task actually carries.
+    pub title: String,
+    /// Optional sanitized details/notes the brain extracted, folded into the task
+    /// input. Absent when the brain offered none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
+    /// The suggested assignee, present ONLY when it named an existing agent the
+    /// kernel honored. Absent when the brain named none or named an unknown agent
+    /// (in which case the task stayed assigned to Prime).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignee: Option<String>,
+    /// The clamped priority the brain suggested and the kernel applied. Absent when
+    /// the brain offered none (the task kept the default priority).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u8>,
+    /// The model id / CLI brain label that produced these slots, for provenance on
+    /// the card. Absent degrades to a generic "AI brain" label client-side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
 /// The full result of Prime handling one user message.
 ///
 /// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 10 (Prime Behavior Specification).
@@ -447,6 +495,14 @@ pub struct PrimeTurn {
     /// "Create these tasks" suggestion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proposal: Option<PrimeProposal>,
+    /// The brain-assisted, validated task slots that shaped a created task, present
+    /// ONLY on a `TaskCreation` / `CreateAndRunTask` turn the brain genuinely
+    /// sharpened (see [`PrimeTaskSlots`]). Omitted on every other turn — including a
+    /// deterministically-titled create — so existing clients see the same JSON they
+    /// did before. Provenance/presentation only; the kernel already validated every
+    /// slot before the task was created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slots: Option<PrimeTaskSlots>,
 }
 
 /// The scope a Prime turn runs in: which namespace work lands in, which agent
@@ -540,11 +596,18 @@ mod tests {
             tool_error: None,
             suggested_actions: vec![],
             proposal: None,
+            slots: None,
         };
         let json = serde_json::to_string(&turn).unwrap();
         assert!(
             !json.contains("suggested_actions"),
             "empty suggestions must be omitted: {json}"
+        );
+        // The brain-assisted slot provenance is present ONLY on a sharpened create
+        // turn: a turn the brain did not shape must omit `slots` on the wire.
+        assert!(
+            !json.contains("slots"),
+            "a turn with no brain-assisted slots must omit the field: {json}"
         );
         // The plan preview is present ONLY on a PlanRequest turn: a normal turn must
         // not carry `proposal` on the wire, so existing clients are unaffected (§11.1).
@@ -654,6 +717,40 @@ mod tests {
         assert_eq!(back.steps, proposal.steps);
         assert_eq!(back.agents, proposal.agents);
         assert_eq!(back.goal, proposal.goal);
+    }
+
+    #[test]
+    fn prime_task_slots_round_trip_and_omit_empty_optionals() {
+        // A minimal slot carries only the title; every optional the brain did not
+        // contribute is omitted from the wire.
+        let minimal = PrimeTaskSlots {
+            title: "Fix the login redirect bug".to_string(),
+            details: None,
+            assignee: None,
+            priority: None,
+            source: None,
+        };
+        let json = serde_json::to_string(&minimal).unwrap();
+        for absent in ["details", "assignee", "priority", "source"] {
+            assert!(
+                !json.contains(absent),
+                "an unset optional must be omitted ({absent}): {json}"
+            );
+        }
+        let back: PrimeTaskSlots = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, minimal);
+
+        // A fully populated slot round-trips with every validated field intact.
+        let full = PrimeTaskSlots {
+            title: "Fix the login redirect bug".to_string(),
+            details: Some("Users land on a blank page after SSO.".to_string()),
+            assignee: Some("code-agent".to_string()),
+            priority: Some(8),
+            source: Some("anthropic/claude-3.5-haiku".to_string()),
+        };
+        let back: PrimeTaskSlots =
+            serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
+        assert_eq!(back, full);
     }
 
     #[test]

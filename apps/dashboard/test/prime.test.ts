@@ -8,8 +8,9 @@ import {
   proposalDisplaySummary,
   polishProvenance,
   intentProvenance,
+  slotProvenance,
 } from "../src/prime.ts";
-import type { ReluxPrimeProposal } from "../src/api.ts";
+import type { ReluxPrimeProposal, ReluxPrimeTaskSlots } from "../src/api.ts";
 
 // The plan proposal card must read HONESTLY: the summary reflects the actual step
 // and agent counts, a single-step proposal is steered to the one-task path (not
@@ -104,6 +105,21 @@ test("polishProvenance shows the CLI brain label", () => {
 // brain genuinely classified the intent (`intent_source === "brain"`); a deterministic
 // turn — no brain, or a proposal the safety gate vetoed — attributes nothing, so the
 // card never overclaims a brain decision (§10.1, §17.1).
+test("slotProvenance shows the brain label only when slots are present", () => {
+  const slots = (extra: Partial<ReluxPrimeTaskSlots> = {}): ReluxPrimeTaskSlots => ({
+    title: "Fix the login redirect bug",
+    ...extra,
+  });
+  // The OpenRouter model id or the CLI brain label is surfaced verbatim.
+  assert.equal(slotProvenance(slots({ source: "anthropic/claude-3.5-haiku" })), "anthropic/claude-3.5-haiku");
+  assert.equal(slotProvenance(slots({ source: "Claude CLI" })), "Claude CLI");
+  // No slots → no chip (never overclaim a brain decision).
+  assert.equal(slotProvenance(undefined), null);
+  // An older kernel that left `source` unset degrades to a generic label.
+  assert.equal(slotProvenance(slots()), "AI brain");
+  assert.equal(slotProvenance(slots({ source: "   " })), "AI brain");
+});
+
 test("intentProvenance shows a label only when the brain decided the intent", () => {
   assert.equal(intentProvenance("brain"), "brain-classified");
   // Deterministic / absent / unknown sources attribute nothing.

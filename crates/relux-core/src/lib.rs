@@ -47,7 +47,7 @@ pub use plugin::{
 pub use prime::{
     PrimeAction, PrimeAutonomyConfig, PrimeAutonomyTickResult, PrimeContext, PrimeDisposition,
     PrimeIntent, PrimePlan, PrimePolishedStep, PrimeProposal, PrimeProposalPolish,
-    PrimeProposalStep, PrimeSuggestion, PrimeTurn, StateSummary, TaskBrief,
+    PrimeProposalStep, PrimeSuggestion, PrimeTaskSlots, PrimeTurn, StateSummary, TaskBrief,
 };
 pub use proposed_change::{
     capture_proposed_changes, sha256_hex, ProposedChange, ProposedChangeAction,

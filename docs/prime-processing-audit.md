@@ -320,6 +320,102 @@ turns. Pinned by `questions_about_work_stay_a_conversation_not_a_task`,
 `explicit_command_inside_a_question_still_acts`, and
 `brainstorm_candidate_strips_question_and_soft_intent_lead_ins`.
 
+## Applied change (brain-assisted, VALIDATED task-slot extraction)
+
+Intent classification was already brain-mediated, but the *slots* of a created
+task were still keyword string-slicing: `prime::task_title` strips a fixed lead-in
+list and takes the remainder verbatim — no normalization, no details, no assignee,
+no priority. So a polite, run-on request became a task titled after the whole
+clause. Per master plan §10.1 (Intent Layer), §10.2 (Action Layer), and §17.1
+("Prime must be smart and grounded"), and following the reference read recorded in
+`reference-driven-development.md` (Hermes `coerce_tool_args` / argument sanitization;
+openclaw `readPlanSteps` allowlist, `UNSUPPORTED_*_PARAM_KEYS`, existing-target
+validation), a configured brain may now *propose* the slots, validated hard before
+any task is created.
+
+- **New module `relux-kernel/src/prime_slots.rs`.** `build_task_slots_prompt`
+  demands JSON-only `{title, details?, assignee?, priority?, confidence}`.
+  `parse_task_slots` lifts the JSON via the shared balanced-brace scanner
+  (`prime_intent::extract_json_object`), **rejects any field outside the strict
+  allowlist** (a smuggled `run_tool`/`tags`/`action` fails the whole proposal
+  closed), requires a non-empty `title`, **sanitizes** every string (control chars
+  stripped, title forced single-line) and **clamps** lengths, and **coerces**
+  priority (number or numeric string → `[1,9]`, else dropped).
+  `reconcile_task_slots` then validates against the live state: a low-confidence
+  proposal falls back; an `assignee` is honored ONLY when it names an EXISTING
+  agent (`summary.all_agent_ids`), else dropped; a proposal that merely echoes the
+  deterministic title with nothing else is a no-op.
+- **New wire field `PrimeTurn.slots: Option<PrimeTaskSlots>`** (`relux-core`),
+  `skip_serializing_if = "Option::is_none"` so the wire is byte-for-byte unchanged
+  on every turn the brain did not sharpen. Provenance/presentation only — the kernel
+  validated every field before the task existed.
+- **Kernel chokepoint.** `KernelState::prime_turn_with_intent_and_slots` reconciles
+  the slot proposal for a create `Act` and threads `ResolvedTaskSlots` into
+  `prime_execute`, which applies the title, folds details into the task input,
+  assigns the validated agent (CreateTask only), and applies the clamped priority.
+  `prime_turn_with_intent` is now a thin wrapper passing `None`, so the deterministic
+  path is unchanged.
+- **Safety invariants (binding).** Slots are computed only for a create intent the
+  fail-closed gate already accepted, and only when the deterministic path already
+  produced a real create — so **casual chat/ideation can never mint a task via
+  slots** (the intent gate keeps it `Brainstorming`). The auto-run path
+  (`CreateAndRunTask`) takes a brain title/details/priority but **never** the
+  brain's assignee: the run stays on Prime, the only agent wired for the required
+  grant. Any failure (no brain, low confidence, invalid JSON, unsupported field,
+  unknown assignee) leaves the deterministic slots in place.
+- **Both brains feed one validator.** OpenRouter goes through
+  `ai::extract_task_slots_via_openrouter`; the Claude/Codex CLI brains are spawned
+  in the same bounded, non-bypass mode and their stdout is lifted by
+  `parse_adapter_result` FIRST (`server.rs` `extract_task_slots_via_cli` /
+  `parse_cli_task_slots`) so the raw envelope never reaches the parser or the UI.
+  Both land on the SAME `parse_task_slots` → `reconcile_task_slots`. The server gates
+  the (slow, off-lock) slot call on the RESOLVED intent being a create, and stamps
+  the provenance label (model id / `Claude CLI` / `Codex CLI`).
+- **Dashboard.** A compact B&W slot card (`apps/dashboard/src/pages/Prime.tsx` +
+  the pure `slotProvenance` helper in `src/prime.ts`) shows the normalized title,
+  optional details, the honored assignee/priority, and a small `🧠 <source>`
+  provenance chip — present ONLY when the kernel attached brain-assisted slots.
+
+Pinned by `prime_task_slots_round_trip_and_omit_empty_optionals` (core wire guard,
+plus the extended omission assertion in `prime_suggestion_round_trips_…`); the
+`prime_slots` unit tests (clean parse, noisy-reply extraction, invalid JSON,
+unsupported-field fail-closed, empty-title reject, overlong-title clamp + control
+strip, priority coercion/clamp, reconcile low-confidence/known-and-unknown-assignee/
+pure-echo/details+priority); the kernel integration tests
+(`brain_slots_sharpen_a_created_task_…`, `brain_slot_assignee_is_honored_only_when_
+the_agent_exists`, `no_slot_proposal_is_byte_for_byte_the_deterministic_create`,
+`ideation_still_cannot_mint_a_task_even_with_a_slot_proposal`,
+`create_and_run_sharpens_the_title_but_never_reassigns_the_run`); the server seam
+tests (`cli_slots_*`: valid envelope, plain JSON, error envelope, prose-without-JSON,
+unsupported-field fail-closed); and the dashboard `slotProvenance` test. No test
+calls a real provider.
+
+## Current Prime brain stack
+
+The end-to-end shape of one Prime turn, with the brain strictly additive and the
+deterministic kernel always the authority:
+
+1. **Intent** — the brain *proposes* a label (`prime_intent::build_intent_prompt` →
+   `parse_intent_proposal`); `reconcile_intent` is the fail-closed gate (guarded
+   chat can never become work; low confidence keeps the deterministic intent;
+   `create_and_run` without run language downgrades to `create`). No brain → the
+   deterministic `classify_intent` decides.
+2. **Validated slots** — only when the resolved intent is a create the kernel will
+   act on, the brain *proposes* task slots (`prime_slots::build_task_slots_prompt` →
+   `parse_task_slots`); `reconcile_task_slots` validates them against the
+   deterministic title and the live agent roster (allowlist fields, clamp lengths/
+   priority, existing-agent assignee only). Any failure → deterministic slots.
+3. **Deterministic / policy execution** — `decide` → `prime_execute` is the SOLE
+   path that changes durable state. Risky intents still become `Propose` behind a
+   human approval; the brain runs nothing and authors no action. Plan previews
+   (`PlanRequest`) remain action-free, and orchestration steps stay owned by the
+   deterministic `plan_orchestration` (the brain only *polishes* their wording).
+4. **UI response** — the reply text may be brain-shaped on a conversational turn
+   (`shape_reply` / CLI brain), a plan card may carry an advisory polish overlay,
+   and a sharpened create carries a `slots` provenance card. Every brain
+   contribution is labeled (intent → `brain-classified`; polish/slots → the model id
+   or CLI label) and is presentation/provenance only — never a fresh authority.
+
 ## Next recommended slice
 
 When the optional LLM brain is enabled, let it *propose* the clarifying question

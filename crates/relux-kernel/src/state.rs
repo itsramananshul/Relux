@@ -3409,6 +3409,29 @@ impl KernelState {
         message: &str,
         intent_proposal: Option<&crate::prime_intent::BrainIntentProposal>,
     ) -> Result<(PrimeTurn, crate::prime_intent::IntentSource), KernelError> {
+        self.prime_turn_with_intent_and_slots(ctx, message, intent_proposal, None)
+    }
+
+    /// Like [`Self::prime_turn_with_intent`], but additionally accepts an OPTIONAL
+    /// brain-proposed set of task slots for a create turn.
+    ///
+    /// This is the chokepoint for brain-assisted slot extraction
+    /// (`crates/relux-kernel/src/prime_slots.rs`): when the (already
+    /// brain-reconciled, fail-closed-gated) plan is a create `Act`, a slot proposal
+    /// is reconciled against the deterministic title and the live agent roster
+    /// before the task is created. The brain authors no new work — it only sharpens
+    /// a create the deterministic path already decided, and an unknown assignee /
+    /// low-confidence / absent proposal leaves the deterministic slots exactly as
+    /// they were. With `slot_proposal = None` this is byte-for-byte the deterministic
+    /// turn. Durable state still flows only through `decide` →
+    /// [`Self::prime_execute`].
+    pub fn prime_turn_with_intent_and_slots(
+        &mut self,
+        ctx: &PrimeContext,
+        message: &str,
+        intent_proposal: Option<&crate::prime_intent::BrainIntentProposal>,
+        slot_proposal: Option<&crate::prime_slots::BrainTaskSlots>,
+    ) -> Result<(PrimeTurn, crate::prime_intent::IntentSource), KernelError> {
         let summary = self.inspect_state();
         let deterministic = classify_intent(message);
         let (intent, intent_source) = match intent_proposal {
@@ -3450,6 +3473,7 @@ impl KernelState {
                 tool_error: None,
                 suggested_actions: Vec::new(),
                 proposal: None,
+                slots: None,
             },
             PrimePlan::Clarify { text } => PrimeTurn {
                 intent,
@@ -3465,8 +3489,25 @@ impl KernelState {
                 tool_error: None,
                 suggested_actions: Vec::new(),
                 proposal: None,
+                slots: None,
             },
-            PrimePlan::Act { action, text } => self.prime_execute(ctx, intent, action, text)?,
+            PrimePlan::Act { action, text } => {
+                // Brain-assisted slot sharpening (validated): only for a create
+                // action, only when a slot proposal is present, and only when it
+                // reconciles against the deterministic title + the live agent roster
+                // behind the fail-closed gate (`prime_slots.rs`). The brain authors
+                // no new work here — it sharpens a create the deterministic path
+                // already decided. `None` (no proposal, low confidence, unknown
+                // assignee with nothing else) keeps the deterministic slots.
+                let resolved = match (&action, slot_proposal) {
+                    (
+                        PrimeAction::CreateTask { title } | PrimeAction::CreateAndRunTask { title },
+                        Some(proposal),
+                    ) => crate::prime_slots::reconcile_task_slots(title, proposal, &summary),
+                    _ => None,
+                };
+                self.prime_execute(ctx, intent, action, text, resolved.as_ref())?
+            }
             PrimePlan::Propose {
                 action,
                 reason,
@@ -3498,6 +3539,7 @@ impl KernelState {
                     tool_error: None,
                     suggested_actions: Vec::new(),
                     proposal: None,
+                    slots: None,
                 }
             }
         };
@@ -3507,6 +3549,25 @@ impl KernelState {
         // nothing the user could not type.
         attach_suggestions(&mut turn, message, &summary);
         Ok((turn, intent_source))
+    }
+
+    /// Apply a brain-suggested, already-clamped priority to a freshly created task.
+    /// A no-op when the brain offered no priority. The value was clamped to the
+    /// supported range by [`crate::prime_slots::parse_task_slots`], so this only
+    /// sets it; nothing else about the task changes.
+    fn apply_slot_priority(
+        &mut self,
+        task: &TaskId,
+        slots: Option<&crate::prime_slots::ResolvedTaskSlots>,
+    ) {
+        let Some(priority) = slots.and_then(|s| s.priority) else {
+            return;
+        };
+        let now = self.clock.tick();
+        if let Some(t) = self.tasks.get_mut(task) {
+            t.priority = priority;
+            t.updated_at = now;
+        }
     }
 
     /// Execute the safe `Act` actions Prime is allowed to perform directly.
@@ -3520,22 +3581,43 @@ impl KernelState {
         intent: relux_core::PrimeIntent,
         action: PrimeAction,
         text: String,
+        slots: Option<&crate::prime_slots::ResolvedTaskSlots>,
     ) -> Result<PrimeTurn, KernelError> {
         match &action {
             PrimeAction::CreateTask { title } => {
+                // The brain may sharpen the slots (validated); otherwise the
+                // deterministic title stands. Details fold into the task input; an
+                // assignee is honored only when it named an EXISTING agent
+                // (`prime_slots::reconcile_task_slots` already validated it).
+                let eff_title = slots.map(|s| s.title.clone()).unwrap_or_else(|| title.clone());
+                let mut input = serde_json::json!({ "prime_request": eff_title });
+                if let Some(details) = slots.and_then(|s| s.details.as_deref()) {
+                    input["details"] = serde_json::Value::String(details.to_string());
+                }
                 let task = self.create_task(
-                    title,
-                    serde_json::json!({ "prime_request": title }),
+                    &eff_title,
+                    input,
                     &ctx.actor,
                     &ctx.namespace,
                     vec![],
                 );
-                // Assign to Prime so the work is immediately runnable when the
-                // user says "start it"; assigning to self is within Prime's scope.
-                self.assign_task(&task, &ctx.agent)?;
+                // Assign to the brain-suggested existing agent when present,
+                // otherwise to Prime so the work is immediately runnable when the
+                // user says "start it" (assigning to self is within Prime's scope).
+                let assignee = slots.and_then(|s| s.assignee.clone());
+                let assigned = match &assignee {
+                    Some(id) => AgentId::new(id.clone()),
+                    None => ctx.agent.clone(),
+                };
+                self.assign_task(&task, &assigned)?;
+                self.apply_slot_priority(&task, slots);
+                let head = if slots.is_some() {
+                    format!("Creating a task: \"{eff_title}\".")
+                } else {
+                    text
+                };
                 let reply = format!(
-                    "{text} Created {task} and assigned it to {}. It is ready to run whenever you are.",
-                    ctx.agent
+                    "{head} Created {task} and assigned it to {assigned}. It is ready to run whenever you are."
                 );
                 Ok(PrimeTurn {
                     intent,
@@ -3551,22 +3633,60 @@ impl KernelState {
                     tool_error: None,
                     suggested_actions: Vec::new(),
                     proposal: None,
+                    slots: slots.map(|s| relux_core::PrimeTaskSlots {
+                        title: eff_title.clone(),
+                        details: s.details.clone(),
+                        assignee,
+                        priority: s.priority,
+                        source: None,
+                    }),
                 })
             }
             PrimeAction::CreateAndRunTask { title } => {
+                // Title/details/priority may be brain-sharpened, but the assignee is
+                // NOT overridden here: this path immediately starts a run, and the
+                // task carries a required permission only Prime is wired to satisfy,
+                // so the run stays assigned to Prime (the brain can never reassign a
+                // task it would auto-run onto an agent that may lack the grant).
+                let eff_title = slots.map(|s| s.title.clone()).unwrap_or_else(|| title.clone());
+                let mut input = serde_json::json!({ "prime_request": eff_title });
+                if let Some(details) = slots.and_then(|s| s.details.as_deref()) {
+                    input["details"] = serde_json::Value::String(details.to_string());
+                }
                 let task = self.create_task(
-                    title,
-                    serde_json::json!({ "prime_request": title }),
+                    &eff_title,
+                    input,
                     &ctx.actor,
                     &ctx.namespace,
                     vec![Permission::new("tool:relux-tools-echo:say").unwrap()],
                 );
                 self.assign_task(&task, &ctx.agent)?;
+                self.apply_slot_priority(&task, slots);
                 let run = self.start_run(&task)?;
 
+                let head = if slots.is_some() {
+                    format!("Creating and running task: \"{eff_title}\".")
+                } else {
+                    text
+                };
                 let reply = format!(
-                    "{text} Created {task} and started {run}. The task is now running and awaiting further action from the assigned agent."
+                    "{head} Created {task} and started {run}. The task is now running and awaiting further action from the assigned agent."
                 );
+                // Provenance reflects only what was applied: the assignee is never
+                // applied on this path, and a proposal that contributed nothing but
+                // a (dropped) assignee shows no chip.
+                let provenance = slots.and_then(|s| {
+                    let changed = eff_title.trim() != title.trim()
+                        || s.details.is_some()
+                        || s.priority.is_some();
+                    changed.then(|| relux_core::PrimeTaskSlots {
+                        title: eff_title.clone(),
+                        details: s.details.clone(),
+                        assignee: None,
+                        priority: s.priority,
+                        source: None,
+                    })
+                });
                 Ok(PrimeTurn {
                     intent,
                     reply,
@@ -3581,6 +3701,7 @@ impl KernelState {
                     tool_error: None,
                     suggested_actions: Vec::new(),
                     proposal: None,
+                    slots: provenance,
                 })
             }
             PrimeAction::StartRun { task_id } => {
@@ -3604,6 +3725,7 @@ impl KernelState {
                     tool_error: None,
                     suggested_actions: Vec::new(),
                     proposal: None,
+                    slots: None,
                 })
             }
             PrimeAction::CreateAgent {
@@ -3636,6 +3758,7 @@ impl KernelState {
                     tool_error: None,
                     suggested_actions: Vec::new(),
                     proposal: None,
+                    slots: None,
                 })
             }
             PrimeAction::AssignTask { task_id, agent_id } => {
@@ -3657,6 +3780,7 @@ impl KernelState {
                     tool_error: None,
                     suggested_actions: Vec::new(),
                     proposal: None,
+                    slots: None,
                 })
             }
             PrimeAction::DiscoverTools => {
@@ -3682,6 +3806,7 @@ impl KernelState {
                     tool_error: None,
                     suggested_actions: Vec::new(),
                     proposal: None,
+                    slots: None,
                 })
             }
             PrimeAction::InvokeTool {
@@ -3709,6 +3834,7 @@ impl KernelState {
                         tool_error: None,
                         suggested_actions: Vec::new(),
                         proposal: None,
+                        slots: None,
                     })
                 }
                 Err(KernelError::OrchestrationNotMultiAgent) => Ok(PrimeTurn {
@@ -3725,6 +3851,7 @@ impl KernelState {
                     tool_error: None,
                     suggested_actions: Vec::new(),
                     proposal: None,
+                    slots: None,
                 }),
                 Err(e) => Err(e),
             },
@@ -3745,6 +3872,7 @@ impl KernelState {
                 tool_error: None,
                 suggested_actions: Vec::new(),
                 proposal: None,
+                slots: None,
             }),
         }
     }
@@ -3804,6 +3932,7 @@ impl KernelState {
                 tool_error,
                 suggested_actions: Vec::new(),
                 proposal: None,
+                slots: None,
             }
         };
 
@@ -6558,6 +6687,174 @@ mod tests {
         // start it now only starts the run, does not complete it.
         assert_eq!(k.run(&run_id).unwrap().status, RunStatus::Running);
         assert_eq!(k.task(&task_id).unwrap().status, TaskStatus::Running);
+    }
+
+    /// Add a second specialist agent so an assignee slot has a real target.
+    fn add_agent(k: &mut KernelState, ctx: &PrimeContext, id: &str) -> AgentId {
+        let adapter = PluginId::new("relux-adapter-local-prime");
+        k.create_agent(
+            id,
+            id,
+            "A specialist agent.",
+            &adapter,
+            &ctx.namespace,
+            None,
+            vec![],
+        )
+        .unwrap()
+    }
+
+    fn slots(title: &str, confidence: f32) -> crate::prime_slots::BrainTaskSlots {
+        crate::prime_slots::BrainTaskSlots {
+            title: title.to_string(),
+            details: None,
+            assignee: None,
+            priority: None,
+            confidence,
+            rationale: String::new(),
+        }
+    }
+
+    #[test]
+    fn brain_slots_sharpen_a_created_task_title_details_priority_and_provenance() {
+        // A validated brain slot proposal normalizes the title, folds details into
+        // the task input, applies a clamped priority, and surfaces honest provenance
+        // — while the create still flows through the deterministic execute path.
+        let (mut k, ctx) = prime_chat_kernel();
+        let mut s = slots("Fix the login redirect bug", 0.9);
+        s.details = Some("Users land on a blank page after SSO.".to_string());
+        s.priority = Some(8);
+
+        let (turn, _src) = k
+            .prime_turn_with_intent_and_slots(
+                &ctx,
+                "create a task to handle the login redirect mess",
+                None,
+                Some(&s),
+            )
+            .unwrap();
+
+        assert_eq!(turn.intent, relux_core::PrimeIntent::TaskCreation);
+        assert_eq!(turn.disposition, PrimeDisposition::Executed);
+        let task_id = turn.created_task.clone().expect("a task was created");
+        let task = k.task(&task_id).unwrap();
+        assert_eq!(task.title, "Fix the login redirect bug");
+        assert_eq!(task.priority, 8);
+        assert_eq!(
+            task.input.get("details").and_then(|v| v.as_str()),
+            Some("Users land on a blank page after SSO.")
+        );
+        // The created task carries the normalized title, not the run-on message.
+        let provenance = turn.slots.expect("brain-assisted slots are surfaced");
+        assert_eq!(provenance.title, "Fix the login redirect bug");
+        assert_eq!(provenance.priority, Some(8));
+        assert!(provenance.assignee.is_none());
+        // The kernel leaves provenance source unset; the server stamps the label.
+        assert!(provenance.source.is_none());
+    }
+
+    #[test]
+    fn brain_slot_assignee_is_honored_only_when_the_agent_exists() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let code_agent = add_agent(&mut k, &ctx, "code-agent");
+
+        // A known assignee lands the task on that agent.
+        let mut known = slots("Fix the login bug", 0.9);
+        known.assignee = Some("code-agent".to_string());
+        let (turn, _) = k
+            .prime_turn_with_intent_and_slots(
+                &ctx,
+                "create a task to fix the login bug",
+                None,
+                Some(&known),
+            )
+            .unwrap();
+        let task = k.task(&turn.created_task.unwrap()).unwrap();
+        assert_eq!(task.assigned_agent.as_ref(), Some(&code_agent));
+        assert_eq!(turn.slots.unwrap().assignee.as_deref(), Some("code-agent"));
+
+        // An UNKNOWN assignee is dropped (fail closed); with nothing else
+        // contributed it resolves to the deterministic slots — the task stays
+        // assigned to Prime and no provenance chip is shown.
+        let mut ghost = slots("summarize the readme", 0.9);
+        ghost.assignee = Some("ghost-agent".to_string());
+        let (turn2, _) = k
+            .prime_turn_with_intent_and_slots(
+                &ctx,
+                "create a task to summarize the readme",
+                None,
+                Some(&ghost),
+            )
+            .unwrap();
+        let task2 = k.task(&turn2.created_task.unwrap()).unwrap();
+        assert_eq!(task2.assigned_agent.as_ref(), Some(&ctx.agent));
+        assert!(turn2.slots.is_none());
+    }
+
+    #[test]
+    fn no_slot_proposal_is_byte_for_byte_the_deterministic_create() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let (turn, _) = k
+            .prime_turn_with_intent_and_slots(
+                &ctx,
+                "create a task to summarize the readme",
+                None,
+                None,
+            )
+            .unwrap();
+        let task = k.task(&turn.created_task.unwrap()).unwrap();
+        assert_eq!(task.title, "summarize the readme");
+        assert!(turn.slots.is_none(), "no brain assist means no slots field");
+    }
+
+    #[test]
+    fn ideation_still_cannot_mint_a_task_even_with_a_slot_proposal() {
+        // The intent gate keeps musing a conversation: the create path is never
+        // reached, so a slot proposal can NEVER turn casual chat into work (§10.5).
+        let (mut k, ctx) = prime_chat_kernel();
+        let s = slots("Refactor the auth module", 0.99);
+        let (turn, _) = k
+            .prime_turn_with_intent_and_slots(
+                &ctx,
+                "we should refactor the auth module",
+                None,
+                Some(&s),
+            )
+            .unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::Brainstorming);
+        assert!(turn.created_task.is_none());
+        assert!(turn.slots.is_none());
+        assert_eq!(k.task_count(), 0, "ideation must not create work");
+    }
+
+    #[test]
+    fn create_and_run_sharpens_the_title_but_never_reassigns_the_run() {
+        // The auto-run path may take a brain title, but the assignee is NOT applied:
+        // the run stays on Prime (the only agent wired for the required grant), so
+        // the brain can never reassign work it would immediately run.
+        let (mut k, ctx) = prime_chat_kernel();
+        add_agent(&mut k, &ctx, "code-agent");
+        let mut s = slots("Ping the health endpoint", 0.9);
+        s.assignee = Some("code-agent".to_string());
+
+        let (turn, _) = k
+            .prime_turn_with_intent_and_slots(
+                &ctx,
+                "create a task to ping the health endpoint and run it",
+                None,
+                Some(&s),
+            )
+            .unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::CreateAndRunTask);
+        let task = k.task(&turn.created_task.clone().unwrap()).unwrap();
+        assert_eq!(task.title, "Ping the health endpoint");
+        // The run stayed on Prime despite the brain naming a different assignee.
+        assert_eq!(task.assigned_agent.as_ref(), Some(&ctx.agent));
+        assert!(turn.started_run.is_some());
+        // Provenance reflects only what was applied: a sharpened title, no assignee.
+        let provenance = turn.slots.expect("a sharpened title surfaces provenance");
+        assert_eq!(provenance.title, "Ping the health endpoint");
+        assert!(provenance.assignee.is_none());
     }
 
     #[test]

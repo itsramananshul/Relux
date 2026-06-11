@@ -134,3 +134,80 @@ durable change through `decide` → `prime_execute`. The model can sharpen a mis
 intent; it authors no slots and runs no action. This keeps the master-plan safety
 contract (`crates/relux-kernel/src/ai.rs`) intact while lifting the "keyword-rules"
 feel the user complained about.
+
+---
+
+## Reference read — Prime brain-assisted task-slot extraction (this slice)
+
+The next brittle part moved off keyword string-slicing: the *slots* of a created
+task. Even with brain-mediated intent, the title was still
+`crate::prime::task_title` stripping a fixed lead-in list and taking the remainder
+verbatim — no normalization, no details, no assignee, no priority. This slice lets
+a configured brain *propose* the slots and validates them hard before any task is
+created. (Orchestration/plan slots are out of scope here: `plan_orchestration`
+already owns steps safely and already has the advisory polish overlay — see the
+audit note — so the new validated-slot layer targets task creation, the part still
+driven by raw slicing.)
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/agent/conversation_loop.py` (~L3166-3251) — the
+  tool-call **argument** path: a string arg is `json.loads`-parsed; a truncated
+  object returns partial; a malformed object retries up to 3×, then a `role:tool`
+  error result is injected for self-correction. **Pattern: parse the model's
+  structured arguments, and on bad JSON fall back / self-correct rather than
+  executing junk.**
+- `reference/hermes-agent-main/agent/message_sanitization.py` —
+  `_repair_tool_call_arguments` (L185-279, a multi-pass JSON repair ending in `{}`),
+  `_escape_invalid_chars_in_json_strings` (L143-182, replace literal `0x00-0x1F`
+  inside strings), `_sanitize_surrogates` (L31-39), and the tool-error clamp to
+  2000 chars (`_sanitize_tool_error`, L515-528). **Pattern: sanitize control chars /
+  surrogates and CLAMP length on every model-produced string.**
+- `reference/hermes-agent-main/model_tools.py` — `coerce_tool_args` (L535-616) and
+  `_coerce_number` / `_coerce_boolean` / `_coerce_json` (L672-728): each argument is
+  **coerced to its registered schema type** before dispatch; a value that will not
+  coerce is left/dropped, not fatal. **Pattern: coerce-to-schema, tolerate the
+  rest.**
+- `reference/hermes-agent-main/tools/schema_sanitizer.py` (L40-93) — strip schema
+  constructs strict backends reject and guarantee the top-level object shape. Noted;
+  it informs our strict field discipline (we reject unsupported fields outright).
+
+### Paperclip (openclaw) — files read
+
+- `reference/openclaw-main/src/agents/tools/update-plan-tool.ts` — `readPlanSteps`
+  (L39-74) validates a structured plan payload field-by-field, checks `status`
+  against the `PLAN_STEP_STATUSES` **allowlist** (L9), and clamps (max one
+  `in_progress`). **Pattern: validate a structured payload against an explicit
+  schema + status allowlist.**
+- `reference/openclaw-main/src/agents/tools/sessions-spawn-tool.ts` —
+  `UNSUPPORTED_SESSIONS_SPAWN_PARAM_KEYS` (L46-55, rejected at L277-284),
+  `readStringParam(..., { required: true })`, `maxItems`, the numeric clamp
+  `Math.max(0, Math.floor(...))` (L355), and the default fallback
+  `cleanup === "keep" | "delete" ? … : "keep"` (L302). **Pattern: reject unsupported
+  keys, require/trim strings, clamp ranges, default the rest.**
+- `reference/openclaw-main/src/agents/tools/common.ts` — `readStringParam` (L91-122)
+  and `ToolInputError` (L57-64): typed extraction that *throws* on bad input rather
+  than coercing silently.
+- `reference/openclaw-main/src/shared/balanced-json.ts` — `extractBalancedJsonPrefix`
+  (L21-69): lift the first balanced `{...}` out of a noisy reply.
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| Hermes: **coerce model args to the schema type** (`coerce_tool_args` / `_coerce_number`) | `crates/relux-kernel/src/prime_slots.rs` `coerce_priority` accepts a number OR numeric string → rounds and clamps to `[1,9]`; a non-numeric priority is dropped (only the bad field), never fatal. |
+| Hermes: **sanitize control chars + clamp length** on model strings | `sanitize_line` / `sanitize_block` strip control chars, collapse whitespace, and clamp (title forced single-line at 120 chars, details at 600); `sanitize_assignee` keeps only `[a-z0-9-_]`. |
+| openclaw: **status allowlist + reject unsupported keys** (`readPlanSteps`, `UNSUPPORTED_*_PARAM_KEYS`) | `parse_task_slots` accepts ONLY `ALLOWED_KEYS` (`title`/`details`/`assignee`/`priority`/`confidence`/`rationale`); ANY other key (a smuggled `run_tool`/`tags`/`action`) fails the whole proposal closed → deterministic slots. |
+| openclaw: **required string throws** (`readStringParam` required) | an empty/missing `title` fails the proposal (the create keeps the deterministic title). |
+| openclaw: **validate a target against what exists** (cwd-scope / existing ids) | `reconcile_task_slots` honors an `assignee` ONLY when it matches an EXISTING agent in `summary.all_agent_ids`; an unknown id is dropped (the brain can never invent an assignee or smuggle a plugin/tool name in as one). |
+| openclaw: **balanced-JSON extraction** | reuse `crate::prime_intent::extract_json_object` (now `pub(crate)`), so a brain that wraps the slot JSON in prose/fences still parses, and the raw `--output-format json` envelope is lifted by `parse_adapter_result` FIRST on the CLI path (`server.rs` `parse_cli_task_slots`). |
+
+**What we deliberately do differently:** the brain *proposes* slots; it executes
+nothing. Slots are computed ONLY when the (already brain-reconciled, fail-closed-
+gated) intent is a create intent **and** the deterministic path already produced a
+real create — so this layer *sharpens* a create, it never mints work from nothing
+(casual chat/ideation still cannot reach it). `CreateAndRunTask` may take a
+brain title/details/priority but **never** the brain's assignee (the run stays on
+Prime, the only agent wired for the required grant). Every durable change still
+flows through `decide` → `prime_execute`; the brain authors a *proposal*, the kernel
+validates and applies it.

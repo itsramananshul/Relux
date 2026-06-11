@@ -26,6 +26,7 @@ pub mod loader;
 pub mod plugin_install;
 pub mod prime;
 pub mod prime_intent;
+pub mod prime_slots;
 pub mod runtime;
 pub mod state;
 pub mod store;
@@ -37,9 +38,9 @@ pub use adapter::{
 };
 pub use ai::{
     classify_intent_via_openrouter, clear_stored_config, compose_chat_prompt, compose_polish_prompt,
-    is_actionful, polish_from_cli_text, polish_proposal, proposal_wants_polish, read_stored_config,
-    shape_reply, write_stored_config, AiConfig, AiMode, AiOutcome, AiStatus, PrimeBrain,
-    StoredAiConfig,
+    extract_task_slots_via_openrouter, is_actionful, polish_from_cli_text, polish_proposal,
+    proposal_wants_polish, read_stored_config, shape_reply, write_stored_config, AiConfig, AiMode,
+    AiOutcome, AiStatus, PrimeBrain, StoredAiConfig,
 };
 pub use auth::{
     admin_path_for_db, clear_session_cookie, read_admin_username, reset_admin_credential,
@@ -59,6 +60,10 @@ pub use prime::{classify_intent, decide, is_chat_guarded};
 pub use prime_intent::{
     build_intent_prompt, parse_intent_proposal, reconcile_intent, BrainIntentProposal,
     IntentSource,
+};
+pub use prime_slots::{
+    build_task_slots_prompt, parse_task_slots, reconcile_task_slots, BrainTaskSlots,
+    ResolvedTaskSlots,
 };
 pub use runtime::{invoke_http_loopback, RuntimeClientError};
 pub use state::{

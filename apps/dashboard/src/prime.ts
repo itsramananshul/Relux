@@ -1,4 +1,4 @@
-import type { ReluxPrimeProposal, ReluxPrimeProposalStep } from "./api";
+import type { ReluxPrimeProposal, ReluxPrimeProposalStep, ReluxPrimeTaskSlots } from "./api";
 
 // Pure helpers for rendering Prime's reviewable plan proposal as a card
 // (RELUX_MASTER_PLAN §10 planning layer, §11.1 "Prime Chat"). The proposal is a
@@ -71,4 +71,17 @@ export function polishProvenance(p: ReluxPrimeProposal): string | null {
 // fail-closed gate accepted the proposal (§10.1, §17.1).
 export function intentProvenance(source: string | undefined): string | null {
   return source === "brain" ? "brain-classified" : null;
+}
+
+// Honest provenance for the brain-assisted task SLOTS that shaped a created task.
+// The kernel attaches `slots` ONLY when a configured brain genuinely sharpened the
+// task (normalized title, details, an existing-agent assignee, or a priority) and
+// every field passed validation; the server stamps `source` with the model id / CLI
+// brain label. Returns that label (falling back to a neutral "AI brain" when an
+// older kernel left `source` unset), or null when the brain did not assist — so the
+// chip never overclaims a brain decision (§10.1, §10.2, §17.1).
+export function slotProvenance(slots: ReluxPrimeTaskSlots | undefined): string | null {
+  if (!slots) return null;
+  const source = slots.source?.trim();
+  return source ? source : "AI brain";
 }

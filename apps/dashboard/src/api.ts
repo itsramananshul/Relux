@@ -1424,6 +1424,19 @@ export interface ReluxPrimeProposal {
   polish?: ReluxPrimeProposalPolish;
 }
 
+// Brain-assisted, VALIDATED task slots that shaped a created task, present ONLY on
+// a task-creation turn the brain genuinely sharpened. Provenance/presentation only
+// — the kernel validated every field (title sanitized/clamped, assignee checked
+// against existing agents, priority clamped) before the task was created.
+export interface ReluxPrimeTaskSlots {
+  title: string;
+  details?: string;
+  assignee?: string;
+  priority?: number;
+  // The model id / CLI brain label that produced these slots, for provenance.
+  source?: string;
+}
+
 export interface ReluxPrimeTurn {
   intent: string;
   reply: string;
@@ -1439,6 +1452,9 @@ export interface ReluxPrimeTurn {
   // A reviewable, action-free plan preview, present ONLY on a plan-request turn
   // (§10 planning layer, §11.1). Omitted on every other turn.
   proposal?: ReluxPrimeProposal;
+  // Brain-assisted, validated task slots, present ONLY on a create turn the brain
+  // sharpened (§10.1, §10.2, §17.1). Omitted on every other turn.
+  slots?: ReluxPrimeTaskSlots;
   // Tool fields: present only when Prime ran (or honestly refused) a tool this
   // turn. `invoked_tool` is "<plugin_id>/<tool_name>"; `tool_output` carries the
   // real kernel output; `tool_error` is an honest reason a tool did NOT run.
