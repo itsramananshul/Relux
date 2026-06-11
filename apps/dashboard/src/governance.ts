@@ -49,10 +49,41 @@ export function permissionPrefix(permission: string): string {
 const SEGMENT_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 // The ONLY scoped wildcard the backend recognizes: `tool:<plugin-id>:*`.
 const TOOL_WILDCARD_RE = /^tool:[A-Za-z0-9][A-Za-z0-9_-]*:\*$/;
+// The manager-subtree scoped grant (advanced / manager scope):
+// `agent:<manager-id>:subtree:<action>`. It authorizes the manager to perform <action> on
+// operatives inside its OWN Branch (the `reports_to` subtree) — never siblings, ancestors,
+// or itself, and only while the manager is live. Mirrors
+// `relux_core::permission::parse_agent_subtree`.
+const AGENT_SUBTREE_RE =
+  /^agent:[A-Za-z0-9][A-Za-z0-9_-]*:subtree:[A-Za-z0-9][A-Za-z0-9_-]*$/;
 
 /** Whether a permission is the one accepted scoped wildcard (`tool:<plugin-id>:*`). */
 export function isScopedWildcard(permission: string): boolean {
   return TOOL_WILDCARD_RE.test(permission.trim());
+}
+
+/** Whether a permission is the manager-subtree scoped grant (`agent:<manager-id>:subtree:<action>`). */
+export function isManagerSubtree(permission: string): boolean {
+  return AGENT_SUBTREE_RE.test(permission.trim());
+}
+
+/** Build the manager-subtree grant scoping `action` to `managerId`'s Branch (or null if malformed). */
+export function managerSubtreePermission(
+  managerId: string,
+  action: string,
+): string | null {
+  const id = managerId.trim();
+  const act = action.trim();
+  return SEGMENT_RE.test(id) && SEGMENT_RE.test(act)
+    ? `agent:${id}:subtree:${act}`
+    : null;
+}
+
+// True if `s` is *attempting* the manager-subtree form (an `agent:` string that uses the
+// reserved `subtree` keyword as a segment). Mirrors the backend's `looks_like_agent_subtree`
+// so a malformed subtree string is rejected with a scope-specific reason, not stored opaque.
+function looksLikeAgentSubtree(s: string): boolean {
+  return s.startsWith("agent:") && s.split(":").slice(1).includes("subtree");
 }
 
 /** Build the scoped grant that authorizes every tool in `pluginId` (or null if the id is malformed). */
@@ -86,6 +117,10 @@ export function permissionInvalidReason(permission: string): string | null {
   // `agent:x:*`, partial globs like `tool:p:re*`, etc.
   if (s.includes("*") && !isScopedWildcard(s)) {
     return "Only `tool:<plugin-id>:*` is allowed as a scope — no global or partial wildcards.";
+  }
+  // The reserved `subtree` keyword is only legal as the strict manager-subtree grant.
+  if (looksLikeAgentSubtree(s) && !isManagerSubtree(s)) {
+    return "A manager-subtree scope must be exactly `agent:<manager-id>:subtree:<action>` (e.g. `agent:lead-1:subtree:grant_permission`).";
   }
   return null;
 }

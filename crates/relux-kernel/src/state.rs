@@ -1600,6 +1600,84 @@ impl KernelState {
         Ok(())
     }
 
+    /// True iff `manager` may exercise the manager-subtree control `action` on `target`:
+    /// it holds a `agent:<manager>:subtree:<action>` grant over its OWN Branch AND `target`
+    /// is a proper descendant of `manager` in the live `reports_to` lattice (the bounded
+    /// [`relux_core::hierarchy::is_in_subtree`] walk).
+    ///
+    /// This is the single chokepoint for manager-subtree authority — the kernel half of
+    /// Paperclip `scopeAllows` + `agentIsInSubtree`. It layers a fail-closed enablement
+    /// rule on top of the pure grammar matcher: **only an `Active` manager wields authority**
+    /// (a `Draft`/`Paused`/`Disabled`/`Error` manager is denied — the org lattice and a
+    /// disabled actor's powers are orthogonal, and the safe default for *exercising* a power
+    /// is to require the actor be live). An unknown manager or target is denied.
+    fn manager_subtree_authorizes(
+        &self,
+        manager: &AgentId,
+        action: &str,
+        target: &AgentId,
+    ) -> bool {
+        let Some(manager_agent) = self.agents.get(manager) else {
+            return false;
+        };
+        // Fail-closed: a non-Active manager exercises no subtree authority.
+        if manager_agent.status != AgentStatus::Active {
+            return false;
+        }
+        // The target must be a real operative.
+        if !self.agents.contains_key(target) {
+            return false;
+        }
+        let reports_to = self.reports_to_map();
+        manager_agent.permissions.iter().any(|grant| {
+            relux_core::permission::manager_subtree_authorizes(
+                grant, manager, action, target, &reports_to,
+            )
+        })
+    }
+
+    /// A manager agent grants a permission to one of its (transitive) subordinates,
+    /// authorized by a manager-subtree scope (`agent:<manager>:subtree:grant_permission`)
+    /// it holds over its own Branch and `target` actually sitting in that Branch. This is
+    /// the one real enforcement path that consults `reports_to` for *authority* (the
+    /// previously display-only org lattice now gates a real mutation here).
+    ///
+    /// It does NOT widen the operator-console path: [`grant_permission_to_agent`] stays a
+    /// kernel/operator action with no actor gate. This adds a strictly *narrower*
+    /// agent-authority path — a manager can only reach operatives inside its own subtree,
+    /// only for the `grant_permission` action it was scoped, and only while Active. The
+    /// underlying grant still goes through `grant_permission_to_agent` (exact-match dedup,
+    /// audited). An unauthorized manager is denied + audited and grants nothing.
+    pub fn manager_grant_permission_to_subordinate(
+        &mut self,
+        manager_id: &AgentId,
+        target_id: &AgentId,
+        permission: Permission,
+    ) -> Result<(), KernelError> {
+        if !self.manager_subtree_authorizes(manager_id, "grant_permission", target_id) {
+            let namespace = self.agents.get(target_id).map(|a| a.namespace_id.clone());
+            self.record_audit(
+                "agent",
+                manager_id.as_str(),
+                "agent:manager_grant_permission",
+                Some("agent"),
+                Some(target_id.as_str()),
+                namespace.as_ref(),
+                AuditResult::Denied,
+                serde_json::json!({
+                    "permission": permission.as_str(),
+                    "reason": "manager-subtree authorization failed (not a live manager of the target's Branch)"
+                }),
+            );
+            return Err(KernelError::PermissionDenied {
+                agent: manager_id.to_string(),
+                permission: format!("agent:{}:subtree:grant_permission", manager_id),
+            });
+        }
+        // Authorized: perform the grant (audited as `agent:grant_permission` inside).
+        self.grant_permission_to_agent(target_id, permission)
+    }
+
     // --- Tasks -------------------------------------------------------------
 
     /// Create a durable unit of work (`docs/RELUX_MASTER_PLAN.md` section 9.5).
@@ -12634,6 +12712,88 @@ mod tests {
             !k.agent_holds_permission(&prime, &create_pr),
             "after revoking the scope the agent holds nothing"
         );
+    }
+
+    #[test]
+    fn manager_subtree_grant_enforces_branch_liveness_and_audits() {
+        // Topology: director <- lead <- ic ; peer reports to director (lead's sibling);
+        // outsider is top-level + unrelated. lead holds an `agent:lead:subtree:grant_permission`
+        // scope over its own Branch.
+        let (mut k, _prime, _task, _run, _echo) = primed_kernel();
+        let ns = NamespaceId::new("workspace");
+        let adapter = PluginId::new("relux-adapter-local-prime");
+        let mk = |k: &mut KernelState, id: &str, lead: Option<AgentId>| {
+            k.create_agent_with_skills(
+                id, id, "", &adapter, &ns, None, vec![], vec![], lead,
+            )
+            .unwrap()
+        };
+        let director = mk(&mut k, "director", None);
+        let lead = mk(&mut k, "lead", Some(director.clone()));
+        let ic = mk(&mut k, "ic", Some(lead.clone()));
+        let peer = mk(&mut k, "peer", Some(director.clone()));
+        let outsider = mk(&mut k, "outsider", None);
+
+        let scope = Permission::new("agent:lead:subtree:grant_permission").unwrap();
+        k.grant_permission_to_agent(&lead, scope).unwrap();
+        let perm = Permission::new("tool:relux-tools-github:create_pr").unwrap();
+
+        // (1) A real subordinate (direct child) — authorized; the target now holds it.
+        k.manager_grant_permission_to_subordinate(&lead, &ic, perm.clone())
+            .expect("lead may grant to its subordinate ic");
+        assert!(k.agent_holds_permission(&ic, &perm));
+        assert!(k
+            .audit_log()
+            .iter()
+            .any(|e| e.action == "agent:grant_permission" && e.result == AuditResult::Success));
+
+        // (2) Sibling (peer) — denied; nothing granted; the denial is audited.
+        let err = k
+            .manager_grant_permission_to_subordinate(&lead, &peer, perm.clone())
+            .unwrap_err();
+        assert!(matches!(err, KernelError::PermissionDenied { .. }), "got {err:?}");
+        assert!(!k.agent_holds_permission(&peer, &perm));
+
+        // (3) Manager / ancestor (director) — denied (a node is not in its own subtree, and
+        // a child is not above its lead).
+        let err = k
+            .manager_grant_permission_to_subordinate(&lead, &director, perm.clone())
+            .unwrap_err();
+        assert!(matches!(err, KernelError::PermissionDenied { .. }), "got {err:?}");
+
+        // (4) Self — denied (proper-descendant semantics).
+        let err = k
+            .manager_grant_permission_to_subordinate(&lead, &lead, perm.clone())
+            .unwrap_err();
+        assert!(matches!(err, KernelError::PermissionDenied { .. }), "got {err:?}");
+
+        // (5) Unrelated operative — denied.
+        let err = k
+            .manager_grant_permission_to_subordinate(&lead, &outsider, perm.clone())
+            .unwrap_err();
+        assert!(matches!(err, KernelError::PermissionDenied { .. }), "got {err:?}");
+
+        // (6) Liveness (documented disabled-manager decision): pause lead — it now wields
+        // NO subtree authority, even over a genuine subordinate.
+        k.update_agent(&lead, None, None, None, None, Some(AgentStatus::Paused))
+            .unwrap();
+        let err = k
+            .manager_grant_permission_to_subordinate(&lead, &ic, perm.clone())
+            .unwrap_err();
+        assert!(matches!(err, KernelError::PermissionDenied { .. }), "paused manager denied: {err:?}");
+
+        // (7) Missing scope: a manager WITHOUT the subtree grant cannot reach its subordinate.
+        // director has a real subordinate (lead) but holds no subtree scope.
+        let err = k
+            .manager_grant_permission_to_subordinate(&director, &lead, perm)
+            .unwrap_err();
+        assert!(matches!(err, KernelError::PermissionDenied { .. }), "no scope => denied: {err:?}");
+
+        // A denial was audited for the manager-grant path.
+        assert!(k
+            .audit_log()
+            .iter()
+            .any(|e| e.action == "agent:manager_grant_permission" && e.result == AuditResult::Denied));
     }
 
     #[test]

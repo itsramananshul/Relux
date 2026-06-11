@@ -13,6 +13,7 @@ import { useAsync } from "../components/common";
 import { ADAPTER_STATE_LABEL } from "../plugins";
 import {
   isElevatedPermission,
+  isManagerSubtree,
   isScopedWildcard,
   permissionInvalidReason,
 } from "../governance";
@@ -535,6 +536,11 @@ function PermissionsList({ permissions }: { permissions: string[] }) {
                 scope: all tools in plugin
               </span>
             )}
+            {isManagerSubtree(p) && (
+              <span className="badge" style={{ marginLeft: 6 }}>
+                scope: manager subtree
+              </span>
+            )}
             {isElevatedPermission(p) && (
               <span className="badge warn" style={{ marginLeft: 6 }}>
                 elevated
@@ -629,6 +635,16 @@ function GovernanceSection({
         authorizes every tool in that plugin. No global or partial wildcards. Revoke
         removes exactly the row you grant — a scope and its tools are separate rows.
       </p>
+      <p className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+        <strong>Advanced — manager scope.</strong> A manager-subtree grant{" "}
+        (<span className="mono">agent:&lt;manager-id&gt;:subtree:&lt;action&gt;</span>,
+        e.g. <span className="mono">agent:lead-1:subtree:grant_permission</span>) lets a
+        live manager perform <span className="mono">&lt;action&gt;</span> on operatives
+        inside its OWN Branch (its <span className="mono">reports_to</span> subtree) — never
+        siblings, its own managers, or itself. Granted to that manager. Today the enforced
+        action is <span className="mono">grant_permission</span> (a manager granting a
+        permission to a subordinate); the manager id must be the operative you grant it to.
+      </p>
       {error && <div className="error-message">{error}</div>}
       {permissions.length === 0 ? (
         <p className="muted" style={{ fontSize: 12 }}>No explicit permissions.</p>
@@ -643,6 +659,9 @@ function GovernanceSection({
                 {p}
                 {isScopedWildcard(p) && (
                   <span className="badge" style={{ marginLeft: 6 }}>scope: all tools in plugin</span>
+                )}
+                {isManagerSubtree(p) && (
+                  <span className="badge" style={{ marginLeft: 6 }}>scope: manager subtree</span>
                 )}
                 {isElevatedPermission(p) && (
                   <span className="badge warn" style={{ marginLeft: 6 }}>elevated</span>

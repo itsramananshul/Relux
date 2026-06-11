@@ -43,7 +43,7 @@ Relux roots audited: `crates/relux-core/src/`, `crates/relux-kernel/src/`, `apps
 | 1 | **Self-correction on a malformed brain decision** — a correctable reply is collapsed into the same `None` as a hard provider failure and silently falls back; no bounded re-prompt with the validation error. Hermes (`_invalid_json_retries`/`_invalid_tool_retries`) and OpenClaw (retry instructions) both do this. | 1, 7 | **P0** *(shipped — see §1)* | backend, tests, docs |
 | 2 | **Structured error/liveness classifier + bounded transient retry** — Relux retry is a fresh run with no error taxonomy and no backoff; Paperclip classifies (`run-liveness.ts`) and retries transient upstream failures on a bounded `[2m,10m,30m,2h]` schedule. | 7 | **P1** *(shipped — see §14)* | backend, frontend, docs, tests |
 | 3 | **Governed budgets (soft/hard, auto-pause)** — Paperclip enforces per-company/agent/project spend with warn + hard-stop + cancel-work. Relux records run `cost`/`usage` but enforces nothing. | 5 | P1 | backend, frontend, docs, tests |
-| 4 | **Scoped permission grants (subtree / project)** — Relux permissions are exact-string match only; Paperclip has fine-grained grants scoped to manager-subtrees/projects. *(minimal plugin-scope `tool:<plugin>:*` SHIPPED — see §17; the `reports_to` org-lattice + acyclic-graph model SHIPPED — see §18; subtree-SCOPED permission enforcement still missing — the helper exists, but no grant reads it yet.)* | 5 | P1 | backend, tests |
+| 4 | **Scoped permission grants (subtree / project)** — Relux permissions are exact-string match only; Paperclip has fine-grained grants scoped to manager-subtrees/projects. *(minimal plugin-scope `tool:<plugin>:*` SHIPPED — see §17; the `reports_to` org-lattice + acyclic-graph model SHIPPED — see §18; the manager-subtree SCOPED grant + one real enforcement path — a live manager granting a permission to a subordinate inside its own Branch — SHIPPED, see §19; broader subtree actions / project / namespace scopes + an agent-actor surface that invokes the manager-grant path still missing.)* | 5 | P1 | backend, tests |
 | 5 | **Memory compaction / cross-session recall** — Relux kept a bounded 12-turn ring with no summarization; Hermes/OpenClaw compact + summarize + (Hermes) FTS5 cross-session search. *(in-session compaction beyond the ring SHIPPED — see §16; cross-session FTS recall still missing.)* | 6 | P1/P2 | backend, tests |
 | 6 | **`execute_code` (RPC-from-script deterministic glue)** — the cheapest multi-step primitive; routes back through the same tool gate. Big, but high-leverage. | 2, 4 | P1 | backend, tests, docs |
 | 7 | **Goal/issue hierarchy + monitor/recovery** — Relux orchestration is a flat ≤6-step DAG; Paperclip has Goal→Project→Issue→Run with monitor scheduling + stranded-issue recovery. | 4 | P2 | backend, frontend, docs, tests |
@@ -276,11 +276,16 @@ safe (adds no authority), bounded, feasible in one commit, and reuses existing v
   `Permission::authorizes` (exact OR same-plugin scope) at the one `agent_holds_permission` chokepoint
   + the `start_run` task check. Grant/revoke bookkeeping stays exact-match, so a scope is one explicit,
   individually-revocable row that never pattern-expands. The **`reports_to` org-lattice an agent-subtree
-  scope needs now exists** (see §18 — `relux_core::hierarchy::is_in_subtree`), but **no grant reads it
-  yet** (deferred). **Still missing**: budgets/spend enforcement (runs record `cost`/`usage` but nothing
-  enforces a ceiling), the agent-subtree / project / namespace **scope enforcement** itself (Paperclip
-  `scopeAllows` + `agentIsInSubtree` — the lattice is in place; the grant that consults it is not),
-  persistent `allow-always` grants, Board-style multi-party oversight.
+  scope needs now exists** (see §18 — `relux_core::hierarchy::is_in_subtree`), and **one real
+  manager-subtree grant now consults it** (SHIPPED THIS ROUND — see §19): `relux_core` accepts the
+  strict `agent:<manager-id>:subtree:<action>` grant, `manager_subtree_authorizes` is the pure
+  grammar+`is_in_subtree` matcher, and the kernel `manager_grant_permission_to_subordinate` path lets a
+  *live* manager grant a permission to an operative inside its OWN Branch (and only there). **Still
+  missing**: budgets/spend enforcement (runs record `cost`/`usage` but nothing enforces a ceiling), the
+  *broader* scope vocabulary (project / namespace scopes; more subtree *actions* than `grant_permission`;
+  an HTTP/agent-actor surface that invokes the manager-grant path — the kernel primitive + model are real
+  and tested, but no production caller wires it yet), persistent `allow-always` grants, Board-style
+  multi-party oversight.
 
 ### Priority & slices
 
@@ -829,9 +834,86 @@ section for the full reference read + applied-change record. In brief:
   green; clippy clean on both crates; dashboard typecheck + tests (284) + bundle rebuild green.
 
 - **Still missing (honest).** The manager-subtree **scoped permission enforcement** (a grant that
-  consults `is_in_subtree` — Paperclip `scopeAllows` + `agentIsInSubtree`), subagent
+  consults `is_in_subtree` — Paperclip `scopeAllows` + `agentIsInSubtree`) **SHIPPED in §19** (one
+  narrow real path: a live manager granting a permission to a subordinate). Subagent
   spawn-depth/children caps, Codex/mid-run resume, governed budgets, and persistent `allow-always`
   grants all remain open.
+
+---
+
+## 19. Implemented this round — the manager-subtree scoped permission grant (§5 P1 / §18 follow-up)
+
+- **Reference read (BINDING).** The manager-subtree authority target is Paperclip's
+  `principal_permission_grants` with scope = `managerAgentId-subtree`, resolved by `authorization.ts`
+  `scopeAllows` + `agentIsInSubtree` (a bounded upward `reportsTo` walk) — summarized in this audit's
+  §5/§18 from the original read; that source is **not vendored** under `reference/`, so only the
+  *shape* (a per-grant subtree scope, membership decided by the bounded walk, default-narrow) was taken.
+  The **vendored** reads that ground the fail-narrow, self-scope-only discipline: OpenClaw
+  `reference/openclaw-main/src/acp/session-lineage-meta.ts` (`subagentControlScope: "children" | "none"`
+  — a node's authority is its children subtree or nothing, default narrow), OpenClaw
+  `reference/openclaw-main/src/acp/permission-relay.ts` (deny-by-default, an explicit option set widens a
+  grant), and Hermes `reference/hermes-agent-main/tools/delegate_tool.py` (`MAX_DEPTH`, per-record
+  `parent_id`/`depth`, flat by default). Relux files read/mapped: `crates/relux-core/src/permission.rs`
+  (grammar + matcher), `crates/relux-core/src/hierarchy.rs` (`is_in_subtree`), `crates/relux-core/src/agent.rs`
+  (`reports_to`), `crates/relux-kernel/src/state.rs` (`grant_permission_to_agent`/`revoke`,
+  `agent_holds_permission`, `reports_to_map`, `start_run` check), `apps/dashboard/src/governance.ts` +
+  `apps/dashboard/src/pages/Crew.tsx` (the Crew Governance panel).
+
+- **Scoped syntax.** Exactly one new grant shape is accepted: `agent:<manager-id>:subtree:<action>` — a
+  manager-subtree scope. `<manager-id>` and `<action>` are each `[A-Za-z0-9][A-Za-z0-9_-]*`. It carries
+  **no `*`**: the manager id is always concrete, so there is no global `agent:*:subtree:*` form (a scope
+  can never name "every manager's subtree"). `subtree` is a **reserved keyword** in the `agent:`
+  namespace — any `agent:` string that uses it outside the strict 4-segment position (`agent:x:subtree`,
+  `agent:x:subtree:a:b`, `agent::subtree:g`, `agent:subtree:g`, `agent:x:subtree:*`) is rejected
+  fail-closed as a malformed scope, never stored as an opaque capability. All existing exact `agent:`
+  capability strings (and every other prefix) are byte-for-byte unaffected.
+
+- **Model / matcher (real, pure, tested).** `relux_core::Permission` gained `is_manager_subtree` /
+  `agent_subtree_parts`, and a free `relux_core::permission::manager_subtree_authorizes(grant, holder,
+  action, target, reports_to)` decides authority. It returns true iff the grant is a well-formed
+  `agent:<manager>:subtree:<action>`, **the grant's manager id equals `holder`** (a manager only ever
+  wields authority over its OWN Branch — a grant naming someone else's id authorizes nothing, no
+  borrowing), the action matches exactly (no action glob), and `target` is a **proper descendant** of
+  `holder` via the bounded `is_in_subtree` walk (self / siblings / ancestors / unrelated all fail; total
+  even on a cyclic map).
+
+- **Enforcement (one real, narrow path).** `KernelState::manager_grant_permission_to_subordinate(manager,
+  target, permission)` is the one production mutation that consults `reports_to` for *authority*. It
+  authorizes via the kernel chokepoint `manager_subtree_authorizes`, which layers a fail-closed
+  **liveness** rule on the pure matcher: **only an `Active` manager wields subtree authority** (a
+  `Draft`/`Paused`/`Disabled`/`Error` manager is denied — the documented disabled-manager decision; the
+  lattice and an actor's live powers are orthogonal, and the safe default for *exercising* a power is to
+  require the actor be live). On success it grants through the existing `grant_permission_to_agent`
+  (exact-match dedup, audited `agent:grant_permission`); on failure it audits `agent:manager_grant_permission`
+  = `Denied` and grants nothing. It does **not** widen the operator-console grant/revoke path (those stay
+  kernel/operator actions with no actor gate) — it adds a strictly *narrower* agent-authority path.
+
+- **Honest scope boundary.** The enforcement primitive + model are real and tested, but **no HTTP route /
+  agent-actor surface invokes `manager_grant_permission_to_subordinate` yet** — wiring it to a request
+  (with the manager's authenticated identity) is the next slice. Exact grants still authorize only
+  themselves; revoke still removes exactly the stored row via `matches_exact` (a manager-subtree grant is
+  one explicit, individually-revocable row).
+
+- **UI.** `governance.ts` mirrors the backend grammar (`isManagerSubtree`, `managerSubtreePermission`,
+  and a scope-specific rejection reason for malformed subtree strings) — the `agent:` prefix is already
+  **elevated**, so a subtree grant shows the `elevated` warning and a new `scope: manager subtree` badge.
+  The Crew Governance panel adds an **Advanced — manager scope** explainer with the
+  `agent:lead-1:subtree:grant_permission` example and the own-Branch / live-manager rules. No fake
+  manager-action console was added (the panel still grants as the operator).
+
+- **Tests.** `permission.rs`: grammar (accept the scope, reject every malformed subtree variant +
+  case-sensitivity of the keyword) and the matcher (subordinate allowed; self / sibling / ancestor /
+  wrong-action denied; cannot borrow another manager's Branch; total under a cyclic map). `state.rs::
+  manager_subtree_grant_enforces_branch_liveness_and_audits`: a live lead grants to a real subordinate
+  (target now holds it, success audited); sibling / ancestor / self / unrelated all denied; a paused
+  manager is denied (liveness); a manager with no subtree scope is denied; the denial is audited.
+  `governance.test.ts`: client-side validation + helper parity + elevated classification. Full `relux-core`
+  (156) + `relux-kernel` lib (629) suites green; clippy clean on both crates; dashboard typecheck + tests
+  (287) + bundle rebuild green.
+
+- **Still missing (honest).** A request/agent-actor surface that calls the manager-grant path, more
+  subtree *actions* than `grant_permission` (e.g. assign_task, revoke), project / namespace scopes,
+  governed budgets, persistent `allow-always` grants, and Board-style oversight all remain open.
 
 ---
 

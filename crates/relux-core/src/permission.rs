@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::agent::AgentId;
+
 /// Valid permission prefixes from the Relux permission model.
 ///
 /// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 7.5 (Permission And Approval Layer)
@@ -69,6 +71,50 @@ fn parse_tool_wildcard(s: &str) -> Option<&str> {
     }
 }
 
+/// Reserved keyword that marks the manager-subtree scoped grant
+/// (`agent:<manager-id>:subtree:<action>`). It is reserved inside the `agent:` namespace:
+/// a string that uses it anywhere but the exact structured position is rejected
+/// fail-closed rather than stored as an opaque `agent:` capability.
+const SUBTREE_KEYWORD: &str = "subtree";
+
+/// If `s` is exactly the manager-subtree scoped grant `agent:<manager-id>:subtree:<action>`
+/// with well-formed `manager-id` and `action` segments, return `(manager-id, action)`.
+///
+/// This is the ONLY agent-control scope Relux recognizes. Unlike the tool-plugin wildcard
+/// it carries no `*` — it is a flat, exact, individually-revocable capability string whose
+/// *authority* only widens at enforcement time, and only over the holder's own Branch
+/// (Paperclip `principal_permission_grants` scope = `managerAgentId-subtree`, resolved by
+/// `scopeAllows` + `agentIsInSubtree`). No global form (`agent:*:subtree:*`) exists: the
+/// manager id is always concrete, so the scope can never name "every manager's subtree".
+fn parse_agent_subtree(s: &str) -> Option<(&str, &str)> {
+    let mut parts = s.split(':');
+    let kind = parts.next()?;
+    let manager = parts.next()?;
+    let keyword = parts.next()?;
+    let action = parts.next()?;
+    // Exactly four segments — anything longer is malformed.
+    if parts.next().is_some() {
+        return None;
+    }
+    if kind == "agent"
+        && keyword == SUBTREE_KEYWORD
+        && is_valid_segment(manager)
+        && is_valid_segment(action)
+    {
+        Some((manager, action))
+    } else {
+        None
+    }
+}
+
+/// True iff `s` is *attempting* the manager-subtree form (an `agent:` string that uses the
+/// reserved [`SUBTREE_KEYWORD`] as a segment) — used to force the strict
+/// `agent:<manager-id>:subtree:<action>` shape so a malformed variant (empty manager/action,
+/// wrong segment count, keyword in the wrong slot) is rejected instead of silently stored.
+fn looks_like_agent_subtree(s: &str) -> bool {
+    s.starts_with("agent:") && s.split(':').skip(1).any(|seg| seg == SUBTREE_KEYWORD)
+}
+
 /// A capability string that controls what an actor may do.
 ///
 /// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 7.5 and section 12.1.
@@ -98,6 +144,12 @@ impl Permission {
         if s.contains('*') && parse_tool_wildcard(&s).is_none() {
             return Err(PermissionError::MalformedScope(s));
         }
+        // The reserved `subtree` keyword is only legal as the strict
+        // `agent:<manager-id>:subtree:<action>` grant. Reject every malformed variant
+        // fail-closed so it is never stored as an opaque `agent:` capability.
+        if looks_like_agent_subtree(&s) && parse_agent_subtree(&s).is_none() {
+            return Err(PermissionError::MalformedScope(s));
+        }
         Ok(Self(s))
     }
 
@@ -114,6 +166,20 @@ impl Permission {
     /// Whether this permission is a scoped tool-plugin wildcard (`tool:<plugin-id>:*`).
     pub fn is_scoped_wildcard(&self) -> bool {
         parse_tool_wildcard(&self.0).is_some()
+    }
+
+    /// Whether this permission is a manager-subtree scoped grant
+    /// (`agent:<manager-id>:subtree:<action>`).
+    pub fn is_manager_subtree(&self) -> bool {
+        parse_agent_subtree(&self.0).is_some()
+    }
+
+    /// If this is a manager-subtree grant, its `(manager-id, action)`; else `None`. The
+    /// `manager-id` is the operative whose Branch the grant covers — authority is only
+    /// ever granted over the holder's OWN subtree, so enforcement additionally requires
+    /// `manager-id == holder` (see [`manager_subtree_authorizes`]).
+    pub fn agent_subtree_parts(&self) -> Option<(&str, &str)> {
+        parse_agent_subtree(&self.0)
     }
 
     /// Whether holding `self` (a GRANT an agent holds) authorizes `required` (the
@@ -149,6 +215,40 @@ impl std::fmt::Display for Permission {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
+}
+
+/// Whether `grant` (a capability the `holder` agent holds) authorizes `action` on `target`
+/// under the **manager-subtree** rule — the agent-control analogue of [`Permission::authorizes`],
+/// but one that needs a target-agent context and the org lattice and so lives outside the
+/// context-free `authorizes` path.
+///
+/// Returns true iff ALL of:
+/// - `grant` is a well-formed `agent:<manager-id>:subtree:<action>`;
+/// - the grant's `manager-id` equals `holder` — a manager only ever wields authority over
+///   its OWN Branch, so a subtree grant naming someone else's id authorizes nothing (no
+///   borrowing another manager's subtree);
+/// - the grant's action equals the requested `action` (exact, no action globbing); and
+/// - `target` is a proper descendant of `holder` in `reports_to` (the bounded
+///   [`crate::hierarchy::is_in_subtree`] walk) — **self, siblings, ancestors, and unrelated
+///   operatives all fail**, and the walk is total even on a malformed/cyclic map.
+///
+/// This is the pure half of Paperclip's `scopeAllows` + `agentIsInSubtree`. It performs NO
+/// status / enablement check (status is orthogonal to the lattice); a caller that wants a
+/// fail-closed "disabled manager wields no authority" rule layers that on top — the kernel
+/// chokepoint does exactly that.
+pub fn manager_subtree_authorizes(
+    grant: &Permission,
+    holder: &AgentId,
+    action: &str,
+    target: &AgentId,
+    reports_to: &crate::hierarchy::ReportsToMap,
+) -> bool {
+    let Some((manager, granted_action)) = grant.agent_subtree_parts() else {
+        return false;
+    };
+    manager == holder.as_str()
+        && granted_action == action
+        && crate::hierarchy::is_in_subtree(holder, target, reports_to)
 }
 
 /// How dangerous a tool call or action is considered to be.
@@ -306,5 +406,96 @@ mod tests {
         // Same-plugin wildcard required is only honoured by exact equality.
         let other_plugin_wild = Permission::new("tool:relux-tools-gitlab:*").unwrap();
         assert!(!grant.authorizes(&other_plugin_wild));
+    }
+
+    // --- manager-subtree scoped grant grammar ------------------------------------
+
+    #[test]
+    fn manager_subtree_grant_is_accepted_and_flagged() {
+        let p = Permission::new("agent:lead-1:subtree:grant_permission").unwrap();
+        assert!(p.is_manager_subtree());
+        assert_eq!(p.agent_subtree_parts(), Some(("lead-1", "grant_permission")));
+        // It is NOT a tool-plugin wildcard.
+        assert!(!p.is_scoped_wildcard());
+        // A plain exact `agent:` capability is not a subtree grant.
+        let plain = Permission::new("agent:lead-1:configure").unwrap();
+        assert!(!plain.is_manager_subtree());
+        assert_eq!(plain.agent_subtree_parts(), None);
+    }
+
+    #[test]
+    fn malformed_subtree_scopes_are_rejected_fail_closed() {
+        for bad in [
+            "agent:lead-1:subtree",     // no action segment
+            "agent:lead-1:subtree:",    // empty action
+            "agent::subtree:grant",     // empty manager id
+            "agent:lead-1:subtree:a:b", // too many segments
+            "agent:subtree:grant",      // reserved keyword in the manager slot
+            "agent:*:subtree:grant",    // global manager (also a wildcard)
+            "agent:lead-1:subtree:*",   // action glob
+        ] {
+            let err = Permission::new(bad).unwrap_err();
+            assert!(
+                matches!(err, PermissionError::MalformedScope(_)),
+                "expected {bad} rejected as malformed scope, got {err:?}"
+            );
+        }
+        // The keyword is case-sensitive: `Subtree` is not reserved, so this stays a valid
+        // opaque 4-segment `agent:` capability (no false strictness).
+        assert!(Permission::new("agent:lead-1:Subtree:grant").is_ok());
+    }
+
+    fn aid(s: &str) -> AgentId {
+        AgentId::new(s)
+    }
+
+    fn rmap(edges: &[(&str, &str)]) -> crate::hierarchy::ReportsToMap {
+        edges.iter().map(|(c, m)| (aid(c), aid(m))).collect()
+    }
+
+    #[test]
+    fn subtree_grant_authorizes_only_descendants_of_its_own_manager() {
+        // ic -> lead -> director ; peer -> director
+        let m = rmap(&[("ic", "lead"), ("lead", "director"), ("peer", "director")]);
+        let grant = Permission::new("agent:lead:subtree:grant_permission").unwrap();
+
+        // Subordinate (direct child) — allowed.
+        assert!(manager_subtree_authorizes(&grant, &aid("lead"), "grant_permission", &aid("ic"), &m));
+
+        // Self — NOT allowed (proper-descendant: a node is not in its own subtree).
+        assert!(!manager_subtree_authorizes(&grant, &aid("lead"), "grant_permission", &aid("lead"), &m));
+        // Manager (ancestor) — NOT allowed.
+        assert!(!manager_subtree_authorizes(&grant, &aid("lead"), "grant_permission", &aid("director"), &m));
+        // Sibling subtree — NOT allowed.
+        assert!(!manager_subtree_authorizes(&grant, &aid("lead"), "grant_permission", &aid("peer"), &m));
+        // Wrong action — NOT allowed (no action globbing).
+        assert!(!manager_subtree_authorizes(&grant, &aid("lead"), "assign_task", &aid("ic"), &m));
+    }
+
+    #[test]
+    fn subtree_grant_cannot_borrow_another_managers_branch() {
+        // A grant naming `director`'s subtree, but HELD by `lead`, authorizes nothing —
+        // even over a node that IS in director's subtree. Authority is over the holder's
+        // own Branch only.
+        let m = rmap(&[("ic", "lead"), ("lead", "director"), ("peer", "director")]);
+        let foreign = Permission::new("agent:director:subtree:grant_permission").unwrap();
+        // `lead` holding a `director`-subtree grant: denied (manager-id != holder).
+        assert!(!manager_subtree_authorizes(&foreign, &aid("lead"), "grant_permission", &aid("peer"), &m));
+        // But `director` holding it over `peer` (a real subordinate): allowed.
+        assert!(manager_subtree_authorizes(&foreign, &aid("director"), "grant_permission", &aid("peer"), &m));
+        // A non-subtree grant never authorizes via this path.
+        let exact = Permission::new("agent:lead:grant_permission").unwrap();
+        assert!(!manager_subtree_authorizes(&exact, &aid("lead"), "grant_permission", &aid("ic"), &m));
+    }
+
+    #[test]
+    fn subtree_authorization_is_total_under_a_cyclic_map() {
+        // a -> b -> a (a cycle that should never persist, but must not hang the matcher).
+        let m = rmap(&[("a", "b"), ("b", "a")]);
+        let grant = Permission::new("agent:a:subtree:grant_permission").unwrap();
+        // The bounded walk terminates; b is a descendant of a in this (degenerate) map.
+        let _ = manager_subtree_authorizes(&grant, &aid("a"), "grant_permission", &aid("b"), &m);
+        // Self is still never authorized, even under a cycle.
+        assert!(!manager_subtree_authorizes(&grant, &aid("a"), "grant_permission", &aid("a"), &m));
     }
 }

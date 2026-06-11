@@ -13,6 +13,8 @@ import {
   permissionRisk,
   isElevatedPermission,
   isScopedWildcard,
+  isManagerSubtree,
+  managerSubtreePermission,
   pluginWildcardPermission,
 } from "../src/governance.ts";
 
@@ -70,6 +72,53 @@ test("pluginWildcardPermission builds the scope from a plugin id, null when malf
   assert.equal(pluginWildcardPermission("bad id"), null);
   assert.equal(pluginWildcardPermission("relux/tools"), null);
   assert.equal(pluginWildcardPermission(""), null);
+});
+
+test("the manager-subtree scope is accepted; malformed subtree strings are rejected", () => {
+  // The accepted advanced/manager scope.
+  assert.equal(permissionInvalidReason("agent:lead-1:subtree:grant_permission"), null);
+  assert.ok(isValidPermission("agent:lead-1:subtree:grant_permission"));
+  assert.ok(isManagerSubtree("agent:lead-1:subtree:grant_permission"));
+  // A plain exact `agent:` capability is not a subtree scope (and stays valid).
+  assert.ok(!isManagerSubtree("agent:lead-1:configure"));
+  assert.equal(permissionInvalidReason("agent:lead-1:configure"), null);
+
+  // Malformed subtree attempts are rejected with the scope-specific reason.
+  for (const bad of [
+    "agent:lead-1:subtree",
+    "agent:lead-1:subtree:",
+    "agent::subtree:grant",
+    "agent:lead-1:subtree:a:b",
+    "agent:subtree:grant",
+    "agent:lead-1:subtree:*", // also a wildcard, but the subtree reason is fine too
+  ]) {
+    assert.ok(permissionInvalidReason(bad), `${bad} must be rejected`);
+    assert.equal(isValidPermission(bad), false);
+  }
+  assert.match(
+    permissionInvalidReason("agent:lead-1:subtree")!,
+    /manager-subtree scope must be exactly/,
+  );
+  // The keyword is case-sensitive: `Subtree` stays an opaque valid `agent:` capability.
+  assert.equal(permissionInvalidReason("agent:lead-1:Subtree:grant"), null);
+});
+
+test("managerSubtreePermission builds the scope from a manager id + action, null when malformed", () => {
+  assert.equal(
+    managerSubtreePermission("lead-1", "grant_permission"),
+    "agent:lead-1:subtree:grant_permission",
+  );
+  assert.equal(
+    managerSubtreePermission("  lead-1  ", "  grant_permission  "),
+    "agent:lead-1:subtree:grant_permission",
+  );
+  assert.equal(managerSubtreePermission("bad id", "grant"), null);
+  assert.equal(managerSubtreePermission("lead-1", "bad action"), null);
+  assert.equal(managerSubtreePermission("", "grant"), null);
+});
+
+test("the manager-subtree scope is an elevated (advanced/manager) capability", () => {
+  assert.equal(isElevatedPermission("agent:lead-1:subtree:grant_permission"), true);
 });
 
 test("control-plane prefixes are elevated; tool/task/audit are standard", () => {

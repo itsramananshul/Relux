@@ -2321,4 +2321,54 @@ reason to forbid it — and any future scoped grant, not the edge, is where a di
 live). The Crew picker excludes self + the operative's own Branch so an obvious cycle can't be chosen,
 but the backend re-validates regardless (the client is convenience, never the authority). The
 manager-subtree **scoped permission enforcement** — wiring `is_in_subtree` into a grant (Paperclip
-`scopeAllows` + `agentIsInSubtree`) — is the explicitly-deferred next slice.
+`scopeAllows` + `agentIsInSubtree`) — is the explicitly-deferred next slice (shipped below).
+
+---
+
+## Reference read — the manager-subtree scoped permission grant (this slice)
+
+The follow-up to the `reports_to` lattice: a strict `agent:<manager-id>:subtree:<action>` grant whose
+*authority* widens at enforcement time, and only over the holder's **own Branch**, decided by the
+bounded `is_in_subtree` walk. One real, narrow enforcement path consults it (a live manager granting a
+permission to a subordinate). Audit ref: `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §19 (and §5/§18).
+
+### openclaw — files read
+
+- `reference/openclaw-main/src/acp/session-lineage-meta.ts` — `subagentControlScope: "children" | "none"`:
+  a node's authority is its children subtree or nothing, **default narrow**. This is the discipline the
+  grant follows — a manager-subtree grant reaches *down* its Branch, never sideways/up, and self is
+  excluded (proper-descendant).
+- `reference/openclaw-main/src/acp/permission-relay.ts` — `GatewayExecApprovalDecision`
+  (`allow-once`/`allow-always`/`deny`), **deny-by-default**: authority is only what an explicit grant
+  confers. The kernel chokepoint mirrors this: absent a matching subtree grant (or a non-live manager),
+  the answer is deny.
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/tools/delegate_tool.py` — `MAX_DEPTH`, per-record `parent_id`/`depth`,
+  flat-by-default delegation: a parent-pointer chain walked under a hard depth bound. Relux's
+  `is_in_subtree` is exactly that bounded walk (`MAX_HIERARCHY_DEPTH = 50`).
+
+### Paperclip — referenced (not vendored)
+
+- `principal_permission_grants` scope = `managerAgentId-subtree`, resolved by `authorization.ts`
+  `scopeAllows` + `agentIsInSubtree`. **Not vendored** under `reference/` — only the *shape* (a per-grant
+  subtree scope; membership decided by the bounded walk; manager-id concrete, never global) was taken,
+  from the original audit read. No feature justified from the un-vendored source.
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| **a per-grant subtree scope** (Paperclip `managerAgentId-subtree`) | `relux_core::Permission` accepts the strict `agent:<manager-id>:subtree:<action>` grant (`parse_agent_subtree`); `subtree` is a reserved keyword, every malformed variant is rejected fail-closed. No `*`, so no global form. |
+| **scope membership decided by the bounded walk** (`scopeAllows` + `agentIsInSubtree`) | `relux_core::permission::manager_subtree_authorizes(grant, holder, action, target, reports_to)` = well-formed grant AND grant's manager == holder AND action matches AND `is_in_subtree(holder, target)`. Self/sibling/ancestor/unrelated all fail; total on a cyclic map. |
+| **deny-by-default + a node reaches only its own subtree** (openclaw) | `KernelState::manager_grant_permission_to_subordinate` — the one real path: a manager grants a permission to a subordinate iff the kernel chokepoint `manager_subtree_authorizes` says yes. Layers a fail-closed **liveness** rule (only an `Active` manager wields authority). Denials audited; grants nothing on failure. |
+| **the operator path is not widened** | Operator-console `grant_permission_to_agent`/`revoke` stay kernel actions with no actor gate; the manager-grant path is strictly *narrower* (own Branch, `grant_permission` action only, live only). Revoke still `matches_exact` — a subtree grant is one explicit, revocable row. |
+
+**What we deliberately do differently / leave out:** the enforcement primitive + model are real and
+tested, but **no HTTP route / agent-actor surface invokes the manager-grant path yet** — wiring it to a
+request carrying the manager's authenticated identity is the next slice. Only the `grant_permission`
+action is enforced (assign_task / revoke and project/namespace scopes are future). The disabled-manager
+decision is **explicit**: a non-`Active` manager wields no subtree authority (fail-closed), even over a
+genuine subordinate — the place a "disabled-Lead can't act" rule lives, exactly as foreshadowed by the
+§18 lattice slice.
