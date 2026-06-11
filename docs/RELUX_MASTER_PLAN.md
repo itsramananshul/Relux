@@ -1820,6 +1820,33 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.7** (2026-06-11) — a product slice on top of v0.1.6 that adds a first-class
+  **idea → plan → tasks** rung and hardens the dashboard against page crashes.
+  **Plan-preview proposal card:** Prime renders an *action-free* preview of a
+  decomposed plan (goal heading, an *N steps across M agents* summary, and each
+  proposed step with its role + assignee); the card commits nothing — an explicit
+  one-click **Create these tasks** (multi-step) / **Turn this into a task**
+  (single-step) is the lone commit path, keyed off the same decomposition the card
+  shows. **Advisory plan polish:** an optional LLM pass may refine only the *wording*
+  of that card (summary, per-step titles, clarifying questions, risk notes) while the
+  deterministic planner stays the sole authority on step count/order/agent
+  grounding/goal/commit; it runs through one `validate_polish` chokepoint on both the
+  OpenRouter brain and the local Claude/Codex CLI brains, and the card shows **which**
+  brain refined the wording (OpenRouter model id or CLI brain label). **Conversation
+  guard:** questions and musing now stay chat and never silently mint work even when
+  the sentence carries an action verb, while an explicit command still overrides and
+  mints/runs work. **Route-level `ErrorBoundary`:** every routed page mounts inside an
+  error boundary, so a render-time throw in one view degrades to an in-app error card
+  with Reload/Retry instead of blanking the whole SPA; a `work-render` SSR test pins
+  **Work** mounting under the plain declarative `<BrowserRouter>` the app uses. Also
+  folds in the **blank-Crew-page fix** (Crew loaded via `useLoaderData()` under a
+  declarative router and white-screened; now loads via `useAsync` with honest
+  loading/error/empty/list states, rail entry repointed to `/crew`) and
+  **reflect-and-clarify** for the Brainstorming, Orchestration single-step, and
+  TaskUpdate clarify arms. Proven by `relux-kernel` unit tests (conversation guard,
+  proposal wire shape, polish validation, clarify reflection) and dashboard tests
+  (error-boundary helper, Work SSR render, proposal-card + polish-provenance
+  helpers); dashboard bundle rebuilt. Every safety property from v0.1.6 still holds.
 - **v0.1.6** (2026-06-10) — a user-facing patch on top of v0.1.5 that keeps **Prime
   conversational on ideation** and ships the post-v0.1.5 operator-session work that
   had not yet been bundled. **Prime stays conversational / deep-links / chat-first:**

@@ -9,6 +9,48 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.7 (Windows bundle).** The `relux-kernel` /
+  `relux-core` crates move from `0.1.6` to `0.1.7`, bundling the post-v0.1.6
+  product work into a fresh Windows release. Headlines: a **first-class idea →
+  plan → tasks rung** — Prime renders an action-free **plan-preview proposal card**
+  (goal, *N steps across M agents*, per-step role + assignee) that commits nothing
+  until an explicit one-click **Create these tasks** / **Turn this into a task**,
+  with an optional **advisory LLM polish** of the *wording only* (summary, step
+  titles, clarifying questions, risk notes) that works through the same
+  `validate_polish` chokepoint on both the OpenRouter and the local Claude/Codex
+  CLI brains and shows *which* brain refined it on the card; a **conversation
+  guard** so questions and musing stay chat and never silently mint work; and a
+  **route-level `ErrorBoundary`** so a single page crash degrades to an in-app
+  error card with Reload/Retry instead of blanking the whole SPA. Also folds in the
+  blank-Crew-page fix and the reflect-and-clarify follow-ups (Brainstorming /
+  Orchestration single-step / TaskUpdate) recorded in the entries below. Build the
+  bundle with `scripts\relux-package-local.ps1 -FullE2E`. This version line is the
+  `relux-kernel` crate version (separate from the legacy Relix workspace versions
+  in the dated sections below). See `docs/RELUX_MASTER_PLAN.md` → *Release history*.
+- **A page crash no longer blanks the whole dashboard — route-level `ErrorBoundary`.**
+  Implements `relix-dashboard-design.md` §2 and `RELUX_MASTER_PLAN.md` §17.6. Every
+  routed page now mounts inside a React `ErrorBoundary`: a render-time throw in one
+  view (e.g. a hook misuse or an unexpected shape) is caught and shown as an in-app
+  error card with **Reload** / **Retry** affordances and a copyable detail, instead
+  of an unrecoverable white screen that takes down the rest of the SPA with it. A
+  pure `errorBoundaryMessage` helper normalizes the displayed text (Error / string /
+  unknown throw) and is pinned by `apps/dashboard/test/error-boundary.test.ts`; a new
+  `apps/dashboard/test/work-render.test.mjs` SSR-renders **Work** under the plain
+  declarative `<BrowserRouter>` the app actually uses, so the page is proven to mount
+  without a data-router-only hook throw. Dashboard bundle rebuilt into
+  `crates/relix-web-bridge/dashboard-dist`.
+- **Conversation guard — questions and musing stay chat, never mint work.**
+  Implements `RELUX_MASTER_PLAN.md` §10.5 (Conversation Rules) and §17.1 (smart &
+  grounded), grounded in `docs/prime-processing-audit.md`. `classify_intent` now
+  treats interrogatives and musing lead-ins as a **conversation** even when the
+  sentence happens to contain an action-shaped verb — so *"should we create a task
+  for this?"* or *"I was thinking we could orchestrate the agents"* gets a real
+  answer instead of silently minting a task or kicking off a run. An **explicit
+  command** (`create a task to…`, `orchestrate`, `assign`, `start it`) still
+  overrides and mints/runs work; the deterministic classifier remains the sole owner
+  of the action decision and the action-free wall is intact. New `relux-kernel`
+  regression tests pin the question/musing phrasings against the explicit-command
+  override.
 - **The plan-preview card now shows *which* brain refined the wording, visibly.**
   Implements `RELUX_MASTER_PLAN.md` §10 (planning layer), §11.1, §17.1, and closes the
   documented "surface the CLI brain's provenance on the card the way the OpenRouter
@@ -68,6 +110,30 @@ once a stable release is cut.
   (present for a plan, absent for normal chat/task-creation, descriptive-only) and
   `apps/dashboard/test/prime.test.ts` pins the card helpers; dashboard bundle
   rebuilt into `crates/relix-web-bridge/dashboard-dist`.
+- **Reflect-and-clarify for the Orchestration single-step and TaskUpdate arms.**
+  Implements `RELUX_MASTER_PLAN.md` §10.5 ("ask clarifying questions when needed"),
+  per `docs/prime-processing-audit.md` ("Next recommended slice"). Both arms used to
+  emit one fixed prompt that ignored what the user already said; they now reflect the
+  parsed target/goal back (mirroring `brainstorm_reply`): the Orchestration
+  single-step Clarify quotes the stripped `orchestration_goal` and asks for the
+  distinct steps, and TaskUpdate reflects the parsed task id and/or field
+  (priority/title/assignee/status) and asks only for the missing piece. Both stay
+  `PrimePlan::Clarify` — no `UpdateTask` action is invented and the action-free wall
+  holds — pinned by `orchestration_clarify_reflects_the_parsed_goal` and
+  `task_update_clarify_reflects_target_and_field`.
+- **Fix the blank Crew page + content-aware Prime brainstorm follow-up.**
+  Implements `relix-dashboard-design.md` §9 / App routing and `RELUX_MASTER_PLAN.md`
+  §10.5. **Crew:** the page called react-router's `useLoaderData()`, but the SPA
+  mounts under a plain `<BrowserRouter>` (a declarative router, not a data router),
+  so the hook threw and white-screened `/crew`. Crew now loads its own data through
+  the same `useAsync` hook every other Relux page uses and renders honest
+  loading / error (with Retry) / empty / list states plus the adapter runtime
+  controls — never a blank page — and the rail's **Crew** entry now points at `/crew`
+  instead of the legacy `/agents` console. **Prime:** the Brainstorming arm reflects
+  the recovered topic (lead-ins stripped, quoted) and asks one concrete follow-up,
+  falling back to the open-ended prompt when nothing is nameable; it stays a Reply,
+  nothing is created or run. Pinned by crew-render SSR + shipped-bundle guards and
+  `brainstorm_reply` reflection/clarify tests; dashboard bundle rebuilt.
 - **Prime suggested next actions — one-click buttons replace "type this" copy.**
   Implements `RELUX_MASTER_PLAN.md` §11.1 (Prime Chat shows *"Prime suggested next
   actions"*), with §10.5 (Conversation Rules) and §17.1 (smart & grounded). Each
@@ -1508,11 +1574,18 @@ First public alpha. Everything below is real and ships.
   `scripts/relix-mesh-up.sh` (POSIX), with `relix-mesh-down.sh` for
   shutdown.
 
-[Unreleased]: https://github.com/itsramananshul/Relix/compare/v0.4.3-beta.1...HEAD
-[0.4.3-beta.1]: https://github.com/itsramananshul/Relix/releases/tag/v0.4.3-beta.1
-[0.4.2]: https://github.com/itsramananshul/Relix/releases/tag/v0.4.2
-[0.4.1]: https://github.com/itsramananshul/Relix/releases/tag/v0.4.1
-[0.4.0]: https://github.com/itsramananshul/Relix/releases/tag/v0.4.0
-[0.1.5]: https://github.com/itsramananshul/Relix/releases/tag/v0.1.5
-[0.1.1]: https://github.com/itsramananshul/Relix/releases/tag/v0.1.1
-[0.1.0]: https://github.com/itsramananshul/Relix/releases/tag/v0.1.0
+<!--
+  Link targets. This repo's real, published releases use the `relux-v0.1.x` tag
+  scheme (see the "Relux local release v0.1.x" bullets under [Unreleased] and the
+  GitHub Releases page). The dated sections below are the LEGACY Relix workspace
+  versions; they were never cut as individual GitHub releases in this repo, so they
+  point at the Releases list rather than non-existent `vX.Y.Z` tags (which 404).
+-->
+[Unreleased]: https://github.com/itsramananshul/Relix/compare/relux-v0.1.7...HEAD
+[0.4.3-beta.1]: https://github.com/itsramananshul/Relix/releases
+[0.4.2]: https://github.com/itsramananshul/Relix/releases
+[0.4.1]: https://github.com/itsramananshul/Relix/releases
+[0.4.0]: https://github.com/itsramananshul/Relix/releases
+[0.1.5]: https://github.com/itsramananshul/Relix/releases
+[0.1.1]: https://github.com/itsramananshul/Relix/releases
+[0.1.0]: https://github.com/itsramananshul/Relix/releases
