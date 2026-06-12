@@ -37,8 +37,10 @@ import {
   type ToolReadiness,
 } from "../plugins";
 import {
+  buildToolPickerOptions,
   buildToolRunTaskPayload,
   MAX_TOOL_RUN_STEPS,
+  type McpServerDiscovery,
   type ToolRunStep,
 } from "../toolruntask";
 
@@ -970,24 +972,52 @@ function CreateToolRunTask({ tools }: { tools: ReluxToolDescriptor[] }) {
   const [err, setErr] = useState<string | null>(null);
   const [created, setCreated] = useState<string | null>(null);
 
-  // The tool options the operator picks from: every discovered tool, ready or gated.
-  // A gated (non-"ready") tool is offered too — the run will simply need an approval
-  // grant — so the dropdown label flags it honestly rather than hiding it.
-  const options = tools.map((t) => {
-    const gated = toolReadiness(t).runnable ? "" : " — needs approval";
-    return {
-      key: `${t.plugin_id} ${t.tool_name}`,
-      plugin: t.plugin_id,
-      tool: t.tool_name,
-      label: `${t.tool_name} (${t.plugin_id})${gated}`,
-    };
-  });
+  // Live MCP discovery for the picker: when the form is open, list the registered
+  // MCP servers and run a real `tools/list` against each ENABLED one, so the picker
+  // can offer MCP-discovered tools alongside the installed plugin tools. Gated on
+  // `open` so merely loading the page never dials the operator's loopback servers;
+  // each open re-discovers (fresh truth, never a cached/faked list). A disabled
+  // server is recorded (not discovered); a failed discovery is recorded as failed,
+  // and both surface as honest notes below — neither silently vanishes.
+  const mcp = useAsync<McpServerDiscovery[]>(async () => {
+    if (!open) return [];
+    const servers = await reluxMcp.list();
+    return Promise.all(
+      servers.map(async (s): Promise<McpServerDiscovery> => {
+        if (!s.enabled) return { serverId: s.id, enabled: false };
+        try {
+          const r = await reluxMcp.tools(s.id);
+          return { serverId: s.id, enabled: true, tools: r.tools ?? [] };
+        } catch (e) {
+          return {
+            serverId: s.id,
+            enabled: true,
+            failed: true,
+            error: e instanceof Error ? e.message : String(e),
+          };
+        }
+      }),
+    );
+  }, [open]);
+
+  // The tool options the operator picks from: every installed plugin tool PLUS every
+  // tool a live discovery surfaced from an enabled MCP server (each keyed by the
+  // stable plugin id `mcp:<server>`). A gated (non-"ready") tool is offered too — the
+  // run will simply need an approval grant — so the dropdown label flags it honestly
+  // rather than hiding it. The merge + honest notes (failed/disabled servers) come
+  // from the React-free `buildToolPickerOptions`; gating reuses `toolReadiness`.
+  const picker = buildToolPickerOptions(
+    tools,
+    mcp.data ?? [],
+    (t) => !toolReadiness(t).runnable,
+  );
+  const options = picker.options;
 
   // Does any chosen step reference a gated tool? Drives the honest approval caveat.
   const anyGated = steps.some((s) => {
     if (!s.plugin || !s.tool) return false;
-    const match = tools.find((t) => t.plugin_id === s.plugin && t.tool_name === s.tool);
-    return match ? !toolReadiness(match).runnable : false;
+    const opt = options.find((o) => o.plugin === s.plugin && o.tool === s.tool);
+    return opt ? opt.gated : false;
   });
 
   function setStep(i: number, patch: Partial<ToolRunStep>) {
@@ -1045,6 +1075,45 @@ function CreateToolRunTask({ tools }: { tools: ReluxToolDescriptor[] }) {
             failure. The task is assigned to Prime — run it from{" "}
             <Link to="/work">Work</Link> with “Run (Assigned)”.
           </p>
+
+          <p className="muted" style={{ marginTop: -4, marginBottom: 10, fontSize: 11 }}>
+            The tool picker lists installed plugin tools and tools discovered live
+            from your enabled MCP servers (keyed{" "}
+            <span className="mono">mcp:&lt;server&gt;</span>). A tool that needs
+            approval is labelled, never hidden.
+          </p>
+
+          {mcp.loading && (
+            <p className="muted" style={{ marginTop: -4, marginBottom: 10, fontSize: 11 }}>
+              Discovering MCP tools…
+            </p>
+          )}
+          {mcp.error && (
+            <div className="banner err" style={{ fontSize: 12, marginBottom: 10 }}>
+              Could not list MCP servers ({mcp.error}); only installed plugin tools
+              are shown. Start the kernel with{" "}
+              <span className="mono">cargo run -p relux-kernel -- serve</span>.
+            </div>
+          )}
+          {picker.failures.length > 0 && (
+            <div className="banner err" style={{ fontSize: 12, marginBottom: 10 }}>
+              Live discovery failed for {picker.failures.length} enabled MCP server
+              {picker.failures.length === 1 ? "" : "s"} (
+              <span className="mono">
+                {picker.failures.map((f) => f.serverId).join(", ")}
+              </span>
+              ); their tools are not listed. The server may be down, stopped
+              mid-flight, or not speaking MCP — Relux does not fake a tool list.
+            </div>
+          )}
+          {picker.disabledServers.length > 0 && (
+            <p className="muted" style={{ marginTop: -4, marginBottom: 10, fontSize: 11 }}>
+              {picker.disabledServers.length} disabled MCP server
+              {picker.disabledServers.length === 1 ? "" : "s"} not included (
+              <span className="mono">{picker.disabledServers.join(", ")}</span>) —
+              enable one in the “MCP servers” section above to discover its tools.
+            </p>
+          )}
 
           <label className="field" style={{ margin: 0 }}>
             <span style={{ fontSize: 12 }}>Task title</span>

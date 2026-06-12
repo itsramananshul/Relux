@@ -10,6 +10,8 @@
 // payload shape and every validation branch without a DOM. The form renders
 // whatever this returns and invents nothing.
 
+import type { ReluxToolDescriptor } from "./api";
+
 // The single tool-call directive shape the backend accepts (`CreateTaskReq.tool_call`
 // / `relux_core::TaskToolCall`). `args` defaults to `{}` when the operator leaves it
 // blank — exactly as the kernel does (`#[serde(default)]` on `args`).
@@ -100,4 +102,121 @@ export function buildToolRunTaskPayload(title: string, steps: ToolRunStep[]): Bu
     return { ok: true, payload: { title: trimmedTitle, tool_call: directives[0] } };
   }
   return { ok: true, payload: { title: trimmedTitle, tool_plan: directives } };
+}
+
+// ── Tool picker options (installed plugin tools + live MCP-discovered tools) ──
+// The "Create a tool-run task" picker offers EVERY tool an operator can put in a
+// directive: the installed plugin tools (from `reluxTools.list`) AND the tools a
+// live `tools/list` discovery surfaced from each ENABLED MCP server (from
+// `reluxMcp.tools`). An MCP tool's directive uses the stable plugin id
+// `mcp:<server>` and the discovered tool name — exactly what the kernel routes a
+// run-driven MCP call through (`plugin_id = "mcp:<server>"`, `docs/mcp.md`
+// "Run-driven MCP tool call"). Gating is decided by the caller's `isGated`
+// predicate (the SAME `toolReadiness` rule the Tools list uses) so a gated tool is
+// labelled "needs approval" rather than hidden. Kept React-free + classifier-free
+// (it imports no runtime) so `node --test` can pin the merge without a DOM.
+
+// One option in the picker. `key` is the `<select>` value the form splits back into
+// (plugin, tool) on a single space — neither a plugin id (`mcp:<server>` or a slug)
+// nor a tool name contains a space, so the round-trip is lossless.
+export interface ToolPickerOption {
+  key: string;
+  // A plugin id, or `mcp:<server>` for an MCP-discovered tool.
+  plugin: string;
+  tool: string;
+  // Human label; an MCP-discovered tool reads as `mcp:<server>/<tool>`.
+  label: string;
+  // True => the run will need an approval/grant for this tool (non-runnable now).
+  gated: boolean;
+  source: "plugin" | "mcp";
+}
+
+// One registered MCP server's outcome as the picker sees it. A DISABLED server is
+// not discovered (its tools are absent by design); an ENABLED server either
+// resolved a (possibly empty) tool list or FAILED discovery (server down / not
+// speaking MCP). The component fills this in from `reluxMcp.list` + `reluxMcp.tools`.
+export interface McpServerDiscovery {
+  serverId: string;
+  enabled: boolean;
+  // Present when enabled and discovery resolved (possibly empty).
+  tools?: ReluxToolDescriptor[];
+  // True when enabled but the live `tools/list` errored.
+  failed?: boolean;
+  error?: string;
+}
+
+export interface ToolPickerModel {
+  options: ToolPickerOption[];
+  // Enabled servers whose live discovery errored — surfaced as a WARNING so a
+  // failed server never silently vanishes from the picker without explanation.
+  failures: { serverId: string; error?: string }[];
+  // Registered-but-disabled servers — surfaced as INFO (enable to discover). Their
+  // tools are deliberately absent, not failed.
+  disabledServers: string[];
+}
+
+// Merge installed plugin tools and per-server MCP discovery outcomes into the
+// picker's options + the honest notes (failed discovery, disabled servers). The
+// caller supplies `isGated` so this stays free of the readiness classifier (which
+// imports the API types) — typically `(t) => !toolReadiness(t).runnable`.
+export function buildToolPickerOptions(
+  installed: ReluxToolDescriptor[],
+  mcp: McpServerDiscovery[],
+  isGated: (t: ReluxToolDescriptor) => boolean,
+): ToolPickerModel {
+  const options: ToolPickerOption[] = [];
+  const seen = new Set<string>();
+
+  const push = (
+    plugin: string,
+    tool: string,
+    label: string,
+    gated: boolean,
+    source: "plugin" | "mcp",
+  ) => {
+    const p = plugin.trim();
+    const t = tool.trim();
+    if (!p || !t) return;
+    const key = `${p} ${t}`;
+    if (seen.has(key)) return; // first occurrence wins; never list the same tool twice
+    seen.add(key);
+    options.push({ key, plugin: p, tool: t, label, gated, source });
+  };
+
+  for (const t of installed) {
+    const gated = isGated(t);
+    push(
+      t.plugin_id,
+      t.tool_name,
+      `${t.tool_name} (${t.plugin_id})${gated ? " — needs approval" : ""}`,
+      gated,
+      "plugin",
+    );
+  }
+
+  const failures: { serverId: string; error?: string }[] = [];
+  const disabledServers: string[] = [];
+  for (const s of mcp) {
+    if (!s.enabled) {
+      disabledServers.push(s.serverId);
+      continue;
+    }
+    if (s.failed) {
+      failures.push({ serverId: s.serverId, error: s.error });
+      continue;
+    }
+    const plugin = `mcp:${s.serverId}`;
+    for (const t of s.tools ?? []) {
+      const gated = isGated(t);
+      push(
+        plugin,
+        t.tool_name,
+        `mcp:${s.serverId}/${t.tool_name}${gated ? " — needs approval" : ""}`,
+        gated,
+        "mcp",
+      );
+    }
+  }
+
+  return { options, failures, disabledServers };
 }

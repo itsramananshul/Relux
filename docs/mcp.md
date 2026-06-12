@@ -288,7 +288,7 @@ still without a brain choosing the tools.
   (`apps/dashboard/src/pages/Plugins.tsx` `CreateToolRunTask`, payload built by the
   React-free `apps/dashboard/src/toolruntask.ts` `buildToolRunTaskPayload`). An
   operator gives the task a title and adds **1–5 steps**, each picking a tool from the
-  discovered tool list and supplying optional **JSON args** (blank = `{}`). One step
+  picker and supplying optional **JSON args** (blank = `{}`). One step
   posts a `tool_call`; two-or-more post a `tool_plan` — the SAME existing
   `POST /v1/relux/tasks` body (no new backend). The builder fails closed the way the
   kernel does (title required, ≤5 steps never silently truncated, a tool must be
@@ -296,7 +296,26 @@ still without a brain choosing the tools.
   kernel would `400`. It is **honest about approval**: a chosen gated
   (`needs_approval`) tool can be put in a plan, but the form shows a banner that the
   run will **block/fail** on that step unless a standing allow-always grant exists —
-  it never implies auto-approval. On success it shows the new task id and a link to
+  it never implies auto-approval.
+- **The picker includes MCP-discovered tools (not just installed plugin tools).** When
+  the form is opened it lists the registered MCP servers (`reluxMcp.list`) and runs a
+  live `tools/list` (`reluxMcp.tools`) against each **enabled** one, then merges those
+  tools into the picker beside the installed plugin tools. The merge + honest notes are
+  produced by the React-free `apps/dashboard/src/toolruntask.ts` `buildToolPickerOptions`
+  (gating reuses the same `toolReadiness` rule the Tools list uses). An MCP tool is
+  offered under the **stable plugin id `mcp:<server>`** with the discovered tool name,
+  labelled `mcp:<server>/<tool>`, so picking it builds a directive the kernel routes as
+  an MCP call (`plugin_id = "mcp:<server>"`, the SAME id the "Run-driven MCP tool call"
+  path uses). Readiness is honest: an unclassified / `medium`+`required` MCP tool reads
+  as **"needs approval"** (it can still be planned, but the run gates on it), exactly
+  like a gated plugin tool. Discovery never hides a server silently — an **enabled
+  server whose `tools/list` failed** shows a **warning** banner naming it (down /
+  stopped / not speaking MCP — never a faked empty list), a **disabled** server shows
+  an **info** note (enable it to discover), and a failure to even list the servers shows
+  a warning that only installed plugin tools are available. Discovery is gated on the
+  form being open, so merely loading the Plugins page never dials the operator's
+  loopback servers; each open re-discovers (fresh truth, never cached).
+- On success the form shows the new task id and a link to
   **Work**, where the operator runs it with "Run (Assigned)" /
   `POST /v1/relux/tasks/:id/execute-assigned`. The raw `POST /v1/relux/tasks` route
   (with the optional `tool_plan` / `tool_call` body) remains available for scripted
