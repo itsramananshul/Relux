@@ -175,9 +175,11 @@ export function Plugins() {
 // docs/mcp.md). The first relux-layer Model Context Protocol surface: register
 // operator-run, loopback-ONLY MCP servers and run a live `tools/list` discovery
 // against them. Honest by construction — Relux dials no remote host and spawns no
-// command, and MCP tool INVOCATION is not wired into the agent tool-call path yet:
-// discovered tools list with a `not_implemented` status ("discovered, not callable
-// yet"). The next slice routes `tools/call` through the existing approval gates.
+// command. MCP tool INVOCATION is now wired: a discovered tool classifies, invokes,
+// or requests a per-call approval through the SAME kernel gates a plugin tool uses
+// (permission, risk/approval, per-call approval, persistent grant, audit) against
+// `plugin_id = "mcp:<server>"`. Resources are a read-only context surface
+// (`resources/list` + `resources/read`); listing or reading one mutates nothing.
 function McpSection() {
   const { data, loading, error, reload } = useAsync<ReluxMcpServer[]>(
     () => reluxMcp.list(),
@@ -210,9 +212,12 @@ function McpSection() {
         <span className="mono">http://localhost:&lt;port&gt;</span>, or{" "}
         <span className="mono">http://[::1]:&lt;port&gt;</span>) — Relux dials no
         remote host and runs no downloaded code. <strong>Discovery is live</strong>{" "}
-        (a real <span className="mono">tools/list</span>), but MCP tool{" "}
-        <strong>invocation is not wired in yet</strong>: discovered tools list as
-        “runtime not implemented”.
+        (a real <span className="mono">tools/list</span>), and a discovered tool is{" "}
+        <strong>callable</strong> through the normal permission, risk/approval, and
+        audit gates (against <span className="mono">plugin_id mcp:&lt;server&gt;</span>)
+        — an unclassified tool stays gated until you set its risk. Resources are a{" "}
+        <strong>read-only</strong> context surface (<span className="mono">resources/list</span>{" "}
+        + <span className="mono">resources/read</span>); reading one mutates nothing.
       </p>
 
       {open && (
