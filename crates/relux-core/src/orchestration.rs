@@ -284,17 +284,27 @@ pub struct OrchestrationBatchResult {
     pub status: OrchestrationStatus,
 }
 
+/// The maximum number of briefs a single orchestration goal decomposes into.
+///
+/// This is a **real safety rail, not a toy/demo cap**: a pathological run-on
+/// sentence must not fan out into an unbounded storm of briefs and agents. But a
+/// serious multi-part goal ("research the options, build a prototype, write tests,
+/// document it, wire CI, and ship it") routinely has more than a handful of
+/// clauses, so the ceiling is set to a practical product value rather than a tiny
+/// demo number. Beyond the cap the extra clauses are reported in an honest note —
+/// they are never silently dropped. (Superseded the original toy `MAX_STEPS = 6`;
+/// see `docs/ARTIFICIAL_CONSTRAINT_AUDIT.md`.)
+pub const MAX_ORCHESTRATION_STEPS: usize = 16;
+
 /// Decompose `goal` into a grounded multi-agent [`OrchestrationPlan`].
 ///
 /// Deterministic and pure: it splits the goal into clauses on natural connectors,
 /// classifies each clause to a [`OrchestrationRole`], and resolves each role to an
 /// existing agent on the roster (`summary.all_agent_ids`). When no specialist
 /// exists for a role the step's `agent_id` is `None` (the kernel assigns Prime and
-/// records a hire suggestion). The number of steps is capped so a long sentence
-/// cannot fan out without bound.
+/// records a hire suggestion). The number of steps is bounded by
+/// [`MAX_ORCHESTRATION_STEPS`] so a long sentence cannot fan out without bound.
 pub fn plan_orchestration(goal: &str, summary: &StateSummary) -> OrchestrationPlan {
-    const MAX_STEPS: usize = 6;
-
     let goal = goal.trim().to_string();
     let clauses = split_into_clauses(&goal);
 
@@ -306,9 +316,9 @@ pub fn plan_orchestration(goal: &str, summary: &StateSummary) -> OrchestrationPl
     let mut steps: Vec<PlannedStep> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
     for clause in clauses {
-        if steps.len() >= MAX_STEPS {
+        if steps.len() >= MAX_ORCHESTRATION_STEPS {
             notes.push(format!(
-                "Goal had more than {MAX_STEPS} steps; only the first {MAX_STEPS} were planned."
+                "Goal had more than {MAX_ORCHESTRATION_STEPS} steps; only the first {MAX_ORCHESTRATION_STEPS} were planned."
             ));
             break;
         }
@@ -635,11 +645,16 @@ mod tests {
     #[test]
     fn step_count_is_capped() {
         let s = summary_with_agents(&["prime"]);
-        let plan = plan_orchestration(
-            "research a, research b, research c, research d, research e, research f, research g, research h",
-            &s,
-        );
-        assert!(plan.steps.len() <= 6);
+        // A goal with MORE clauses than the cap must truncate to exactly the cap and
+        // emit the honest "only the first N" note — never silently drop the overflow.
+        // Built from the constant so the test tracks the configured ceiling, not a
+        // hard-coded demo number.
+        let goal = (0..MAX_ORCHESTRATION_STEPS + 3)
+            .map(|i| format!("research topic{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let plan = plan_orchestration(&goal, &s);
+        assert_eq!(plan.steps.len(), MAX_ORCHESTRATION_STEPS);
         assert!(plan.notes.iter().any(|n| n.contains("only the first")));
     }
 

@@ -57,7 +57,7 @@ pub use namespace::{Namespace, NamespaceId};
 pub use orchestration::{
     plan_orchestration, Orchestration, OrchestrationBatchResult, OrchestrationId,
     OrchestrationPlan, OrchestrationRole, OrchestrationStatus, OrchestrationStep, PlannedStep,
-    StepOutcome,
+    StepOutcome, MAX_ORCHESTRATION_STEPS,
 };
 pub use permission::{ApprovalRequirement, Permission, PermissionError, RiskLevel, ToolDefinition};
 pub use persistent_grant::PersistentGrant;

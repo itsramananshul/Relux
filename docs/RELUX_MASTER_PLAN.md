@@ -1836,6 +1836,25 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **unreleased** — **Artificial-constraint audit + the next toy-cap fixes** continuing the autonomy-policy
+  line (§10.5/§17.1), built reference-first against Hermes `agent/conversation_loop.py` /
+  `agent/iteration_budget.py` (the "high configurable ceiling, not a tiny constant" precedent). After the
+  Prime Agent Loop's toy 3/3 cap was replaced by a configurable policy, this slice sweeps the rest of the
+  **relux-\*** product layer for the same class of mistake and records the result in
+  `docs/ARTIFICIAL_CONSTRAINT_AUDIT.md` (FIX NOW / KEEP-with-reason / LATER). **What changes (safe, bounded):**
+  (1) the orchestration step cap was a function-local `MAX_STEPS = 6` duplicated as a second literal in
+  `prime_orchestration_slots.rs`; it is now a single named `relux_core::MAX_ORCHESTRATION_STEPS = 16` both
+  paths reference (no drift), so a real multi-part goal is no longer truncated to six briefs — overflow is
+  still reported in an honest note, never dropped. (2) Prime's **read-only** context loop bound
+  `MAX_TOOL_ROUNDS` was a toy `4`; raised to `8` (Hermes' own default is 90), still finite, still stopping
+  early on a repeated/no-progress read. **What is deliberately KEPT** (documented as real guardrails, not toy
+  caps): the clamped `PrimeAgentPolicy` ceilings (already configurable), the echo fixture's demotion to
+  internal-only (`is_internal_plugin` — verified, not rebuilt), `create_agent`'s least-privilege grant, the
+  MCP loopback/size bounds, and every char/byte/HTTP-body clamp. **LATER** (recorded with exact next steps):
+  making `MAX_TASK_TOOL_PLAN_STEPS`, the orchestration width, and `MAX_TOOL_ROUNDS` operator-configurable
+  policy fields, and lifting `MAX_ACTIVE_JOBS`. No release cut; no safety property weakened. `cargo test` +
+  `clippy` clean on `relux-core`/`relux-kernel` (orchestration/​slots/​context-loop/​decision tests pin the
+  raised-but-bounded caps via the named constants).
 - **unreleased** — **Resumable Prime agent-loop continuation (the real "keep working")** on top of the
   configurable autonomy policy, continuing the §10.5/§17.1 line, built reference-first against Hermes'
   `agent/conversation_loop.py` (`run_conversation(conversation_history=…)` seeds `messages =

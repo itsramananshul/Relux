@@ -88,9 +88,14 @@ pub fn turn_wants_context(turn: &PrimeTurn) -> bool {
 }
 
 /// The bounded number of brain rounds the read-only loop will run for one turn — Hermes's
-/// `max_iterations` cap, kept small because a context lookup needs only a few reads. A brain
-/// that has not finished gathering by then simply answers with what it has.
-pub const MAX_TOOL_ROUNDS: usize = 4;
+/// `max_iterations` cap. This is a **real safety rail, not a toy cap**: the loop is
+/// read-only (it gathers state, it changes nothing), so the bound exists only to keep one
+/// turn from spinning on context reads and running up brain-call cost. The original value
+/// (`4`) made Prime give up gathering far too early on a real, multi-part question; it is
+/// raised to a practical product default while staying finite (a brain that has not finished
+/// by then simply answers with what it has, and a repeated/no-progress read still stops the
+/// loop early). See `docs/ARTIFICIAL_CONSTRAINT_AUDIT.md`.
+pub const MAX_TOOL_ROUNDS: usize = 8;
 
 /// Max characters kept from any single tool result the brain sees next round (Hermes's
 /// `_sanitize_tool_error` 2000-char clamp). Keeps a large board from blowing the context.

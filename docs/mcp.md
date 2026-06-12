@@ -206,6 +206,14 @@ security model: every execution still flows through `prime_invoke_tool`.
 > *extended* profile (default **64** / **96** / **1800s**) the operator can tune, plus an explicit
 > "keep working / extended mode" the user can invoke for long-running work. There is **no infinite
 > loop** — see "Why bounded, not infinite" below.
+>
+> **Other toy caps were swept too.** The same "tiny hard constant where a serious product needs a
+> bounded-but-practical limit" mistake was audited across the whole relux-\* layer and recorded in
+> `docs/ARTIFICIAL_CONSTRAINT_AUDIT.md`. Two more were fixed here: the orchestration step cap (`6` →
+> the named, shared `relux_core::MAX_ORCHESTRATION_STEPS = 16`) and Prime's **read-only** context loop
+> bound (`MAX_TOOL_ROUNDS` `4` → `8`). Both stay finite safety rails. Real guardrails (the clamped
+> autonomy ceilings, the loopback/size bounds, the echo fixture's demotion to dev/test-only) are
+> deliberately kept — they are guardrails, not toy caps.
 
 **When the loop engages (the safety wall).** Only when (a) a brain is configured (not Local) and
 (b) the deterministic classifier returns `ToolInvocation` for the message (the user explicitly asked

@@ -84,9 +84,11 @@ const CONFIDENCE_FLOOR: f32 = 0.6;
 const MAX_GOAL_CHARS: usize = 400;
 /// Max characters kept for one proposed step before it is folded into the goal text.
 const MAX_STEP_CHARS: usize = 160;
-/// Max proposed steps kept. Mirrors the deterministic planner's own `MAX_STEPS` cap so a
-/// brain can never propose more briefs than the planner would itself plan.
-const MAX_STEPS: usize = 6;
+/// Max proposed steps kept. Bound DIRECTLY to the deterministic planner's own
+/// [`relux_core::MAX_ORCHESTRATION_STEPS`] cap (no duplicated literal) so a brain can
+/// never propose more briefs than the planner would itself plan, and the two stay in
+/// lock-step if the ceiling is ever retuned.
+const MAX_STEPS: usize = relux_core::MAX_ORCHESTRATION_STEPS;
 /// Max characters kept from the brain's free-text rationale (audit/provenance only).
 const MAX_RATIONALE_CHARS: usize = 240;
 
@@ -377,10 +379,14 @@ mod tests {
 
     #[test]
     fn steps_are_sanitized_and_count_clamped() {
-        let parsed = parse_orchestration_slots(
-            r#"{"goal":"g","steps":["a","b","c","d","e","f","g","h"],"confidence":0.9}"#,
-        )
-        .unwrap();
+        // Feed MORE steps than the cap so the clamp is exercised regardless of the
+        // configured ceiling (built from the constant, not a hard-coded count).
+        let steps = (0..MAX_STEPS + 3)
+            .map(|i| format!("\"step{i}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!("{{\"goal\":\"g\",\"steps\":[{steps}],\"confidence\":0.9}}");
+        let parsed = parse_orchestration_slots(&json).unwrap();
         // Clamped to the planner's cap so the brain can never propose more briefs than the
         // planner would plan.
         assert_eq!(parsed.steps.len(), MAX_STEPS);
