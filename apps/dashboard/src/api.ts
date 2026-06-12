@@ -2290,6 +2290,10 @@ export interface ReluxTask {
   assigned_agent?: string;
   assignee_name?: string; // New field for assignee's name
   namespace_id: string;
+  // The ad-hoc parent task id, when this task is a subtask of another (design §6.2).
+  // Null/absent for a standalone top-level task. The board joins this on the client to
+  // render parent→child subtrees outside orchestration.
+  parent_task?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -2721,6 +2725,10 @@ export const reluxWork = {
     extra?: {
       tool_call?: { plugin: string; tool: string; args: unknown };
       tool_plan?: Array<{ plugin: string; tool: string; args: unknown }>;
+      // Create this task as an ad-hoc subtask of `parent_task` (design §6.2). The
+      // backend validates the parent (exists, same namespace, no cycle); an unknown
+      // parent is an honest 400. Omitted → a standalone top-level task.
+      parent_task?: string;
     },
   ) => api.post<ReluxTask>("/v1/relux/tasks", { title, ...(extra ?? {}) }),
   // Start an execution attempt for a task.

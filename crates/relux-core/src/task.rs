@@ -299,6 +299,156 @@ pub struct Task {
     pub updated_at: String,
 }
 
+// --- Ad-hoc task subtrees (the `parent_task` edge) ------------------------------
+//
+// Section: `docs/relix-dashboard-design.md` §6.2 (the still-pending "ad-hoc
+// (non-orchestration) task subtrees" target — the orchestration is the ONLY real
+// parent→child link today; these pure helpers let the kernel populate the inert
+// `Task::parent_task` edge safely).
+//
+// Reference-driven (`docs/reference-driven-development.md`): the same bounded,
+// cycle-guarded parent-pointer walk the org-lattice uses (`hierarchy.rs`,
+// Paperclip `agentIsInSubtree` / Hermes `delegate_tool` `MAX_DEPTH`), applied to the
+// task tree rather than the agent tree. A parent pointer walked under a hard depth
+// bound, fail-narrow by default.
+
+/// Hard cap on how deep an ad-hoc task subtree is walked when validating a proposed
+/// parent edge. Deep enough for any real plan decomposition, bounded so a malformed/
+/// cyclic map can never loop forever (defence in depth — the kernel boundary rejects
+/// a cycle before persisting an edge). Mirrors the org-lattice `MAX_HIERARCHY_DEPTH`.
+pub const MAX_TASK_DEPTH: usize = 64;
+
+/// Child task id → parent task id. One entry per task that carries a `parent_task`; a
+/// top-level (standalone) task simply has no entry. Built from the live task set at
+/// the call site. A hash map because every consumer walks the graph by following
+/// pointers — the outputs depend on the edges, never on map iteration order.
+pub type TaskParentMap = std::collections::HashMap<TaskId, TaskId>;
+
+/// The ordered chain of ancestor tasks above `task` (nearest parent first). The walk
+/// stops at a standalone task (no entry), a dangling parent id (still returned, the
+/// walk just can't continue), a repeat (cycle guard), or [`MAX_TASK_DEPTH`]. `task`
+/// itself is never included. Pure; total even on a cyclic map.
+pub fn task_ancestors(task: &TaskId, parent_of: &TaskParentMap) -> Vec<TaskId> {
+    let mut chain = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(task.clone());
+    let mut current = task.clone();
+    for _ in 0..MAX_TASK_DEPTH {
+        match parent_of.get(&current) {
+            // Stop the moment we'd revisit a node — the cycle guard keeps the walk
+            // total even if a cyclic map ever reached this code.
+            Some(parent) if !seen.contains(parent) => {
+                chain.push(parent.clone());
+                seen.insert(parent.clone());
+                current = parent.clone();
+            }
+            _ => break,
+        }
+    }
+    chain
+}
+
+/// True iff `ancestor` is a (transitive) parent of `task` — i.e. `task` sits somewhere
+/// in `ancestor`'s subtree. Proper-descendant semantics: a task is NOT in its own
+/// subtree, so `is_in_task_subtree(x, x)` is `false`. Bounded by [`MAX_TASK_DEPTH`].
+pub fn is_in_task_subtree(ancestor: &TaskId, task: &TaskId, parent_of: &TaskParentMap) -> bool {
+    if ancestor == task {
+        return false;
+    }
+    task_ancestors(task, parent_of)
+        .iter()
+        .any(|a| a == ancestor)
+}
+
+/// True iff pointing `child` → `new_parent` would create a cycle in the task tree:
+/// either a self-parent (`child == new_parent`) or `new_parent` already sits in
+/// `child`'s subtree (so the new edge would close a loop). Pure; used by the kernel
+/// boundary before persisting a `parent_task` edge.
+///
+/// The map passed in is the CURRENT graph (it does not yet contain the proposed
+/// `child → new_parent` edge); the check walks up from `new_parent` and asks whether
+/// it can already reach `child`, which is exactly the loop the new edge would close.
+pub fn would_create_task_cycle(
+    child: &TaskId,
+    new_parent: &TaskId,
+    parent_of: &TaskParentMap,
+) -> bool {
+    child == new_parent || is_in_task_subtree(child, new_parent, parent_of)
+}
+
+#[cfg(test)]
+mod task_subtree_tests {
+    use super::*;
+
+    fn id(s: &str) -> TaskId {
+        TaskId::new(s)
+    }
+
+    /// Build a child→parent map from `(child, parent)` pairs.
+    fn map(edges: &[(&str, &str)]) -> TaskParentMap {
+        edges.iter().map(|(c, p)| (id(c), id(p))).collect()
+    }
+
+    #[test]
+    fn ancestors_walk_nearest_first_and_stop_at_the_root() {
+        // leaf -> mid -> root ; root is top-level (standalone).
+        let m = map(&[("leaf", "mid"), ("mid", "root")]);
+        assert_eq!(task_ancestors(&id("leaf"), &m), vec![id("mid"), id("root")]);
+        assert_eq!(task_ancestors(&id("mid"), &m), vec![id("root")]);
+        // A standalone task has no ancestors.
+        assert!(task_ancestors(&id("root"), &m).is_empty());
+        // A task not in the map at all is treated as standalone.
+        assert!(task_ancestors(&id("ghost"), &m).is_empty());
+    }
+
+    #[test]
+    fn subtree_membership_is_proper_descendant_only() {
+        let m = map(&[("leaf", "mid"), ("mid", "root"), ("peer", "root")]);
+        assert!(is_in_task_subtree(&id("root"), &id("mid"), &m));
+        assert!(is_in_task_subtree(&id("root"), &id("leaf"), &m));
+        assert!(is_in_task_subtree(&id("root"), &id("peer"), &m));
+        assert!(is_in_task_subtree(&id("mid"), &id("leaf"), &m));
+        // Not a descendant: self, upward, and sideways.
+        assert!(!is_in_task_subtree(&id("root"), &id("root"), &m), "self not in own subtree");
+        assert!(!is_in_task_subtree(&id("leaf"), &id("root"), &m), "child is not above its parent");
+        assert!(!is_in_task_subtree(&id("mid"), &id("peer"), &m), "siblings' subtrees don't overlap");
+    }
+
+    #[test]
+    fn cycle_check_rejects_self_direct_and_transitive_loops() {
+        let m = map(&[("leaf", "mid"), ("mid", "root")]);
+        // Self-parent.
+        assert!(would_create_task_cycle(&id("mid"), &id("mid"), &m));
+        // root -> leaf would close root -> leaf -> mid -> root.
+        assert!(would_create_task_cycle(&id("root"), &id("leaf"), &m));
+        // root -> mid would close root -> mid -> root.
+        assert!(would_create_task_cycle(&id("root"), &id("mid"), &m));
+        // A safe edge (peer under mid) is fine; so is a fresh, unrelated child.
+        assert!(!would_create_task_cycle(&id("peer"), &id("mid"), &m));
+        assert!(!would_create_task_cycle(&id("brand_new"), &id("root"), &m));
+        // leaf -> root (skip-level re-parent) is acyclic and allowed.
+        assert!(!would_create_task_cycle(&id("leaf"), &id("root"), &m));
+    }
+
+    #[test]
+    fn walks_stay_total_under_a_cyclic_map() {
+        // a -> b -> a (a cycle that should never be persisted, but must not hang).
+        let m = map(&[("a", "b"), ("b", "a")]);
+        let chain = task_ancestors(&id("a"), &m);
+        assert!(chain.len() <= MAX_TASK_DEPTH);
+        assert_eq!(chain, vec![id("b")]);
+    }
+
+    #[test]
+    fn deep_chain_is_capped_at_max_depth() {
+        let edges: Vec<(String, String)> = (0..MAX_TASK_DEPTH + 5)
+            .map(|i| (format!("n{i}"), format!("n{}", i + 1)))
+            .collect();
+        let m: TaskParentMap = edges.iter().map(|(c, p)| (id(c), id(p))).collect();
+        assert_eq!(task_ancestors(&id("n0"), &m).len(), MAX_TASK_DEPTH);
+    }
+}
+
 #[cfg(test)]
 mod tool_call_directive_tests {
     use super::*;

@@ -113,8 +113,9 @@ pub use runtime::{
     MIN_RUNTIME_TIMEOUT_MS,
 };
 pub use task::{
-    parse_task_tool_call, parse_task_tool_plan, Task, TaskId, TaskStatus, TaskToolCall,
-    TaskToolPlan, TaskToolPlanError, MAX_TASK_TOOL_PLAN_ARGS_BYTES, MAX_TASK_TOOL_PLAN_STEPS,
+    is_in_task_subtree, parse_task_tool_call, parse_task_tool_plan, task_ancestors,
+    would_create_task_cycle, Task, TaskId, TaskParentMap, TaskStatus, TaskToolCall, TaskToolPlan,
+    TaskToolPlanError, MAX_TASK_DEPTH, MAX_TASK_TOOL_PLAN_ARGS_BYTES, MAX_TASK_TOOL_PLAN_STEPS,
     MAX_TASK_TOOL_PLAN_STEPS_CEIL,
 };
 pub use tool::{

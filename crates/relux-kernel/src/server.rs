@@ -2403,6 +2403,12 @@ struct CreateTaskReq {
     /// Mutually exclusive with `tool_call`. (`docs/mcp.md` "Run-driven multi-tool plan".)
     #[serde(default)]
     tool_plan: Option<Vec<relux_core::TaskToolCall>>,
+    /// Optional parent task id — when present this task is created as an ad-hoc
+    /// subtask of that parent (`docs/relix-dashboard-design.md` §6.2). Validated by the
+    /// kernel: the parent must exist, share this task's namespace, and not close a
+    /// cycle, else an honest 400. Absent → a standalone top-level task (the default).
+    #[serde(default)]
+    parent_task: Option<String>,
 }
 
 /// One read-only role preset (an operator-convenience suggestion bundle). Carries only
@@ -2674,15 +2680,24 @@ async fn create_task(
         }
         (None, None) => serde_json::json!({}),
     };
+    // An optional ad-hoc parent (design §6.2). The kernel validates it (exists,
+    // same namespace, no cycle); an empty/whitespace value is treated as no parent.
+    let parent = req
+        .parent_task
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| relux_core::TaskId::new(s.to_string()));
     let task = locked_save(&state, |kernel| {
         let ctx = crate::ensure_bootstrapped(kernel)?;
-        let id = kernel.create_task(
+        let id = kernel.create_task_with_parent(
             &title,
             input,
             &ctx.actor,
             &ctx.namespace,
             vec![],
-        );
+            parent.as_ref(),
+        )?;
         // Automatically assign to Prime so it is ready to run.
         kernel.assign_task(&id, &ctx.agent)?;
         Ok(kernel.task(&id).cloned().unwrap())
@@ -10695,6 +10710,65 @@ mod tests {
         let body = r#"{"title":"both","tool_call":{"plugin":"mcp:fs","tool":"search"},"tool_plan":[{"plugin":"mcp:fs","tool":"search"}]}"#;
         let (status, _, _b) = call(&state, "POST", "/v1/relux/tasks", None, Some(body)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_task_with_parent_links_an_ad_hoc_subtask() {
+        // An operator can create a task as an ad-hoc subtask of an existing task
+        // (design §6.2). The child carries `parent_task`, which the list/get response
+        // surfaces (TaskRecord flattens Task), so the board can render the subtree.
+        let (state, _dir) = auth_state(true);
+        let (status, _, pb) = call(
+            &state,
+            "POST",
+            "/v1/relux/tasks",
+            None,
+            Some(r#"{"title":"Ship the feature"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "parent create failed: {pb}");
+        let parent: serde_json::Value = serde_json::from_str(&pb).unwrap();
+        let parent_id = parent["id"].as_str().unwrap();
+
+        let body = format!(r#"{{"title":"Write the docs","parent_task":"{parent_id}"}}"#);
+        let (status, _, cb) = call(&state, "POST", "/v1/relux/tasks", None, Some(&body)).await;
+        assert_eq!(status, StatusCode::OK, "child create failed: {cb}");
+        let child: serde_json::Value = serde_json::from_str(&cb).unwrap();
+        assert_eq!(child["parent_task"], parent_id);
+
+        // The link is visible on the list read the board uses.
+        let (status, _, lb) = call(&state, "GET", "/v1/relux/tasks", None, None).await;
+        assert_eq!(status, StatusCode::OK, "{lb}");
+        let list: serde_json::Value = serde_json::from_str(&lb).unwrap();
+        let found = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == child["id"])
+            .expect("the child task is listed");
+        assert_eq!(found["parent_task"], parent_id);
+    }
+
+    #[tokio::test]
+    async fn create_task_with_an_unknown_parent_is_rejected() {
+        // A parent_task that names no existing task is an honest 400 (the kernel's
+        // UnknownTask mapping for every task route) — never a silently orphaned child.
+        let (state, _dir) = auth_state(true);
+        let body = r#"{"title":"orphan","parent_task":"task_9999"}"#;
+        let (status, _, b) = call(&state, "POST", "/v1/relux/tasks", None, Some(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{b}");
+    }
+
+    #[tokio::test]
+    async fn create_task_with_a_blank_parent_is_a_standalone_task() {
+        // A whitespace-only parent_task is treated as no parent (a standalone task),
+        // not a lookup of an empty id — so a cleared UI field never 400s.
+        let (state, _dir) = auth_state(true);
+        let body = r#"{"title":"top level","parent_task":"   "}"#;
+        let (status, _, b) = call(&state, "POST", "/v1/relux/tasks", None, Some(body)).await;
+        assert_eq!(status, StatusCode::OK, "{b}");
+        let task: serde_json::Value = serde_json::from_str(&b).unwrap();
+        assert!(task["parent_task"].is_null(), "no parent was set");
     }
 
     /// Extract the `relux_session=...` pair from a Set-Cookie header so a later

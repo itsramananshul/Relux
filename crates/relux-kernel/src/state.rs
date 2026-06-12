@@ -2824,6 +2824,11 @@ impl KernelState {
     // --- Tasks -------------------------------------------------------------
 
     /// Create a durable unit of work (`docs/RELUX_MASTER_PLAN.md` section 9.5).
+    ///
+    /// Convenience wrapper for the common standalone (no-parent) create. Delegates to
+    /// [`Self::create_task_with_parent`] with no parent — which is infallible (only a
+    /// parent edge can be rejected), so this keeps its existing infallible signature
+    /// for the many internal callers.
     pub fn create_task(
         &mut self,
         title: &str,
@@ -2832,8 +2837,63 @@ impl KernelState {
         namespace: &NamespaceId,
         required_permissions: Vec<Permission>,
     ) -> TaskId {
+        self.create_task_with_parent(title, input, created_by, namespace, required_permissions, None)
+            .expect("create_task with no parent never fails")
+    }
+
+    /// The current child→parent edges of the task tree (one entry per task that has a
+    /// `parent_task`). Built fresh from the live task set; used to cycle-check a
+    /// proposed `parent_task` edge before persisting it (`relix-dashboard-design.md`
+    /// §6.2 ad-hoc task subtrees).
+    fn task_parent_map(&self) -> relux_core::TaskParentMap {
+        self.tasks
+            .iter()
+            .filter_map(|(id, t)| t.parent_task.clone().map(|p| (id.clone(), p)))
+            .collect()
+    }
+
+    /// Create a durable unit of work, optionally as an ad-hoc subtask of `parent`
+    /// (`docs/relix-dashboard-design.md` §6.2). When a `parent` is given it is
+    /// validated before any state changes: the parent must exist (else
+    /// [`KernelError::UnknownTask`]), it must share the child's namespace (else
+    /// [`KernelError::TaskParentScope`] — a subtask lives in its parent's scope), and
+    /// the edge must not close a cycle (else [`KernelError::TaskParentCycle`], guarded
+    /// by the pure [`relux_core::would_create_task_cycle`]). The cycle guard is defence
+    /// in depth: a freshly minted id is in no existing subtree, so it never rejects a
+    /// normal create — it protects this path if it is ever reused to reparent.
+    pub fn create_task_with_parent(
+        &mut self,
+        title: &str,
+        input: serde_json::Value,
+        created_by: &str,
+        namespace: &NamespaceId,
+        required_permissions: Vec<Permission>,
+        parent: Option<&TaskId>,
+    ) -> Result<TaskId, KernelError> {
+        if let Some(parent_id) = parent {
+            let parent_task = self
+                .tasks
+                .get(parent_id)
+                .ok_or_else(|| KernelError::UnknownTask(parent_id.to_string()))?;
+            if &parent_task.namespace_id != namespace {
+                return Err(KernelError::TaskParentScope {
+                    parent: parent_id.to_string(),
+                    parent_ns: parent_task.namespace_id.to_string(),
+                    child_ns: namespace.to_string(),
+                });
+            }
+        }
+        let task_id = TaskId::new(format!("task_{:04}", self.next_task + 1));
+        if let Some(parent_id) = parent {
+            let parent_of = self.task_parent_map();
+            if relux_core::would_create_task_cycle(&task_id, parent_id, &parent_of) {
+                return Err(KernelError::TaskParentCycle {
+                    child: task_id.to_string(),
+                    parent: parent_id.to_string(),
+                });
+            }
+        }
         self.next_task += 1;
-        let task_id = TaskId::new(format!("task_{:04}", self.next_task));
         let now = self.clock.tick();
         let task = Task {
             id: task_id.clone(),
@@ -2845,7 +2905,7 @@ impl KernelState {
             assigned_agent: None,
             namespace_id: namespace.clone(),
             required_permissions,
-            parent_task: None,
+            parent_task: parent.cloned(),
             deadline: None,
             created_at: now.clone(),
             updated_at: now,
@@ -2858,10 +2918,10 @@ impl KernelState {
             Some(task_id.as_str()),
             Some(namespace),
             AuditResult::Success,
-            serde_json::json!({ "title": title }),
+            serde_json::json!({ "title": title, "parent_task": parent.map(|p| p.as_str()) }),
         );
         self.tasks.insert(task_id.clone(), task);
-        task_id
+        Ok(task_id)
     }
 
     /// Assign a task to an agent and move it to `Queued`
@@ -12985,6 +13045,78 @@ mod tests {
         assert_eq!(g.tool_name, "deploy.run");
         assert_eq!(g.subject_agent.as_str(), "prime");
         assert_eq!(g.risk, RiskLevel::High);
+    }
+
+    // --- Ad-hoc task subtrees (design §6.2: the `parent_task` edge) ---------------
+
+    #[test]
+    fn ad_hoc_subtask_persists_its_parent_through_a_snapshot_roundtrip() {
+        let mut k = KernelState::new();
+        let ns = k.create_namespace("workspace", "Workspace", NamespaceKind::Personal);
+        let parent = k.create_task("Ship the feature", serde_json::json!({}), "op", &ns, vec![]);
+        let child = k
+            .create_task_with_parent(
+                "Write the docs",
+                serde_json::json!({}),
+                "op",
+                &ns,
+                vec![],
+                Some(&parent),
+            )
+            .expect("a valid same-namespace parent is accepted");
+        assert_eq!(k.task(&child).unwrap().parent_task.as_ref(), Some(&parent));
+        // The edge survives persist/load.
+        let restored = KernelState::from_snapshot(k.snapshot());
+        assert_eq!(restored.task(&child).unwrap().parent_task.as_ref(), Some(&parent));
+    }
+
+    #[test]
+    fn ad_hoc_subtask_rejects_a_missing_parent_cleanly() {
+        let mut k = KernelState::new();
+        let ns = k.create_namespace("workspace", "Workspace", NamespaceKind::Personal);
+        let ghost = TaskId::new("task_9999");
+        let err = k
+            .create_task_with_parent(
+                "orphan",
+                serde_json::json!({}),
+                "op",
+                &ns,
+                vec![],
+                Some(&ghost),
+            )
+            .unwrap_err();
+        assert!(matches!(err, KernelError::UnknownTask(_)), "got {err:?}");
+        // A rejected create persists nothing and does not advance the id counter.
+        assert!(k.tasks().is_empty(), "no task is created on rejection");
+    }
+
+    #[test]
+    fn ad_hoc_subtask_rejects_a_cross_namespace_parent() {
+        let mut k = KernelState::new();
+        let ns_a = k.create_namespace("a", "A", NamespaceKind::Personal);
+        let ns_b = k.create_namespace("b", "B", NamespaceKind::Personal);
+        let parent = k.create_task("parent in A", serde_json::json!({}), "op", &ns_a, vec![]);
+        let err = k
+            .create_task_with_parent(
+                "child in B",
+                serde_json::json!({}),
+                "op",
+                &ns_b,
+                vec![],
+                Some(&parent),
+            )
+            .unwrap_err();
+        assert!(matches!(err, KernelError::TaskParentScope { .. }), "got {err:?}");
+        // Only the parent exists; the rejected child was never inserted.
+        assert_eq!(k.tasks().len(), 1);
+    }
+
+    #[test]
+    fn standalone_create_leaves_parent_task_unset() {
+        let mut k = KernelState::new();
+        let ns = k.create_namespace("workspace", "Workspace", NamespaceKind::Personal);
+        let id = k.create_task("standalone", serde_json::json!({}), "op", &ns, vec![]);
+        assert!(k.task(&id).unwrap().parent_task.is_none());
     }
 
     #[test]

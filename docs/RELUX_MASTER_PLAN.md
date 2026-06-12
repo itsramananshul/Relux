@@ -707,6 +707,15 @@ cancelled
 expired
 ```
 
+**Ad-hoc subtrees (`parent_task`).** `parent_task` is now **populated** for hand-made
+subtasks (an operator breaking a task down outside any orchestration). The kernel's
+`create_task_with_parent` validates the edge before persisting it — the parent must
+exist, share the child's namespace, and not close a cycle (the bounded, cycle-guarded
+task-tree walk in `relux_core::task`) — and `POST /v1/relux/tasks` accepts an optional
+`parent_task`. This is the second real parent→child link beside the orchestration's
+`steps[]`; the dashboard renders it as a subtree on the Work board
+(`docs/relix-dashboard-design.md` §6.3).
+
 ### 9.6 Run
 
 One execution attempt for a task.

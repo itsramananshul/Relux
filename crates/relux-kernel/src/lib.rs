@@ -264,6 +264,14 @@ pub enum KernelError {
     TaskNotAssigned(String),
     #[error("task {task} is not assignable in status {status}; only a non-terminal task can be (re)assigned")]
     TaskNotAssignable { task: String, status: String },
+    #[error("parent task {parent} is in namespace {parent_ns}, not the child's namespace {child_ns}; an ad-hoc subtask lives in its parent's namespace")]
+    TaskParentScope {
+        parent: String,
+        parent_ns: String,
+        child_ns: String,
+    },
+    #[error("task {child} cannot be parented to {parent}: it would create a cycle in the task tree")]
+    TaskParentCycle { child: String, parent: String },
     #[error("plugin {plugin} has no tool named {tool}")]
     ToolNotFound { plugin: String, tool: String },
     #[error("tool {tool} on plugin {plugin} has no runtime handler yet (installed as metadata only; arbitrary plugin code is not executed)")]

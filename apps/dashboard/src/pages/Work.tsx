@@ -20,6 +20,11 @@ import {
   type WorkGroup,
   type GroupProgress,
 } from "../workhierarchy";
+import {
+  childrenOfTask,
+  adhocSubtaskProgress,
+  subtaskCounts,
+} from "../adhocsubtrees";
 import { orchestrationStatusTone } from "../orchestration";
 import { approvalInlineActions } from "../approvalactions";
 import {
@@ -182,6 +187,10 @@ export function Work() {
     () => (selectedTaskId ? groupForTask(groups, selectedTaskId) : null),
     [groups, selectedTaskId],
   );
+  // Ad-hoc subtask counts per parent (design §6.2): the second real parent→child link,
+  // the `parent_task` edge the kernel now populates. Used to mark board cards with
+  // sub-work and to render a parent's subtree in the task detail.
+  const subCounts = useMemo(() => subtaskCounts(tasks ?? []), [tasks]);
 
   const error = errorTasks || errorRuns || errorAgents;
   const loading = (loadingTasks && !tasks) || (loadingRuns && !runs) || (loadingAgents && !agents);
@@ -249,10 +258,10 @@ export function Work() {
             />
 
             <div className="row wrap" style={{ gap: 16, alignItems: "flex-start" }}>
-              <Column title="Open" tasks={columns.open} onAction={handleReload} onInspectTask={handleInspectTask} agents={agents || []} />
-              <Column title="Running" tasks={columns.running} onAction={handleReload} onInspectTask={handleInspectTask} agents={agents || []} />
-              <Column title="Blocked / Failed" tasks={columns.blocked} onAction={handleReload} onInspectTask={handleInspectTask} agents={agents || []} />
-              <Column title="Done" tasks={columns.done} onAction={handleReload} onInspectTask={handleInspectTask} agents={agents || []} />
+              <Column title="Open" tasks={columns.open} onAction={handleReload} onInspectTask={handleInspectTask} agents={agents || []} subtaskCounts={subCounts} />
+              <Column title="Running" tasks={columns.running} onAction={handleReload} onInspectTask={handleInspectTask} agents={agents || []} subtaskCounts={subCounts} />
+              <Column title="Blocked / Failed" tasks={columns.blocked} onAction={handleReload} onInspectTask={handleInspectTask} agents={agents || []} subtaskCounts={subCounts} />
+              <Column title="Done" tasks={columns.done} onAction={handleReload} onInspectTask={handleInspectTask} agents={agents || []} subtaskCounts={subCounts} />
             </div>
 
             {(selectedTaskId || selectedRunId) && (
@@ -262,7 +271,9 @@ export function Work() {
                     taskId={selectedTaskId}
                     group={selectedTaskGroup}
                     agents={agents || []}
+                    tasks={tasks || []}
                     onInspectTask={handleInspectTask}
+                    onChanged={handleReload}
                     onClose={() => setSelectedTaskId(null)}
                   />
                 )}
@@ -944,7 +955,7 @@ function WorkChecklist({
   );
 }
 
-function Column({ title, tasks, onAction, onInspectTask, agents }: { title: string; tasks: ReluxTask[]; onAction: () => void; onInspectTask: (taskId: string) => void; agents: ReluxAgent[] }) {
+function Column({ title, tasks, onAction, onInspectTask, agents, subtaskCounts }: { title: string; tasks: ReluxTask[]; onAction: () => void; onInspectTask: (taskId: string) => void; agents: ReluxAgent[]; subtaskCounts: Map<string, number> }) {
   return (
     <div style={{ flex: 1, minWidth: 280 }}>
       <h4 style={{ marginBottom: 8, fontSize: 13, textTransform: "uppercase", letterSpacing: "0.05em" }}>
@@ -952,7 +963,7 @@ function Column({ title, tasks, onAction, onInspectTask, agents }: { title: stri
       </h4>
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
         {tasks.map(t => (
-          <TaskCard key={t.id} task={t} onAction={onAction} onInspectTask={onInspectTask} agents={agents} />
+          <TaskCard key={t.id} task={t} onAction={onAction} onInspectTask={onInspectTask} agents={agents} subtaskCount={subtaskCounts.get(t.id) ?? 0} />
         ))}
         {tasks.length === 0 && <div className="empty sm" style={{ padding: 16 }}>No {title.toLowerCase()} tasks</div>}
       </div>
@@ -960,7 +971,7 @@ function Column({ title, tasks, onAction, onInspectTask, agents }: { title: stri
   );
 }
 
-function TaskCard({ task, onAction, onInspectTask, agents }: { task: ReluxTask; onAction: () => void; onInspectTask: (taskId: string) => void; agents: ReluxAgent[] }) {
+function TaskCard({ task, onAction, onInspectTask, agents, subtaskCount }: { task: ReluxTask; onAction: () => void; onInspectTask: (taskId: string) => void; agents: ReluxAgent[]; subtaskCount: number }) {
   const [busy, setBusy] = useState(false);
   const [selectedAgent, setSelectedAgent] = useState(task.assigned_agent || "");
 
@@ -1019,7 +1030,34 @@ function TaskCard({ task, onAction, onInspectTask, agents }: { task: ReluxTask; 
           {task.status}
         </div>
       </div>
-      <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 10, lineHeight: 1.4 }}>{task.title}</div>
+      <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 6, lineHeight: 1.4 }}>{task.title}</div>
+      {/* Ad-hoc subtree markers (design §6.2): a card shows when it is itself a parent
+          (has sub-work) and/or a subtask of another task, from the real `parent_task`
+          edge — the second hierarchy beside orchestration. Color is meaning-only. */}
+      {(subtaskCount > 0 || task.parent_task) && (
+        <div className="row" style={{ gap: 6, marginBottom: 8, flexWrap: "wrap", alignItems: "center" }}>
+          {subtaskCount > 0 && (
+            <span
+              className="badge backlog"
+              style={{ fontSize: 9, cursor: "pointer" }}
+              title="this task has ad-hoc subtasks — open it to see the subtree"
+              onClick={() => onInspectTask(task.id)}
+            >
+              ↳ {subtaskCount} subtask{subtaskCount === 1 ? "" : "s"}
+            </span>
+          )}
+          {task.parent_task && (
+            <span
+              className="badge backlog"
+              style={{ fontSize: 9, cursor: "pointer" }}
+              title={`subtask of ${task.parent_task}`}
+              onClick={() => onInspectTask(task.parent_task!)}
+            >
+              ↑ subtask of <span className="mono">{task.parent_task}</span>
+            </span>
+          )}
+        </div>
+      )}
       <div className="row" style={{ alignItems: "center", flexWrap: "wrap", gap: 8 }}>
         {isAssigned ? (
           <div className="mono muted" style={{ fontSize: 10 }}>Assigned: {assignedAgent?.name || task.assigned_agent}</div>
@@ -1065,13 +1103,17 @@ function TaskDetailPanel({
   taskId,
   group,
   agents,
+  tasks,
   onInspectTask,
+  onChanged,
   onClose,
 }: {
   taskId: string;
   group: WorkGroup | null;
   agents: ReluxAgent[];
+  tasks: ReluxTask[];
   onInspectTask: (taskId: string) => void;
+  onChanged: () => void;
   onClose: () => void;
 }) {
   const { data: task, loading, error } = useAsync<ReluxTaskDetail>(
@@ -1139,6 +1181,124 @@ function TaskDetailPanel({
       ) : (
         <div className="empty sm">No task details found.</div>
       )}
+      {/* Ad-hoc subtasks (design §6.2): break this task down by hand, outside any
+          orchestration. Renders the parent's children with the SAME progress strip +
+          numbered list the orchestration groups use, plus an Add-subtask form. */}
+      <AdhocSubtaskSection
+        taskId={taskId}
+        tasks={tasks}
+        agentName={agentName}
+        onInspectTask={onInspectTask}
+        onChanged={onChanged}
+      />
+    </div>
+  );
+}
+
+// The ad-hoc subtree of one parent task (design §6.2): the children joined from the
+// flat task list by the real `parent_task` edge, shown as a segmented progress strip
+// + a numbered checklist (the same shape as an orchestration group), with an inline
+// "Add subtask" form. Honest empty state when the task has no sub-work yet.
+export function AdhocSubtaskSection({
+  taskId,
+  tasks,
+  agentName,
+  onInspectTask,
+  onChanged,
+}: {
+  taskId: string;
+  tasks: ReluxTask[];
+  agentName: (id: string | null) => string;
+  onInspectTask: (taskId: string) => void;
+  onChanged: () => void;
+}) {
+  const children = useMemo(() => childrenOfTask(tasks, taskId), [tasks, taskId]);
+  const progress = useMemo(() => adhocSubtaskProgress(children), [children]);
+  const [title, setTitle] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function addSubtask() {
+    const t = title.trim();
+    if (!t) return;
+    setAdding(true);
+    setErr(null);
+    try {
+      await reluxWork.createTask(t, { parent_task: taskId });
+      setTitle("");
+      onChanged(); // reload the board so the new child appears in the strip + columns
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Add subtask failed.");
+    } finally {
+      setAdding(false);
+    }
+  }
+
+  return (
+    <div className="card sm" style={{ padding: 10, marginTop: 14, border: "1px solid var(--border)" }}>
+      <div className="row" style={{ alignItems: "center", gap: 8, marginBottom: 8 }}>
+        <h5 style={{ margin: 0 }}>Subtasks</h5>
+        {children.length > 0 && (
+          <>
+            <span className="muted" style={{ fontSize: 11 }}>{groupProgressLabel(progress)}</span>
+            <div className="spacer" style={{ flex: 1 }} />
+            <span className="muted" style={{ fontSize: 10, whiteSpace: "nowrap" }}>
+              {progress.total} subtask{progress.total === 1 ? "" : "s"}
+            </span>
+          </>
+        )}
+      </div>
+      {children.length > 0 ? (
+        <>
+          <SegmentedBar progress={progress} />
+          <div className="plan-list" style={{ marginTop: 8 }}>
+            {children.map(c => (
+              <div key={c.taskId} className="plan-row">
+                <div className="plan-num mono">{c.index + 1}</div>
+                <div className="plan-main">
+                  <div className="plan-title-row">
+                    <span className="plan-title" onClick={() => onInspectTask(c.taskId)}>{c.title}</span>
+                    <span className={`badge ${bucketTone(c.bucket)}`} style={{ fontSize: 9 }} title="live board status">
+                      {c.status}
+                    </span>
+                  </div>
+                  <div className="row wrap" style={{ gap: 8, fontSize: 10, alignItems: "center" }}>
+                    <span className="mono muted">{c.taskId}</span>
+                    <span className="muted">· {agentName(c.assignedAgent)}</span>
+                    <div className="spacer" style={{ flex: 1 }} />
+                    <button
+                      className="btn ghost sm"
+                      style={{ height: 20, padding: "0 8px" }}
+                      onClick={() => onInspectTask(c.taskId)}
+                    >
+                      Inspect
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </>
+      ) : (
+        <div className="empty sm" style={{ padding: 12 }}>
+          No sub-work yet — add a subtask to break this task down.
+        </div>
+      )}
+      <div className="row" style={{ gap: 8, marginTop: 10 }}>
+        <input
+          className="input sm"
+          placeholder="Add a subtask..."
+          value={title}
+          onChange={e => setTitle(e.target.value)}
+          onKeyDown={e => e.key === "Enter" && void addSubtask()}
+          disabled={adding}
+          style={{ flex: 1 }}
+        />
+        <button className="btn sm" onClick={() => void addSubtask()} disabled={adding || !title.trim()}>
+          {adding ? "..." : "Add subtask"}
+        </button>
+      </div>
+      {err && <div className="banner err" style={{ fontSize: 11, marginTop: 8 }}>{err}</div>}
     </div>
   );
 }
