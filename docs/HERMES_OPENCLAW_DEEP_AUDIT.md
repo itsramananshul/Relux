@@ -503,8 +503,11 @@ safe (adds no authority), bounded, feasible in one commit, and reuses existing v
   (`McpServerConfig`/`McpTransport::HttpLoopback`, `validate_mcp_server_config` loopback-only,
   `McpToolClassification` risk/approval, `is_valid_mcp_tool_name`, `scan_mcp_tool_description`),
   `crates/relux-kernel/src/mcp.rs` (blocking loopback JSON-RPC client: `initialize` →
-  `tools/list`/`tools/call`, single-POST subset + SSE-frame parse, **result shaping** (text +
-  `structuredContent`, `isError`→honest failure, never the raw envelope), bounded/timeout/honest),
+  `tools/list`/`tools/call`, single-POST + SSE-frame parse + **per-operation streamable-HTTP session**
+  (`Mcp-Session-Id` captured on `initialize`, validated to visible-ASCII, echoed on later requests,
+  one bounded re-`initialize` on a `404` session-expiry; in-memory only, never persisted/logged/
+  surfaced), **result shaping** (text + `structuredContent`, `isError`→honest failure, never the raw
+  envelope), bounded/timeout/honest),
   `crates/relux-kernel/src/state.rs` (registry CRUD + `set/clear_mcp_tool_classification`, and MCP
   branches in `resolve_tool_permission`/`tool_needs_approval`/`execute_tool_runtime`/
   `matching_persistent_grant_id`/`tool_risk_for` so `call_tool`/`invoke_tool`/per-call-approval/
@@ -519,11 +522,18 @@ safe (adds no authority), bounded, feasible in one commit, and reuses existing v
     approval per `McpToolClassification` (default gated Medium + Required until the operator
     classifies); every call permission-checked, risk/approval-gated, per-call-approvable,
     grant-bypassable, and audited — the SAME path a plugin tool uses.
-  - **Still deferred (honest):** no stdio command servers; no remote/`https`/SSE-subscription; no
-    OAuth; no session-continuity streamable-HTTP; no MCP resources/prompts/sampling; an MCP call is
-    captured on the audit log but not (yet) on the run transcript (`docs/mcp.md` "Next MCP slice").
-- **Missing (deliberate/deferred)**: MCP remote transport + OAuth, session-continuity, resources,
-  run-transcript capture; plugin activation triggers.
+  - **Session continuity — SHIPPED (per-operation streamable-HTTP).** A stateful loopback MCP server
+    that sets `Mcp-Session-Id` on `initialize` and requires it back now works: the id is captured,
+    validated, echoed, and one bounded re-`initialize` recovers an expired session (`404`); it is
+    in-memory per operation, never persisted/logged/returned (so it cannot reach the UI/API). Maps
+    Hermes' SDK-managed `Mcp-Session-Id` / `_get_session_id` + reconnect (`tools/mcp_tool.py`
+    L1454-1480), done by hand at the HTTP layer (no SDK, no long-lived connection).
+  - **Still deferred (honest):** no stdio command servers; no remote/`https`; no long-lived
+    SSE-subscription / server-push channel; no cross-operation session reuse; no OAuth; no MCP
+    resources/prompts/sampling; an MCP call is captured on the audit log but not (yet) on the run
+    transcript (`docs/mcp.md` "Next MCP slice").
+- **Missing (deliberate/deferred)**: MCP remote transport + OAuth, long-lived SSE subscription,
+  resources, run-transcript capture; plugin activation triggers.
 
 ### Priority & slices
 

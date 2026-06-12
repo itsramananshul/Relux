@@ -81,18 +81,48 @@ append-only log. The tool name is re-validated as a safe identifier
 (`is_valid_mcp_tool_name`) before any dial. No arbitrary downloaded code is run — only
 the operator's own loopback MCP server is dialed.
 
+## Session continuity (streamable-HTTP `Mcp-Session-Id`)
+
+A streamable-HTTP MCP server may be **stateful**: its `initialize` response sets an
+`Mcp-Session-Id` HTTP header, and it then rejects any later request that does not
+echo that header (typically with a `400`/`404`). Relux now speaks this within a
+single logical operation:
+
+- On `initialize`, the kernel client captures the `Mcp-Session-Id` **response
+  header** (if present), **validates** it (non-empty, ≤512 chars, visible-ASCII
+  `0x21..=0x7E` only — the MCP-spec session charset) and **echoes** it as the
+  `Mcp-Session-Id` **request header** on the operation's remaining requests
+  (`notifications/initialized`, then `tools/list` or `tools/call`). A malformed /
+  oversized value is **dropped, not echoed** — that closes a header-injection path
+  (a hostile value cannot smuggle `CR`/`LF` into our next request) and the operation
+  simply proceeds session-less.
+- **Session invalidation** is handled once, bounded: if a request returns HTTP
+  `404` **while a session id is held** (the streamable-HTTP "session expired /
+  unknown" signal), the client clears the session, runs **one** fresh `initialize`
+  to obtain a new session, and **retries the operation a single time**. If it still
+  fails, the error is surfaced honestly (`McpClientError::HttpStatus(404)` →
+  discovery/invocation failure) — there is no retry loop and no fabricated result.
+- **The session id never leaves the kernel.** It lives only in an in-memory
+  `Session` for the duration of one operation, is dropped when that operation ends,
+  is **never persisted** (not in `McpServerConfig`, not in the snapshot), **never
+  logged**, and **never returned** by discover/invoke — so it cannot reach the
+  dashboard or the HTTP API. There is no cross-call session reuse: each discover /
+  invoke opens, uses, and discards its own session.
+
 ## What it does NOT do (honest limitations)
 
 - **No stdio (command) MCP servers.** Relux never spawns arbitrary downloaded
   code. Only an operator-run loopback HTTP server is dialed.
 - **No remote / `https` / SSE-subscription transport.** v1 dials no remote host.
-- **Single-POST subset of streamable HTTP.** Each JSON-RPC request is its own
-  `Connection: close` POST (`initialize`, then `tools/list` or `tools/call`). A
-  server that requires session continuity ACROSS requests (a streamable-HTTP
-  session id) is not supported — its `tools/list`/`tools/call` fails honestly
-  (`McpDiscoveryFailed` / `ToolRuntimeInvocation`), never a fabricated result. A
-  single SSE-framed response body (`data: {json}`) IS parsed, so simple stateless
-  streamable-HTTP servers work.
+- **Session-continuous streamable HTTP (within one operation).** Each JSON-RPC
+  request is still its own `Connection: close` POST (`initialize`, then `tools/list`
+  or `tools/call`), but a single logical operation now carries a **streamable-HTTP
+  session** across its requests — see "Session continuity" below. A single
+  SSE-framed response body (`data: {json}`) is parsed, so simple stateless
+  streamable-HTTP servers also work. What is still NOT supported: a **long-lived
+  SSE subscription / server-push channel**, and **cross-operation** session reuse
+  (each discover/invoke runs its own `initialize`; sessions are never kept open or
+  shared between calls).
 - **No OAuth / auth header.** No `Authorization` is sent. (Hermes' `mcp_oauth_manager`
   is deferred.)
 - **No MCP resources / prompts / sampling.** Only `tools/list` + `tools/call` are
@@ -150,6 +180,15 @@ Files read before implementing:
   before `list_tools`/`call_tool`, `tools/call` params `{ name, arguments }`,
   JSON-RPC `error` → honest failure (never fake success). We mirror the posture in a
   blocking `std::net` client that fits the synchronous kernel tool path.
+- **Hermes** `reference/hermes-agent-main/tools/mcp_tool.py` (L1454-1480) — the
+  streamable-HTTP session: Hermes delegates to the official MCP SDK's
+  `streamablehttp_client`, which manages the `Mcp-Session-Id` session id internally
+  (exposed as `_get_session_id`) and re-handshakes on a dropped/expired session
+  ("reconnect requested — tearing down HTTP session"). Relux has no SDK and stays
+  single-POST, so we implement the same contract by hand at the HTTP layer: capture
+  the `Mcp-Session-Id` response header on `initialize`, echo it on the operation's
+  requests, and do one bounded re-`initialize` on a `404` session-expiry — without a
+  long-lived connection or cross-call session reuse.
 - **openclaw** `reference/openclaw-main/src/tools/execution.ts`
   (`formatToolExecutorRef`) — the `mcp:<serverId>:<toolName>` executor namespace.
   We adopt `mcp:<server>` as the synthetic plugin id so MCP tools map into the
@@ -159,7 +198,8 @@ Files read before implementing:
 Relux files: `crates/relux-core/src/mcp.rs` (config + validation + discovery types +
 `McpToolClassification` + `is_valid_mcp_tool_name` + injection scan),
 `crates/relux-kernel/src/mcp.rs` (loopback JSON-RPC discovery + `call_tool` client
-with result shaping), `crates/relux-kernel/src/state.rs` (`register_mcp_server` /
+with result shaping, plus the in-memory streamable-HTTP `Session` —
+`Mcp-Session-Id` capture/echo/validate + one bounded re-initialize on `404`), `crates/relux-kernel/src/state.rs` (`register_mcp_server` /
 `set_mcp_server_enabled` / `remove_mcp_server` / `mcp_servers` / `discover_mcp_tools` /
 `set_mcp_tool_classification` / `clear_mcp_tool_classification`, and the MCP branches
 in `resolve_tool_permission` / `tool_needs_approval` / `execute_tool_runtime` /
@@ -172,10 +212,11 @@ discover → classify → invoke / request-approval).
 
 ## Next MCP slice
 
-Discovery + gated invocation now work end to end. Candidate next slices, in rough
-order: (1) **session-continuity streamable-HTTP** (carry a session id across
-`initialize`/`tools/call`) so stateful MCP servers work; (2) **remote transport +
-OAuth** (an allow-listed remote endpoint with `mcp_oauth_manager`-style auth),
-gated behind an explicit operator opt-in; (3) **MCP resources** (`resources/list` +
-`resources/read`) surfaced as a read-only Dossier source; (4) capturing an MCP call
-on the **run transcript** (not just the audit log) when invoked inside a run.
+Discovery + gated invocation + **per-operation session continuity** now work end to
+end. Candidate next slices, in rough order: (1) **remote transport + OAuth** (an
+allow-listed remote endpoint with `mcp_oauth_manager`-style auth), gated behind an
+explicit operator opt-in; (2) a **long-lived SSE / server-push subscription** (the
+streamable-HTTP variant Relux still does not speak — only single-POST request/reply
+today); (3) **MCP resources** (`resources/list` + `resources/read`) surfaced as a
+read-only Dossier source; (4) capturing an MCP call on the **run transcript** (not
+just the audit log) when invoked inside a run.

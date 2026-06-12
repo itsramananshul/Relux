@@ -31,12 +31,17 @@
 //! - **Bounded.** A per-call connect/read/write timeout, a request-body cap, and a
 //!   response-body cap (reused from [`crate::runtime`]). Discovered tools are
 //!   capped at [`relux_core::MAX_MCP_TOOLS`]; descriptions are sanitized + clamped.
-//! - **Single-POST subset.** Each JSON-RPC request is its own `Connection: close`
-//!   POST. The `initialize` handshake runs first, then `tools/list`. A server that
-//!   requires session continuity ACROSS requests (e.g. a streamable-HTTP session
-//!   id) is not supported yet — its `tools/list` / `tools/call` fails honestly with
-//!   [`McpClientError::ServerError`] / [`McpClientError::BadResponse`], never a
-//!   fabricated result. See `docs/mcp.md` for the next slice.
+//! - **One POST per JSON-RPC request, session-continuous.** Each JSON-RPC request
+//!   is still its own `Connection: close` POST, but a single logical operation
+//!   (`initialize` → `tools/list`, or `initialize` → `tools/call`) now carries a
+//!   **streamable-HTTP session** across its requests: if the server returns an
+//!   `Mcp-Session-Id` response header on `initialize`, that id (bounded + validated
+//!   to visible ASCII, never persisted, never surfaced to the UI/API) is echoed on
+//!   every subsequent request in the same operation. A server that rejects a stale
+//!   session with HTTP 404 triggers **one** bounded clear-and-re-initialize retry;
+//!   if it still refuses, the call fails honestly with [`McpClientError`], never a
+//!   fabricated result. Sessions are per-operation and in-memory only — there is no
+//!   long-lived connection and no cross-call session reuse. See `docs/mcp.md`.
 //! - **Honest failures.** A connect failure, timeout, non-2xx status, oversized
 //!   body, invalid JSON, or a JSON-RPC `error` becomes a clear [`McpClientError`].
 
@@ -107,28 +112,20 @@ impl From<RuntimeClientError> for McpClientError {
 /// [`McpClientError`].
 ///
 /// `endpoint` must already be a validated loopback URL; it is re-validated here.
-/// `timeout_ms` bounds connect, read, and write for each request independently.
+/// `timeout_ms` bounds connect, read, and write for each request independently. The
+/// `initialize` and `tools/list` requests share a streamable-HTTP session (see
+/// [`Session`]); a stale-session `404` triggers one bounded re-initialize retry.
 pub fn discover_tools(endpoint: &str, timeout_ms: u64) -> Result<Vec<McpTool>, McpClientError> {
     // Re-validate the loopback endpoint on every call (defense in depth).
-    let _ = parse_loopback_url(endpoint).map_err(|e| McpClientError::InvalidEndpoint(e.to_string()))?;
+    let _ =
+        parse_loopback_url(endpoint).map_err(|e| McpClientError::InvalidEndpoint(e.to_string()))?;
 
-    // 1. initialize — required by the MCP spec before any other method. We do not
-    //    inspect the server's advertised capabilities in v1; a JSON-RPC `error`
-    //    here is surfaced honestly (the server refused to initialize).
-    let init_params = serde_json::json!({
-        "protocolVersion": MCP_PROTOCOL_VERSION,
-        "capabilities": {},
-        "clientInfo": { "name": "relux", "version": env!("CARGO_PKG_VERSION") },
-    });
-    let _ = post_jsonrpc(endpoint, 1, "initialize", &init_params, timeout_ms)?;
-
-    // 2. notifications/initialized — best effort. Some servers expect it; a failure
-    //    here must not abort discovery (it carries no result).
-    let _ = post_notification(endpoint, "notifications/initialized", timeout_ms);
-
-    // 3. tools/list — the real discovery call.
-    let result = post_jsonrpc(endpoint, 2, "tools/list", &serde_json::json!({}), timeout_ms)?;
-    parse_tools_list(&result)
+    run_with_session(endpoint, timeout_ms, |session| {
+        // tools/list — the real discovery call, carrying the session established by
+        // the handshake. A JSON-RPC `error` is surfaced honestly.
+        let result = session.request("tools/list", &serde_json::json!({}))?;
+        parse_tools_list(&result)
+    })
 }
 
 /// Maximum characters of text kept from a `tools/call` result. The whole response
@@ -162,22 +159,134 @@ pub fn call_tool(
     let _ =
         parse_loopback_url(endpoint).map_err(|e| McpClientError::InvalidEndpoint(e.to_string()))?;
 
-    // 1. initialize — required before any other method.
-    let init_params = serde_json::json!({
-        "protocolVersion": MCP_PROTOCOL_VERSION,
-        "capabilities": {},
-        "clientInfo": { "name": "relux", "version": env!("CARGO_PKG_VERSION") },
-    });
-    let _ = post_jsonrpc(endpoint, 1, "initialize", &init_params, timeout_ms)?;
-    // 2. notifications/initialized — best effort (carries no result).
-    let _ = post_notification(endpoint, "notifications/initialized", timeout_ms);
+    run_with_session(endpoint, timeout_ms, |session| {
+        // tools/call — forward { name, arguments }, carrying the handshake's session.
+        // A non-object `arguments` is sent as-is and the server validates it.
+        let params = serde_json::json!({ "name": tool_name, "arguments": arguments });
+        let result = session.request("tools/call", &params)?;
+        shape_tool_call_result(&result)
+    })
+}
 
-    // 3. tools/call — forward { name, arguments }. An object that is not a JSON
-    //    object is wrapped under no key; the MCP spec expects an object, so a
-    //    non-object is sent as-is and the server validates it.
-    let params = serde_json::json!({ "name": tool_name, "arguments": arguments });
-    let result = post_jsonrpc(endpoint, 2, "tools/call", &params, timeout_ms)?;
-    shape_tool_call_result(&result)
+/// Open a streamable-HTTP [`Session`] against `endpoint` (run the `initialize`
+/// handshake), then run `op` (the `tools/list` or `tools/call` step) under it. If
+/// the server rejects an established session with HTTP `404` (the streamable-HTTP
+/// "session not found / expired" signal), clear the session and re-initialize
+/// **once**, then retry `op` a single time — bounded, never a retry loop. If the
+/// retry still fails, the error is surfaced honestly.
+///
+/// The session id lives only for the duration of this call: it is captured from the
+/// `initialize` response header, echoed on the operation's requests, and dropped
+/// when the [`Session`] goes out of scope. It is never persisted and never returned
+/// to the caller (and thus never reaches the UI/API).
+fn run_with_session<T>(
+    endpoint: &str,
+    timeout_ms: u64,
+    op: impl Fn(&mut Session) -> Result<T, McpClientError>,
+) -> Result<T, McpClientError> {
+    let mut session = Session::new(endpoint, timeout_ms);
+    session.initialize()?;
+    match op(&mut session) {
+        Ok(value) => Ok(value),
+        // Only a 404 *while we hold a session id* means the server invalidated our
+        // session; a 404 without one is just an unknown endpoint (honest failure).
+        Err(McpClientError::HttpStatus(404)) if session.has_session() => {
+            session.reset();
+            session.initialize()?;
+            op(&mut session)
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// One in-memory streamable-HTTP MCP session: the loopback endpoint, the per-call
+/// timeout, a monotonic JSON-RPC id, and the optional `Mcp-Session-Id` handed back
+/// by `initialize`. The session id is bounded + validated to visible ASCII before
+/// it is ever echoed (so a malformed server value can never inject an HTTP header)
+/// and is never logged, persisted, or returned to a caller.
+struct Session {
+    endpoint: String,
+    timeout_ms: u64,
+    session_id: Option<String>,
+    next_id: u64,
+}
+
+impl Session {
+    fn new(endpoint: &str, timeout_ms: u64) -> Self {
+        Self {
+            endpoint: endpoint.to_string(),
+            timeout_ms,
+            session_id: None,
+            next_id: 1,
+        }
+    }
+
+    /// Whether the server handed us a session id to echo.
+    fn has_session(&self) -> bool {
+        self.session_id.is_some()
+    }
+
+    /// Clear any established session id (used before a bounded re-initialize).
+    fn reset(&mut self) {
+        self.session_id = None;
+    }
+
+    fn next_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    /// Run the MCP `initialize` handshake, capturing the streamable-HTTP session id
+    /// from the response's `Mcp-Session-Id` header (if any), then send the
+    /// best-effort `notifications/initialized`. A fresh handshake always drops any
+    /// prior session id first (a re-initialize must not reuse the invalidated one).
+    fn initialize(&mut self) -> Result<(), McpClientError> {
+        self.session_id = None;
+        let init_params = serde_json::json!({
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": { "name": "relux", "version": env!("CARGO_PKG_VERSION") },
+        });
+        let id = self.next_id();
+        let (_result, captured) =
+            post_jsonrpc(&self.endpoint, id, "initialize", &init_params, self.timeout_ms, None)?;
+        // Honor the session only if the server supplied a safe id; a malformed one is
+        // ignored (the operation then proceeds session-less, exactly as before).
+        self.session_id = captured;
+        // notifications/initialized — best effort, carrying the session header so a
+        // session-strict server accepts it. A failure here must not abort the op.
+        let _ = post_notification(
+            &self.endpoint,
+            "notifications/initialized",
+            self.timeout_ms,
+            self.session_id.as_deref(),
+        );
+        Ok(())
+    }
+
+    /// POST one JSON-RPC `method` under this session and return its `result`. The
+    /// established session id (if any) is echoed; a response that re-issues one is
+    /// honored. A JSON-RPC `error` / transport failure surfaces as [`McpClientError`].
+    fn request(
+        &mut self,
+        method: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, McpClientError> {
+        let id = self.next_id();
+        let (result, captured) = post_jsonrpc(
+            &self.endpoint,
+            id,
+            method,
+            params,
+            self.timeout_ms,
+            self.session_id.as_deref(),
+        )?;
+        if captured.is_some() {
+            self.session_id = captured;
+        }
+        Ok(result)
+    }
 }
 
 /// Shape a raw `tools/call` JSON-RPC result into a bounded, sanitized value:
@@ -285,23 +394,26 @@ fn parse_tools_list(result: &serde_json::Value) -> Result<Vec<McpTool>, McpClien
     Ok(out)
 }
 
-/// POST one JSON-RPC request to the loopback endpoint and return its `result`
-/// value, or an honest [`McpClientError`] (transport failure or a JSON-RPC
-/// `error`). A single `Connection: close` request, mirroring [`crate::runtime`].
+/// POST one JSON-RPC request to the loopback endpoint and return `(result_value,
+/// captured_session_id)`, or an honest [`McpClientError`] (transport failure or a
+/// JSON-RPC `error`). A single `Connection: close` request, mirroring
+/// [`crate::runtime`]. `session_id`, when `Some`, is echoed as the `Mcp-Session-Id`
+/// request header; the response's `Mcp-Session-Id` (if any) is returned alongside.
 fn post_jsonrpc(
     endpoint: &str,
     id: u64,
     method: &str,
     params: &serde_json::Value,
     timeout_ms: u64,
-) -> Result<serde_json::Value, McpClientError> {
+    session_id: Option<&str>,
+) -> Result<(serde_json::Value, Option<String>), McpClientError> {
     let envelope = serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
         "method": method,
         "params": params,
     });
-    let body = post_raw(endpoint, &envelope, timeout_ms)?;
+    let (body, captured) = post_raw(endpoint, &envelope, timeout_ms, session_id)?;
     let value = parse_response_body(&body)?;
 
     if let Some(err) = value.get("error") {
@@ -315,32 +427,42 @@ fn post_jsonrpc(
             return Err(McpClientError::ServerError { code, message });
         }
     }
-    value
+    let result = value
         .get("result")
         .cloned()
-        .ok_or_else(|| McpClientError::BadResponse("response had no `result` field".to_string()))
+        .ok_or_else(|| McpClientError::BadResponse("response had no `result` field".to_string()))?;
+    Ok((result, captured))
 }
 
 /// POST a JSON-RPC notification (no id, no result expected). Best effort: any
-/// transport or status failure is swallowed by the caller.
-fn post_notification(endpoint: &str, method: &str, timeout_ms: u64) -> Result<(), McpClientError> {
+/// transport or status failure is swallowed by the caller. `session_id`, when
+/// `Some`, is echoed as the `Mcp-Session-Id` request header.
+fn post_notification(
+    endpoint: &str,
+    method: &str,
+    timeout_ms: u64,
+    session_id: Option<&str>,
+) -> Result<(), McpClientError> {
     let envelope = serde_json::json!({
         "jsonrpc": "2.0",
         "method": method,
         "params": {},
     });
-    let _ = post_raw(endpoint, &envelope, timeout_ms)?;
+    let _ = post_raw(endpoint, &envelope, timeout_ms, session_id)?;
     Ok(())
 }
 
-/// Send one HTTP POST of `envelope` to the loopback endpoint and return the raw
-/// 2xx response body bytes. Re-validates the loopback URL, bounds the request and
-/// response, and uses the shared [`crate::runtime`] HTTP plumbing.
+/// Send one HTTP POST of `envelope` to the loopback endpoint and return
+/// `(body_bytes, captured_session_id)`. Re-validates the loopback URL, bounds the
+/// request and response, echoes the `Mcp-Session-Id` request header when
+/// `session_id` is `Some`, and extracts the response's `Mcp-Session-Id` (validated)
+/// for the caller. Uses the shared [`crate::runtime`] HTTP plumbing.
 fn post_raw(
     endpoint: &str,
     envelope: &serde_json::Value,
     timeout_ms: u64,
-) -> Result<Vec<u8>, McpClientError> {
+    session_id: Option<&str>,
+) -> Result<(Vec<u8>, Option<String>), McpClientError> {
     let parts = parse_loopback_url(endpoint)
         .map_err(|e| McpClientError::InvalidEndpoint(e.to_string()))?;
 
@@ -373,6 +495,13 @@ fn post_raw(
     } else {
         parts.path.clone()
     };
+    // The streamable-HTTP session header, echoed only when the server gave us a
+    // session id. It is already validated to visible ASCII (no CR/LF/space) by
+    // `validate_session_id`, so it cannot inject an extra header line.
+    let session_header = match session_id {
+        Some(sid) => format!("Mcp-Session-Id: {sid}\r\n"),
+        None => String::new(),
+    };
     // Streamable-HTTP MCP servers may require the dual Accept; we still only parse a
     // single JSON object (or a single SSE `data:` event — see `parse_response_body`).
     let request_head = format!(
@@ -380,6 +509,7 @@ fn post_raw(
          Host: {host_header}\r\n\
          Content-Type: application/json\r\n\
          Accept: application/json, text/event-stream\r\n\
+         {session_header}\
          Content-Length: {len}\r\n\
          Connection: close\r\n\
          \r\n",
@@ -392,11 +522,54 @@ fn post_raw(
     stream.flush().map_err(|e| McpClientError::Io(e.to_string()))?;
 
     let raw = runtime::read_capped(&mut stream)?;
+    // Capture the session id from the response head BEFORE the status check: a
+    // streamable-HTTP server may set `Mcp-Session-Id` on the `initialize` 200, but a
+    // session 404 carries no useful body — either way the head holds the id.
+    let captured = extract_session_id(&raw);
     let (status, response_body) = runtime::parse_http_response(&raw)?;
     if !(200..300).contains(&status) {
         return Err(McpClientError::HttpStatus(status));
     }
-    Ok(response_body.to_vec())
+    Ok((response_body.to_vec(), captured))
+}
+
+/// Max characters kept for a captured `Mcp-Session-Id`. Real session ids (UUIDs,
+/// short opaque tokens) are far shorter; a value beyond this is treated as malformed
+/// and ignored rather than echoed.
+const MAX_MCP_SESSION_ID_CHARS: usize = 512;
+
+/// Extract and validate the `Mcp-Session-Id` response header from a raw HTTP
+/// response. Returns `None` when the header is absent, empty, over-long, or carries
+/// any byte outside visible ASCII (`0x21..=0x7E`) — the MCP-spec session-id charset.
+/// Rejecting a malformed value (rather than echoing it) prevents a hostile server
+/// from smuggling CR/LF or control bytes into our next request's headers.
+fn extract_session_id(raw: &[u8]) -> Option<String> {
+    let head_end = runtime::find_subslice(raw, b"\r\n\r\n")
+        .or_else(|| runtime::find_subslice(raw, b"\n\n"))?;
+    let head = std::str::from_utf8(&raw[..head_end]).ok()?;
+    // Skip the status line and any line without a colon; match the header
+    // case-insensitively (HTTP header names are case-insensitive).
+    for line in head.lines() {
+        if let Some((name, value)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("mcp-session-id") {
+                return validate_session_id(value.trim());
+            }
+        }
+    }
+    None
+}
+
+/// Validate a candidate session id: non-empty, at most [`MAX_MCP_SESSION_ID_CHARS`],
+/// and every byte in the visible-ASCII range. Returns the owned id when safe.
+fn validate_session_id(s: &str) -> Option<String> {
+    if s.is_empty() || s.chars().count() > MAX_MCP_SESSION_ID_CHARS {
+        return None;
+    }
+    if s.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+        Some(s.to_string())
+    } else {
+        None
+    }
 }
 
 /// Parse a response body into a JSON-RPC envelope value. Accepts either a single
@@ -497,6 +670,34 @@ mod tests {
             body.len(),
             body
         )
+    }
+
+    /// A 200 JSON response that also sets an `Mcp-Session-Id` response header — the
+    /// streamable-HTTP session handshake a session-strict server performs.
+    fn http_json_session(value: serde_json::Value, session_id: &str) -> String {
+        let body = value.to_string();
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: {session_id}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    /// A bare `200 OK {}` (used for the `notifications/initialized` POST).
+    fn http_empty_ok() -> String {
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_string()
+    }
+
+    /// A `404 Not Found` — the streamable-HTTP "session expired / unknown" signal.
+    fn http_404() -> String {
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+    }
+
+    fn tools_list_ok() -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2,
+            "result": { "tools": [ { "name": "search", "description": "Search." } ] }
+        })
     }
 
     fn init_ok() -> serde_json::Value {
@@ -685,5 +886,113 @@ mod tests {
         let err = call_tool("https://evil.example.com/mcp", "x", &serde_json::json!({}), 500)
             .unwrap_err();
         assert!(matches!(err, McpClientError::InvalidEndpoint(_)));
+    }
+
+    #[test]
+    fn session_id_is_captured_on_initialize_and_echoed_on_later_requests() {
+        // A session-strict server: initialize hands back a session id, and the
+        // follow-up tools/list must carry it back as the `Mcp-Session-Id` header.
+        let responses = vec![
+            http_json_session(init_ok(), "sess-abc123"),
+            http_empty_ok(),
+            http_json(tools_list_ok()),
+        ];
+        let (endpoint, rx) = mock_server(responses);
+        let tools = discover_tools(&endpoint, 2_000).expect("discovery ok");
+        assert_eq!(tools.len(), 1);
+
+        let _init = rx.recv().unwrap();
+        let notif = rx.recv().unwrap();
+        let list = rx.recv().unwrap();
+        // The session is echoed on both the notification and the real call.
+        assert!(notif.contains("Mcp-Session-Id: sess-abc123"), "notif: {notif}");
+        assert!(list.contains("Mcp-Session-Id: sess-abc123"), "list: {list}");
+    }
+
+    #[test]
+    fn call_tool_carries_the_session_established_at_initialize() {
+        let responses = vec![
+            http_json_session(init_ok(), "sess-xyz"),
+            http_empty_ok(),
+            http_json(call_ok(serde_json::json!({
+                "content": [ { "type": "text", "text": "ok" } ]
+            }))),
+        ];
+        let (endpoint, rx) = mock_server(responses);
+        let out = call_tool(&endpoint, "say", &serde_json::json!({}), 2_000).expect("call ok");
+        assert_eq!(out["result"], "ok");
+        let _init = rx.recv().unwrap();
+        let _notif = rx.recv().unwrap();
+        let call = rx.recv().unwrap();
+        assert!(call.contains("tools/call"), "call: {call}");
+        assert!(call.contains("Mcp-Session-Id: sess-xyz"), "call carried session: {call}");
+    }
+
+    #[test]
+    fn invalid_session_triggers_one_bounded_reinitialize_then_succeeds() {
+        // First session (S1) is rejected with 404 on tools/list; the client must
+        // clear it, re-initialize ONCE (getting S2), and retry tools/list with S2.
+        let responses = vec![
+            http_json_session(init_ok(), "S1"), // initialize → S1
+            http_empty_ok(),                    // notifications/initialized
+            http_404(),                         // tools/list with S1 → expired
+            http_json_session(init_ok(), "S2"), // re-initialize → S2
+            http_empty_ok(),                    // notifications/initialized
+            http_json(tools_list_ok()),         // tools/list with S2 → ok
+        ];
+        let (endpoint, rx) = mock_server(responses);
+        let tools = discover_tools(&endpoint, 2_000).expect("recovers after re-init");
+        assert_eq!(tools.len(), 1);
+
+        // Six requests were made; the FINAL tools/list carried the fresh S2 (never
+        // the invalidated S1).
+        let reqs: Vec<String> = (0..6).map(|_| rx.recv().unwrap()).collect();
+        let final_list = reqs.last().unwrap();
+        assert!(final_list.contains("tools/list"), "final: {final_list}");
+        assert!(final_list.contains("Mcp-Session-Id: S2"), "final carried S2: {final_list}");
+        assert!(!final_list.contains("S1"), "final must not reuse S1: {final_list}");
+    }
+
+    #[test]
+    fn persistent_invalid_session_fails_honestly_after_one_retry() {
+        // The server rejects every session: the single bounded re-init still 404s,
+        // so the call fails honestly rather than retrying forever or faking a list.
+        let responses = vec![
+            http_json_session(init_ok(), "S1"),
+            http_empty_ok(),
+            http_404(), // tools/list with S1 → 404
+            http_json_session(init_ok(), "S2"),
+            http_empty_ok(),
+            http_404(), // tools/list with S2 → 404 again
+        ];
+        let (endpoint, _rx) = mock_server(responses);
+        let err = discover_tools(&endpoint, 2_000).unwrap_err();
+        assert!(matches!(err, McpClientError::HttpStatus(404)), "got {err:?}");
+    }
+
+    #[test]
+    fn malformed_session_id_is_ignored_not_echoed() {
+        // A server hands back a session id containing a space (outside the visible-
+        // ASCII session charset). It must NOT be echoed (header-injection guard); the
+        // op proceeds session-less and still works against a lenient server.
+        let bad = http_json_session(init_ok(), "bad value");
+        let responses = vec![bad, http_empty_ok(), http_json(tools_list_ok())];
+        let (endpoint, rx) = mock_server(responses);
+        let tools = discover_tools(&endpoint, 2_000).expect("discovery ok");
+        assert_eq!(tools.len(), 1);
+        let _init = rx.recv().unwrap();
+        let _notif = rx.recv().unwrap();
+        let list = rx.recv().unwrap();
+        // No session header was echoed (the malformed value was dropped).
+        assert!(!list.contains("Mcp-Session-Id"), "no session echoed: {list}");
+    }
+
+    #[test]
+    fn validate_session_id_rejects_unsafe_values() {
+        assert_eq!(validate_session_id("abc-123_DEF"), Some("abc-123_DEF".to_string()));
+        assert_eq!(validate_session_id(""), None);
+        assert_eq!(validate_session_id("has space"), None);
+        assert_eq!(validate_session_id("crlf\r\ninjected"), None);
+        assert_eq!(validate_session_id(&"a".repeat(MAX_MCP_SESSION_ID_CHARS + 1)), None);
     }
 }
