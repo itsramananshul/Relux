@@ -9,6 +9,65 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.25 (Windows bundle).** The `relux-kernel` /
+  `relux-core` crates move from `0.1.24` to `0.1.25`, bundling the post-v0.1.24
+  **run-driven multi-tool plans** into a fresh Windows release: an
+  operator-authored bounded `tool_plan`, a compact operator UI to create
+  tool-run tasks, and live MCP-discovered tools in that picker. All slices
+  continue the §9 ("P2 — MCP tool support") line from
+  `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` (Next-slice item 5), were built
+  reference-first against the vendored Hermes `tool_calls` loop and the
+  openclaw `buildToolPlan` fail-closed posture per
+  `docs/reference-driven-development.md`, and are documented in `docs/mcp.md`
+  ("Run-driven multi-tool plan"). No master-plan safety property is weakened:
+  MCP stays **loopback-only**, no downloaded code is ever run, secrets are never
+  persisted or returned, and every MCP tool call still flows through the SAME
+  permission / risk-approval / grant / audit gates a real plugin tool uses, with
+  the same `mcp_tool_call*` transcript events. The brain never picks a step — the
+  plan is operator-authored and fixed at task creation. Headlines:
+  - **Bounded operator-authored multi-tool run plan (`tool_plan`).** A `Task`
+    input may carry a `tool_plan` of up to 5 `{ plugin, tool, args }` steps
+    executed sequentially in one local-prime run through the same gated
+    `call_tool` chokepoint as the single `tool_call` directive, stopping on the
+    first step failure/denial (run + task fail honestly; no partial-success
+    lie). `relux-core` adds `TaskToolPlan` / `TaskToolPlanError` /
+    `parse_task_tool_plan` / `TaskToolPlan::validate` (non-empty, ≤ 5 steps,
+    per-step non-empty `plugin`/`tool`, per-step args size-bounded), validating
+    the whole plan up front. `execute_local_run` runs each step in order with a
+    compact step-count completion summary, reusing the existing
+    `mcp_tool_call*` / `tool_call*` transcript events.
+    `POST /v1/relux/tasks` accepts the optional `tool_plan` (strictly validated;
+    mutually exclusive with `tool_call`; honest `400` on
+    empty/too-many/empty-step/oversized-args/both).
+  - **Compact operator UI to create a tool-run task.** The Plugins → Tools
+    section gains a "Create a tool-run task" form: an operator gives a title and
+    adds 1–5 steps, each picking a discovered tool + optional JSON args; one step
+    posts a `tool_call`, two-or-more a `tool_plan`, over the existing
+    `POST /v1/relux/tasks` (no new backend). The React-free payload builder
+    (`toolruntask.ts`) fails closed exactly as the kernel does, and is honest
+    about approval: a gated tool can be added but the form warns the run will
+    block/fail unless a standing grant exists. Success shows the task id + a link
+    to Work to run it with "Run (Assigned)".
+  - **Live MCP-discovered tools in the tool-run picker.** The picker merges
+    installed plugin tools with tools discovered live from each enabled MCP
+    server (`reluxMcp.list` + `reluxMcp.tools`), keyed by the stable plugin id
+    `mcp:<server>` and the discovered tool name, so a chosen MCP tool builds a
+    directive the kernel routes as an MCP call. Gating reuses `toolReadiness`
+    (medium/required → "needs approval"); a failed discovery shows a warning and
+    a disabled server an info note — neither silently vanishes.
+  - **Honest MCP servers copy.** The Plugins MCP section no longer claims
+    "invocation is not wired in yet"; the copy now states a discovered tool is
+    callable through the normal permission, risk/approval, and audit gates
+    (gated until classified) and that resources are a read-only context surface.
+
+  Built reference-first per `docs/reference-driven-development.md`. `cargo test`
+  + `clippy` clean on `relux-core` / `relux-kernel`; dashboard tests + typecheck
+  + build green; the tracked `dashboard-dist` bundle rebuilt and committed in
+  sync. Build the bundle with `scripts\relux-package-local.ps1 -FullE2E`. This
+  version line is the `relux-kernel` crate version (separate from the legacy
+  Relix workspace versions in the dated sections below). See
+  `docs/RELUX_MASTER_PLAN.md` → *Release history*. Every safety property from
+  v0.1.24 still holds.
 - **Relux local release v0.1.24 (Windows bundle).** The `relux-kernel` /
   `relux-core` crates move from `0.1.23` to `0.1.24`, bundling the post-v0.1.23
   **MCP surface deepening** into a fresh Windows release: per-operation

@@ -1836,6 +1836,32 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.25** (2026-06-12) — **run-driven multi-tool plans** on top of v0.1.24, continuing the §9
+  ("P2 — MCP tool support") line from `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` (Next-slice item 5), built
+  reference-first against the vendored Hermes `tool_calls` loop and the openclaw `buildToolPlan`
+  validate-whole-plan-up-front fail-closed posture per `docs/reference-driven-development.md` (full
+  mapping in `docs/mcp.md`, "Run-driven multi-tool plan"). No master-plan safety property is weakened:
+  MCP stays **loopback-only**, no downloaded code is ever run, secrets are never persisted or returned,
+  and every step still flows through the SAME permission / risk-approval / grant / audit gates a real
+  plugin tool uses, with the same `mcp_tool_call*` transcript events. The brain never picks a step —
+  the plan is operator-authored and fixed at task creation. **Bounded multi-tool plan:** a `Task` input
+  may carry a `tool_plan` of ≤ 5 `{ plugin, tool, args }` steps run sequentially in one local-prime run
+  through the gated `call_tool` chokepoint (`relux-core` `TaskToolPlan` + `parse_task_tool_plan` +
+  `validate`: non-empty, ≤ 5 steps, per-step non-empty plugin/tool, per-step args size-bounded),
+  stopping on the first failure/denial (run + task fail honestly, no partial-success lie);
+  `execute_local_run` emits a compact step-count completion summary; `POST /v1/relux/tasks` accepts the
+  optional directive (strictly validated, mutually exclusive with `tool_call`, honest `400`).
+  **Operator UI:** a compact Plugins → Tools "Create a tool-run task" form (title + 1–5 steps, each a
+  discovered tool + optional JSON args) posts a `tool_call` (one step) or `tool_plan` (two-or-more) over
+  the existing endpoint with a React-free, fail-closed payload builder (`toolruntask.ts`) that warns
+  honestly when a gated tool needs a standing grant. **Live discovery in the picker:** the picker merges
+  installed plugin tools with tools discovered live from each enabled MCP server
+  (`reluxMcp.list` + `reluxMcp.tools`, keyed `mcp:<server>`), gating via `toolReadiness`, surfacing a
+  warning on failed discovery and an info note on a disabled server rather than silently dropping it; the
+  Plugins MCP copy now reflects that a discovered tool is callable through the standard gates.
+  `cargo test` + `clippy` clean on `relux-core`/`relux-kernel`, dashboard tests + typecheck + build
+  green, the tracked `dashboard-dist` bundle rebuilt and committed in sync. Every safety property from
+  v0.1.24 still holds.
 - **v0.1.24** (2026-06-12) — **MCP surface deepening** on top of v0.1.23, continuing the §9
   ("P2 — MCP tool support") line from `docs/HERMES_OPENCLAW_DEEP_AUDIT.md`, built reference-first
   against the vendored Hermes (`tools/mcp_tool.py`, `hermes_cli/mcp_config.py`) and the legacy
