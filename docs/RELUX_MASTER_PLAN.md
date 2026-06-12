@@ -1870,18 +1870,38 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
-- **Unreleased (on `main`, post-v0.1.28)** — **Cross-Guild Inbox v1.** A new read-only
-  `GET /v1/relux/inbox` projection (`relux-kernel` `server.rs::get_inbox`, sibling of
-  `get_oversight`) composes the whole Guild's attention items — pending approvals, hard-failed runs
-  (**excluding** the ones silently auto-retrying, per `relix-execution-and-issue-design.md` §3.3b),
-  blocked tasks, and a paused Prime continuation — into unified `InboxItem`s (stable id / kind /
-  severity / title / summary / related ids / recommended action kinds / link). A new top-level
-  **Inbox** dashboard page + sidebar badge (`apps/dashboard/src/pages/Inbox.tsx`, pure
-  `inbox.ts`) renders the prioritized, grouped queue; every action reuses an existing route
-  (open-approval / retry / reopen[-and-run] / diagnose / investigate / continue / inspect) — **no new
-  authority, no auto-run**. Honest empty state + bounded `truncated` flag. Delivers
-  `relix-dashboard-design.md` §5 / §6.11. `cargo test` + `clippy` clean on `relux-kernel`; dashboard
-  `tsc`/`npm test` green (527); `dashboard-dist` rebuilt. Not yet packaged into a release.
+- **v0.1.29** (2026-06-12) — **recovery + Cross-Guild Inbox** rollup. The `relux-kernel` / `relux-core`
+  crates move `0.1.28` → `0.1.29` in lockstep, packaging the whole post-v0.1.28 line per
+  `docs/relix-dashboard-design.md` §6.6–§6.11 and `relix-execution-and-issue-design.md` §3.3b. (1) **Safe
+  task reparenting v1** (`POST /v1/relux/tasks/:id/parent`, the create-path exist / namespace / cycle
+  validation reused, structural only, compact Move-under… / Remove-parent control whose candidates exclude
+  self + descendants client-side). (2) **Drag-to-column status movement v1** — drag a Work card onto a
+  column to Block / Cancel, validated and additive. (3) **Keyboard-accessible board movement v1** — a
+  descriptive `aria-label` + visible helper on the status-move select, an honest reason for finished tasks.
+  (4) **Reopen-blocked-work v1** — re-queue a blocked task as a run-lifecycle action (`POST
+  /v1/relux/tasks/:id/reopen`), not a status decree, validated + eligibility-gated; plus **one-click Reopen
+  & run** that chains the re-queue into the assigned-run path through both existing gates. (5) **Recovery
+  decision cards v1** for failed / blocked work — a deterministic model (root cause + recommendation +
+  existing-route choices) with no new authority. (6) **Investigate with Prime v1** — seed the chat from a
+  recovery card with a safe, redacted diagnosis. (7) **Diagnostic narrative pass v1** — an explicit,
+  operator-triggered, **read-only** `POST /v1/relux/runs/:id/diagnose` (`run_diagnosis.rs` pure model) that
+  hands a bounded + redacted run context to the configured brain off-lock for a concise four-part narrative
+  (likely cause / evidence / next action / uncertainty), mutating nothing, gated to failed runs, with a
+  clean no-provider fallback and an inline result on the card. (8) **Cross-Guild Inbox v1** — a new
+  read-only `GET /v1/relux/inbox` projection (`server.rs::get_inbox`, sibling of `get_oversight`) composes
+  the whole Guild's attention items — pending approvals, hard-failed runs (**excluding** the ones silently
+  auto-retrying, per `relix-execution-and-issue-design.md` §3.3b), blocked tasks, and a paused Prime
+  continuation — into unified `InboxItem`s (stable id / kind / severity / title / summary / related ids /
+  recommended action kinds / link); a top-level **Inbox** page + sidebar badge
+  (`apps/dashboard/src/pages/Inbox.tsx`, pure `inbox.ts`) renders the prioritized queue, every action
+  reuses an existing route (open-approval / retry / reopen[-and-run] / diagnose / investigate / continue /
+  inspect) — **no new authority, no auto-run**. It also gained **inline approval decisions** in place,
+  honest logical-clock **ageing / SLA** buckets (fresh / waiting / stale / overdue; kernel has no
+  wall-clock, so age is kernel-event ticks), a URL-shareable **cross-Guild search / filter**, and
+  **cross-item subtree grouping** (collapse a stalled subtree into one card on the real `parent_task`
+  edge). All reads/writes hit real kernel state; honest empty states + bounded `truncated` flags. No
+  master-plan safety property is weakened. `cargo test` + `clippy` clean on `relux-core`/`relux-kernel`;
+  dashboard `tsc`/`npm test` green; `dashboard-dist` in sync. Every safety property from v0.1.28 holds.
 - **v0.1.28** (2026-06-12) — **dashboard Work-board oversight** rollup. The `relux-kernel` / `relux-core`
   crates move `0.1.27` → `0.1.28` in lockstep, packaging the post-v0.1.27 oversight line per
   `docs/relix-dashboard-design.md` §6.x: (1) **Board Oversight v1** — a composed `GET /v1/relux/oversight`
@@ -1892,19 +1912,9 @@ stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
   populated via `create_task_with_parent`); (5) **Work board status movement v1**
   (`POST /v1/relux/tasks/:id/status`, settable-status allowlist + terminal guard, compact Block / Cancel
   control); (6) **per-subtree run / cost rollup v1** (pure client join `runrollup.ts`, honest "cost
-  unavailable" not a fake `$0`); (6b) **safe task reparenting v1** (`POST /v1/relux/tasks/:id/parent`,
-  the create-path exist/namespace/cycle validation reused, structural only, compact Move-under… /
-  Remove-parent control whose candidates exclude self + descendants client-side); (7) **dashboard route +
-  dependency-free live-browser click smokes** (Relux
-  Approvals rebuilt on the B&W design system, per-route render smoke); (8) the post-v0.1.28 **recovery
-  line** (`docs/relix-dashboard-design.md` §6.8–§6.10; `relix-execution-and-issue-design.md` §3.3b):
-  keyboard-accessible board movement, reopen-blocked-work + one-click Reopen & run, the **recovery
-  decision cards** (deterministic root cause + recommendation + existing-route choices), **Investigate
-  with Prime** (a safe redacted chat seed), and the **diagnostic narrative pass** — an explicit,
-  operator-triggered, **read-only** `POST /v1/relux/runs/:id/diagnose` (`run_diagnosis.rs` pure model)
-  that hands a bounded + redacted run context to the configured brain off-lock for a concise four-part
-  narrative (likely cause / evidence / next action / uncertainty), mutating nothing, gated to failed
-  runs, with a clean no-provider fallback and an inline result on the card. All reads/writes hit real kernel
+  unavailable" not a fake `$0`); and (7) **dashboard route + dependency-free live-browser click smokes**
+  (Relux Approvals rebuilt on the B&W design system, per-route render smoke). (The post-tag reparenting +
+  recovery + Inbox line rolled up into **v0.1.29**, below.) All reads/writes hit real kernel
   state. No master-plan safety property is weakened. `cargo test` + `clippy` clean on
   `relux-core`/`relux-kernel`; dashboard green; `dashboard-dist` in sync. Every safety property from v0.1.27
   holds.
