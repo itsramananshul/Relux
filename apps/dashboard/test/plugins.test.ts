@@ -79,6 +79,40 @@ test("an MCP server badge reflects only its config (configured vs disabled), nev
   assert.equal(off.variant, "muted");
 });
 
+// A discovered MCP tool flows through the SAME `toolReadiness` classifier a plugin
+// tool uses, keyed off the kernel's `executable`. An unclassified MCP tool is
+// `needs_approval` (gated, but can request a per-call approval); a classified
+// low-risk + auto-approve tool is `ready` (directly invocable). This pins the
+// invoke-surface integration so a regression (a gated MCP tool shown runnable, or
+// a ready one shown as "not callable") fails loudly.
+function mcpTool(over = {}) {
+  return tool({
+    plugin_id: "mcp:fs-helper",
+    tool_name: "search",
+    permission: "tool:mcp-fs-helper:search",
+    source_kind: "Mcp",
+    risk: "medium",
+    executable: "needs_approval",
+    ...over,
+  });
+}
+
+test("an unclassified MCP tool is gated (needs approval), never directly runnable", () => {
+  const r = toolReadiness(mcpTool());
+  assert.equal(r.runnable, false);
+  assert.equal(r.canRequestApproval, true);
+  assert.equal(r.label, "needs approval");
+  assert.equal(isRunnableTool(mcpTool()), false);
+});
+
+test("a classified low-risk auto-approve MCP tool is ready to invoke directly", () => {
+  const r = toolReadiness(mcpTool({ executable: "ready", risk: "low" }));
+  assert.equal(r.runnable, true);
+  assert.equal(r.canRequestApproval, false);
+  assert.equal(r.label, "ready");
+  assert.equal(isRunnableTool(mcpTool({ executable: "ready" })), true);
+});
+
 test("a generated wrapper is categorized as a wrapper regardless of kind", () => {
   assert.equal(pluginCategory(plugin({ generated: true })), "wrapper");
   assert.equal(pluginCategory(plugin({ generated: true, kind: "ToolSet" })), "wrapper");

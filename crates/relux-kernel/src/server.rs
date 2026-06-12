@@ -251,7 +251,10 @@ async fn serve() -> Result<(), KernelError> {
     println!("   GET    /v1/relux/mcp/servers               (registered MCP servers — loopback HTTP discovery)");
     println!("   POST   /v1/relux/mcp/servers              {{ \"id\":\"...\", \"endpoint\":\"http://127.0.0.1:<port>/mcp\", \"description\"?, \"enabled\"?, \"timeout_ms\"? }}");
     println!("   DELETE /v1/relux/mcp/servers/:id           (remove an MCP server)");
-    println!("   GET    /v1/relux/mcp/servers/:id/tools     (live tools/list discovery; MCP tools are not callable yet)");
+    println!("   GET    /v1/relux/mcp/servers/:id/tools     (live tools/list discovery → ToolDescriptor[])");
+    println!("   PUT    /v1/relux/mcp/servers/:id/tools/:tool/classification  {{ \"risk\":\"low|medium|high|critical\", \"approval\":\"never|required\" }}");
+    println!("   DELETE /v1/relux/mcp/servers/:id/tools/:tool/classification  (revert to the gated default)");
+    println!("          (MCP tools invoke through /v1/relux/tools/invoke etc. with plugin_id \"mcp:<server>\")");
 
     // Start background autonomy loop
     let background_state = state.clone();
@@ -537,6 +540,12 @@ fn protected_router() -> Router<AppState> {
         )
         .route("/v1/relux/mcp/servers/:id", delete(delete_mcp_server))
         .route("/v1/relux/mcp/servers/:id/tools", get(mcp_server_tools))
+        .route(
+            "/v1/relux/mcp/servers/:id/tools/:tool/classification",
+            put(set_mcp_tool_classification)
+                .patch(set_mcp_tool_classification)
+                .delete(clear_mcp_tool_classification),
+        )
         // Relux Approvals and Permissions
         .route("/v1/relux/approvals", get(list_approvals))
         .route("/v1/relux/approvals/:id/decide", post(decide_approval))
@@ -5955,6 +5964,10 @@ struct McpServerResponse {
     /// `configured` (enabled) or `disabled`. Reachability is dynamic — see the
     /// per-server tools endpoint.
     status: String,
+    /// Operator-set per-tool risk/approval classifications, keyed by MCP tool name.
+    /// Empty when no tool has been classified (every tool then uses the fail-closed
+    /// default: Medium + Required → gated).
+    tool_overrides: std::collections::BTreeMap<String, relux_core::McpToolClassification>,
 }
 
 impl McpServerResponse {
@@ -5967,6 +5980,7 @@ impl McpServerResponse {
             enabled: c.enabled,
             timeout_ms: c.timeout_ms,
             status: c.status_str().to_string(),
+            tool_overrides: c.tool_overrides.clone(),
         }
     }
 }
@@ -6037,7 +6051,9 @@ async fn delete_mcp_server(
 /// The live discovery response for one MCP server. Honest by construction: on a
 /// transport/protocol failure the route surfaces the error (HTTP 4xx/5xx via
 /// [`ApiError`]); a successful probe returns the discovered tools as
-/// [`relux_core::ToolDescriptor`]s (all `not_implemented` in v1).
+/// [`relux_core::ToolDescriptor`]s. Each tool's `executable` reflects its operator
+/// classification: an unclassified tool is `needs_approval` (gated), a low-risk
+/// auto-approve tool is `ready` (directly callable through the tool-invoke gates).
 #[derive(Debug, Serialize)]
 struct McpToolsResponse {
     server_id: String,
@@ -6065,6 +6081,55 @@ async fn mcp_server_tools(
         reachable: true,
         tools,
     }))
+}
+
+/// The operator-set risk/approval classification for one MCP tool. Accepts the
+/// native serde shapes: `risk` is `"low"|"medium"|"high"|"critical"`; `approval`
+/// is `"never"|"required"|{"required_when_risk":"<level>"}`.
+#[derive(Debug, Deserialize)]
+struct McpToolClassificationReq {
+    risk: relux_core::RiskLevel,
+    approval: relux_core::ApprovalRequirement,
+}
+
+/// PUT/PATCH `/v1/relux/mcp/servers/:id/tools/:tool/classification` — set the risk +
+/// approval for one discovered MCP tool, so it can become directly runnable
+/// (low + never) or stay gated behind approval. Unknown server → 404; an invalid
+/// tool name → 400. Returns the updated server config.
+async fn set_mcp_tool_classification(
+    State(state): State<AppState>,
+    AxumPath((id, tool)): AxumPath<(String, String)>,
+    Json(req): Json<McpToolClassificationReq>,
+) -> Result<Json<McpServerResponse>, ApiError> {
+    let id = id.trim().to_string();
+    let tool = tool.trim().to_string();
+    if id.is_empty() || tool.is_empty() {
+        return Err(ApiError::bad_request("server id and tool name are required"));
+    }
+    let resp = locked_save(&state, |kernel| {
+        let cfg = kernel.set_mcp_tool_classification(&id, &tool, req.risk, req.approval)?;
+        Ok(McpServerResponse::from_config(&cfg))
+    })?;
+    Ok(Json(resp))
+}
+
+/// DELETE `/v1/relux/mcp/servers/:id/tools/:tool/classification` — clear a tool's
+/// classification, reverting it to the fail-closed default (gated). Unknown server
+/// → 404. Returns the updated server config.
+async fn clear_mcp_tool_classification(
+    State(state): State<AppState>,
+    AxumPath((id, tool)): AxumPath<(String, String)>,
+) -> Result<Json<McpServerResponse>, ApiError> {
+    let id = id.trim().to_string();
+    let tool = tool.trim().to_string();
+    if id.is_empty() || tool.is_empty() {
+        return Err(ApiError::bad_request("server id and tool name are required"));
+    }
+    let resp = locked_save(&state, |kernel| {
+        let cfg = kernel.clear_mcp_tool_classification(&id, &tool)?;
+        Ok(McpServerResponse::from_config(&cfg))
+    })?;
+    Ok(Json(resp))
 }
 
 // --- Store access (serialized) ---------------------------------------------
@@ -6622,6 +6687,8 @@ fn status_for(err: &KernelError) -> StatusCode {
         // (bad gateway) failure, surfaced honestly rather than as a fake empty list.
         KernelError::McpServerDisabled(_) => StatusCode::CONFLICT,
         KernelError::McpDiscoveryFailed { .. } => StatusCode::BAD_GATEWAY,
+        // An invalid MCP tool name (classification or invocation) is bad input.
+        KernelError::InvalidMcpToolName { .. } => StatusCode::BAD_REQUEST,
         // A configured tool that requires approval cannot be invoked directly yet:
         // a conflict the operator resolves by lowering risk / enabling auto-approve,
         // or by requesting a per-call approval.
@@ -8811,6 +8878,59 @@ mod tests {
         let (_, _, body) = call(&state, "GET", "/v1/relux/mcp/servers", None, None).await;
         let list: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(list.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_classification_route_sets_and_clears() {
+        let (state, _dir) = auth_state(true);
+        // Register a server.
+        let (status, _, _) = call(
+            &state,
+            "POST",
+            "/v1/relux/mcp/servers",
+            None,
+            Some(r#"{"id":"fs","endpoint":"http://127.0.0.1:8000/mcp"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Classify a tool Low + auto-approve.
+        let (status, _, body) = call(
+            &state,
+            "PUT",
+            "/v1/relux/mcp/servers/fs/tools/search/classification",
+            None,
+            Some(r#"{"risk":"low","approval":"never"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "classify body: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["tool_overrides"]["search"]["risk"], "low");
+        assert_eq!(v["tool_overrides"]["search"]["approval"], "never");
+
+        // Classifying an unknown server is a 404.
+        let (status, _, _) = call(
+            &state,
+            "PUT",
+            "/v1/relux/mcp/servers/ghost/tools/search/classification",
+            None,
+            Some(r#"{"risk":"low","approval":"never"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Clear it → reverts to the gated default (no override row).
+        let (status, _, body) = call(
+            &state,
+            "DELETE",
+            "/v1/relux/mcp/servers/fs/tools/search/classification",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v["tool_overrides"].as_object().map(|o| o.is_empty()).unwrap_or(true));
     }
 
     /// Write a fake CLI that prints `output` and exits 0 (cross-platform), used to

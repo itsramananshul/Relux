@@ -159,7 +159,9 @@ pub use prime_write_tools::{
     BrainRunOrchestration, BrainRunStart, ParsedWriteTool, WriteTool, WriteToolSlot, WRITE_TOOLS,
     WRITE_TOOL_CONFIDENCE,
 };
-pub use mcp::{discover_tools as discover_mcp_tools, McpClientError};
+pub use mcp::{
+    call_tool as call_mcp_tool, discover_tools as discover_mcp_tools, McpClientError,
+};
 pub use runtime::{invoke_http_loopback, RuntimeClientError};
 pub use state::{
     run_briefs_in_parallel, run_briefs_in_parallel_streaming, AppliedProposedChange,
@@ -330,4 +332,6 @@ pub enum KernelError {
     McpServerDisabled(String),
     #[error("MCP discovery against server '{id}' failed: {message}")]
     McpDiscoveryFailed { id: String, message: String },
+    #[error("invalid MCP tool name '{tool}' for server '{server}' (must be [A-Za-z0-9._-], non-empty, bounded)")]
+    InvalidMcpToolName { server: String, tool: String },
 }

@@ -2831,13 +2831,23 @@ export const reluxTools = {
   }) => api.post<ReluxApproval>("/v1/relux/tools/request-approval", body),
 };
 
-// -- Relux MCP servers (loopback HTTP discovery — MCP v1) -------------------
+// -- Relux MCP servers (loopback HTTP discovery + invocation) ---------------
 // Operator-curated Model Context Protocol servers, loopback-ONLY. Relux lists
 // registered servers and runs a live `tools/list` discovery against an enabled
 // one. The config carries NO secrets — only the id, the loopback endpoint, a
-// description, the enabled flag, and the per-call timeout. MCP tool INVOCATION is
-// not wired into the agent tool-call path yet: discovered tools are listed with an
-// honest `not_implemented` status ("discovered, not callable yet").
+// description, the enabled flag, the per-call timeout, and per-tool risk/approval
+// classifications. MCP tool INVOCATION now routes through the SAME tool-invoke
+// gates as a plugin tool (permission, risk/approval, per-call approval, persistent
+// grant, audit) using `plugin_id = "mcp:<server>"`. An unclassified tool defaults
+// to gated (`needs_approval`); the operator classifies it to make it runnable.
+
+// One MCP tool's operator-set risk + approval classification.
+export interface McpToolClassification {
+  risk: "low" | "medium" | "high" | "critical";
+  // "never" (directly runnable) | "required" (always gated) |
+  // { required_when_risk: "<level>" }.
+  approval: "never" | "required" | { required_when_risk: string };
+}
 
 export interface ReluxMcpServer {
   id: string;
@@ -2848,11 +2858,15 @@ export interface ReluxMcpServer {
   timeout_ms: number;
   // "configured" (enabled) | "disabled". Reachability is dynamic — see `tools`.
   status: string;
+  // Operator-set per-tool classifications, keyed by tool name. Empty when no tool
+  // has been classified (each then uses the gated default: Medium + Required).
+  tool_overrides: Record<string, McpToolClassification>;
 }
 
 // The live discovery result for one server. `reachable` is true only when the
-// `tools/list` probe succeeded; the tools reuse the standard ToolDescriptor shape
-// (all `not_implemented` in v1).
+// `tools/list` probe succeeded; the tools reuse the standard ToolDescriptor shape.
+// Each tool's `executable` reflects its classification: `needs_approval` when
+// unclassified/gated, `ready` when classified low-risk + auto-approve.
 export interface ReluxMcpToolsResult {
   server_id: string;
   reachable: boolean;
@@ -2864,6 +2878,7 @@ export const reluxMcp = {
   list: () => api.get<ReluxMcpServer[]>("/v1/relux/mcp/servers"),
   // Register or update (upsert by id) a server. The endpoint is validated as
   // loopback-only server-side; a remote/https endpoint is refused (HTTP 400).
+  // Existing per-tool classifications are preserved on a re-register.
   register: (body: {
     id: string;
     endpoint: string;
@@ -2882,6 +2897,23 @@ export const reluxMcp = {
   tools: (id: string) =>
     api.get<ReluxMcpToolsResult>(
       `/v1/relux/mcp/servers/${encodeURIComponent(id)}/tools`,
+    ),
+  // Set the risk + approval classification for one discovered tool, so it can
+  // become directly runnable (low + never) or stay gated. 404 unknown server ·
+  // 400 invalid tool name. Returns the updated server config.
+  setClassification: (
+    id: string,
+    tool: string,
+    body: McpToolClassification,
+  ) =>
+    api.put<ReluxMcpServer>(
+      `/v1/relux/mcp/servers/${encodeURIComponent(id)}/tools/${encodeURIComponent(tool)}/classification`,
+      body,
+    ),
+  // Clear a tool's classification, reverting it to the gated default.
+  clearClassification: (id: string, tool: string) =>
+    api.del<ReluxMcpServer>(
+      `/v1/relux/mcp/servers/${encodeURIComponent(id)}/tools/${encodeURIComponent(tool)}/classification`,
     ),
 };
 

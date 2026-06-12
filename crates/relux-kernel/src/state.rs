@@ -1032,8 +1032,10 @@ impl KernelState {
     // `docs/RELUX_MASTER_PLAN.md` §8.2/§18, `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §9,
     // `docs/mcp.md`. The kernel registers operator-curated, loopback-only MCP
     // servers and runs a live `tools/list` against an enabled one. No secrets are
-    // stored; MCP tool INVOCATION is not wired into the agent tool-call path yet
-    // (discovered tools surface as `NotImplemented`, honestly "not callable yet").
+    // stored. MCP tool INVOCATION routes through the SAME tool-invoke gates as a
+    // plugin tool (permission / risk-approval / per-call / grant / audit), under
+    // `plugin_id = "mcp:<server>"`; a discovered tool's executable state is driven by
+    // its operator classification (gated by default until classified).
 
     /// Register (or replace) an MCP server. The id + loopback endpoint are validated
     /// with the same loopback-only rule as the plugin runtime; the description is
@@ -1048,6 +1050,13 @@ impl KernelState {
         timeout_ms: Option<u64>,
     ) -> Result<relux_core::McpServerConfig, KernelError> {
         let id = id.trim().to_string();
+        // Upsert preserves any operator-set per-tool classifications so re-pointing a
+        // server's endpoint/description does not silently reset its tools' risk.
+        let tool_overrides = self
+            .mcp_servers
+            .get(&id)
+            .map(|existing| existing.tool_overrides.clone())
+            .unwrap_or_default();
         let config = relux_core::McpServerConfig {
             id: id.clone(),
             transport: relux_core::McpTransport::HttpLoopback,
@@ -1058,6 +1067,7 @@ impl KernelState {
             ),
             enabled,
             timeout_ms: relux_core::clamp_mcp_timeout(timeout_ms),
+            tool_overrides,
         };
         relux_core::validate_mcp_server_config(&config).map_err(|e| {
             KernelError::InvalidMcpConfig {
@@ -1144,10 +1154,11 @@ impl KernelState {
     /// Honest by construction: an unknown server is [`KernelError::UnknownMcpServer`];
     /// a disabled one is [`KernelError::McpServerDisabled`]; a transport/protocol
     /// failure is [`KernelError::McpDiscoveryFailed`] (never a fabricated empty
-    /// list). Discovered tools are listed as
-    /// [`ToolExecutability::NotImplemented`] — MCP tool invocation is not wired into
-    /// the agent tool-call path yet (`docs/mcp.md`). Read-only: it performs a bounded
-    /// loopback network call but mutates no kernel state.
+    /// list). Each discovered tool's executable state is driven by its
+    /// [`relux_core::McpToolClassification`]: `needs_approval` until the operator
+    /// classifies it, `ready` once classified low-risk + auto-approve. Invocation
+    /// itself routes through the standard tool-invoke gates (`docs/mcp.md`).
+    /// Read-only: it performs a bounded loopback network call but mutates no state.
     pub fn discover_mcp_tools(&self, id: &str) -> Result<Vec<ToolDescriptor>, KernelError> {
         let server = self
             .mcp_servers
@@ -1180,26 +1191,143 @@ impl KernelState {
                         findings.join("; ")
                     );
                 }
+                // The tool's risk + approval come from the operator's classification
+                // (or the fail-closed default: Medium + Required). The SAME
+                // `approval_blocks_direct_invocation` predicate that gates real
+                // plugin tools decides whether this MCP tool is directly runnable or
+                // gated behind approval — so an unclassified tool reads as
+                // `needs_approval`, never auto-runnable.
+                let classification = server.tool_classification(&tool.name);
+                let executable = if approval_blocks_direct_invocation(
+                    &classification.approval,
+                    &classification.risk,
+                ) {
+                    ToolExecutability::NeedsApproval
+                } else {
+                    // Low-risk + auto-approve: directly invocable. The MCP server
+                    // (enabled, loopback) IS the runtime; the invoke path still
+                    // permission-checks the calling agent.
+                    ToolExecutability::Ready
+                };
                 ToolDescriptor {
                     permission: relux_core::mcp_tool_permission(id, &tool.name),
                     plugin_id: plugin_id.clone(),
                     tool_name: tool.name,
                     description: tool.description,
-                    // Conservative default: an MCP tool's real risk is unknown, so it
-                    // is listed as Medium (and, once invocation lands, would gate
-                    // behind approval until the operator classifies it).
-                    risk: relux_core::RiskLevel::Medium,
+                    risk: classification.risk,
                     source_kind: "Mcp".to_string(),
                     installed: true,
                     enabled: server.enabled,
                     protected: false,
-                    // Honest: discovery is live, but invocation is not wired yet.
-                    executable: ToolExecutability::NotImplemented,
+                    executable,
                 }
             })
             .collect();
         out.sort_by(|a, b| a.tool_name.cmp(&b.tool_name));
         Ok(out)
+    }
+
+    /// Set (or replace) the operator's risk + approval classification for ONE MCP
+    /// tool, so a discovered tool can become directly runnable (Low + auto-approve)
+    /// or stay gated. The server must exist and the tool name must be a safe
+    /// identifier ([`relux_core::is_valid_mcp_tool_name`]). Persisted on the server
+    /// config and audited. This is the MCP analogue of declaring a `ToolDefinition`
+    /// risk/approval, and the same `approval_blocks_direct_invocation` predicate
+    /// then decides whether the tool gates.
+    pub fn set_mcp_tool_classification(
+        &mut self,
+        server_id: &str,
+        tool_name: &str,
+        risk: relux_core::RiskLevel,
+        approval: relux_core::ApprovalRequirement,
+    ) -> Result<relux_core::McpServerConfig, KernelError> {
+        if !relux_core::is_valid_mcp_tool_name(tool_name) {
+            return Err(KernelError::InvalidMcpToolName {
+                server: server_id.to_string(),
+                tool: tool_name.to_string(),
+            });
+        }
+        let server = self
+            .mcp_servers
+            .get_mut(server_id)
+            .ok_or_else(|| KernelError::UnknownMcpServer(server_id.to_string()))?;
+        server.tool_overrides.insert(
+            tool_name.to_string(),
+            relux_core::McpToolClassification {
+                risk: risk.clone(),
+                approval: approval.clone(),
+            },
+        );
+        let server = server.clone();
+        self.record_audit(
+            "kernel",
+            "kernel",
+            "mcp:tool_classify",
+            Some("mcp_tool"),
+            Some(tool_name),
+            None,
+            AuditResult::Success,
+            serde_json::json!({
+                "server": server_id,
+                "risk": format!("{risk:?}"),
+                "approval": format!("{approval:?}"),
+            }),
+        );
+        Ok(server)
+    }
+
+    /// Remove an MCP tool's operator classification, reverting it to the fail-closed
+    /// default (Medium + Required → gated). The server must exist; clearing an
+    /// unclassified tool is a no-op success. Audited.
+    pub fn clear_mcp_tool_classification(
+        &mut self,
+        server_id: &str,
+        tool_name: &str,
+    ) -> Result<relux_core::McpServerConfig, KernelError> {
+        let server = self
+            .mcp_servers
+            .get_mut(server_id)
+            .ok_or_else(|| KernelError::UnknownMcpServer(server_id.to_string()))?;
+        server.tool_overrides.remove(tool_name);
+        let server = server.clone();
+        self.record_audit(
+            "kernel",
+            "kernel",
+            "mcp:tool_unclassify",
+            Some("mcp_tool"),
+            Some(tool_name),
+            None,
+            AuditResult::Success,
+            serde_json::json!({ "server": server_id }),
+        );
+        Ok(server)
+    }
+
+    /// If `plugin_id` is an MCP synthetic plugin id (`mcp:<server>`), the registered
+    /// server config, else `None`. This is the single chokepoint the tool-invocation
+    /// gates use to recognise an MCP tool: every gate first asks "is this an MCP
+    /// plugin?" and, if so, resolves permission/risk/approval/runtime from the MCP
+    /// server config instead of an installed plugin manifest.
+    fn mcp_server_for_plugin(&self, plugin_id: &PluginId) -> Option<&relux_core::McpServerConfig> {
+        let server_id = plugin_id.as_str().strip_prefix("mcp:")?;
+        self.mcp_servers.get(server_id)
+    }
+
+    /// The risk level a tool's per-call approval / persistent grant snapshots.
+    /// MCP-aware: a `mcp:<server>` tool uses the operator's classification (or the
+    /// fail-closed default Medium); a real plugin tool uses its manifest-declared
+    /// risk, defaulting to High when the plugin/tool cannot be resolved (fail
+    /// closed). Shared by [`request_tool_invocation_approval`](Self::request_tool_invocation_approval)
+    /// and [`grant_persistent_tool_invocation`](Self::grant_persistent_tool_invocation).
+    fn tool_risk_for(&self, plugin_id: &PluginId, tool_name: &str) -> RiskLevel {
+        if let Some(server) = self.mcp_server_for_plugin(plugin_id) {
+            return server.tool_classification(tool_name).risk;
+        }
+        self.plugins
+            .get(plugin_id)
+            .and_then(|m| m.capabilities.tools.iter().find(|t| t.name == tool_name))
+            .map(|t| t.risk.clone())
+            .unwrap_or(RiskLevel::High)
     }
 
     // --- Adapter runtime config (local CLI adapters) -----------------------
@@ -3740,6 +3868,32 @@ impl KernelState {
             .ok_or_else(|| KernelError::UnknownAgent(agent_id.to_string()))?
             .namespace_id
             .clone();
+        // MCP tool (`mcp:<server>`): the required permission is the derived
+        // `tool:mcp-<server>:<verb>`. The server must be registered and the tool name
+        // must be a safe identifier; resolution never touches the plugin manifest map.
+        if plugin_id.as_str().starts_with("mcp:") {
+            let server = self.mcp_server_for_plugin(plugin_id).ok_or_else(|| {
+                KernelError::UnknownMcpServer(
+                    plugin_id
+                        .as_str()
+                        .strip_prefix("mcp:")
+                        .unwrap_or(plugin_id.as_str())
+                        .to_string(),
+                )
+            })?;
+            if !relux_core::is_valid_mcp_tool_name(tool_name) {
+                return Err(KernelError::InvalidMcpToolName {
+                    server: server.id.clone(),
+                    tool: tool_name.to_string(),
+                });
+            }
+            let required = Permission::new(relux_core::mcp_tool_permission(&server.id, tool_name))
+                .map_err(|e| KernelError::InvalidMcpToolName {
+                    server: server.id.clone(),
+                    tool: format!("{tool_name}: {e}"),
+                })?;
+            return Ok((namespace, required));
+        }
         let manifest = self
             .plugins
             .get(plugin_id)
@@ -3765,6 +3919,12 @@ impl KernelState {
     /// resolution already failed it). Bundled tools declare `Never`, so this never
     /// changes their behavior.
     fn tool_needs_approval(&self, plugin_id: &PluginId, tool_name: &str) -> bool {
+        // MCP tool: gate on the operator's classification (default Medium + Required
+        // → always gated until classified).
+        if let Some(server) = self.mcp_server_for_plugin(plugin_id) {
+            let c = server.tool_classification(tool_name);
+            return approval_blocks_direct_invocation(&c.approval, &c.risk);
+        }
         self.plugins
             .get(plugin_id)
             .and_then(|m| m.capabilities.tools.iter().find(|t| t.name == tool_name))
@@ -3802,6 +3962,29 @@ impl KernelState {
         tool_name: &str,
         input: &serde_json::Value,
     ) -> Result<serde_json::Value, KernelError> {
+        // MCP tool (`mcp:<server>`): route to the loopback MCP `tools/call` client.
+        // The server must exist + be enabled; the tool name is re-validated (defense
+        // in depth); the loopback endpoint is re-validated on every call inside the
+        // client. The result is the SHAPED, sanitized value — never the raw MCP
+        // envelope. Arbitrary downloaded code is never run — only the operator's
+        // own loopback MCP server is dialed.
+        if let Some(server) = self.mcp_server_for_plugin(plugin_id) {
+            if !server.enabled {
+                return Err(KernelError::McpServerDisabled(server.id.clone()));
+            }
+            if !relux_core::is_valid_mcp_tool_name(tool_name) {
+                return Err(KernelError::InvalidMcpToolName {
+                    server: server.id.clone(),
+                    tool: tool_name.to_string(),
+                });
+            }
+            return crate::mcp::call_tool(&server.endpoint, tool_name, input, server.timeout_ms)
+                .map_err(|e| KernelError::ToolRuntimeInvocation {
+                    plugin: plugin_id.to_string(),
+                    tool: tool_name.to_string(),
+                    message: e.to_string(),
+                });
+        }
         if let Some(output) = self.builtin_tool_output(plugin_id.as_str(), tool_name, input) {
             return Ok(output);
         }
@@ -4986,12 +5169,7 @@ impl KernelState {
             });
         }
 
-        let risk = self
-            .plugins
-            .get(plugin_id)
-            .and_then(|m| m.capabilities.tools.iter().find(|t| t.name == tool_name))
-            .map(|t| t.risk.clone())
-            .unwrap_or(RiskLevel::High);
+        let risk = self.tool_risk_for(plugin_id, tool_name);
         let args_sha256 = sha256_hex(&body);
         let args_preview = redact_args_for_preview(&input);
 
@@ -5196,6 +5374,25 @@ impl KernelState {
         plugin_id: &PluginId,
         tool_name: &str,
     ) -> Option<String> {
+        // MCP tool: the grant must match the derived permission + the operator's
+        // classified risk EXACTLY, same fail-closed re-check as a plugin tool.
+        if let Some(server) = self.mcp_server_for_plugin(plugin_id) {
+            let permission = relux_core::mcp_tool_permission(&server.id, tool_name);
+            let risk = server.tool_classification(tool_name).risk;
+            return self
+                .persistent_grants
+                .values()
+                .find(|g| {
+                    g.authorizes_invocation(
+                        subject,
+                        plugin_id.as_str(),
+                        tool_name,
+                        &permission,
+                        &risk,
+                    )
+                })
+                .map(|g| g.id.clone());
+        }
         let tool = self
             .plugins
             .get(plugin_id)
@@ -5302,12 +5499,7 @@ impl KernelState {
             });
         }
 
-        let risk = self
-            .plugins
-            .get(plugin_id)
-            .and_then(|m| m.capabilities.tools.iter().find(|t| t.name == tool_name))
-            .map(|t| t.risk.clone())
-            .unwrap_or(RiskLevel::High);
+        let risk = self.tool_risk_for(plugin_id, tool_name);
 
         // Idempotent: an identical standing grant already covers this exact
         // invocation — return it rather than minting a duplicate row.
@@ -11323,8 +11515,290 @@ mod tests {
         assert_eq!(t.plugin_id, "mcp:fs");
         assert_eq!(t.permission, "tool:mcp-fs:search");
         assert_eq!(t.source_kind, "Mcp");
-        // Honest: discovered, but invocation is not wired yet.
-        assert_eq!(t.executable, ToolExecutability::NotImplemented);
+        // An unclassified MCP tool is gated behind approval (Medium + Required),
+        // never directly runnable, until the operator classifies it.
+        assert_eq!(t.executable, ToolExecutability::NeedsApproval);
+        assert_eq!(t.risk, relux_core::RiskLevel::Medium);
+
+        // Classify it Low + auto-approve → it becomes directly runnable (`ready`).
+        k.set_mcp_tool_classification(
+            "fs",
+            "search",
+            relux_core::RiskLevel::Low,
+            relux_core::ApprovalRequirement::Never,
+        )
+        .unwrap();
+        // Re-discover requires another live probe; spin up a fresh mock for the
+        // re-run is overkill — assert the executable mapping via a fresh descriptor
+        // build is covered by the invocation tests below. Here just assert the
+        // classification persisted on the config.
+        assert!(k.mcp_server("fs").unwrap().tool_overrides.contains_key("search"));
+    }
+
+    // --- MCP tool invocation (loopback tools/call through the gates) -----------
+    // `docs/mcp.md` "MCP tool invocation"; `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §9.
+    // These cover the FULL gate path: permission check, approval/risk gate, per-call
+    // approval, persistent grant bypass, disabled-server + bad-name refusal, and the
+    // no-raw-envelope contract — all through the SAME `invoke_tool` / approval / grant
+    // surface a real plugin tool uses.
+
+    /// Boot a mock loopback MCP server that answers `bodies` (raw JSON-RPC bodies)
+    /// one per request, wrapping each in an HTTP 200. Returns its loopback endpoint.
+    fn mock_mcp(bodies: Vec<String>) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let endpoint = format!("http://127.0.0.1:{}/mcp", addr.port());
+        thread::spawn(move || {
+            for body in bodies {
+                let Ok((mut sock, _)) = listener.accept() else { break };
+                let mut buf = [0u8; 4096];
+                let mut data = Vec::new();
+                let header_end = loop {
+                    if let Some(i) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break i + 4;
+                    }
+                    match sock.read(&mut buf) {
+                        Ok(0) => break data.len(),
+                        Ok(n) => data.extend_from_slice(&buf[..n]),
+                        Err(_) => break data.len(),
+                    }
+                };
+                let headers = String::from_utf8_lossy(&data[..header_end]).to_lowercase();
+                let clen = headers
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                while data.len() - header_end < clen {
+                    match sock.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => data.extend_from_slice(&buf[..n]),
+                        Err(_) => break,
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes());
+                let _: Result<(), _> = sock.flush();
+            }
+        });
+        endpoint
+    }
+
+    /// The three response bodies for one successful tools/call: initialize ack,
+    /// notifications/initialized ack, and a text-content result.
+    fn mcp_call_bodies(text: &str) -> Vec<String> {
+        vec![
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{}}}"#.to_string(),
+            "{}".to_string(),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":2,"result":{{"content":[{{"type":"text","text":"{text}"}}]}}}}"#
+            ),
+        ]
+    }
+
+    /// A primed kernel with an MCP server registered + Prime holding the MCP tool
+    /// permission. `bodies` seed the mock server's responses.
+    fn mcp_primed(bodies: Vec<String>) -> (KernelState, AgentId) {
+        let (mut k, prime, _t, _r, _e) = primed_kernel();
+        let endpoint = mock_mcp(bodies);
+        k.register_mcp_server("fs", &endpoint, "fs server", true, Some(2000))
+            .unwrap();
+        k.grant_permission_to_agent(&prime, Permission::new("tool:mcp-fs:search").unwrap())
+            .unwrap();
+        (k, prime)
+    }
+
+    #[test]
+    fn mcp_tool_unclassified_is_gated_even_with_permission() {
+        // Default classification (Medium + Required) gates the direct invoke path
+        // even though Prime holds the permission. No network call is made.
+        let (mut k, prime) = mcp_primed(vec![]);
+        let mcp = PluginId::new("mcp:fs");
+        let err = k
+            .invoke_tool(&prime, &mcp, "search", serde_json::json!({ "q": "x" }))
+            .unwrap_err();
+        assert!(matches!(err, KernelError::ToolRequiresApproval { .. }), "got {err:?}");
+        assert!(k.audit_log().iter().any(|e| e.action == "tool:mcp-fs:search"
+            && e.result == AuditResult::Denied));
+    }
+
+    #[test]
+    fn mcp_tool_denied_without_permission() {
+        // Even a directly-runnable (Low + Never) MCP tool is refused for an agent
+        // that does not hold its permission — the permission check runs first.
+        let (mut k, _prime) = mcp_primed(vec![]);
+        k.set_mcp_tool_classification(
+            "fs",
+            "search",
+            relux_core::RiskLevel::Low,
+            relux_core::ApprovalRequirement::Never,
+        )
+        .unwrap();
+        let ns = NamespaceId::new("workspace");
+        let adapter = PluginId::new("relux-adapter-local-prime");
+        let weak = k
+            .create_agent("weak", "Weak", "no perms", &adapter, &ns, None, vec![])
+            .unwrap();
+        let mcp = PluginId::new("mcp:fs");
+        let err = k
+            .invoke_tool(&weak, &mcp, "search", serde_json::json!({}))
+            .unwrap_err();
+        assert!(matches!(err, KernelError::PermissionDenied { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn mcp_tool_runs_through_gates_when_classified_runnable() {
+        let (mut k, prime) = mcp_primed(mcp_call_bodies("hello from mcp"));
+        k.set_mcp_tool_classification(
+            "fs",
+            "search",
+            relux_core::RiskLevel::Low,
+            relux_core::ApprovalRequirement::Never,
+        )
+        .unwrap();
+        let mcp = PluginId::new("mcp:fs");
+        let result = k
+            .invoke_tool(&prime, &mcp, "search", serde_json::json!({ "q": "files" }))
+            .expect("mcp invocation allowed");
+        // The output is the SHAPED result, never the raw JSON-RPC envelope.
+        assert_eq!(result.output, serde_json::json!({ "result": "hello from mcp" }));
+        assert!(result.output.get("jsonrpc").is_none());
+        assert_eq!(result.plugin_id, "mcp:fs");
+        assert_eq!(result.tool_name, "search");
+        assert_eq!(result.permission, "tool:mcp-fs:search");
+        // Audited via the invoke path.
+        assert!(k.audit_log().iter().any(|e| e.action == "tool:mcp-fs:search"
+            && e.result == AuditResult::Success
+            && e.metadata["via"] == "invoke"));
+    }
+
+    #[test]
+    fn mcp_tool_persistent_grant_bypasses_approval() {
+        // Default-gated tool + a standing allow-always grant → the direct invoke
+        // runs (and records a grant:use), without lowering the tool's risk.
+        let (mut k, prime) = mcp_primed(mcp_call_bodies("granted result"));
+        let mcp = PluginId::new("mcp:fs");
+        let grant = k
+            .grant_persistent_tool_invocation("op", &prime, &mcp, "search")
+            .expect("grant created");
+        let result = k
+            .invoke_tool(&prime, &mcp, "search", serde_json::json!({}))
+            .expect("invocation via grant");
+        assert_eq!(result.output, serde_json::json!({ "result": "granted result" }));
+        assert!(k.audit_log().iter().any(|e| e.action == "grant:use"
+            && e.metadata["grant"] == grant.id));
+    }
+
+    #[test]
+    fn mcp_tool_per_call_approval_executes_once() {
+        // Request a per-call approval (no network), approve it, then execute it —
+        // the stored snapshot runs through the loopback MCP server exactly once.
+        let (mut k, prime) = mcp_primed(mcp_call_bodies("approved call"));
+        let mcp = PluginId::new("mcp:fs");
+        let approval_id = k
+            .request_tool_invocation_approval("op", &prime, &mcp, "search", serde_json::json!({ "q": "y" }))
+            .expect("approval requested");
+        k.resolve_approval(&approval_id, true, "op", None).unwrap();
+        let result = k
+            .execute_approved_tool_invocation(&approval_id, "op")
+            .expect("execute approved");
+        assert_eq!(result.output, serde_json::json!({ "result": "approved call" }));
+        // A second execute is refused (consumed) — never runs twice on one approval.
+        let err = k
+            .execute_approved_tool_invocation(&approval_id, "op")
+            .unwrap_err();
+        assert!(matches!(err, KernelError::ToolInvocationConsumed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn mcp_tool_iserror_surfaces_as_runtime_failure() {
+        let bodies = vec![
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{}}}"#.to_string(),
+            "{}".to_string(),
+            r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"nope"}],"isError":true}}"#.to_string(),
+        ];
+        let (mut k, prime) = mcp_primed(bodies);
+        k.set_mcp_tool_classification(
+            "fs",
+            "search",
+            relux_core::RiskLevel::Low,
+            relux_core::ApprovalRequirement::Never,
+        )
+        .unwrap();
+        let mcp = PluginId::new("mcp:fs");
+        let err = k
+            .invoke_tool(&prime, &mcp, "search", serde_json::json!({}))
+            .unwrap_err();
+        assert!(matches!(err, KernelError::ToolRuntimeInvocation { .. }), "got {err:?}");
+        assert!(k.audit_log().iter().any(|e| e.action == "tool:mcp-fs:search"
+            && e.result == AuditResult::Failed));
+    }
+
+    #[test]
+    fn mcp_disabled_server_refuses_invocation() {
+        let (mut k, prime) = mcp_primed(vec![]);
+        k.set_mcp_tool_classification(
+            "fs",
+            "search",
+            relux_core::RiskLevel::Low,
+            relux_core::ApprovalRequirement::Never,
+        )
+        .unwrap();
+        k.set_mcp_server_enabled("fs", false).unwrap();
+        let mcp = PluginId::new("mcp:fs");
+        let err = k
+            .invoke_tool(&prime, &mcp, "search", serde_json::json!({}))
+            .unwrap_err();
+        assert!(matches!(err, KernelError::McpServerDisabled(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn mcp_unknown_server_and_bad_tool_name_refused() {
+        let (mut k, prime) = mcp_primed(vec![]);
+        // Unknown server id.
+        let unknown = PluginId::new("mcp:ghost");
+        let err = k
+            .invoke_tool(&prime, &unknown, "search", serde_json::json!({}))
+            .unwrap_err();
+        assert!(matches!(err, KernelError::UnknownMcpServer(_)), "got {err:?}");
+        // A bad tool name is refused before any dial.
+        let mcp = PluginId::new("mcp:fs");
+        let err = k
+            .invoke_tool(&prime, &mcp, "bad name", serde_json::json!({}))
+            .unwrap_err();
+        assert!(matches!(err, KernelError::InvalidMcpToolName { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn mcp_tool_classification_set_and_clear() {
+        let (mut k, _prime) = mcp_primed(vec![]);
+        let mcp = PluginId::new("mcp:fs");
+        // Default → gated.
+        assert!(k.tool_needs_approval(&mcp, "search"));
+        // Classify Low + Never → no longer gated.
+        k.set_mcp_tool_classification(
+            "fs",
+            "search",
+            relux_core::RiskLevel::Low,
+            relux_core::ApprovalRequirement::Never,
+        )
+        .unwrap();
+        assert!(!k.tool_needs_approval(&mcp, "search"));
+        // Clear → back to the gated default.
+        k.clear_mcp_tool_classification("fs", "search").unwrap();
+        assert!(k.tool_needs_approval(&mcp, "search"));
+        // Classifying with a bad tool name is refused.
+        assert!(matches!(
+            k.set_mcp_tool_classification("fs", "bad name", relux_core::RiskLevel::Low, relux_core::ApprovalRequirement::Never),
+            Err(KernelError::InvalidMcpToolName { .. })
+        ));
     }
 
     #[test]

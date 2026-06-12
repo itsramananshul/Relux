@@ -34,9 +34,9 @@
 //! - **Single-POST subset.** Each JSON-RPC request is its own `Connection: close`
 //!   POST. The `initialize` handshake runs first, then `tools/list`. A server that
 //!   requires session continuity ACROSS requests (e.g. a streamable-HTTP session
-//!   id) is not supported yet — its `tools/list` fails honestly with
+//!   id) is not supported yet — its `tools/list` / `tools/call` fails honestly with
 //!   [`McpClientError::ServerError`] / [`McpClientError::BadResponse`], never a
-//!   fabricated tool list. See `docs/mcp.md` for the next slice.
+//!   fabricated result. See `docs/mcp.md` for the next slice.
 //! - **Honest failures.** A connect failure, timeout, non-2xx status, oversized
 //!   body, invalid JSON, or a JSON-RPC `error` becomes a clear [`McpClientError`].
 
@@ -76,6 +76,8 @@ pub enum McpClientError {
     BadResponse(String),
     #[error("loopback MCP server reported a JSON-RPC error ({code}): {message}")]
     ServerError { code: i64, message: String },
+    #[error("loopback MCP tool reported an error: {0}")]
+    ToolCallError(String),
 }
 
 impl From<RuntimeClientError> for McpClientError {
@@ -127,6 +129,130 @@ pub fn discover_tools(endpoint: &str, timeout_ms: u64) -> Result<Vec<McpTool>, M
     // 3. tools/list — the real discovery call.
     let result = post_jsonrpc(endpoint, 2, "tools/list", &serde_json::json!({}), timeout_ms)?;
     parse_tools_list(&result)
+}
+
+/// Maximum characters of text kept from a `tools/call` result. The whole response
+/// body is already capped by [`crate::runtime::read_capped`]; this additionally
+/// bounds the model/operator-facing text so a large result never floods the UI.
+const MAX_MCP_CALL_TEXT_CHARS: usize = 20_000;
+
+/// Run the MCP `initialize` handshake, then `tools/call`, against the loopback
+/// `endpoint`, returning a **shaped, sanitized** result (never the raw JSON-RPC
+/// envelope) or an honest [`McpClientError`].
+///
+/// `endpoint` must already be a validated loopback URL; it is re-validated here on
+/// every call (defense in depth). `tool_name` is the MCP tool name and `arguments`
+/// is the operator-supplied JSON args object forwarded as the call's `arguments`.
+/// `timeout_ms` bounds connect, read, and write for each request independently.
+///
+/// The returned value mirrors Hermes' `tools/call` shaping
+/// (`reference/hermes-agent-main/tools/mcp_tool.py` L2334-2382): the result's text
+/// content blocks are concatenated into `result`, and any `structuredContent` is
+/// carried alongside. A result flagged `isError` becomes
+/// [`McpClientError::ToolCallError`] (the tool ran but reported failure), never a
+/// fabricated success. The raw `{ jsonrpc, id, result: { content: [...] } }`
+/// envelope is NEVER returned to the caller.
+pub fn call_tool(
+    endpoint: &str,
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    timeout_ms: u64,
+) -> Result<serde_json::Value, McpClientError> {
+    // Re-validate the loopback endpoint on every call (defense in depth).
+    let _ =
+        parse_loopback_url(endpoint).map_err(|e| McpClientError::InvalidEndpoint(e.to_string()))?;
+
+    // 1. initialize — required before any other method.
+    let init_params = serde_json::json!({
+        "protocolVersion": MCP_PROTOCOL_VERSION,
+        "capabilities": {},
+        "clientInfo": { "name": "relux", "version": env!("CARGO_PKG_VERSION") },
+    });
+    let _ = post_jsonrpc(endpoint, 1, "initialize", &init_params, timeout_ms)?;
+    // 2. notifications/initialized — best effort (carries no result).
+    let _ = post_notification(endpoint, "notifications/initialized", timeout_ms);
+
+    // 3. tools/call — forward { name, arguments }. An object that is not a JSON
+    //    object is wrapped under no key; the MCP spec expects an object, so a
+    //    non-object is sent as-is and the server validates it.
+    let params = serde_json::json!({ "name": tool_name, "arguments": arguments });
+    let result = post_jsonrpc(endpoint, 2, "tools/call", &params, timeout_ms)?;
+    shape_tool_call_result(&result)
+}
+
+/// Shape a raw `tools/call` JSON-RPC result into a bounded, sanitized value:
+/// `{ "result": <text>, "structuredContent"?: <json> }`. An `isError` result is an
+/// honest [`McpClientError::ToolCallError`]. Never returns the raw envelope.
+fn shape_tool_call_result(
+    result: &serde_json::Value,
+) -> Result<serde_json::Value, McpClientError> {
+    let is_error = result
+        .get("isError")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let text = extract_content_text(result.get("content"));
+    if is_error {
+        let message = if text.is_empty() {
+            "MCP tool returned an error".to_string()
+        } else {
+            text
+        };
+        return Err(McpClientError::ToolCallError(message));
+    }
+    let mut out = serde_json::Map::new();
+    out.insert("result".to_string(), serde_json::Value::String(text));
+    // structuredContent is machine-oriented JSON the tool may supply alongside the
+    // text. The whole body is already size-capped, so carry it through verbatim
+    // (it is a documented result field, not the JSON-RPC envelope).
+    if let Some(structured) = result.get("structuredContent") {
+        if !structured.is_null() {
+            out.insert("structuredContent".to_string(), structured.clone());
+        }
+    }
+    Ok(serde_json::Value::Object(out))
+}
+
+/// Concatenate the text of a `tools/call` result's `content` blocks (the model-
+/// oriented payload), sanitized and clamped. A non-text block (image/resource) is
+/// summarized as a `[non-text content: <type>]` marker rather than dropped or
+/// leaked. Mirrors Hermes' text collection in `mcp_tool.py`.
+fn extract_content_text(content: Option<&serde_json::Value>) -> String {
+    let Some(items) = content.and_then(|c| c.as_array()) else {
+        return String::new();
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for block in items {
+        if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+            parts.push(t.to_string());
+            continue;
+        }
+        let kind = block
+            .get("type")
+            .and_then(|k| k.as_str())
+            .unwrap_or("unknown");
+        parts.push(format!("[non-text content: {kind}]"));
+    }
+    sanitize_result_text(&parts.join("\n"), MAX_MCP_CALL_TEXT_CHARS)
+}
+
+/// Light sanitize of MCP result text: drop control characters except newline/tab
+/// (so legitimate multi-line text — file contents, logs — is preserved), then
+/// clamp to `max` characters. Unlike a description, a result is not collapsed to a
+/// single line.
+fn sanitize_result_text(s: &str, max: usize) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| {
+            if c == '\n' || c == '\t' {
+                c
+            } else if c.is_control() {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    cleaned.chars().take(max).collect()
 }
 
 /// Parse a `tools/list` JSON-RPC result into bounded, sanitized [`McpTool`]s.
@@ -479,5 +605,85 @@ mod tests {
             err,
             McpClientError::Connect(_) | McpClientError::Timeout
         ));
+    }
+
+    fn call_ok(result: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "jsonrpc": "2.0", "id": 2, "result": result })
+    }
+
+    #[test]
+    fn call_tool_shapes_text_content_and_forwards_args() {
+        let responses = vec![
+            http_json(init_ok()),
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_string(),
+            http_json(call_ok(serde_json::json!({
+                "content": [ { "type": "text", "text": "hello world" } ],
+                "isError": false
+            }))),
+        ];
+        let (endpoint, rx) = mock_server(responses);
+        let out = call_tool(&endpoint, "say", &serde_json::json!({ "name": "alice" }), 2_000)
+            .expect("call ok");
+        // Shaped result — NEVER the raw { jsonrpc, id, result } envelope.
+        assert_eq!(out, serde_json::json!({ "result": "hello world" }));
+        assert!(out.get("jsonrpc").is_none());
+        // The initialize + tools/call requests were seen; the call carries args.
+        let _init = rx.recv().unwrap();
+        let _notif = rx.recv().unwrap();
+        let call = rx.recv().unwrap();
+        assert!(call.contains("tools/call"), "call req: {call}");
+        assert!(call.contains("alice"), "call req carried args: {call}");
+    }
+
+    #[test]
+    fn call_tool_carries_structured_content() {
+        let responses = vec![
+            http_json(init_ok()),
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_string(),
+            http_json(call_ok(serde_json::json!({
+                "content": [ { "type": "text", "text": "ok" } ],
+                "structuredContent": { "count": 3 }
+            }))),
+        ];
+        let (endpoint, _rx) = mock_server(responses);
+        let out = call_tool(&endpoint, "count", &serde_json::json!({}), 2_000).unwrap();
+        assert_eq!(out["result"], "ok");
+        assert_eq!(out["structuredContent"], serde_json::json!({ "count": 3 }));
+    }
+
+    #[test]
+    fn call_tool_iserror_is_an_honest_failure() {
+        let responses = vec![
+            http_json(init_ok()),
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_string(),
+            http_json(call_ok(serde_json::json!({
+                "content": [ { "type": "text", "text": "boom" } ],
+                "isError": true
+            }))),
+        ];
+        let (endpoint, _rx) = mock_server(responses);
+        let err = call_tool(&endpoint, "explode", &serde_json::json!({}), 2_000).unwrap_err();
+        assert!(matches!(err, McpClientError::ToolCallError(m) if m.contains("boom")));
+    }
+
+    #[test]
+    fn call_tool_summarizes_non_text_content() {
+        let responses = vec![
+            http_json(init_ok()),
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_string(),
+            http_json(call_ok(serde_json::json!({
+                "content": [ { "type": "image", "data": "…", "mimeType": "image/png" } ]
+            }))),
+        ];
+        let (endpoint, _rx) = mock_server(responses);
+        let out = call_tool(&endpoint, "snap", &serde_json::json!({}), 2_000).unwrap();
+        assert_eq!(out["result"], "[non-text content: image]");
+    }
+
+    #[test]
+    fn call_tool_rejects_non_loopback_before_dialing() {
+        let err = call_tool("https://evil.example.com/mcp", "x", &serde_json::json!({}), 500)
+            .unwrap_err();
+        assert!(matches!(err, McpClientError::InvalidEndpoint(_)));
     }
 }

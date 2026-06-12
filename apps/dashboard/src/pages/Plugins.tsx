@@ -8,6 +8,7 @@ import {
   reluxTools,
   type ReluxAdapterStatus,
   type ReluxManifestTemplate,
+  type McpToolClassification,
   type ReluxMcpServer,
   type ReluxMcpToolsResult,
   type ReluxPlugin,
@@ -326,10 +327,12 @@ function McpServerRow({
 // The live discovery panel: runs `tools/list` against the loopback MCP server and
 // lists the discovered tools. Honest about every outcome — a disabled server, an
 // unreachable server, or a server that isn't speaking MCP each shows its real
-// reason, never a faked tool list. Discovered tools are explicitly labelled
-// "not callable yet" (the kernel reports them `not_implemented`).
+// reason, never a faked tool list. Each discovered tool shows its honest readiness
+// (`needs approval` until classified, `ready` once classified low-risk + auto-
+// approve) and can be classified, invoked, or sent through the per-call approval
+// flow — all through the SAME kernel gates a plugin tool uses.
 function McpDiscoverPanel({ server }: { server: ReluxMcpServer }) {
-  const { data, loading, error } = useAsync<ReluxMcpToolsResult>(
+  const { data, loading, error, reload } = useAsync<ReluxMcpToolsResult>(
     () => reluxMcp.tools(server.id),
     [server.id, server.enabled],
   );
@@ -346,9 +349,10 @@ function McpDiscoverPanel({ server }: { server: ReluxMcpServer }) {
       </div>
       <p className="muted" style={{ marginTop: 0, marginBottom: 10, fontSize: 11 }}>
         Discovery runs a real <span className="mono">tools/list</span> against the
-        loopback server. These tools are <strong>not callable yet</strong> — Relux
-        lists them honestly; routing MCP calls through the approval/permission gates
-        lands in a later slice.
+        loopback server. An unclassified tool is <strong>gated</strong> (needs
+        approval) until you set its risk — every call still routes through the
+        permission, approval/grant, and audit gates, against{" "}
+        <span className="mono">plugin_id mcp:{server.id}</span>.
       </p>
       {error ? (
         <div className="banner err" style={{ fontSize: 12 }}>
@@ -364,29 +368,208 @@ function McpDiscoverPanel({ server }: { server: ReluxMcpServer }) {
       ) : (
         <div className="table-scroll">
           <table className="table">
+            <thead>
+              <tr>
+                <th>Tool</th>
+                <th>Risk</th>
+                <th>Status</th>
+                <th style={{ textAlign: "right" }}>Actions</th>
+              </tr>
+            </thead>
             <tbody>
               {tools.map((t) => (
-                <tr key={t.tool_name}>
-                  <td>
-                    <strong>{t.tool_name}</strong>
-                    <div className="mono muted" style={{ fontSize: 11 }}>{t.permission}</div>
-                    {t.description && (
-                      <div className="muted" style={{ fontSize: 12, marginTop: 2, maxWidth: 420 }}>
-                        {t.description}
-                      </div>
-                    )}
-                  </td>
-                  <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
-                    <span className="badge backlog" title="MCP tool invocation is not wired into the agent tool-call path yet.">
-                      not callable yet
-                    </span>
-                  </td>
-                </tr>
+                <McpToolRow
+                  key={t.tool_name}
+                  serverId={server.id}
+                  tool={t}
+                  onClassified={reload}
+                />
               ))}
             </tbody>
           </table>
         </div>
       )}
+    </div>
+  );
+}
+
+// One discovered MCP tool row: its honest readiness (the same `toolReadiness`
+// classifier a plugin tool uses), plus three real actions — Classify (set its
+// risk/approval), Invoke (when `ready`), or Why not? (the honest refusal panel,
+// which itself offers the per-call approval flow for a `needs_approval` tool).
+// Nothing is faked: a gated tool cannot be invoked directly, exactly as the kernel
+// enforces.
+function McpToolRow({
+  serverId,
+  tool,
+  onClassified,
+}: {
+  serverId: string;
+  tool: ReluxToolDescriptor;
+  onClassified: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [classifyOpen, setClassifyOpen] = useState(false);
+  const readiness = toolReadiness(tool);
+  const ready = readiness.runnable;
+
+  return (
+    <>
+      <tr>
+        <td>
+          <strong>{tool.tool_name}</strong>
+          <div className="mono muted" style={{ fontSize: 11 }}>{tool.permission}</div>
+          {tool.description && (
+            <div className="muted" style={{ fontSize: 12, marginTop: 2, maxWidth: 420 }}>
+              {tool.description}
+            </div>
+          )}
+        </td>
+        <td className="muted" style={{ fontSize: 12 }}>{tool.risk}</td>
+        <td>
+          <span className={`badge ${BADGE_CLASS[readiness.tone]}`} title={readiness.reason}>
+            {readiness.label}
+          </span>
+        </td>
+        <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
+          <button
+            className="btn ghost sm"
+            onClick={() => {
+              setClassifyOpen((v) => !v);
+              setOpen(false);
+            }}
+            aria-expanded={classifyOpen}
+          >
+            {classifyOpen ? "Close" : "Classify"}
+          </button>{" "}
+          <button
+            className="btn ghost sm"
+            onClick={() => {
+              setOpen((v) => !v);
+              setClassifyOpen(false);
+            }}
+            aria-expanded={open}
+          >
+            {open ? "Close" : ready ? "Invoke" : "Why not?"}
+          </button>
+        </td>
+      </tr>
+      {(open || classifyOpen) && (
+        <tr>
+          <td colSpan={4} style={{ background: "transparent" }}>
+            {classifyOpen && (
+              <McpClassifyForm
+                serverId={serverId}
+                tool={tool}
+                onDone={() => {
+                  setClassifyOpen(false);
+                  onClassified();
+                }}
+              />
+            )}
+            {open &&
+              (ready ? (
+                <InvokeTool tool={tool} />
+              ) : (
+                <ToolNotRunnable tool={tool} readiness={readiness} />
+              ))}
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
+// The MCP tool classification form: set the tool's risk + approval so it becomes
+// directly runnable (low + auto-approve) or stays gated behind approval. This is
+// the operator action that turns a discovered-but-gated MCP tool into a callable
+// one — the same risk/approval model a plugin tool's manifest declares.
+function McpClassifyForm({
+  serverId,
+  tool,
+  onDone,
+}: {
+  serverId: string;
+  tool: ReluxToolDescriptor;
+  onDone: () => void;
+}) {
+  const [risk, setRisk] = useState<McpToolClassification["risk"]>(
+    (tool.risk as McpToolClassification["risk"]) ?? "medium",
+  );
+  const [approval, setApproval] = useState<"never" | "required">(
+    tool.executable === "ready" ? "never" : "required",
+  );
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function save(clear: boolean) {
+    setBusy(true);
+    setErr(null);
+    try {
+      if (clear) {
+        await reluxMcp.clearClassification(serverId, tool.tool_name);
+      } else {
+        await reluxMcp.setClassification(serverId, tool.tool_name, { risk, approval });
+      }
+      onDone();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Classification failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="card" style={{ margin: "6px 0", padding: 12 }}>
+      <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8 }}>
+        Classify <span className="mono">{tool.tool_name}</span>
+      </div>
+      <p className="muted" style={{ fontSize: 11, marginTop: 0, marginBottom: 10 }}>
+        A discovered MCP tool's real risk is unknown, so it stays gated (needs
+        approval) until you set it. <strong>Low + Auto-approve</strong> makes it
+        directly callable; anything else keeps it behind the per-call approval flow.
+      </p>
+      <div className="row wrap" style={{ gap: 10 }}>
+        <label className="field" style={{ margin: 0 }}>
+          <span style={{ fontSize: 12 }}>Risk</span>
+          <select
+            className="input"
+            value={risk}
+            onChange={(e) => setRisk(e.target.value as McpToolClassification["risk"])}
+          >
+            <option value="low">low</option>
+            <option value="medium">medium</option>
+            <option value="high">high</option>
+            <option value="critical">critical</option>
+          </select>
+        </label>
+        <label className="field" style={{ margin: 0 }}>
+          <span style={{ fontSize: 12 }}>Approval</span>
+          <select
+            className="input"
+            value={approval}
+            onChange={(e) => setApproval(e.target.value as "never" | "required")}
+          >
+            <option value="required">required (gated)</option>
+            <option value="never">never (auto-approve)</option>
+          </select>
+        </label>
+      </div>
+      {approval === "never" && risk !== "low" && (
+        <div className="muted" style={{ fontSize: 11, marginTop: 8 }}>
+          Note: a non-low risk with auto-approve is still directly runnable — set it
+          deliberately.
+        </div>
+      )}
+      <div className="row wrap" style={{ gap: 8, marginTop: 10 }}>
+        <button className="btn" disabled={busy} onClick={() => void save(false)}>
+          {busy ? "Saving…" : "Save classification"}
+        </button>
+        <button className="btn ghost" disabled={busy} onClick={() => void save(true)}>
+          Reset to gated default
+        </button>
+      </div>
+      {err && <div className="banner err" style={{ fontSize: 12, marginTop: 10 }}>{err}</div>}
     </div>
   );
 }

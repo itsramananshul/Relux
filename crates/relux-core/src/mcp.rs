@@ -41,15 +41,20 @@
 //!   never spawns arbitrary downloaded code, and v1 dials no remote host).
 //! - This config NEVER stores secrets — only an id, the loopback endpoint, a
 //!   description, an enabled flag, and a per-call timeout.
-//! - Discovery is real (`tools/list` against the loopback server) but MCP tool
-//!   **invocation is not wired into the agent tool-call path yet**: discovered
-//!   tools surface as [`crate::tool::ToolExecutability::NotImplemented`], honestly
-//!   "discovered, not callable yet". See the kernel + `docs/mcp.md` for the next
-//!   slice (route `tools/call` through the existing approval/permission gates).
+//! - Discovery is real (`tools/list` against the loopback server) AND invocation is
+//!   wired into the standard tool-invoke gates: a discovered tool surfaces with a
+//!   real [`crate::tool::ToolExecutability`] driven by its [`McpToolClassification`]
+//!   (`needs_approval` until classified, `ready` once classified low-risk +
+//!   auto-approve), and `tools/call` runs through the kernel's
+//!   permission/approval/grant/audit path under `plugin_id = "mcp:<server>"`. See
+//!   the kernel (`call_tool`) + `docs/mcp.md` for the exact semantics + bounds.
+
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::permission::{ApprovalRequirement, RiskLevel};
 use crate::runtime::validate_loopback_url;
 
 /// Default per-call timeout for an MCP loopback discovery/call, in milliseconds.
@@ -67,6 +72,10 @@ pub const MAX_MCP_ID_CHARS: usize = 64;
 pub const MAX_MCP_DESCRIPTION_CHARS: usize = 400;
 /// Max characters kept for a discovered tool description.
 pub const MAX_MCP_TOOL_DESC_CHARS: usize = 600;
+/// Max characters accepted for a discovered/invoked MCP tool name. The name is
+/// echoed verbatim into a `tools/call` request and used to derive a permission
+/// string, so it is bounded and restricted to a safe identifier charset.
+pub const MAX_MCP_TOOL_NAME_CHARS: usize = 128;
 /// Hard cap on how many discovered tools a single server may surface, so a
 /// misbehaving server cannot flood the Tools list.
 pub const MAX_MCP_TOOLS: usize = 256;
@@ -117,6 +126,14 @@ pub struct McpServerConfig {
     pub enabled: bool,
     /// Per-call timeout in milliseconds (already clamped to a sane range).
     pub timeout_ms: u64,
+    /// Operator-set per-tool risk/approval classifications, keyed by the MCP tool
+    /// name. A discovered tool with no entry here is treated as
+    /// [`McpToolClassification::default`] (unknown risk → Medium + approval
+    /// Required), so an unclassified MCP tool is never directly runnable until the
+    /// operator classifies it. Empty by default and omitted from the wire shape
+    /// when empty, so a server that has classified no tools is unchanged.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_overrides: BTreeMap<String, McpToolClassification>,
 }
 
 impl McpServerConfig {
@@ -128,6 +145,40 @@ impl McpServerConfig {
             "configured"
         } else {
             "disabled"
+        }
+    }
+
+    /// The risk/approval classification the operator set for `tool_name`, or the
+    /// fail-closed [`McpToolClassification::default`] (Medium + Required) when the
+    /// tool is unclassified. This is the single resolution the kernel's invocation
+    /// gates use for an MCP tool's risk + approval requirement.
+    pub fn tool_classification(&self, tool_name: &str) -> McpToolClassification {
+        self.tool_overrides
+            .get(tool_name)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// An operator-set risk + approval classification for one MCP tool.
+///
+/// A discovered MCP tool's real risk is unknown to Relux, so until the operator
+/// classifies it the [`Default`] is the fail-closed Medium + [`ApprovalRequirement::Required`]:
+/// the tool is gated behind approval and never directly runnable. The operator can
+/// then lower its risk / set `Never` (directly runnable) or keep it gated. This is
+/// the MCP analogue of a `ToolDefinition`'s `risk` + `approval`, used by the same
+/// `approval_blocks_direct_invocation` predicate that gates real plugin tools.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpToolClassification {
+    pub risk: RiskLevel,
+    pub approval: ApprovalRequirement,
+}
+
+impl Default for McpToolClassification {
+    fn default() -> Self {
+        Self {
+            risk: RiskLevel::Medium,
+            approval: ApprovalRequirement::Required,
         }
     }
 }
@@ -155,6 +206,22 @@ pub fn is_valid_mcp_id(id: &str) -> bool {
     !id.is_empty()
         && id.chars().count() <= MAX_MCP_ID_CHARS
         && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+}
+
+/// Whether `name` is a safe MCP tool name to invoke: non-empty, at most
+/// [`MAX_MCP_TOOL_NAME_CHARS`] characters, and restricted to `[A-Za-z0-9._-]`. The
+/// name is echoed verbatim into a `tools/call` JSON-RPC request and used to derive
+/// a `tool:mcp-<server>:<verb>` permission, so it must never carry whitespace,
+/// control characters, path separators, colons, or other injection-shaped
+/// characters. A name that fails this is refused on invocation (fail closed)
+/// rather than forwarded to the loopback server.
+pub fn is_valid_mcp_tool_name(name: &str) -> bool {
+    let name = name.trim();
+    !name.is_empty()
+        && name.chars().count() <= MAX_MCP_TOOL_NAME_CHARS
+        && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
 }
@@ -196,14 +263,14 @@ pub fn mcp_synthetic_plugin_id(server_id: &str) -> String {
     format!("mcp:{server_id}")
 }
 
-/// The display permission string for a discovered MCP tool: `tool:mcp-<server>:<verb>`.
+/// The ENFORCED permission string for a discovered MCP tool: `tool:mcp-<server>:<verb>`.
 ///
-/// This is for HONEST DISPLAY ONLY in v1 — MCP invocation is not wired into the
-/// agent tool-call path yet, so nothing enforces this string. It is shaped like a
-/// real `tool:` permission (scoped to this server's own `mcp-<server>` namespace)
-/// so the next slice can adopt it as the enforced permission without reshaping the
-/// surface. `verb` is the dotted tool name's trailing segment, reduced to a safe
-/// identifier; the server id has any unsafe character collapsed to `-`.
+/// The kernel resolves and checks this exact capability on every MCP `tools/call`
+/// (the calling agent must hold it, or the scoped `tool:mcp-<server>:*` wildcard).
+/// It is shaped like a real `tool:` permission, scoped to this server's own
+/// `mcp-<server>` namespace, so it slots into the existing permission grammar. `verb`
+/// is the dotted tool name's trailing segment, reduced to a safe identifier; the
+/// server id has any unsafe character collapsed to `-`.
 pub fn mcp_tool_permission(server_id: &str, tool_name: &str) -> String {
     let server = sanitize_identifier(server_id, '-');
     let verb = derive_verb(tool_name);
@@ -334,6 +401,7 @@ mod tests {
             description: "test server".to_string(),
             enabled: true,
             timeout_ms: DEFAULT_MCP_TIMEOUT_MS,
+            tool_overrides: BTreeMap::new(),
         }
     }
 
@@ -432,6 +500,51 @@ mod tests {
             sanitize_mcp_tool_description(&long).chars().count(),
             MAX_MCP_TOOL_DESC_CHARS
         );
+    }
+
+    #[test]
+    fn valid_tool_names_are_safe_identifiers() {
+        assert!(is_valid_mcp_tool_name("search"));
+        assert!(is_valid_mcp_tool_name("search.files"));
+        assert!(is_valid_mcp_tool_name("read-file_2"));
+        // Injection-shaped / path / whitespace names are refused.
+        assert!(!is_valid_mcp_tool_name(""));
+        assert!(!is_valid_mcp_tool_name("has space"));
+        assert!(!is_valid_mcp_tool_name("a/b"));
+        assert!(!is_valid_mcp_tool_name("a:b"));
+        assert!(!is_valid_mcp_tool_name("drop\ntable"));
+        assert!(!is_valid_mcp_tool_name(&"a".repeat(MAX_MCP_TOOL_NAME_CHARS + 1)));
+    }
+
+    #[test]
+    fn unclassified_tool_defaults_to_gated_medium() {
+        let c = cfg("s", "http://127.0.0.1:8000");
+        let cls = c.tool_classification("anything");
+        assert_eq!(cls, McpToolClassification::default());
+        assert_eq!(cls.risk, RiskLevel::Medium);
+        assert_eq!(cls.approval, ApprovalRequirement::Required);
+        // The default must block a direct invocation (gated → never auto-runnable).
+        assert!(crate::tool::approval_blocks_direct_invocation(&cls.approval, &cls.risk));
+    }
+
+    #[test]
+    fn operator_classification_overrides_the_default() {
+        let mut c = cfg("s", "http://127.0.0.1:8000");
+        c.tool_overrides.insert(
+            "ping".to_string(),
+            McpToolClassification {
+                risk: RiskLevel::Low,
+                approval: ApprovalRequirement::Never,
+            },
+        );
+        let cls = c.tool_classification("ping");
+        // A Low + Never tool is directly runnable (not gated).
+        assert!(!crate::tool::approval_blocks_direct_invocation(&cls.approval, &cls.risk));
+        // An unclassified sibling still defaults to gated.
+        assert!(crate::tool::approval_blocks_direct_invocation(
+            &c.tool_classification("other").approval,
+            &c.tool_classification("other").risk
+        ));
     }
 
     #[test]

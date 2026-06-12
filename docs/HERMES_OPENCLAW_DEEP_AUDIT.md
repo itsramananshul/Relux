@@ -499,29 +499,36 @@ safe (adds no authority), bounded, feasible in one commit, and reuses existing v
   non-loopback / creds / traversal).
 - Honest discovery (installed-but-unimplemented → `NotImplemented`), bundled-protected, no remote code
   execution by design.
-- **MCP support — v1 SHIPPED (loopback discovery).** `crates/relux-core/src/mcp.rs`
+- **MCP support — SHIPPED (loopback discovery + gated invocation).** `crates/relux-core/src/mcp.rs`
   (`McpServerConfig`/`McpTransport::HttpLoopback`, `validate_mcp_server_config` loopback-only,
-  `scan_mcp_tool_description` injection scan), `crates/relux-kernel/src/mcp.rs` (blocking loopback
-  JSON-RPC discovery client: `initialize` → `tools/list`, single-POST subset + SSE-frame parse,
-  bounded/timeout/honest-errors), `crates/relux-kernel/src/state.rs`
-  (`register_mcp_server`/`set_mcp_server_enabled`/`remove_mcp_server`/`mcp_servers`/`discover_mcp_tools`
-  → `ToolDescriptor`s with `plugin_id="mcp:<id>"`, `NotImplemented`), four `/v1/relux/mcp/servers*`
-  routes, snapshot persistence, and a Plugins-tab **MCP servers** section. Operator-curated,
+  `McpToolClassification` risk/approval, `is_valid_mcp_tool_name`, `scan_mcp_tool_description`),
+  `crates/relux-kernel/src/mcp.rs` (blocking loopback JSON-RPC client: `initialize` →
+  `tools/list`/`tools/call`, single-POST subset + SSE-frame parse, **result shaping** (text +
+  `structuredContent`, `isError`→honest failure, never the raw envelope), bounded/timeout/honest),
+  `crates/relux-kernel/src/state.rs` (registry CRUD + `set/clear_mcp_tool_classification`, and MCP
+  branches in `resolve_tool_permission`/`tool_needs_approval`/`execute_tool_runtime`/
+  `matching_persistent_grant_id`/`tool_risk_for` so `call_tool`/`invoke_tool`/per-call-approval/
+  persistent-grant ALL handle `mcp:<server>` tools), registry + classification routes (invocation
+  reuses the generic `/v1/relux/tools/invoke` etc.), snapshot persistence, and a Plugins-tab **MCP
+  servers** section (discover → classify → invoke / request-approval). Operator-curated,
   loopback-ONLY, no secrets, no stdio subprocess, no remote host. Maps Hermes `tools/mcp_tool.py`
-  (wire shape + `_validate_remote_mcp_url` posture, stricter → loopback) + legacy
-  `relix-runtime/.../mcp_http.rs` (one-POST-per-RPC, error→honest) + openclaw `execution.ts`
-  (`mcp:<server>:<tool>` namespace). See `docs/mcp.md`.
-  - **Still deferred (honest):** MCP tool **invocation** is NOT wired into the agent tool-call path
-    (discovered tools are `not_implemented`); no stdio command servers; no remote/SSE-subscription;
-    no OAuth. Next slice routes `tools/call` through the existing approval/permission/grant/audit
-    gates (`docs/mcp.md` "Next MCP slice").
-- **Missing (deliberate/deferred)**: MCP tool **invocation** (v1 is discovery-only), plugin activation
-  triggers.
+  (wire shape + `_validate_remote_mcp_url` posture, stricter → loopback; `call_tool` result shaping)
+  + legacy `relix-runtime/.../mcp_http.rs` (one-POST-per-RPC, `{name,arguments}`, error→honest) +
+  openclaw `execution.ts` (`mcp:<server>:<tool>` namespace). See `docs/mcp.md`.
+  - **Enforced model:** permission `tool:mcp-<server>:<verb>` (no broad wildcard by default); risk +
+    approval per `McpToolClassification` (default gated Medium + Required until the operator
+    classifies); every call permission-checked, risk/approval-gated, per-call-approvable,
+    grant-bypassable, and audited — the SAME path a plugin tool uses.
+  - **Still deferred (honest):** no stdio command servers; no remote/`https`/SSE-subscription; no
+    OAuth; no session-continuity streamable-HTTP; no MCP resources/prompts/sampling; an MCP call is
+    captured on the audit log but not (yet) on the run transcript (`docs/mcp.md` "Next MCP slice").
+- **Missing (deliberate/deferred)**: MCP remote transport + OAuth, session-continuity, resources,
+  run-transcript capture; plugin activation triggers.
 
 ### Priority & slices
 
-- **P2 — MCP tool INVOCATION** (Hermes `mcp_tool.py` `call_tool`): route `tools/call` through the
-  existing tool-invocation gates; v1 discovery already shipped. *(backend, tests, docs.)*
+- **P2 — MCP tool INVOCATION** — ✅ DONE: `tools/call` routes through the existing tool-invocation
+  gates with per-tool risk/approval classification; discovery already shipped. *(backend, tests, docs.)*
 - **P2 — install-time manifest validation surfaced in Doctor/UI** (Paperclip Zod safe-parse style).
 
 ---
