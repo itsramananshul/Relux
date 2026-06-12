@@ -2244,6 +2244,15 @@ struct CreateTaskReq {
     /// (`docs/mcp.md` "Run-driven MCP tool call".)
     #[serde(default)]
     tool_call: Option<relux_core::TaskToolCall>,
+    /// Optional bounded MULTI-tool plan (`[ { plugin, tool, args }, … ]`, ≤
+    /// [`relux_core::MAX_TASK_TOOL_PLAN_STEPS`]). When present the task's input becomes
+    /// the canonical `{ "tool_plan": [ … ] }` shape, so the local run executes each
+    /// step in order through the gated `call_tool` path, stopping on the first
+    /// failure/denial. Validated strictly here (non-empty, step count + per-step args
+    /// bounded); the sequence is fixed at creation time — never chosen by the brain.
+    /// Mutually exclusive with `tool_call`. (`docs/mcp.md` "Run-driven multi-tool plan".)
+    #[serde(default)]
+    tool_plan: Option<Vec<relux_core::TaskToolCall>>,
 }
 
 /// One read-only role preset (an operator-convenience suggestion bundle). Carries only
@@ -2474,11 +2483,18 @@ async fn create_task(
     if title.is_empty() {
         return Err(ApiError::bad_request("title is required"));
     }
-    // Build the task input. An explicit tool-call directive is validated (non-empty
-    // plugin + tool) and serialized into the canonical `{ "tool_call": … }` shape the
-    // local run reads; otherwise the input is empty (a plain echo task).
-    let input = match &req.tool_call {
-        Some(directive) => {
+    // Build the task input. Exactly one of an explicit single tool-call directive or a
+    // bounded multi-tool plan may be supplied; each is validated and serialized into
+    // its canonical input shape the local run reads. With neither, the input is empty
+    // (a plain echo task). Supplying both is an honest 400 — the run path would only
+    // ever take one (the plan), so an unused directive must not be silently dropped.
+    let input = match (&req.tool_call, &req.tool_plan) {
+        (Some(_), Some(_)) => {
+            return Err(ApiError::bad_request(
+                "provide either tool_call or tool_plan, not both",
+            ));
+        }
+        (Some(directive), None) => {
             let built = directive.to_input();
             if relux_core::parse_task_tool_call(&built).is_none() {
                 return Err(ApiError::bad_request(
@@ -2487,7 +2503,19 @@ async fn create_task(
             }
             built
         }
-        None => serde_json::json!({}),
+        (None, Some(steps)) => {
+            let plan = relux_core::TaskToolPlan { steps: steps.clone() };
+            plan.validate()
+                .map_err(|e| ApiError::bad_request(e.to_string()))?;
+            let built = plan.to_input();
+            // Defensive: the validated plan must also read back as a plan (it always
+            // will after validate() passes; this fails closed if the shapes ever drift).
+            if relux_core::parse_task_tool_plan(&built).is_none() {
+                return Err(ApiError::bad_request("tool_plan is invalid"));
+            }
+            built
+        }
+        (None, None) => serde_json::json!({}),
     };
     let task = locked_save(&state, |kernel| {
         let ctx = crate::ensure_bootstrapped(kernel)?;
@@ -8940,6 +8968,62 @@ mod tests {
         // task (that would hide the operator's intent).
         let (state, _dir) = auth_state(true);
         let body = r#"{"title":"bad","tool_call":{"plugin":"mcp:fs","tool":"   "}}"#;
+        let (status, _, _b) = call(&state, "POST", "/v1/relux/tasks", None, Some(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_task_with_tool_plan_stores_canonical_input() {
+        // An operator can create a task with a bounded MULTI-tool plan; the POST body's
+        // steps are validated + serialized into the canonical `{ "tool_plan": [ … ] }`
+        // input the local run reads in order. (`docs/mcp.md` "Run-driven multi-tool plan".)
+        let (state, _dir) = auth_state(true);
+        let body = r#"{"title":"two-step","tool_plan":[{"plugin":"mcp:fs","tool":"search","args":{"q":"a"}},{"plugin":"mcp:fs","tool":"search","args":{"q":"b"}}]}"#;
+        let (status, _, tb) = call(&state, "POST", "/v1/relux/tasks", None, Some(body)).await;
+        assert_eq!(status, StatusCode::OK, "plan task create failed: {tb}");
+        let task: serde_json::Value = serde_json::from_str(&tb).unwrap();
+        let plan = task["input"]["tool_plan"].as_array().expect("a plan array");
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0]["plugin"], "mcp:fs");
+        assert_eq!(plan[0]["args"]["q"], "a");
+        assert_eq!(plan[1]["args"]["q"], "b");
+    }
+
+    #[tokio::test]
+    async fn create_task_with_empty_tool_plan_is_rejected() {
+        // An empty plan is a 400 — never a silent echo fallback.
+        let (state, _dir) = auth_state(true);
+        let body = r#"{"title":"empty","tool_plan":[]}"#;
+        let (status, _, b) = call(&state, "POST", "/v1/relux/tasks", None, Some(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{b}");
+    }
+
+    #[tokio::test]
+    async fn create_task_with_too_many_plan_steps_is_rejected() {
+        // A plan over MAX_TASK_TOOL_PLAN_STEPS is a 400 — never silently truncated.
+        let (state, _dir) = auth_state(true);
+        let step = r#"{"plugin":"mcp:fs","tool":"search"}"#;
+        let steps = [step; relux_core::MAX_TASK_TOOL_PLAN_STEPS + 1].join(",");
+        let body = format!(r#"{{"title":"toomany","tool_plan":[{steps}]}}"#);
+        let (status, _, b) = call(&state, "POST", "/v1/relux/tasks", None, Some(&body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{b}");
+    }
+
+    #[tokio::test]
+    async fn create_task_with_empty_plan_step_is_rejected() {
+        // A step with an empty tool is a 400.
+        let (state, _dir) = auth_state(true);
+        let body = r#"{"title":"badstep","tool_plan":[{"plugin":"mcp:fs","tool":"  "}]}"#;
+        let (status, _, _b) = call(&state, "POST", "/v1/relux/tasks", None, Some(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_task_with_both_tool_call_and_plan_is_rejected() {
+        // Supplying both a single directive and a plan is a 400 — the run path would
+        // take only one, so an unused intent must not be silently dropped.
+        let (state, _dir) = auth_state(true);
+        let body = r#"{"title":"both","tool_call":{"plugin":"mcp:fs","tool":"search"},"tool_plan":[{"plugin":"mcp:fs","tool":"search"}]}"#;
         let (status, _, _b) = call(&state, "POST", "/v1/relux/tasks", None, Some(body)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }

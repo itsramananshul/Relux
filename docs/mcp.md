@@ -242,6 +242,59 @@ one tool, fixed in the task input, gated end-to-end. It is NOT a brain freely ch
 arbitrary MCP tools mid-run — that broader autonomy stays out of scope until it routes
 through an allowlisted/validated write tool and the same approval gates.
 
+## Run-driven multi-tool plan (bounded, operator-authored sequence)
+
+The single tool-call directive above drives exactly ONE tool. A task may now instead
+carry a bounded, **operator-authored multi-tool plan** so a single run executes a small
+fixed SEQUENCE of gated tool calls — the next step up in deeper multi-action loops,
+still without a brain choosing the tools.
+
+- **The plan.** A task's `input` may be the canonical shape
+  `{ "tool_plan": [ { "plugin": "mcp:<server>"|"<plugin-id>", "tool": "<name>",
+  "args": { … } }, … ] }` (`relux_core::TaskToolPlan` / `parse_task_tool_plan`). Each
+  step is the same `{plugin, tool, args}` directive shape, where `plugin` is a synthetic
+  `mcp:<server>` MCP server **or** a real installed plugin id. The plan is **fixed at
+  task creation** — the brain never adds, removes, reorders, or chooses a step.
+- **Bounds + strict create-time validation (`TaskToolPlan::validate`, fail closed).** A
+  plan must be **non-empty** and carry **at most `MAX_TASK_TOOL_PLAN_STEPS` (5)** steps;
+  every step must have a **non-empty plugin + tool** (trimmed); and every step's
+  serialized `args` must be **≤ `MAX_TASK_TOOL_PLAN_ARGS_BYTES` (256 KiB)** — mirroring
+  the loopback request cap so a step can never carry args `call_tool` would itself
+  reject. An empty plan, an over-long plan (never silently truncated), an empty
+  plugin/tool, or oversized args all **fail at create time** with an honest `400`
+  (`POST /v1/relux/tasks`). `tool_plan` and the single `tool_call` are **mutually
+  exclusive** — supplying both is a `400` (the run would take only one, so an unused
+  intent must not be silently dropped).
+- **Sequential execution, stop on first failure (`execute_local_run`).** When the
+  deterministic local run sees a `tool_plan`, it executes each step **in order** through
+  the SAME gated `call_tool` chokepoint (the same permission + risk/approval +
+  per-call-approval / allow-always-grant + audit + `mcp_tool_call*` / `tool_call*`
+  transcript path as a single directive). **Every step is gated independently** — a
+  missing permission or a requires-approval step blocks the run at that step. The run
+  **stops on the first step's failure or denial**, marking the run + task `Failed`
+  (never a partial-success lie); on full success the run + task complete and the run
+  summary is a **compact** `ran N tool step(s): <i/N: tool via plugin ok; …>` — the step
+  count + per-step ok markers only, never the step results (which would risk a leak; the
+  per-step result already lives on the transcript, redacted, via `call_tool`).
+- **Transcript.** Each step appends its own existing per-tool event through `call_tool`
+  — an `mcp_tool_call` (success, bounded redacted `result_summary`) /
+  `mcp_tool_call_denied` / `mcp_tool_call_failed` for an MCP step, or the generic
+  `tool_call*` for a plugin step. A two-step plan therefore shows two tool-call events,
+  in order. No new run-event kind and no new UI surface is added in this slice — the
+  plan reuses the existing transcript path end to end.
+- **Operating it (no new UI).** An operator creates such a task over the existing
+  `POST /v1/relux/tasks` route, which now also accepts an optional `tool_plan` body
+  (validated as above), then runs it with the existing "Run (Assigned)" /
+  `POST /v1/relux/tasks/:id/execute-assigned` action.
+
+**Scope (still narrow).** A `tool_plan` is a **fixed, operator-authored** sequence,
+validated and capped, gated per step. It is NOT a brain choosing tools mid-run, NOT
+conditional/branching execution, NOT data-flow between steps (each step's `args` are
+fixed at creation; a step cannot consume a prior step's output), and NOT cross-adapter
+(it runs only on the deterministic local-prime adapter, like the single directive).
+Those remain out of scope until they route through allowlisted/validated write tools and
+the same approval gates.
+
 ## What it does NOT do (honest limitations)
 
 - **No stdio (command) MCP servers.** Relux never spawns arbitrary downloaded
@@ -347,11 +400,33 @@ Files read before implementing:
   without colliding with real plugin ids.
 
 Run-driven path files: `crates/relux-core/src/task.rs` (`TaskToolCall` +
-`parse_task_tool_call` — the operator-named directive type/parser),
-`crates/relux-kernel/src/state.rs` (`execute_local_run` routes a directive through
-`call_tool` instead of echo, failing the run/task honestly on a gate refusal),
-`crates/relux-kernel/src/server.rs` (`create_task` / `CreateTaskReq` accept the
-optional `tool_call` directive and serialize it into the canonical input).
+`parse_task_tool_call` — the operator-named single directive type/parser; **plus
+`TaskToolPlan` + `TaskToolPlanError` + `parse_task_tool_plan` + `TaskToolPlan::validate`
++ the `MAX_TASK_TOOL_PLAN_STEPS`/`MAX_TASK_TOOL_PLAN_ARGS_BYTES` bounds — the bounded
+multi-tool plan type/parser/validator**), `crates/relux-kernel/src/state.rs`
+(`execute_local_run` routes a single directive — **or, before it, each step of a
+`tool_plan` in order, stopping on the first failure/denial** — through `call_tool`
+instead of echo, failing the run/task honestly on a gate refusal),
+`crates/relux-kernel/src/server.rs` (`create_task` / `CreateTaskReq` accept the optional
+`tool_call` directive **or the optional `tool_plan` (validated strictly; mutually
+exclusive with `tool_call`)** and serialize it into the canonical input).
+
+**Multi-tool plan reference mapping (`docs/reference-driven-development.md`, BINDING).**
+Files read before implementing the plan:
+- **Hermes** `reference/hermes-agent-main/agent/agent_runtime_helpers.py` — the
+  conversation tool loop iterates an assistant turn's `msg["tool_calls"]` list
+  (`for tool_call in tool_calls`, L266-272), executing each tool call in sequence. We
+  mirror the **sequential per-step execution** but deliberately **diverge on authorship**:
+  Hermes' list is MODEL-chosen each turn; a Relux `tool_plan` is OPERATOR-authored and
+  fixed at task creation, so the brain never chooses a step (the keyword/brain-free rail
+  the design docs require here).
+- **openclaw** `reference/openclaw-main/src/tools/planner.ts` (`buildToolPlan`) —
+  validates an ENTIRE tool plan up front (unique names, availability diagnostics,
+  executor presence) and partitions valid/invalid BEFORE any execution rather than
+  discovering invalidity mid-run. We adopt the same **validate-the-whole-plan-up-front,
+  fail-closed** posture in `TaskToolPlan::validate` (non-empty, step-count cap, per-step
+  plugin/tool + args bounds checked at create time), so an invalid plan is a `400` and
+  never a partially-run task.
 
 Relux files: `crates/relux-core/src/mcp.rs` (config + validation + discovery types +
 `McpToolClassification` + `is_valid_mcp_tool_name` + injection scan, **plus the
@@ -394,8 +469,11 @@ opt-in; (2) a **long-lived SSE / server-push subscription** (the streamable-HTTP
 variant Relux still does not speak — only single-POST request/reply today);
 (3) **MCP prompts** (`prompts/list` + `prompts/get`) as reusable prompt templates;
 (4) a **resource-change subscription** (`notifications/resources/list_changed`) once a
-server-push channel exists; (5) a **multi-step / CLI-adapter run path** that can drive
-several gated MCP tools in one run (today the run-driven path executes a single
-operator-named tool on the deterministic local-prime adapter; a brain freely choosing
-arbitrary MCP tools mid-run stays out of scope until it routes through an
-allowlisted/validated write tool and the same approval gates).
+server-push channel exists; (5) a **bounded multi-tool run plan** — DONE: an
+operator-authored, create-time-validated `tool_plan` of ≤ 5 gated steps now runs
+sequentially in one local-prime run, stopping on the first failure (see "Run-driven
+multi-tool plan" above). What remains out of scope here: a **CLI-adapter** multi-tool
+path (the plan runs only on the deterministic local-prime adapter), **data-flow /
+conditional** steps (a step consuming a prior step's output, or branching), and a brain
+freely choosing arbitrary MCP tools mid-run (still gated behind allowlisted/validated
+write tools + the same approval gates).

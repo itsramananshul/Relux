@@ -7598,7 +7598,51 @@ impl KernelState {
         // denial/failure event is already on the transcript) — never a fabricated
         // success. (`docs/mcp.md` "Run-driven MCP tool call";
         // `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §9.)
-        if let Some(directive) = relux_core::parse_task_tool_call(&input) {
+        //
+        // A task may instead carry a bounded, operator-authored MULTI-tool plan
+        // (`{ "tool_plan": [ { plugin, tool, args }, … ] }`, ≤
+        // `MAX_TASK_TOOL_PLAN_STEPS`). When present, the local run executes each step
+        // IN ORDER through the SAME gated `call_tool` chokepoint, **stopping on the
+        // first failure/denial** (which fails the run + task honestly — never a
+        // partial-success lie). Each step's per-tool transcript event
+        // (`mcp_tool_call*` / `tool_call*`) is appended by `call_tool`, so the
+        // transcript shows every step; the completion summary carries a compact step
+        // count + per-step ok markers (never the step results, which would risk a
+        // leak). The plan is fixed at creation time and validated there — the brain
+        // never chooses a step. (`docs/mcp.md` "Run-driven multi-tool plan".)
+        if let Some(steps) = relux_core::parse_task_tool_plan(&input) {
+            let total = steps.len();
+            let mut markers: Vec<String> = Vec::with_capacity(total);
+            for (i, step) in steps.iter().enumerate() {
+                let plugin = PluginId::new(step.plugin.clone());
+                match self.call_tool(&run_id, &agent_id_for_call, &plugin, &step.tool, step.args.clone()) {
+                    Ok(_) => {
+                        markers.push(format!("{}/{}: {} via {} ok", i + 1, total, step.tool, step.plugin));
+                    }
+                    Err(e) => {
+                        self.fail_run(
+                            &run_id,
+                            &format!(
+                                "tool plan step {}/{} ({} via {}) did not run: {e}",
+                                i + 1,
+                                total,
+                                step.tool,
+                                step.plugin
+                            ),
+                        )
+                        .ok();
+                        self.fail_task(task_id).ok();
+                        return Err(e);
+                    }
+                }
+            }
+            self.complete_run(
+                &run_id,
+                &format!("ran {total} tool step(s): {}", markers.join("; ")),
+            )?;
+            self.complete_task(task_id)?;
+            Ok(run_id)
+        } else if let Some(directive) = relux_core::parse_task_tool_call(&input) {
             let plugin = PluginId::new(directive.plugin.clone());
             match self.call_tool(&run_id, &agent_id_for_call, &plugin, &directive.tool, directive.args) {
                 Ok(_) => {
@@ -12281,6 +12325,171 @@ mod tests {
         assert!(k.run_events(&run).iter().any(|e| e.kind == "mcp_tool_call"));
         assert!(k.audit_log().iter().any(|e| e.action == "grant:use"
             && e.metadata["grant"] == grant.id));
+    }
+
+    /// A mock MCP server returning `n` successful `tools/call` results in a row, each
+    /// labelled `r#"step{i}"#`. One TCP accept per JSON-RPC request (3 per tool call:
+    /// initialize, notifications/initialized, tools/call).
+    fn mcp_multi_call_bodies(n: usize) -> Vec<String> {
+        let mut bodies = Vec::new();
+        for i in 0..n {
+            bodies.extend(mcp_call_bodies(&format!("step{i}")));
+        }
+        bodies
+    }
+
+    /// Create + assign + start a run for a task carrying a multi-step `tool_plan`.
+    fn mcp_plan_task(
+        k: &mut KernelState,
+        prime: &AgentId,
+        steps: Vec<relux_core::TaskToolCall>,
+    ) -> (TaskId, RunId) {
+        let ns = NamespaceId::new("workspace");
+        let plan = relux_core::TaskToolPlan { steps };
+        let task = k.create_task("multi-tool plan", plan.to_input(), "op", &ns, vec![]);
+        k.assign_task(&task, prime).unwrap();
+        let run = k.start_run(&task).unwrap();
+        (task, run)
+    }
+
+    fn fs_search_step(args: serde_json::Value) -> relux_core::TaskToolCall {
+        relux_core::TaskToolCall { plugin: "mcp:fs".to_string(), tool: "search".to_string(), args }
+    }
+
+    #[test]
+    fn run_driven_tool_plan_executes_each_step_in_order() {
+        // A two-step plan of a classified-runnable MCP tool runs both steps through
+        // `call_tool`, completing the run + task and leaving TWO distinct
+        // `mcp_tool_call` events on the transcript (one per step, in order).
+        let (mut k, prime) = mcp_primed(mcp_multi_call_bodies(2));
+        k.set_mcp_tool_classification(
+            "fs",
+            "search",
+            relux_core::RiskLevel::Low,
+            relux_core::ApprovalRequirement::Never,
+        )
+        .unwrap();
+        let (task, run) = mcp_plan_task(
+            &mut k,
+            &prime,
+            vec![
+                fs_search_step(serde_json::json!({ "q": "a" })),
+                fs_search_step(serde_json::json!({ "q": "b" })),
+            ],
+        );
+
+        let returned = k.execute_local_run(&task).expect("the run executes the plan");
+        assert_eq!(returned, run);
+        assert_eq!(k.run(&run).unwrap().status, RunStatus::Completed);
+        assert_eq!(k.task(&task).unwrap().status, TaskStatus::Completed);
+
+        let events = k.run_events(&run);
+        let calls: Vec<_> = events.iter().filter(|e| e.kind == "mcp_tool_call").collect();
+        assert_eq!(calls.len(), 2, "both plan steps appear on the transcript");
+        assert_eq!(calls[0].payload["result_summary"], "step0");
+        assert_eq!(calls[1].payload["result_summary"], "step1");
+        // The completion summary names the step count compactly (no result content).
+        let completed = events.iter().find(|e| e.kind == "run_completed").unwrap();
+        assert!(
+            completed.message.contains("2 tool step(s)"),
+            "summary: {}",
+            completed.message
+        );
+        // Two successful, run-bound audit entries.
+        assert_eq!(
+            k.audit_log()
+                .iter()
+                .filter(|e| e.action == "tool:mcp-fs:search"
+                    && e.result == AuditResult::Success
+                    && e.metadata["run"] == run.as_str())
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn run_driven_tool_plan_stops_on_first_step_failure() {
+        // The first step runs (one successful tools/call), the second dials a server
+        // with no response queued → a transport failure stops the plan: the run + task
+        // fail and only the FIRST step's event is on the transcript (no third dial).
+        let (mut k, prime) = mcp_primed(mcp_call_bodies("only-step")); // bodies for ONE call
+        k.set_mcp_tool_classification(
+            "fs",
+            "search",
+            relux_core::RiskLevel::Low,
+            relux_core::ApprovalRequirement::Never,
+        )
+        .unwrap();
+        let (task, run) = mcp_plan_task(
+            &mut k,
+            &prime,
+            vec![
+                fs_search_step(serde_json::json!({ "q": "a" })),
+                fs_search_step(serde_json::json!({ "q": "b" })),
+            ],
+        );
+
+        let err = k.execute_local_run(&task).unwrap_err();
+        // The second step's loopback dial fails (server has no more responses).
+        let events = k.run_events(&run);
+        assert_eq!(k.run(&run).unwrap().status, RunStatus::Failed, "err: {err:?}");
+        assert_eq!(k.task(&task).unwrap().status, TaskStatus::Failed);
+        // Exactly one success event (step 1) and one failure event (step 2).
+        assert_eq!(events.iter().filter(|e| e.kind == "mcp_tool_call").count(), 1);
+        assert_eq!(events.iter().filter(|e| e.kind == "mcp_tool_call_failed").count(), 1);
+        // It never fabricated a completion.
+        assert!(!events.iter().any(|e| e.kind == "run_completed"));
+    }
+
+    #[test]
+    fn run_driven_tool_plan_gates_each_step_requires_approval() {
+        // Every step passes through the SAME gate: a default-gated (unclassified) MCP
+        // tool in a plan blocks the run at the FIRST step — no step is silently run.
+        let (mut k, prime) = mcp_primed(vec![]); // no dial expected
+        let (task, run) = mcp_plan_task(&mut k, &prime, vec![fs_search_step(serde_json::json!({}))]);
+
+        let err = k.execute_local_run(&task).unwrap_err();
+        assert!(matches!(err, KernelError::ToolRequiresApproval { .. }), "got {err:?}");
+        assert_eq!(k.run(&run).unwrap().status, RunStatus::Failed);
+        assert_eq!(k.task(&task).unwrap().status, TaskStatus::Failed);
+        let ev = k
+            .run_events(&run)
+            .into_iter()
+            .find(|e| e.kind == "mcp_tool_call_denied")
+            .expect("a per-step denial event");
+        assert_eq!(ev.payload["reason"], "requires approval");
+        assert!(!k.run_events(&run).iter().any(|e| e.kind == "mcp_tool_call"));
+    }
+
+    #[test]
+    fn run_driven_tool_plan_denied_step_without_permission_fails_the_run() {
+        // A runnable tool whose calling agent lacks the permission is refused before
+        // any dial — the per-step permission check runs first, exactly as the single
+        // directive path does.
+        let (mut k, _prime) = mcp_primed(vec![]);
+        k.set_mcp_tool_classification(
+            "fs",
+            "search",
+            relux_core::RiskLevel::Low,
+            relux_core::ApprovalRequirement::Never,
+        )
+        .unwrap();
+        let ns = NamespaceId::new("workspace");
+        let adapter = PluginId::new("relux-adapter-local-prime");
+        let weak = k
+            .create_agent("weak", "Weak", "no mcp perm", &adapter, &ns, None, vec![])
+            .unwrap();
+        let (task, run) = mcp_plan_task(&mut k, &weak, vec![fs_search_step(serde_json::json!({}))]);
+
+        let err = k.execute_local_run(&task).unwrap_err();
+        assert!(matches!(err, KernelError::PermissionDenied { .. }), "got {err:?}");
+        assert_eq!(k.run(&run).unwrap().status, RunStatus::Failed);
+        assert_eq!(k.task(&task).unwrap().status, TaskStatus::Failed);
+        assert!(k
+            .run_events(&run)
+            .iter()
+            .any(|e| e.kind == "mcp_tool_call_denied"
+                && e.payload["permission"] == "tool:mcp-fs:search"));
     }
 
     #[test]
