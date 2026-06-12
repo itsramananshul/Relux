@@ -6634,6 +6634,7 @@ impl KernelState {
                 context_reads: vec![],
                 tool_plan_proposal: None,
                 pending_tool_approval: None,
+                tool_trace: vec![],
             },
             PrimePlan::Clarify { text } => PrimeTurn {
                 intent,
@@ -6657,6 +6658,7 @@ impl KernelState {
                 context_reads: vec![],
                 tool_plan_proposal: None,
                 pending_tool_approval: None,
+                tool_trace: vec![],
             },
             PrimePlan::Act { action, text } => {
                 // Brain-assisted slot sharpening (validated): a create action takes
@@ -6739,6 +6741,7 @@ impl KernelState {
                     context_reads: vec![],
                     tool_plan_proposal: None,
                     pending_tool_approval: None,
+                tool_trace: vec![],
                 }
             }
         };
@@ -6853,6 +6856,7 @@ impl KernelState {
             context_reads: vec![],
             tool_plan_proposal: None,
             pending_tool_approval: None,
+                tool_trace: vec![],
         }
     }
 
@@ -7057,6 +7061,7 @@ impl KernelState {
             context_reads: vec![],
             tool_plan_proposal: None,
             pending_tool_approval: None,
+                tool_trace: vec![],
         }
     }
 
@@ -7138,6 +7143,7 @@ impl KernelState {
                     context_reads: vec![],
                     tool_plan_proposal: None,
                     pending_tool_approval: None,
+                tool_trace: vec![],
                 })
             }
             PrimeAction::CreateAndRunTask { title } => {
@@ -7207,6 +7213,7 @@ impl KernelState {
                     context_reads: vec![],
                     tool_plan_proposal: None,
                     pending_tool_approval: None,
+                tool_trace: vec![],
                 })
             }
             PrimeAction::StartRun { task_id } => {
@@ -7238,6 +7245,7 @@ impl KernelState {
                     context_reads: vec![],
                     tool_plan_proposal: None,
                     pending_tool_approval: None,
+                tool_trace: vec![],
                 })
             }
             PrimeAction::CreateAgent {
@@ -7313,6 +7321,7 @@ impl KernelState {
                     context_reads: vec![],
                     tool_plan_proposal: None,
                     pending_tool_approval: None,
+                tool_trace: vec![],
                 })
             }
             PrimeAction::AssignTask { task_id, agent_id } => {
@@ -7342,6 +7351,7 @@ impl KernelState {
                     context_reads: vec![],
                     tool_plan_proposal: None,
                     pending_tool_approval: None,
+                tool_trace: vec![],
                 })
             }
             PrimeAction::UpdateTask { task_id, patch } => {
@@ -7487,6 +7497,7 @@ impl KernelState {
                     context_reads: vec![],
                     tool_plan_proposal: None,
                     pending_tool_approval: None,
+                tool_trace: vec![],
                 })
             }
             PrimeAction::DiscoverTools => {
@@ -7520,6 +7531,7 @@ impl KernelState {
                     context_reads: vec![],
                     tool_plan_proposal: None,
                     pending_tool_approval: None,
+                tool_trace: vec![],
                 })
             }
             PrimeAction::ProposeToolPlan { goal } => {
@@ -7560,6 +7572,7 @@ impl KernelState {
                     context_reads: vec![],
                     tool_plan_proposal: Some(proposal),
                     pending_tool_approval: None,
+                tool_trace: vec![],
                 })
             }
             PrimeAction::InvokeTool {
@@ -7595,6 +7608,7 @@ impl KernelState {
                         context_reads: vec![],
                         tool_plan_proposal: None,
                         pending_tool_approval: None,
+                tool_trace: vec![],
                     })
                 }
                 Err(KernelError::OrchestrationNotMultiAgent) => Ok(PrimeTurn {
@@ -7619,6 +7633,7 @@ impl KernelState {
                     context_reads: vec![],
                     tool_plan_proposal: None,
                     pending_tool_approval: None,
+                tool_trace: vec![],
                 }),
                 Err(e) => Err(e),
             },
@@ -7656,6 +7671,7 @@ impl KernelState {
                         context_reads: vec![],
                         tool_plan_proposal: None,
                         pending_tool_approval: None,
+                tool_trace: vec![],
                     });
                 }
                 match self.run_orchestration(&oid, 25, 2) {
@@ -7683,6 +7699,7 @@ impl KernelState {
                             context_reads: vec![],
                             tool_plan_proposal: None,
                             pending_tool_approval: None,
+                tool_trace: vec![],
                         })
                     }
                     Err(e) => Err(e),
@@ -7713,6 +7730,7 @@ impl KernelState {
                 context_reads: vec![],
                 tool_plan_proposal: None,
                 pending_tool_approval: None,
+                tool_trace: vec![],
             }),
         }
     }
@@ -7780,6 +7798,7 @@ impl KernelState {
                 context_reads: vec![],
                 tool_plan_proposal: None,
                 pending_tool_approval: None,
+                tool_trace: vec![],
             }
         };
 
@@ -8063,6 +8082,73 @@ impl KernelState {
                 }
             }
         }
+    }
+
+    /// The bounded set of tools the agent loop's brain may pick from this turn — the SHARED live
+    /// catalog (installed plugin tools PLUS the off-lock-discovered live MCP tools), scoped to the
+    /// acting agent and projected fail-closed by [`crate::prime_agent_loop::build_agent_catalog`]
+    /// (only a `Ready` or `NeedsApproval` tool the agent can actually run is offered). Take this
+    /// under the lock once (the proposal MCP catalog must already be injected via
+    /// [`Self::set_proposal_mcp_catalog`]); the loop's brain rounds then run lock-free.
+    pub fn prime_agent_catalog(&self, ctx: &PrimeContext) -> Vec<crate::prime_agent_loop::AgentTool> {
+        crate::prime_agent_loop::build_agent_catalog(&self.live_tool_catalog(Some(&ctx.agent)))
+    }
+
+    /// Execute ONE bounded-agent-loop tool pick through the EXISTING single-invocation gate
+    /// ([`Self::prime_invoke_tool`]), mapping its terminal turn into an agent-loop step. This is the
+    /// loop's ONLY execution path, so there is no second security model
+    /// (`docs/mcp.md` "Prime Agent Loop"; `docs/RELUX_MASTER_PLAN.md` §10.5, §17.1):
+    ///
+    /// - A `Ready` tool (or a gated tool already covered by a standing allow-always grant) RUNS
+    ///   through the unchanged permission/grant/audit path and yields an
+    ///   [`crate::prime_agent_loop::AgentExecStep::Observed`] — the loop folds it in and continues.
+    /// - A gated (`NeedsApproval`) tool with NO grant stages the EXISTING per-call approval card and
+    ///   yields it as [`crate::prime_agent_loop::AgentExecStep::Terminal`] — the loop PAUSES and the
+    ///   card is surfaced; nothing ran.
+    /// - A missing / not-implemented / missing-permission / unknown tool yields the honest refusal
+    ///   turn as `Terminal` (fail closed) — never a fabricated observation.
+    ///
+    /// The `pick` was already validated against the live catalog by
+    /// [`crate::prime_agent_loop::interpret_agent_reply`]; the kernel STILL re-resolves and re-gates
+    /// it here (via `prime_invoke_tool`), so a stale or off-catalog pick cannot smuggle a run.
+    pub fn prime_agent_step(
+        &mut self,
+        ctx: &PrimeContext,
+        pick: &crate::prime_agent_loop::AgentPick,
+    ) -> Result<crate::prime_agent_loop::AgentExecStep, KernelError> {
+        use crate::prime_agent_loop::{AgentExecStep, AgentObservation};
+        let input_json = match &pick.args {
+            serde_json::Value::Null => "{}".to_string(),
+            v => serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()),
+        };
+        let action = PrimeAction::InvokeTool {
+            plugin_id: pick.plugin_id.clone(),
+            tool_name: pick.tool_name.clone(),
+            input_json: input_json.clone(),
+        };
+        let turn = self.prime_invoke_tool(
+            ctx,
+            relux_core::PrimeIntent::ToolInvocation,
+            &action,
+            "",
+            &pick.plugin_id,
+            &pick.tool_name,
+            &input_json,
+        )?;
+        let source = if pick.plugin_id.starts_with("mcp:") { "mcp" } else { "plugin" };
+        // A real, kernel-executed tool result → an observation to fold in and continue.
+        if matches!(turn.disposition, PrimeDisposition::Executed) {
+            if let Some(output) = turn.tool_output.as_ref() {
+                return Ok(AgentExecStep::Observed(AgentObservation::ran(
+                    &pick.label(),
+                    source,
+                    output,
+                )));
+            }
+        }
+        // Otherwise the turn is terminal for the loop: a staged approval card (AwaitingApproval) or
+        // an honest refusal (NeedsClarification with a tool_error). Surface it unchanged.
+        Ok(AgentExecStep::Terminal(Box::new(turn)))
     }
 
     /// Executes a running task locally using the echo tool and completes it.
@@ -16603,6 +16689,124 @@ mod tests {
             k.approval(&appr_id).map(|a| a.status.clone()),
             Some(ApprovalStatus::Pending)
         );
+    }
+
+    // ── Prime Agent Loop v1: the kernel step reuses the SAME single-invocation gate ──
+
+    /// A pick of a runnable MCP tool covered by a standing allow-always grant RUNS inside the loop
+    /// step (`prime_agent_step`) and yields an observation — the allow-always-in-loop path.
+    #[test]
+    fn agent_step_runs_a_granted_tool_and_yields_an_observation() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let mut bodies =
+            mcp_tools_list_bodies(r#"[{"name":"search","description":"Find things."}]"#);
+        bodies.extend(mcp_call_bodies("found 3 files"));
+        let endpoint = mock_mcp(bodies);
+        k.register_mcp_server("fs", &endpoint, "fs server", true, Some(2000)).unwrap();
+        k.grant_permission_to_agent(&ctx.agent, Permission::new("tool:mcp-fs:search").unwrap())
+            .unwrap();
+        k.grant_persistent_tool_invocation(
+            "founder",
+            &ctx.agent,
+            &PluginId::new("mcp:fs".to_string()),
+            "search",
+        )
+        .unwrap();
+        inject_proposal_mcp_catalog(&mut k, &ctx);
+
+        let pick = crate::prime_agent_loop::AgentPick {
+            plugin_id: "mcp:fs".to_string(),
+            tool_name: "search".to_string(),
+            args: serde_json::json!({ "q": "a" }),
+        };
+        match k.prime_agent_step(&ctx, &pick).unwrap() {
+            crate::prime_agent_loop::AgentExecStep::Observed(obs) => {
+                assert_eq!(obs.label, "mcp:fs/search");
+                assert_eq!(obs.source, "mcp");
+                assert!(obs.ok);
+                assert!(obs.detail.contains("found 3 files"), "the real output grounds: {obs:?}");
+            }
+            other => panic!("expected an observation, got {other:?}"),
+        }
+    }
+
+    /// A pick of a gated tool with NO standing grant stages the EXISTING per-call approval card and
+    /// returns it as a terminal step — nothing ran (the loop pauses).
+    #[test]
+    fn agent_step_gated_without_grant_stages_the_approval_card() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let endpoint = mock_mcp(mcp_tools_list_bodies(
+            r#"[{"name":"search","description":"Find things."}]"#,
+        ));
+        k.register_mcp_server("fs", &endpoint, "fs server", true, Some(2000)).unwrap();
+        k.grant_permission_to_agent(&ctx.agent, Permission::new("tool:mcp-fs:search").unwrap())
+            .unwrap();
+        inject_proposal_mcp_catalog(&mut k, &ctx);
+
+        let pick = crate::prime_agent_loop::AgentPick {
+            plugin_id: "mcp:fs".to_string(),
+            tool_name: "search".to_string(),
+            args: serde_json::json!({ "q": "a" }),
+        };
+        match k.prime_agent_step(&ctx, &pick).unwrap() {
+            crate::prime_agent_loop::AgentExecStep::Terminal(turn) => {
+                assert_eq!(turn.disposition, PrimeDisposition::AwaitingApproval);
+                assert!(turn.invoked_tool.is_none(), "nothing ran: {turn:?}");
+                let card = turn.pending_tool_approval.expect("a staged approval card");
+                assert_eq!(card.label, "mcp:fs/search");
+                assert!(card.allow_always_supported);
+            }
+            other => panic!("expected a staged-approval terminal, got {other:?}"),
+        }
+    }
+
+    /// A pick of a tool the live catalog does NOT carry fails closed: a terminal refusal with an
+    /// honest reason and no fabricated output.
+    #[test]
+    fn agent_step_unknown_tool_fails_closed() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let endpoint = mock_mcp(mcp_tools_list_bodies(
+            r#"[{"name":"search","description":"Find things."}]"#,
+        ));
+        k.register_mcp_server("fs", &endpoint, "fs server", true, Some(2000)).unwrap();
+        inject_proposal_mcp_catalog(&mut k, &ctx);
+
+        let pick = crate::prime_agent_loop::AgentPick {
+            plugin_id: "mcp:fs".to_string(),
+            tool_name: "delete".to_string(),
+            args: serde_json::json!({}),
+        };
+        match k.prime_agent_step(&ctx, &pick).unwrap() {
+            crate::prime_agent_loop::AgentExecStep::Terminal(turn) => {
+                assert!(turn.invoked_tool.is_none());
+                assert!(turn.tool_output.is_none());
+                assert!(turn.tool_error.is_some(), "an honest refusal reason: {turn:?}");
+            }
+            other => panic!("expected a refusal terminal, got {other:?}"),
+        }
+    }
+
+    /// The agent catalog the loop's brain picks from carries a runnable MCP tool (gated, mcp
+    /// source) when the agent holds its permission, and is the fail-closed projection of the live
+    /// catalog.
+    #[test]
+    fn agent_catalog_lists_a_runnable_mcp_tool() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let endpoint = mock_mcp(mcp_tools_list_bodies(
+            r#"[{"name":"search","description":"Find things."}]"#,
+        ));
+        k.register_mcp_server("fs", &endpoint, "fs server", true, Some(2000)).unwrap();
+        k.grant_permission_to_agent(&ctx.agent, Permission::new("tool:mcp-fs:search").unwrap())
+            .unwrap();
+        inject_proposal_mcp_catalog(&mut k, &ctx);
+
+        let catalog = k.prime_agent_catalog(&ctx);
+        let entry = catalog
+            .iter()
+            .find(|t| t.label == "mcp:fs/search")
+            .expect("the runnable MCP tool is offered to the brain");
+        assert_eq!(entry.source, "mcp");
+        assert!(entry.gated, "an unclassified MCP tool is fail-closed gated");
     }
 
     #[test]

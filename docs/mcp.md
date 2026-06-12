@@ -190,6 +190,65 @@ returns an honest "no such tool", never a raw dump (`crate::prime::parse_tool_re
   `is_chat_guarded`) — so it never reaches the `NeedsApproval` arm and never stages an
   approval.
 
+## Prime Agent Loop v1 (bounded think → tool → observe → respond, in chat)
+
+The single explicit invocation above runs ONE named tool and stops. The **Prime Agent Loop** turns
+that into a real, bounded agentic loop for chat: on an explicit tool-request turn the configured
+brain may **call an allowed tool, observe its real output, and continue** — chaining a small number
+of tool calls and folding what it learned into a useful final answer — all behind the SAME
+fail-closed gates (Hermes/Codex-style `run_conversation`, but local and tightly bounded). It invents
+no second security model: every execution still flows through `prime_invoke_tool`.
+
+**When the loop engages (the safety wall).** Only when (a) a brain is configured (not Local) and
+(b) the deterministic classifier returns `ToolInvocation` for the message (the user explicitly asked
+to use / check / call a tool — the SAME gate the single invocation uses), and never on a
+continuation. Normal chat, a greeting, frustration / profanity, a vague idea, a Q&A or a brainstorm
+classifies as some other intent and **never enters the loop** — it stays conversational on the
+unchanged reply path. When the brain (inside the loop) chooses not to call any tool, the loop
+returns nothing and `run_prime` falls back to the normal turn path unchanged.
+
+**The bounded loop (`crates/relux-kernel/src/prime_agent_loop.rs`, pure + unit-tested).**
+- The brain is offered a **live, per-agent catalog** (`build_agent_catalog`) projected fail-closed
+  from the shared live catalog (installed plugin tools + off-lock-discovered live MCP tools): ONLY a
+  `Ready` (directly runnable) or `NeedsApproval` (runnable behind the approval/grant gate) tool the
+  agent can actually run is offered. A tool the agent lacks permission for, or with no runtime, is
+  omitted — the brain can never pick a tool that cannot run. This catalog is the loop's
+  `valid_tool_names` (Hermes), and every pick is validated against it (`interpret_agent_reply`):
+  an off-catalog / made-up name is fed back as a self-correction note, **never executed**.
+- Each round the brain replies with strict JSON — either `{"tool":"<plugin/tool>","args":{…}}` to
+  call one tool, or `{"answer":"…"}` to finish. A valid pick is executed through the gate
+  (`KernelState::prime_agent_step` → `prime_invoke_tool`); the **real, redacted, bounded**
+  observation is fed back, and the brain calls another tool or answers.
+- **Caps (Hermes `max_iterations`):** at most `MAX_AGENT_TOOL_CALLS = 3` tool executions and
+  `MAX_BRAIN_ROUNDS = 3` brain rounds (one initial + up to two post-observation iterations) per
+  turn; a repeated identical call (no progress) stops the loop; each observation is secret-redacted
+  (`relux_core::redact_secrets`) and clamped (`MAX_OBS_CHARS`).
+- **Gated tool → pause, not auto-run.** A `NeedsApproval` tool with no standing grant returns the
+  EXISTING staged approval card (see "Chat-staged approval" above) and the loop **stops** — nothing
+  ran. An allow-always grant turns that same tool into a direct run (the grant fast-path in
+  `prime_invoke_tool`), so a granted tool participates in the loop like any low-risk one.
+- **Fail closed on the result.** A missing / not-implemented / missing-permission / unknown tool is
+  an honest refusal turn (no fabricated observation). A tool that ran but errored is recorded as an
+  `ok:false` observation, never a fabricated success.
+
+**Locking.** Every brain round runs OFF the kernel lock; every execution takes its own short lock
+and is persisted (`drive_prime_agent_loop` in `server.rs`), so the kernel lock never spans a
+network/process brain call. The loop is bounded, so the interleave is too.
+
+**UX (no raw envelopes).** A multi-step turn surfaces a compact `tool_trace` (one chip per real
+execution, `relux_core::PrimeToolTrace` → `apps/dashboard/src/pages/Prime.tsx` `ToolTrace`); a
+single tool still shows its result via `ToolResult`; a paused turn shows the approval card. The
+final reply is the brain's answer grounded in the observations (kept deterministic — `invoked_tool`
+is set, so it is actionful and never re-narrated). No raw CLI JSON or transport envelope reaches the
+user.
+
+**v2 gaps (honest).** v1 does NOT: resume the brain's reasoning automatically AFTER an approval is
+granted (the operator approves + the bound call runs once via the existing routes; the brain does
+not then continue the loop in the same turn — it resumes on the next message, now grant-covered);
+stream tool output live; branch / run tools in parallel; or let the brain pick tools the user did
+not explicitly request (the `ToolInvocation` gate is the entry condition). These are deliberately
+out of scope to keep v1 local, bounded, and reuse-only.
+
 ## Session continuity (streamable-HTTP `Mcp-Session-Id`)
 
 A streamable-HTTP MCP server may be **stateful**: its `initialize` response sets an
@@ -640,6 +699,38 @@ Files read before implementing the plan:
   fail-closed** posture in `TaskToolPlan::validate` (non-empty, step-count cap, per-step
   plugin/tool + args bounds checked at create time), so an invalid plan is a `400` and
   never a partially-run task.
+
+**Prime Agent Loop v1 reference mapping (`docs/reference-driven-development.md`, BINDING).**
+Files read before implementing the loop:
+- **Hermes** `reference/hermes-agent-main/agent/conversation_loop.py` `run_conversation(...)` —
+  the per-turn agentic loop: `while (api_call_count < agent.max_iterations and
+  agent.iteration_budget.remaining > 0)` (L598) bounds the rounds; the assistant reply is inspected
+  for tool calls, each requested tool is executed and its result fed back as a `role:"tool"` message
+  (L630-676), and the loop ends when the model stops requesting tools and answers. The chosen tool
+  is validated against `agent.valid_tool_names` BEFORE execution (L389, L656) — an off-list name is
+  fed back as a self-correction message, never executed. We mirror this exactly:
+  `crates/relux-kernel/src/prime_agent_loop.rs` — `AgentLoop` (the bounded driver,
+  `MAX_AGENT_TOOL_CALLS` / `MAX_BRAIN_ROUNDS`), the live `AgentTool` catalog (`valid_tool_names`),
+  `interpret_agent_reply` (the pick interpreter + off-catalog `UnknownTool` self-correction), and a
+  reply with no tool/`{"answer":…}` ends the loop. We **diverge** by gating loop *entry* on an
+  explicit `ToolInvocation` turn (the safety wall) and by capping much tighter (3 calls / 3 rounds).
+- **openclaw** `reference/openclaw-main/src/agents/tool-mutation.ts` `isMutatingToolCall` (the
+  fail-closed default — an unknown action is mutating) and `src/acp/approval-classifier.ts` (an
+  unknown tool never auto-approves). We invert the polarity for the same safety: `build_agent_catalog`
+  admits ONLY a `Ready`/`NeedsApproval` tool the agent can run (everything else omitted), a gated
+  tool is never auto-run (the loop pauses with the existing approval card), and a stale/off-catalog
+  pick is refused.
+- **openclaw** `reference/openclaw-main/src/acp/permission-relay.ts` — allow-once / allow-always /
+  deny. The pause reuses the EXISTING `PrimeToolApprovalRequest` card + routes unchanged; the loop
+  only signals WHEN to pause.
+
+Prime Agent Loop files: `crates/relux-kernel/src/prime_agent_loop.rs` (the pure driver + types +
+unit tests), `crates/relux-kernel/src/state.rs` (`prime_agent_catalog` + `prime_agent_step` — the
+loop's catalog + its ONLY execution path, reusing `prime_invoke_tool`),
+`crates/relux-kernel/src/server.rs` (`drive_prime_agent_loop` + `agent_brain_round` +
+`build_agent_loop_turn` — the off-lock-brain / short-locked-exec orchestration in `run_prime`),
+`crates/relux-core/src/prime.rs` (`PrimeToolTrace` + `PrimeTurn.tool_trace`),
+`apps/dashboard/src/pages/Prime.tsx` (`ToolTrace` chips).
 
 Relux files: `crates/relux-core/src/mcp.rs` (config + validation + discovery types +
 `McpToolClassification` + `is_valid_mcp_tool_name` + injection scan, **plus the

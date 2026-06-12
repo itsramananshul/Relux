@@ -35,6 +35,7 @@ pub mod prime;
 pub mod prime_after_action;
 pub mod prime_admin_slots;
 pub mod prime_agent_slots;
+pub mod prime_agent_loop;
 pub mod prime_assign_slots;
 pub mod prime_clarify;
 pub mod prime_clarify_memory;
@@ -138,6 +139,11 @@ pub use prime_assign_slots::{
 pub use prime_orchestration_slots::{
     build_orchestration_slots_prompt, parse_orchestration_slots, reconcile_orchestration_slots,
     BrainOrchestrationSlots, ResolvedOrchestration,
+};
+pub use prime_agent_loop::{
+    build_agent_catalog, build_agent_prompt, interpret_agent_reply, run_agent_loop, AgentExecStep,
+    AgentLoop, AgentLoopResult, AgentObservation, AgentOutcome, AgentPick, AgentReply, AgentStep,
+    AgentTool, ToolStepOutcome, MAX_AGENT_TOOL_CALLS, MAX_BRAIN_ROUNDS,
 };
 pub use prime_slots::{
     build_task_slots_prompt, parse_task_slots, reconcile_task_slots, BrainTaskSlots,

@@ -35,11 +35,20 @@ Read for: **loop continuation, the bounded tool-call iteration cap, the valid-to
   message (L634, L676); when the model stops requesting tools the loop ends with its answer.
 - The model can only call a tool in `agent.valid_tool_names` (L389, L656); an off-list name
   is fed back as a self-correction message, never executed.
-- **Relux mapping:** `crates/relux-kernel/src/prime_tools.rs` — `ContextLoop` (the bounded
-  driver, `MAX_TOOL_ROUNDS`), `interpret_reply` (tool-call detector), `classify_tool`
+- **Relux mapping (read-only context):** `crates/relux-kernel/src/prime_tools.rs` — `ContextLoop`
+  (the bounded driver, `MAX_TOOL_ROUNDS`), `interpret_reply` (tool-call detector), `classify_tool`
   (allowlist gate), `unknown_tool_feedback` (self-correction). The unified-decision path
   (`prime_decision.rs`) collapses this to one envelope; the kernel still validates and
   executes deterministically.
+- **Relux mapping (Prime Agent Loop v1 — real tool execution):**
+  `crates/relux-kernel/src/prime_agent_loop.rs` — `AgentLoop` (the bounded think→tool→observe→respond
+  driver, `MAX_AGENT_TOOL_CALLS` / `MAX_BRAIN_ROUNDS`), the live `AgentTool` catalog
+  (`valid_tool_names`), `interpret_agent_reply` (pick interpreter + off-catalog self-correction),
+  `AgentObservation` (the redacted, bounded `role:"tool"` result fed back). The kernel executes each
+  pick through the UNCHANGED single-invocation gate (`state.rs` `prime_agent_step` → `prime_invoke_tool`),
+  pausing on a gated tool with the existing approval card; the off-lock-brain / short-locked-exec
+  orchestration is `server.rs` `drive_prime_agent_loop`. Entry is gated on an explicit `ToolInvocation`
+  turn (the safety wall). See `docs/mcp.md` "Prime Agent Loop v1".
 
 ### `tools/mcp_tool.py` — the MCP client (list + call shaping)
 Read for: **MCP `tools/list` discovery, `tools/call` result shaping, description scanning.**

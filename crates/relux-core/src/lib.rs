@@ -73,7 +73,7 @@ pub use prime::{
     PrimeIntent,
     PrimePlan, PrimePolishedStep, PrimeProposal, PrimeProposalPolish, PrimeProposalStep,
     PrimeSuggestion, PrimeTaskChange, PrimeTaskSlots, PrimeTaskUpdate, PrimeToolApprovalRequest,
-    PrimeToolPlanProposal,
+    PrimeToolPlanProposal, PrimeToolTrace,
     PrimeToolPlanStep, PrimeTurn, StateSummary,
     TaskBrief,
 };

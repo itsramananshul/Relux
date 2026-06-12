@@ -3163,11 +3163,45 @@ async fn run_prime(
         relux_kernel::ProposalMcpCatalog::default()
     };
 
+    // 0f. PRIME AGENT LOOP v1 — a bounded think → tool → observe → respond loop for an EXPLICIT
+    // tool-request turn. Engaged ONLY when (a) a brain is configured and (b) the deterministic
+    // classifier says the user explicitly asked to use / check / call a tool (`ToolInvocation`),
+    // and never on a continuation. That gate is the safety wall: normal chat, a greeting,
+    // frustration / profanity, a vague idea, a Q&A or a brainstorm classifies as some other intent
+    // and NEVER enters the loop — it stays conversational. Inside the loop the brain may call an
+    // allowed tool, observe its real output, and continue (bounded to `MAX_AGENT_TOOL_CALLS` calls
+    // / `MAX_BRAIN_ROUNDS` rounds), pausing with the EXISTING per-call approval card on a gated
+    // tool with no standing grant. Every execution flows through the UNCHANGED
+    // `prime_invoke_tool` gate (`prime_agent_step`), so there is no second security model. When the
+    // brain never picks a tool the loop returns `None` and the normal turn path below runs
+    // unchanged (`docs/mcp.md` "Prime Agent Loop"; §10.5, §17.1).
+    let agent_loop_turn = if !is_continuation
+        && matches!(relux_kernel::classify_intent(&message), relux_core::PrimeIntent::ToolInvocation)
+        && !matches!(brain, relux_kernel::PrimeBrain::Local)
+    {
+        drive_prime_agent_loop(
+            &state,
+            brain,
+            &ai_config,
+            cli_status.clone(),
+            &message,
+            &proposal_mcp_catalog,
+        )
+        .await?
+    } else {
+        None
+    };
+
     // 1. Run the deterministic kernel turn (must happen under the lock), passing
     // the optional brain intent proposal AND the slot bundle so the kernel reconciles
     // + audits the final intent and validates every slot at its single chokepoint.
-    // `intent_source` records who decided.
-    let (turn, summary, intent_source, pending_clarification) = {
+    // `intent_source` records who decided. SKIPPED when the agent loop above already produced the
+    // turn (an explicit tool-request turn that ran at least one tool, or paused for approval).
+    let (turn, summary, intent_source, pending_clarification) = if let Some(loop_outcome) =
+        agent_loop_turn
+    {
+        loop_outcome
+    } else {
         let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut store = SqliteStore::open(&state.db_path)?;
         let mut kernel = store.load()?;
@@ -4270,6 +4304,200 @@ async fn gather_read_only_context(
         }
     }
     lp.into_reads()
+}
+
+/// One brain round of the PRIME AGENT LOOP: ask the configured brain (off-lock) for the next tool
+/// pick or final answer, returning the lifted raw reply or `None` on any failure. Reuses the SAME
+/// per-brain "one tool round" primitives the read-only context loop uses
+/// ([`relux_kernel::complete_tool_round`] for OpenRouter, [`cli_brain_tool_round`] for the CLI
+/// brains), so the agentic loop's safety logic lives once in [`relux_kernel::AgentLoop`] and only
+/// the "get raw text" primitive differs per brain.
+async fn agent_brain_round(
+    brain: relux_kernel::PrimeBrain,
+    ai_config: &relux_kernel::AiConfig,
+    cli_status: Option<relux_core::AdapterRuntimeStatus>,
+    prompt: String,
+) -> Option<String> {
+    match brain {
+        relux_kernel::PrimeBrain::Openrouter => {
+            relux_kernel::complete_tool_round(ai_config, prompt).await
+        }
+        relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli => {
+            cli_brain_tool_round(brain, cli_status, prompt).await
+        }
+        relux_kernel::PrimeBrain::Local => None,
+    }
+}
+
+/// Build the final [`relux_core::PrimeTurn`] for an agent-loop turn that ran at least one tool and
+/// did NOT pause/refuse: an `Executed` tool-result turn whose reply incorporates what the tools
+/// returned (the brain's final answer when it gave one, else a grounded fold of the observations).
+/// `invoked_tool` / `tool_output` carry the LAST observation so the turn reads as actionful and
+/// keeps its grounded reply (no brain re-narration); `tool_trace` carries the full compact trace.
+/// Only called when `result.ran_any_tool()` is true, so `invoked_tool` is always set (honest).
+fn build_agent_loop_turn(result: &relux_kernel::AgentLoopResult) -> relux_core::PrimeTurn {
+    let reply = match &result.answer {
+        Some(a) => a.clone(),
+        None => {
+            let body = relux_kernel::prime_agent_loop::render_observations(&result.observations);
+            if body.is_empty() {
+                "I could not complete the tool request.".to_string()
+            } else {
+                format!("Here is what the tools returned:\n\n{body}")
+            }
+        }
+    };
+    let last = result.observations.last();
+    relux_core::PrimeTurn {
+        intent: relux_core::PrimeIntent::ToolInvocation,
+        reply,
+        disposition: relux_core::PrimeDisposition::Executed,
+        action: None,
+        created_task: None,
+        started_run: None,
+        created_agent: None,
+        approval: None,
+        invoked_tool: last.map(|o| o.label.clone()),
+        tool_output: last.map(|o| serde_json::Value::String(o.detail.clone())),
+        tool_error: None,
+        suggested_actions: vec![],
+        proposal: None,
+        slots: None,
+        agent_slots: None,
+        admin_slots: None,
+        assign_slots: None,
+        update: None,
+        context_reads: vec![],
+        tool_plan_proposal: None,
+        pending_tool_approval: None,
+        tool_trace: result.trace(),
+    }
+}
+
+/// Drive the bounded PRIME AGENT LOOP for one explicit tool-request turn, interleaving OFF-LOCK
+/// brain rounds with SHORT locked tool-execution steps (each through the unchanged
+/// `prime_agent_step` → `prime_invoke_tool` gate). Returns:
+///
+/// - `Ok(Some((turn, summary, source, clarification)))` when the loop produced the turn — either a
+///   tool-result turn (≥1 tool ran), a staged approval card (a gated tool paused), or an honest
+///   refusal — to use IN PLACE of the normal deterministic turn.
+/// - `Ok(None)` when the brain never picked a runnable tool (or none are runnable), so `run_prime`
+///   falls back to the normal turn path unchanged.
+///
+/// Every brain round is OFF-LOCK; every execution takes its own short lock and is persisted, so the
+/// kernel lock never spans a network/process brain call. Bounded by [`relux_kernel::AgentLoop`].
+async fn drive_prime_agent_loop(
+    state: &AppState,
+    brain: relux_kernel::PrimeBrain,
+    ai_config: &relux_kernel::AiConfig,
+    cli_status: Option<relux_core::AdapterRuntimeStatus>,
+    message: &str,
+    proposal_mcp_catalog: &relux_kernel::ProposalMcpCatalog,
+) -> Result<
+    Option<(
+        relux_core::PrimeTurn,
+        StateResponse,
+        relux_kernel::IntentSource,
+        Option<relux_core::PendingClarification>,
+    )>,
+    ApiError,
+> {
+    // 1. Take the live, per-agent tool catalog under a short lock (MCP catalog injected so live
+    // MCP tools are included). Lock-free below.
+    let catalog = {
+        let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let store = SqliteStore::open(&state.db_path)?;
+        let mut kernel = store.load()?;
+        kernel.set_proposal_mcp_catalog(proposal_mcp_catalog.clone());
+        let ctx = crate::ensure_bootstrapped(&mut kernel)?;
+        kernel.prime_agent_catalog(&ctx)
+    };
+    // No runnable tools at all → nothing to drive; fall back to the normal turn path.
+    if catalog.is_empty() {
+        return Ok(None);
+    }
+
+    // 2. Drive the bounded loop.
+    let mut lp = relux_kernel::AgentLoop::new(message, catalog);
+    let mut terminal_turn: Option<relux_core::PrimeTurn> = None;
+    while let Some(prompt) = lp.next_prompt() {
+        let Some(raw) = agent_brain_round(brain, ai_config, cli_status.clone(), prompt).await else {
+            break;
+        };
+        match lp.classify(&raw) {
+            relux_kernel::AgentStep::Stop => break,
+            relux_kernel::AgentStep::Retry => continue,
+            relux_kernel::AgentStep::Execute(pick) => {
+                // Locked: execute ONE pick through the existing gate, persist the result/staging.
+                let step = {
+                    let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut store = SqliteStore::open(&state.db_path)?;
+                    let mut kernel = store.load()?;
+                    kernel.set_proposal_mcp_catalog(proposal_mcp_catalog.clone());
+                    let ctx = crate::ensure_bootstrapped(&mut kernel)?;
+                    let step = kernel.prime_agent_step(&ctx, &pick)?;
+                    store.save(&kernel)?;
+                    step
+                };
+                match step {
+                    relux_kernel::AgentExecStep::Observed(obs) => {
+                        if !lp.record_outcome(&pick, relux_kernel::ToolStepOutcome::Ran(obs)) {
+                            break;
+                        }
+                    }
+                    relux_kernel::AgentExecStep::Terminal(turn) => {
+                        // A staged approval card (gated, no grant) or an honest refusal — surface it
+                        // and stop. Record the matching outcome so the loop result reflects the stop.
+                        let outcome = if turn.pending_tool_approval.is_some() {
+                            relux_kernel::ToolStepOutcome::AwaitApproval
+                        } else {
+                            relux_kernel::ToolStepOutcome::Refused(
+                                turn.tool_error.clone().unwrap_or_default(),
+                            )
+                        };
+                        lp.record_outcome(&pick, outcome);
+                        terminal_turn = Some(*turn);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let result = lp.into_result();
+
+    // 3. No tool ran and nothing was staged → the brain stayed conversational. Fall back so the
+    // normal turn path (and its validated reply shaping) runs unchanged.
+    if terminal_turn.is_none() && !result.ran_any_tool() {
+        return Ok(None);
+    }
+
+    // 4. Read back the board summary + any pending clarification under a short lock, and assemble
+    // the final turn (the staged/refused terminal turn, or a tool-result turn).
+    let (summary, pending_clarification) = {
+        let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut store = SqliteStore::open(&state.db_path)?;
+        let mut kernel = store.load()?;
+        let ctx = crate::ensure_bootstrapped(&mut kernel)?;
+        let pc = kernel.pending_clarification_for(&ctx);
+        let summary = state_response(&kernel, &state.db_path);
+        // ensure_bootstrapped is read-only here in practice; persist defensively in case it had to
+        // bootstrap (matches the other short read locks in run_prime).
+        store.save(&kernel)?;
+        (summary, pc)
+    };
+
+    let trace = result.trace();
+    let turn = match terminal_turn {
+        Some(mut t) => {
+            // Attach any successful tool trace gathered BEFORE the pause/refusal this turn.
+            if !trace.is_empty() {
+                t.tool_trace = trace;
+            }
+            t
+        }
+        None => build_agent_loop_turn(&result),
+    };
+    Ok(Some((turn, summary, relux_kernel::IntentSource::Brain, pending_clarification)))
 }
 
 /// The provenance label for brain-extracted slots: the OpenRouter model id, or the
@@ -7455,6 +7683,7 @@ mod tests {
             context_reads: vec![],
             tool_plan_proposal: None,
             pending_tool_approval: None,
+        tool_trace: vec![],
         }
     }
 
@@ -8896,6 +9125,7 @@ mod tests {
             context_reads: vec![],
             tool_plan_proposal: None,
             pending_tool_approval: None,
+        tool_trace: vec![],
         };
         let wire = serde_json::to_value(&turn).expect("PrimeTurn serializes");
         assert!(

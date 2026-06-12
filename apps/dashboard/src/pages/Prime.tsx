@@ -281,6 +281,36 @@ function ToolResult({ turn }: { turn: ReluxPrimeTurn }) {
   return null;
 }
 
+// The compact trace of the tools Prime called inside the bounded AGENT LOOP this turn — one chip
+// per real, gated, audited execution, in order. Each chip carries the tool label, a source badge
+// (mcp / plugin), and the one-line summary on hover; an errored call is marked. Rendered straight
+// from the turn's `tool_trace` — the UI fabricates nothing. Nothing renders when the loop ran a
+// single tool (that is already shown by ToolResult) or no tools at all.
+function ToolTrace({ turn }: { turn: ReluxPrimeTurn }) {
+  const trace = turn.tool_trace;
+  // A single execution is already surfaced by ToolResult; the trace strip is for a real CHAIN.
+  if (!trace || trace.length < 2) return null;
+  return (
+    <div style={{ marginTop: 8 }}>
+      <div className="row wrap" style={{ gap: 6, alignItems: "center", fontSize: 11 }}>
+        <span className="badge done" style={{ fontSize: 9 }} title="Tools Prime called in sequence this turn">
+          🛠 {trace.length} tool steps
+        </span>
+        {trace.map((t, i) => (
+          <span
+            key={i}
+            className={"badge " + (t.ok ? "done" : "blocked")}
+            style={{ fontSize: 9 }}
+            title={`${t.source} · ${t.ok ? "ok" : "error"} — ${t.summary}`}
+          >
+            {t.source === "mcp" ? "mcp" : "tool"} · <span className="mono">{t.label}</span>
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function AiStatusBanner({ status }: { status: ReluxAiStatus | null }) {
   if (!status) return null;
   const brain = status.brain ?? "local";
@@ -434,6 +464,8 @@ function PrimeTurnCard({
         )}
 
       <ToolResult turn={turn} />
+
+      <ToolTrace turn={turn} />
 
       {/* A pending per-call tool approval Prime staged because an explicit chat tool
           invocation named a gated (needs_approval) tool with no standing grant. The

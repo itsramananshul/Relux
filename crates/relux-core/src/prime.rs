@@ -787,6 +787,27 @@ pub struct PrimeContextRead {
     pub summary: String,
 }
 
+/// One real tool execution Prime performed inside the bounded agent loop this turn — a compact,
+/// secret-redacted trace chip for the chat UI.
+///
+/// Provenance/presentation ONLY, and honest by construction: an entry exists only when the kernel
+/// actually executed the tool through the UNCHANGED permission/approval/grant/audit gates
+/// (`crates/relux-kernel/src/prime_agent_loop.rs`, `prime_invoke_tool`). `ok` is `false` when the
+/// tool ran but reported an error — never a fabricated success. The full output stays server-side
+/// grounding (it grounds the reply); only this short summary is shipped. Omitted on every turn that
+/// ran no loop tool (`docs/mcp.md` "Prime Agent Loop"; `docs/RELUX_MASTER_PLAN.md` §10.5, §17.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrimeToolTrace {
+    /// The `<plugin_id>/<tool_name>` label that ran.
+    pub label: String,
+    /// The source kind for the chip badge: `"mcp"` or `"plugin"`.
+    pub source: String,
+    /// Whether the call succeeded. `false` is an honest error, never a fabricated result.
+    pub ok: bool,
+    /// A short, human one-line summary of what the tool returned.
+    pub summary: String,
+}
+
 /// The full result of Prime handling one user message.
 ///
 /// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 10 (Prime Behavior Specification).
@@ -888,6 +909,14 @@ pub struct PrimeTurn {
     /// they did before (`docs/mcp.md` "Invocation"; `docs/RELUX_MASTER_PLAN.md` §7.4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_tool_approval: Option<PrimeToolApprovalRequest>,
+    /// The real tool executions Prime performed inside the bounded agent loop this turn, in order
+    /// (see [`PrimeToolTrace`]). Present ONLY when a configured brain ran the agent loop and
+    /// executed at least one tool; omitted on every other turn, so existing clients see the same
+    /// JSON they did before. Provenance/presentation only — every entry is a real, gated, audited
+    /// execution, and the gathered outputs ground this turn's reply
+    /// (`docs/mcp.md` "Prime Agent Loop"; `docs/RELUX_MASTER_PLAN.md` §10.5, §17.1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_trace: Vec<PrimeToolTrace>,
 }
 
 /// A pending per-call tool approval Prime created when an explicit chat tool
@@ -1207,6 +1236,7 @@ mod tests {
             context_reads: vec![],
             tool_plan_proposal: None,
             pending_tool_approval: None,
+            tool_trace: vec![],
         };
         let json = serde_json::to_string(&turn).unwrap();
         assert!(

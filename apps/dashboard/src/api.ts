@@ -1708,6 +1708,22 @@ export interface ReluxPrimeToolApprovalRequest {
   allow_always_supported: boolean;
 }
 
+// One real tool execution Prime performed inside the bounded agent loop this turn — a compact,
+// secret-redacted trace chip. Presentation/provenance only, and honest by construction: an entry
+// exists only when the kernel actually executed the tool through the unchanged
+// permission/approval/grant/audit gates. `ok` is false when the tool ran but reported an error,
+// never a fabricated success. (docs/mcp.md "Prime Agent Loop"; §10.5, §17.1)
+export interface ReluxPrimeToolTrace {
+  // The `<plugin_id>/<tool_name>` label that ran.
+  label: string;
+  // The source kind for the chip badge: "mcp" or "plugin".
+  source: "mcp" | "plugin";
+  // Whether the call succeeded. false is an honest error, never a fabricated result.
+  ok: boolean;
+  // A short, human one-line summary of what the tool returned.
+  summary: string;
+}
+
 export interface ReluxPrimeTurn {
   intent: string;
   reply: string;
@@ -1760,6 +1776,12 @@ export interface ReluxPrimeTurn {
   // the same JSON they did before. Provenance only — every read was a deterministic,
   // fabricate-nothing inspection of live state, and none of it is an action.
   context_reads?: ReluxPrimeContextRead[];
+  // The real tool executions Prime performed inside the bounded AGENT LOOP this turn, in order
+  // (see ReluxPrimeToolTrace). Present ONLY when a configured brain ran the agent loop and
+  // executed at least one tool; omitted on every other turn. Provenance/presentation only — every
+  // entry is a real, gated, audited execution, and the gathered outputs ground this turn's reply.
+  // (docs/mcp.md "Prime Agent Loop"; §10.5, §17.1)
+  tool_trace?: ReluxPrimeToolTrace[];
   // Tool fields: present only when Prime ran (or honestly refused) a tool this
   // turn. `invoked_tool` is "<plugin_id>/<tool_name>"; `tool_output` carries the
   // real kernel output; `tool_error` is an honest reason a tool did NOT run.

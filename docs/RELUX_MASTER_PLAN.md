@@ -1836,6 +1836,39 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **unreleased** — **Prime Agent Loop v1 (bounded think → tool → observe → respond, in chat)** on top of
+  the chat-staged-approval slice, continuing the §9/§10.5/§17.1 line, built reference-first against Hermes'
+  `agent/conversation_loop.py` (`run_conversation` bounded `while api_call_count < max_iterations` tool
+  loop + `valid_tool_names` gate + tool-result observation feedback) and openclaw's fail-closed
+  mutate/approval classifiers per `docs/reference-driven-development.md` (mapping in `docs/mcp.md`, "Prime
+  Agent Loop v1"; `docs/REFERENCE_CODE_MAP.md`). No release cut; no master-plan safety property is weakened
+  — no gate is bypassed, nothing is auto-approved, and the loop invents no second security model.
+  **What closes:** the single explicit invocation ran ONE named tool and stopped. Now, on an explicit
+  tool-request turn (`classify_intent` → `ToolInvocation`, the SAME safety wall — normal chat / profanity /
+  vague ideas / Q&A never enter), a configured brain may **call an allowed tool, observe its real output,
+  and continue**, chaining up to `MAX_AGENT_TOOL_CALLS = 3` tools across `MAX_BRAIN_ROUNDS = 3` rounds and
+  folding the observations into a useful final answer. The pure, unit-tested driver
+  (`crates/relux-kernel/src/prime_agent_loop.rs` — `AgentLoop`, the live `AgentTool` catalog =
+  `valid_tool_names`, `interpret_agent_reply` with off-catalog self-correction, redacted/bounded
+  `AgentObservation`) executes each pick through the UNCHANGED single-invocation gate (`state.rs`
+  `prime_agent_step` → `prime_invoke_tool`): a `Ready` (or allow-always-granted) tool runs and is observed;
+  a gated tool with no grant returns the EXISTING staged approval card and the loop **pauses** (nothing
+  ran); a missing/unrunnable/unknown tool fails closed honestly. The off-lock-brain / short-locked-exec
+  orchestration is `server.rs` `drive_prime_agent_loop` (the kernel lock never spans a brain call). **UI:**
+  a compact `tool_trace` chip strip (`relux_core::PrimeToolTrace` → `Prime.tsx` `ToolTrace`) for a chain; a
+  single tool keeps its existing result render; no raw CLI JSON / transport envelope reaches the user.
+  **Fail-closed + honest:** the catalog offers only `Ready`/`NeedsApproval` tools the agent can run (the
+  brain cannot pick a tool it lacks permission for or that has no runtime); a stale/off-catalog pick is
+  refused; an errored run is an `ok:false` observation, never a fabricated success. **v2 gaps (honest):**
+  no automatic brain resume in the same turn after an approval is granted (the bound call runs once via the
+  existing routes; the brain resumes on the next message, now grant-covered); no live streaming, branching,
+  or parallel tools; the brain may not pick tools the user did not explicitly request. `cargo test` +
+  `clippy` clean on `relux-core`/`relux-kernel` (incl. new targeted tests: greeting/frustration never loop,
+  low-risk tool executes + observation grounds the answer, gated tool pauses with the card, allow-always
+  grant runs inside the loop, unknown tool fails closed, tool calls bounded to the cap, MCP tool
+  participates; plus kernel `prime_agent_step` tests: granted run yields an observation, gated-no-grant
+  stages the card, unknown fails closed, catalog lists a runnable MCP tool). Dashboard typechecks, builds,
+  and its tests pass; the committed bundle was rebuilt. Every safety property from the prior slice holds.
 - **unreleased** — **chat-staged tool approvals (gated chat tool calls become usable)** on top of the
   single-invoke slice, continuing the §9 ("P2 — MCP tool support") line, built reference-first against
   openclaw's `src/acp/permission-relay.ts` (the canonical allow-once / allow-always / deny decision model
