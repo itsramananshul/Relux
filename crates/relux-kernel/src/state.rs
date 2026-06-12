@@ -1151,25 +1151,74 @@ impl KernelState {
         timeout_ms: Option<u64>,
     ) -> Result<relux_core::McpServerConfig, KernelError> {
         let id = id.trim().to_string();
-        // Upsert preserves any operator-set per-tool classifications so re-pointing a
-        // server's endpoint/description does not silently reset its tools' risk.
-        let tool_overrides = self
-            .mcp_servers
-            .get(&id)
-            .map(|existing| existing.tool_overrides.clone())
-            .unwrap_or_default();
         let config = relux_core::McpServerConfig {
             id: id.clone(),
             transport: relux_core::McpTransport::HttpLoopback,
             endpoint: endpoint.trim().to_string(),
+            command: None,
+            args: Vec::new(),
             description: relux_core::sanitize_mcp_text(
                 description,
                 relux_core::MAX_MCP_DESCRIPTION_CHARS,
             ),
             enabled,
             timeout_ms: relux_core::clamp_mcp_timeout(timeout_ms),
-            tool_overrides,
+            // Filled in by `upsert_mcp_server` from any existing registration.
+            tool_overrides: std::collections::BTreeMap::new(),
         };
+        self.upsert_mcp_server(config)
+    }
+
+    /// Register (or replace) a **managed-stdio** MCP server: a governed local command
+    /// Relux spawns directly (argv only, never a shell) and speaks JSON-RPC to over
+    /// stdin/stdout. The command + args are validated with
+    /// [`relux_core::validate_stdio_command`] (no shell metacharacters, bounded,
+    /// no bypass/danger flag); the description is sanitized and the timeout clamped.
+    /// Upsert by id (preserving per-tool classifications). Stores **no env** (env
+    /// would carry secrets) and **no `cwd`** override. Registration is explicit and
+    /// operator-confirmed — it never spawns the command (that happens only on a later
+    /// operator-driven Discover / gated invocation). (`docs/mcp.md` "Managed stdio".)
+    pub fn register_mcp_stdio_server(
+        &mut self,
+        id: &str,
+        command: &str,
+        args: &[String],
+        description: &str,
+        enabled: bool,
+        timeout_ms: Option<u64>,
+    ) -> Result<relux_core::McpServerConfig, KernelError> {
+        let id = id.trim().to_string();
+        let config = relux_core::McpServerConfig {
+            id: id.clone(),
+            transport: relux_core::McpTransport::ManagedStdio,
+            endpoint: String::new(),
+            command: Some(command.trim().to_string()),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            description: relux_core::sanitize_mcp_text(
+                description,
+                relux_core::MAX_MCP_DESCRIPTION_CHARS,
+            ),
+            enabled,
+            timeout_ms: relux_core::clamp_mcp_timeout(timeout_ms),
+            tool_overrides: std::collections::BTreeMap::new(),
+        };
+        self.upsert_mcp_server(config)
+    }
+
+    /// Validate, audit, and insert (upsert by id) an MCP server config. Upsert
+    /// preserves any operator-set per-tool classifications so re-pointing a server's
+    /// transport/description does not silently reset its tools' risk. Stores no
+    /// secrets (the config carries none).
+    fn upsert_mcp_server(
+        &mut self,
+        mut config: relux_core::McpServerConfig,
+    ) -> Result<relux_core::McpServerConfig, KernelError> {
+        let id = config.id.clone();
+        config.tool_overrides = self
+            .mcp_servers
+            .get(&id)
+            .map(|existing| existing.tool_overrides.clone())
+            .unwrap_or_default();
         relux_core::validate_mcp_server_config(&config).map_err(|e| {
             KernelError::InvalidMcpConfig {
                 id: id.clone(),
@@ -1280,11 +1329,9 @@ impl KernelState {
         if !server.enabled {
             return Err(KernelError::McpServerDisabled(id.to_string()));
         }
-        let tools = crate::mcp::discover_tools(&server.endpoint, server.timeout_ms).map_err(|e| {
-            KernelError::McpDiscoveryFailed {
-                id: id.to_string(),
-                message: e.to_string(),
-            }
+        let tools = mcp_discover_tools(server).map_err(|e| KernelError::McpDiscoveryFailed {
+            id: id.to_string(),
+            message: e.to_string(),
         })?;
         let plugin_id = relux_core::mcp_synthetic_plugin_id(id);
         let mut out: Vec<ToolDescriptor> = tools
@@ -1358,6 +1405,16 @@ impl KernelState {
         if !server.enabled {
             return Err(KernelError::McpServerDisabled(id.to_string()));
         }
+        // The managed-stdio bridge speaks only initialize/tools/list/tools/call
+        // (`docs/mcp.md` "Managed stdio"). Resources over stdio are an honest
+        // not-supported failure here rather than a fabricated empty list.
+        if server.transport == relux_core::McpTransport::ManagedStdio {
+            return Err(KernelError::McpResourceFetchFailed {
+                id: id.to_string(),
+                message: "MCP resources are not supported over the managed-stdio transport yet"
+                    .to_string(),
+            });
+        }
         crate::mcp::list_resources(&server.endpoint, server.timeout_ms).map_err(|e| {
             KernelError::McpResourceFetchFailed {
                 id: id.to_string(),
@@ -1395,6 +1452,13 @@ impl KernelState {
             return Err(KernelError::InvalidMcpResourceUri {
                 server: id.to_string(),
                 uri: uri.chars().take(120).collect(),
+            });
+        }
+        if server.transport == relux_core::McpTransport::ManagedStdio {
+            return Err(KernelError::McpResourceFetchFailed {
+                id: id.to_string(),
+                message: "MCP resources are not supported over the managed-stdio transport yet"
+                    .to_string(),
             });
         }
         crate::mcp::read_resource(&server.endpoint, uri, server.timeout_ms).map_err(|e| {
@@ -4484,12 +4548,13 @@ impl KernelState {
                     tool: tool_name.to_string(),
                 });
             }
-            return crate::mcp::call_tool(&server.endpoint, tool_name, input, server.timeout_ms)
-                .map_err(|e| KernelError::ToolRuntimeInvocation {
+            return mcp_call_tool(server, tool_name, input).map_err(|e| {
+                KernelError::ToolRuntimeInvocation {
                     plugin: plugin_id.to_string(),
                     tool: tool_name.to_string(),
                     message: e.to_string(),
-                });
+                }
+            });
         }
         if let Some(output) = self.builtin_tool_output(plugin_id.as_str(), tool_name, input) {
             return Ok(output);
@@ -6338,7 +6403,10 @@ impl KernelState {
             .take(MAX_SNAPSHOT_ITEMS)
             .map(|s| crate::prime_tools::McpServerView {
                 id: s.id.clone(),
+                transport: s.transport,
                 endpoint: s.endpoint.clone(),
+                command: s.command.clone(),
+                args: s.args.clone(),
                 description: s.description.clone(),
                 enabled: s.enabled,
                 timeout_ms: s.timeout_ms,
@@ -11116,7 +11184,7 @@ pub fn discover_proposal_mcp_catalog(
         if !s.enabled {
             continue;
         }
-        let entry = match crate::mcp::discover_tools(&s.endpoint, s.timeout_ms) {
+        let entry = match mcp_view_discover_tools(s) {
             Ok(tools) => ProposalMcpServer {
                 server_id: s.id.clone(),
                 tools: Some(
@@ -11139,6 +11207,60 @@ pub fn discover_proposal_mcp_catalog(
         out.push(entry);
     }
     ProposalMcpCatalog { servers: out }
+}
+
+/// Run a live `tools/list` against one MCP server, dispatching on its transport:
+/// loopback HTTP dials the endpoint ([`crate::mcp`]); managed-stdio spawns the
+/// command ([`crate::mcp_stdio`]). The result handling (bounding/sanitizing) is the
+/// SAME for both — only the transport differs. Used by [`KernelState::discover_mcp_tools`].
+fn mcp_discover_tools(
+    server: &relux_core::McpServerConfig,
+) -> Result<Vec<relux_core::McpTool>, crate::mcp::McpClientError> {
+    match server.transport {
+        relux_core::McpTransport::HttpLoopback => {
+            crate::mcp::discover_tools(&server.endpoint, server.timeout_ms)
+        }
+        relux_core::McpTransport::ManagedStdio => {
+            let command = server.command.as_deref().unwrap_or("");
+            crate::mcp_stdio::discover_tools(command, &server.args, server.timeout_ms)
+        }
+    }
+}
+
+/// Run a `tools/call` against one MCP server, dispatching on its transport. Returns
+/// the SHAPED, sanitized result (never the raw envelope) for both transports. Used by
+/// the gated invocation path ([`KernelState::run_tool_runtime`]).
+fn mcp_call_tool(
+    server: &relux_core::McpServerConfig,
+    tool_name: &str,
+    input: &serde_json::Value,
+) -> Result<serde_json::Value, crate::mcp::McpClientError> {
+    match server.transport {
+        relux_core::McpTransport::HttpLoopback => {
+            crate::mcp::call_tool(&server.endpoint, tool_name, input, server.timeout_ms)
+        }
+        relux_core::McpTransport::ManagedStdio => {
+            let command = server.command.as_deref().unwrap_or("");
+            crate::mcp_stdio::call_tool(command, &server.args, tool_name, input, server.timeout_ms)
+        }
+    }
+}
+
+/// Live `tools/list` for an off-lock [`crate::prime_tools::McpServerView`], dispatching
+/// on its transport (the view carries the non-secret command/args alongside the
+/// endpoint). Used by [`discover_proposal_mcp_catalog`] OUTSIDE the kernel lock.
+fn mcp_view_discover_tools(
+    s: &crate::prime_tools::McpServerView,
+) -> Result<Vec<relux_core::McpTool>, crate::mcp::McpClientError> {
+    match s.transport {
+        relux_core::McpTransport::ManagedStdio => {
+            let command = s.command.as_deref().unwrap_or("");
+            crate::mcp_stdio::discover_tools(command, &s.args, s.timeout_ms)
+        }
+        // Default to HTTP for the loopback transport (and any older view that
+        // deserialized without an explicit transport).
+        _ => crate::mcp::discover_tools(&s.endpoint, s.timeout_ms),
+    }
 }
 
 /// Clamp + de-control an MCP discovery error for the (operator-facing) proposal note.
@@ -12769,6 +12891,66 @@ mod tests {
             k.set_mcp_server_enabled("nope", true),
             Err(KernelError::UnknownMcpServer(_))
         ));
+    }
+
+    #[test]
+    fn mcp_stdio_server_register_validates_and_preserves_classifications() {
+        let mut k = KernelState::new();
+        // A managed-stdio server registers (no spawn happens here).
+        let cfg = k
+            .register_mcp_stdio_server(
+                "gh",
+                "npx",
+                &["-y".to_string(), "server-github".to_string()],
+                "github mcp",
+                true,
+                Some(2_000),
+            )
+            .expect("register ok");
+        assert_eq!(cfg.transport.as_str(), "managed_stdio");
+        assert_eq!(cfg.command.as_deref(), Some("npx"));
+        assert_eq!(cfg.args, vec!["-y".to_string(), "server-github".to_string()]);
+        assert!(cfg.endpoint.is_empty());
+
+        // Classify a tool, then re-register: the classification survives the upsert.
+        k.set_mcp_tool_classification(
+            "gh",
+            "github.create_pr",
+            relux_core::RiskLevel::Low,
+            relux_core::ApprovalRequirement::Never,
+        )
+        .unwrap();
+        let re = k
+            .register_mcp_stdio_server("gh", "npx", &["-y".to_string(), "v2".to_string()], "moved", true, None)
+            .unwrap();
+        assert_eq!(re.args, vec!["-y".to_string(), "v2".to_string()]);
+        assert!(re.tool_overrides.contains_key("github.create_pr"));
+        assert_eq!(k.mcp_servers().len(), 1);
+
+        // An unsafe command (shell metacharacter) is refused fail-closed.
+        assert!(matches!(
+            k.register_mcp_stdio_server("bad", "sh;rm", &[], "x", true, None),
+            Err(KernelError::InvalidMcpConfig { .. })
+        ));
+        // An empty command is refused.
+        assert!(matches!(
+            k.register_mcp_stdio_server("bad", "   ", &[], "x", true, None),
+            Err(KernelError::InvalidMcpConfig { .. })
+        ));
+        // A forbidden bypass flag in args is refused.
+        assert!(matches!(
+            k.register_mcp_stdio_server(
+                "bad",
+                "claude",
+                &["--dangerously-skip-permissions".to_string()],
+                "x",
+                true,
+                None
+            ),
+            Err(KernelError::InvalidMcpConfig { .. })
+        ));
+        // None of the rejected registrations were stored.
+        assert!(k.mcp_server("bad").is_none());
     }
 
     #[test]

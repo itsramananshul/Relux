@@ -42,6 +42,126 @@ An operator can:
   tool (see "Invocation" below).
 - **Remove** a server registration (which also drops its tool classifications).
 
+## Managed stdio MCP servers (governed local command transport)
+
+Many real MCP servers are **stdio commands** (`npx @modelcontextprotocol/server-…`,
+`python -m mcp_server`), not loopback HTTP endpoints. Relux now registers and runs
+these as a **governed managed-stdio transport** — a second safe transport alongside
+loopback HTTP — so an operator no longer has to stand up a loopback HTTP shim by hand.
+It stays safe by construction and **never runs downloaded code on import**.
+
+Reference (`docs/reference-driven-development.md`, BINDING):
+`reference/hermes-agent-main/hermes_cli/mcp_config.py` (`cmd_mcp_add` /
+`_probe_single_server`) — a server is `{"url"}` HTTP or `{"command","args","env"}`
+stdio, spawned via the MCP SDK and probed by connecting → `tools/list` → disconnect;
+`crates/relix-runtime/src/nodes/tool/mcp_stdio.rs` — the prior async stdio MCP client
+(spawn with `kill_on_drop`, `initialize` + `notifications/initialized`, drain
+notifications until a matching-id response, map every failure to an honest error).
+Relux ports that posture to a **blocking** `std::process` client
+(`crates/relux-kernel/src/mcp_stdio.rs`) that fits the synchronous kernel tool path,
+and goes **stricter** than Hermes.
+
+- **Two transports in one registry.** `relux_core::McpTransport` now has
+  `HttpLoopback` (the original loopback HTTP endpoint) and `ManagedStdio` (a local
+  command). `McpServerConfig` carries `command: Option<String>` + `args: Vec<String>`
+  for the stdio transport (and `endpoint` for HTTP); both serialize/deserialize, and
+  the config still **stores no secret**. Registered via the SAME
+  `POST /v1/relux/mcp/servers` route — `{ "id", "transport":"managed_stdio",
+  "command":"npx", "args":[…], "description"?, "enabled"?, "timeout_ms"? }` (a present
+  `command` also selects stdio) — and the SAME list/enable/remove/classify surfaces.
+- **Registration is explicit + operator-confirmed; it never spawns.** Registering a
+  stdio server only records the (validated) `command` + `args`. The command is spawned
+  **only** on a later operator-driven **Discover** (`GET …/tools`) or a **gated
+  invocation** — never on registration and never on plugin import.
+- **argv only — never a shell.** The command + args are validated by
+  `relux_core::validate_stdio_command` and passed straight to `std::process::Command`
+  as `argv`. The command must be a single bounded program token with **no shell
+  metacharacter** (`; | & $ \` < > ( ) { } [ ] * ? ! # ' "`) and no control character
+  (a space IS allowed, so a full path like `C:\Program Files\nodejs\node.exe` works —
+  it is one argv token, never split). Each arg is bounded, control-character free, and
+  may otherwise contain anything (flags, `=`, JSON) because it is one `argv` element,
+  never shell-expanded. The arg **count** is bounded. There is **no shell-injection
+  surface**.
+- **No env, no `cwd`, no bypass flags.** The child inherits the parent environment
+  unchanged and runs in the parent's working directory: Relux passes **no env** (env
+  would carry secrets, which the config must never store) and **no `cwd` override**,
+  and it **never injects** a bypass/danger flag. A small denylist
+  (`--dangerously-skip-permissions`, `--dangerously-bypass-approvals-and-sandbox`,
+  `--yolo`) also **refuses** an operator-supplied bypass flag fail-closed — consistent
+  with the adapter governance (`crate::adapter` never passes one either).
+- **Spawn-per-operation, bounded, reaped.** Each Discover / invocation **spawns its
+  own child, runs one logical operation (`initialize` → `tools/list` / `tools/call`),
+  and kills + reaps it** (`StdioChild::drop`) — exactly like the HTTP client opens a
+  fresh `Connection: close` POST per operation. There is **no long-lived daemon**: a
+  managed server can never linger, leak, or run between operations. The lifecycle is
+  operator-controlled (a Discover / a gated invocation drives one bounded run).
+- **Timeout + size + redaction bounds.** Each request is bounded by the per-call
+  timeout (the child is killed on expiry); each stdout response line is size-capped
+  (4 MiB); the child's **stderr is drained into a bounded, secret-redacted tail**
+  (`relux_core::redact_secrets`, ≤20 lines) folded into the failure message so an
+  operator can see *why* a spawn/handshake/call failed. The result of a `tools/list`
+  / `tools/call` reuses the **same** bounded, sanitized, secret-redacted shapers as
+  the HTTP client (`crate::mcp::parse_tools_list` / `shape_tool_call_result`) — the
+  transport differs, the result handling does not. A `tools/call` `isError` is an
+  honest runtime failure, never a fabricated success; the **raw JSON-RPC envelope is
+  never returned**.
+- **Same gates, same `mcp:<server>` namespace.** A discovered stdio tool maps into the
+  identical `ToolDescriptor` shape (`plugin_id = "mcp:<server>"`, permission
+  `tool:mcp-<server>:<verb>`, fail-closed Medium+Required until classified) and is
+  **invoked through the unchanged `call_tool` / `invoke_tool` / per-call-approval /
+  persistent-grant path**. Registering or running a stdio server **does not
+  auto-approve its tools**. The plan-proposal grounding (`discover_proposal_mcp_catalog`)
+  dispatches on transport too, so an `mcp:<server>/<tool>` step grounds against a live
+  stdio `tools/list` the same way it does an HTTP one.
+- **Minimal JSON-RPC subset (tools only).** The stdio bridge speaks **only**
+  `initialize`, `notifications/initialized`, `tools/list`, and `tools/call`. MCP
+  **resources** (`resources/list` / `resources/read`) are **not** supported over
+  managed stdio in this slice — a resource read against a stdio server is an honest
+  not-supported failure, never a fabricated body (resources stay an HTTP-only surface
+  for now; see "Remaining gaps" below).
+
+### Plugin MCP hint → managed-stdio prefill (advisory, never auto-run)
+
+When an imported plugin's MCP config names a stdio `{command, args}`,
+`crate::mcp_proposal::propose_mcp_registration` now **pre-fills a reviewable
+managed-stdio registration draft** (`suggested_transport = "managed_stdio"`,
+`detected_command`, `detected_args`) instead of treating the command as display-only
+text. It still **executes nothing** on import — it only reads the same bounded
+metadata files the hint scan reads — and registration still flows through the
+unchanged `POST /v1/relux/mcp/servers` route + `validate_stdio_command`. The dashboard
+form seeds from the draft (`apps/dashboard/src/plugins.ts` `mcpDraftFromProposal`), the
+operator **reviews + confirms** the command/args (the same fail-closed pre-check
+`validateMcpRegisterDraft` mirrors the kernel), and the command is spawned only on a
+later operator-driven Discover/invoke. A detected non-loopback / missing `url` still
+forces manual entry; nothing is auto-registered or auto-run.
+
+### Operating it (dashboard)
+
+The Plugins page's **MCP servers** form now has a **Transport** selector (loopback
+HTTP endpoint vs. managed stdio command); the stdio form takes a **command** and
+**args (one argv element per line)**, pre-checked with the same argv-only rules the
+kernel enforces. The servers list shows each server's transport (`http` / `stdio`) and
+its `transport_display` (endpoint or `cmd args…`), the honest `configured`/`disabled`
+status, and **Discover** (which for a stdio server spawns the command, runs the live
+`tools/list`, and reaps the child) + **Remove** actions. The Resources action is hidden
+for a stdio server (resources are HTTP-only in this slice).
+(`apps/dashboard/src/pages/Plugins.tsx`, `apps/dashboard/src/plugins.ts`.)
+
+### Remaining gaps (honest)
+
+- **No long-lived daemon.** Each Discover/invocation spawns + reaps its own child;
+  there is no persistent process kept warm between operations (start/stop/restart of a
+  standing daemon is out of scope). This is deliberate — it keeps a managed server from
+  ever lingering or leaking — but it means a server that is expensive to start pays that
+  cost per operation.
+- **No env / no `cwd`.** Env is not stored (it would carry secrets) and `cwd` is not
+  overridden, so a stdio server that *requires* an env var (e.g. a token) or a specific
+  working directory is not yet supported through Relux's managed transport — run it as a
+  loopback HTTP server instead, or this stays a future slice once a safe, redacted
+  secret store backs it.
+- **Resources are HTTP-only.** `resources/list` / `resources/read` are not bridged over
+  managed stdio yet (tools only).
+
 ## MCP hint → review → register (one-click from imported plugin details)
 
 An operator who imports an arbitrary repo with no `relux-plugin.json` gets a
@@ -62,22 +182,27 @@ auto-action, and never running the source.
   `package.json` `description`, else an honest default), and — **only when an MCP config
   file names a loopback `url` that passes `validate_loopback_url`** — a pre-filled
   endpoint. A non-loopback / `https` / missing `url` is **never** pre-filled.
-- **stdio `{command, args}` is advisory only.** Mirroring the Hermes MCP config shape
-  (`reference/hermes-agent-main/hermes_cli/mcp_config.py` — a server is `{"url"}` HTTP or
-  `{"command","args","env"}` stdio), a detected stdio command is surfaced **bounded, as
-  display text** so the operator knows what to run themselves. Relux **never runs the
-  command**, never uses it as the endpoint, and never stores it — consistent with the
-  "No stdio (command) MCP servers" rule below. When no loopback endpoint can be safely
-  inferred, the proposal sets `endpoint_required` and the form **forces manual entry**.
+- **stdio `{command, args}` pre-fills a reviewable managed-stdio draft.** Mirroring the
+  Hermes MCP config shape (`reference/hermes-agent-main/hermes_cli/mcp_config.py` — a
+  server is `{"url"}` HTTP or `{"command","args","env"}` stdio), a detected stdio command
+  now **pre-fills a managed-stdio registration draft** (`suggested_transport =
+  "managed_stdio"`, `detected_command`, `detected_args`) — advisory, requiring the
+  operator's review/confirm (see "Managed stdio MCP servers" above). Relux still
+  **executes nothing on import**, never uses the command as an HTTP endpoint, and only
+  spawns it (argv-only, never a shell) after the operator registers it and clicks
+  Discover/invoke. When no loopback endpoint can be safely inferred, the proposal sets
+  `endpoint_required` so an *HTTP* registration would force manual entry — but the
+  operator can instead register the pre-filled managed-stdio command.
 - **The action opens a review form, not a runner.** The plugin details render a
   **"Register MCP server…"** button (`apps/dashboard/src/pages/Plugins.tsx`
   `DetectedHints` → the pre-filled `AddMcpServerForm`, seeded by the React-free
   `apps/dashboard/src/plugins.ts` `mcpDraftFromProposal`). The operator confirms/edits the
-  id, endpoint, and description; the detected command + honest notes show above the fields
-  as advisory text. Submit is pre-checked with the SAME fail-closed rules the kernel
-  enforces (`validateMcpRegisterDraft` mirrors `is_valid_mcp_id` + the required endpoint),
-  then POSTs the **existing** `POST /v1/relux/mcp/servers` route — **no new backend, no
-  parallel registry, nothing auto-registered or auto-run**.
+  id, transport, endpoint **or** command/args, and description; the detected command +
+  honest notes show above the fields as advisory text. Submit is pre-checked with the
+  SAME fail-closed rules the kernel enforces (`validateMcpRegisterDraft` mirrors
+  `is_valid_mcp_id` + the required endpoint for HTTP, and the argv-only command/args
+  rules for stdio), then POSTs the **existing** `POST /v1/relux/mcp/servers` route —
+  **no new backend, no parallel registry, nothing auto-registered or auto-run**.
 - **After registration: discover through the gate (unchanged).** On success the form
   points the operator to the **MCP servers** section to click **Discover**, which runs the
   existing live `tools/list` (`GET /v1/relux/mcp/servers/:id/tools`) and lists tools with

@@ -38,7 +38,10 @@ import {
   toolReadiness,
   validateMcpRegisterDraft,
   visibleTools,
+  emptyMcpRegisterDraft,
+  mcpRegisterBody,
   type McpRegisterDraft,
+  type McpDraftTransport,
   type StatusVariant,
   type ToolReadiness,
 } from "../plugins";
@@ -213,11 +216,13 @@ function McpSection() {
         </button>
       </div>
       <p className="muted" style={{ marginTop: -2, marginBottom: 12, fontSize: 12 }}>
-        Model Context Protocol servers you run locally. Only loopback endpoints are
-        allowed (<span className="mono">http://127.0.0.1:&lt;port&gt;</span>,{" "}
+        Model Context Protocol servers you run locally — a loopback HTTP endpoint
+        (<span className="mono">http://127.0.0.1:&lt;port&gt;</span>,{" "}
         <span className="mono">http://localhost:&lt;port&gt;</span>, or{" "}
-        <span className="mono">http://[::1]:&lt;port&gt;</span>) — Relux dials no
-        remote host and runs no downloaded code. <strong>Discovery is live</strong>{" "}
+        <span className="mono">http://[::1]:&lt;port&gt;</span>) or a{" "}
+        <strong>governed managed-stdio command</strong> (argv only, never a shell;
+        spawned only on Discover/invoke, never on registration). Relux dials no
+        remote host and runs no downloaded code on import. <strong>Discovery is live</strong>{" "}
         (a real <span className="mono">tools/list</span>), and a discovered tool is{" "}
         <strong>callable</strong> through the normal permission, risk/approval, and
         audit gates (against <span className="mono">plugin_id mcp:&lt;server&gt;</span>)
@@ -251,7 +256,7 @@ function McpSection() {
             <thead>
               <tr>
                 <th>Server</th>
-                <th>Endpoint</th>
+                <th>Transport</th>
                 <th>Status</th>
                 <th />
               </tr>
@@ -310,7 +315,13 @@ function McpServerRow({
           )}
         </td>
         <td className="mono muted" style={{ fontSize: 11, wordBreak: "break-all", maxWidth: 240 }}>
-          {server.endpoint}
+          <span className="badge" style={{ marginRight: 6 }}>
+            {server.transport === "managed_stdio" ? "stdio" : "http"}
+          </span>
+          {server.transport_display ??
+            (server.transport === "managed_stdio"
+              ? [server.command, ...(server.args ?? [])].filter(Boolean).join(" ")
+              : server.endpoint)}
         </td>
         <td>
           <span className={"badge " + BADGE_CLASS[status.variant]} title={status.title}>
@@ -322,19 +333,25 @@ function McpServerRow({
             className="btn ghost sm"
             onClick={() => setToolsOpen((v) => !v)}
             aria-expanded={toolsOpen}
-            title="Run a live tools/list discovery against this server"
+            title={
+              server.transport === "managed_stdio"
+                ? "Spawn the command and run a live tools/list discovery"
+                : "Run a live tools/list discovery against this server"
+            }
           >
             {toolsOpen ? "Close" : "Discover"}
           </button>
-          <button
-            className="btn ghost sm"
-            style={{ marginLeft: 6 }}
-            onClick={() => setResourcesOpen((v) => !v)}
-            aria-expanded={resourcesOpen}
-            title="Run a live resources/list against this server (read-only context)"
-          >
-            {resourcesOpen ? "Close" : "Resources"}
-          </button>
+          {server.transport !== "managed_stdio" && (
+            <button
+              className="btn ghost sm"
+              style={{ marginLeft: 6 }}
+              onClick={() => setResourcesOpen((v) => !v)}
+              aria-expanded={resourcesOpen}
+              title="Run a live resources/list against this server (read-only context)"
+            >
+              {resourcesOpen ? "Close" : "Resources"}
+            </button>
+          )}
           <button
             className="btn ghost sm"
             style={{ marginLeft: 6 }}
@@ -768,9 +785,12 @@ function McpClassifyForm({
   );
 }
 
-// The "Add an MCP server" form. Minimal, validated fields: id (required),
-// loopback endpoint (required, validated server-side as loopback-only), and an
-// optional description. No secrets are accepted.
+// The "Add an MCP server" form. Supports two transports:
+//   - loopback HTTP endpoint (validated server-side as loopback-only), or
+//   - a governed managed-stdio command + args (validated argv-only — no shell
+//     metacharacters, bounded, no bypass/danger flag).
+// No secrets are accepted (env is not stored). Registering a stdio server NEVER runs
+// the command — it is spawned only on a later operator-driven Discover / gated call.
 function AddMcpServerForm({
   onClose,
   onAdded,
@@ -782,36 +802,38 @@ function AddMcpServerForm({
   onAdded: () => void;
   // A pre-filled review draft (from a detected MCP hint proposal). The form is
   // identical to the manual "Add an MCP server" form — it never auto-registers and
-  // never runs the source; the operator still confirms id/endpoint/description.
+  // never runs the source; the operator still confirms every field.
   initial?: McpRegisterDraft;
   title?: string;
   // An optional advisory block (e.g. the detected stdio command + honest notes)
   // rendered above the fields. Display-only.
   advisory?: ReactNode;
 }) {
-  const [id, setId] = useState(initial?.id ?? "");
-  const [endpoint, setEndpoint] = useState(initial?.endpoint ?? "");
-  const [description, setDescription] = useState(initial?.description ?? "");
+  const seed = initial ?? emptyMcpRegisterDraft();
+  const [id, setId] = useState(seed.id);
+  const [transport, setTransport] = useState<McpDraftTransport>(seed.transport);
+  const [endpoint, setEndpoint] = useState(seed.endpoint);
+  const [command, setCommand] = useState(seed.command);
+  const [argsText, setArgsText] = useState(seed.argsText);
+  const [description, setDescription] = useState(seed.description);
   const [busy, setBusy] = useState(false);
   const [banner, setBanner] = useState<{ kind: string; msg: string } | null>(null);
+
+  const draft: McpRegisterDraft = { id, transport, endpoint, command, argsText, description };
 
   async function submit() {
     setBusy(true);
     setBanner(null);
     // Pre-check with the SAME fail-closed rules the kernel enforces, so the form
-    // never sends a request the loopback registry would reject.
-    const problem = validateMcpRegisterDraft({ id, endpoint, description });
+    // never sends a request the registry would reject.
+    const problem = validateMcpRegisterDraft(draft);
     if (problem) {
       setBanner({ kind: "err", msg: problem });
       setBusy(false);
       return;
     }
     try {
-      await reluxMcp.register({
-        id: id.trim(),
-        endpoint: endpoint.trim(),
-        description: description.trim() || undefined,
-      });
+      await reluxMcp.register(mcpRegisterBody(draft));
       setBanner({
         kind: "ok",
         msg: "MCP server registered. Find it under MCP servers above and click Discover to list its tools through the gate.",
@@ -819,6 +841,8 @@ function AddMcpServerForm({
       if (!initial) {
         setId("");
         setEndpoint("");
+        setCommand("");
+        setArgsText("");
         setDescription("");
       }
       onAdded();
@@ -853,19 +877,66 @@ function AddMcpServerForm({
         </span>
       </label>
       <label className="field" style={{ margin: "8px 0 0" }}>
-        <span style={{ fontSize: 12 }}>Loopback endpoint</span>
-        <input
+        <span style={{ fontSize: 12 }}>Transport</span>
+        <select
           className="input"
-          value={endpoint}
-          placeholder="http://127.0.0.1:8000/mcp"
-          onChange={(e) => setEndpoint(e.target.value)}
-        />
+          value={transport}
+          onChange={(e) => setTransport(e.target.value as McpDraftTransport)}
+        >
+          <option value="http_loopback">Loopback HTTP endpoint</option>
+          <option value="managed_stdio">Managed stdio command</option>
+        </select>
         <span className="muted" style={{ fontSize: 11, marginTop: 4 }}>
-          Loopback only. A remote or <span className="mono">https</span> endpoint is
-          refused. Relux POSTs JSON-RPC (<span className="mono">initialize</span>,{" "}
-          <span className="mono">tools/list</span>) here.
+          Managed stdio runs a local command (argv only, never a shell). It is spawned
+          only when you Discover or invoke a tool — never on registration.
         </span>
       </label>
+      {transport === "http_loopback" ? (
+        <label className="field" style={{ margin: "8px 0 0" }}>
+          <span style={{ fontSize: 12 }}>Loopback endpoint</span>
+          <input
+            className="input"
+            value={endpoint}
+            placeholder="http://127.0.0.1:8000/mcp"
+            onChange={(e) => setEndpoint(e.target.value)}
+          />
+          <span className="muted" style={{ fontSize: 11, marginTop: 4 }}>
+            Loopback only. A remote or <span className="mono">https</span> endpoint is
+            refused. Relux POSTs JSON-RPC (<span className="mono">initialize</span>,{" "}
+            <span className="mono">tools/list</span>) here.
+          </span>
+        </label>
+      ) : (
+        <>
+          <label className="field" style={{ margin: "8px 0 0" }}>
+            <span style={{ fontSize: 12 }}>Command</span>
+            <input
+              className="input"
+              value={command}
+              placeholder="npx"
+              onChange={(e) => setCommand(e.target.value)}
+            />
+            <span className="muted" style={{ fontSize: 11, marginTop: 4 }}>
+              One program token (argv only, never a shell). No shell metacharacters; a
+              full path is allowed. Bypass/danger flags are refused.
+            </span>
+          </label>
+          <label className="field" style={{ margin: "8px 0 0" }}>
+            <span style={{ fontSize: 12 }}>Args (one per line)</span>
+            <textarea
+              className="input"
+              rows={3}
+              value={argsText}
+              placeholder={"-y\n@modelcontextprotocol/server-github"}
+              onChange={(e) => setArgsText(e.target.value)}
+            />
+            <span className="muted" style={{ fontSize: 11, marginTop: 4 }}>
+              Each line is one argv element (never split) — an arg may contain spaces
+              or JSON. No env is stored; the child inherits the parent environment.
+            </span>
+          </label>
+        </>
+      )}
       <label className="field" style={{ margin: "8px 0 0" }}>
         <span style={{ fontSize: 12 }}>Description (optional)</span>
         <input

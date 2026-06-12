@@ -1836,6 +1836,45 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **unreleased** — **Governed managed-stdio MCP transport (closes the loopback-HTTP-only gap)** on top of
+  the MCP hint→register slice, continuing the §8.2/§18 + `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §9
+  ("P2 — MCP tool support") line, built reference-first against Hermes
+  `reference/hermes-agent-main/hermes_cli/mcp_config.py` (`cmd_mcp_add`/`_probe_single_server` — a server is
+  `{"url"}` HTTP or `{"command","args","env"}` stdio, spawned + probed by connect→`tools/list`→disconnect)
+  and `crates/relix-runtime/src/nodes/tool/mcp_stdio.rs` (the prior async stdio MCP client: `kill_on_drop`,
+  `initialize` + `notifications/initialized`, drain notifications until a matching-id response, honest error
+  on every failure) — `docs/reference-driven-development.md` (BINDING; mapping in `docs/mcp.md` "Managed
+  stdio MCP servers"). **What closes:** many real MCP servers are stdio commands, and Relux previously told
+  the operator to stand up a loopback HTTP shim themselves. Now the registry supports a **second safe
+  transport** — `relux_core::McpTransport::ManagedStdio` (`McpServerConfig.command`/`args`, serialized,
+  no secret) — registered via the SAME `POST /v1/relux/mcp/servers` route and the SAME
+  list/discover/classify/invoke/remove surfaces. **Safe by construction:** the command+args are validated
+  (`relux_core::validate_stdio_command`) and passed argv-only to `std::process::Command` (no shell, no
+  metacharacter-injection surface; a space is allowed so a full path works); no env is stored (it would
+  carry secrets), no `cwd` is overridden, and a bypass/danger-flag denylist
+  (`--dangerously-skip-permissions` / `--dangerously-bypass-approvals-and-sandbox` / `--yolo`) is refused.
+  **Operator-controlled lifecycle:** registration **never spawns** — the command runs only on a later
+  operator-driven Discover/invoke; the blocking client (`crates/relux-kernel/src/mcp_stdio.rs`)
+  **spawns-per-operation, reaps on drop** (no lingering daemon), bounds every request by the per-call
+  timeout (child killed on expiry), caps each stdout line (4 MiB), and drains a **bounded, secret-redacted
+  stderr tail** into the failure message. The `tools/list`/`tools/call` results reuse the SAME bounded,
+  sanitized, secret-redacted shapers as the HTTP client (no second result path); a `tools/call` `isError`
+  is an honest failure, never a fabricated success; the raw JSON-RPC envelope is never returned. **Same
+  gates:** a discovered stdio tool maps to the identical `mcp:<server>` namespace + `tool:mcp-<server>:<verb>`
+  permission + fail-closed Medium+Required default and invokes through the unchanged
+  `call_tool`/`invoke_tool`/approval/grant/audit path — registering or running a server auto-approves
+  nothing. **Plugin hints prefill (advisory):** a detected stdio `{command,args}` now pre-fills a reviewable
+  managed-stdio registration draft (`mcp_proposal` `suggested_transport`/`detected_command`/`detected_args`),
+  executing nothing on import. **UI:** the MCP servers form gains a Transport selector + command/args fields
+  (pre-checked with the same argv-only rules in `apps/dashboard/src/plugins.ts`); the list shows transport +
+  `transport_display` + Discover/Remove (Resources hidden for stdio — tools-only bridge). **Honest gaps:** no
+  long-lived daemon, no env/`cwd`, resources are HTTP-only. No release cut; no master-plan safety property
+  weakened (no remote host dialed, no downloaded code run on import, no secret stored). `cargo test` +
+  `clippy` clean on `relux-core`/`relux-kernel` (new tests: stdio config validate/serialize both transports,
+  shell-metachar/empty-command/too-many-args/bypass-flag rejection, a REAL subprocess fixture
+  `src/bin/relux_mcp_test_server.rs` driven end-to-end via `tests/mcp_stdio.rs` — spawn→initialize→list→call,
+  `isError` honest, unknown-tool clean, kernel registry discovery; route accepts/validates the stdio body);
+  dashboard typecheck/build/tests green (368), committed bundle rebuilt.
 - **unreleased** — **Background-job concurrency folded into the autonomy policy (retires the hidden
   `MAX_ACTIVE_JOBS = 4`)**, the FINAL LATER item from `docs/ARTIFICIAL_CONSTRAINT_AUDIT.md` promoted to
   FIXED, finishing the artificial-constraint pass and continuing the autonomy-policy line (§10.5/§17.1).

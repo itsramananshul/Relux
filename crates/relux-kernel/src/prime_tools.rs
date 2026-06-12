@@ -322,10 +322,28 @@ pub struct ApprovalView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpServerView {
     pub id: String,
+    /// The transport (loopback HTTP or managed stdio). Defaulted to loopback HTTP so
+    /// an older serialized snapshot (no transport field) still deserializes.
+    #[serde(default = "default_mcp_transport")]
+    pub transport: relux_core::McpTransport,
+    /// The loopback endpoint (HTTP transport); empty for a managed-stdio server.
+    #[serde(default)]
     pub endpoint: String,
+    /// The managed-stdio program (stdio transport); `None` for an HTTP server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// The managed-stdio program's args; empty for an HTTP server.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
     pub description: String,
     pub enabled: bool,
     pub timeout_ms: u64,
+}
+
+/// The transport an older serialized [`McpServerView`] (no transport field) defaults
+/// to — loopback HTTP, the original v1 transport.
+fn default_mcp_transport() -> relux_core::McpTransport {
+    relux_core::McpTransport::HttpLoopback
 }
 
 /// An owned, bounded snapshot of the control-plane state the read-only tools read from. Taken

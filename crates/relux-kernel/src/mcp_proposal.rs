@@ -76,14 +76,21 @@ pub struct McpRegistrationProposal {
     /// that passes the loopback rule. Absent ⇒ the operator must enter it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggested_endpoint: Option<String>,
-    /// True when no endpoint could be safely inferred, so the review form must
-    /// require manual entry (fail-closed).
+    /// True when no HTTP endpoint could be safely inferred, so an HTTP registration
+    /// would require manual endpoint entry (fail-closed). A detected stdio command
+    /// (below) can be registered as a managed-stdio server instead.
     pub endpoint_required: bool,
-    /// A stdio command detected in an MCP config — INFORMATIONAL ONLY. Relux never
-    /// runs it; it is shown so the operator knows what to start themselves.
+    /// The transport the review form should default to: `"managed_stdio"` when a
+    /// stdio command was detected, else `"http_loopback"`. Advisory — the operator
+    /// can switch transports in the form.
+    pub suggested_transport: String,
+    /// A stdio command detected in an MCP config — used to **pre-fill** a managed-stdio
+    /// registration draft (advisory). Relux never runs it on import; registration is
+    /// an explicit, operator-confirmed action and the command is re-validated +
+    /// spawned only on a later operator-driven Discover / gated invocation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detected_command: Option<String>,
-    /// The detected stdio command's args — informational only, bounded.
+    /// The detected stdio command's args — bounded; pre-fills the managed-stdio draft.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub detected_args: Vec<String>,
     /// Honest, human-readable notes about what was detected and why manual entry may
@@ -168,21 +175,30 @@ pub fn propose_mcp_registration(
                 .filter(|a| !a.is_empty())
                 .collect();
             notes.push(
-                "This server runs as a command (stdio). Relux never runs commands or \
-                 downloaded code — start it yourself as a loopback HTTP server, then enter \
-                 that address below."
+                "This server runs as a command (stdio). Relux can register it as a governed \
+                 managed-stdio server — review the command + args below and confirm. Relux runs \
+                 the command only after you register it, argv-only (never a shell), and never on \
+                 import."
                     .to_string(),
             );
         }
         None => {}
     }
 
+    let suggested_transport = if detected_command.is_some() {
+        "managed_stdio".to_string()
+    } else {
+        "http_loopback".to_string()
+    };
+
     if suggested_endpoint.is_none() && detected_command.is_none() {
         // npm/python MCP servers are typically stdio; a loopback address can't be
-        // inferred from metadata. Force manual entry (fail-closed).
+        // inferred from metadata. The operator either enters an HTTP loopback address
+        // or registers the server as managed stdio (fail-closed manual entry).
         notes.push(
-            "Relux could not infer a loopback address from the source. Run the server \
-             yourself as a loopback HTTP endpoint and enter it below."
+            "Relux could not infer how to reach this server from the source. Either run it \
+             yourself as a loopback HTTP endpoint and enter that address, or register it as a \
+             managed-stdio command below."
                 .to_string(),
         );
     }
@@ -191,6 +207,7 @@ pub fn propose_mcp_registration(
 
     Some(McpRegistrationProposal {
         endpoint_required: suggested_endpoint.is_none(),
+        suggested_transport,
         suggested_id,
         suggested_description,
         suggested_endpoint,
@@ -395,14 +412,16 @@ mod tests {
             r#"{"mcpServers":{"gh":{"command":"npx","args":["@modelcontextprotocol/server-github"]}}}"#,
         );
         let p = propose(d.path(), "gh-plugin").expect("draft");
-        // The command is surfaced informationally; it is NEVER the endpoint.
+        // The command pre-fills a managed-stdio draft; it is NEVER the HTTP endpoint.
         assert_eq!(p.detected_command.as_deref(), Some("npx"));
         assert_eq!(p.detected_args, vec!["@modelcontextprotocol/server-github".to_string()]);
-        assert!(p.suggested_endpoint.is_none(), "a command is never an endpoint");
-        assert!(p.endpoint_required);
+        assert!(p.suggested_endpoint.is_none(), "a command is never an HTTP endpoint");
+        assert!(p.endpoint_required, "no HTTP endpoint was inferred");
+        // The form should default to managed stdio for a detected command.
+        assert_eq!(p.suggested_transport, "managed_stdio");
         assert!(
-            p.notes.iter().any(|n| n.contains("never runs commands")),
-            "must be honest that Relux will not run the command: {:?}",
+            p.notes.iter().any(|n| n.contains("managed-stdio") || n.contains("never on")),
+            "must be honest that Relux runs the command only after review, never on import: {:?}",
             p.notes
         );
     }

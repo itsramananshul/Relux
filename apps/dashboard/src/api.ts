@@ -2893,8 +2893,12 @@ export interface ReluxMcpRegistrationProposal {
   // `url`. Absent ⇒ the operator must enter it (endpoint_required).
   suggested_endpoint?: string;
   endpoint_required: boolean;
-  // A stdio command detected in an MCP config — INFORMATIONAL ONLY. Relux never runs
-  // it; shown so the operator knows what to start themselves as a loopback server.
+  // The transport the review form should default to: "managed_stdio" when a stdio
+  // command was detected, else "http_loopback". Advisory — the operator can switch.
+  suggested_transport: string;
+  // A stdio command detected in an MCP config — pre-fills a managed-stdio registration
+  // draft (advisory). Relux never runs it on import; registration is explicit and the
+  // command is spawned only on a later operator-driven Discover / gated invocation.
   detected_command?: string;
   detected_args?: string[];
   // Honest notes about what was detected and why manual entry may be needed.
@@ -3103,8 +3107,16 @@ export interface McpToolClassification {
 
 export interface ReluxMcpServer {
   id: string;
-  transport: string; // "http_loopback"
+  transport: string; // "http_loopback" | "managed_stdio"
+  // The loopback endpoint (HTTP transport); empty for a managed-stdio server.
   endpoint: string;
+  // The managed-stdio program (stdio transport); absent for an HTTP server. No
+  // secret (env is not stored).
+  command?: string;
+  // The managed-stdio program's args; absent/empty for an HTTP server.
+  args?: string[];
+  // A bounded one-line summary of how the server is reached (endpoint or `cmd args…`).
+  transport_display?: string;
   description: string;
   enabled: boolean;
   timeout_ms: number;
@@ -3162,7 +3174,12 @@ export const reluxMcp = {
   // Existing per-tool classifications are preserved on a re-register.
   register: (body: {
     id: string;
-    endpoint: string;
+    // The transport. "http_loopback" (default) requires `endpoint`; "managed_stdio"
+    // requires `command` (and optional `args`). A present `command` also selects stdio.
+    transport?: "http_loopback" | "managed_stdio";
+    endpoint?: string;
+    command?: string;
+    args?: string[];
     description?: string;
     enabled?: boolean;
     timeout_ms?: number;

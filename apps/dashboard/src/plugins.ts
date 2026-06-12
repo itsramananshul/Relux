@@ -140,33 +140,71 @@ export function hintsNextStep(hints: ReluxPluginHint[]): string | null {
   return "Detected source signals only. Add a tool definition below (and a loopback runtime) to make anything runnable; Relux never infers tools or runs downloaded code.";
 }
 
+// The transport an MCP server draft registers as.
+export type McpDraftTransport = "http_loopback" | "managed_stdio";
+
 // The editable fields of the "Register MCP server" review form, pre-filled from a
 // detected proposal. The operator confirms/edits these before they are POSTed to the
-// EXISTING loopback registry — Relux never auto-registers and never runs the source.
+// EXISTING registry — Relux never auto-registers and never runs the source on import.
+// A draft is either an HTTP loopback endpoint OR a managed-stdio command + args.
 export interface McpRegisterDraft {
   id: string;
+  transport: McpDraftTransport;
   endpoint: string;
+  // The managed-stdio program (one argv token). Used when transport is "managed_stdio".
+  command: string;
+  // The managed-stdio args, one argv element per line (whitespace-trimmed, blanks dropped).
+  argsText: string;
   description: string;
 }
 
-// Seed the review form from a server-built proposal. The endpoint is pre-filled only
-// when the server could safely infer a loopback address; otherwise it stays blank so
-// the operator must supply it (fail-closed manual entry).
+// Parse the args textarea into argv elements: one per line, trimmed, blanks dropped.
+// (Per-line — never shell-split — so an arg may safely contain spaces, e.g. JSON.)
+export function parseStdioArgs(argsText: string): string[] {
+  return argsText
+    .split("\n")
+    .map((a) => a.trim())
+    .filter((a) => a.length > 0);
+}
+
+// Seed the review form from a server-built proposal. For a detected stdio command the
+// form defaults to managed stdio with the command + args pre-filled (advisory); else
+// it defaults to HTTP, the endpoint pre-filled only when a loopback address was safely
+// inferred (otherwise blank — fail-closed manual entry).
 export function mcpDraftFromProposal(
   p: ReluxMcpRegistrationProposal,
 ): McpRegisterDraft {
+  const transport: McpDraftTransport =
+    p.suggested_transport === "managed_stdio" ? "managed_stdio" : "http_loopback";
   return {
     id: p.suggested_id ?? "",
+    transport,
     endpoint: p.suggested_endpoint ?? "",
+    command: p.detected_command ?? "",
+    argsText: (p.detected_args ?? []).join("\n"),
     description: p.suggested_description ?? "",
   };
 }
 
-// Client-side pre-check for the review form, mirroring the kernel's fail-closed
-// rules so the form never sends a request the registry would reject. Returns an
-// error string, or null when the draft looks submittable. The server remains the
-// authoritative validator (it re-checks the id charset and the loopback-only
-// endpoint); this only catches the obvious cases early for a clean message.
+// A fresh, empty HTTP-loopback draft for the manual "Add MCP server" form.
+export function emptyMcpRegisterDraft(): McpRegisterDraft {
+  return { id: "", transport: "http_loopback", endpoint: "", command: "", argsText: "", description: "" };
+}
+
+// Shell metacharacters the kernel refuses in a managed-stdio command (argv-only —
+// never shelled). Mirrors relux_core::validate_stdio_command's STDIO_COMMAND_METACHARS.
+const STDIO_COMMAND_METACHARS = /[;|&$`<>(){}\[\]*?!#'"]/;
+const DANGEROUS_STDIO_FLAGS = new Set([
+  "--dangerously-skip-permissions",
+  "--dangerously-bypass-approvals-and-sandbox",
+  "--yolo",
+]);
+
+// Client-side pre-check for the review form, mirroring the kernel's fail-closed rules
+// so the form never sends a request the registry would reject. Returns an error
+// string, or null when the draft looks submittable. The server remains the
+// authoritative validator (it re-checks the id charset, the loopback-only endpoint,
+// and the argv-only command); this only catches the obvious cases early.
 export function validateMcpRegisterDraft(d: McpRegisterDraft): string | null {
   const id = d.id.trim();
   if (!id) return "Server id is required.";
@@ -175,10 +213,55 @@ export function validateMcpRegisterDraft(d: McpRegisterDraft): string | null {
     return "Server id may use only letters, digits, '.', '-' or '_'.";
   }
   if (id.length > 64) return "Server id is too long (max 64 characters).";
+
+  if (d.transport === "managed_stdio") {
+    const cmd = d.command.trim();
+    if (!cmd) return "A managed-stdio server requires a command (e.g. npx).";
+    if (cmd.length > 256) return "Command is too long (max 256 characters).";
+    if (STDIO_COMMAND_METACHARS.test(cmd)) {
+      return "Command must not contain shell metacharacters — Relux runs it directly (argv only), never through a shell.";
+    }
+    const args = parseStdioArgs(d.argsText);
+    if (args.length > 64) return "Too many args (max 64).";
+    for (const a of args) {
+      if (DANGEROUS_STDIO_FLAGS.has(a.toLowerCase())) {
+        return `Arg "${a}" is a forbidden bypass/danger flag and cannot be used.`;
+      }
+    }
+    return null;
+  }
+
   if (!d.endpoint.trim()) {
     return "Loopback endpoint is required (e.g. http://127.0.0.1:8000/mcp).";
   }
   return null;
+}
+
+// Build the POST body for `reluxMcp.register` from a validated draft, dispatching on
+// the transport. Stdio args are parsed per-line (never shell-split).
+export function mcpRegisterBody(d: McpRegisterDraft): {
+  id: string;
+  transport: McpDraftTransport;
+  endpoint?: string;
+  command?: string;
+  args?: string[];
+  description?: string;
+} {
+  if (d.transport === "managed_stdio") {
+    return {
+      id: d.id.trim(),
+      transport: "managed_stdio",
+      command: d.command.trim(),
+      args: parseStdioArgs(d.argsText),
+      description: d.description.trim() || undefined,
+    };
+  }
+  return {
+    id: d.id.trim(),
+    transport: "http_loopback",
+    endpoint: d.endpoint.trim(),
+    description: d.description.trim() || undefined,
+  };
 }
 
 export type NextStepKind =

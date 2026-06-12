@@ -449,58 +449,88 @@ test("hintsNextStep is null when there are no hints (nothing to suggest)", () =>
   assert.equal(hintsNextStep([]), null);
 });
 
-test("mcpDraftFromProposal seeds the review form from a server-built proposal", () => {
+test("mcpDraftFromProposal seeds the review form from an HTTP proposal", () => {
   const draft = mcpDraftFromProposal({
     suggested_id: "acme-cool-mcp",
     suggested_description: "A cool MCP server.",
     suggested_endpoint: "http://127.0.0.1:8000/mcp",
     endpoint_required: false,
+    suggested_transport: "http_loopback",
     notes: [],
   });
   assert.deepEqual(draft, {
     id: "acme-cool-mcp",
+    transport: "http_loopback",
     endpoint: "http://127.0.0.1:8000/mcp",
+    command: "",
+    argsText: "",
     description: "A cool MCP server.",
   });
 });
 
-test("mcpDraftFromProposal leaves the endpoint blank when none was safely inferred", () => {
-  // The endpoint must NOT be auto-filled from a detected command — manual entry.
+test("mcpDraftFromProposal prefills a managed-stdio draft from a detected command", () => {
+  // A detected command pre-fills a reviewable managed-stdio draft (advisory). The
+  // HTTP endpoint stays blank — the command is never used as an endpoint.
   const draft = mcpDraftFromProposal({
     suggested_id: "gh",
     suggested_description: "Imported MCP server",
     endpoint_required: true,
+    suggested_transport: "managed_stdio",
     detected_command: "npx",
-    detected_args: ["@modelcontextprotocol/server-github"],
-    notes: ["This server runs as a command (stdio). Relux never runs commands…"],
+    detected_args: ["-y", "@modelcontextprotocol/server-github"],
+    notes: ["This server runs as a command (stdio). Relux can register it…"],
   });
+  assert.equal(draft.transport, "managed_stdio");
+  assert.equal(draft.command, "npx");
+  assert.equal(draft.argsText, "-y\n@modelcontextprotocol/server-github");
   assert.equal(draft.endpoint, "", "a command is never used as the endpoint");
   assert.equal(draft.id, "gh");
 });
 
-test("validateMcpRegisterDraft mirrors the kernel's fail-closed rules", () => {
+test("validateMcpRegisterDraft mirrors the kernel's fail-closed rules (HTTP)", () => {
+  const http = (over: Partial<Parameters<typeof validateMcpRegisterDraft>[0]>) =>
+    validateMcpRegisterDraft({
+      id: "acme-mcp",
+      transport: "http_loopback",
+      endpoint: "http://127.0.0.1:8000/mcp",
+      command: "",
+      argsText: "",
+      description: "",
+      ...over,
+    });
   // A clean draft passes.
-  assert.equal(
-    validateMcpRegisterDraft({ id: "acme-mcp", endpoint: "http://127.0.0.1:8000/mcp", description: "" }),
-    null,
-  );
+  assert.equal(http({}), null);
   // An empty endpoint is required (the manual-entry case).
-  assert.match(
-    validateMcpRegisterDraft({ id: "acme-mcp", endpoint: "  ", description: "" }) ?? "",
-    /endpoint is required/i,
-  );
+  assert.match(http({ endpoint: "  " }) ?? "", /endpoint is required/i);
   // An id with an illegal char (a space / path separator) is rejected early.
-  assert.match(
-    validateMcpRegisterDraft({ id: "bad id", endpoint: "http://127.0.0.1:8000", description: "" }) ?? "",
-    /letters, digits/i,
-  );
-  assert.match(
-    validateMcpRegisterDraft({ id: "a/b", endpoint: "http://127.0.0.1:8000", description: "" }) ?? "",
-    /letters, digits/i,
-  );
+  assert.match(http({ id: "bad id" }) ?? "", /letters, digits/i);
+  assert.match(http({ id: "a/b" }) ?? "", /letters, digits/i);
   // An empty id is rejected.
+  assert.match(http({ id: "" }) ?? "", /id is required/i);
+});
+
+test("validateMcpRegisterDraft enforces the managed-stdio safety rules", () => {
+  const stdio = (over: Partial<Parameters<typeof validateMcpRegisterDraft>[0]>) =>
+    validateMcpRegisterDraft({
+      id: "gh",
+      transport: "managed_stdio",
+      endpoint: "",
+      command: "npx",
+      argsText: "-y\nserver-github",
+      description: "",
+      ...over,
+    });
+  // A clean stdio draft passes (no endpoint needed).
+  assert.equal(stdio({}), null);
+  // A missing command is rejected.
+  assert.match(stdio({ command: "  " }) ?? "", /requires a command/i);
+  // A shell-metacharacter command is rejected (argv-only).
+  assert.match(stdio({ command: "sh;rm" }) ?? "", /shell metacharacters/i);
+  // A forbidden bypass/danger flag in args is rejected.
   assert.match(
-    validateMcpRegisterDraft({ id: "", endpoint: "http://127.0.0.1:8000", description: "" }) ?? "",
-    /id is required/i,
+    stdio({ argsText: "--dangerously-skip-permissions" }) ?? "",
+    /bypass\/danger flag/i,
   );
+  // An arg with spaces (e.g. JSON) is fine — args are per-line, never shell-split.
+  assert.equal(stdio({ argsText: '--config\n{"k": 1}' }), null);
 });

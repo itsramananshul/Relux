@@ -80,25 +80,46 @@ pub const MAX_MCP_TOOL_NAME_CHARS: usize = 128;
 /// misbehaving server cannot flood the Tools list.
 pub const MAX_MCP_TOOLS: usize = 256;
 
+/// Max characters accepted for a managed-stdio program (the `command`). The command
+/// is the program Relux spawns directly (argv only, never a shell), so it is bounded
+/// and restricted to a single token (no whitespace / shell metacharacters).
+pub const MAX_MCP_COMMAND_CHARS: usize = 256;
+/// Max characters accepted for one managed-stdio argument.
+pub const MAX_MCP_ARG_CHARS: usize = 4096;
+/// Hard cap on how many managed-stdio arguments a server may carry.
+pub const MAX_MCP_ARGS: usize = 64;
+
 /// The transport used to reach an MCP server.
 ///
-/// Only one variant is accepted in v1 — an operator-run loopback HTTP server.
-/// `Stdio` (spawn a command) and `Sse`/remote `Http` are deliberately deferred
-/// (`docs/mcp.md`): Relux never spawns arbitrary downloaded code, and v1 dials no
-/// remote host. It is an enum so future safe transports slot in without changing
-/// the wire shape of the rest of the config.
+/// Two safe transports are accepted:
+///
+/// - [`McpTransport::HttpLoopback`] — JSON-RPC over a loopback HTTP endpoint the
+///   operator runs themselves (the original v1 transport).
+/// - [`McpTransport::ManagedStdio`] — a **governed, operator-confirmed** local
+///   command Relux spawns directly (argv only, never a shell) and speaks JSON-RPC to
+///   over the child's stdin/stdout. The command + args are bounded and validated
+///   ([`validate_stdio_command`]); no env is stored (deferred — it would carry
+///   secrets), no `cwd` is overridden, and no bypass/danger flag is ever injected.
+///
+/// Remote `http(s)`/`sse` stays deliberately deferred (`docs/mcp.md`): Relux dials no
+/// remote host. The enum keeps the rest of the config's wire shape stable as safe
+/// transports slot in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum McpTransport {
     /// JSON-RPC over a loopback HTTP endpoint the operator runs themselves.
     HttpLoopback,
+    /// JSON-RPC over the stdin/stdout of a local command Relux spawns (argv only,
+    /// never a shell), with a bounded, validated `command` + `args`.
+    ManagedStdio,
 }
 
 impl McpTransport {
-    /// The stable wire string for this transport (`"http_loopback"`).
+    /// The stable wire string for this transport.
     pub fn as_str(&self) -> &'static str {
         match self {
             McpTransport::HttpLoopback => "http_loopback",
+            McpTransport::ManagedStdio => "managed_stdio",
         }
     }
 }
@@ -114,11 +135,23 @@ pub struct McpServerConfig {
     /// Stable, unique id for this server (e.g. `fs-helper`). Used as the synthetic
     /// plugin namespace `mcp:<id>` for discovered tools.
     pub id: String,
-    /// The transport (v1: always [`McpTransport::HttpLoopback`]).
+    /// The transport ([`McpTransport::HttpLoopback`] or [`McpTransport::ManagedStdio`]).
     pub transport: McpTransport,
-    /// The validated loopback endpoint, e.g. `http://127.0.0.1:8000/mcp`. JSON-RPC
-    /// requests are POSTed here.
+    /// The validated loopback endpoint, e.g. `http://127.0.0.1:8000/mcp` — JSON-RPC
+    /// requests are POSTed here. Used by [`McpTransport::HttpLoopback`]; empty (and
+    /// omitted from the wire shape) for a [`McpTransport::ManagedStdio`] server.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub endpoint: String,
+    /// The program Relux spawns for a [`McpTransport::ManagedStdio`] server (argv
+    /// only, never a shell). `None` for an HTTP server. Bounded + validated by
+    /// [`validate_stdio_command`]; carries no secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// The arguments passed to [`McpServerConfig::command`] (each a single argv
+    /// element — never split or shell-expanded). Empty (and omitted from the wire
+    /// shape) for an HTTP server or a command with no args.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
     /// A short human description of what this server provides.
     pub description: String,
     /// Whether the server is enabled. A disabled server is kept (so its endpoint
@@ -196,6 +229,98 @@ pub enum McpConfigError {
     InvalidId,
     #[error("MCP server endpoint is not a valid loopback URL: {0}")]
     InvalidEndpoint(String),
+    #[error("managed-stdio MCP server command must not be empty")]
+    EmptyCommand,
+    #[error("managed-stdio MCP server command is too long (max {MAX_MCP_COMMAND_CHARS} chars)")]
+    CommandTooLong,
+    #[error("managed-stdio MCP server command is not a safe program token: {0}")]
+    InvalidCommand(String),
+    #[error("managed-stdio MCP server has too many args (max {MAX_MCP_ARGS})")]
+    TooManyArgs,
+    #[error("managed-stdio MCP server argument is too long (max {MAX_MCP_ARG_CHARS} chars)")]
+    ArgTooLong,
+    #[error("managed-stdio MCP server argument is not safe: {0}")]
+    InvalidArg(String),
+    #[error("managed-stdio MCP server argument is a forbidden bypass/danger flag: {0}")]
+    DangerousFlag(String),
+}
+
+/// Shell metacharacters refused in a managed-stdio `command` token. Relux spawns the
+/// program directly (argv only, never a shell), so these are not interpreted — but a
+/// command carrying one is almost always an operator pasting a shell line by mistake,
+/// so it is rejected fail-closed with a clear message rather than spawned literally.
+const STDIO_COMMAND_METACHARS: &[char] = &[
+    ';', '|', '&', '$', '`', '<', '>', '(', ')', '{', '}', '[', ']', '*', '?', '!',
+    '#', '\'', '"',
+];
+
+/// Argument tokens that turn an agent CLI into an ungoverned, approval-skipping
+/// runner. Relux NEVER injects these, and refuses to spawn a managed-stdio server
+/// whose operator-supplied args carry one — a safety rail consistent with the
+/// adapter governance (`crate::adapter` never passes a bypass/danger flag). Compared
+/// case-insensitively against each trimmed arg.
+const DANGEROUS_STDIO_FLAGS: &[&str] = &[
+    "--dangerously-skip-permissions",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--yolo",
+];
+
+/// Validate a managed-stdio `command` + `args` against the safety contract:
+///
+/// - the **command** is a single, non-empty, bounded program token with no
+///   whitespace, no control characters, and no shell metacharacter (Relux runs it
+///   argv-only, never through a shell — a metacharacter signals a pasted shell line);
+/// - each **arg** is bounded and control-character free (a `NUL`/`CR`/`LF` could
+///   smuggle past `argv` boundaries on some platforms), the arg **count** is bounded,
+///   and no arg is a forbidden bypass/danger flag ([`DANGEROUS_STDIO_FLAGS`]).
+///
+/// Args may otherwise contain any printable content (flags, JSON, `=`): they are
+/// passed verbatim as individual `argv` elements and never shell-expanded, so they
+/// carry no shell-injection surface. A failure is fail-closed (the server is never
+/// spawned).
+pub fn validate_stdio_command(command: &str, args: &[String]) -> Result<(), McpConfigError> {
+    let cmd = command.trim();
+    if cmd.is_empty() {
+        return Err(McpConfigError::EmptyCommand);
+    }
+    if cmd.chars().count() > MAX_MCP_COMMAND_CHARS {
+        return Err(McpConfigError::CommandTooLong);
+    }
+    // No control characters (a tab/newline signals a pasted multi-line shell snippet).
+    // A space IS allowed: the command is one argv program token (never split, never
+    // shelled), so a path like `C:\Program Files\nodejs\node.exe` is legitimate.
+    if cmd.chars().any(|c| c.is_control()) {
+        return Err(McpConfigError::InvalidCommand(
+            "the command must not contain control characters".to_string(),
+        ));
+    }
+    if cmd.chars().any(|c| STDIO_COMMAND_METACHARS.contains(&c)) {
+        return Err(McpConfigError::InvalidCommand(
+            "the command must not contain shell metacharacters; Relux runs it directly (argv only), never through a shell"
+                .to_string(),
+        ));
+    }
+    if args.len() > MAX_MCP_ARGS {
+        return Err(McpConfigError::TooManyArgs);
+    }
+    for arg in args {
+        if arg.chars().count() > MAX_MCP_ARG_CHARS {
+            return Err(McpConfigError::ArgTooLong);
+        }
+        if arg.chars().any(|c| c.is_control()) {
+            return Err(McpConfigError::InvalidArg(
+                "an argument must not contain control characters".to_string(),
+            ));
+        }
+        let trimmed = arg.trim();
+        if DANGEROUS_STDIO_FLAGS
+            .iter()
+            .any(|f| trimmed.eq_ignore_ascii_case(f))
+        {
+            return Err(McpConfigError::DangerousFlag(trimmed.to_string()));
+        }
+    }
+    Ok(())
 }
 
 /// Whether `id` is a safe MCP server id: non-empty, `[A-Za-z0-9._-]` only, and at
@@ -245,8 +370,32 @@ pub fn validate_mcp_server_config(config: &McpServerConfig) -> Result<(), McpCon
     match config.transport {
         McpTransport::HttpLoopback => validate_loopback_url(&config.endpoint)
             .map_err(|e| McpConfigError::InvalidEndpoint(e.to_string()))?,
+        McpTransport::ManagedStdio => {
+            let command = config.command.as_deref().unwrap_or("");
+            validate_stdio_command(command, &config.args)?;
+        }
     }
     Ok(())
+}
+
+impl McpServerConfig {
+    /// A bounded, human one-line summary of how this server is reached — its loopback
+    /// endpoint, or `cmd arg1 arg2 …` for a managed-stdio server. Carries no secret
+    /// (the config stores none). Used for the operator-facing listing / error text.
+    pub fn transport_display(&self) -> String {
+        match self.transport {
+            McpTransport::HttpLoopback => self.endpoint.clone(),
+            McpTransport::ManagedStdio => {
+                let mut parts: Vec<String> = Vec::new();
+                if let Some(cmd) = &self.command {
+                    parts.push(cmd.clone());
+                }
+                parts.extend(self.args.iter().cloned());
+                let joined = parts.join(" ");
+                joined.chars().take(200).collect()
+            }
+        }
+    }
 }
 
 /// Clamp a requested MCP timeout into the supported range, defaulting when absent.
@@ -507,7 +656,23 @@ mod tests {
             id: id.to_string(),
             transport: McpTransport::HttpLoopback,
             endpoint: endpoint.to_string(),
+            command: None,
+            args: Vec::new(),
             description: "test server".to_string(),
+            enabled: true,
+            timeout_ms: DEFAULT_MCP_TIMEOUT_MS,
+            tool_overrides: BTreeMap::new(),
+        }
+    }
+
+    fn stdio_cfg(id: &str, command: &str, args: &[&str]) -> McpServerConfig {
+        McpServerConfig {
+            id: id.to_string(),
+            transport: McpTransport::ManagedStdio,
+            endpoint: String::new(),
+            command: Some(command.to_string()),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            description: "test stdio server".to_string(),
             enabled: true,
             timeout_ms: DEFAULT_MCP_TIMEOUT_MS,
             tool_overrides: BTreeMap::new(),
@@ -556,6 +721,106 @@ mod tests {
         assert_eq!(
             validate_mcp_server_config(&cfg(&long, "http://127.0.0.1:8000")),
             Err(McpConfigError::IdTooLong)
+        );
+    }
+
+    #[test]
+    fn accepts_a_managed_stdio_server() {
+        assert!(validate_mcp_server_config(&stdio_cfg("gh", "npx", &["-y", "server-github"])).is_ok());
+        assert!(validate_mcp_server_config(&stdio_cfg("py", "python", &["-m", "mcp_server"])).is_ok());
+        // A full path command (Windows or unix) is allowed (no shell metachars).
+        assert!(validate_mcp_server_config(&stdio_cfg("p", "C:\\tools\\node.exe", &[])).is_ok());
+        assert!(validate_mcp_server_config(&stdio_cfg("p", "/usr/bin/node", &[])).is_ok());
+    }
+
+    #[test]
+    fn rejects_unsafe_stdio_commands() {
+        // Empty command.
+        assert_eq!(
+            validate_mcp_server_config(&stdio_cfg("s", "   ", &[])),
+            Err(McpConfigError::EmptyCommand)
+        );
+        // A spaced program path IS allowed (argv-only — never split/shelled).
+        assert!(validate_mcp_server_config(&stdio_cfg("s", "C:\\Program Files\\nodejs\\node.exe", &[])).is_ok());
+        // A control character (e.g. a pasted multi-line snippet) is rejected.
+        assert!(matches!(
+            validate_mcp_server_config(&stdio_cfg("s", "node\nrm", &[])),
+            Err(McpConfigError::InvalidCommand(_))
+        ));
+        // Shell metacharacters in the command.
+        for bad in ["sh;rm", "a|b", "a&b", "a$(b)", "a`b`", "a>b"] {
+            assert!(
+                matches!(
+                    validate_mcp_server_config(&stdio_cfg("s", bad, &[])),
+                    Err(McpConfigError::InvalidCommand(_))
+                ),
+                "command {bad:?} must be rejected"
+            );
+        }
+        // An over-long command.
+        let long = "a".repeat(MAX_MCP_COMMAND_CHARS + 1);
+        assert_eq!(
+            validate_mcp_server_config(&stdio_cfg("s", &long, &[])),
+            Err(McpConfigError::CommandTooLong)
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_stdio_args() {
+        // Too many args.
+        let many: Vec<String> = (0..(MAX_MCP_ARGS + 1)).map(|i| format!("a{i}")).collect();
+        let many_refs: Vec<&str> = many.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            validate_mcp_server_config(&stdio_cfg("s", "node", &many_refs)),
+            Err(McpConfigError::TooManyArgs)
+        );
+        // An over-long arg.
+        let long = "x".repeat(MAX_MCP_ARG_CHARS + 1);
+        assert_eq!(
+            validate_mcp_server_config(&stdio_cfg("s", "node", &[&long])),
+            Err(McpConfigError::ArgTooLong)
+        );
+        // A control character in an arg (e.g. an embedded newline).
+        assert!(matches!(
+            validate_mcp_server_config(&stdio_cfg("s", "node", &["a\nb"])),
+            Err(McpConfigError::InvalidArg(_))
+        ));
+        // A forbidden bypass/danger flag (case-insensitive).
+        assert!(matches!(
+            validate_mcp_server_config(&stdio_cfg("s", "claude", &["--Dangerously-Skip-Permissions"])),
+            Err(McpConfigError::DangerousFlag(_))
+        ));
+        // A normal flag/arg with `=` or JSON is fine (argv-only, never shell-expanded).
+        assert!(validate_mcp_server_config(&stdio_cfg("s", "node", &["--port=8000", "{\"k\":1}"])).is_ok());
+    }
+
+    #[test]
+    fn stdio_config_serializes_command_and_args_not_endpoint() {
+        let v = serde_json::to_value(stdio_cfg("gh", "npx", &["-y", "srv"])).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+        keys.sort_unstable();
+        // The empty endpoint is omitted; command + args are present.
+        assert_eq!(
+            keys,
+            ["args", "command", "description", "enabled", "id", "timeout_ms", "transport"]
+        );
+        assert_eq!(v["transport"], "managed_stdio");
+        assert_eq!(v["command"], "npx");
+        assert_eq!(v["args"], serde_json::json!(["-y", "srv"]));
+        // Round-trips back to the same config.
+        let back: McpServerConfig = serde_json::from_value(v).unwrap();
+        assert_eq!(back, stdio_cfg("gh", "npx", &["-y", "srv"]));
+    }
+
+    #[test]
+    fn transport_display_summarizes_both_transports() {
+        assert_eq!(
+            cfg("s", "http://127.0.0.1:8000/mcp").transport_display(),
+            "http://127.0.0.1:8000/mcp"
+        );
+        assert_eq!(
+            stdio_cfg("gh", "npx", &["-y", "server-github"]).transport_display(),
+            "npx -y server-github"
         );
     }
 

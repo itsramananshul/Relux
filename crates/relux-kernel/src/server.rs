@@ -251,8 +251,9 @@ async fn serve() -> Result<(), KernelError> {
     println!("   GET    /v1/relux/adapters/:id/runtime");
     println!("   PUT    /v1/relux/adapters/:id/runtime     {{ \"enabled\":true, \"command\"?, \"timeout_seconds\"?, \"max_output_bytes\"? }}");
     println!("   DELETE /v1/relux/adapters/:id/runtime     (clear adapter runtime config)");
-    println!("   GET    /v1/relux/mcp/servers               (registered MCP servers — loopback HTTP discovery)");
+    println!("   GET    /v1/relux/mcp/servers               (registered MCP servers — loopback HTTP + managed stdio)");
     println!("   POST   /v1/relux/mcp/servers              {{ \"id\":\"...\", \"endpoint\":\"http://127.0.0.1:<port>/mcp\", \"description\"?, \"enabled\"?, \"timeout_ms\"? }}");
+    println!("   POST   /v1/relux/mcp/servers              {{ \"id\":\"...\", \"transport\":\"managed_stdio\", \"command\":\"npx\", \"args\":[\"-y\",\"server\"], … }}");
     println!("   DELETE /v1/relux/mcp/servers/:id           (remove an MCP server)");
     println!("   GET    /v1/relux/mcp/servers/:id/tools     (live tools/list discovery → ToolDescriptor[])");
     println!("   GET    /v1/relux/mcp/servers/:id/resources (live resources/list → McpResource[]; read-only context)");
@@ -6960,8 +6961,20 @@ async fn delete_adapter_runtime(
 #[derive(Debug, Serialize)]
 struct McpServerResponse {
     id: String,
+    /// `"http_loopback"` or `"managed_stdio"`.
     transport: String,
+    /// The loopback endpoint (HTTP transport); empty for a managed-stdio server.
     endpoint: String,
+    /// The managed-stdio program (stdio transport); absent for an HTTP server. No
+    /// secret (the config stores none — env is not stored).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command: Option<String>,
+    /// The managed-stdio program's args; empty for an HTTP server.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    args: Vec<String>,
+    /// A bounded one-line summary of how the server is reached (endpoint or
+    /// `cmd args…`), for the listing.
+    transport_display: String,
     description: String,
     enabled: bool,
     timeout_ms: u64,
@@ -6980,6 +6993,9 @@ impl McpServerResponse {
             id: c.id.clone(),
             transport: c.transport.as_str().to_string(),
             endpoint: c.endpoint.clone(),
+            command: c.command.clone(),
+            args: c.args.clone(),
+            transport_display: c.transport_display(),
             description: c.description.clone(),
             enabled: c.enabled,
             timeout_ms: c.timeout_ms,
@@ -7007,8 +7023,19 @@ async fn list_mcp_servers(
 struct McpServerReq {
     /// Stable, unique id (`[A-Za-z0-9._-]`). Required.
     id: String,
-    /// The loopback endpoint (validated loopback-only). Required.
-    endpoint: String,
+    /// The transport: `"http_loopback"` (default) or `"managed_stdio"`. The presence
+    /// of `command` also selects managed stdio.
+    #[serde(default)]
+    transport: Option<String>,
+    /// The loopback endpoint (validated loopback-only). Required for the HTTP transport.
+    #[serde(default)]
+    endpoint: Option<String>,
+    /// The managed-stdio program (argv only). Required for the managed-stdio transport.
+    #[serde(default)]
+    command: Option<String>,
+    /// The managed-stdio program's args (each a single argv element). Optional.
+    #[serde(default)]
+    args: Option<Vec<String>>,
     description: Option<String>,
     /// Defaults to enabled on first register; can be set false to disable.
     enabled: Option<bool>,
@@ -7016,7 +7043,13 @@ struct McpServerReq {
 }
 
 /// POST `/v1/relux/mcp/servers` — register or update (upsert by id) an MCP server.
-/// The endpoint is validated as loopback-only; no secrets are accepted or stored.
+///
+/// Two transports: an HTTP `endpoint` (validated loopback-only) or a managed-stdio
+/// `command` + `args` (validated argv-only — no shell metacharacters, bounded, no
+/// bypass/danger flag). Selecting stdio (transport `"managed_stdio"` or a present
+/// `command`) is an **explicit, operator-confirmed** registration — it never spawns
+/// the command (that happens only on a later operator-driven Discover / gated
+/// invocation). No secrets are accepted or stored (env is deliberately not stored).
 async fn register_mcp_server(
     State(state): State<AppState>,
     Json(req): Json<McpServerReq>,
@@ -7025,17 +7058,37 @@ async fn register_mcp_server(
     if id.is_empty() {
         return Err(ApiError::bad_request("MCP server id is required"));
     }
-    let endpoint = req.endpoint.trim().to_string();
-    if endpoint.is_empty() {
-        return Err(ApiError::bad_request("MCP server endpoint is required"));
-    }
     let description = req.description.unwrap_or_default();
     let enabled = req.enabled.unwrap_or(true);
-    let resp = locked_save(&state, |kernel| {
-        let cfg =
-            kernel.register_mcp_server(&id, &endpoint, &description, enabled, req.timeout_ms)?;
-        Ok(McpServerResponse::from_config(&cfg))
-    })?;
+    // Select the transport: an explicit `"managed_stdio"`, or the presence of a
+    // command (so a stdio draft posts without restating the transport).
+    let transport = req.transport.as_deref().unwrap_or("").trim().to_string();
+    let command = req.command.unwrap_or_default().trim().to_string();
+    let is_stdio = transport == "managed_stdio" || (transport.is_empty() && !command.is_empty());
+
+    let resp = if is_stdio {
+        if command.is_empty() {
+            return Err(ApiError::bad_request(
+                "a managed-stdio MCP server requires a command",
+            ));
+        }
+        let args = req.args.unwrap_or_default();
+        locked_save(&state, |kernel| {
+            let cfg = kernel
+                .register_mcp_stdio_server(&id, &command, &args, &description, enabled, req.timeout_ms)?;
+            Ok(McpServerResponse::from_config(&cfg))
+        })?
+    } else {
+        let endpoint = req.endpoint.unwrap_or_default().trim().to_string();
+        if endpoint.is_empty() {
+            return Err(ApiError::bad_request("MCP server endpoint is required"));
+        }
+        locked_save(&state, |kernel| {
+            let cfg =
+                kernel.register_mcp_server(&id, &endpoint, &description, enabled, req.timeout_ms)?;
+            Ok(McpServerResponse::from_config(&cfg))
+        })?
+    };
     Ok(Json(resp))
 }
 
@@ -10369,13 +10422,62 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
 
+        // Register a MANAGED-STDIO server (explicit transport + command/args). This
+        // only records the registration — it never spawns the command.
+        let (status, _, body) = call(
+            &state,
+            "POST",
+            "/v1/relux/mcp/servers",
+            None,
+            Some(r#"{"id":"gh","transport":"managed_stdio","command":"npx","args":["-y","server-github"],"description":"github"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "stdio register body: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["transport"], "managed_stdio");
+        assert_eq!(v["command"], "npx");
+        assert_eq!(v["args"], serde_json::json!(["-y", "server-github"]));
+        assert_eq!(v["transport_display"], "npx -y server-github");
+        // No endpoint field is surfaced for a stdio server.
+        assert!(v.get("endpoint").map(|e| e.as_str() == Some("")).unwrap_or(true));
+
+        // A managed-stdio registration with no command is a 400 (fail closed).
+        let (status, _, _) = call(
+            &state,
+            "POST",
+            "/v1/relux/mcp/servers",
+            None,
+            Some(r#"{"id":"bad","transport":"managed_stdio"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // A managed-stdio registration with a shell-metacharacter command is a 400.
+        let (status, _, _) = call(
+            &state,
+            "POST",
+            "/v1/relux/mcp/servers",
+            None,
+            Some(r#"{"id":"bad2","transport":"managed_stdio","command":"sh;rm"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
         // Discovery against an unknown server is a 404; nothing is faked.
         let (status, _, _) =
             call(&state, "GET", "/v1/relux/mcp/servers/nope/tools", None, None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
-        // Delete it.
+        // Delete the HTTP server; the managed-stdio one remains.
         let (status, _, _) = call(&state, "DELETE", "/v1/relux/mcp/servers/fs", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, _, body) = call(&state, "GET", "/v1/relux/mcp/servers", None, None).await;
+        let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        assert_eq!(list[0]["id"], "gh");
+
+        // Delete the stdio server too.
+        let (status, _, _) = call(&state, "DELETE", "/v1/relux/mcp/servers/gh", None, None).await;
         assert_eq!(status, StatusCode::OK);
         let (_, _, body) = call(&state, "GET", "/v1/relux/mcp/servers", None, None).await;
         let list: serde_json::Value = serde_json::from_str(&body).unwrap();

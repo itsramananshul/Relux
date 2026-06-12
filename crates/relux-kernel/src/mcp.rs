@@ -83,6 +83,15 @@ pub enum McpClientError {
     ServerError { code: i64, message: String },
     #[error("loopback MCP tool reported an error: {0}")]
     ToolCallError(String),
+    // --- managed-stdio transport (see `crate::mcp_stdio`) -------------------
+    #[error("could not spawn managed MCP server: {0}")]
+    Spawn(String),
+    #[error("managed MCP server exited before responding")]
+    ProcessExited,
+    #[error("managed MCP server response line exceeds the size cap")]
+    StdioLineTooLong,
+    #[error("managed MCP server transport error: {0}")]
+    Stdio(String),
 }
 
 impl From<RuntimeClientError> for McpClientError {
@@ -343,7 +352,11 @@ impl Session {
 /// Shape a raw `tools/call` JSON-RPC result into a bounded, sanitized value:
 /// `{ "result": <text>, "structuredContent"?: <json> }`. An `isError` result is an
 /// honest [`McpClientError::ToolCallError`]. Never returns the raw envelope.
-fn shape_tool_call_result(
+///
+/// `pub(crate)` so the managed-stdio client ([`crate::mcp_stdio`]) reuses the SAME
+/// security-sensitive shaping/redaction — the transport differs, the result handling
+/// does not.
+pub(crate) fn shape_tool_call_result(
     result: &serde_json::Value,
 ) -> Result<serde_json::Value, McpClientError> {
     let is_error = result
@@ -416,7 +429,10 @@ fn sanitize_result_text(s: &str, max: usize) -> String {
 }
 
 /// Parse a `tools/list` JSON-RPC result into bounded, sanitized [`McpTool`]s.
-fn parse_tools_list(result: &serde_json::Value) -> Result<Vec<McpTool>, McpClientError> {
+///
+/// `pub(crate)` so the managed-stdio client ([`crate::mcp_stdio`]) reuses the SAME
+/// bounding/sanitizing — only the transport differs.
+pub(crate) fn parse_tools_list(result: &serde_json::Value) -> Result<Vec<McpTool>, McpClientError> {
     let tools = result
         .get("tools")
         .and_then(|t| t.as_array())
