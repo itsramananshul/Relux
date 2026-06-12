@@ -525,6 +525,7 @@ fn protected_router() -> Router<AppState> {
         .route("/v1/relux/tasks/:id/execute-assigned", post(execute_assigned_task))
         .route("/v1/relux/tasks/:id/assign", post(assign_task_to_agent))
         .route("/v1/relux/tasks/:id/status", post(set_task_status_route))
+        .route("/v1/relux/tasks/:id/parent", post(reparent_task_route))
         .route("/v1/relux/tools", get(list_tools))
         .route("/v1/relux/tools/invoke", post(invoke_tool))
         .route(
@@ -2755,6 +2756,48 @@ async fn set_task_status_route(
         .ok_or_else(|| ApiError::bad_request("status must be one of: blocked, cancelled"))?;
     let task = locked_save(&state, |kernel| {
         kernel.set_task_status(&task_id, &target)?;
+        Ok(kernel.task(&task_id).cloned().unwrap())
+    })?;
+    Ok(Json(task))
+}
+
+#[derive(Debug, Deserialize)]
+struct ReparentTaskReq {
+    /// The new parent task id, or `null` / a blank string to CLEAR the parent (make the
+    /// task top-level). A blank/whitespace value is treated as "no parent" so a cleared
+    /// UI field never 400s — the same forgiving handling the create path gives a blank
+    /// `parent_task`.
+    #[serde(default)]
+    parent_task: Option<String>,
+}
+
+/// POST `/v1/relux/tasks/:id/parent` — the operator board SAFE REPARENT
+/// (`docs/relix-dashboard-design.md` §6.6 "reparent / reorder a subtask"). Moves an
+/// existing task under a new `parent_task`, or clears the edge to a top-level task,
+/// through the SAME validation the ad-hoc create path enforces (`reparent_task`): the
+/// task and a set parent must exist, the parent must share the child's namespace, and
+/// the edge must not close a cycle (including a self-parent). It is STRUCTURAL ONLY —
+/// status / assignment / runs are untouched.
+///
+/// A `null`/absent/blank `parent_task` CLEARS the edge. An unknown task/parent is a 400,
+/// a cross-namespace parent a 400 (`TaskParentScope`), and a cycle a 400
+/// (`TaskParentCycle`) — the same honest mapping the create path documents. Returns the
+/// updated task. Session-gated like every other board mutation.
+async fn reparent_task_route(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<ReparentTaskReq>,
+) -> Result<Json<relux_core::Task>, ApiError> {
+    let task_id = relux_core::TaskId::new(id);
+    // A blank/whitespace parent is "no parent" (clear), mirroring the create path.
+    let new_parent = req
+        .parent_task
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(relux_core::TaskId::new);
+    let task = locked_save(&state, |kernel| {
+        kernel.reparent_task(&task_id, new_parent.as_ref())?;
         Ok(kernel.task(&task_id).cloned().unwrap())
     })?;
     Ok(Json(task))
@@ -8189,6 +8232,12 @@ fn status_for(err: &KernelError) -> StatusCode {
         // off-allowlist target is bad input (400 — the route also pre-validates it).
         KernelError::TaskTerminalStatus { .. } => StatusCode::CONFLICT,
         KernelError::TaskStatusNotSettable { .. } => StatusCode::BAD_REQUEST,
+        // An ad-hoc parent edge (create or board reparent) that crosses a namespace or
+        // would close a cycle is bad input (400) — the same honest mapping §6.3/§6.6
+        // documents; the create/reparent paths reject it before any state change.
+        KernelError::TaskParentScope { .. } | KernelError::TaskParentCycle { .. } => {
+            StatusCode::BAD_REQUEST
+        }
         // An honest "this run cannot be resumed" (no captured session, an adapter
         // without safe non-interactive resume, or a run still in flight): the
         // request is well-formed but the action does not apply — unprocessable.
@@ -12025,6 +12074,91 @@ mod tests {
         let (status, _, audit) = call(&state, "GET", "/v1/relux/audit?limit=500", None, None).await;
         assert_eq!(status, StatusCode::OK);
         assert!(audit.contains("task:update"), "board move audit missing: {audit}");
+    }
+
+    /// End-to-end HTTP for the operator board SAFE REPARENT
+    /// (`POST /v1/relux/tasks/:id/parent`, design §6.6). The route reuses the create
+    /// path's validation: a valid same-namespace move sets the edge, a blank parent
+    /// clears it, a self-parent / cycle is a 400, and an unknown task a 400 — all
+    /// structural (the moved task's status is left alone).
+    #[tokio::test]
+    async fn reparent_task_route_moves_clears_and_rejects_cycles() {
+        let (state, _dir) = auth_state(true);
+        let (status, _, tb) =
+            call(&state, "POST", "/v1/relux/tasks", None, Some(r#"{"title":"Parent A"}"#)).await;
+        assert_eq!(status, StatusCode::OK, "task create failed: {tb}");
+        let a = serde_json::from_str::<serde_json::Value>(&tb).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, _, tb) =
+            call(&state, "POST", "/v1/relux/tasks", None, Some(r#"{"title":"Child B"}"#)).await;
+        assert_eq!(status, StatusCode::OK, "task create failed: {tb}");
+        let b = serde_json::from_str::<serde_json::Value>(&tb).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let parent_path = |id: &str| format!("/v1/relux/tasks/{id}/parent");
+
+        // Move B under A.
+        let (status, _, body) = call(
+            &state,
+            "POST",
+            &parent_path(&b),
+            None,
+            Some(&format!(r#"{{"parent_task":"{a}"}}"#)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "reparent failed: {body}");
+        assert!(body.contains(&format!("\"parent_task\":\"{a}\"")), "edge missing: {body}");
+
+        // A self-parent is a cycle → 400.
+        let (status, _, _) = call(
+            &state,
+            "POST",
+            &parent_path(&a),
+            None,
+            Some(&format!(r#"{{"parent_task":"{a}"}}"#)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "self-parent must be a 400");
+
+        // Moving A under B closes A -> B -> A → 400.
+        let (status, _, _) = call(
+            &state,
+            "POST",
+            &parent_path(&a),
+            None,
+            Some(&format!(r#"{{"parent_task":"{b}"}}"#)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "transitive cycle must be a 400");
+
+        // A blank parent CLEARS B's edge (a cleared UI field never 400s).
+        let (status, _, body) = call(
+            &state,
+            "POST",
+            &parent_path(&b),
+            None,
+            Some(r#"{"parent_task":""}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "clear failed: {body}");
+        assert!(
+            body.contains("\"parent_task\":null"),
+            "parent should be cleared: {body}"
+        );
+
+        // An unknown task is a 400.
+        let (status, _, _) = call(
+            &state,
+            "POST",
+            "/v1/relux/tasks/task_does_not_exist/parent",
+            None,
+            Some(r#"{"parent_task":null}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "unknown task is a 400");
     }
 
     /// The board status MOVE route is session-gated like every other protected route:

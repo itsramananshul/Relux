@@ -2924,6 +2924,98 @@ impl KernelState {
         Ok(task_id)
     }
 
+    /// Operator-driven SAFE REPARENT of an ad-hoc task subtree: change a task's
+    /// `parent_task` edge — move it under a new parent, or clear it to a top-level task
+    /// (`docs/relix-dashboard-design.md` §6.6 "reparent / reorder a subtask"; the §6.3
+    /// "still pending: drag-to-reorder / reparent a subtask in the UI — the kernel cycle
+    /// guard already covers reparenting safety" target).
+    ///
+    /// This is STRUCTURAL ONLY — it touches the `parent_task` edge and `updated_at` and
+    /// nothing else: the task's status, assigned agent, and any run are left exactly as
+    /// they were (moving a task in the tree never re-runs or re-buckets it). It mirrors
+    /// the in-kernel reparent precedent the org-lattice already uses for an operative's
+    /// Lead ([`Self::update_agent_with_skills`] `reports_to`): validate a SET parent
+    /// BEFORE mutating anything, with the SAME rules the create path
+    /// ([`Self::create_task_with_parent`]) enforces, so the board reparent can never be
+    /// looser than create:
+    ///
+    /// - the task being moved must EXIST (else [`KernelError::UnknownTask`]);
+    /// - a SET `new_parent` must exist (else [`KernelError::UnknownTask`] for the parent),
+    ///   share the child's namespace (else [`KernelError::TaskParentScope`] — a subtask
+    ///   lives in its parent's scope, never silently crossing a tenant boundary), and the
+    ///   edge must not close a cycle, including a self-parent (else
+    ///   [`KernelError::TaskParentCycle`], guarded by the pure, unit-tested
+    ///   [`relux_core::would_create_task_cycle`] over the CURRENT task tree — a
+    ///   bounded-depth, total walk even on a malformed map);
+    /// - a `None` `new_parent` CLEARS the edge (always valid for an existing task — a
+    ///   top-level task has no parent to validate).
+    ///
+    /// On success the change is audited (`task:update`, the same action the chat update
+    /// and the board status move write) with the structural change recorded. Persistence
+    /// is the caller's (the route's `locked_save`).
+    pub fn reparent_task(
+        &mut self,
+        task_id: &TaskId,
+        new_parent: Option<&TaskId>,
+    ) -> Result<(), KernelError> {
+        // (1) The task being moved must exist; capture its namespace for the scope check.
+        let child_ns = self
+            .tasks
+            .get(task_id)
+            .map(|t| t.namespace_id.clone())
+            .ok_or_else(|| KernelError::UnknownTask(task_id.to_string()))?;
+        // (2) Validate a SET parent BEFORE mutating anything (a clear needs no check).
+        if let Some(parent_id) = new_parent {
+            let parent_task = self
+                .tasks
+                .get(parent_id)
+                .ok_or_else(|| KernelError::UnknownTask(parent_id.to_string()))?;
+            if parent_task.namespace_id != child_ns {
+                return Err(KernelError::TaskParentScope {
+                    parent: parent_id.to_string(),
+                    parent_ns: parent_task.namespace_id.to_string(),
+                    child_ns: child_ns.to_string(),
+                });
+            }
+            // Pointing `task_id` → `parent_id` must not close a loop (self-parent, or
+            // moving a task under one of its own descendants). Checked against the LIVE
+            // task tree via the pure helper — bounded-depth and total even on a malformed
+            // map. The map carries `task_id`'s current edge, but the walk goes UP from
+            // `parent_id`, so an unrelated move is never falsely rejected.
+            let parent_of = self.task_parent_map();
+            if relux_core::would_create_task_cycle(task_id, parent_id, &parent_of) {
+                return Err(KernelError::TaskParentCycle {
+                    child: task_id.to_string(),
+                    parent: parent_id.to_string(),
+                });
+            }
+        }
+        // (3) Apply the structural change ONLY — status / agent / runs are untouched.
+        let now = self.clock.tick();
+        {
+            let task = self
+                .tasks
+                .get_mut(task_id)
+                .expect("task presence re-checked under the same &mut self");
+            task.parent_task = new_parent.cloned();
+            task.updated_at = now;
+        }
+        self.record_audit(
+            "kernel",
+            "kernel",
+            "task:update",
+            Some("task"),
+            Some(task_id.as_str()),
+            Some(&child_ns),
+            AuditResult::Success,
+            serde_json::json!({
+                "changes": { "parent_task": new_parent.map(|p| p.as_str()) },
+                "source": "board",
+            }),
+        );
+        Ok(())
+    }
+
     /// Assign a task to an agent and move it to `Queued`
     /// (`docs/RELUX_MASTER_PLAN.md` section 13.3).
     pub fn assign_task(&mut self, task_id: &TaskId, agent_id: &AgentId) -> Result<(), KernelError> {
@@ -13189,6 +13281,73 @@ mod tests {
         let ns = k.create_namespace("workspace", "Workspace", NamespaceKind::Personal);
         let id = k.create_task("standalone", serde_json::json!({}), "op", &ns, vec![]);
         assert!(k.task(&id).unwrap().parent_task.is_none());
+    }
+
+    // --- Safe task reparenting (design §6.6: change the `parent_task` edge) ----------
+
+    #[test]
+    fn reparent_sets_and_clears_the_parent_and_persists() {
+        let mut k = KernelState::new();
+        let ns = k.create_namespace("workspace", "Workspace", NamespaceKind::Personal);
+        let a = k.create_task("Parent A", serde_json::json!({}), "op", &ns, vec![]);
+        let b = k.create_task("Child B", serde_json::json!({}), "op", &ns, vec![]);
+        // Initially standalone.
+        assert!(k.task(&b).unwrap().parent_task.is_none());
+
+        // Move B under A.
+        k.reparent_task(&b, Some(&a)).expect("a valid same-namespace move");
+        assert_eq!(k.task(&b).unwrap().parent_task.as_ref(), Some(&a));
+        // Reparenting is STRUCTURAL ONLY — B's status is untouched.
+        assert_eq!(k.task(&b).unwrap().status, TaskStatus::Created);
+        // The edge survives persist/load.
+        let restored = KernelState::from_snapshot(k.snapshot());
+        assert_eq!(restored.task(&b).unwrap().parent_task.as_ref(), Some(&a));
+
+        // Clear B's parent → top-level again.
+        k.reparent_task(&b, None).expect("clearing a parent is always valid");
+        assert!(k.task(&b).unwrap().parent_task.is_none());
+        let restored = KernelState::from_snapshot(k.snapshot());
+        assert!(restored.task(&b).unwrap().parent_task.is_none());
+    }
+
+    #[test]
+    fn reparent_rejects_a_missing_parent_and_unknown_task() {
+        let mut k = KernelState::new();
+        let ns = k.create_namespace("workspace", "Workspace", NamespaceKind::Personal);
+        let b = k.create_task("Child B", serde_json::json!({}), "op", &ns, vec![]);
+        let ghost = TaskId::new("task_9999");
+        // A missing PARENT is rejected; B's edge is unchanged.
+        let err = k.reparent_task(&b, Some(&ghost)).unwrap_err();
+        assert!(matches!(err, KernelError::UnknownTask(_)), "missing parent: {err:?}");
+        assert!(k.task(&b).unwrap().parent_task.is_none());
+        // A missing CHILD (the task being moved) is rejected too.
+        let err = k.reparent_task(&ghost, Some(&b)).unwrap_err();
+        assert!(matches!(err, KernelError::UnknownTask(_)), "missing child: {err:?}");
+    }
+
+    #[test]
+    fn reparent_rejects_cross_namespace_self_and_cycles() {
+        let mut k = KernelState::new();
+        let ns_a = k.create_namespace("a", "A", NamespaceKind::Personal);
+        let ns_b = k.create_namespace("b", "B", NamespaceKind::Personal);
+        let a = k.create_task("Parent A", serde_json::json!({}), "op", &ns_a, vec![]);
+        let b = k.create_task("Child B", serde_json::json!({}), "op", &ns_a, vec![]);
+        let other = k.create_task("Other in B", serde_json::json!({}), "op", &ns_b, vec![]);
+
+        // Cross-namespace parent is rejected.
+        let err = k.reparent_task(&b, Some(&other)).unwrap_err();
+        assert!(matches!(err, KernelError::TaskParentScope { .. }), "cross-ns: {err:?}");
+
+        // Self-parent is a cycle.
+        let err = k.reparent_task(&b, Some(&b)).unwrap_err();
+        assert!(matches!(err, KernelError::TaskParentCycle { .. }), "self: {err:?}");
+
+        // Build A -> B (B under A), then moving A under B closes the loop.
+        k.reparent_task(&b, Some(&a)).expect("B under A is fine");
+        let err = k.reparent_task(&a, Some(&b)).unwrap_err();
+        assert!(matches!(err, KernelError::TaskParentCycle { .. }), "transitive cycle: {err:?}");
+        // The rejected move left A standalone — nothing was mutated.
+        assert!(k.task(&a).unwrap().parent_task.is_none());
     }
 
     #[test]

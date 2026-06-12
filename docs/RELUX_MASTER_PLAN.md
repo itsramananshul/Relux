@@ -714,7 +714,10 @@ exist, share the child's namespace, and not close a cycle (the bounded, cycle-gu
 task-tree walk in `relux_core::task`) — and `POST /v1/relux/tasks` accepts an optional
 `parent_task`. This is the second real parent→child link beside the orchestration's
 `steps[]`; the dashboard renders it as a subtree on the Work board
-(`docs/relix-dashboard-design.md` §6.3).
+(`docs/relix-dashboard-design.md` §6.3). The edge can also be **safely reparented**
+after creation via `KernelState::reparent_task` / `POST /v1/relux/tasks/:id/parent`
+(move under a new parent or clear it) — the same exist/namespace/cycle validation,
+structural only (status / agent / runs untouched); §6.6.
 
 ### 9.6 Run
 
@@ -1855,7 +1858,10 @@ stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
   populated via `create_task_with_parent`); (5) **Work board status movement v1**
   (`POST /v1/relux/tasks/:id/status`, settable-status allowlist + terminal guard, compact Block / Cancel
   control); (6) **per-subtree run / cost rollup v1** (pure client join `runrollup.ts`, honest "cost
-  unavailable" not a fake `$0`); (7) **dashboard route + dependency-free live-browser click smokes** (Relux
+  unavailable" not a fake `$0`); (6b) **safe task reparenting v1** (`POST /v1/relux/tasks/:id/parent`,
+  the create-path exist/namespace/cycle validation reused, structural only, compact Move-under… /
+  Remove-parent control whose candidates exclude self + descendants client-side); (7) **dashboard route +
+  dependency-free live-browser click smokes** (Relux
   Approvals rebuilt on the B&W design system, per-route render smoke). All reads/writes hit real kernel
   state. No master-plan safety property is weakened. `cargo test` + `clippy` clean on
   `relux-core`/`relux-kernel`; dashboard green; `dashboard-dist` in sync. Every safety property from v0.1.27

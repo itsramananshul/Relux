@@ -2750,6 +2750,19 @@ export const reluxWork = {
   setTaskStatus: (taskId: string, status: string) =>
     api.post<ReluxTask>(`/v1/relux/tasks/${encodeURIComponent(taskId)}/status`, { status }),
 
+  // SAFE REPARENT a task's ad-hoc subtree edge from the board (design §6.6): move it
+  // under `parentTask`, or pass `null` / "" to CLEAR the parent (make it top-level).
+  // The backend reuses the create path's validation (the task + a set parent must
+  // exist, share a namespace, and not close a cycle/self-parent → honest 400); it is
+  // STRUCTURAL ONLY (status/assignment/runs are untouched). Returns the updated task.
+  // Throws an ApiError carrying the real reason on rejection. The UI only offers
+  // candidate parents that exclude self + descendants (reparent.ts), so a valid call
+  // never 4xxs in normal use; the throw is the honest fallback if state changed.
+  reparentTask: (taskId: string, parentTask: string | null) =>
+    api.post<ReluxTask>(`/v1/relux/tasks/${encodeURIComponent(taskId)}/parent`, {
+      parent_task: parentTask,
+    }),
+
   // Execute a running task locally as its assigned agent.
   executeAssignedTask: (id: string) =>
     api.post<{ run_id: string }>(`/v1/relux/tasks/${encodeURIComponent(id)}/execute-assigned`),

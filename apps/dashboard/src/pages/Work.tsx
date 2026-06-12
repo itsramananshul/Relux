@@ -32,6 +32,7 @@ import {
   type RollupChip,
 } from "../runrollup";
 import { operatorStatusMoves, canMoveStatus } from "../taskmove";
+import { candidateParents } from "../reparent";
 import { orchestrationStatusTone } from "../orchestration";
 import { approvalInlineActions } from "../approvalactions";
 import {
@@ -1085,6 +1086,87 @@ export function StatusMoveControl({
   );
 }
 
+// SAFE REPARENT control (design §6.6): a compact "Move under…" selector + a "Remove
+// parent" button on the task detail. Candidate parents come from reparent.ts, which
+// excludes self, all descendants (no cycle), the current parent (no-op), and any
+// cross-namespace task — the SAME safety the kernel enforces, so the control never
+// offers a parent the backend would reject. When nothing qualifies it says so honestly
+// rather than presenting an empty control. A selection control, not drag-and-drop —
+// reliable v1 (free-form drag/reorder stays a §6/§7 target). On success it calls
+// onReparented() so the panel + board refresh; a rejection surfaces the real reason.
+export function ReparentControl({
+  task,
+  tasks,
+  onReparented,
+}: {
+  task: ReluxTask;
+  tasks: ReluxTask[];
+  onReparented: () => void;
+}) {
+  const candidates = useMemo(() => candidateParents(tasks, task.id), [tasks, task.id]);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const hasParent = !!task.parent_task;
+
+  async function reparent(parentTask: string | null) {
+    setBusy(true);
+    setErr(null);
+    try {
+      await reluxWork.reparentTask(task.id, parentTask);
+      onReparented();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Reparent failed.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <span className="reparent-control" style={{ display: "inline-flex", flexDirection: "column", gap: 2 }}>
+      <span className="row" style={{ alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+        {candidates.length > 0 ? (
+          <select
+            className="input sm"
+            aria-label="Move task under a new parent"
+            title="Move this task under another task"
+            value=""
+            disabled={busy}
+            style={{ fontSize: 10, padding: "4px 8px", minWidth: 120, height: 24 }}
+            onChange={(e) => e.target.value && void reparent(e.target.value)}
+          >
+            <option value="">{busy ? "Moving…" : "Move under…"}</option>
+            {candidates.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.title} ({c.id})
+              </option>
+            ))}
+          </select>
+        ) : (
+          <span className="muted" style={{ fontSize: 10 }}>
+            No other task can be its parent.
+          </span>
+        )}
+        {hasParent && (
+          <button
+            className="btn ghost sm"
+            style={{ height: 24, padding: "0 8px", fontSize: 10 }}
+            disabled={busy}
+            title="Make this a top-level task"
+            onClick={() => void reparent(null)}
+          >
+            Remove parent
+          </button>
+        )}
+      </span>
+      {err && (
+        <span className="badge failed" style={{ fontSize: 9, whiteSpace: "normal" }} title={err}>
+          {err}
+        </span>
+      )}
+    </span>
+  );
+}
+
 function TaskCard({ task, onAction, onInspectTask, agents, subtaskCount }: { task: ReluxTask; onAction: () => void; onInspectTask: (taskId: string) => void; agents: ReluxAgent[]; subtaskCount: number }) {
   const [busy, setBusy] = useState(false);
   const [selectedAgent, setSelectedAgent] = useState(task.assigned_agent || "");
@@ -1307,6 +1389,28 @@ function TaskDetailPanel({
               {canMoveStatus(task.status) && (
                 <StatusMoveControl taskId={task.id} status={task.status} onMoved={onStatusMoved} />
               )}
+            </span>
+          </div>
+          {/* Parent edge + SAFE REPARENT (design §6.6): show the current parent (if any,
+              click to inspect) and the compact Move-under… / Remove-parent control. The
+              candidate list (reparent.ts) excludes self + descendants + cross-namespace,
+              so it never offers a move the kernel would reject. */}
+          <div className="kv">
+            <span>Parent:</span>
+            <span className="row" style={{ alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+              {task.parent_task ? (
+                <span
+                  className="mono"
+                  style={{ cursor: "pointer", textDecoration: "underline" }}
+                  title={`subtask of ${task.parent_task}`}
+                  onClick={() => onInspectTask(task.parent_task!)}
+                >
+                  ↑ {task.parent_task}
+                </span>
+              ) : (
+                <span className="muted">top-level (no parent)</span>
+              )}
+              <ReparentControl task={task} tasks={tasks} onReparented={onStatusMoved} />
             </span>
           </div>
           <div className="kv"><span>Priority:</span><span>{task.priority}</span></div>
