@@ -102,8 +102,9 @@ Read order for that change:
 Relux files that implement it (`docs/mcp.md` "Run-driven multi-tool plan"; `RELUX_MASTER_PLAN`
 §10.5, §17.1):
 - `crates/relux-kernel/src/prime.rs` — `parse_tool_request` recognizes `mcp:<server>/<tool>`.
-- `crates/relux-kernel/src/state.rs` — `proposal_tool_catalog` (installed + live MCP merged,
-  read-only), `discover_proposal_mcp_catalog` (off-lock `tools/list`), `build_tool_plan_proposal`
+- `crates/relux-kernel/src/state.rs` — `live_tool_catalog` (installed + live MCP merged,
+  read-only; grounds BOTH the inert plan proposal AND a single explicit MCP invocation),
+  `discover_proposal_mcp_catalog` (off-lock `tools/list`), `build_tool_plan_proposal`
   (fail-closed grounding), the transient `proposal_mcp_catalog` + `set_proposal_mcp_catalog`.
 - `crates/relux-kernel/src/server.rs` — pre-fetches the catalog OFF-LOCK before the locked turn.
 - `apps/dashboard/src/pages/Prime.tsx` — the inert proposal card (MCP badge, readiness/risk,

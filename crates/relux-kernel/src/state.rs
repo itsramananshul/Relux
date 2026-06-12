@@ -4001,12 +4001,19 @@ impl KernelState {
         out
     }
 
-    /// The SHARED, read-only tool catalog used to ground a multi-tool-plan proposal:
-    /// every installed plugin tool ([`Self::discover_tools`]) PLUS the live
-    /// MCP-discovered tools the server pre-fetched off-lock for this turn
-    /// ([`Self::set_proposal_mcp_catalog`]). One catalog so a proposed `mcp:<server>/<tool>`
-    /// step resolves with the SAME `(plugin_id, tool_name)` lookup as an installed tool
-    /// and carries the SAME executable/risk semantics — there is no second tool system.
+    /// The SHARED, read-only live tool catalog: every installed plugin tool
+    /// ([`Self::discover_tools`]) PLUS the live MCP-discovered tools the server
+    /// pre-fetched off-lock for this turn ([`Self::set_proposal_mcp_catalog`]). One catalog
+    /// so an `mcp:<server>/<tool>` reference resolves with the SAME `(plugin_id, tool_name)`
+    /// lookup as an installed tool and carries the SAME executable/risk semantics — there is
+    /// no second tool system.
+    ///
+    /// Used by BOTH grounding paths so they agree: the inert multi-tool plan PROPOSAL
+    /// ([`Self::build_tool_plan_proposal`]) AND a SINGLE explicit MCP tool invocation
+    /// ([`Self::prime_invoke_tool`]). A `mcp:<server>/<tool>` the user names in chat
+    /// therefore resolves against the same off-lock catalog whether it is one tool or part
+    /// of a plan, and lands in the same `mcp:<server>` invoke gates (`docs/mcp.md`
+    /// "Invocation"; §10.5, §17.1).
     ///
     /// Each MCP tool's executable state mirrors [`Self::discover_mcp_tools`] (the unified
     /// Tools picker the operator already trusts): driven by the server's operator
@@ -4014,8 +4021,8 @@ impl KernelState {
     /// unclassified MCP tool reads as `needs_approval` (fail-closed Medium + Required),
     /// never auto-runnable. PURE: reads only — no network I/O (the live `tools/list` already
     /// ran off-lock), mutates nothing, fabricates nothing. An unreachable server contributes
-    /// NO tools here, so a step naming it cannot resolve and grounds as `unavailable`.
-    fn proposal_tool_catalog(
+    /// NO tools here, so a reference naming it cannot resolve and grounds as `unavailable`.
+    fn live_tool_catalog(
         &self,
         agent_for_permission: Option<&AgentId>,
     ) -> Vec<ToolDescriptor> {
@@ -4086,7 +4093,7 @@ impl KernelState {
         // reference resolves exactly like an installed plugin tool and lands in the SAME
         // `mcp:<server>` task tool_plan execution shape — never a second execution system
         // (`docs/mcp.md` "Run-driven multi-tool plan"; §10.5, §17.1).
-        let catalog = self.proposal_tool_catalog(Some(&ctx.agent));
+        let catalog = self.live_tool_catalog(Some(&ctx.agent));
         let segments = crate::prime::split_tool_plan_segments(goal);
 
         let mut steps: Vec<relux_core::PrimeToolPlanStep> = Vec::new();
@@ -7757,7 +7764,14 @@ impl KernelState {
             }
         };
 
-        let descriptors = self.discover_tools(Some(&ctx.agent));
+        // Resolve against the SHARED live catalog (installed plugin tools PLUS the
+        // off-lock-discovered live MCP tools), so an explicit `mcp:<server>/<tool>` the
+        // user named in chat resolves exactly like an installed tool — the same catalog
+        // the inert plan proposal grounds against. There is no second MCP invoke path: a
+        // resolved + `Ready` MCP tool runs through `invoke_tool` (the SAME
+        // permission/approval/grant/audit gates as a plugin tool), and a gated /
+        // unresolved one fails closed below (`docs/mcp.md` "Invocation"; §10.5, §17.1).
+        let descriptors = self.live_tool_catalog(Some(&ctx.agent));
         // Resolve an empty tool name to the plugin's first installed tool.
         let resolved_tool = if tool_name.is_empty() {
             descriptors
@@ -7786,7 +7800,29 @@ impl KernelState {
             .find(|d| d.plugin_id == plugin_id && d.tool_name == tool);
         match descriptor.map(|d| d.executable.clone()) {
             None => {
-                let note = format!("I could not find {label} among the installed tools");
+                // FAIL CLOSED with an HONEST reason. For an `mcp:<server>/<tool>` reference
+                // a miss is NOT "not installed" — the live catalog only carries a server's
+                // tools when this turn's off-lock `tools/list` succeeded, so distinguish the
+                // three real causes (the same partition the plan proposal uses) instead of a
+                // misleading "installed tools" message or a raw envelope dump:
+                //   - reachable server, no such tool        -> no such tool on the server
+                //   - registered+enabled but discovery failed -> server unavailable (reason)
+                //   - not registered / not enabled this turn  -> server not registered/enabled
+                let note = match plugin_id.strip_prefix("mcp:") {
+                    Some(server_id) => match self.proposal_mcp_catalog.server(server_id) {
+                        Some(s) if s.tools.is_some() => format!(
+                            "MCP server \"{server_id}\" has no tool \"{tool}\" — ask it to list its tools, or check the name"
+                        ),
+                        Some(s) => format!(
+                            "MCP server \"{server_id}\" is not reachable right now ({}); start it (or re-enable it) and try again",
+                            s.error.as_deref().unwrap_or("discovery failed")
+                        ),
+                        None => format!(
+                            "MCP server \"{server_id}\" is not registered or not enabled; register and enable it on the Plugins page first"
+                        ),
+                    },
+                    None => format!("I could not find {label} among the installed tools"),
+                };
                 Ok(turn(
                     with_prose(note.clone()),
                     PrimeDisposition::NeedsClarification,
@@ -7844,9 +7880,18 @@ impl KernelState {
                 ))
             }
             Some(ToolExecutability::NeedsApproval) => {
-                let note = format!(
-                    "{label} is configured as a higher-risk tool that requires approval, so I will not run it directly; lower its risk (or mark it low-risk + auto-approve) to make it directly callable"
-                );
+                // A gated tool is NOT auto-run from chat — the same fail-closed posture as a
+                // gated plugin tool. For an MCP tool (unclassified → fail-closed Medium +
+                // Required) name the existing approval/grant routes; never imply auto-allow.
+                let note = if plugin_id.starts_with("mcp:") {
+                    format!(
+                        "{label} requires approval, so I won't run it directly. Either classify it low-risk + auto-approve on the Plugins page, stand up an allow-always grant for it, or run it once via the per-call approval there — then ask me again"
+                    )
+                } else {
+                    format!(
+                        "{label} is configured as a higher-risk tool that requires approval, so I will not run it directly; lower its risk (or mark it low-risk + auto-approve) to make it directly callable"
+                    )
+                };
                 Ok(turn(
                     with_prose(note.clone()),
                     PrimeDisposition::NeedsClarification,
@@ -16305,6 +16350,178 @@ mod tests {
                 turn.tool_plan_proposal.is_none(),
                 "{msg:?} must attach no tool-plan preview"
             );
+        }
+    }
+
+    // --- Single explicit MCP tool invocation from Prime chat -------------------
+    //
+    // (`docs/mcp.md` "Invocation"; §10.5, §17.1). An explicit `mcp:<server>/<tool>` the
+    // user names runs through the SAME gated `invoke_tool` path as a plugin tool, grounded
+    // against the SAME off-lock live catalog the inert plan proposal uses — no second path.
+
+    #[test]
+    fn single_mcp_ref_classifies_as_tool_invocation_not_a_plan() {
+        // A single explicit MCP ref is ONE tool invocation, never a multi-tool plan.
+        for msg in [
+            "use mcp:fs/search",
+            "call mcp:fs/search with {\"q\":\"a\"}",
+            "mcp:fs/search",
+        ] {
+            assert_eq!(
+                crate::prime::classify_intent(msg),
+                relux_core::PrimeIntent::ToolInvocation,
+                "{msg:?} is a single MCP tool invocation"
+            );
+        }
+        // A deliberative question about an MCP tool stays conversation — never invokes.
+        for msg in [
+            "should I use mcp:fs/search?",
+            "what does mcp:fs/search do?",
+        ] {
+            assert_ne!(
+                crate::prime::classify_intent(msg),
+                relux_core::PrimeIntent::ToolInvocation,
+                "{msg:?} is a question, not an invocation"
+            );
+        }
+    }
+
+    #[test]
+    fn single_mcp_invoke_runs_a_classified_tool_through_the_gates() {
+        // A classified (Low + auto-approve) MCP tool the agent holds the permission for
+        // runs through the SAME `invoke_tool` gates and returns the SHAPED result — never
+        // the raw JSON-RPC envelope.
+        let (mut k, ctx) = prime_chat_kernel();
+        let mut bodies =
+            mcp_tools_list_bodies(r#"[{"name":"search","description":"Find things."}]"#);
+        bodies.extend(mcp_call_bodies("found 3 files"));
+        let endpoint = mock_mcp(bodies);
+        k.register_mcp_server("fs", &endpoint, "fs server", true, Some(2000))
+            .unwrap();
+        k.set_mcp_tool_classification(
+            "fs",
+            "search",
+            relux_core::RiskLevel::Low,
+            relux_core::ApprovalRequirement::Never,
+        )
+        .unwrap();
+        k.grant_permission_to_agent(&ctx.agent, Permission::new("tool:mcp-fs:search").unwrap())
+            .unwrap();
+        inject_proposal_mcp_catalog(&mut k, &ctx);
+
+        let turn = k.prime_turn(&ctx, "use mcp:fs/search").unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::ToolInvocation);
+        assert_eq!(turn.disposition, PrimeDisposition::Executed);
+        assert_eq!(turn.invoked_tool.as_deref(), Some("mcp:fs/search"));
+        assert!(turn.tool_error.is_none(), "a clean run has no error: {turn:?}");
+        // SHAPED result, never the raw envelope: the text content lands under `result`.
+        let out = turn.tool_output.expect("the shaped result rides along");
+        assert_eq!(out.get("result").and_then(|v| v.as_str()), Some("found 3 files"));
+        assert!(out.get("jsonrpc").is_none(), "the raw JSON-RPC envelope is never returned");
+    }
+
+    #[test]
+    fn single_mcp_invoke_respects_the_approval_gate_no_auto_allow() {
+        // An UNCLASSIFIED MCP tool is fail-closed (Medium + Required). Even with the
+        // permission held, Prime refuses to run it directly — never auto-allowed — and the
+        // honest "requires approval" reason names the existing approval/grant routes.
+        let (mut k, ctx) = prime_chat_kernel();
+        let endpoint = mock_mcp(mcp_tools_list_bodies(
+            r#"[{"name":"search","description":"Find things."}]"#,
+        ));
+        k.register_mcp_server("fs", &endpoint, "fs server", true, Some(2000))
+            .unwrap();
+        k.grant_permission_to_agent(&ctx.agent, Permission::new("tool:mcp-fs:search").unwrap())
+            .unwrap();
+        inject_proposal_mcp_catalog(&mut k, &ctx);
+
+        let turn = k.prime_turn(&ctx, "use mcp:fs/search").unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::ToolInvocation);
+        assert_eq!(turn.disposition, PrimeDisposition::NeedsClarification);
+        assert!(turn.invoked_tool.is_none(), "a gated tool is NOT run: {turn:?}");
+        assert!(turn.tool_output.is_none(), "nothing ran, so no output");
+        let err = turn.tool_error.expect("an honest refusal reason");
+        assert!(
+            err.contains("approval"),
+            "the refusal explains the approval gate: {err:?}"
+        );
+    }
+
+    #[test]
+    fn single_mcp_invoke_missing_tool_fails_closed_cleanly() {
+        // A reference to a tool the live server does NOT advertise fails closed with a
+        // clean, MCP-aware message — no blank page, no raw JSON, no "installed tools" lie.
+        let (mut k, ctx) = prime_chat_kernel();
+        let endpoint = mock_mcp(mcp_tools_list_bodies(
+            r#"[{"name":"search","description":"Find things."}]"#,
+        ));
+        k.register_mcp_server("fs", &endpoint, "fs server", true, Some(2000))
+            .unwrap();
+        inject_proposal_mcp_catalog(&mut k, &ctx);
+
+        let turn = k.prime_turn(&ctx, "use mcp:fs/delete").unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::ToolInvocation);
+        assert!(turn.invoked_tool.is_none(), "nothing runs for a missing tool");
+        let err = turn.tool_error.expect("an honest reason");
+        assert!(
+            err.contains("fs") && err.contains("delete"),
+            "the reason names the missing tool: {err:?}"
+        );
+        assert!(
+            !err.contains("jsonrpc"),
+            "no raw envelope leaks into the reply: {err:?}"
+        );
+    }
+
+    #[test]
+    fn single_mcp_invoke_unavailable_server_fails_closed_cleanly() {
+        // An enabled but unreachable MCP server: the single ref grounds against the empty
+        // live catalog and fails closed with a clean "not reachable" message.
+        let (mut k, ctx) = prime_chat_kernel();
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let endpoint = format!("http://127.0.0.1:{port}/mcp");
+        k.register_mcp_server("fs", &endpoint, "fs server", true, Some(500))
+            .unwrap();
+        inject_proposal_mcp_catalog(&mut k, &ctx);
+
+        let turn = k.prime_turn(&ctx, "use mcp:fs/search").unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::ToolInvocation);
+        assert!(turn.invoked_tool.is_none());
+        let err = turn.tool_error.expect("an honest reason");
+        assert!(
+            err.contains("fs") && err.to_lowercase().contains("reachable"),
+            "the reason names the unreachable server: {err:?}"
+        );
+    }
+
+    #[test]
+    fn normal_chat_with_mcp_catalog_present_never_invokes() {
+        // Requirement: a greeting / insult / vague idea must NOT invoke a tool just because
+        // an MCP catalog is available — only an explicit MCP ref does (§10.5, §17.1).
+        let (mut k, ctx) = prime_chat_kernel();
+        let endpoint = mock_mcp(mcp_tools_list_bodies(
+            r#"[{"name":"search","description":"Find things."}]"#,
+        ));
+        k.register_mcp_server("fs", &endpoint, "fs server", true, Some(2000))
+            .unwrap();
+        k.grant_permission_to_agent(&ctx.agent, Permission::new("tool:mcp-fs:search").unwrap())
+            .unwrap();
+        inject_proposal_mcp_catalog(&mut k, &ctx);
+        for msg in [
+            "hey there",
+            "you're useless and everything is broken",
+            "i was wondering if we could search some files",
+        ] {
+            let turn = k.prime_turn(&ctx, msg).unwrap();
+            assert_ne!(
+                turn.intent,
+                relux_core::PrimeIntent::ToolInvocation,
+                "{msg:?} must not invoke a tool"
+            );
+            assert!(turn.invoked_tool.is_none(), "{msg:?} runs no tool");
         }
     }
 

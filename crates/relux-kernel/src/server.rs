@@ -3142,15 +3142,16 @@ async fn run_prime(
         }
     }
 
-    // 0e. Off-lock MCP tool discovery for multi-tool-plan proposal grounding. A
-    // ToolPlanRequest turn grounds each `mcp:<server>/<tool>` step against the LIVE tools an
-    // enabled MCP server advertises. We run that bounded `tools/list` HERE, OUTSIDE the lock
-    // (exactly like the context snapshot's off-lock reads), and inject the result so
-    // `build_tool_plan_proposal` grounds without the kernel lock ever spanning a network read.
-    // Gated cheaply: only when the message actually carries an `mcp:` reference AND at least one
-    // MCP server is enabled — a plan can only resolve an MCP step from an `mcp:` token, so no
-    // other message pays the discovery cost. A failed/empty discovery ⇒ the step grounds as
-    // `unavailable` (fail-closed). `docs/mcp.md` "Run-driven multi-tool plan"; §10.5, §17.1.
+    // 0e. Off-lock MCP tool discovery for grounding an `mcp:<server>/<tool>` reference the
+    // user named in chat — BOTH a multi-tool-plan proposal (each step) AND a single explicit
+    // MCP tool invocation (`prime_invoke_tool` resolves the one ref against this catalog). We
+    // run that bounded `tools/list` HERE, OUTSIDE the lock (exactly like the context
+    // snapshot's off-lock reads), and inject the result so `live_tool_catalog` grounds without
+    // the kernel lock ever spanning a network read. Gated cheaply: only when the message
+    // actually carries an `mcp:` reference AND at least one MCP server is enabled — only an
+    // `mcp:` token can resolve to an MCP tool, so no other message pays the discovery cost. A
+    // failed/empty discovery ⇒ the reference grounds as `unavailable` (fail-closed).
+    // `docs/mcp.md` "Invocation" + "Run-driven multi-tool plan"; §10.5, §17.1.
     let proposal_mcp_catalog = if decision_message.to_ascii_lowercase().contains("mcp:")
         && context_snapshot.mcp_servers.iter().any(|s| s.enabled)
     {

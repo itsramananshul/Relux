@@ -147,11 +147,27 @@ pub fn classify_intent(message: &str) -> PrimeIntent {
         || starts("call ")
         || starts("test ")
         || starts("execute ");
+    // An explicit SINGLE MCP tool reference ("use mcp:loopback/status.summary",
+    // "call mcp:fs/search with {…}", or a bare "mcp:loopback/echo.say"). Recognized via
+    // the SAME `parse_tool_request` resolver the multi-tool plan path uses, so the
+    // accepted ref form is exactly `mcp:<server>/<tool>` (the stable synthetic
+    // `mcp:<server>` plugin id, mirroring openclaw's `mcp:<serverId>:<toolName>` ref).
+    // The multi-tool plan block above already claimed a message that names ≥2 tools
+    // behind a plan/sequence cue, so only a single MCP ref reaches here. It is gated so
+    // a deliberative question or a guarded musing never invokes — an explicit invoke
+    // verb forces it, otherwise the message must NOT be chat-guarded ([`is_chat_guarded`]:
+    // a question / ideation / venting / chitchat without an explicit command). Grounding
+    // + every gate happen later in the kernel (`prime_invoke_tool` resolves the ref against
+    // the off-lock live MCP catalog); a server/tool that is not live fails closed with a
+    // clean message, never a raw dump (`docs/mcp.md` "Invocation"; §10.5, §17.1).
+    let references_mcp_tool = parse_tool_request(message)
+        .is_some_and(|(plugin, tool, _)| plugin.starts_with("mcp:") && !tool.is_empty());
     if has(&["echo.say", "status.summary"])
         || (first_word == "echo")
         || (invoke_verb && has(&[" tool", "echo", "status tool"]))
         || (invoke_verb && m.contains("relux-tools-"))
         || has(&["use the echo", "use the status", "the echo tool", "the status tool"])
+        || (references_mcp_tool && (invoke_verb || !is_chat_guarded(message)))
     {
         return PrimeIntent::ToolInvocation;
     }

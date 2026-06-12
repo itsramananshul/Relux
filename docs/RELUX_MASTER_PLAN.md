@@ -1836,6 +1836,32 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **unreleased** — **single MCP tool invocation from Prime chat** on top of v0.1.25, continuing the §9
+  ("P2 — MCP tool support") line from `docs/HERMES_OPENCLAW_DEEP_AUDIT.md`, built reference-first against
+  the vendored Hermes one-off tool-call path (`agent/conversation_loop.py` valid-tool gate +
+  `tools/mcp_tool.py` `tools/call` result shaping) and the openclaw `mcp:<serverId>:<toolName>` ref
+  (`src/tools/execution.ts`) + fail-closed mutate default (`src/agents/tool-mutation.ts`) per
+  `docs/reference-driven-development.md` (mapping in `docs/mcp.md`, "Invocation"). No release cut; no
+  master-plan safety property is weakened. **What closes:** the single-tool Prime invoke path
+  (`PrimeAction::InvokeTool` → `prime_invoke_tool`) was plugin-only; it now resolves an explicit
+  `mcp:<server>/<tool>` reference the user names in chat ("use mcp:loopback/status.summary",
+  "call mcp:fs/search with {…}", or a bare `mcp:fs/search`). Recognition reuses the SAME
+  `parse_tool_request` resolver as the plan path (`classify_intent` → `ToolInvocation` for a single MCP
+  ref; gated so a question/musing/insult never invokes — `is_chat_guarded`). Grounding reuses the SAME
+  off-lock live catalog (`live_tool_catalog`, fed by the already-existing `discover_proposal_mcp_catalog`
+  prefetch — the `mcp:`-token gate in `server.rs` already covered single-ref messages). Execution reuses
+  the SAME gated `invoke_tool` (permission → risk/approval + per-call/allow-always grant → audit), and
+  the SAME shaped result (text under `result`, never the raw JSON-RPC envelope). **Fail-closed + honest:**
+  an unclassified/Medium+Required MCP tool is `needs_approval` and is NEVER auto-run from chat (the reply
+  names the existing classify / allow-always-grant / per-call-approval routes); a missing tool, an
+  unreachable/disabled/unregistered server each surface a clean, MCP-aware `tool_error` (no blank page,
+  no raw JSON). The frontend needs no change — the existing `invoked_tool` / `tool_output` / `tool_error`
+  fields already render the `mcp:<server>/<tool>` source label + shaped result cleanly. **Multi-step
+  plans stay inert** (unchanged proposal path, still a reviewable card, still operator-click to commit).
+  Raw reference reading recorded in `docs/REFERENCE_CODE_MAP.md`. `cargo test` + `clippy` clean on
+  `relux-core`/`relux-kernel` (incl. 6 new targeted tests: single-ref classification, classified-tool
+  run through the gates with shaped result, approval-gate no-auto-allow, missing-tool + unreachable-server
+  fail-closed, normal-chat-with-catalog-present never invokes). Every safety property from v0.1.25 holds.
 - **v0.1.25** (2026-06-12) — **run-driven multi-tool plans** on top of v0.1.24, continuing the §9
   ("P2 — MCP tool support") line from `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` (Next-slice item 5), built
   reference-first against the vendored Hermes `tool_calls` loop and the openclaw `buildToolPlan`
@@ -1861,7 +1887,7 @@ stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
   Plugins MCP copy now reflects that a discovered tool is callable through the standard gates.
   **Live MCP tools in Prime plan PROPOSALS:** Prime's inert multi-tool-plan preview
   (`KernelState::build_tool_plan_proposal`) now grounds against a SHARED, read-only catalog
-  (`proposal_tool_catalog`) of installed plugin tools PLUS the live MCP-discovered tools of every
+  (`live_tool_catalog`) of installed plugin tools PLUS the live MCP-discovered tools of every
   enabled server — so an `mcp:<server>/<tool>` step (recognized by `parse_tool_request`, mirroring
   openclaw's `mcp:<serverId>:<toolName>` ref) resolves exactly like an installed tool and lands in the
   SAME `mcp:<server>` task `tool_plan` execution path (no second tool system). The bounded `tools/list`

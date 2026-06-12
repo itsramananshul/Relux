@@ -81,6 +81,47 @@ append-only log. The tool name is re-validated as a safe identifier
 (`is_valid_mcp_tool_name`) before any dial. No arbitrary downloaded code is run — only
 the operator's own loopback MCP server is dialed.
 
+### Single MCP tool invocation from Prime chat (same gates, no new path)
+
+Beyond the operator-driven Plugins invoke and the task `tool_call` / `tool_plan` run
+paths, an operator can ask **Prime in chat** to run ONE MCP tool by naming it
+explicitly. This is a single tool invocation — **not** the (inert) multi-step plan
+PROPOSAL below, and not a brain freely choosing tools.
+
+- **Exact ref syntax.** `mcp:<server>/<tool>` — the stable synthetic `mcp:<server>`
+  plugin id (mirroring openclaw's `mcp:<serverId>:<toolName>` ref in
+  `src/tools/execution.ts`) plus the discovered tool name. Recognized phrasings:
+  `use mcp:loopback/status.summary`, `call mcp:fs/search with {"q":"files"}` (inline
+  JSON becomes the `arguments`), or a bare `mcp:fs/search`. Recognition reuses the SAME
+  `crate::prime::parse_tool_request` resolver the plan path uses; `classify_intent`
+  routes a single MCP ref to `PrimeIntent::ToolInvocation` (the multi-tool plan path
+  already claims a message that names ≥ 2 tools behind a plan/sequence cue).
+- **Normal chat never invokes.** A greeting, an insult/frustration, a vague idea, or a
+  deliberative question about an MCP tool ("should I use mcp:fs/search?", "what does
+  mcp:fs/search do?") resolves to NO tool — the bare-ref recognition is gated by
+  `is_chat_guarded` (an explicit invoke verb forces it; otherwise the message must not be
+  a guarded question/musing/venting). An MCP catalog merely being available never turns
+  chat into an invocation.
+- **Grounded against the live catalog, off-lock.** `prime_invoke_tool` resolves the ref
+  against the SHARED `KernelState::live_tool_catalog` — installed plugin tools PLUS the
+  live MCP-discovered tools the server pre-fetched OFF-LOCK for this turn
+  (`discover_proposal_mcp_catalog`, the same `mcp:`-token-gated prefetch the plan proposal
+  uses, injected via `set_proposal_mcp_catalog`). The kernel lock never spans the
+  network read.
+- **Same gates, same shaped result.** A resolved tool runs through the EXACT
+  `invoke_tool` path above — permission (`tool:mcp-<server>:<verb>`), the
+  risk/approval gate with the per-call / allow-always-grant bypass, audit — and returns
+  the same **shaped** `{ "result": <text>, "structuredContent"?: … }` (the raw JSON-RPC
+  envelope is never surfaced). The reply carries it on the turn's `invoked_tool`
+  (`mcp:<server>/<tool>`, the source/tool label) + `tool_output` fields.
+- **Fail closed, honest, never auto-allowed.** An unclassified / Medium+Required MCP tool
+  is `needs_approval` and Prime **refuses to run it directly** — the reply names the
+  existing routes (classify it low-risk + auto-approve, stand up an allow-always grant, or
+  run it once via the per-call approval on the Plugins page). A tool the server does not
+  advertise, an unreachable/disabled server, or an unregistered server each surface a
+  clean, MCP-aware `tool_error` on the turn (no blank page, no raw JSON dump). Nothing is
+  ever auto-approved from chat.
+
 ## Session continuity (streamable-HTTP `Mcp-Session-Id`)
 
 A streamable-HTTP MCP server may be **stateful**: its `initialize` response sets an
@@ -352,8 +393,8 @@ preview.
   deterministic classifier already catches, gets there.
 - **Inert, grounded preview (`KernelState::build_tool_plan_proposal`).** The
   `ProposeToolPlan` action is READ-ONLY: the kernel splits the request into ordered
-  steps and resolves each against the **shared proposal tool catalog**
-  (`KernelState::proposal_tool_catalog`) — **installed plugin tools (`discover_tools`)
+  steps and resolves each against the **shared live tool catalog**
+  (`KernelState::live_tool_catalog`) — **installed plugin tools (`discover_tools`)
   PLUS the live MCP-discovered tools** from every enabled MCP server. It surfaces each
   step's honest `readiness` (`ready` / `needs_approval` / `missing_permission` /
   `not_runnable` / `unknown` / `unavailable`) and declared `risk`, and validates the
@@ -389,7 +430,7 @@ preview.
   starts the task in Work. The card is honest: nothing is created or run by showing it.
 
 **Scope (proposal layer).** The proposal is grounded against the **shared catalog of
-installed plugin tools + live MCP-discovered tools** (`KernelState::proposal_tool_catalog`),
+installed plugin tools + live MCP-discovered tools** (`KernelState::live_tool_catalog`),
 so a `mcp:<server>/<tool>` step grounds against a real enabled MCP server exactly like an
 installed plugin tool and lands in the SAME `mcp:<server>` task `tool_plan` execution path
 (the operator's Plugins → Tools "Create a tool-run task" form uses the same merge). The
