@@ -6,6 +6,7 @@ import {
   pluginStatus,
   pluginNextStep,
   canConfigureTools,
+  guidedConfigSteps,
   installResultSummary,
   visibleTools,
   isRunnableTool,
@@ -672,4 +673,97 @@ test("parseEnvMappingLines + mcpEnvFromText parse VAR=secret lines (refs only)",
   assert.deepEqual(mcpEnvFromText("OPENAI_API_KEY=my_key"), {
     OPENAI_API_KEY: { secret: "my_key" },
   });
+});
+
+// ── Guided configuration checklist (RELUX_MASTER_PLAN "Tool Invocation Workflow")
+// The documented sequence for a metadata-only wrapper — review → define a tool (or
+// register an MCP server) → enable a loopback runtime → use it — surfaced as honest
+// step statuses. These pin: nothing reads "done" before the backend supports it,
+// the runtime step is upcoming until a tool exists (a runtime-first move surfaces
+// nothing), and a non-configurable plugin's define step is honestly "blocked".
+
+function runtime(over = {}) {
+  return { plugin_id: "relux-tools-demo", configured: false, enabled: false, ...over };
+}
+function hints(over = {}) {
+  return { plugin_id: "relux-tools-demo", install_dir: "/d", scanned: true, generated: true, hints: [], ...over };
+}
+
+test("guidedConfigSteps: a fresh scanned wrapper points at 'add a tool', NOT a runtime", () => {
+  const g = guidedConfigSteps(plugin({ generated: true, tool_count: 0 }), [], runtime(), hints());
+  assert.equal(g.total, 4);
+  assert.equal(g.complete, false);
+  const byKey = Object.fromEntries(g.steps.map((s) => [s.key, s]));
+  // Review is done once scanned; the define step is the one to act on now.
+  assert.equal(byKey.review.status, "done");
+  assert.equal(byKey.define.status, "current");
+  assert.ok(byKey.define.actionable, "define is actionable on a configurable wrapper");
+  // Runtime is NOT yet actionable — a runtime with no tools surfaces nothing.
+  assert.equal(byKey.runtime.status, "upcoming");
+  assert.equal(byKey.runtime.actionable, false);
+  assert.match(byKey.runtime.missing, /tool definition first/i);
+  // Use is upcoming and honestly states no tool is defined yet.
+  assert.equal(byKey.use.status, "upcoming");
+  assert.match(byKey.use.missing, /No tool is defined/i);
+});
+
+test("guidedConfigSteps: a tool defined but no runtime makes runtime the current step", () => {
+  const t = tool({ executable: "runtime_not_configured" });
+  const g = guidedConfigSteps(plugin({ generated: true, tool_count: 1 }), [t], runtime(), hints());
+  const byKey = Object.fromEntries(g.steps.map((s) => [s.key, s]));
+  assert.equal(byKey.define.status, "done");
+  assert.equal(byKey.runtime.status, "current");
+  assert.ok(byKey.runtime.actionable);
+  // Not ready yet → use is upcoming, citing the missing runtime.
+  assert.equal(byKey.use.status, "upcoming");
+  assert.match(byKey.use.missing, /enable a loopback runtime/i);
+  assert.equal(g.complete, false);
+});
+
+test("guidedConfigSteps: a ready tool + enabled runtime completes the checklist", () => {
+  const t = tool({ executable: "ready" });
+  const g = guidedConfigSteps(
+    plugin({ generated: true, tool_count: 1 }),
+    [t],
+    runtime({ configured: true, enabled: true }),
+    hints(),
+  );
+  const byKey = Object.fromEntries(g.steps.map((s) => [s.key, s]));
+  assert.equal(byKey.runtime.status, "done");
+  assert.equal(byKey.use.status, "done");
+  assert.equal(g.complete, true);
+  assert.equal(g.doneCount, 4);
+});
+
+test("guidedConfigSteps: a non-configurable plugin's define step is honestly blocked", () => {
+  // A bundled/protected plugin can't be configured in-UI — say so, don't pretend.
+  const g = guidedConfigSteps(plugin({ generated: false, bundled: true, tool_count: 0 }), [], runtime(), hints());
+  const byKey = Object.fromEntries(g.steps.map((s) => [s.key, s]));
+  assert.equal(byKey.define.status, "blocked");
+  assert.equal(byKey.define.actionable, false);
+  assert.match(byKey.define.missing, /can't be configured in-UI|bundled|ToolSet/i);
+});
+
+test("guidedConfigSteps: an MCP-proposal source offers register-MCP as the define step", () => {
+  const g = guidedConfigSteps(
+    plugin({ generated: true, tool_count: 0 }),
+    [],
+    runtime(),
+    hints({ mcp_proposal: { suggested_id: "x", suggested_description: "", endpoint_required: true, suggested_transport: "http_loopback", notes: [] } }),
+  );
+  const define = g.steps.find((s) => s.key === "define");
+  assert.match(define.title, /MCP server/i);
+  assert.match(define.detail, /Discover/i);
+});
+
+test("guidedConfigSteps: unloaded runtime/hints degrade honestly (no fake progress)", () => {
+  // Before the runtime/hints fetch resolves, undefined must not read as configured.
+  const t = tool({ executable: "runtime_not_configured" });
+  const g = guidedConfigSteps(plugin({ generated: true, tool_count: 1 }), [t], undefined, undefined);
+  const byKey = Object.fromEntries(g.steps.map((s) => [s.key, s]));
+  // Review is still done because a tool already exists (it was reviewed to define it).
+  assert.equal(byKey.review.status, "done");
+  // Runtime unknown → treated as not-ready, the current actionable step.
+  assert.equal(byKey.runtime.status, "current");
+  assert.equal(g.complete, false);
 });

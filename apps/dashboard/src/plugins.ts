@@ -20,6 +20,8 @@ import type {
   ReluxMcpServer,
   ReluxPlugin,
   ReluxPluginHint,
+  ReluxPluginHints,
+  ReluxPluginRuntime,
   ReluxToolDescriptor,
 } from "./api";
 
@@ -400,6 +402,177 @@ export function pluginNextStep(p: ReluxPlugin): PluginNextStep {
   }
 
   return { kind: "none", cta: "", detail: "" };
+}
+
+// ── Guided configuration checklist (metadata-only imports) ─────────────────────
+// RELUX_MASTER_PLAN "Tool Invocation Workflow + Honest Readiness": a generated
+// metadata-only wrapper becomes usable through a FIXED, documented sequence —
+//   1. install → a metadata-only wrapper (nothing runnable)
+//   2. add a tool definition (or register an MCP server)
+//   3. enable a loopback runtime so a tool flips to `ready`
+//   4. invoke it from a tool-run task / Prime / Work.
+// The panels to do each step already exist, but were never PRESENTED as an
+// ordered checklist, so an operator had to guess the order (and a runtime alone,
+// the wrong first move, surfaces nothing). This derives that exact sequence's
+// honest status from REAL state and is the single source of truth the
+// GuidedConfigChecklist renders. It invents no new authority: a step is
+// `actionable` only when the backend already supports it, and when it is not,
+// `missing` says exactly what is absent. Relux never infers tools or runs
+// downloaded code (§18).
+
+export type ConfigStepStatus = "done" | "current" | "upcoming" | "blocked";
+
+export interface ConfigStep {
+  key: "review" | "define" | "runtime" | "use";
+  title: string;
+  status: ConfigStepStatus;
+  // One honest sentence on what this step is / why it sits where it does.
+  detail: string;
+  // True when the operator can act on this step right now with a supported action.
+  actionable: boolean;
+  // When NOT actionable, exactly what is missing (an earlier step's output, or a
+  // capability the backend does not support). Undefined when actionable.
+  missing?: string;
+}
+
+export interface GuidedConfig {
+  steps: ConfigStep[];
+  doneCount: number;
+  total: number;
+  // True once at least one tool on this plugin is `ready` — runnable end to end.
+  complete: boolean;
+}
+
+// `tools` are the descriptors for THIS plugin (filtered defensively here too).
+// `runtime`/`hints` are optional: when still loading they are undefined and the
+// checklist degrades to an honest "not yet known" rather than claiming progress.
+export function guidedConfigSteps(
+  plugin: ReluxPlugin,
+  tools: ReluxToolDescriptor[],
+  runtime: ReluxPluginRuntime | undefined,
+  hints: ReluxPluginHints | undefined,
+): GuidedConfig {
+  const configurable = canConfigureTools(plugin);
+  const myTools = tools.filter((t) => t.plugin_id === plugin.id);
+  const hasTool = myTools.length > 0;
+  const hasReady = myTools.some((t) => t.executable === "ready");
+  const runtimeReady = !!runtime?.configured && !!runtime?.enabled;
+  const hasMcpProposal = !!hints?.mcp_proposal;
+  const scannedFalse = hints?.scanned === false;
+
+  // 1 — Review the imported source (read-only hints). Done once the source has
+  // been scanned (or any tool already exists, which means it was reviewed).
+  const reviewDone = hasTool || hints?.scanned === true;
+  const review: ConfigStep = {
+    key: "review",
+    title: "Review the imported source",
+    status: reviewDone ? "done" : "current",
+    detail: scannedFalse
+      ? "Nothing to inspect — the source is not in the local plugins directory. You can still define a tool manually."
+      : "The read-only “Detected in source” hints below show what the source is (a possible MCP server, an npm/python package, scripts). Relux never runs the source or turns a hint into a tool.",
+    actionable: true,
+  };
+
+  // 2 — Add a tool definition (or, for an MCP source, register an MCP server).
+  let define: ConfigStep;
+  if (hasTool) {
+    define = {
+      key: "define",
+      title: "Add a tool definition",
+      status: "done",
+      detail: `${myTools.length} tool${myTools.length === 1 ? "" : "s"} defined. Add more below, or remove any you don't want.`,
+      actionable: configurable,
+    };
+  } else if (!configurable) {
+    define = {
+      key: "define",
+      title: "Add a tool definition",
+      status: "blocked",
+      detail:
+        "Only an installed, non-bundled ToolSet (a generated wrapper is one) can have tool definitions added in the dashboard.",
+      actionable: false,
+      missing:
+        "This plugin kind can't be configured in-UI — it is bundled/protected or not a ToolSet.",
+    };
+  } else {
+    define = {
+      key: "define",
+      title: hasMcpProposal ? "Register an MCP server, or add a tool" : "Add a tool definition",
+      status: "current",
+      detail: hasMcpProposal
+        ? "This source looks like an MCP server: register it below (review form, loopback-only) and Discover its tools, OR add a tool definition that points at a loopback HTTP server you run. Relux runs neither for you."
+        : "Add a tool definition below — a name, description and risk. Relux derives the permission and never infers tools from the source.",
+      actionable: true,
+    };
+  }
+
+  // 3 — Enable a loopback runtime so a defined tool can become `ready`.
+  let runtimeStep: ConfigStep;
+  if (!hasTool) {
+    runtimeStep = {
+      key: "runtime",
+      title: "Enable a loopback runtime",
+      status: "upcoming",
+      detail:
+        "A tool runs only through an HTTP loopback server you run locally. Enable that runtime once a tool exists — a runtime with no tools surfaces nothing.",
+      actionable: false,
+      missing: "Add a tool definition first (step 2).",
+    };
+  } else if (runtimeReady) {
+    runtimeStep = {
+      key: "runtime",
+      title: "Enable a loopback runtime",
+      status: "done",
+      detail:
+        "A loopback runtime is enabled, so a low-risk tool can be ready. Update or disable it on the plugin row's Runtime panel.",
+      actionable: true,
+    };
+  } else {
+    runtimeStep = {
+      key: "runtime",
+      title: "Enable a loopback runtime",
+      status: "current",
+      detail: runtime?.configured
+        ? "A loopback runtime is configured but disabled — enable it on the Runtime panel."
+        : "Point Relux at the http://127.0.0.1:<port> server you run (the Runtime panel) so the tool can run. Relux never auto-runs downloaded code.",
+      actionable: true,
+    };
+  }
+
+  // 4 — Use it from a tool-run task / Prime / Work.
+  let use: ConfigStep;
+  if (hasReady) {
+    use = {
+      key: "use",
+      title: "Use it from Prime or the Work board",
+      status: "done",
+      detail:
+        "A tool is ready. Add it as a step in a “Create a tool-run task” here, or ask Prime to run it — every call is permission-checked, approval-gated, and audited.",
+      actionable: true,
+    };
+  } else {
+    use = {
+      key: "use",
+      title: "Use it from Prime or the Work board",
+      status: "upcoming",
+      detail:
+        "Once a tool is ready you can run it from a tool-run task on this page, or from Prime and the Work board.",
+      actionable: false,
+      missing: !hasTool
+        ? "No tool is defined yet (step 2)."
+        : !runtimeReady
+          ? "No tool is ready — enable a loopback runtime (step 3) and keep the tool low-risk with auto-approve."
+          : "The defined tool isn't ready — it may require approval (higher risk) or the calling agent lacks its permission.",
+    };
+  }
+
+  const steps = [review, define, runtimeStep, use];
+  return {
+    steps,
+    doneCount: steps.filter((s) => s.status === "done").length,
+    total: steps.length,
+    complete: hasReady,
+  };
 }
 
 // ── Live adapter runtime status (Plugins page) ────────────────────────────────

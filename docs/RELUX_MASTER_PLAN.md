@@ -3677,6 +3677,31 @@ non-ready tool never opens a blank page):
    `KernelError`, never a fabricated success. Relux never shells out to plugin
    commands or runs downloaded plugin code in-process (§18).
 
+**Guided Setup checklist (the workflow, made visible).** The four steps above are
+not just prose — for a configurable metadata-only import the **Configure tools**
+panel now opens with a **Setup checklist** that PRESENTS that exact documented
+order with each step's live status, so an operator never has to guess it (and never
+reaches for a runtime first, which on a wrapper surfaces nothing). The step statuses
+are derived purely from real state by `apps/dashboard/src/plugins.ts`
+`guidedConfigSteps(plugin, tools, runtime, hints)` → 1 **Review the imported
+source** (done once the source was scanned), 2 **Add a tool definition** — titled
+*Register an MCP server, or add a tool* when an `mcp_proposal` is present, 3
+**Enable a loopback runtime** (`upcoming` until a tool exists; `current` once one
+does; `done` when configured **and** enabled), 4 **Use it from Prime or the Work
+board** (`done` only once a tool reports `ready`). A step is **actionable only when
+the backend already supports it**; when it is not, the step carries an honest
+`Needs:` line naming the missing prerequisite (e.g. a non-configurable bundled
+plugin's define step is `blocked` with *can't be configured in-UI*). The checklist
+invents no authority — every action is one of the existing gated panels below it
+(`GuidedConfigChecklist` reads runtime via `GET /v1/relux/plugins/:id/runtime` and
+the lifted hints fetch; it never registers, enables, or runs anything itself). The
+in-UI **Add a tool** form is also honest that a tool definition is
+name/description/risk/timeout **only** — there is no input-schema field; the
+loopback server receives the JSON input passed at call time. Pinned by
+`apps/dashboard/test/plugins.test.ts` (`guidedConfigSteps` per-state assertions) and
+`apps/dashboard/test/install-result-render.test.mjs` (the wrapper result renders the
+4-step checklist + the "no input-schema field" copy).
+
 **Honest readiness in the UI.** `apps/dashboard/src/plugins.ts` `toolReadiness`
 is the single classifier (mirroring openclaw `acp/approval-classifier.ts` — one
 function, a named class, only the safe class is runnable) that maps the kernel's

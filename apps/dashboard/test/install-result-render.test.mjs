@@ -121,6 +121,30 @@ test("the wrapper result AUTO-OPENS the configure + detected-hints path", () => 
   assert.match(html, /Detected in source|Inspecting source/);
 });
 
+test("the wrapper result renders the guided Setup checklist with the 4 documented steps", () => {
+  // The metadata-only import's "what now" stepper (RELUX_MASTER_PLAN Tool Invocation
+  // Workflow) must render the documented order so the operator never guesses — and
+  // never reaches for a runtime first (which on a wrapper surfaces nothing).
+  const html = mod.renderWrapper();
+  assert.match(html, /Setup checklist/);
+  assert.match(html, /Review the imported source/);
+  // Step 2 title (no MCP proposal under static render, so the plain add-a-tool title).
+  assert.match(html, /Add a tool definition/);
+  assert.match(html, /Enable a loopback runtime/);
+  assert.match(html, /Use it from Prime or the Work board/);
+  // The honest "Needs:" prerequisite line proves a not-yet-actionable step is shown
+  // with what's missing rather than as a dead/blank affordance.
+  assert.match(html, /Needs:/);
+});
+
+test("the add-tool form is honest that there is no input-schema field", () => {
+  // Requirement: don't overpromise. The backend tool definition is name/desc/risk/
+  // timeout only — the form must say the loopback server receives JSON at call time.
+  const html = mod.renderWrapper();
+  assert.match(html, /no\s+input-schema field/i);
+  assert.match(html, /receives the JSON input you pass at\s+call time/i);
+});
+
 test("the result card never says a manifest is required", () => {
   const html = mod.renderWrapper();
   assert.doesNotMatch(html, /manifest (is )?required/i);

@@ -32,6 +32,7 @@ import { useAsync } from "../components/common";
 import {
   adapterStatusBadge,
   canConfigureTools,
+  guidedConfigSteps,
   hintKindLabel,
   hintsNextStep,
   installResultSummary,
@@ -50,6 +51,7 @@ import {
   mcpRegisterBody,
   type McpRegisterDraft,
   type McpDraftTransport,
+  type ConfigStepStatus,
   type StatusVariant,
   type ToolReadiness,
 } from "../plugins";
@@ -2405,6 +2407,100 @@ function PluginRow({
   );
 }
 
+// The honest "what now" stepper for a metadata-only import (RELUX_MASTER_PLAN
+// "Tool Invocation Workflow + Honest Readiness"): install → add a tool definition
+// (or register an MCP server) → enable a loopback runtime → use it from Prime/Work.
+// The panels to do each step already live below; this just PRESENTS the documented
+// order with each step's live status, so an operator never has to guess (and never
+// reaches for a runtime first, which on a wrapper surfaces nothing). It derives the
+// step statuses from real state via `guidedConfigSteps` and invents no authority —
+// a step that the backend can't support reads as blocked with an honest "Needs:".
+function GuidedConfigChecklist({
+  plugin,
+  tools,
+  hints,
+}: {
+  plugin: ReluxPlugin;
+  tools: ReluxToolDescriptor[];
+  hints: ReluxPluginHints | undefined;
+}) {
+  // The runtime status is the truth for step 3 (configured + enabled). Fetched
+  // here read-only; the operator still changes it on the Runtime panel.
+  const runtimeAsync = useAsync<ReluxPluginRuntime>(
+    () => reluxPluginRuntime.get(plugin.id),
+    [plugin.id],
+  );
+  const guide = guidedConfigSteps(plugin, tools, runtimeAsync.data ?? undefined, hints);
+
+  return (
+    <div className="card" style={{ margin: "0 0 12px", padding: 10 }}>
+      <div className="row" style={{ alignItems: "center", marginBottom: 8 }}>
+        <strong style={{ fontSize: 12 }}>Setup checklist</strong>
+        <div className="spacer" style={{ flex: 1 }} />
+        <span className={"badge " + (guide.complete ? "done" : "in_progress")}>
+          {guide.doneCount}/{guide.total} done
+        </span>
+      </div>
+      <ol style={{ margin: 0, paddingLeft: 0, listStyle: "none" }}>
+        {guide.steps.map((s, i) => (
+          <li
+            key={s.key}
+            className="row"
+            style={{ alignItems: "baseline", gap: 8, marginBottom: 8 }}
+          >
+            <span
+              className={"badge " + configStepBadgeClass(s.status)}
+              style={{ flexShrink: 0, minWidth: 56, textAlign: "center" }}
+              title={s.status}
+            >
+              {configStepBadgeLabel(s.status)}
+            </span>
+            <div>
+              <div style={{ fontSize: 12, fontWeight: 600 }}>
+                {i + 1}. {s.title}
+              </div>
+              <div className="muted" style={{ fontSize: 11, marginTop: 2 }}>
+                {s.detail}
+              </div>
+              {s.missing && (
+                <div className="muted" style={{ fontSize: 11, marginTop: 2 }}>
+                  <strong>Needs:</strong> {s.missing}
+                </div>
+              )}
+            </div>
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
+
+// Map an honest ConfigStepStatus to the page's existing badge classes + a short
+// label. `current` is the one to act on now; `blocked` means the backend can't
+// support it (the step carries a "Needs:" line saying so).
+function configStepBadgeClass(status: ConfigStepStatus): string {
+  switch (status) {
+    case "done":
+      return "done";
+    case "current":
+      return "in_progress";
+    default:
+      return "backlog";
+  }
+}
+function configStepBadgeLabel(status: ConfigStepStatus): string {
+  switch (status) {
+    case "done":
+      return "done";
+    case "current":
+      return "now";
+    case "blocked":
+      return "n/a";
+    default:
+      return "next";
+  }
+}
+
 // Tool configuration panel for a user-installed ToolSet / metadata-only wrapper
 // (RELUX_MASTER_PLAN §7.4 Plugin Kernel Layer, §8.2 ToolSet Plugins). A generated
 // wrapper declares NO tools, so a loopback runtime alone surfaces nothing — the
@@ -2422,6 +2518,9 @@ function ManifestPanel({
 }) {
   const toolsAsync = useAsync<ReluxToolDescriptor[]>(() => reluxTools.list(), [plugin.id]);
   const myTools = (toolsAsync.data ?? []).filter((t) => t.plugin_id === plugin.id);
+  // Lifted once and shared by the checklist (to know what the source IS) and the
+  // DetectedHints panel below (so the source is inspected only once).
+  const hintsAsync = useAsync<ReluxPluginHints>(() => reluxPlugins.hints(plugin.id), [plugin.id]);
   const [advancedOpen, setAdvancedOpen] = useState(false);
 
   function reloadAfterChange() {
@@ -2447,7 +2546,17 @@ function ManifestPanel({
         requires approval and stays non-runnable until you lower its risk.
       </p>
 
-      <DetectedHints plugin={plugin} />
+      <GuidedConfigChecklist
+        plugin={plugin}
+        tools={myTools}
+        hints={hintsAsync.data ?? undefined}
+      />
+
+      <DetectedHints
+        hints={hintsAsync.data ?? undefined}
+        loading={hintsAsync.loading}
+        error={hintsAsync.error}
+      />
 
       <ConfiguredToolsList
         plugin={plugin}
@@ -2599,8 +2708,8 @@ function AddToolForm({
       setBanner({
         kind: "ok",
         msg: lowRisk && autoApprove
-          ? "Tool added. Enable a loopback Runtime to make it runnable."
-          : "Tool added. It requires approval (higher risk or auto-approve off), so it stays non-runnable until you lower its risk.",
+          ? "Tool added. Enable a loopback Runtime (above) to make it ready — then run it as a step in a “Create a tool-run task” here, or ask Prime to run it."
+          : "Tool added. It requires approval (higher risk or auto-approve off), so it stays non-runnable until you lower its risk to low with auto-approve.",
       });
       setName("");
       setDescription("");
@@ -2616,6 +2725,11 @@ function AddToolForm({
   return (
     <div className="card" style={{ padding: 12, marginTop: 4 }}>
       <strong style={{ fontSize: 12 }}>Add a tool</strong>
+      <p className="muted" style={{ margin: "4px 0 0", fontSize: 11 }}>
+        A tool definition is a name, description, risk and timeout — there is no
+        input-schema field. Your loopback server receives the JSON input you pass at
+        call time; the definition only governs the permission, approval and timeout.
+      </p>
       {banner && (
         <div className={"banner " + banner.kind} style={{ fontSize: 12, marginTop: 8 }}>
           {banner.msg}
@@ -2696,11 +2810,18 @@ function AddToolForm({
 // package, an entrypoint, scripts) and an advisory next step. It explicitly states
 // these are hints only: Relux never turns one into a runnable tool and never runs
 // the source. (RELUX_MASTER_PLAN §7.4 Plugin Kernel Layer, §8.)
-function DetectedHints({ plugin }: { plugin: ReluxPlugin }) {
-  const { data, loading, error } = useAsync<ReluxPluginHints>(
-    () => reluxPlugins.hints(plugin.id),
-    [plugin.id],
-  );
+function DetectedHints({
+  hints,
+  loading,
+  error,
+}: {
+  // Hints are fetched once by the parent ManifestPanel and passed in, so the
+  // source is inspected a single time and the checklist + this panel agree.
+  hints: ReluxPluginHints | undefined;
+  loading: boolean;
+  error: string | null;
+}) {
+  const data = hints;
   // The "Register MCP server…" review form is opened on demand; never auto-shown,
   // never auto-registered.
   const [registering, setRegistering] = useState(false);

@@ -647,6 +647,22 @@ gets **Configure on Crew** (a link to `/crew`); and every result offers **Copy i
 and **Install another / Done**. Nothing is auto-run and no new backend route is added — the
 card is a faster on-ramp to the existing, gated configure surfaces.
 
+**Guided Setup checklist (don't make the operator guess the order).** The `ManifestPanel`
+now opens with a **Setup checklist** that presents the documented four-step path for a
+metadata-only import — 1 **Review the imported source** (the read-only hints below), 2 **Add
+a tool definition** (or, when an MCP signal was detected, **Register an MCP server** and
+Discover its tools), 3 **Enable a loopback runtime** so a low-risk tool flips to `ready`, 4
+**Use it from Prime or the Work board** — each with its live status. The steps are derived
+purely from real state by `guidedConfigSteps(plugin, tools, runtime, hints)`
+(`apps/dashboard/src/plugins.ts`): a step is actionable **only** when the backend already
+supports it, and when it is not it shows an honest `Needs:` line (e.g. the runtime step stays
+`upcoming` with *Add a tool definition first* until a tool exists — a runtime alone surfaces
+nothing). The checklist registers/enables/runs nothing itself; it only reads runtime status
+(`GET /v1/relux/plugins/:id/runtime`) and points at the existing gated panels. The **Add a
+tool** form is also honest that a definition is name/description/risk/timeout **only** — there
+is no input-schema field; your loopback server receives the JSON input passed at call time.
+This matches `docs/RELUX_MASTER_PLAN.md` "Tool invocation workflow + honest readiness".
+
 The **GitHub URL** field is forgiving: it accepts the `owner/repo` shorthand as well as a
 full `https://github.com/owner/repo` URL. The pure, conservative `normalizeGithubUrl`
 (`apps/dashboard/src/plugins.ts`) expands **only** the exact `owner/repo[.git]` shape to the
