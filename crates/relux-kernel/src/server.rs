@@ -1953,6 +1953,14 @@ struct InboxItem {
     /// dashboard's investigate/diagnose framing). Absent for non-failure items.
     #[serde(skip_serializing_if = "Option::is_none")]
     failure_class: Option<String>,
+    /// For a `pending_approval` item: the full approval record (the same
+    /// [`ReluxApprovalRecord`] the Approvals page and the Work oversight strip
+    /// consume), so the dashboard can offer the INLINE approve / allow-always / deny
+    /// decisions without a second fetch. Present ONLY on approval items; it grants no
+    /// new authority — every decision still flows through the existing approval routes
+    /// (`decide` / `execute` / `allow-always`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval: Option<ReluxApprovalRecord>,
     /// Recommended action KINDS in priority order. Each is mapped by the dashboard to
     /// an EXISTING route or surface; the projection grants no new authority.
     actions: Vec<String>,
@@ -2069,6 +2077,10 @@ async fn get_inbox(State(state): State<AppState>) -> Result<Json<InboxResponse>,
                     approval_id: Some(a.id.to_string()),
                     continuation_id: None,
                     failure_class: None,
+                    // Embed the full approval so the Inbox row can offer the same
+                    // inline decisions the Work oversight strip does, with no second
+                    // fetch. The decision still flows through the existing routes.
+                    approval: Some(approval_record(kernel, a.clone())),
                     actions: vec!["open_approval".to_string()],
                     link: "/approvals".to_string(),
                 });
@@ -2153,6 +2165,7 @@ async fn get_inbox(State(state): State<AppState>) -> Result<Json<InboxResponse>,
                     approval_id: None,
                     continuation_id: None,
                     failure_class: fc,
+                    approval: None,
                     actions,
                     link: "/work".to_string(),
                 });
@@ -2219,6 +2232,7 @@ async fn get_inbox(State(state): State<AppState>) -> Result<Json<InboxResponse>,
                     approval_id: None,
                     continuation_id: None,
                     failure_class: fc,
+                    approval: None,
                     actions,
                     link: "/work".to_string(),
                 });
@@ -2261,6 +2275,7 @@ async fn get_inbox(State(state): State<AppState>) -> Result<Json<InboxResponse>,
                 approval_id: None,
                 continuation_id: Some(c.id.clone()),
                 failure_class: None,
+                approval: None,
                 actions,
                 link: "/work".to_string(),
             });
@@ -11204,6 +11219,61 @@ mod tests {
             it["summary"].as_str().unwrap().contains("reopen"),
             "the summary names the reopen path"
         );
+    }
+
+    #[tokio::test]
+    async fn inbox_pending_approval_item_embeds_full_record_for_inline_decisions() {
+        // A pending approval surfaces as an Inbox item that carries the FULL approval
+        // record (the same shape the Approvals page consumes), so the row can offer the
+        // inline approve/deny decisions without a second fetch — and never has to
+        // invent an action the backend would reject.
+        let (state, _dir) = auth_state(true);
+
+        // Seed a generic pending approval directly through the kernel + store (a
+        // generic approval has no bound tool invocation, so its inline set is
+        // approve/deny only — no allow-always).
+        {
+            let mut store = SqliteStore::open(&state.db_path).expect("open store");
+            let mut kernel = store.load().expect("load");
+            kernel.request_approval(
+                "prime",
+                "promote to production",
+                "needs sign-off",
+                relux_core::RiskLevel::High,
+                None,
+            );
+            store.save(&kernel).expect("save");
+        }
+
+        let (status, _, body) = call(&state, "GET", "/v1/relux/inbox", None, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let items = v["items"].as_array().unwrap();
+        let it = items
+            .iter()
+            .find(|i| i["kind"] == "pending_approval")
+            .expect("the pending approval is an attention item");
+
+        // The embedded record carries exactly what the inline decision controls need.
+        let appr = &it["approval"];
+        assert!(appr.is_object(), "the full approval record is embedded: {it}");
+        assert_eq!(appr["status"], "pending");
+        assert_eq!(appr["action"], "promote to production");
+        assert_eq!(appr["risk"], "high");
+        // A generic approval has no bound tool invocation (so the row offers approve +
+        // deny only, never allow-always — the allow-always route 404s without one).
+        assert!(
+            appr["tool_invocation"].is_null(),
+            "generic approval has no bound invocation: {appr}"
+        );
+        // The nav action to the detailed surface is still offered alongside.
+        let actions: Vec<String> = it["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap().to_string())
+            .collect();
+        assert!(actions.contains(&"open_approval".to_string()));
     }
 
     #[tokio::test]

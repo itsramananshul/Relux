@@ -3536,6 +3536,12 @@ export interface ReluxInboxItem {
   approval_id?: string | null;
   continuation_id?: string | null;
   failure_class?: string | null;
+  // For a pending_approval item: the full approval record (the same shape the
+  // Approvals page + Work oversight strip consume), so the Inbox row can offer the
+  // inline approve / allow-always / deny decisions without a second fetch. Present
+  // only on approval items; the decision still flows through the existing approval
+  // routes — the projection grants no new authority.
+  approval?: ReluxApproval | null;
   // Recommended action kinds in priority order (mapped to existing routes by inbox.ts).
   actions: ReluxInboxActionKind[];
   // The dashboard path that owns the richer controls for this item.

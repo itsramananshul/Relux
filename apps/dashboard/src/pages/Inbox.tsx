@@ -17,6 +17,7 @@ import {
   inboxSeverityTone,
 } from "../inbox";
 import { buildInvestigationSeed, stashInvestigationSeed } from "../investigateseed";
+import { ApprovalInlineDecisions } from "../components/ApprovalInlineDecisions";
 import type { ReluxDiagnostic } from "../api";
 
 // The cross-Guild Inbox (docs/relix-dashboard-design.md §5 "The Inbox (the
@@ -41,12 +42,20 @@ type DiagState =
   | { status: "done"; result: ReluxDiagnostic }
   | { status: "error"; message: string };
 
-function InboxRow({ item, onActed }: { item: ReluxInboxItem; onActed: () => void }) {
+export function InboxRow({ item, onActed }: { item: ReluxInboxItem; onActed: () => void }) {
   const navigate = useNavigate();
   const [action, setAction] = useState<ActionState>({ status: "idle" });
   const [diag, setDiag] = useState<DiagState | null>(null);
 
   const busyKind = action.status === "busy" ? action.kind : null;
+
+  // A pending-approval item carries the full approval record, so the row offers the
+  // SAME inline decisions (approve & run / allow always / deny) the Work oversight
+  // strip does — through the existing reluxApprovals routes, no new authority. When
+  // the projection didn't embed it (older backend), we fall back to the generic
+  // "Open approval" nav button so the row is never a dead end.
+  const inlineApproval =
+    item.kind === "pending_approval" ? item.approval ?? null : null;
 
   // A "post" action: call the existing route the operator explicitly clicked, show a
   // compact shaped result, then ask the page to refresh. Never auto-runs — the click
@@ -135,27 +144,40 @@ function InboxRow({ item, onActed }: { item: ReluxInboxItem; onActed: () => void
       <div className="muted" style={{ fontSize: 12, marginTop: 4, lineHeight: 1.5 }}>
         {item.summary}
       </div>
-      <div className="row wrap" style={{ gap: 6, marginTop: 10 }}>
-        {item.actions.map((kind) => {
-          const spec = inboxActionSpec(kind);
-          const isBusy = busyKind === kind;
-          const primary = kind === item.actions[0];
-          return (
-            <button
-              key={kind}
-              className={"btn sm" + (primary ? "" : " ghost")}
-              title={spec.hint}
-              disabled={action.status === "busy"}
-              onClick={() => onAction(kind)}
-            >
-              {isBusy ? "…" : spec.label}
-            </button>
-          );
-        })}
-        <Link to={item.link} className="link" style={{ fontSize: 11, alignSelf: "center" }}>
-          Open →
-        </Link>
-      </div>
+      {inlineApproval ? (
+        // Inline approval decisions, reusing the shared controls (decide / execute /
+        // allow-always). "Open approval →" always stays available for the full record.
+        <div style={{ marginTop: 4 }}>
+          <ApprovalInlineDecisions approval={inlineApproval} onDecided={onActed} />
+          <div className="row" style={{ marginTop: 6 }}>
+            <Link to={item.link} className="link" style={{ fontSize: 11 }}>
+              Open approval →
+            </Link>
+          </div>
+        </div>
+      ) : (
+        <div className="row wrap" style={{ gap: 6, marginTop: 10 }}>
+          {item.actions.map((kind) => {
+            const spec = inboxActionSpec(kind);
+            const isBusy = busyKind === kind;
+            const primary = kind === item.actions[0];
+            return (
+              <button
+                key={kind}
+                className={"btn sm" + (primary ? "" : " ghost")}
+                title={spec.hint}
+                disabled={action.status === "busy"}
+                onClick={() => onAction(kind)}
+              >
+                {isBusy ? "…" : spec.label}
+              </button>
+            );
+          })}
+          <Link to={item.link} className="link" style={{ fontSize: 11, alignSelf: "center" }}>
+            Open →
+          </Link>
+        </div>
+      )}
       {action.status === "ok" && (
         <div className="banner ok" style={{ fontSize: 11, marginTop: 8 }}>{action.message}</div>
       )}
