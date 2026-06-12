@@ -76,6 +76,18 @@ test("Plugins RENDERS the tool-run-task form (no render-time throw)", () => {
   assert.match(html, /Create a tool-run task/);
 });
 
+test("Plugins RENDERS the 'no manifest needed' install guidance, never 'manifest required'", () => {
+  // The reported UX bug: the install surface read as if an external repo NEEDS a
+  // relux-plugin.json. The always-visible intro copy (outside the loading branch)
+  // must say the opposite — no manifest needed, the file is optional — so an
+  // operator can never misread it. This asserts the page-level guidance directly.
+  const html = render();
+  assert.match(html, /No Relux manifest needed/i);
+  assert.match(html, /optional/i);
+  // It must NOT frame the manifest as a requirement.
+  assert.doesNotMatch(html, /manifest (is )?required/i);
+});
+
 test("the committed dashboard bundle carries the tool-run-task form (no stale dist)", () => {
   const assetsDir = join(distDir, "assets");
   const jsFiles = readdirSync(assetsDir).filter((f) => f.endsWith(".js"));
@@ -83,4 +95,14 @@ test("the committed dashboard bundle carries the tool-run-task form (no stale di
   // ASCII fragment survives minification; its absence means the source has the form
   // but the committed bundle was never rebuilt.
   assert.match(bundle, /Create a tool-run task/);
+});
+
+test("the committed dashboard bundle carries the 'no manifest needed' copy (no stale dist)", () => {
+  const assetsDir = join(distDir, "assets");
+  const jsFiles = readdirSync(assetsDir).filter((f) => f.endsWith(".js"));
+  const bundle = jsFiles.map((f) => readFileSync(join(assetsDir, f), "utf8")).join("\n");
+  // If this fails, the source has the blunt manifest-optional copy but the tracked
+  // bundle was never rebuilt — the shipped UI would still read the old way.
+  assert.match(bundle, /No Relux manifest needed/i);
+  assert.match(bundle, /Install any GitHub repo/i);
 });

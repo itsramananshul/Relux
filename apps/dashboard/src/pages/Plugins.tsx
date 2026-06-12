@@ -134,14 +134,14 @@ export function Plugins() {
           be removed.
         </p>
         <p className="muted" style={{ marginTop: -8, marginBottom: 12, fontSize: 12 }}>
-          To add one — for example to import a GitHub repository like{" "}
-          <span className="mono">nousresearch/hermes-agent</span> as a plugin — use{" "}
-          <strong>+ Install</strong> and paste a GitHub URL (or upload a ZIP / point at a
-          local folder). If the source has a{" "}
-          <span className="mono">relux-plugin.json</span> manifest it is installed as a
-          plugin; if not, Relux imports it safely as <em>metadata only</em>, scans it for
-          hints (MCP server, tools, scripts), and lets you configure tools / register an
-          MCP server afterward. <strong>No repository code runs during install.</strong>
+          <strong>No Relux manifest needed.</strong> Use <strong>+ Install</strong> and
+          paste any GitHub repository (or upload a ZIP / point at a local folder) — for
+          example <span className="mono">nousresearch/hermes-agent</span>. A{" "}
+          <span className="mono">relux-plugin.json</span> file is <em>optional</em>: only
+          first-class Relux plugins ship one. When it is absent (the common case), Relux
+          imports the source safely as <em>metadata only</em>, scans it for hints (MCP
+          server, tools, scripts), and lets you configure tools / register an MCP server
+          afterward. <strong>No repository code runs during install.</strong>
         </p>
 
         {open && (
@@ -3151,7 +3151,7 @@ function InstallPanel({
   return (
     <div className="card" style={{ marginBottom: 12, padding: 12 }}>
       <div className="row" style={{ marginBottom: 10, alignItems: "center" }}>
-        <strong style={{ fontSize: 13 }}>Install a plugin</strong>
+        <strong style={{ fontSize: 13 }}>Install any GitHub repo — no Relux manifest needed</strong>
         <div className="spacer" style={{ flex: 1 }} />
         <div className="seg">
           <button
@@ -3181,9 +3181,10 @@ function InstallPanel({
 
       <p className="muted" style={{ marginTop: 0, marginBottom: 10, fontSize: 11 }}>
         Installing only reads the source and records it — <strong>no repository code is
-        executed</strong>. A source without a <span className="mono">relux-plugin.json</span>{" "}
-        manifest is imported as a safe metadata-only wrapper (no runnable tools) you
-        configure afterward.
+        executed</strong>. A <span className="mono">relux-plugin.json</span> manifest is{" "}
+        <strong>optional</strong> (only first-class Relux plugins ship one); almost no
+        external repo has it, and none is required. Without one, Relux imports the source
+        as a safe metadata-only plugin (no runnable tools) you configure afterward.
       </p>
 
       {source === "github" && (
@@ -3197,9 +3198,9 @@ function InstallPanel({
           />
           <p className="muted" style={{ fontSize: 11, marginTop: 6 }}>
             Cloned with <span className="mono">git clone --depth 1</span> on the Relux host.
-            If the repo has a <span className="mono">relux-plugin.json</span> manifest it is used
-            directly; if not, Relux generates a safe <em>metadata-only</em> wrapper manifest
-            (no runnable tools) you can configure afterward.
+            A <span className="mono">relux-plugin.json</span> manifest is <em>optional</em> —
+            if the repo has one it is used directly; if not (the usual case), Relux imports a
+            safe <em>metadata-only</em> plugin (no runnable tools) you can configure afterward.
           </p>
         </label>
       )}
@@ -3215,10 +3216,10 @@ function InstallPanel({
           />
           <p className="muted" style={{ fontSize: 11, marginTop: 6 }}>
             The archive is uploaded, extracted, and validated on the Relux host;
-            path-traversal entries are refused. If it has a{" "}
-            <span className="mono">relux-plugin.json</span> manifest it is used
-            directly; if not, Relux imports it as a safe <em>metadata-only</em>{" "}
-            wrapper (no runnable tools) you can configure afterward.
+            path-traversal entries are refused. A{" "}
+            <span className="mono">relux-plugin.json</span> manifest is <em>optional</em> — if
+            it has one it is used directly; if not, Relux imports it as a safe{" "}
+            <em>metadata-only</em> plugin (no runnable tools) you can configure afterward.
           </p>
         </label>
       )}
@@ -3234,11 +3235,11 @@ function InstallPanel({
           />
           <p className="muted" style={{ fontSize: 11, marginTop: 6 }}>
             Browser folder picking is not available yet; this path is read on the
-            Relux process host, not your machine. If the folder (or its single
-            plugin subfolder) has a <span className="mono">relux-plugin.json</span>{" "}
-            manifest it is used directly; if not, Relux imports it as a safe{" "}
-            <em>metadata-only</em> wrapper (no runnable tools) you can configure
-            afterward.
+            Relux process host, not your machine. A{" "}
+            <span className="mono">relux-plugin.json</span> manifest is <em>optional</em> — if
+            the folder (or its single plugin subfolder) has one it is used directly; if not,
+            Relux imports it as a safe <em>metadata-only</em> plugin (no runnable tools) you
+            can configure afterward.
           </p>
         </label>
       )}

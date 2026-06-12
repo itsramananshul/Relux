@@ -482,9 +482,9 @@ export function installResultSummary(p: ReluxPlugin): InstallSummary {
   if (category === "wrapper") {
     return {
       tone: "info",
-      headline: `Installed ${name} as a metadata-only wrapper.`,
+      headline: `Imported ${name} as metadata-only — no Relux manifest needed.`,
       detail:
-        "The source had no relux-plugin.json, so Relux generated a safe wrapper and discovered no tools. Nothing is runnable yet — open “Set up” on its row to add tool definitions. Relux never infers tools or runs downloaded code.",
+        "The source had no relux-plugin.json (that file is optional — only first-class Relux plugins ship one), so Relux created a safe metadata-only plugin and discovered no tools. Nothing runs until you configure it: open “Configure” on its row to review detected hints, register an MCP server, or add a tool definition. Relux never infers tools or runs downloaded code.",
     };
   }
 

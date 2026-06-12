@@ -3539,10 +3539,15 @@ implemented.**
 
 ### Plugin Install UX v1 (honest metadata-only wrappers)
 
-Installing a GitHub repo / folder / zip with no `relux-plugin.json` succeeds as a
-**generated metadata-only wrapper** (sanitized id, zero tools, zero permissions,
-`Unverified`, `generated: true`). The dashboard now makes that state honest and
-actionable instead of leaving the operator to wonder:
+**A `relux-plugin.json` is never required to import a repo.** That file is *optional* —
+only first-class Relux plugins ship one, and almost no external repo will. Paste any
+GitHub repo / folder / zip and it succeeds as a **generated metadata-only wrapper**
+(sanitized id, zero tools, zero permissions, `Unverified`, `generated: true`). The
+install surface copy says this plainly — headline **"Install any GitHub repo — no Relux
+manifest needed"**, the manifest framed as optional throughout, and the post-install
+result reads **"Imported as metadata-only — no Relux manifest needed"** (never a failure
+or "manifest required"). The dashboard then makes that state honest and actionable
+instead of leaving the operator to wonder:
 
 - **No "ready"-looking label.** A wrapper is badged **Needs configuration** (amber),
   never the green "enabled" a real plugin shows. Its row carries an inline banner
@@ -3564,9 +3569,11 @@ actionable instead of leaving the operator to wonder:
   internal dev/test plugins (hidden by default, §echo). A real manifest-based
   plugin is unaffected and keeps its normal Runtime flow.
 - **Install result summary.** After an install the panel stays open and reports
-  what happened — tools discovered (count), a wrapper generated (nothing runnable
-  yet), or an adapter installed — and the exact next step, instead of a bare
-  "Installed X".
+  what happened — tools discovered (count), an import as metadata-only (nothing
+  runnable yet, *no manifest needed*), or an adapter installed — and the exact next
+  step (review detected hints, register an MCP server, or add a tool definition),
+  instead of a bare "Installed X". The result line carries `generated` + `tool_count`
+  from the install API so the wrapper-vs-native distinction is shown, not guessed.
 - **Runnable-only tools by default.** The Tools list shows only `ready` tools by
   default so a metadata-only or unconfigured plugin never looks usable; a
   "Show N non-runnable" toggle reveals the rest with their honest status. Nothing

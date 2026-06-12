@@ -245,11 +245,18 @@ test("tools list shows only runnable tools by default, with a hidden count", () 
   assert.equal(all.hiddenCount, 0);
 });
 
-test("install summary for a wrapper is honest: nothing runnable yet, add tools", () => {
+test("install summary for a wrapper is honest: imported as metadata-only, no manifest needed", () => {
   const s = installResultSummary(plugin({ generated: true, tool_count: 0 }));
   assert.equal(s.tone, "info");
-  assert.match(s.headline, /metadata-only wrapper/i);
-  assert.match(s.detail, /no tools|nothing is runnable/i);
+  // The headline must read as a SUCCESSFUL import that needed no manifest — never
+  // as a failure or a "manifest required" message (the exact UX the mission fixes).
+  assert.match(s.headline, /imported/i);
+  assert.match(s.headline, /metadata-only/i);
+  assert.match(s.headline, /no Relux manifest needed/i);
+  // The detail says the manifest is optional and names the real next actions.
+  assert.match(s.detail, /optional/i);
+  assert.match(s.detail, /no tools|nothing runs/i);
+  assert.match(s.detail, /tool definition|MCP server|hints/i);
 });
 
 test("install summary for a real toolset reports discovered tool count + runtime step", () => {

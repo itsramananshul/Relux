@@ -620,13 +620,21 @@ Three sources, all governed, none of which **execute repository code at install 
 
 What install does with the source (`crate::plugin_install`):
 
-- If the source has a **`relux-plugin.json` manifest**, it is validated and installed
-  as a plugin.
-- If it has **no manifest**, Relux generates a safe **metadata-only wrapper** (no
-  runnable tools, `TrustLevel::Unverified`), scans it for read-only **hints** (MCP
-  server, npm/python entrypoints, scripts, README), and lets the operator configure
-  tools / register an MCP server afterward (see the next section). Arbitrary plugin
-  code is never executed by install.
+- **No `relux-plugin.json` is required.** That file is **optional** — only first-class
+  Relux plugins ship one, and almost no external repo will. This is the **common case**:
+  with no manifest, Relux generates a safe **metadata-only wrapper** (no runnable tools,
+  `TrustLevel::Unverified`, author sentinel `relux (generated manifest)`), scans it for
+  read-only **hints** (MCP server, npm/python entrypoints, scripts, README), and lets the
+  operator configure tools / register an MCP server afterward (see the next section).
+  Arbitrary plugin code is never executed by install. The generated id is derived from the
+  repo/folder/zip name, sanitized and collision-safe (`relux-plugin-<seed>`).
+- If the source **does** happen to carry a `relux-plugin.json` manifest (a first-class
+  Relux plugin), it is validated and installed directly with its declared tools.
+
+The wrapper-vs-native distinction is surfaced honestly on the install result + plugin
+row: the install API returns a `generated: bool` flag (`relux_kernel::is_generated_manifest`)
+and `tool_count`, so the dashboard labels a generated import **"Imported as metadata-only —
+no Relux manifest needed"** and never as a failure or a "manifest required" error.
 
 So "**Clone `nousresearch/hermes-agent` and import it as a plugin**" is a Plugins →
 **+ Install** → **GitHub URL** action — paste the repo URL and install. It is **not**
