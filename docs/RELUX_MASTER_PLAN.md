@@ -1836,6 +1836,25 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.27** (2026-06-12) — **autonomy policy + managed-stdio MCP + encrypted local secrets** rollup. The
+  `relux-kernel` crate moves `0.1.26` → `0.1.27` and `relux-core` `0.1.25` → `0.1.27` (restoring lockstep —
+  `0.1.26` had been cut from a feature commit that bumped only the kernel). First packaged bundle since
+  v0.1.26; it rolls up the post-v0.1.26 work into one release: (1) a real **configurable Prime autonomy
+  policy** (tool-plan width std 16 / ext 64 / ceil 64, orchestration width + read-only context rounds,
+  background-job concurrency) retiring the `MAX_TASK_TOOL_PLAN_STEPS` / `MAX_ORCHESTRATION_STEPS` /
+  `MAX_TOOL_ROUNDS` / `MAX_ACTIVE_JOBS` toy caps per `docs/ARTIFICIAL_CONSTRAINT_AUDIT.md`; (2) **Prime
+  Agent Loop v1** with a genuine resumable continuation ("keep working" resumes from stored observations,
+  not a blind re-run); (3) a second governed **managed-stdio MCP transport** (argv-only, spawn-per-op, same
+  gates) plus an operator start/stop/restart/status **lifecycle** with process reuse; (4) a **local secret
+  store** + secret-referenced env + confined cwd for managed-stdio servers, the Prime OpenRouter brain key
+  moved to a **write-only secret reference** (never plaintext), and Windows **DPAPI encryption at rest** for
+  stored secrets (per-value scheme markers, fail-safe plaintext fallback + auto-migration); (5) safe
+  read-only **plugin source introspection** ("what is this?" hints, source never executed) + one-click MCP
+  hint→register. No master-plan safety property is weakened: MCP stays loopback-only, no downloaded code is
+  ever run, secrets are never returned in plaintext or persisted unencrypted, and every tool call flows
+  through the SAME permission / risk-approval / grant / audit gates. `cargo test` + `clippy` clean on
+  `relux-core`/`relux-kernel`; dashboard green; `dashboard-dist` in sync. Every safety property from v0.1.25
+  holds.
 - **unreleased** — **Governed managed-stdio MCP transport (closes the loopback-HTTP-only gap)** on top of
   the MCP hint→register slice, continuing the §8.2/§18 + `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §9
   ("P2 — MCP tool support") line, built reference-first against Hermes

@@ -9,6 +9,48 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.27 (Windows bundle).** The `relux-kernel` crate
+  moves `0.1.26` → `0.1.27` and `relux-core` `0.1.25` → `0.1.27` (restoring the
+  two crates to lockstep — `0.1.26` had been cut from a feature commit that bumped
+  only the kernel). This is the first packaged Windows bundle since v0.1.26, and it
+  rolls up the substantial post-v0.1.26 autonomy / MCP / secret-handling work into
+  one release. No master-plan safety property is weakened: MCP stays
+  **loopback-only**, no downloaded plugin code is ever run, secrets are never
+  returned in plaintext or persisted unencrypted, and every tool call still flows
+  through the SAME permission / risk-approval / grant / audit gates. Headlines
+  (each already documented in `docs/mcp.md` / `docs/RELUX_MASTER_PLAN.md` and built
+  reference-first per `docs/reference-driven-development.md`):
+  - **Configurable Prime autonomy policy.** The toy v1 agent-loop caps become a
+    real `PrimeAgentPolicy` (tool-plan width std **16** / ext **64** / ceil **64**,
+    orchestration width + read-only context rounds, background-job concurrency),
+    retiring the hidden `MAX_TASK_TOOL_PLAN_STEPS = 5`, `MAX_ORCHESTRATION_STEPS`,
+    `MAX_TOOL_ROUNDS`, and `MAX_ACTIVE_JOBS` toy constants per the
+    `docs/ARTIFICIAL_CONSTRAINT_AUDIT.md` ledger.
+  - **Prime Agent Loop v1 + real resumable continuation.** A bounded
+    think/tool/observe/respond chat loop, with "keep working" now a genuine resume
+    from stored observations (`PrimeAgentContinuation` + `/prime/agent/continue`),
+    not a blind re-run.
+  - **Managed-stdio MCP transport + lifecycle.** A second governed MCP transport
+    (argv-only local commands, spawn-per-op, same gates) plus an operator
+    start/stop/restart/status lifecycle with process reuse.
+  - **Local secret store + secret-referenced env/cwd + provider-key secret refs.**
+    A write-only/redacted local secret store, secret-referenced environment and a
+    confined working directory for managed-stdio servers, and the Prime OpenRouter
+    brain key moved to a write-only secret reference (never plaintext in config or
+    UI). On Windows, stored secrets are **encrypted at rest** (DPAPI CurrentUser)
+    with per-value scheme markers, a fail-safe plaintext fallback, and automatic
+    migration.
+  - **Safe read-only plugin source introspection + one-click MCP hint register.**
+    Imported plugins gain metadata-only "what is this?" hints (the source is never
+    executed); a detected MCP hint becomes a one-click pre-filled registration
+    through the existing loopback registry.
+
+  `cargo test` + `clippy` clean on `relux-core` / `relux-kernel`; dashboard tests
+  + typecheck + build green; the tracked `dashboard-dist` bundle is in sync.
+  Packaged with `scripts\relux-package-local.ps1`. This version line is the
+  `relux-kernel` crate version (separate from the legacy Relix workspace versions
+  in the dated sections below). See `docs/RELUX_MASTER_PLAN.md` → *Release history*.
+  Every safety property from v0.1.25 still holds.
 - **Configurable tool-plan step policy (retires the hidden `MAX_TASK_TOOL_PLAN_STEPS
   = 5`).** The toy 5-step cap on operator-authored / Prime-proposed multi-tool plans
   becomes two configurable `PrimeAgentPolicy` fields: `max_tool_plan_steps` (standard,
