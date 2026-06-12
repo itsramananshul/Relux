@@ -8,6 +8,7 @@ import {
   reluxTools,
   reluxWork,
   type ReluxAdapterStatus,
+  type ReluxManagedStdioStatus,
   type ReluxManifestTemplate,
   type McpToolClassification,
   type ReluxMcpServer,
@@ -29,6 +30,7 @@ import {
   hintKindLabel,
   hintsNextStep,
   installResultSummary,
+  managedStdioStatusBadge,
   mcpDraftFromProposal,
   mcpServerStatusBadge,
   pluginCategory,
@@ -362,6 +364,13 @@ function McpServerRow({
           </button>
         </td>
       </tr>
+      {server.transport === "managed_stdio" && (
+        <tr>
+          <td colSpan={4} style={{ background: "transparent", paddingTop: 0 }}>
+            <ManagedStdioControls server={server} />
+          </td>
+        </tr>
+      )}
       {toolsOpen && (
         <tr>
           <td colSpan={4} style={{ background: "transparent" }}>
@@ -377,6 +386,126 @@ function McpServerRow({
         </tr>
       )}
     </>
+  );
+}
+
+// The managed-stdio process lifecycle controls: the live process status (state, pid,
+// start time, last error, redacted log tail) plus Start / Stop / Restart. A
+// managed-stdio server is registered (config) independently of whether its process is
+// running; starting one keeps a single initialized process warm so Discover and tool
+// calls reuse it (no per-call spawn). Nothing is auto-started — the process spawns
+// only on an explicit Start (or, when stopped, a per-operation Discover/invoke).
+function ManagedStdioControls({ server }: { server: ReluxMcpServer }) {
+  const { data, loading, error, reload } = useAsync<ReluxManagedStdioStatus>(
+    () => reluxMcp.status(server.id),
+    [server.id],
+  );
+  const [busy, setBusy] = useState<null | "start" | "stop" | "restart">(null);
+  const [actionErr, setActionErr] = useState<string | null>(null);
+
+  async function act(kind: "start" | "stop" | "restart") {
+    setBusy(kind);
+    setActionErr(null);
+    try {
+      if (kind === "start") await reluxMcp.start(server.id);
+      else if (kind === "stop") await reluxMcp.stop(server.id);
+      else await reluxMcp.restart(server.id);
+      reload();
+    } catch (e) {
+      setActionErr(e instanceof Error ? e.message : `${kind} failed`);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  const badge = data ? managedStdioStatusBadge(data) : null;
+  const running = data?.state === "running";
+  const startedAt = data?.started_at_ms
+    ? new Date(data.started_at_ms).toLocaleString()
+    : null;
+
+  return (
+    <div className="card" style={{ margin: "6px 0", padding: 12 }}>
+      <div className="row" style={{ alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+        <strong style={{ fontSize: 13 }}>Process</strong>
+        {loading && <span className="muted" style={{ fontSize: 12 }}>checking…</span>}
+        {badge && (
+          <span className={"badge " + BADGE_CLASS[badge.variant]} title={badge.title}>
+            {badge.label}
+          </span>
+        )}
+        {data?.tools_count != null && (
+          <span className="muted" style={{ fontSize: 11 }}>
+            {data.tools_count} tool{data.tools_count === 1 ? "" : "s"} discovered
+          </span>
+        )}
+        {startedAt && (
+          <span className="muted" style={{ fontSize: 11 }}>started {startedAt}</span>
+        )}
+        <div className="spacer" style={{ flex: 1 }} />
+        <button
+          className="btn ghost sm"
+          disabled={busy !== null}
+          onClick={() => void act("start")}
+          title="Spawn (or replace) the managed process and run its initialize handshake. Discover/calls then reuse it."
+        >
+          {busy === "start" ? "…" : "Start"}
+        </button>
+        <button
+          className="btn ghost sm"
+          style={{ marginLeft: 6 }}
+          disabled={busy !== null || !running}
+          onClick={() => void act("stop")}
+          title="Kill + reap the managed process."
+        >
+          {busy === "stop" ? "…" : "Stop"}
+        </button>
+        <button
+          className="btn ghost sm"
+          style={{ marginLeft: 6 }}
+          disabled={busy !== null}
+          onClick={() => void act("restart")}
+          title="Stop then start the managed process."
+        >
+          {busy === "restart" ? "…" : "Restart"}
+        </button>
+      </div>
+      <p className="muted" style={{ marginTop: 8, marginBottom: 0, fontSize: 11 }}>
+        Starting keeps one initialized process warm (argv only — never a shell; no env,
+        no cwd). When stopped, Discover/invoke still work via a one-shot spawn-per-call.
+      </p>
+      {error && (
+        <div className="banner err" style={{ fontSize: 11, marginTop: 8, marginBottom: 0 }}>
+          Could not read status ({error}).
+        </div>
+      )}
+      {actionErr && (
+        <div className="banner err" style={{ fontSize: 11, marginTop: 8, marginBottom: 0 }}>
+          {actionErr}
+        </div>
+      )}
+      {data?.last_error && (
+        <div className="banner err" style={{ fontSize: 11, marginTop: 8, marginBottom: 0 }}>
+          Last error: <span className="mono">{data.last_error}</span>
+        </div>
+      )}
+      {data?.log_tail && data.log_tail.length > 0 && (
+        <pre
+          className="mono"
+          style={{
+            marginTop: 8,
+            marginBottom: 0,
+            fontSize: 11,
+            maxHeight: 140,
+            overflow: "auto",
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-all",
+          }}
+        >
+          {data.log_tail.join("\n")}
+        </pre>
+      )}
+    </div>
   );
 }
 

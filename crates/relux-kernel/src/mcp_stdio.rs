@@ -25,15 +25,21 @@
 //!   a fake success). We port that posture to a **blocking** `std::process` client
 //!   that fits the synchronous kernel tool path (the same shape as [`crate::mcp`]).
 //!
-//! ## Process model (spawn-per-operation, bounded, reaped)
+//! ## Process model (two modes: spawn-per-operation OR an operator-managed pool)
 //!
-//! Each discovery / tool-call **spawns its own child, runs one logical operation
-//! (`initialize` → the request), and reaps it** — exactly like the HTTP client opens
-//! a fresh `Connection: close` POST per operation. There is no long-lived daemon:
-//! the child is killed (via [`StdioChild::drop`]) when the operation ends, so a
-//! managed server can never linger, leak, or run between operations. The lifecycle is
-//! operator-controlled (a discovery / a gated invocation drives one bounded run) and
-//! safe by construction:
+//! 1. **Spawn-per-operation (the safe fallback).** [`discover_tools`] / [`call_tool`]
+//!    **spawn their own child, run one logical operation (`initialize` → the request),
+//!    and reap it** — exactly like the HTTP client opens a fresh `Connection: close`
+//!    POST per operation. The child is killed (via [`StdioChild::drop`]) when the
+//!    operation ends, so it can never linger between operations.
+//! 2. **Operator-managed pool (a real lifecycle).** [`pool`] keeps an operator-started
+//!    process **alive** so repeated discovery / invocation reuse ONE `initialize`d
+//!    process (start / stop / restart / status, with a redacted log tail). A managed
+//!    process is killed + reaped on stop / restart / drop / process shutdown; it never
+//!    runs without an explicit operator start. See the "Managed-stdio process pool"
+//!    section below and `docs/mcp.md`.
+//!
+//! Both modes are safe by construction (identical spawn rules):
 //!
 //! - **No shell.** The command + args are passed as `argv` to [`std::process::Command`]
 //!   (re-validated by [`relux_core::validate_stdio_command`] on every spawn). No
@@ -48,13 +54,14 @@
 //!   a malformed body, or a JSON-RPC `error` becomes a clear [`McpClientError`] — a
 //!   `tools/call` `isError` is a runtime failure, never a fabricated success.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use relux_core::McpTool;
 
@@ -343,8 +350,16 @@ impl StdioChild {
                         Err(_) => continue,
                     };
                     // A notification (no `id`) is not our response; keep reading.
-                    if value.get("id").is_none() {
-                        continue;
+                    // A response whose `id` does not match THIS request's id is a
+                    // stale reply (e.g. a previous request that timed out and answered
+                    // late) — skip it too, so a reused process never confuses one
+                    // request's response with another. Ids are monotonically
+                    // increasing, so only the exact match is ours.
+                    match value.get("id").and_then(|v| v.as_u64()) {
+                        Some(resp_id) if resp_id == id => {}
+                        // Has an id but not ours → stale; or a non-integer id we did
+                        // not send → not ours. Either way, keep draining.
+                        _ => continue,
                     }
                     if let Some(err) = value.get("error") {
                         if !err.is_null() {
@@ -392,6 +407,37 @@ impl StdioChild {
         let bounded: String = redacted.chars().take(MAX_STDERR_TAIL_CHARS).collect();
         McpClientError::Stdio(format!("{err}; stderr: {bounded}"))
     }
+
+    /// The OS process id of this child (safe to surface — carries no secret).
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// A bounded, secret-redacted snapshot of the child's stderr tail, one line per
+    /// entry (most recent last). Used for the managed-pool status log tail. Reads the
+    /// shared tail under its own short lock; never blocks on the child itself.
+    fn redacted_log_lines(&self) -> Vec<String> {
+        let lines: Vec<String> = self
+            .stderr_tail
+            .lock()
+            .map(|t| t.lines.iter().cloned().collect())
+            .unwrap_or_default();
+        lines
+            .into_iter()
+            .map(|l| relux_core::redact_secrets(&l))
+            .collect()
+    }
+
+    /// If the child has already exited, return its (lossy) status string; otherwise
+    /// `None`. Non-blocking (`try_wait`), so a status read can cheaply detect a crash.
+    fn poll_exited(&mut self) -> Option<String> {
+        match self.child.try_wait() {
+            Ok(Some(status)) => Some(format!("process exited: {status}")),
+            // Still running, or an error querying — treat the latter as "unknown,
+            // assume alive" (a later request will surface a real transport failure).
+            _ => None,
+        }
+    }
 }
 
 impl Drop for StdioChild {
@@ -438,6 +484,439 @@ fn read_capped_line<R: Read>(reader: &mut R, cap: usize) -> LineRead {
                 buf.push(byte[0]);
             }
             Err(e) => return LineRead::Err(e.to_string()),
+        }
+    }
+}
+
+// ===========================================================================
+// Managed-stdio process pool (operator-visible lifecycle: start/stop/restart,
+// status, reuse for tools/list + tools/call).
+// ===========================================================================
+//
+// The spawn-per-operation client above stays the safe FALLBACK. On top of it,
+// the pool keeps an operator-started child **alive** so repeated discovery /
+// invocation reuse ONE `initialize`d process instead of paying spawn + handshake
+// per call (Hermes keeps the MCP client connected between `list_tools`/`call_tool`;
+// `_probe_single_server` connects → lists → disconnects only for a one-shot probe —
+// `reference/hermes-agent-main/hermes_cli/mcp_config.py`). It stays safe by
+// construction: same argv-only spawn, no env / no `cwd`, no bypass flag, bounded
+// logs/memory, and the child is killed + reaped on stop / restart / drop / process
+// shutdown.
+//
+// Concurrency model: the pool maps `server id → ManagedEntry`. Each entry serializes
+// requests to its OWN process behind a `child` mutex (one JSON-RPC exchange at a
+// time), so two different servers run in parallel but two calls to the SAME server
+// queue. The lightweight status fields (state / pid / started-at) are atomics, so a
+// status read never blocks a live request and can observe `Starting` mid-spawn.
+
+/// State encodings for [`ManagedEntry::state`] (an `AtomicU8`).
+const STATE_STOPPED: u8 = 0;
+const STATE_STARTING: u8 = 1;
+const STATE_RUNNING: u8 = 2;
+const STATE_FAILED: u8 = 3;
+
+fn state_from_u8(v: u8) -> relux_core::ManagedStdioState {
+    match v {
+        STATE_STARTING => relux_core::ManagedStdioState::Starting,
+        STATE_RUNNING => relux_core::ManagedStdioState::Running,
+        STATE_FAILED => relux_core::ManagedStdioState::Failed,
+        _ => relux_core::ManagedStdioState::Stopped,
+    }
+}
+
+/// Wall-clock epoch milliseconds (best effort; `0` if the clock is before the epoch).
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Keep only the most recent [`relux_core::MAX_MANAGED_STDIO_LOG_LINES`] lines.
+fn bound_log(mut lines: Vec<String>) -> Vec<String> {
+    let max = relux_core::MAX_MANAGED_STDIO_LOG_LINES;
+    if lines.len() > max {
+        lines = lines.split_off(lines.len() - max);
+    }
+    lines
+}
+
+/// Secret-redact + bound a failure message stored on an entry.
+fn redact_and_bound(s: &str) -> String {
+    let r = relux_core::redact_secrets(s);
+    r.chars().take(MAX_STDERR_TAIL_CHARS).collect()
+}
+
+/// Whether an error means the managed process is suspect and must be torn down (it
+/// died, the read timed out — the response stream may be desynced — or a low-level
+/// transport/spawn failure). An *application* error (a JSON-RPC `error`, or a
+/// `tools/call` `isError`) leaves the process healthy and reusable, so it is NOT
+/// fatal: the call surfaces honestly without killing the daemon.
+fn is_fatal_transport_error(err: &McpClientError) -> bool {
+    matches!(
+        err,
+        McpClientError::ProcessExited
+            | McpClientError::StdioLineTooLong
+            | McpClientError::Timeout
+            | McpClientError::Io(_)
+            | McpClientError::Spawn(_)
+            | McpClientError::Stdio(_)
+    )
+}
+
+/// The non-process metadata tracked for a managed entry (everything that is not a
+/// cheap atomic). Guarded by a short-lived mutex never held across a spawn.
+#[derive(Default)]
+struct EntryMeta {
+    /// The honest, redacted reason for the last failure (spawn/handshake/transport).
+    last_error: Option<String>,
+    /// Tools discovered by the last live `tools/list` against the running process.
+    tools_count: Option<usize>,
+    /// A redacted log-tail snapshot captured at stop / failure, so logs survive after
+    /// the child is dropped. While running, the live tail is read from the child.
+    log_tail: Vec<String>,
+}
+
+/// One managed server's lifecycle slot: the live process (behind `child`), the
+/// lock-free status atomics, and the metadata.
+struct ManagedEntry {
+    id: String,
+    /// One of the `STATE_*` constants.
+    state: AtomicU8,
+    /// The running child's OS pid, or `0` when none.
+    pid: AtomicU32,
+    /// Epoch-millis the current process started, or `0` when none.
+    started_at_ms: AtomicU64,
+    meta: Mutex<EntryMeta>,
+    /// The live process, or `None` when stopped / failed. Locked for the duration of
+    /// one JSON-RPC exchange (and the spawn), serializing calls to this one server.
+    child: Mutex<Option<StdioChild>>,
+}
+
+impl ManagedEntry {
+    fn new(id: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            state: AtomicU8::new(STATE_STOPPED),
+            pid: AtomicU32::new(0),
+            started_at_ms: AtomicU64::new(0),
+            meta: Mutex::new(EntryMeta::default()),
+            child: Mutex::new(None),
+        }
+    }
+
+    fn meta(&self) -> std::sync::MutexGuard<'_, EntryMeta> {
+        self.meta.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn child_guard(&self) -> std::sync::MutexGuard<'_, Option<StdioChild>> {
+        self.child.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Record a failure: state → `Failed`, clear pid/started-at, store the reason.
+    fn fail(&self, message: &str) {
+        self.state.store(STATE_FAILED, Ordering::SeqCst);
+        self.pid.store(0, Ordering::SeqCst);
+        self.started_at_ms.store(0, Ordering::SeqCst);
+        self.meta().last_error = Some(redact_and_bound(message));
+    }
+
+    /// Spawn `command` + `args` (argv only) and run the `initialize` handshake,
+    /// replacing any existing process. Sets `Starting` for the spawn window, then
+    /// `Running` (with pid + started-at) on success or `Failed` (with the redacted,
+    /// stderr-enriched reason) on failure.
+    fn start(&self, command: &str, args: &[String], timeout_ms: u64) {
+        self.state.store(STATE_STARTING, Ordering::SeqCst);
+        let timeout = Duration::from_millis(timeout_ms);
+        let mut guard = self.child_guard();
+        // Drop (kill + reap) any prior process first.
+        *guard = None;
+        self.pid.store(0, Ordering::SeqCst);
+        self.started_at_ms.store(0, Ordering::SeqCst);
+        match StdioChild::spawn(command, args) {
+            Ok(mut child) => match child.initialize(timeout) {
+                Ok(()) => {
+                    self.pid.store(child.pid(), Ordering::SeqCst);
+                    self.started_at_ms.store(now_ms(), Ordering::SeqCst);
+                    {
+                        let mut m = self.meta();
+                        m.last_error = None;
+                        m.tools_count = None;
+                        m.log_tail.clear();
+                    }
+                    self.state.store(STATE_RUNNING, Ordering::SeqCst);
+                    *guard = Some(child);
+                }
+                Err(err) => {
+                    // Fold the child's stderr tail into the reason, then reap it.
+                    let enriched = child.enrich_error(err);
+                    *guard = None;
+                    self.fail(&enriched.to_string());
+                }
+            },
+            Err(err) => {
+                *guard = None;
+                self.fail(&err.to_string());
+            }
+        }
+    }
+
+    /// Kill + reap the running process (if any), capturing its final redacted log
+    /// tail, and set state → `Stopped`. Idempotent.
+    fn stop(&self) {
+        let mut guard = self.child_guard();
+        if let Some(child) = guard.as_ref() {
+            let tail = bound_log(child.redacted_log_lines());
+            self.meta().log_tail = tail;
+        }
+        *guard = None; // Drop → kill + reap.
+        self.state.store(STATE_STOPPED, Ordering::SeqCst);
+        self.pid.store(0, Ordering::SeqCst);
+        self.started_at_ms.store(0, Ordering::SeqCst);
+        {
+            let mut m = self.meta();
+            m.last_error = None;
+            m.tools_count = None;
+        }
+    }
+
+    /// Best-effort crash detection: if the running child has already exited, mark it
+    /// `Failed` (with the exit reason + final log tail). Uses `try_lock` so a status
+    /// read never blocks a live request — if the child is busy, it is by definition
+    /// still running.
+    fn detect_crash(&self) {
+        if self.state.load(Ordering::SeqCst) != STATE_RUNNING {
+            return;
+        }
+        if let Ok(mut guard) = self.child.try_lock() {
+            let crashed = guard.as_mut().and_then(|c| {
+                c.poll_exited()
+                    .map(|reason| (reason, bound_log(c.redacted_log_lines())))
+            });
+            if let Some((reason, tail)) = crashed {
+                *guard = None;
+                drop(guard);
+                self.fail(&reason);
+                self.meta().log_tail = tail;
+            }
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        self.detect_crash();
+        self.state.load(Ordering::SeqCst) == STATE_RUNNING
+    }
+
+    /// Send one JSON-RPC request to the live process and return its raw `result`.
+    /// A fatal transport error tears the process down (drop + reap), records the
+    /// honest reason, and marks `Failed`; an application error leaves it reusable.
+    fn request_reuse(
+        &self,
+        method: &str,
+        params: &serde_json::Value,
+        timeout_ms: u64,
+    ) -> Result<serde_json::Value, McpClientError> {
+        let timeout = Duration::from_millis(timeout_ms);
+        let mut guard = self.child_guard();
+        // Borrow the child only for the exchange; end the borrow before mutating the
+        // entry on a fatal error.
+        let (result, tail) = {
+            let Some(child) = guard.as_mut() else {
+                return Err(McpClientError::ProcessExited);
+            };
+            let r = child.request(method, params, timeout);
+            let tail = bound_log(child.redacted_log_lines());
+            (r, tail)
+        };
+        match result {
+            Ok(v) => {
+                // Keep the latest live tail visible to status while running.
+                self.meta().log_tail = tail;
+                Ok(v)
+            }
+            Err(err) if is_fatal_transport_error(&err) => {
+                let enriched = match guard.as_mut() {
+                    Some(child) => child.enrich_error(err),
+                    None => err,
+                };
+                *guard = None;
+                drop(guard);
+                self.fail(&enriched.to_string());
+                self.meta().log_tail = tail;
+                Err(enriched)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// A status snapshot. Reads the cheap atomics, detects a crash first, and prefers
+    /// the live stderr tail when running (falling back to the captured snapshot).
+    fn status(&self) -> relux_core::ManagedStdioStatus {
+        self.detect_crash();
+        let state = state_from_u8(self.state.load(Ordering::SeqCst));
+        let pid = match self.pid.load(Ordering::SeqCst) {
+            0 => None,
+            p => Some(p),
+        };
+        let started_at_ms = match self.started_at_ms.load(Ordering::SeqCst) {
+            0 => None,
+            t => Some(t),
+        };
+        let (last_error, tools_count, snapshot_tail) = {
+            let m = self.meta();
+            (m.last_error.clone(), m.tools_count, m.log_tail.clone())
+        };
+        let log_tail = if state == relux_core::ManagedStdioState::Running {
+            // Non-blocking live read; fall back to the snapshot if the child is busy.
+            match self.child.try_lock() {
+                Ok(guard) => match guard.as_ref() {
+                    Some(child) => bound_log(child.redacted_log_lines()),
+                    None => snapshot_tail,
+                },
+                Err(_) => snapshot_tail,
+            }
+        } else {
+            snapshot_tail
+        };
+        relux_core::ManagedStdioStatus {
+            id: self.id.clone(),
+            state,
+            pid,
+            started_at_ms,
+            last_error,
+            tools_count,
+            log_tail,
+        }
+    }
+}
+
+/// A process-global pool of managed-stdio MCP servers. Accessed via [`pool`].
+///
+/// Lives OUTSIDE the serializable [`crate::state::KernelState`] (a live OS process is
+/// not snapshot state): the kernel's registry stays the source of truth for *what* is
+/// registered; this pool owns *whether it is running*. The kernel drives it
+/// (start/stop/restart/status) and reuses a running process for discovery/invocation.
+pub struct ManagedPool {
+    entries: Mutex<HashMap<String, Arc<ManagedEntry>>>,
+}
+
+/// The process-global managed-stdio pool. Created lazily on first use.
+static POOL: OnceLock<ManagedPool> = OnceLock::new();
+
+/// The process-global managed-stdio pool.
+pub fn pool() -> &'static ManagedPool {
+    POOL.get_or_init(ManagedPool::new)
+}
+
+impl ManagedPool {
+    fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<ManagedEntry>>> {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Get or create the entry for `id`.
+    fn entry(&self, id: &str) -> Arc<ManagedEntry> {
+        self.entries()
+            .entry(id.to_string())
+            .or_insert_with(|| Arc::new(ManagedEntry::new(id)))
+            .clone()
+    }
+
+    /// The entry for `id`, if the pool is tracking one.
+    fn lookup(&self, id: &str) -> Option<Arc<ManagedEntry>> {
+        self.entries().get(id).cloned()
+    }
+
+    /// Start (or replace) the managed process for `id`. Returns its status — `Running`
+    /// on success, `Failed` (with `last_error`) if the spawn/handshake failed.
+    pub fn start(
+        &self,
+        id: &str,
+        command: &str,
+        args: &[String],
+        timeout_ms: u64,
+    ) -> relux_core::ManagedStdioStatus {
+        let entry = self.entry(id);
+        entry.start(command, args, timeout_ms);
+        entry.status()
+    }
+
+    /// Stop the managed process for `id` (kill + reap). Idempotent — a never-started /
+    /// already-stopped server returns a clean `Stopped` status.
+    pub fn stop(&self, id: &str) -> relux_core::ManagedStdioStatus {
+        let entry = self.entry(id);
+        entry.stop();
+        entry.status()
+    }
+
+    /// Restart: stop the current process then start a fresh one.
+    pub fn restart(
+        &self,
+        id: &str,
+        command: &str,
+        args: &[String],
+        timeout_ms: u64,
+    ) -> relux_core::ManagedStdioStatus {
+        let entry = self.entry(id);
+        entry.stop();
+        entry.start(command, args, timeout_ms);
+        entry.status()
+    }
+
+    /// The current status for `id` (a clean `Stopped` default when untracked).
+    pub fn status(&self, id: &str) -> relux_core::ManagedStdioStatus {
+        match self.lookup(id) {
+            Some(e) => e.status(),
+            None => relux_core::ManagedStdioStatus::stopped(id),
+        }
+    }
+
+    /// Whether a live, running process exists for `id` (with crash detection).
+    pub fn is_running(&self, id: &str) -> bool {
+        self.lookup(id).map(|e| e.is_running()).unwrap_or(false)
+    }
+
+    /// Reuse the running process to run `tools/list`. Errors with
+    /// [`McpClientError::ProcessExited`] when no process is running (the caller then
+    /// decides whether to fall back to a spawn-per-operation discovery).
+    pub fn list_tools(
+        &self,
+        id: &str,
+        timeout_ms: u64,
+    ) -> Result<Vec<relux_core::McpTool>, McpClientError> {
+        let entry = self.lookup(id).ok_or(McpClientError::ProcessExited)?;
+        let result = entry.request_reuse("tools/list", &serde_json::json!({}), timeout_ms)?;
+        let tools = parse_tools_list(&result)?;
+        entry.meta().tools_count = Some(tools.len());
+        Ok(tools)
+    }
+
+    /// Reuse the running process to run `tools/call`, returning the SHAPED result
+    /// (never the raw envelope). Errors with [`McpClientError::ProcessExited`] when no
+    /// process is running.
+    pub fn call_tool(
+        &self,
+        id: &str,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+        timeout_ms: u64,
+    ) -> Result<serde_json::Value, McpClientError> {
+        let entry = self.lookup(id).ok_or(McpClientError::ProcessExited)?;
+        let params = serde_json::json!({ "name": tool_name, "arguments": arguments });
+        let result = entry.request_reuse("tools/call", &params, timeout_ms)?;
+        shape_tool_call_result(&result)
+    }
+
+    /// Stop and forget `id` entirely (used when its registration is removed).
+    pub fn remove(&self, id: &str) {
+        let removed = self.entries().remove(id);
+        if let Some(entry) = removed {
+            entry.stop();
         }
     }
 }

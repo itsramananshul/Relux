@@ -3166,6 +3166,25 @@ export interface ReluxMcpResourceContent {
   binary: boolean;
 }
 
+// The lifecycle status of a managed-stdio MCP server's long-lived process. A
+// managed-stdio server is registered (config) independently of whether its process
+// is running; the operator starts/stops/restarts it and discovery/invocation reuse
+// the running process. Carries no secret (the pid is the OS process id; last_error
+// and log_tail are already secret-redacted by the kernel).
+export interface ReluxManagedStdioStatus {
+  id: string;
+  // "stopped" | "starting" | "running" | "failed".
+  state: "stopped" | "starting" | "running" | "failed";
+  pid?: number;
+  started_at_ms?: number;
+  // The honest, redacted reason for the last failure (absent when none).
+  last_error?: string;
+  // Tools discovered by the last live tools/list against the running process.
+  tools_count?: number;
+  // A bounded, redacted tail of the child's stderr (most recent last).
+  log_tail?: string[];
+}
+
 export const reluxMcp = {
   // Registered MCP servers (no secrets). Throws an ApiError on failure.
   list: () => api.get<ReluxMcpServer[]>("/v1/relux/mcp/servers"),
@@ -3225,6 +3244,35 @@ export const reluxMcp = {
   readResource: (id: string, uri: string) =>
     api.get<ReluxMcpResourceContent>(
       `/v1/relux/mcp/servers/${encodeURIComponent(id)}/resources/read?uri=${encodeURIComponent(uri)}`,
+    ),
+  // --- Managed-stdio process lifecycle (managed_stdio servers only) ---------
+  // The managed-process status for every registered managed-stdio server.
+  statuses: () =>
+    api.get<ReluxManagedStdioStatus[]>("/v1/relux/mcp/servers/status"),
+  // The managed-process status for one server. 404 unknown · 400 not stdio.
+  status: (id: string) =>
+    api.get<ReluxManagedStdioStatus>(
+      `/v1/relux/mcp/servers/${encodeURIComponent(id)}/status`,
+    ),
+  // Start (or replace) the managed process — reused for list/call. A spawn failure
+  // is an honest `failed` status (200), not an error. 404 unknown · 400 not stdio ·
+  // 409 disabled.
+  start: (id: string) =>
+    api.post<ReluxManagedStdioStatus>(
+      `/v1/relux/mcp/servers/${encodeURIComponent(id)}/start`,
+      {},
+    ),
+  // Stop (kill + reap) the managed process. Idempotent.
+  stop: (id: string) =>
+    api.post<ReluxManagedStdioStatus>(
+      `/v1/relux/mcp/servers/${encodeURIComponent(id)}/stop`,
+      {},
+    ),
+  // Restart: stop then start the managed process.
+  restart: (id: string) =>
+    api.post<ReluxManagedStdioStatus>(
+      `/v1/relux/mcp/servers/${encodeURIComponent(id)}/restart`,
+      {},
     ),
 };
 

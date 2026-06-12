@@ -342,6 +342,8 @@ pub enum KernelError {
     UnknownMcpServer(String),
     #[error("MCP server '{0}' is disabled; enable it before discovering its tools")]
     McpServerDisabled(String),
+    #[error("MCP server '{0}' is not a managed-stdio server; only managed-stdio servers have a process lifecycle")]
+    NotAManagedStdioServer(String),
     #[error("MCP discovery against server '{id}' failed: {message}")]
     McpDiscoveryFailed { id: String, message: String },
     #[error("invalid MCP tool name '{tool}' for server '{server}' (must be [A-Za-z0-9._-], non-empty, bounded)")]

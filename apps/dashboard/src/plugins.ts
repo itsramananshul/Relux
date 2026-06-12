@@ -15,6 +15,7 @@
 
 import type {
   ReluxAdapterStatus,
+  ReluxManagedStdioStatus,
   ReluxMcpRegistrationProposal,
   ReluxMcpServer,
   ReluxPlugin,
@@ -566,6 +567,46 @@ export function mcpServerStatusBadge(server: ReluxMcpServer): PluginStatus {
     title:
       "Registered and enabled. Use Discover to run a live tools/list against the loopback server.",
   };
+}
+
+// ── Managed-stdio process lifecycle ───────────────────────────────────────────
+// A managed-stdio server is registered (config) independently of whether its
+// process is running. This badge reflects the LIVE process state reported by the
+// kernel's managed pool: stopped / starting / running / failed. Honest by
+// construction — `failed` surfaces the redacted reason; nothing is faked.
+export function managedStdioStatusBadge(
+  status: ReluxManagedStdioStatus,
+): PluginStatus {
+  switch (status.state) {
+    case "running":
+      return {
+        label: status.pid ? `running · pid ${status.pid}` : "running",
+        variant: "ok",
+        title:
+          "The managed process is up; Discover and tool calls reuse it (one initialized process, no per-call spawn).",
+      };
+    case "starting":
+      return {
+        label: "starting",
+        variant: "muted",
+        title: "The managed process is spawning and running its initialize handshake.",
+      };
+    case "failed":
+      return {
+        label: "failed",
+        variant: "warn",
+        title: status.last_error
+          ? `The managed process failed: ${status.last_error}`
+          : "The managed process failed to start or died. Restart it to try again.",
+      };
+    default:
+      return {
+        label: "stopped",
+        variant: "muted",
+        title:
+          "No managed process is running. Discover still works (spawn-per-operation); Start one to reuse a single long-lived process.",
+      };
+  }
 }
 
 export interface VisibleTools {

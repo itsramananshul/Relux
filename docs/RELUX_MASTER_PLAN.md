@@ -1875,6 +1875,44 @@ stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
   `src/bin/relux_mcp_test_server.rs` driven end-to-end via `tests/mcp_stdio.rs` — spawn→initialize→list→call,
   `isError` honest, unknown-tool clean, kernel registry discovery; route accepts/validates the stdio body);
   dashboard typecheck/build/tests green (368), committed bundle rebuilt.
+- **unreleased** — **Managed-stdio MCP server lifecycle v1 (operator Start/Stop/Restart + process reuse;
+  closes the "no long-lived daemon" gap)** on top of the governed managed-stdio transport, same §8.2/§18 +
+  `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §9 line, built reference-first against Hermes
+  `reference/hermes-agent-main/hermes_cli/mcp_config.py` (the SDK keeps the MCP client **connected** between
+  `list_tools`/`call_tool`; `_probe_single_server` connect→list→disconnect is the one-shot probe) and the
+  prior `crates/relix-runtime/src/nodes/tool/mcp_stdio.rs` posture — mapping in `docs/mcp.md` "Managed-stdio
+  process lifecycle". **What closes:** the prior slice was spawn-per-operation only and listed "no long-lived
+  daemon" as a gap, so an expensive-to-start server paid spawn+handshake on every call. **What ships:** a
+  process-global managed pool (`crate::mcp_stdio::pool()` / `ManagedPool`) that lives **outside** the
+  serializable `KernelState` (a live OS process is not snapshot state) — the registry stays the source of
+  truth for *what* is registered, the pool owns *whether it is running*. The kernel drives it
+  (`start_mcp_stdio_server`/`stop…`/`restart…`/`mcp_stdio_status`/`mcp_stdio_statuses`, each validated
+  against the registry + audited `mcp:server_start`/`_stop`/`_restart`) via new routes
+  `GET /v1/relux/mcp/servers/status`, `GET …/:id/status`, `POST …/:id/{start,stop,restart}`. **Reuse:** while
+  a managed process is running, Discover (`tools/list`) and gated invocation (`tools/call`) **reuse the one
+  `initialize`d process** — monotonic JSON-RPC ids, responses matched to their request id (a stale reply /
+  notification is drained, never confused), per-call timeout, process-death detection; when nothing is
+  running the same operations fall back to the safe spawn-per-operation transport (so Discover/invoke never
+  silently fail). **Honest status** (`relux_core::ManagedStdioStatus`: `stopped`/`starting`/`running`/`failed`,
+  pid, started-at, redacted `last_error`, `tools_count`, bounded secret-redacted log tail): a failed start is
+  a `failed` status with the reason (never a fabricated `running`); a process that dies / a fatal transport
+  error tears the process down and marks `failed` (never a fabricated success); an application error (JSON-RPC
+  `error` / `tools/call` `isError`) leaves the process healthy and reusable. **Same safety contract** as the
+  per-operation transport (argv only — never a shell; no env stored; no `cwd` override; no bypass/danger
+  flag; bounded process + redacted log memory; killed + reaped on stop/restart/drop/shutdown/registration
+  removal — a removed server never leaves a daemon behind); nothing auto-started, nothing auto-approved.
+  **UI:** the Plugins page adds a per-stdio-server **Process** control row (`ManagedStdioControls` +
+  `managedStdioStatusBadge`) showing the live status (state/pid/start-time/tools-count/redacted
+  last-error+log-tail) and Start/Stop/Restart. **Honest gaps:** a timed-out / transport-failed call tears the
+  warm process down (avoids a desynced pipe); still no env/`cwd`; resources still HTTP-only; status is polled,
+  not pushed. No release cut; no safety property weakened (no remote host dialed, no downloaded code run, no
+  secret stored). `cargo test` + `clippy` clean on `relux-core`/`relux-kernel` (new tests: pool
+  start/list/call/stop lifecycle against the REAL subprocess fixture, **one-process reuse proven via a
+  per-process pid+counter** `whoami` tool, restart spawns a new pid, a `crash` tool proves process-death →
+  `failed`+reason, reuse requires an explicit start, a failed start is an honest `failed` status; kernel
+  lifecycle through the registry incl. HTTP/disabled/unknown refusals + remove-stops-the-process; the
+  lifecycle routes incl. 400/404 mappings; `ManagedStdioStatus` serde shape); dashboard typecheck/build/tests
+  green (369), committed bundle rebuilt.
 - **unreleased** — **Background-job concurrency folded into the autonomy policy (retires the hidden
   `MAX_ACTIVE_JOBS = 4`)**, the FINAL LATER item from `docs/ARTIFICIAL_CONSTRAINT_AUDIT.md` promoted to
   FIXED, finishing the artificial-constraint pass and continuing the autonomy-policy line (§10.5/§17.1).

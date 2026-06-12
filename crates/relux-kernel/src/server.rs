@@ -256,6 +256,11 @@ async fn serve() -> Result<(), KernelError> {
     println!("   POST   /v1/relux/mcp/servers              {{ \"id\":\"...\", \"transport\":\"managed_stdio\", \"command\":\"npx\", \"args\":[\"-y\",\"server\"], … }}");
     println!("   DELETE /v1/relux/mcp/servers/:id           (remove an MCP server)");
     println!("   GET    /v1/relux/mcp/servers/:id/tools     (live tools/list discovery → ToolDescriptor[])");
+    println!("   GET    /v1/relux/mcp/servers/status        (managed-stdio process status for every stdio server)");
+    println!("   GET    /v1/relux/mcp/servers/:id/status    (managed-stdio process status: state/pid/log tail)");
+    println!("   POST   /v1/relux/mcp/servers/:id/start     (start the managed-stdio process — reused for list/call)");
+    println!("   POST   /v1/relux/mcp/servers/:id/stop      (stop + reap the managed-stdio process)");
+    println!("   POST   /v1/relux/mcp/servers/:id/restart   (stop then start the managed-stdio process)");
     println!("   GET    /v1/relux/mcp/servers/:id/resources (live resources/list → McpResource[]; read-only context)");
     println!("   GET    /v1/relux/mcp/servers/:id/resources/read?uri=…  (read one resource → shaped, redacted text)");
     println!("   PUT    /v1/relux/mcp/servers/:id/tools/:tool/classification  {{ \"risk\":\"low|medium|high|critical\", \"approval\":\"never|required\" }}");
@@ -552,6 +557,16 @@ fn protected_router() -> Router<AppState> {
         )
         .route("/v1/relux/mcp/servers/:id", delete(delete_mcp_server))
         .route("/v1/relux/mcp/servers/:id/tools", get(mcp_server_tools))
+        // Managed-stdio process lifecycle (start/stop/restart/status). HTTP-loopback
+        // servers have no process lifecycle (they are an endpoint the operator runs).
+        .route(
+            "/v1/relux/mcp/servers/status",
+            get(list_mcp_stdio_statuses),
+        )
+        .route("/v1/relux/mcp/servers/:id/status", get(mcp_stdio_status))
+        .route("/v1/relux/mcp/servers/:id/start", post(start_mcp_stdio))
+        .route("/v1/relux/mcp/servers/:id/stop", post(stop_mcp_stdio))
+        .route("/v1/relux/mcp/servers/:id/restart", post(restart_mcp_stdio))
         // MCP resources — read-only context source (resources/list + resources/read).
         .route("/v1/relux/mcp/servers/:id/resources", get(mcp_server_resources))
         .route(
@@ -7140,6 +7155,80 @@ async fn mcp_server_tools(
     }))
 }
 
+// --- Managed-stdio process lifecycle routes --------------------------------
+// `docs/mcp.md` "Managed stdio MCP server lifecycle". A managed-stdio server is
+// registered (config) independently of whether its process is running. These routes
+// let an operator start/stop/restart that process and read its honest status (state,
+// pid, started-at, last error, tools count, redacted log tail). The process is spawned
+// argv-only, never auto-started, and killed + reaped on stop/restart/shutdown.
+
+/// GET `/v1/relux/mcp/servers/status` — the managed-process status for EVERY
+/// registered managed-stdio server (HTTP servers omitted — no process lifecycle).
+async fn list_mcp_stdio_statuses(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<relux_core::ManagedStdioStatus>>, ApiError> {
+    let rows = locked_read(&state, |kernel| Ok(kernel.mcp_stdio_statuses()))?;
+    Ok(Json(rows))
+}
+
+/// GET `/v1/relux/mcp/servers/:id/status` — the managed-process status for one
+/// managed-stdio server. Unknown id → 404; not a managed-stdio server → 400.
+async fn mcp_stdio_status(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<relux_core::ManagedStdioStatus>, ApiError> {
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err(ApiError::bad_request("MCP server id is required"));
+    }
+    let status = locked_read(&state, |kernel| kernel.mcp_stdio_status(&id))?;
+    Ok(Json(status))
+}
+
+/// POST `/v1/relux/mcp/servers/:id/start` — start (or replace) the managed process.
+/// Unknown id → 404; not a managed-stdio server → 400; disabled → 409. A
+/// spawn/handshake failure is an honest `failed` status (200), not an error — the
+/// operator reads `last_error` from the status.
+async fn start_mcp_stdio(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<relux_core::ManagedStdioStatus>, ApiError> {
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err(ApiError::bad_request("MCP server id is required"));
+    }
+    let status = locked_save(&state, |kernel| kernel.start_mcp_stdio_server(&id))?;
+    Ok(Json(status))
+}
+
+/// POST `/v1/relux/mcp/servers/:id/stop` — stop (kill + reap) the managed process.
+/// Idempotent. Unknown id → 404; not a managed-stdio server → 400.
+async fn stop_mcp_stdio(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<relux_core::ManagedStdioStatus>, ApiError> {
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err(ApiError::bad_request("MCP server id is required"));
+    }
+    let status = locked_save(&state, |kernel| kernel.stop_mcp_stdio_server(&id))?;
+    Ok(Json(status))
+}
+
+/// POST `/v1/relux/mcp/servers/:id/restart` — stop then start the managed process.
+/// Unknown id → 404; not a managed-stdio server → 400; disabled → 409.
+async fn restart_mcp_stdio(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<relux_core::ManagedStdioStatus>, ApiError> {
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err(ApiError::bad_request("MCP server id is required"));
+    }
+    let status = locked_save(&state, |kernel| kernel.restart_mcp_stdio_server(&id))?;
+    Ok(Json(status))
+}
+
 /// The operator-set risk/approval classification for one MCP tool. Accepts the
 /// native serde shapes: `risk` is `"low"|"medium"|"high"|"critical"`; `approval`
 /// is `"never"|"required"|{"required_when_risk":"<level>"}`.
@@ -7812,6 +7901,8 @@ fn status_for(err: &KernelError) -> StatusCode {
         KernelError::InvalidMcpToolName { .. } | KernelError::InvalidMcpResourceUri { .. } => {
             StatusCode::BAD_REQUEST
         }
+        // A lifecycle action (start/stop/restart) was asked for a non-stdio server.
+        KernelError::NotAManagedStdioServer(_) => StatusCode::BAD_REQUEST,
         // A configured tool that requires approval cannot be invoked directly yet:
         // a conflict the operator resolves by lowering risk / enabling auto-approve,
         // or by requesting a per-call approval.
@@ -10482,6 +10573,82 @@ mod tests {
         let (_, _, body) = call(&state, "GET", "/v1/relux/mcp/servers", None, None).await;
         let list: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(list.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn mcp_managed_stdio_lifecycle_routes() {
+        // Exercises the route → kernel → managed-pool wiring + the honest status
+        // shapes. The happy "running" path against a REAL subprocess is covered by the
+        // integration test (`tests/mcp_stdio.rs`); here we use a non-existent binary so
+        // the test needs no fixture build, and assert the start-fails-honestly path
+        // (a `failed` status, never a fabricated `running`).
+        let (state, _dir) = auth_state(true);
+
+        // Register a managed-stdio server whose command does not exist.
+        let (status, _, _) = call(
+            &state,
+            "POST",
+            "/v1/relux/mcp/servers",
+            None,
+            Some(r#"{"id":"route-fs","transport":"managed_stdio","command":"relux-mcp-no-such-binary-zzz","description":"fixture"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Status before start: stopped (registered, no process).
+        let (status, _, body) =
+            call(&state, "GET", "/v1/relux/mcp/servers/route-fs/status", None, None).await;
+        assert_eq!(status, StatusCode::OK, "status body: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["state"], "stopped");
+
+        // Start → failed (the binary can't spawn), with an honest last_error — a 200
+        // carrying the failed status, never a fabricated running/pid.
+        let (status, _, body) =
+            call(&state, "POST", "/v1/relux/mcp/servers/route-fs/start", None, None).await;
+        assert_eq!(status, StatusCode::OK, "start body: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["state"], "failed", "start body: {body}");
+        assert!(v["pid"].as_u64().is_none(), "a failed start has no pid: {body}");
+        assert!(v["last_error"].as_str().is_some(), "failed start records why: {body}");
+
+        // The failed server appears in the statuses list.
+        let (status, _, body) =
+            call(&state, "GET", "/v1/relux/mcp/servers/status", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            list.as_array().unwrap().iter().any(|s| s["id"] == "route-fs"),
+            "statuses: {body}"
+        );
+
+        // Stop → stopped (idempotent; clears the prior error).
+        let (status, _, body) =
+            call(&state, "POST", "/v1/relux/mcp/servers/route-fs/stop", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["state"], "stopped", "stop body: {body}");
+
+        // A lifecycle action against an HTTP server is a 400 (no process lifecycle).
+        let (status, _, _) = call(
+            &state,
+            "POST",
+            "/v1/relux/mcp/servers",
+            None,
+            Some(r#"{"id":"route-http","endpoint":"http://127.0.0.1:8000/mcp"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, _) =
+            call(&state, "POST", "/v1/relux/mcp/servers/route-http/start", None, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // An unknown server is a 404.
+        let (status, _, _) =
+            call(&state, "POST", "/v1/relux/mcp/servers/ghost/start", None, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let _ = call(&state, "DELETE", "/v1/relux/mcp/servers/route-fs", None, None).await;
     }
 
     #[tokio::test]

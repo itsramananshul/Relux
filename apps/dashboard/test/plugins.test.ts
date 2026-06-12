@@ -13,6 +13,7 @@ import {
   adapterStatusBadge,
   ADAPTER_STATE_LABEL,
   mcpServerStatusBadge,
+  managedStdioStatusBadge,
   hintKindLabel,
   hintsNextStep,
   mcpDraftFromProposal,
@@ -81,6 +82,27 @@ test("an MCP server badge reflects only its config (configured vs disabled), nev
   const off = mcpServerStatusBadge(mcpServer({ enabled: false }));
   assert.equal(off.label, "disabled");
   assert.equal(off.variant, "muted");
+});
+
+test("a managed-stdio process badge reflects the LIVE process state, never faked", () => {
+  // Running shows the pid and reads as ok; failed surfaces the redacted reason as a
+  // warn (never ok); stopped/starting are muted.
+  const running = managedStdioStatusBadge({ id: "gh", state: "running", pid: 4242 });
+  assert.equal(running.variant, "ok");
+  assert.ok(running.label.includes("4242"), `pid shown: ${running.label}`);
+
+  const failed = managedStdioStatusBadge({
+    id: "gh",
+    state: "failed",
+    last_error: "spawn npx: not found",
+  });
+  assert.equal(failed.label, "failed");
+  assert.equal(failed.variant, "warn");
+  assert.ok(failed.title.includes("not found"), "failure reason surfaced");
+
+  assert.equal(managedStdioStatusBadge({ id: "gh", state: "stopped" }).label, "stopped");
+  assert.equal(managedStdioStatusBadge({ id: "gh", state: "stopped" }).variant, "muted");
+  assert.equal(managedStdioStatusBadge({ id: "gh", state: "starting" }).label, "starting");
 });
 
 // A discovered MCP tool flows through the SAME `toolReadiness` classifier a plugin

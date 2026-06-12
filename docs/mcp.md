@@ -89,12 +89,15 @@ and goes **stricter** than Hermes.
   (`--dangerously-skip-permissions`, `--dangerously-bypass-approvals-and-sandbox`,
   `--yolo`) also **refuses** an operator-supplied bypass flag fail-closed — consistent
   with the adapter governance (`crate::adapter` never passes one either).
-- **Spawn-per-operation, bounded, reaped.** Each Discover / invocation **spawns its
-  own child, runs one logical operation (`initialize` → `tools/list` / `tools/call`),
-  and kills + reaps it** (`StdioChild::drop`) — exactly like the HTTP client opens a
-  fresh `Connection: close` POST per operation. There is **no long-lived daemon**: a
-  managed server can never linger, leak, or run between operations. The lifecycle is
-  operator-controlled (a Discover / a gated invocation drives one bounded run).
+- **Two process modes: spawn-per-operation OR an operator-managed process.** The
+  original transport **spawns its own child, runs one logical operation (`initialize`
+  → `tools/list` / `tools/call`), and kills + reaps it** (`StdioChild::drop`) — exactly
+  like the HTTP client opens a fresh `Connection: close` POST per operation. That stays
+  the safe **fallback** (used when no managed process is running). On top of it, an
+  operator can **Start** a managed server so a single `initialize`d process stays warm
+  and Discover / invocation **reuse** it (no per-call spawn + handshake) — see
+  "Managed-stdio process lifecycle" below. Either way the process is bounded, reaped,
+  and never runs without an explicit operator action.
 - **Timeout + size + redaction bounds.** Each request is bounded by the per-call
   timeout (the child is killed on expiry); each stdout response line is size-capped
   (4 MiB); the child's **stderr is drained into a bounded, secret-redacted tail**
@@ -135,25 +138,79 @@ operator **reviews + confirms** the command/args (the same fail-closed pre-check
 later operator-driven Discover/invoke. A detected non-loopback / missing `url` still
 forces manual entry; nothing is auto-registered or auto-run.
 
+### Managed-stdio process lifecycle (operator Start / Stop / Restart + reuse)
+
+A registered managed-stdio server is **registered** (a config row) independently of
+whether its **process is running**. Beyond the per-operation spawn, an operator can run
+a single long-lived process and reuse it — the real lifecycle a serious product needs
+(Hermes keeps the MCP client connected between `list_tools` / `call_tool`; its
+`_probe_single_server` connects → lists → disconnects only for a one-shot probe —
+`reference/hermes-agent-main/hermes_cli/mcp_config.py`). It stays safe by construction.
+
+- **A managed pool, outside the snapshot.** `crate::mcp_stdio::pool()` is a
+  process-global pool (`ManagedPool`) keyed by server id; it lives **outside** the
+  serializable `KernelState` (a live OS process is not snapshot state). The kernel's
+  registry stays the source of truth for *what* is registered; the pool owns *whether
+  it is running*. The kernel drives it (`start_mcp_stdio_server` / `stop…` / `restart…`
+  / `mcp_stdio_status` / `mcp_stdio_statuses`), each validated against the registry
+  (the server must exist, be a managed-stdio transport, and — to start — be enabled),
+  audited (`mcp:server_start` / `_stop` / `_restart`), and honest.
+- **Explicit lifecycle, never auto-started.** A process spawns only on an explicit
+  **Start** (or, when no managed process is running, a per-operation Discover/invoke
+  via the fallback). Start runs the spawn + `initialize` once; **Stop** kills + reaps
+  the child; **Restart** stops then starts a fresh one; removing the registration stops
+  + reaps any process so a removed server never leaves a daemon behind; and a managed
+  process is always killed + reaped on stop / restart / drop / process shutdown.
+- **Reuse for `tools/list` + `tools/call`.** While a managed process is **running**,
+  Discover (`tools/list`) and gated invocation (`tools/call`) **reuse it** — one
+  `initialize`d process, monotonically increasing JSON-RPC request ids, responses
+  matched to their request id (a stale reply or a notification is drained, never
+  confused for the answer), per-call timeout, and process-death detection. When no
+  process is running, the same operations fall back to the safe spawn-per-operation
+  transport — so Discover/invoke never silently fail just because nothing was started.
+- **Status is honest.** Each managed server reports `stopped` / `starting` / `running`
+  / `failed`, the `pid` (safe to show) and start time when up, the redacted `last_error`
+  on a failure (spawn failed, the process died, a fatal transport error), the
+  `tools_count` from the last live `tools/list`, and a bounded, **secret-redacted**
+  stderr **log tail** (`relux_core::ManagedStdioStatus`). A start that fails to spawn is
+  a `failed` status with the reason — **never** a fabricated `running`. A running
+  process that dies (or a call that hits a fatal transport error / timeout) is torn down
+  and marked `failed` with the reason — **never** a fabricated success. An *application*
+  error (a JSON-RPC `error`, or a `tools/call` `isError`) leaves the process healthy and
+  reusable; it does not kill the daemon.
+- **Bounded process + log memory.** One process per registered stdio server; the stderr
+  tail is bounded (`relux_core::MAX_MANAGED_STDIO_LOG_LINES`, redacted); status fields
+  are cheap atomics read without blocking a live request (so `starting` is observable
+  mid-spawn). Same safety contract as the per-operation transport: **argv only (never a
+  shell), no env stored, no `cwd` override, no bypass/danger flag.**
+- **Routes.** `GET /v1/relux/mcp/servers/status` (all stdio servers),
+  `GET …/:id/status`, `POST …/:id/start`, `POST …/:id/stop`, `POST …/:id/restart`. A
+  lifecycle action against an HTTP-loopback server is a `400` (it has no process
+  lifecycle — it is an endpoint the operator runs); an unknown server is `404`; a
+  disabled server refused to start is `409`.
+
 ### Operating it (dashboard)
 
-The Plugins page's **MCP servers** form now has a **Transport** selector (loopback
-HTTP endpoint vs. managed stdio command); the stdio form takes a **command** and
-**args (one argv element per line)**, pre-checked with the same argv-only rules the
-kernel enforces. The servers list shows each server's transport (`http` / `stdio`) and
-its `transport_display` (endpoint or `cmd args…`), the honest `configured`/`disabled`
-status, and **Discover** (which for a stdio server spawns the command, runs the live
-`tools/list`, and reaps the child) + **Remove** actions. The Resources action is hidden
-for a stdio server (resources are HTTP-only in this slice).
-(`apps/dashboard/src/pages/Plugins.tsx`, `apps/dashboard/src/plugins.ts`.)
+The Plugins page's **MCP servers** form has a **Transport** selector (loopback HTTP
+endpoint vs. managed stdio command); the stdio form takes a **command** and **args (one
+argv element per line)**, pre-checked with the same argv-only rules the kernel enforces.
+The servers list shows each server's transport (`http` / `stdio`), its
+`transport_display` (endpoint or `cmd args…`), the honest `configured`/`disabled` config
+status, and **Discover** + **Remove** actions. For a managed-stdio server a **Process**
+control row also shows the live process **status** (state badge with pid, start time,
+tools-discovered count, redacted **last error** + **log tail**) and **Start** / **Stop**
+/ **Restart** buttons (`ManagedStdioControls`). The Resources action is hidden for a
+stdio server (resources are HTTP-only in this slice).
+(`apps/dashboard/src/pages/Plugins.tsx`, `apps/dashboard/src/plugins.ts`,
+`managedStdioStatusBadge`.)
 
 ### Remaining gaps (honest)
 
-- **No long-lived daemon.** Each Discover/invocation spawns + reaps its own child;
-  there is no persistent process kept warm between operations (start/stop/restart of a
-  standing daemon is out of scope). This is deliberate — it keeps a managed server from
-  ever lingering or leaking — but it means a server that is expensive to start pays that
-  cost per operation.
+- **A fatal call tears the process down.** A `tools/call` / `tools/list` that **times
+  out** or hits a transport error drops the managed process (the response stream may be
+  desynced) and marks it `failed`; the operator (or the next fallback Discover/invoke)
+  restarts it. This is deliberate — it avoids reusing a desynced pipe — but a single
+  slow call can end a warm process.
 - **No env / no `cwd`.** Env is not stored (it would carry secrets) and `cwd` is not
   overridden, so a stdio server that *requires* an env var (e.g. a token) or a specific
   working directory is not yet supported through Relux's managed transport — run it as a
@@ -161,6 +218,8 @@ for a stdio server (resources are HTTP-only in this slice).
   secret store backs it.
 - **Resources are HTTP-only.** `resources/list` / `resources/read` are not bridged over
   managed stdio yet (tools only).
+- **Status polling, not push.** The dashboard reads status on demand (no live stream);
+  a crash between reads surfaces on the next status read / call, not instantly.
 
 ## MCP hint → review → register (one-click from imported plugin details)
 

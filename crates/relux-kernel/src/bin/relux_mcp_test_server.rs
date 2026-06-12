@@ -13,8 +13,19 @@
 //! - `boom` — returns a `tools/call` result flagged `isError` (an honest failure).
 //! - `noisy` — writes a line to stderr (so the client's bounded stderr tail is
 //!   exercised) and returns an ok result.
+//! - `whoami` — returns this process's OS pid plus a per-process call counter (it
+//!   increments each invocation), so a test can PROVE the managed pool reuses one
+//!   long-lived process across calls (same pid, increasing count) rather than
+//!   spawning a fresh one per call.
+//! - `crash` — makes the server process exit immediately without responding, so a
+//!   test can exercise the pool's process-death detection (the call sees EOF →
+//!   `ProcessExited`, and a later status reports `failed`).
 
 use std::io::{BufRead, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Per-process invocation counter for `whoami`, proving process reuse across calls.
+static CALLS: AtomicU64 = AtomicU64::new(0);
 
 fn main() {
     let stdin = std::io::stdin();
@@ -51,7 +62,9 @@ fn main() {
                 "result": { "tools": [
                     { "name": "status.summary", "description": "Return a small status summary." },
                     { "name": "boom", "description": "Always returns an error result." },
-                    { "name": "noisy", "description": "Writes to stderr, then returns ok." }
+                    { "name": "noisy", "description": "Writes to stderr, then returns ok." },
+                    { "name": "whoami", "description": "Return this process pid + per-process call count." },
+                    { "name": "crash", "description": "Exit the process without responding (death test)." }
                 ]}
             }),
             "tools/call" => {
@@ -94,6 +107,24 @@ fn main() {
                                 "isError": false
                             }
                         })
+                    }
+                    "whoami" => {
+                        let n = CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+                        let pid = std::process::id();
+                        serde_json::json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": {
+                                "content": [ { "type": "text", "text": format!("pid={pid} calls={n}") } ],
+                                "structuredContent": { "pid": pid, "calls": n },
+                                "isError": false
+                            }
+                        })
+                    }
+                    "crash" => {
+                        // Exit without responding — the client must see EOF and report
+                        // an honest process-death failure (never a fabricated success).
+                        let _ = stdout.flush();
+                        std::process::exit(7);
                     }
                     other => serde_json::json!({
                         "jsonrpc": "2.0", "id": id,

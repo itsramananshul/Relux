@@ -1268,11 +1268,16 @@ impl KernelState {
         Ok(server)
     }
 
-    /// Remove an MCP server registration entirely. Errors if unknown.
+    /// Remove an MCP server registration entirely. Errors if unknown. A managed-stdio
+    /// server's running process (if any) is stopped + reaped so a removed server never
+    /// leaves a daemon behind.
     pub fn remove_mcp_server(&mut self, id: &str) -> Result<(), KernelError> {
         self.mcp_servers
             .remove(id)
             .ok_or_else(|| KernelError::UnknownMcpServer(id.to_string()))?;
+        // Stop + forget any managed process for this id (process state lives outside
+        // the kernel snapshot, in the managed pool).
+        crate::mcp_stdio::pool().remove(id);
         self.record_audit(
             "kernel",
             "kernel",
@@ -1284,6 +1289,135 @@ impl KernelState {
             serde_json::Value::Null,
         );
         Ok(())
+    }
+
+    // --- Managed-stdio MCP server lifecycle (start/stop/restart/status) -----
+    //
+    // `docs/mcp.md` "Managed stdio MCP server lifecycle". The registry above records
+    // WHAT is registered; the process pool (`crate::mcp_stdio::pool`) owns WHETHER a
+    // managed-stdio server's process is running. These methods are the operator-facing
+    // lifecycle: they validate against the registry (the server must exist, be a
+    // managed-stdio transport, and — to start — be enabled), audit the action, and
+    // drive the pool. The pool keeps the process safe by construction (argv only, no
+    // env / no cwd, no bypass flag, bounded + reaped). HTTP-loopback servers have no
+    // process lifecycle (they are an endpoint the operator runs), so a lifecycle
+    // action against one is [`KernelError::NotAManagedStdioServer`].
+
+    /// Look up a managed-stdio server config by id (clone of the non-secret command +
+    /// args + timeout), or an honest error: unknown id, or not a managed-stdio server.
+    fn managed_stdio_config(
+        &self,
+        id: &str,
+    ) -> Result<relux_core::McpServerConfig, KernelError> {
+        let server = self
+            .mcp_servers
+            .get(id)
+            .ok_or_else(|| KernelError::UnknownMcpServer(id.to_string()))?;
+        if server.transport != relux_core::McpTransport::ManagedStdio {
+            return Err(KernelError::NotAManagedStdioServer(id.to_string()));
+        }
+        Ok(server.clone())
+    }
+
+    /// Start (or replace) the managed process for a registered, enabled managed-stdio
+    /// server, returning its [`relux_core::ManagedStdioStatus`]. The process is spawned
+    /// argv-only (never a shell), inherits the parent env + cwd unchanged, and is
+    /// killed + reaped on a later stop/restart/shutdown. A disabled server is refused
+    /// (enable it first). A spawn/handshake failure is surfaced honestly as a `failed`
+    /// status carrying the redacted reason (not a fabricated `running`).
+    pub fn start_mcp_stdio_server(
+        &mut self,
+        id: &str,
+    ) -> Result<relux_core::ManagedStdioStatus, KernelError> {
+        let server = self.managed_stdio_config(id)?;
+        if !server.enabled {
+            return Err(KernelError::McpServerDisabled(id.to_string()));
+        }
+        let command = server.command.clone().unwrap_or_default();
+        let status =
+            crate::mcp_stdio::pool().start(id, &command, &server.args, server.timeout_ms);
+        self.record_audit(
+            "kernel",
+            "kernel",
+            "mcp:server_start",
+            Some("mcp_server"),
+            Some(id),
+            None,
+            AuditResult::Success,
+            serde_json::json!({ "state": status.state.as_str() }),
+        );
+        Ok(status)
+    }
+
+    /// Stop the managed process for a registered managed-stdio server (kill + reap),
+    /// returning its `stopped` status. Idempotent.
+    pub fn stop_mcp_stdio_server(
+        &mut self,
+        id: &str,
+    ) -> Result<relux_core::ManagedStdioStatus, KernelError> {
+        let _ = self.managed_stdio_config(id)?;
+        let status = crate::mcp_stdio::pool().stop(id);
+        self.record_audit(
+            "kernel",
+            "kernel",
+            "mcp:server_stop",
+            Some("mcp_server"),
+            Some(id),
+            None,
+            AuditResult::Success,
+            serde_json::json!({ "state": status.state.as_str() }),
+        );
+        Ok(status)
+    }
+
+    /// Restart the managed process for a registered, enabled managed-stdio server:
+    /// stop the current process then start a fresh one. Returns the new status.
+    pub fn restart_mcp_stdio_server(
+        &mut self,
+        id: &str,
+    ) -> Result<relux_core::ManagedStdioStatus, KernelError> {
+        let server = self.managed_stdio_config(id)?;
+        if !server.enabled {
+            return Err(KernelError::McpServerDisabled(id.to_string()));
+        }
+        let command = server.command.clone().unwrap_or_default();
+        let status =
+            crate::mcp_stdio::pool().restart(id, &command, &server.args, server.timeout_ms);
+        self.record_audit(
+            "kernel",
+            "kernel",
+            "mcp:server_restart",
+            Some("mcp_server"),
+            Some(id),
+            None,
+            AuditResult::Success,
+            serde_json::json!({ "state": status.state.as_str() }),
+        );
+        Ok(status)
+    }
+
+    /// The managed-process status for a registered managed-stdio server. Read-only:
+    /// no audit mutation (mirrors [`Self::discover_mcp_tools`]).
+    pub fn mcp_stdio_status(
+        &self,
+        id: &str,
+    ) -> Result<relux_core::ManagedStdioStatus, KernelError> {
+        let _ = self.managed_stdio_config(id)?;
+        Ok(crate::mcp_stdio::pool().status(id))
+    }
+
+    /// The managed-process status for EVERY registered managed-stdio server (sorted by
+    /// id; HTTP servers are omitted — they have no process lifecycle). Read-only.
+    pub fn mcp_stdio_statuses(&self) -> Vec<relux_core::ManagedStdioStatus> {
+        let pool = crate::mcp_stdio::pool();
+        let mut out: Vec<relux_core::ManagedStdioStatus> = self
+            .mcp_servers
+            .values()
+            .filter(|s| s.transport == relux_core::McpTransport::ManagedStdio)
+            .map(|s| pool.status(&s.id))
+            .collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
     }
 
     /// One MCP server config by id.
@@ -11221,8 +11355,17 @@ fn mcp_discover_tools(
             crate::mcp::discover_tools(&server.endpoint, server.timeout_ms)
         }
         relux_core::McpTransport::ManagedStdio => {
-            let command = server.command.as_deref().unwrap_or("");
-            crate::mcp_stdio::discover_tools(command, &server.args, server.timeout_ms)
+            // Reuse the operator-started managed process when one is running (one
+            // `initialize`d process, no per-call spawn); otherwise fall back to the
+            // safe spawn-per-operation discovery. A running-but-dead process surfaces
+            // its honest failure rather than silently re-spawning (so a crash is
+            // visible), via the pool's process-death detection.
+            if crate::mcp_stdio::pool().is_running(&server.id) {
+                crate::mcp_stdio::pool().list_tools(&server.id, server.timeout_ms)
+            } else {
+                let command = server.command.as_deref().unwrap_or("");
+                crate::mcp_stdio::discover_tools(command, &server.args, server.timeout_ms)
+            }
         }
     }
 }
@@ -11240,8 +11383,19 @@ fn mcp_call_tool(
             crate::mcp::call_tool(&server.endpoint, tool_name, input, server.timeout_ms)
         }
         relux_core::McpTransport::ManagedStdio => {
-            let command = server.command.as_deref().unwrap_or("");
-            crate::mcp_stdio::call_tool(command, &server.args, tool_name, input, server.timeout_ms)
+            // Reuse the running managed process when one is up; otherwise spawn-per-op.
+            if crate::mcp_stdio::pool().is_running(&server.id) {
+                crate::mcp_stdio::pool().call_tool(&server.id, tool_name, input, server.timeout_ms)
+            } else {
+                let command = server.command.as_deref().unwrap_or("");
+                crate::mcp_stdio::call_tool(
+                    command,
+                    &server.args,
+                    tool_name,
+                    input,
+                    server.timeout_ms,
+                )
+            }
         }
     }
 }
@@ -11254,8 +11408,14 @@ fn mcp_view_discover_tools(
 ) -> Result<Vec<relux_core::McpTool>, crate::mcp::McpClientError> {
     match s.transport {
         relux_core::McpTransport::ManagedStdio => {
-            let command = s.command.as_deref().unwrap_or("");
-            crate::mcp_stdio::discover_tools(command, &s.args, s.timeout_ms)
+            // Reuse the running managed process when one is up (off-lock grounding
+            // pays no per-call spawn); otherwise spawn-per-operation.
+            if crate::mcp_stdio::pool().is_running(&s.id) {
+                crate::mcp_stdio::pool().list_tools(&s.id, s.timeout_ms)
+            } else {
+                let command = s.command.as_deref().unwrap_or("");
+                crate::mcp_stdio::discover_tools(command, &s.args, s.timeout_ms)
+            }
         }
         // Default to HTTP for the loopback transport (and any older view that
         // deserialized without an explicit transport).

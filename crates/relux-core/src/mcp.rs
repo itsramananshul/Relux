@@ -398,6 +398,96 @@ impl McpServerConfig {
     }
 }
 
+/// The lifecycle state of a **managed-stdio MCP server's** long-lived process, as
+/// reported by the kernel's managed pool (`relux-kernel::mcp_stdio`). Pure data — the
+/// process itself lives in the kernel, never in this crate.
+///
+/// A managed stdio server is *registered* (a config row) independently of whether its
+/// process is *running*. The operator explicitly starts/stops/restarts it; discovery
+/// and invocation reuse the running process when one is up, and otherwise fall back to
+/// the original spawn-per-operation transport. See `docs/mcp.md` "Managed stdio".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedStdioState {
+    /// No managed process is running (never started, or stopped by the operator).
+    Stopped,
+    /// A start/restart is in flight (the spawn + `initialize` handshake is running).
+    Starting,
+    /// The process is up and has completed its `initialize` handshake; discovery and
+    /// invocation reuse it.
+    Running,
+    /// The process failed to start, or a running process died / a call hit a fatal
+    /// transport error. [`ManagedStdioStatus::last_error`] carries the honest reason.
+    Failed,
+}
+
+impl ManagedStdioState {
+    /// The stable wire string for this state.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ManagedStdioState::Stopped => "stopped",
+            ManagedStdioState::Starting => "starting",
+            ManagedStdioState::Running => "running",
+            ManagedStdioState::Failed => "failed",
+        }
+    }
+}
+
+/// Max log-tail lines surfaced in a [`ManagedStdioStatus`]. The pool keeps a bounded,
+/// secret-redacted tail of the child's stderr; this caps what the operator sees.
+pub const MAX_MANAGED_STDIO_LOG_LINES: usize = 20;
+
+/// An operator-facing status snapshot of one managed-stdio MCP server's process.
+///
+/// Carries no secret: the `pid` is the OS process id (safe to show), `started_at_ms`
+/// is a wall-clock epoch-millis stamp, `last_error` and `log_tail` are already
+/// secret-redacted by the kernel, and `tools_count` is filled in once a live
+/// `tools/list` has run against the process. Everything is bounded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedStdioStatus {
+    /// The server id this status is for.
+    pub id: String,
+    /// The lifecycle state.
+    pub state: ManagedStdioState,
+    /// The OS process id of the running child, when one is up. Absent when stopped /
+    /// failed. Shown to the operator for transparency; it carries no secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// Wall-clock epoch milliseconds when the current process was started, when one is
+    /// up. Absent when stopped / failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
+    /// The honest, secret-redacted reason for the last failure (spawn failed, the
+    /// process died, a fatal transport error). Absent when there has been none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// How many tools the last live `tools/list` against this process discovered.
+    /// Absent until a Discover has run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools_count: Option<usize>,
+    /// A bounded, secret-redacted tail of the child's stderr (most recent lines last).
+    /// Empty when the process emitted nothing / is stopped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub log_tail: Vec<String>,
+}
+
+impl ManagedStdioStatus {
+    /// A `Stopped` status carrying nothing but the id — the honest default for a
+    /// registered managed-stdio server that has never been started (or whose process
+    /// the pool is not tracking).
+    pub fn stopped(id: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            state: ManagedStdioState::Stopped,
+            pid: None,
+            started_at_ms: None,
+            last_error: None,
+            tools_count: None,
+            log_tail: Vec::new(),
+        }
+    }
+}
+
 /// Clamp a requested MCP timeout into the supported range, defaulting when absent.
 pub fn clamp_mcp_timeout(timeout_ms: Option<u64>) -> u64 {
     timeout_ms
@@ -956,6 +1046,42 @@ mod tests {
         assert!(!is_valid_mcp_resource_uri("file:///a\r\nb"));
         assert!(!is_valid_mcp_resource_uri("file:///a\u{0}b"));
         assert!(!is_valid_mcp_resource_uri(&"x".repeat(MAX_MCP_RESOURCE_URI_CHARS + 1)));
+    }
+
+    #[test]
+    fn managed_stdio_state_wire_strings() {
+        assert_eq!(ManagedStdioState::Stopped.as_str(), "stopped");
+        assert_eq!(ManagedStdioState::Starting.as_str(), "starting");
+        assert_eq!(ManagedStdioState::Running.as_str(), "running");
+        assert_eq!(ManagedStdioState::Failed.as_str(), "failed");
+        // serde uses the same snake_case wire string.
+        let v = serde_json::to_value(ManagedStdioState::Running).unwrap();
+        assert_eq!(v, serde_json::json!("running"));
+    }
+
+    #[test]
+    fn managed_stdio_status_omits_absent_optionals() {
+        let stopped = ManagedStdioStatus::stopped("fs");
+        let v = serde_json::to_value(&stopped).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+        keys.sort_unstable();
+        // A stopped status carries only id + state; every optional/empty field omitted.
+        assert_eq!(keys, ["id", "state"]);
+        assert_eq!(v["state"], "stopped");
+
+        // A populated running status round-trips with all fields present.
+        let running = ManagedStdioStatus {
+            id: "fs".to_string(),
+            state: ManagedStdioState::Running,
+            pid: Some(4242),
+            started_at_ms: Some(1_700_000_000_000),
+            last_error: None,
+            tools_count: Some(3),
+            log_tail: vec!["started".to_string()],
+        };
+        let back: ManagedStdioStatus =
+            serde_json::from_value(serde_json::to_value(&running).unwrap()).unwrap();
+        assert_eq!(back, running);
     }
 
     #[test]
