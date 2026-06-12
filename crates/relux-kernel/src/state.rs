@@ -3629,15 +3629,32 @@ impl KernelState {
         input: serde_json::Value,
     ) -> Result<serde_json::Value, KernelError> {
         let (namespace, required) = self.resolve_tool_permission(agent_id, plugin_id, tool_name)?;
+        // Is this an MCP tool (`mcp:<server>`)? If so the run transcript gets a
+        // distinct, bounded, secret-redacted `mcp_tool_call*` event instead of the
+        // generic `tool_call*` — so an operator can see WHICH MCP server/tool a run
+        // used without the raw args/result blob or any JSON-RPC envelope/session id
+        // (`docs/mcp.md` "Run transcript visibility"; `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §9).
+        let mcp_server_id: Option<String> =
+            self.mcp_server_for_plugin(plugin_id).map(|s| s.id.clone());
 
         if !self.agent_holds_permission(agent_id, &required) {
-            self.push_run_event(
-                run_id,
-                "tool_call_denied",
-                "kernel",
-                &format!("denied {tool_name}: agent lacks {required}"),
-                serde_json::json!({ "tool": tool_name, "permission": required.as_str() }),
-            );
+            if let Some(server) = mcp_server_id.as_deref() {
+                self.push_run_event(
+                    run_id,
+                    "mcp_tool_call_denied",
+                    "kernel",
+                    &format!("denied MCP tool {tool_name} via {plugin_id}: agent lacks {required}"),
+                    serde_json::json!({ "server": server, "tool": tool_name, "permission": required.as_str() }),
+                );
+            } else {
+                self.push_run_event(
+                    run_id,
+                    "tool_call_denied",
+                    "kernel",
+                    &format!("denied {tool_name}: agent lacks {required}"),
+                    serde_json::json!({ "tool": tool_name, "permission": required.as_str() }),
+                );
+            }
             self.record_audit(
                 "agent",
                 agent_id.as_str(),
@@ -3668,13 +3685,23 @@ impl KernelState {
                     );
                 }
                 None => {
-                    self.push_run_event(
-                        run_id,
-                        "tool_call_denied",
-                        "kernel",
-                        &format!("denied {tool_name}: requires approval"),
-                        serde_json::json!({ "tool": tool_name, "plugin": plugin_id.as_str() }),
-                    );
+                    if let Some(server) = mcp_server_id.as_deref() {
+                        self.push_run_event(
+                            run_id,
+                            "mcp_tool_call_denied",
+                            "kernel",
+                            &format!("denied MCP tool {tool_name} via {plugin_id}: requires approval"),
+                            serde_json::json!({ "server": server, "tool": tool_name, "reason": "requires approval" }),
+                        );
+                    } else {
+                        self.push_run_event(
+                            run_id,
+                            "tool_call_denied",
+                            "kernel",
+                            &format!("denied {tool_name}: requires approval"),
+                            serde_json::json!({ "tool": tool_name, "plugin": plugin_id.as_str() }),
+                        );
+                    }
                     self.record_audit(
                         "agent",
                         agent_id.as_str(),
@@ -3700,13 +3727,26 @@ impl KernelState {
         let output = match self.execute_tool_runtime(plugin_id, tool_name, &input) {
             Ok(output) => output,
             Err(e) => {
-                self.push_run_event(
-                    run_id,
-                    "tool_call_failed",
-                    "kernel",
-                    &format!("{tool_name} on {plugin_id} did not run: {e}"),
-                    serde_json::json!({ "tool": tool_name, "plugin": plugin_id.as_str() }),
-                );
+                if let Some(server) = mcp_server_id.as_deref() {
+                    // Redact the failure reason too — an MCP transport/protocol error
+                    // string must not become a leak channel on the transcript.
+                    let reason = relux_core::redact_secrets(&e.to_string());
+                    self.push_run_event(
+                        run_id,
+                        "mcp_tool_call_failed",
+                        "kernel",
+                        &format!("MCP tool {tool_name} via {plugin_id} did not run: {reason}"),
+                        serde_json::json!({ "server": server, "tool": tool_name, "reason": reason }),
+                    );
+                } else {
+                    self.push_run_event(
+                        run_id,
+                        "tool_call_failed",
+                        "kernel",
+                        &format!("{tool_name} on {plugin_id} did not run: {e}"),
+                        serde_json::json!({ "tool": tool_name, "plugin": plugin_id.as_str() }),
+                    );
+                }
                 self.record_audit(
                     "agent",
                     agent_id.as_str(),
@@ -3721,13 +3761,33 @@ impl KernelState {
             }
         };
 
-        self.push_run_event(
-            run_id,
-            "tool_call",
-            agent_id.as_str(),
-            &format!("called {tool_name} via {plugin_id}"),
-            serde_json::json!({ "tool": tool_name, "input": input, "output": output }),
-        );
+        if let Some(server) = mcp_server_id.as_deref() {
+            // The shaped MCP result is already loopback-bounded; the transcript
+            // entry carries only a SHORT, secret-redacted result summary (never the
+            // raw args, the structuredContent, the JSON-RPC envelope, or the session
+            // id) so a large/sensitive result never floods or leaks the transcript.
+            let result_summary = mcp_event_result_summary(&output);
+            self.push_run_event(
+                run_id,
+                "mcp_tool_call",
+                agent_id.as_str(),
+                &format!("called MCP tool {tool_name} via {plugin_id}"),
+                serde_json::json!({
+                    "server": server,
+                    "tool": tool_name,
+                    "ok": true,
+                    "result_summary": result_summary,
+                }),
+            );
+        } else {
+            self.push_run_event(
+                run_id,
+                "tool_call",
+                agent_id.as_str(),
+                &format!("called {tool_name} via {plugin_id}"),
+                serde_json::json!({ "tool": tool_name, "input": input, "output": output }),
+            );
+        }
         self.record_audit(
             "agent",
             agent_id.as_str(),
@@ -8441,6 +8501,26 @@ impl KernelState {
     }
 }
 
+/// Maximum characters kept from an MCP tool-call result when it is recorded on the
+/// run transcript. The shaped result is already clamped by the MCP client
+/// (`crate::mcp` — 20 000 chars); this keeps the transcript entry itself compact so
+/// even a large result is a SHORT excerpt, never a flood.
+const MAX_MCP_EVENT_SUMMARY_CHARS: usize = 500;
+
+/// Build a bounded, secret-redacted one-line summary of a shaped MCP `tools/call`
+/// result for the run transcript. The MCP client already shapes the result to
+/// `{ "result": <text>, "structuredContent"?: … }` and NEVER returns the raw
+/// JSON-RPC envelope or the streamable-HTTP session id; here we additionally
+/// [`relux_core::redact_secrets`] any credential that slipped into the text and
+/// clamp it to [`MAX_MCP_EVENT_SUMMARY_CHARS`] so the transcript entry stays small.
+/// Only the human-oriented `result` text is summarized — the `structuredContent`
+/// (machine JSON) is intentionally left off the transcript.
+fn mcp_event_result_summary(output: &serde_json::Value) -> String {
+    let text = output.get("result").and_then(|v| v.as_str()).unwrap_or("");
+    let redacted = relux_core::redact_secrets(text);
+    redacted.chars().take(MAX_MCP_EVENT_SUMMARY_CHARS).collect()
+}
+
 /// Parse the numeric sequence from a `revent_NNNN` event id. The kernel mints
 /// ids as `revent_{:04}` off a monotonic counter, so the numeric suffix orders
 /// events even past the 4-digit zero-pad width (where lexicographic compare on
@@ -11881,6 +11961,157 @@ mod tests {
             k.set_mcp_tool_classification("fs", "bad name", relux_core::RiskLevel::Low, relux_core::ApprovalRequirement::Never),
             Err(KernelError::InvalidMcpToolName { .. })
         ));
+    }
+
+    // --- MCP run-transcript visibility (run-bound `call_tool`) -----------------
+    // `docs/mcp.md` "Run transcript visibility"; `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §9.
+    // An MCP tool call made INSIDE a run (through the run-context `call_tool`
+    // chokepoint) records a distinct, bounded, secret-redacted `mcp_tool_call*`
+    // event on the run transcript — never the raw args/result blob, JSON-RPC
+    // envelope, or session id. A manual `invoke_tool` (no run) stays audit-only.
+
+    /// A primed kernel that already has an ACTIVE run, plus an MCP server "fs"
+    /// registered (seeded with `bodies`) and Prime holding `tool:mcp-fs:search`.
+    fn mcp_primed_with_run(bodies: Vec<String>) -> (KernelState, AgentId, RunId) {
+        let (mut k, prime, _task, run, _echo) = primed_kernel();
+        let endpoint = mock_mcp(bodies);
+        k.register_mcp_server("fs", &endpoint, "fs server", true, Some(2000))
+            .unwrap();
+        k.grant_permission_to_agent(&prime, Permission::new("tool:mcp-fs:search").unwrap())
+            .unwrap();
+        (k, prime, run)
+    }
+
+    #[test]
+    fn mcp_tool_call_in_run_records_bounded_transcript_event() {
+        let (mut k, prime, run) = mcp_primed_with_run(mcp_call_bodies("hello from mcp"));
+        k.set_mcp_tool_classification(
+            "fs",
+            "search",
+            relux_core::RiskLevel::Low,
+            relux_core::ApprovalRequirement::Never,
+        )
+        .unwrap();
+        let mcp = PluginId::new("mcp:fs");
+        let out = k
+            .call_tool(&run, &prime, &mcp, "search", serde_json::json!({ "q": "files" }))
+            .expect("mcp call in run allowed");
+        assert_eq!(out, serde_json::json!({ "result": "hello from mcp" }));
+
+        // The transcript carries a DISTINCT `mcp_tool_call` event (not the generic
+        // `tool_call`), tagged with the server + tool and a bounded result summary.
+        let events = k.run_events(&run);
+        let ev = events
+            .iter()
+            .find(|e| e.kind == "mcp_tool_call")
+            .expect("an mcp_tool_call event was recorded");
+        assert_eq!(ev.payload["server"], "fs");
+        assert_eq!(ev.payload["tool"], "search");
+        assert_eq!(ev.payload["ok"], true);
+        assert_eq!(ev.payload["result_summary"], "hello from mcp");
+        assert!(ev.message.contains("MCP tool search"));
+        // No generic tool_call event and NO raw input/output/JSON-RPC envelope leaked.
+        assert!(!events.iter().any(|e| e.kind == "tool_call"));
+        assert!(ev.payload.get("input").is_none());
+        assert!(ev.payload.get("output").is_none());
+        assert!(ev.payload.get("jsonrpc").is_none());
+    }
+
+    #[test]
+    fn mcp_tool_call_in_run_redacts_secrets_and_is_bounded() {
+        // A result carrying a secret + a very long body: the transcript summary
+        // redacts the credential and clamps the length.
+        let long = "A".repeat(5_000);
+        let text = format!("line one api_key=sk-supersecretvalue1234567890 {long}");
+        let (mut k, prime, run) = mcp_primed_with_run(mcp_call_bodies(&text));
+        k.set_mcp_tool_classification(
+            "fs",
+            "search",
+            relux_core::RiskLevel::Low,
+            relux_core::ApprovalRequirement::Never,
+        )
+        .unwrap();
+        let mcp = PluginId::new("mcp:fs");
+        k.call_tool(&run, &prime, &mcp, "search", serde_json::json!({}))
+            .expect("mcp call ok");
+        let events = k.run_events(&run);
+        let ev = events.iter().find(|e| e.kind == "mcp_tool_call").unwrap();
+        let summary = ev.payload["result_summary"].as_str().unwrap();
+        // Legit prose survives; the embedded secret is gone; the summary is clamped.
+        assert!(summary.contains("line one"), "summary: {summary}");
+        assert!(!summary.contains("sk-supersecretvalue1234567890"), "secret leaked: {summary}");
+        assert!(summary.chars().count() <= MAX_MCP_EVENT_SUMMARY_CHARS);
+    }
+
+    #[test]
+    fn mcp_tool_call_failure_in_run_records_transcript_event_no_crash() {
+        // A disabled server makes the runtime fail honestly — the transcript records
+        // an `mcp_tool_call_failed` event (server + redacted reason) and never panics.
+        let (mut k, prime, run) = mcp_primed_with_run(vec![]);
+        k.set_mcp_tool_classification(
+            "fs",
+            "search",
+            relux_core::RiskLevel::Low,
+            relux_core::ApprovalRequirement::Never,
+        )
+        .unwrap();
+        k.set_mcp_server_enabled("fs", false).unwrap();
+        let mcp = PluginId::new("mcp:fs");
+        let err = k
+            .call_tool(&run, &prime, &mcp, "search", serde_json::json!({}))
+            .unwrap_err();
+        assert!(matches!(err, KernelError::McpServerDisabled(_)), "got {err:?}");
+        let events = k.run_events(&run);
+        let ev = events
+            .iter()
+            .find(|e| e.kind == "mcp_tool_call_failed")
+            .expect("a failure event was recorded");
+        assert_eq!(ev.payload["server"], "fs");
+        assert_eq!(ev.payload["tool"], "search");
+        assert!(ev.payload.get("reason").is_some());
+    }
+
+    #[test]
+    fn mcp_tool_call_denied_in_run_records_transcript_event() {
+        // A default-gated MCP tool (no classification) invoked in a run records an
+        // `mcp_tool_call_denied` event with the requires-approval reason.
+        let (mut k, prime, run) = mcp_primed_with_run(vec![]);
+        let mcp = PluginId::new("mcp:fs");
+        let err = k
+            .call_tool(&run, &prime, &mcp, "search", serde_json::json!({}))
+            .unwrap_err();
+        assert!(matches!(err, KernelError::ToolRequiresApproval { .. }), "got {err:?}");
+        let events = k.run_events(&run);
+        let ev = events
+            .iter()
+            .find(|e| e.kind == "mcp_tool_call_denied")
+            .expect("a denial event was recorded");
+        assert_eq!(ev.payload["server"], "fs");
+        assert_eq!(ev.payload["reason"], "requires approval");
+    }
+
+    #[test]
+    fn manual_mcp_invoke_adds_no_run_transcript_event() {
+        // The manual Plugins invoke path (`invoke_tool`, no run context) stays
+        // audit-only: it never appends to any run transcript. We prove it by holding
+        // a separate active run and asserting its transcript is untouched.
+        let (mut k, prime, run) = mcp_primed_with_run(mcp_call_bodies("manual"));
+        k.set_mcp_tool_classification(
+            "fs",
+            "search",
+            relux_core::RiskLevel::Low,
+            relux_core::ApprovalRequirement::Never,
+        )
+        .unwrap();
+        let before = k.run_events(&run).len();
+        let mcp = PluginId::new("mcp:fs");
+        k.invoke_tool(&prime, &mcp, "search", serde_json::json!({}))
+            .expect("manual invoke ok");
+        // No run event was appended (the invoke is recorded on the audit log only).
+        assert_eq!(k.run_events(&run).len(), before);
+        assert!(k.audit_log().iter().any(|e| e.action == "tool:mcp-fs:search"
+            && e.result == AuditResult::Success
+            && e.metadata["via"] == "invoke"));
     }
 
     // --- MCP resources (resources/list + resources/read — read-only context) ----

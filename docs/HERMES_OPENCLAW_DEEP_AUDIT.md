@@ -541,12 +541,24 @@ safe (adds no authority), bounded, feasible in one commit, and reuses existing v
     `mcp_read_resource` — so the brain can pull resource context inside the existing bounded loop
     with no mutation / no action authority (provenance via `PrimeContextRead`). Maps Hermes
     `_make_list_resources_handler` / `_make_read_resource_handler` (`tools/mcp_tool.py` L2434-2548).
+  - **Run-transcript visibility — SHIPPED (run-bound MCP tool calls).** An MCP tool call made inside
+    a run (through the run-context `call_tool` chokepoint) now records a distinct, bounded,
+    secret-redacted `mcp_tool_call` / `mcp_tool_call_denied` / `mcp_tool_call_failed` run event
+    (payload `{ server, tool, ok | reason | result_summary }`; `result_summary` is redacted + clamped
+    to 500 chars; no raw args/result/`structuredContent`, no JSON-RPC envelope, no session id). The
+    Work run detail's existing Transcript table + tool-call summary surface it (`phaseLabel` /
+    `toolCallSummary`). The manual `invoke_tool`, the approval-execute, and a grant bypass invoked
+    OUTSIDE a run carry no `run_id` and stay audit-only (honest — a transcript belongs to a run). See
+    `docs/mcp.md` "Run transcript visibility".
   - **Still deferred (honest):** no stdio command servers; no remote/`https`; no long-lived
     SSE-subscription / server-push channel; no cross-operation session reuse; no OAuth; no MCP
-    prompts/sampling; no resource-change subscription; an MCP call is captured on the audit log but
-    not (yet) on the run transcript (`docs/mcp.md` "Next MCP slice").
+    prompts/sampling; no resource-change subscription; the run-transcript MCP entry is wired through
+    `call_tool` but no PRODUCTION run path yet routes MCP tool calls through it (only the
+    deterministic local-echo run does), so it is exercised by tests + ready for the first MCP-using
+    run path (`docs/mcp.md` "Next MCP slice").
 - **Missing (deliberate/deferred)**: MCP remote transport + OAuth, long-lived SSE subscription,
-  prompts/sampling, run-transcript capture; plugin activation triggers.
+  prompts/sampling, resource-change subscription; a production run path that routes MCP tool calls
+  through `call_tool`; plugin activation triggers.
 
 ### Priority & slices
 

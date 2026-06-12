@@ -148,6 +148,10 @@ test("phaseLabel humanizes event kinds and falls back to status", () => {
   assert.equal(phaseLabel("run_failed", "failed"), "Failed");
   assert.equal(phaseLabel(undefined, "running"), "running");
   assert.equal(phaseLabel("some_future_kind", "running"), "some_future_kind");
+  // MCP tool calls in a run get distinct, humanized labels.
+  assert.equal(phaseLabel("mcp_tool_call", "running"), "MCP tool call");
+  assert.equal(phaseLabel("mcp_tool_call_denied", "running"), "MCP tool call denied");
+  assert.equal(phaseLabel("mcp_tool_call_failed", "running"), "MCP tool call failed");
 });
 
 test("isRunInFlight is true only for non-terminal states", () => {
@@ -177,6 +181,12 @@ test("toolCallSummary counts only real tool events, and is null when there are n
   assert.equal(
     toolCallSummary([ev("tool_call"), ev("tool_call_denied"), ev("tool_call_failed"), ev("tool_call_failed")]),
     "1 tool call · 1 denied · 2 failed",
+  );
+  // MCP tool-call events fold into the same totals — an MCP call IS a tool call.
+  assert.equal(toolCallSummary([ev("mcp_tool_call")]), "1 tool call");
+  assert.equal(
+    toolCallSummary([ev("tool_call"), ev("mcp_tool_call"), ev("mcp_tool_call_denied"), ev("mcp_tool_call_failed")]),
+    "2 tool calls · 1 denied · 1 failed",
   );
 });
 

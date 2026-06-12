@@ -136,6 +136,11 @@ export function phaseLabel(
     run_retried_from: "Retry started",
     run_resumed_from: "Resume started",
     tool_call: "Tool call",
+    // MCP tool calls made inside a run get distinct, bounded transcript events
+    // (`docs/mcp.md` "Run transcript visibility").
+    mcp_tool_call: "MCP tool call",
+    mcp_tool_call_denied: "MCP tool call denied",
+    mcp_tool_call_failed: "MCP tool call failed",
   };
   if (phase && map[phase]) return map[phase];
   if (phase) return phase;
@@ -153,17 +158,20 @@ export function isRunInFlight(status: string | undefined): boolean {
 // plan section 11.3 Active Runs lists "tool calls"). We only count the kernel's
 // real tool events — `tool_call` (a permitted, attempted call), `tool_call_denied`
 // (blocked by permissions), and `tool_call_failed` (errored) — and never invent a
-// call from an `adapter_output`. Returns null when the transcript recorded no tool
-// activity, so the UI can omit the row rather than show a misleading "0".
+// call from an `adapter_output`. MCP tool calls in a run carry distinct
+// `mcp_tool_call*` kinds (`docs/mcp.md` "Run transcript visibility"); an MCP call
+// IS a tool call, so it folds into the same totals. Returns null when the
+// transcript recorded no tool activity, so the UI can omit the row rather than
+// show a misleading "0".
 export function toolCallSummary(events: ReluxRunEvent[] | undefined | null): string | null {
   if (!events || events.length === 0) return null;
   let calls = 0;
   let denied = 0;
   let failed = 0;
   for (const e of events) {
-    if (e.kind === "tool_call") calls += 1;
-    else if (e.kind === "tool_call_denied") denied += 1;
-    else if (e.kind === "tool_call_failed") failed += 1;
+    if (e.kind === "tool_call" || e.kind === "mcp_tool_call") calls += 1;
+    else if (e.kind === "tool_call_denied" || e.kind === "mcp_tool_call_denied") denied += 1;
+    else if (e.kind === "tool_call_failed" || e.kind === "mcp_tool_call_failed") failed += 1;
   }
   if (calls === 0 && denied === 0 && failed === 0) return null;
   const parts: string[] = [`${calls} tool call${calls === 1 ? "" : "s"}`];

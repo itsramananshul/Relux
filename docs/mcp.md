@@ -154,6 +154,49 @@ it is safe to expose as a read-only context source to Prime and to operators.
   full body and the endpoint stay server-side). An unknown/disabled server or a
   transport failure is an honest `ok:false` read, never a fabricated body.
 
+## Run transcript visibility (run-bound MCP calls)
+
+An MCP **tool call made inside a run** is now visible on that run's transcript, not
+only on the audit log. When a tool is invoked through the run-context chokepoint
+`KernelState::call_tool` (the path that carries a `run_id`) and the plugin id is an
+MCP server (`mcp:<server>`), the kernel appends a **distinct, bounded,
+secret-redacted** run event:
+
+- `mcp_tool_call` (success) — payload `{ server, tool, ok: true, result_summary }`,
+  message `called MCP tool <tool> via mcp:<server>`. The `result_summary` is the
+  shaped result's human `result` text, **secret-redacted** (`redact_secrets`) and
+  clamped to 500 chars. The raw args, the `structuredContent`, the JSON-RPC
+  envelope, and the streamable-HTTP session id are **never** put on the transcript.
+- `mcp_tool_call_denied` — payload `{ server, tool, permission | reason }` for a
+  permission denial or a requires-approval refusal.
+- `mcp_tool_call_failed` — payload `{ server, tool, reason }` with a redacted reason
+  for a transport/protocol/runtime failure.
+
+A real plugin tool keeps its existing generic `tool_call` / `tool_call_denied` /
+`tool_call_failed` events unchanged (those still carry the full input/output for a
+trusted local tool); only the MCP branch gets the compact, redacted shape.
+
+**Where it shows.** These events surface in the Work run detail's existing
+**Transcript / Events** table (kind → label via `phaseLabel`, e.g. "MCP tool call")
+and fold into the run header's tool-call summary (`toolCallSummary`) — no new UI
+surface. (`apps/dashboard/src/runview.ts`, `apps/dashboard/src/pages/Work.tsx`.)
+
+**No run context → audit only (honest).** The manual Plugins invoke path
+(`invoke_tool`), the per-call **approval execute** path
+(`execute_approved_tool_invocation`), and a persistent-grant bypass invoked outside
+a run carry **no `run_id`**, so they cannot (and do not) append a run-transcript
+entry — they remain fully recorded on the append-only **audit log** (which already
+captures actor, action `tool:mcp-<server>:<verb>`, result, and the `via` / `grant` /
+`approval` metadata). This is deliberate: a run transcript belongs to a run, and
+these operator-initiated invocations are not part of one.
+
+**Prime read-only MCP context.** When Prime's read-only context loop reads MCP
+context (`list_mcp_servers`, `mcp_list_resources`, `mcp_read_resource`), the
+provenance is the existing [`PrimeContextRead`] (tool + ok + bounded summary) shown
+as the `🔎 used:` context-read chip — the full resource body and the endpoint stay
+server-side. No raw resource body is stored on a turn. A Prime turn is not a run, so
+it carries no run transcript; the context-read provenance is the bounded record.
+
 ## What it does NOT do (honest limitations)
 
 - **No stdio (command) MCP servers.** Relux never spawns arbitrary downloaded
@@ -270,7 +313,9 @@ with resource shaping + secret redaction**, plus the in-memory streamable-HTTP
 `set_mcp_tool_classification` / `clear_mcp_tool_classification` / **`list_mcp_resources`
 / `read_mcp_resource`**, the MCP branches in `resolve_tool_permission` /
 `tool_needs_approval` / `execute_tool_runtime` / `matching_persistent_grant_id` /
-`tool_risk_for`, + the **`McpServerView` projection in `context_snapshot`**, + snapshot
+`tool_risk_for`, **the run-bound MCP transcript events in `call_tool` (distinct
+`mcp_tool_call*` kinds) + the bounded/redacted `mcp_event_result_summary` helper**,
++ the **`McpServerView` projection in `context_snapshot`**, + snapshot
 persistence), `crates/relux-kernel/src/prime_tools.rs` (the read-only context tools —
 **`list_mcp_servers` / `mcp_list_resources` / `mcp_read_resource`** on the
 `READ_ONLY_TOOLS` allowlist + `ContextSnapshot.mcp_servers`),
@@ -279,18 +324,23 @@ resource list/read routes**; invocation reuses the generic tool-invoke routes),
 `crates/relux-kernel/src/store.rs` (`mcp_servers` persistence, carrying
 classifications), `apps/dashboard/src/{api.ts,pages/Plugins.tsx}` (the MCP servers UI:
 discover → classify → invoke / request-approval, **plus the Resources panel:
-resources/list + inline read-only preview**).
+resources/list + inline read-only preview**), `apps/dashboard/src/runview.ts`
+(**`phaseLabel` + `toolCallSummary` recognize the `mcp_tool_call*` run events** so a
+run-bound MCP call shows in the Work run detail's Transcript + tool-call summary).
 
 ## Next MCP slice
 
 Discovery + gated invocation + **per-operation session continuity** + **read-only MCP
 resources** (`resources/list` + `resources/read`, surfaced to operators and to Prime's
-read-only context loop) now work end to end. Candidate next slices, in rough order:
-(1) **remote transport + OAuth** (an allow-listed remote endpoint with
-`mcp_oauth_manager`-style auth), gated behind an explicit operator opt-in; (2) a
-**long-lived SSE / server-push subscription** (the streamable-HTTP variant Relux still
-does not speak — only single-POST request/reply today); (3) **MCP prompts**
-(`prompts/list` + `prompts/get`) as reusable prompt templates; (4) capturing an MCP
-call (tool or resource read) on the **run transcript** (not just the audit log) when
-invoked inside a run; (5) a **resource-change subscription**
-(`notifications/resources/list_changed`) once a server-push channel exists.
+read-only context loop) + **run-transcript visibility for a run-bound MCP tool call**
+(the distinct `mcp_tool_call*` events above) now work end to end. Candidate next
+slices, in rough order: (1) **remote transport + OAuth** (an allow-listed remote
+endpoint with `mcp_oauth_manager`-style auth), gated behind an explicit operator
+opt-in; (2) a **long-lived SSE / server-push subscription** (the streamable-HTTP
+variant Relux still does not speak — only single-POST request/reply today);
+(3) **MCP prompts** (`prompts/list` + `prompts/get`) as reusable prompt templates;
+(4) a **resource-change subscription** (`notifications/resources/list_changed`) once a
+server-push channel exists; (5) extending the run-transcript MCP entry to a real
+production run path once a non-echo adapter routes tool calls through `call_tool`
+(today only the deterministic local-echo run path invokes `call_tool`, so the MCP
+branch is exercised by tests + ready for the first MCP-using run path).
