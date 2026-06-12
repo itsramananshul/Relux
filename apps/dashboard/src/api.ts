@@ -2879,6 +2879,28 @@ export interface ReluxPluginHint {
   detail: string;
 }
 
+// A safe, pre-filled draft for registering an imported MCP source on the EXISTING
+// loopback MCP registry. Present only when an MCP signal was detected. Building it
+// executes nothing; registration still goes through POST /v1/relux/mcp/servers with
+// its unchanged loopback-only validation. The operator reviews + confirms before
+// anything is registered.
+export interface ReluxMcpRegistrationProposal {
+  // A sanitized, valid MCP server id derived from the source (always safe to submit;
+  // still editable in the review form).
+  suggested_id: string;
+  suggested_description: string;
+  // A loopback HTTP endpoint pre-filled ONLY when an MCP config named a loopback
+  // `url`. Absent ⇒ the operator must enter it (endpoint_required).
+  suggested_endpoint?: string;
+  endpoint_required: boolean;
+  // A stdio command detected in an MCP config — INFORMATIONAL ONLY. Relux never runs
+  // it; shown so the operator knows what to start themselves as a loopback server.
+  detected_command?: string;
+  detected_args?: string[];
+  // Honest notes about what was detected and why manual entry may be needed.
+  notes: string[];
+}
+
 export interface ReluxPluginHints {
   plugin_id: string;
   install_dir: string;
@@ -2887,6 +2909,9 @@ export interface ReluxPluginHints {
   scanned: boolean;
   generated: boolean;
   hints: ReluxPluginHint[];
+  // A pre-filled MCP registration draft, present only when an MCP signal was
+  // detected. Absent ⇒ no MCP action is offered.
+  mcp_proposal?: ReluxMcpRegistrationProposal;
 }
 
 // -- Relux plugin tool runtime (HTTP loopback) ------------------------------

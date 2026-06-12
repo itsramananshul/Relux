@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import {
   reluxAdapters,
@@ -29,13 +29,16 @@ import {
   hintKindLabel,
   hintsNextStep,
   installResultSummary,
+  mcpDraftFromProposal,
   mcpServerStatusBadge,
   pluginCategory,
   pluginKindLabel,
   pluginNextStep,
   pluginStatus,
   toolReadiness,
+  validateMcpRegisterDraft,
   visibleTools,
+  type McpRegisterDraft,
   type StatusVariant,
   type ToolReadiness,
 } from "../plugins";
@@ -771,26 +774,35 @@ function McpClassifyForm({
 function AddMcpServerForm({
   onClose,
   onAdded,
+  initial,
+  title,
+  advisory,
 }: {
   onClose: () => void;
   onAdded: () => void;
+  // A pre-filled review draft (from a detected MCP hint proposal). The form is
+  // identical to the manual "Add an MCP server" form — it never auto-registers and
+  // never runs the source; the operator still confirms id/endpoint/description.
+  initial?: McpRegisterDraft;
+  title?: string;
+  // An optional advisory block (e.g. the detected stdio command + honest notes)
+  // rendered above the fields. Display-only.
+  advisory?: ReactNode;
 }) {
-  const [id, setId] = useState("");
-  const [endpoint, setEndpoint] = useState("");
-  const [description, setDescription] = useState("");
+  const [id, setId] = useState(initial?.id ?? "");
+  const [endpoint, setEndpoint] = useState(initial?.endpoint ?? "");
+  const [description, setDescription] = useState(initial?.description ?? "");
   const [busy, setBusy] = useState(false);
   const [banner, setBanner] = useState<{ kind: string; msg: string } | null>(null);
 
   async function submit() {
     setBusy(true);
     setBanner(null);
-    if (!id.trim()) {
-      setBanner({ kind: "err", msg: "Server id is required." });
-      setBusy(false);
-      return;
-    }
-    if (!endpoint.trim()) {
-      setBanner({ kind: "err", msg: "Loopback endpoint is required." });
+    // Pre-check with the SAME fail-closed rules the kernel enforces, so the form
+    // never sends a request the loopback registry would reject.
+    const problem = validateMcpRegisterDraft({ id, endpoint, description });
+    if (problem) {
+      setBanner({ kind: "err", msg: problem });
       setBusy(false);
       return;
     }
@@ -800,10 +812,15 @@ function AddMcpServerForm({
         endpoint: endpoint.trim(),
         description: description.trim() || undefined,
       });
-      setBanner({ kind: "ok", msg: "MCP server registered. Use Discover to list its tools." });
-      setId("");
-      setEndpoint("");
-      setDescription("");
+      setBanner({
+        kind: "ok",
+        msg: "MCP server registered. Find it under MCP servers above and click Discover to list its tools through the gate.",
+      });
+      if (!initial) {
+        setId("");
+        setEndpoint("");
+        setDescription("");
+      }
       onAdded();
     } catch (e) {
       setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Register failed" });
@@ -815,8 +832,9 @@ function AddMcpServerForm({
   return (
     <div className="card" style={{ marginBottom: 12, padding: 12 }}>
       <div className="row" style={{ marginBottom: 8, alignItems: "center" }}>
-        <strong style={{ fontSize: 13 }}>Add an MCP server</strong>
+        <strong style={{ fontSize: 13 }}>{title ?? "Add an MCP server"}</strong>
       </div>
+      {advisory}
       {banner && (
         <div className={"banner " + banner.kind} style={{ fontSize: 12 }}>{banner.msg}</div>
       )}
@@ -1965,6 +1983,10 @@ function DetectedHints({ plugin }: { plugin: ReluxPlugin }) {
     () => reluxPlugins.hints(plugin.id),
     [plugin.id],
   );
+  // The "Register MCP server…" review form is opened on demand; never auto-shown,
+  // never auto-registered.
+  const [registering, setRegistering] = useState(false);
+  const [registered, setRegistered] = useState(false);
 
   if (loading && !data) {
     return <div className="loading" style={{ fontSize: 12 }}>Inspecting source…</div>;
@@ -2031,8 +2053,78 @@ function DetectedHints({ plugin }: { plugin: ReluxPlugin }) {
               {nextStep}
             </p>
           )}
+          {data.mcp_proposal && (
+            <div style={{ marginTop: 10 }}>
+              {registered ? (
+                <p className="banner ok" style={{ fontSize: 11, margin: 0 }}>
+                  MCP server registered. Open the <strong>MCP servers</strong>{" "}
+                  section above and click <strong>Discover</strong> to list its
+                  tools through the gate — discovery dials your loopback server only
+                  when you ask.
+                </p>
+              ) : registering ? (
+                <AddMcpServerForm
+                  title="Register MCP server"
+                  initial={mcpDraftFromProposal(data.mcp_proposal)}
+                  advisory={<McpProposalAdvisory proposal={data.mcp_proposal} />}
+                  onClose={() => setRegistering(false)}
+                  onAdded={() => {
+                    setRegistering(false);
+                    setRegistered(true);
+                  }}
+                />
+              ) : (
+                <button
+                  className="btn sm"
+                  onClick={() => setRegistering(true)}
+                  title="Open a review form pre-filled from what was detected; nothing is registered or run until you confirm"
+                >
+                  Register MCP server…
+                </button>
+              )}
+            </div>
+          )}
         </>
       )}
+    </div>
+  );
+}
+
+// The advisory block shown above the pre-filled MCP registration form: the honest
+// notes from detection, plus any detected stdio command — INFORMATIONAL ONLY. Relux
+// never runs the command and never uses it as the endpoint; it is shown so the
+// operator knows what to start themselves as a loopback server.
+function McpProposalAdvisory({
+  proposal,
+}: {
+  proposal: NonNullable<ReluxPluginHints["mcp_proposal"]>;
+}) {
+  const command = proposal.detected_command;
+  const args = proposal.detected_args ?? [];
+  return (
+    <div style={{ marginBottom: 8 }}>
+      <p className="muted" style={{ marginTop: 0, marginBottom: 6, fontSize: 11 }}>
+        Pre-filled from the detected source. Relux never runs the source — review and
+        confirm, then it registers through the same loopback-only MCP registry and
+        gates as any other server.
+      </p>
+      {command && (
+        <div className="banner warn" style={{ fontSize: 11, marginBottom: 6 }}>
+          Detected stdio command (not run by Relux):{" "}
+          <span className="mono" style={{ wordBreak: "break-all" }}>
+            {[command, ...args].join(" ")}
+          </span>
+        </div>
+      )}
+      {proposal.notes.map((n, i) => (
+        <p
+          key={i}
+          className="muted"
+          style={{ margin: "0 0 4px", fontSize: 11 }}
+        >
+          {n}
+        </p>
+      ))}
     </div>
   );
 }

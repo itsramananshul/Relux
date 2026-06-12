@@ -256,6 +256,21 @@ pub fn clamp_mcp_timeout(timeout_ms: Option<u64>) -> u64 {
         .clamp(MIN_MCP_TIMEOUT_MS, MAX_MCP_TIMEOUT_MS)
 }
 
+/// Reduce an arbitrary raw string (a package name, a plugin id) into a **valid**
+/// MCP server id — lowercased, restricted to `[a-z0-9_-]`, separator-collapsed, and
+/// bounded to [`MAX_MCP_ID_CHARS`]. Returns the empty string when nothing usable
+/// remains (the caller then falls back). The result, when non-empty, always passes
+/// [`is_valid_mcp_id`], so a proposed id derived from imported source metadata can
+/// never carry whitespace, path separators, or other injection-shaped characters.
+pub fn sanitize_mcp_server_id(raw: &str) -> String {
+    let id = sanitize_identifier(raw, '-');
+    id.chars()
+        .take(MAX_MCP_ID_CHARS)
+        .collect::<String>()
+        .trim_matches(|c| c == '-' || c == '_')
+        .to_string()
+}
+
 /// The synthetic plugin id a discovered MCP tool is listed under: `mcp:<server>`.
 /// Mirrors openclaw's `mcp:<serverId>:<toolName>` executor namespace so MCP tools
 /// never collide with real installed-plugin ids in the unified Tools list.
@@ -562,6 +577,21 @@ mod tests {
             ["description", "enabled", "endpoint", "id", "timeout_ms", "transport"]
         );
         assert_eq!(v["transport"], "http_loopback");
+    }
+
+    #[test]
+    fn sanitize_server_id_yields_a_valid_id_or_empty() {
+        // A package/scoped name reduces to a valid, lowercased, bounded id.
+        assert_eq!(sanitize_mcp_server_id("@acme/Cool-MCP"), "acme-cool-mcp");
+        assert!(is_valid_mcp_id(&sanitize_mcp_server_id("@acme/Cool-MCP")));
+        assert_eq!(sanitize_mcp_server_id("my server!!"), "my-server");
+        // An over-long name is bounded and still valid.
+        let long = sanitize_mcp_server_id(&"a".repeat(MAX_MCP_ID_CHARS + 50));
+        assert!(long.chars().count() <= MAX_MCP_ID_CHARS);
+        assert!(is_valid_mcp_id(&long));
+        // Nothing usable ⇒ empty (the caller falls back), never an invalid id.
+        assert_eq!(sanitize_mcp_server_id("///"), "");
+        assert_eq!(sanitize_mcp_server_id(""), "");
     }
 
     #[test]

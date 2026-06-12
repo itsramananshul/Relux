@@ -6728,6 +6728,12 @@ struct PluginHintsResponse {
     /// matter most for).
     generated: bool,
     hints: Vec<relux_kernel::PluginHint>,
+    /// A safe, pre-filled draft for registering this source as a loopback MCP server
+    /// on the EXISTING registry, present ONLY when an MCP signal was detected. The
+    /// draft executes nothing; registration still flows through the unchanged
+    /// `POST /v1/relux/mcp/servers` route + validation. Absent ⇒ no MCP action.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mcp_proposal: Option<relux_kernel::McpRegistrationProposal>,
 }
 
 /// GET `/v1/relux/plugins/:id/hints` - safe, read-only introspection of an
@@ -6769,12 +6775,22 @@ async fn plugin_hints(
         (false, Vec::new())
     };
 
+    // When an MCP signal was detected, build a safe pre-filled registration draft
+    // for the EXISTING registry. This reads only the same bounded metadata files
+    // and executes nothing; absent when there is no MCP signal.
+    let mcp_proposal = if scanned {
+        relux_kernel::propose_mcp_registration(&dir, &id, &hints)
+    } else {
+        None
+    };
+
     Ok(Json(PluginHintsResponse {
         plugin_id: id,
         install_dir,
         scanned,
         generated,
         hints,
+        mcp_proposal,
     }))
 }
 
@@ -8163,6 +8179,19 @@ mod tests {
             resp.hints.iter().any(|h| h.kind == "npm-package"),
             "the npm package itself is surfaced"
         );
+        // The MCP signal yields a safe, pre-filled registration draft: a sanitized
+        // id derived from the package name, manual endpoint required (no loopback
+        // address inferable), and nothing executed.
+        let proposal = resp
+            .mcp_proposal
+            .as_ref()
+            .expect("an MCP source carries a registration proposal");
+        assert_eq!(proposal.suggested_id, "cool-mcp");
+        assert!(
+            proposal.endpoint_required && proposal.suggested_endpoint.is_none(),
+            "no inferable endpoint ⇒ manual entry required"
+        );
+        assert!(proposal.detected_command.is_none(), "no command was executed/derived");
         // No tool was ever created from a hint: discovery still shows nothing.
         let tools = locked_read(&state, |k| {
             Ok(k.discover_tools(None)
@@ -8189,6 +8218,10 @@ mod tests {
             .0;
         assert!(!resp.scanned, "a dir outside the plugins root is not scanned");
         assert!(resp.hints.is_empty(), "nothing scanned => no hints");
+        assert!(
+            resp.mcp_proposal.is_none(),
+            "nothing scanned => no MCP registration proposal"
+        );
     }
 
     /// The honest dead-end: a generated wrapper has no tool definitions, so even an

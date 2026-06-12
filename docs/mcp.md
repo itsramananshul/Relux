@@ -42,6 +42,49 @@ An operator can:
   tool (see "Invocation" below).
 - **Remove** a server registration (which also drops its tool classifications).
 
+## MCP hint → review → register (one-click from imported plugin details)
+
+An operator who imports an arbitrary repo with no `relux-plugin.json` gets a
+metadata-only wrapper plus the read-only "Detected in source" hints
+(`docs/mcp.md` is silent on these; see `crate::introspect::detect_hints`). When a hint
+flags the source as a **likely MCP server** (`mcp-server` / `mcp-config`), the plugin
+details now offer a **"Register MCP server…"** action that turns that detection into a
+**pre-filled, reviewable** registration on the EXISTING loopback registry — never an
+auto-action, and never running the source.
+
+- **Proposal (read-only, fail-closed).** The same `/v1/relux/plugins/:id/hints`
+  scan additionally builds a `relux_kernel::McpRegistrationProposal`
+  (`crate::mcp_proposal::propose_mcp_registration`) **only when an MCP signal was
+  detected**. It reads the same bounded metadata files the hint scan reads and
+  **executes nothing**. It proposes a **sanitized, valid** server id
+  (`relux_core::sanitize_mcp_server_id` — from the npm `package.json` `name`, else the
+  plugin id, else `imported-mcp`; always passes `is_valid_mcp_id`), a description (from
+  `package.json` `description`, else an honest default), and — **only when an MCP config
+  file names a loopback `url` that passes `validate_loopback_url`** — a pre-filled
+  endpoint. A non-loopback / `https` / missing `url` is **never** pre-filled.
+- **stdio `{command, args}` is advisory only.** Mirroring the Hermes MCP config shape
+  (`reference/hermes-agent-main/hermes_cli/mcp_config.py` — a server is `{"url"}` HTTP or
+  `{"command","args","env"}` stdio), a detected stdio command is surfaced **bounded, as
+  display text** so the operator knows what to run themselves. Relux **never runs the
+  command**, never uses it as the endpoint, and never stores it — consistent with the
+  "No stdio (command) MCP servers" rule below. When no loopback endpoint can be safely
+  inferred, the proposal sets `endpoint_required` and the form **forces manual entry**.
+- **The action opens a review form, not a runner.** The plugin details render a
+  **"Register MCP server…"** button (`apps/dashboard/src/pages/Plugins.tsx`
+  `DetectedHints` → the pre-filled `AddMcpServerForm`, seeded by the React-free
+  `apps/dashboard/src/plugins.ts` `mcpDraftFromProposal`). The operator confirms/edits the
+  id, endpoint, and description; the detected command + honest notes show above the fields
+  as advisory text. Submit is pre-checked with the SAME fail-closed rules the kernel
+  enforces (`validateMcpRegisterDraft` mirrors `is_valid_mcp_id` + the required endpoint),
+  then POSTs the **existing** `POST /v1/relux/mcp/servers` route — **no new backend, no
+  parallel registry, nothing auto-registered or auto-run**.
+- **After registration: discover through the gate (unchanged).** On success the form
+  points the operator to the **MCP servers** section to click **Discover**, which runs the
+  existing live `tools/list` (`GET /v1/relux/mcp/servers/:id/tools`) and lists tools with
+  their honest readiness. No tool is auto-enabled: a discovered tool stays the fail-closed
+  Medium + Required (`needs_approval`) until the operator classifies it — exactly the
+  existing behavior. The hint never becomes a runnable tool on its own.
+
 ## Invocation (loopback `tools/call` through the gates)
 
 MCP tools are **first-class tool-invoke citizens**: they flow through the kernel's
@@ -907,6 +950,17 @@ discover → classify → invoke / request-approval, **plus the Resources panel:
 resources/list + inline read-only preview**), `apps/dashboard/src/runview.ts`
 (**`phaseLabel` + `toolCallSummary` recognize the `mcp_tool_call*` run events** so a
 run-bound MCP call shows in the Work run detail's Transcript + tool-call summary).
+
+**MCP hint → register files** (`docs/mcp.md` "MCP hint → review → register"):
+`crates/relux-core/src/mcp.rs` (`sanitize_mcp_server_id` — the valid-id reducer),
+`crates/relux-kernel/src/mcp_proposal.rs` (`McpRegistrationProposal` +
+`propose_mcp_registration` — the read-only, executes-nothing draft builder + tests),
+`crates/relux-kernel/src/server.rs` (`PluginHintsResponse.mcp_proposal` — folded into the
+existing `/v1/relux/plugins/:id/hints` scan; registration reuses the unchanged
+`POST /v1/relux/mcp/servers`), `apps/dashboard/src/plugins.ts` (`mcpDraftFromProposal` +
+`validateMcpRegisterDraft` — React-free seed + fail-closed pre-check, unit-tested),
+`apps/dashboard/src/pages/Plugins.tsx` (`DetectedHints` "Register MCP server…" → the
+pre-filled `AddMcpServerForm` + `McpProposalAdvisory`).
 
 ## Next MCP slice
 

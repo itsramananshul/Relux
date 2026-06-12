@@ -45,7 +45,7 @@ pub use hierarchy::{
 pub use mcp::{
     clamp_mcp_timeout, is_valid_mcp_id, is_valid_mcp_resource_uri, is_valid_mcp_tool_name,
     mcp_synthetic_plugin_id, mcp_tool_permission, sanitize_mcp_resource_description,
-    sanitize_mcp_text, sanitize_mcp_tool_description, scan_mcp_tool_description,
+    sanitize_mcp_server_id, sanitize_mcp_text, sanitize_mcp_tool_description, scan_mcp_tool_description,
     validate_mcp_server_config, McpConfigError, McpResource, McpResourceContent, McpServerConfig,
     McpTool, McpToolClassification, McpTransport, DEFAULT_MCP_TIMEOUT_MS,
     MAX_MCP_DESCRIPTION_CHARS, MAX_MCP_ID_CHARS, MAX_MCP_RESOURCES, MAX_MCP_RESOURCE_DESC_CHARS,

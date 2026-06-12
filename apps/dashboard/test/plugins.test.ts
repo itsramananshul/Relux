@@ -15,6 +15,8 @@ import {
   mcpServerStatusBadge,
   hintKindLabel,
   hintsNextStep,
+  mcpDraftFromProposal,
+  validateMcpRegisterDraft,
 } from "../src/plugins.ts";
 
 // The Plugins page must read HONESTLY: a generated metadata-only wrapper is never
@@ -445,4 +447,60 @@ test("hintsNextStep for a plain package points at the in-UI tool path, not auto-
 
 test("hintsNextStep is null when there are no hints (nothing to suggest)", () => {
   assert.equal(hintsNextStep([]), null);
+});
+
+test("mcpDraftFromProposal seeds the review form from a server-built proposal", () => {
+  const draft = mcpDraftFromProposal({
+    suggested_id: "acme-cool-mcp",
+    suggested_description: "A cool MCP server.",
+    suggested_endpoint: "http://127.0.0.1:8000/mcp",
+    endpoint_required: false,
+    notes: [],
+  });
+  assert.deepEqual(draft, {
+    id: "acme-cool-mcp",
+    endpoint: "http://127.0.0.1:8000/mcp",
+    description: "A cool MCP server.",
+  });
+});
+
+test("mcpDraftFromProposal leaves the endpoint blank when none was safely inferred", () => {
+  // The endpoint must NOT be auto-filled from a detected command — manual entry.
+  const draft = mcpDraftFromProposal({
+    suggested_id: "gh",
+    suggested_description: "Imported MCP server",
+    endpoint_required: true,
+    detected_command: "npx",
+    detected_args: ["@modelcontextprotocol/server-github"],
+    notes: ["This server runs as a command (stdio). Relux never runs commands…"],
+  });
+  assert.equal(draft.endpoint, "", "a command is never used as the endpoint");
+  assert.equal(draft.id, "gh");
+});
+
+test("validateMcpRegisterDraft mirrors the kernel's fail-closed rules", () => {
+  // A clean draft passes.
+  assert.equal(
+    validateMcpRegisterDraft({ id: "acme-mcp", endpoint: "http://127.0.0.1:8000/mcp", description: "" }),
+    null,
+  );
+  // An empty endpoint is required (the manual-entry case).
+  assert.match(
+    validateMcpRegisterDraft({ id: "acme-mcp", endpoint: "  ", description: "" }) ?? "",
+    /endpoint is required/i,
+  );
+  // An id with an illegal char (a space / path separator) is rejected early.
+  assert.match(
+    validateMcpRegisterDraft({ id: "bad id", endpoint: "http://127.0.0.1:8000", description: "" }) ?? "",
+    /letters, digits/i,
+  );
+  assert.match(
+    validateMcpRegisterDraft({ id: "a/b", endpoint: "http://127.0.0.1:8000", description: "" }) ?? "",
+    /letters, digits/i,
+  );
+  // An empty id is rejected.
+  assert.match(
+    validateMcpRegisterDraft({ id: "", endpoint: "http://127.0.0.1:8000", description: "" }) ?? "",
+    /id is required/i,
+  );
 });

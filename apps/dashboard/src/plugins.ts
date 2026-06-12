@@ -15,6 +15,7 @@
 
 import type {
   ReluxAdapterStatus,
+  ReluxMcpRegistrationProposal,
   ReluxMcpServer,
   ReluxPlugin,
   ReluxPluginHint,
@@ -137,6 +138,47 @@ export function hintsNextStep(hints: ReluxPluginHint[]): string | null {
     return "This source is a package/entrypoint, not a Relux ToolSet. Run it yourself as a local loopback server, then add a tool definition below — Relux never runs downloaded code.";
   }
   return "Detected source signals only. Add a tool definition below (and a loopback runtime) to make anything runnable; Relux never infers tools or runs downloaded code.";
+}
+
+// The editable fields of the "Register MCP server" review form, pre-filled from a
+// detected proposal. The operator confirms/edits these before they are POSTed to the
+// EXISTING loopback registry — Relux never auto-registers and never runs the source.
+export interface McpRegisterDraft {
+  id: string;
+  endpoint: string;
+  description: string;
+}
+
+// Seed the review form from a server-built proposal. The endpoint is pre-filled only
+// when the server could safely infer a loopback address; otherwise it stays blank so
+// the operator must supply it (fail-closed manual entry).
+export function mcpDraftFromProposal(
+  p: ReluxMcpRegistrationProposal,
+): McpRegisterDraft {
+  return {
+    id: p.suggested_id ?? "",
+    endpoint: p.suggested_endpoint ?? "",
+    description: p.suggested_description ?? "",
+  };
+}
+
+// Client-side pre-check for the review form, mirroring the kernel's fail-closed
+// rules so the form never sends a request the registry would reject. Returns an
+// error string, or null when the draft looks submittable. The server remains the
+// authoritative validator (it re-checks the id charset and the loopback-only
+// endpoint); this only catches the obvious cases early for a clean message.
+export function validateMcpRegisterDraft(d: McpRegisterDraft): string | null {
+  const id = d.id.trim();
+  if (!id) return "Server id is required.";
+  // Same charset the kernel's is_valid_mcp_id enforces: letters, digits, . - _ only.
+  if (!/^[A-Za-z0-9._-]+$/.test(id)) {
+    return "Server id may use only letters, digits, '.', '-' or '_'.";
+  }
+  if (id.length > 64) return "Server id is too long (max 64 characters).";
+  if (!d.endpoint.trim()) {
+    return "Loopback endpoint is required (e.g. http://127.0.0.1:8000/mcp).";
+  }
+  return null;
 }
 
 export type NextStepKind =

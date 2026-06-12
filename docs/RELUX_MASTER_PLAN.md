@@ -3415,10 +3415,19 @@ badge with an advisory next step — never a claim that anything is runnable.
 tell the operator which of the existing governed paths to take; Relux runs nothing
 on their behalf:
 
-1. **If the source is an MCP server** (an `mcp-server`/`mcp-config` hint): run it
-   yourself locally, then register it on the **MCP** page
-   (`POST /v1/relux/mcp/servers`, loopback-only). Its tools then flow through the
-   same discovery + per-call gate as any MCP tool. Relux never launches it for you.
+1. **If the source is an MCP server** (an `mcp-server`/`mcp-config` hint): the plugin
+   details now offer a one-click **"Register MCP server…"** action. The same hints
+   scan builds a read-only `McpRegistrationProposal`
+   (`crates/relux-kernel/src/mcp_proposal.rs` `propose_mcp_registration`) — a
+   **sanitized, valid** server id (`relux_core::sanitize_mcp_server_id`), a
+   description, and a loopback endpoint **only when an `mcp.json`'s `url` passes the
+   loopback rule** (a detected stdio `{command, args}` is shown as advisory text only,
+   never run, never the endpoint; otherwise manual entry is forced). The action opens a
+   **pre-filled review form** (`DetectedHints` → `AddMcpServerForm`); the operator
+   confirms/edits and submits to the **existing** `POST /v1/relux/mcp/servers`
+   (loopback-only) — no parallel registry, nothing auto-registered, nothing executed.
+   After registering, **Discover** lists its tools through the same per-call gate as
+   any MCP tool (an unclassified tool stays gated). Relux never launches it for you.
 2. **If the source is a package/entrypoint** that exposes an HTTP surface: run it
    yourself as a local **loopback** server, then on the Plugins page add a tool
    definition (Plugin Tool Config v1) and point a loopback runtime at it
@@ -3430,9 +3439,14 @@ on their behalf:
 
 Pinned by `crates/relux-kernel/src/introspect.rs` unit tests (npm+MCP, python+MCP,
 mcp.json, container/rust/scripts/readme, oversized-file skip, hint-count bound),
-the server tests `hints_route_introspects_an_imported_repo_without_a_manifest` /
-`hints_route_does_not_scan_outside_the_plugins_root`, and the dashboard
-`hintKindLabel`/`hintsNextStep` assertions.
+`crates/relux-kernel/src/mcp_proposal.rs` unit tests (npm-SDK → safe id + manual
+endpoint, loopback `mcp.json` `url` → pre-filled endpoint, remote `url` → manual,
+stdio `command` → advisory-only never an endpoint, id fallback, no-signal → no
+proposal), `crates/relux-core/src/mcp.rs` `sanitize_server_id_yields_a_valid_id_or_empty`,
+the server tests `hints_route_introspects_an_imported_repo_without_a_manifest` (now also
+asserting the pre-filled proposal) / `hints_route_does_not_scan_outside_the_plugins_root`
+(no proposal when nothing scanned), and the dashboard
+`hintKindLabel`/`hintsNextStep`/`mcpDraftFromProposal`/`validateMcpRegisterDraft` assertions.
 
 #### Per-tool-call approval flow (gated tools)
 

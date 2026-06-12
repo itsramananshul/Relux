@@ -30,6 +30,7 @@ pub mod introspect;
 pub mod live_run_log;
 pub mod loader;
 pub mod mcp;
+pub mod mcp_proposal;
 pub mod plugin_install;
 pub mod plugin_tool_config;
 pub mod prime;
@@ -91,6 +92,7 @@ pub use builtin::{is_builtin_tool, is_internal_plugin, BUILTIN_TOOLS, INTERNAL_P
 pub use clock::Clock;
 pub use event::RunEvent;
 pub use introspect::{detect_hints, PluginHint};
+pub use mcp_proposal::{propose_mcp_registration, McpRegistrationProposal};
 pub use loader::{load_plugin_manifests, MANIFEST_FILENAME};
 pub use plugin_install::{
     install_from_dir, install_from_github, install_from_zip, is_generated_manifest, list_installed,
