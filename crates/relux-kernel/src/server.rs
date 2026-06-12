@@ -2236,6 +2236,14 @@ async fn agent_self_manager_revoke(
 #[derive(Debug, Deserialize)]
 struct CreateTaskReq {
     title: String,
+    /// Optional explicit tool-call directive. When present the task's input becomes
+    /// the canonical `{ "tool_call": { plugin, tool, args } }` shape, so the local
+    /// run executes that ONE operator-named tool through the gated `call_tool` path
+    /// (an MCP `mcp:<server>` server or a real plugin) instead of the default echo.
+    /// The directive is fixed here at creation time — never chosen by the brain.
+    /// (`docs/mcp.md` "Run-driven MCP tool call".)
+    #[serde(default)]
+    tool_call: Option<relux_core::TaskToolCall>,
 }
 
 /// One read-only role preset (an operator-convenience suggestion bundle). Carries only
@@ -2466,11 +2474,26 @@ async fn create_task(
     if title.is_empty() {
         return Err(ApiError::bad_request("title is required"));
     }
+    // Build the task input. An explicit tool-call directive is validated (non-empty
+    // plugin + tool) and serialized into the canonical `{ "tool_call": … }` shape the
+    // local run reads; otherwise the input is empty (a plain echo task).
+    let input = match &req.tool_call {
+        Some(directive) => {
+            let built = directive.to_input();
+            if relux_core::parse_task_tool_call(&built).is_none() {
+                return Err(ApiError::bad_request(
+                    "tool_call requires a non-empty plugin and tool",
+                ));
+            }
+            built
+        }
+        None => serde_json::json!({}),
+    };
     let task = locked_save(&state, |kernel| {
         let ctx = crate::ensure_bootstrapped(kernel)?;
         let id = kernel.create_task(
             &title,
-            serde_json::json!({}),
+            input,
             &ctx.actor,
             &ctx.namespace,
             vec![],
@@ -8893,6 +8916,32 @@ mod tests {
             .map(|s| s.to_string());
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         (status, set_cookie, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    #[tokio::test]
+    async fn create_task_with_tool_call_directive_stores_canonical_input() {
+        // An operator can create a task that names ONE MCP/plugin tool to run; the
+        // POST body's directive is validated + serialized into the canonical
+        // `{ "tool_call": { plugin, tool, args } }` input the local run reads.
+        // (`docs/mcp.md` "Run-driven MCP tool call".)
+        let (state, _dir) = auth_state(true);
+        let body = r#"{"title":"call fs search","tool_call":{"plugin":"mcp:fs","tool":"search","args":{"q":"files"}}}"#;
+        let (status, _, tb) = call(&state, "POST", "/v1/relux/tasks", None, Some(body)).await;
+        assert_eq!(status, StatusCode::OK, "directive task create failed: {tb}");
+        let task: serde_json::Value = serde_json::from_str(&tb).unwrap();
+        assert_eq!(task["input"]["tool_call"]["plugin"], "mcp:fs");
+        assert_eq!(task["input"]["tool_call"]["tool"], "search");
+        assert_eq!(task["input"]["tool_call"]["args"]["q"], "files");
+    }
+
+    #[tokio::test]
+    async fn create_task_with_empty_directive_tool_is_rejected() {
+        // A directive with an empty tool is a 400 — never silently dropped to an echo
+        // task (that would hide the operator's intent).
+        let (state, _dir) = auth_state(true);
+        let body = r#"{"title":"bad","tool_call":{"plugin":"mcp:fs","tool":"   "}}"#;
+        let (status, _, _b) = call(&state, "POST", "/v1/relux/tasks", None, Some(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     /// Extract the `relux_session=...` pair from a Set-Cookie header so a later

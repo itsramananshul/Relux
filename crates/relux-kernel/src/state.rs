@@ -7582,17 +7582,51 @@ impl KernelState {
         let agent = self.agent(&assigned_agent_id).ok_or_else(|| KernelError::UnknownAgent(assigned_agent_id.to_string()))?;
         let agent_id_for_call = agent.id.clone();
 
-        // Perform the echo cycle on the task's own input.
-        let echo_plugin = PluginId::new("relux-tools-echo");
         let input = self.task(task_id)
             .map(|t| t.input.clone())
             .unwrap_or_else(|| serde_json::json!({})); // Fallback to empty JSON if no input
 
-        self.call_tool(&run_id, &agent_id_for_call, &echo_plugin, "echo.say", input)?;
-        self.complete_run(&run_id, "echo.say returned the input unchanged")?;
-        self.complete_task(task_id)?;
-
-        Ok(run_id)
+        // A task may carry an explicit, operator-named tool-call directive in its
+        // input (`{ "tool_call": { plugin, tool, args } }`). When present, the local
+        // run executes that ONE named tool through the gated `call_tool` chokepoint
+        // (permission + approval/grant + audit + the distinct `mcp_tool_call*`
+        // transcript events) INSTEAD of the default echo. This is the first
+        // production run path that can drive an MCP (`mcp:<server>`) or plugin tool
+        // from a run; the brain never picks the tool — it is fixed in the task input
+        // at creation time. A non-runnable directive (missing permission, requires
+        // approval, transport failure) fails the run + task honestly (the gate's
+        // denial/failure event is already on the transcript) — never a fabricated
+        // success. (`docs/mcp.md` "Run-driven MCP tool call";
+        // `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §9.)
+        if let Some(directive) = relux_core::parse_task_tool_call(&input) {
+            let plugin = PluginId::new(directive.plugin.clone());
+            match self.call_tool(&run_id, &agent_id_for_call, &plugin, &directive.tool, directive.args) {
+                Ok(_) => {
+                    self.complete_run(
+                        &run_id,
+                        &format!("ran tool {} via {}", directive.tool, directive.plugin),
+                    )?;
+                    self.complete_task(task_id)?;
+                    Ok(run_id)
+                }
+                Err(e) => {
+                    self.fail_run(
+                        &run_id,
+                        &format!("tool {} via {} did not run: {e}", directive.tool, directive.plugin),
+                    )
+                    .ok();
+                    self.fail_task(task_id).ok();
+                    Err(e)
+                }
+            }
+        } else {
+            // Default: the deterministic echo cycle on the task's own input.
+            let echo_plugin = PluginId::new("relux-tools-echo");
+            self.call_tool(&run_id, &agent_id_for_call, &echo_plugin, "echo.say", input)?;
+            self.complete_run(&run_id, "echo.say returned the input unchanged")?;
+            self.complete_task(task_id)?;
+            Ok(run_id)
+        }
     }
 
     /// Execute an assigned task through its agent's adapter, dispatching on the
@@ -12112,6 +12146,152 @@ mod tests {
         assert!(k.audit_log().iter().any(|e| e.action == "tool:mcp-fs:search"
             && e.result == AuditResult::Success
             && e.metadata["via"] == "invoke"));
+    }
+
+    // --- Run-driven MCP tool call (first production run path → `call_tool`) ------
+    // `docs/mcp.md` "Run-driven MCP tool call"; `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §9.
+    // A Task whose input carries an explicit `{ "tool_call": { plugin, tool, args } }`
+    // directive makes the deterministic LOCAL run execute that ONE operator-named tool
+    // through the SAME gated `call_tool` chokepoint (permission + approval/grant +
+    // audit + `mcp_tool_call*` transcript) instead of echo. The brain never picks the
+    // tool. This is the first production run path that routes MCP through `call_tool`.
+
+    /// Create a local-prime task carrying an `mcp:fs`/`search` tool-call directive,
+    /// assign it to Prime, and start its run. Returns the task + run ids.
+    fn mcp_directive_task(k: &mut KernelState, prime: &AgentId, args: serde_json::Value) -> (TaskId, RunId) {
+        let ns = NamespaceId::new("workspace");
+        let directive = relux_core::TaskToolCall {
+            plugin: "mcp:fs".to_string(),
+            tool: "search".to_string(),
+            args,
+        };
+        let task = k.create_task("call the fs search tool", directive.to_input(), "op", &ns, vec![]);
+        k.assign_task(&task, prime).unwrap();
+        let run = k.start_run(&task).unwrap();
+        (task, run)
+    }
+
+    #[test]
+    fn run_driven_mcp_tool_call_executes_through_call_tool() {
+        // A classified-runnable MCP tool named in the task input runs through the
+        // local run → `call_tool`, completing the run + task and leaving a distinct,
+        // bounded `mcp_tool_call` event on the transcript (no raw envelope).
+        let (mut k, prime) = mcp_primed(mcp_call_bodies("hello from a run"));
+        k.set_mcp_tool_classification(
+            "fs",
+            "search",
+            relux_core::RiskLevel::Low,
+            relux_core::ApprovalRequirement::Never,
+        )
+        .unwrap();
+        let (task, run) = mcp_directive_task(&mut k, &prime, serde_json::json!({ "q": "files" }));
+
+        let returned = k.execute_local_run(&task).expect("the run executes the directed MCP tool");
+        assert_eq!(returned, run);
+        assert_eq!(k.run(&run).unwrap().status, RunStatus::Completed);
+        assert_eq!(k.task(&task).unwrap().status, TaskStatus::Completed);
+
+        let events = k.run_events(&run);
+        let ev = events
+            .iter()
+            .find(|e| e.kind == "mcp_tool_call")
+            .expect("an mcp_tool_call event was recorded");
+        assert_eq!(ev.payload["server"], "fs");
+        assert_eq!(ev.payload["tool"], "search");
+        assert_eq!(ev.payload["result_summary"], "hello from a run");
+        // The run drove the gated path — not the generic plugin `tool_call`, and no
+        // raw args/output/JSON-RPC envelope leaked onto the transcript.
+        assert!(!events.iter().any(|e| e.kind == "tool_call"));
+        assert!(ev.payload.get("output").is_none());
+        assert!(ev.payload.get("jsonrpc").is_none());
+        // Audited as a successful run-bound tool call.
+        assert!(k.audit_log().iter().any(|e| e.action == "tool:mcp-fs:search"
+            && e.result == AuditResult::Success
+            && e.metadata["run"] == run.as_str()));
+    }
+
+    #[test]
+    fn run_driven_mcp_tool_call_requires_approval_blocks_the_run() {
+        // A default-gated (unclassified) MCP tool named in a task is NOT silently run:
+        // the run + task fail honestly and the transcript records a denial. No network
+        // call is made (no bodies needed).
+        let (mut k, prime) = mcp_primed(vec![]);
+        let (task, run) = mcp_directive_task(&mut k, &prime, serde_json::json!({}));
+
+        let err = k.execute_local_run(&task).unwrap_err();
+        assert!(matches!(err, KernelError::ToolRequiresApproval { .. }), "got {err:?}");
+        assert_eq!(k.run(&run).unwrap().status, RunStatus::Failed);
+        assert_eq!(k.task(&task).unwrap().status, TaskStatus::Failed);
+        let events = k.run_events(&run);
+        let ev = events
+            .iter()
+            .find(|e| e.kind == "mcp_tool_call_denied")
+            .expect("a denial event was recorded");
+        assert_eq!(ev.payload["server"], "fs");
+        assert_eq!(ev.payload["reason"], "requires approval");
+        // It never fabricated a completion.
+        assert!(!events.iter().any(|e| e.kind == "mcp_tool_call"));
+    }
+
+    #[test]
+    fn run_driven_mcp_tool_call_denied_without_permission_fails_the_run() {
+        // A runnable tool whose calling agent lacks the permission is refused before
+        // any dial; the run + task fail and a denial event names the missing capability.
+        let (mut k, _prime) = mcp_primed(vec![]);
+        k.set_mcp_tool_classification(
+            "fs",
+            "search",
+            relux_core::RiskLevel::Low,
+            relux_core::ApprovalRequirement::Never,
+        )
+        .unwrap();
+        let ns = NamespaceId::new("workspace");
+        let adapter = PluginId::new("relux-adapter-local-prime");
+        let weak = k
+            .create_agent("weak", "Weak", "no mcp perm", &adapter, &ns, None, vec![])
+            .unwrap();
+        let (task, run) = mcp_directive_task(&mut k, &weak, serde_json::json!({}));
+
+        let err = k.execute_local_run(&task).unwrap_err();
+        assert!(matches!(err, KernelError::PermissionDenied { .. }), "got {err:?}");
+        assert_eq!(k.run(&run).unwrap().status, RunStatus::Failed);
+        assert_eq!(k.task(&task).unwrap().status, TaskStatus::Failed);
+        let ev = k
+            .run_events(&run)
+            .into_iter()
+            .find(|e| e.kind == "mcp_tool_call_denied")
+            .expect("a denial event was recorded");
+        assert_eq!(ev.payload["permission"], "tool:mcp-fs:search");
+    }
+
+    #[test]
+    fn run_driven_mcp_tool_call_persistent_grant_bypasses_approval() {
+        // A default-gated tool + a standing allow-always grant → the run executes it
+        // (recording a grant:use) without the operator lowering its risk.
+        let (mut k, prime) = mcp_primed(mcp_call_bodies("granted in a run"));
+        let mcp = PluginId::new("mcp:fs");
+        let grant = k
+            .grant_persistent_tool_invocation("op", &prime, &mcp, "search")
+            .expect("grant created");
+        let (task, run) = mcp_directive_task(&mut k, &prime, serde_json::json!({}));
+
+        let returned = k.execute_local_run(&task).expect("grant lets the run proceed");
+        assert_eq!(returned, run);
+        assert_eq!(k.run(&run).unwrap().status, RunStatus::Completed);
+        assert!(k.run_events(&run).iter().any(|e| e.kind == "mcp_tool_call"));
+        assert!(k.audit_log().iter().any(|e| e.action == "grant:use"
+            && e.metadata["grant"] == grant.id));
+    }
+
+    #[test]
+    fn run_with_no_directive_still_runs_the_default_echo() {
+        // A task with an ordinary (non-directive) input keeps the default echo path:
+        // the run records a generic `tool_call`, never an `mcp_tool_call`.
+        let (mut k, _prime, task, run, _echo) = primed_kernel();
+        k.execute_local_run(&task).expect("echo run ok");
+        let events = k.run_events(&run);
+        assert!(events.iter().any(|e| e.kind == "tool_call"));
+        assert!(!events.iter().any(|e| e.kind.starts_with("mcp_tool_call")));
     }
 
     // --- MCP resources (resources/list + resources/read — read-only context) ----

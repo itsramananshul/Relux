@@ -197,6 +197,51 @@ as the `🔎 used:` context-read chip — the full resource body and the endpoin
 server-side. No raw resource body is stored on a turn. A Prime turn is not a run, so
 it carries no run transcript; the context-read provenance is the bounded record.
 
+## Run-driven MCP tool call (first production run path through `call_tool`)
+
+The run-transcript events above were wired through `call_tool`, but until now **no
+production run path routed an MCP tool call through it** — only the test suite and the
+default local echo exercised the branch. A `Task` can now carry an explicit,
+operator-named **tool-call directive** so a real run drives one MCP (or plugin) tool
+through the gated chokepoint.
+
+- **The directive.** A task's `input` may be the canonical shape
+  `{ "tool_call": { "plugin": "mcp:<server>", "tool": "<name>", "args": { … } } }`
+  (`relux_core::TaskToolCall` / `parse_task_tool_call`). `plugin` may be a synthetic
+  `mcp:<server>` MCP server **or** a real installed plugin id — `call_tool` applies the
+  identical gates to both. `args` defaults to `{}`. The directive is **fixed at task
+  creation time**: the brain never chooses the tool, and there is no implicit
+  tool-selection — an ordinary (non-directive) task still runs the default echo.
+- **Execution.** When the deterministic local run (`KernelState::execute_local_run`,
+  the `LocalPrime` adapter path behind "Run (Assigned)") sees a directive, it calls
+  `self.call_tool(run_id, agent, plugin, tool, args)` **instead of** echo. That means
+  the run-driven MCP call flows through the SAME path as every other tool call:
+  (1) the `tool:mcp-<server>:<verb>` permission is resolved and checked against the
+  assigned agent; (2) the risk/approval gate applies, with the per-call-approval and
+  standing **allow-always grant** bypasses; (3) the loopback `tools/call` runs, shaped
+  + bounded; (4) the call is audited; (5) the distinct `mcp_tool_call*` transcript
+  event is appended (success carries only the bounded, secret-redacted
+  `result_summary`).
+- **Honest outcomes (never a fabricated success).** A directive whose tool is not
+  runnable — the agent lacks the permission, the tool requires approval with no
+  standing grant, or the loopback call fails — **fails the run and the task** and
+  surfaces the gate's `mcp_tool_call_denied` / `mcp_tool_call_failed` event. A
+  requires-approval directive blocks the run rather than auto-running; an operator must
+  either classify the tool low-risk + auto-approve or stand up an allow-always grant
+  for the call to proceed.
+- **Operating it (no new UI).** An operator creates such a task over the existing
+  `POST /v1/relux/tasks` route — which now accepts an optional `tool_call` body
+  (validated; an empty plugin/tool is a `400`) and serializes it into the canonical
+  input — then runs it with the existing "Run (Assigned)" /
+  `POST /v1/relux/tasks/:id/execute-assigned` action. The resulting `mcp_tool_call`
+  event surfaces in the Work run detail's existing Transcript table. No bespoke MCP-run
+  UI is added in this slice.
+
+**Scope (deliberately narrow).** This is a **deterministic, operator-named** run path:
+one tool, fixed in the task input, gated end-to-end. It is NOT a brain freely choosing
+arbitrary MCP tools mid-run — that broader autonomy stays out of scope until it routes
+through an allowlisted/validated write tool and the same approval gates.
+
 ## What it does NOT do (honest limitations)
 
 - **No stdio (command) MCP servers.** Relux never spawns arbitrary downloaded
@@ -301,6 +346,13 @@ Files read before implementing:
   existing `ToolDescriptor` list and route through the existing tool-invoke gates
   without colliding with real plugin ids.
 
+Run-driven path files: `crates/relux-core/src/task.rs` (`TaskToolCall` +
+`parse_task_tool_call` — the operator-named directive type/parser),
+`crates/relux-kernel/src/state.rs` (`execute_local_run` routes a directive through
+`call_tool` instead of echo, failing the run/task honestly on a gate refusal),
+`crates/relux-kernel/src/server.rs` (`create_task` / `CreateTaskReq` accept the
+optional `tool_call` directive and serialize it into the canonical input).
+
 Relux files: `crates/relux-core/src/mcp.rs` (config + validation + discovery types +
 `McpToolClassification` + `is_valid_mcp_tool_name` + injection scan, **plus the
 resource types `McpResource`/`McpResourceContent` + `is_valid_mcp_resource_uri` +
@@ -333,14 +385,17 @@ run-bound MCP call shows in the Work run detail's Transcript + tool-call summary
 Discovery + gated invocation + **per-operation session continuity** + **read-only MCP
 resources** (`resources/list` + `resources/read`, surfaced to operators and to Prime's
 read-only context loop) + **run-transcript visibility for a run-bound MCP tool call**
-(the distinct `mcp_tool_call*` events above) now work end to end. Candidate next
+(the distinct `mcp_tool_call*` events above) + the **first production run path** that
+routes an MCP `tools/call` through `call_tool` (the operator-named **tool-call
+directive** in "Run-driven MCP tool call" above) now work end to end. Candidate next
 slices, in rough order: (1) **remote transport + OAuth** (an allow-listed remote
 endpoint with `mcp_oauth_manager`-style auth), gated behind an explicit operator
 opt-in; (2) a **long-lived SSE / server-push subscription** (the streamable-HTTP
 variant Relux still does not speak — only single-POST request/reply today);
 (3) **MCP prompts** (`prompts/list` + `prompts/get`) as reusable prompt templates;
 (4) a **resource-change subscription** (`notifications/resources/list_changed`) once a
-server-push channel exists; (5) extending the run-transcript MCP entry to a real
-production run path once a non-echo adapter routes tool calls through `call_tool`
-(today only the deterministic local-echo run path invokes `call_tool`, so the MCP
-branch is exercised by tests + ready for the first MCP-using run path).
+server-push channel exists; (5) a **multi-step / CLI-adapter run path** that can drive
+several gated MCP tools in one run (today the run-driven path executes a single
+operator-named tool on the deterministic local-prime adapter; a brain freely choosing
+arbitrary MCP tools mid-run stays out of scope until it routes through an
+allowlisted/validated write tool and the same approval gates).

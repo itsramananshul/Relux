@@ -97,7 +97,7 @@ pub use runtime::{
     RuntimeKind, ToolRuntimeConfig, DEFAULT_RUNTIME_TIMEOUT_MS, MAX_RUNTIME_TIMEOUT_MS,
     MIN_RUNTIME_TIMEOUT_MS,
 };
-pub use task::{Task, TaskId, TaskStatus};
+pub use task::{parse_task_tool_call, Task, TaskId, TaskStatus, TaskToolCall};
 pub use tool::{
     approval_blocks_direct_invocation, ToolDescriptor, ToolExecutability, ToolInvocationResult,
 };

@@ -567,6 +567,13 @@ safe (adds no authority), bounded, feasible in one commit, and reuses existing v
 - **P2 — MCP resources (read-only context)** — ✅ DONE: `resources/list` + `resources/read` over the
   loopback path (text-only, binary summarized, secret-redacted, bounded), surfaced to operators
   (Plugins Resources panel) and to Prime's read-only context loop. *(core, kernel, UI, tests, docs.)*
+- **P2 — run-driven MCP tool call (first production run path through `call_tool`)** — ✅ DONE: a
+  `Task` may carry an operator-named `{ "tool_call": { plugin, tool, args } }` directive
+  (`relux_core::TaskToolCall`); the deterministic local run (`execute_local_run`) routes it through
+  the SAME gated `call_tool` chokepoint as any tool — permission + risk/approval + per-call/grant
+  bypass + audit + the distinct `mcp_tool_call*` transcript events — instead of echo, failing the
+  run/task honestly on a gate refusal (never a fabricated success). The brain never picks the tool;
+  a multi-step / brain-chosen MCP run stays out of scope. *(core, kernel, API, tests, docs.)*
 - **P2 — install-time manifest validation surfaced in Doctor/UI** (Paperclip Zod safe-parse style).
 
 ---
