@@ -4005,6 +4005,7 @@ version = "0.1.26"
 dependencies = [
  "argon2",
  "axum",
+ "base64 0.22.1",
  "hex",
  "rand 0.8.6",
  "relux-core",

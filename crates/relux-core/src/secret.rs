@@ -46,6 +46,18 @@ pub const MAX_SECRET_VALUE_BYTES: usize = 16 * 1024;
 /// caller cannot grow the file unboundedly.
 pub const MAX_SECRETS: usize = 256;
 
+/// At-rest encoding scheme: **Windows DPAPI, CurrentUser scope**. The stored value
+/// is base64 of the `CryptProtectData` blob — only the same Windows user account on
+/// the same machine can decrypt it. The default writer on Windows.
+pub const SECRET_SCHEME_DPAPI: &str = "dpapi_current_user";
+
+/// At-rest encoding scheme: **plaintext** in the permission-hardened file (POSIX
+/// `0600` / Windows `icacls` owner-only). The value is stored verbatim. Used on
+/// non-Windows hosts (no OS keychain integration yet) and as the fail-safe fallback
+/// when DPAPI is unavailable. Also the assumed scheme for a pre-encryption (legacy)
+/// file with no per-secret scheme marker.
+pub const SECRET_SCHEME_PLAINTEXT: &str = "plaintext_file_v1";
+
 /// Whether `name` is a safe secret name: non-empty, at most [`MAX_SECRET_NAME_CHARS`]
 /// characters, and restricted to `[A-Za-z0-9._-]`. The name is the store key and is
 /// echoed into config / status / logs (never the value), so it must never carry
@@ -109,6 +121,20 @@ pub struct SecretStatus {
     /// would be too revealing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
+    /// The at-rest encoding scheme this secret is stored under
+    /// ([`SECRET_SCHEME_DPAPI`] / [`SECRET_SCHEME_PLAINTEXT`]). Operator-facing
+    /// metadata so the dashboard can show "encrypted at rest (DPAPI)" vs
+    /// "permission-hardened plaintext". Never the value. Defaults to plaintext for
+    /// a status deserialized from an older payload that predates the field.
+    #[serde(default = "default_scheme")]
+    pub scheme: String,
+}
+
+/// Default scheme for a [`SecretStatus`] deserialized from a payload that predates
+/// the `scheme` field — the only stores that ever existed before encryption were
+/// plaintext.
+fn default_scheme() -> String {
+    SECRET_SCHEME_PLAINTEXT.to_string()
 }
 
 /// Return a redacted preview of `value`: an ellipsis plus the last 4 characters.
@@ -175,13 +201,24 @@ mod tests {
             name: "openai".to_string(),
             set_at: 1_700_000_000,
             preview: Some("…cdef".to_string()),
+            scheme: SECRET_SCHEME_DPAPI.to_string(),
         };
         let v = serde_json::to_value(&s).unwrap();
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(|s| s.as_str()).collect();
-        // Only name + set_at + preview — never a `value`.
+        // Only name + set_at + preview + scheme — never a `value`.
         assert!(keys.contains(&"name"));
         assert!(keys.contains(&"set_at"));
         assert!(keys.contains(&"preview"));
+        assert!(keys.contains(&"scheme"));
         assert!(!keys.contains(&"value"));
+    }
+
+    #[test]
+    fn status_defaults_scheme_to_plaintext_for_legacy_payload() {
+        // A status JSON written before the `scheme` field existed must deserialize
+        // with the plaintext default — never panic, never lose the row.
+        let legacy = r#"{"name":"openai","set_at":1700000000,"preview":"…cdef"}"#;
+        let s: SecretStatus = serde_json::from_str(legacy).unwrap();
+        assert_eq!(s.scheme, SECRET_SCHEME_PLAINTEXT);
     }
 }

@@ -227,8 +227,40 @@ tail-redacted preview. Relux ports that posture to the relux layer.
   Names are bounded + charset-restricted (`is_valid_secret_name`), values are bounded
   (`MAX_SECRET_VALUE_BYTES`, 16 KiB), and the store is count-capped (`MAX_SECRETS`, 256).
   The **only** method that returns plaintext is `resolve(name)`, called solely at
-  managed-stdio spawn time to seed the child env — never logged, stored back, or returned
-  over HTTP.
+  managed-stdio spawn / Prime-brain request time to seed the child env / the auth header —
+  never logged, stored back, or returned over HTTP.
+
+- **Encrypted at rest (Windows DPAPI), with an honest fallback.** Each secret carries a
+  per-value **scheme marker** so the at-rest encoding is explicit and migratable
+  (`relux-kernel::secret_cipher`):
+  - **Windows → `dpapi_current_user`.** The value is sealed with **DPAPI, CurrentUser
+    scope** (`CryptProtectData`, driven through PowerShell's
+    `System.Security.Cryptography.ProtectedData` — the same shell-out posture as
+    `os_secure`'s `icacls`, so the kernel stays free of `unsafe` and a heavyweight
+    `windows` crate). Only the same Windows user on the same machine can unseal it; the
+    file alone is useless to a thief / backup / other admin. The plaintext **never rides
+    an argv** — it travels base64 over the child's stdin/stdout pipes only. The stored
+    value is `base64(CryptProtectData blob)`.
+  - **Other OSes / DPAPI unavailable → `plaintext_file_v1`.** No OS-keychain integration
+    yet, so the value is stored verbatim and protected only by the owner-only file
+    permissions — **honestly marked** so the dashboard shows "plaintext (file-locked)"
+    rather than implying encryption. This is also the **fail-safe fallback** on Windows
+    when DPAPI is unavailable: a sealing failure stores plaintext (never loses the secret)
+    and records the honest scheme.
+  - **Reads dispatch on the stored scheme**, so a mixed-scheme file (mid-migration) reads
+    correctly, and a value sealed on one host that another can't unseal (e.g. a DPAPI file
+    copied to Linux) **fails closed** with a clean, value-free error naming the secret +
+    scheme — never a silent wrong answer, never the value.
+  - **Migration is automatic + safe.** On load (`open`/`attach`), any legacy
+    `plaintext_file_v1` entry is **re-sealed** to the active encrypting scheme and the file
+    rewritten — so an existing plaintext `secrets.json` upgrades to DPAPI on the next
+    Windows boot. A re-seal failure leaves that entry exactly as-is (never dropped). A
+    plaintext host leaves a plaintext file untouched. Setting a secret again also rewrites
+    it under the current scheme (manual rotation = re-set).
+  - **Status exposes the scheme, never the value.** `SecretStatus` now carries `scheme`
+    alongside `name` / `set_at` / `preview`, so the operator can see which secrets are
+    encrypted at rest. The redacted **preview is precomputed at set time** (and derived
+    live only for a legacy plaintext entry), so `list`/`status` **never decrypt**.
 
 - **Secret-referenced `env` on a managed-stdio server.** `McpServerConfig.env` is a map
   keyed by the **env-var NAME** the child receives, valued by a **secret reference**
@@ -271,9 +303,13 @@ tail-redacted preview. Relux ports that posture to the relux layer.
   protected/bundled plugins are untouched; nothing auto-starts or auto-runs on
   registration.
 
-- **Limitations (honest).** The store is **local-only** and **dev-safe**: plaintext at
-  rest is protected by file permissions (no OS keychain / DPAPI integration yet), so it
-  is hardened-but-not-encrypted. Secret **rotation** is manual (set the same name again).
+- **Limitations (honest).** The store is **local-only**. At rest it is **encrypted on
+  Windows (DPAPI, CurrentUser)** and **permission-hardened plaintext elsewhere** (no
+  macOS/Linux keychain integration yet — the `plaintext_file_v1` scheme is honestly
+  surfaced, not silently implied to be encrypted). DPAPI is **CurrentUser-scoped**: it
+  protects against another user / an offline disk image, not against code already running
+  as the same user (which is the trust level that legitimately needs the key at spawn
+  time). Secret **rotation** is manual (set the same name again, which re-seals it).
   `env` resolution is **per-process** — a running managed process keeps the env it was
   started with; change a secret and **Restart** to pick it up. The **Prime brain
   provider** (OpenRouter) now consumes the store by reference (see "Prime brain provider

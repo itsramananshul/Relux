@@ -52,6 +52,7 @@ pub mod prime_update_slots;
 pub mod prime_write_tools;
 pub mod run_cancel;
 pub mod runtime;
+pub mod secret_cipher;
 pub mod secret_store;
 pub mod state;
 pub mod store;

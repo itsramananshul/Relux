@@ -1936,9 +1936,22 @@ stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
   (argv only — never a shell; no bypass/danger flag; protected/bundled plugins untouched; nothing auto-run on
   registration). **UI:** Plugins page gains a **Secrets & environment** section (write-only value field,
   redacted listing, delete) and the MCP form gains **Environment** (`ENV_VAR=secret_name`) + **Working
-  directory** fields, pre-checked with the kernel's rules. **Honest gaps:** local dev-safe (file-permission
-  hardened, not encrypted; no OS keychain/DPAPI yet); rotation is manual; env is per-process (Restart to pick
-  up a changed secret); adapters do not yet consume the store. No release cut; no safety property weakened (no
+  directory** fields, pre-checked with the kernel's rules.
+
+  **Encryption at rest (follow-up slice, shipped).** Each secret now carries a per-value **scheme marker**
+  (`relux-kernel::secret_cipher`): on **Windows** the value is sealed with **DPAPI, CurrentUser scope**
+  (`CryptProtectData` via PowerShell's `ProtectedData` — the same `unsafe`-free shell-out posture as
+  `os_secure`'s `icacls`; plaintext rides stdin/stdout, never an argv), stored as `base64(blob)` under
+  scheme `dpapi_current_user`; on other OSes / when DPAPI is unavailable it stays **permission-hardened
+  plaintext** under the honestly-named `plaintext_file_v1`. Reads **dispatch on the stored scheme** (mixed
+  schemes read correctly; a value sealed on a host another can't unseal **fails closed**, naming the secret +
+  scheme, never the value); a legacy plaintext file **auto-migrates** (re-seals) to the active scheme on load,
+  fail-safe (a re-seal failure leaves the entry untouched). `SecretStatus` exposes the `scheme` (never the
+  value); `list`/`status` never decrypt (preview precomputed at set time). **Remaining gap:** no
+  macOS/Linux keychain yet (those stay file-permission-hardened plaintext); DPAPI is CurrentUser-scoped
+  (protects against another user / an offline disk image, not against code already running as the same user);
+  rotation is manual (re-set re-seals); env is per-process (Restart to pick up a changed secret).
+  No release cut; no safety property weakened (no
   remote host dialed, no downloaded code run, **no plaintext secret stored in the config/snapshot/API**).
   `cargo test` + `clippy` clean on `relux-core`/`relux-kernel` (new tests: secret set/list/delete never return
   plaintext, redacted preview, hardened-file round-trip; spawn-Command env/cwd injection + a REAL-subprocess

@@ -46,6 +46,10 @@ hex = { workspace = true }
 # salt/KDF needed — argon2 above stays the password KDF). Workspace-pinned,
 # already in the tree.
 sha2 = { workspace = true }
+# At-rest secret encryption: the Windows DPAPI cipher base64-encodes the value over
+# the PowerShell child's stdin/stdout and stores base64(CryptProtectData blob).
+# Workspace-pinned, already in the tree (tool.pdf transport).
+base64 = { workspace = true }
 
 [dev-dependencies]
 # Temp directories for the SqliteStore round-trip tests.

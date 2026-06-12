@@ -3304,12 +3304,17 @@ export const reluxMcp = {
 };
 
 // The redacted status of one stored secret. NEVER carries a plaintext value — only
-// the name, when it was set, and a tail preview (e.g. "…cdef").
+// the name, when it was set, a tail preview (e.g. "…cdef"), and the at-rest scheme.
 export interface ReluxSecretStatus {
   name: string;
   set_at: number;
   // Ellipsis + last-4-chars preview, or absent for an empty value.
   preview?: string;
+  // At-rest encoding scheme: "dpapi_current_user" (Windows DPAPI, encrypted at rest)
+  // or "plaintext_file_v1" (permission-hardened plaintext — other OSes / DPAPI
+  // unavailable). Metadata only; never the value. Defaults to plaintext for an older
+  // server that predates the field.
+  scheme?: string;
 }
 
 export const reluxSecrets = {

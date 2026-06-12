@@ -60,7 +60,8 @@ pub use mcp::{
 };
 pub use secret::{
     is_valid_secret_name, secret_preview, validate_secret, SecretError, SecretStatus,
-    MAX_SECRETS, MAX_SECRET_NAME_CHARS, MAX_SECRET_VALUE_BYTES,
+    MAX_SECRETS, MAX_SECRET_NAME_CHARS, MAX_SECRET_VALUE_BYTES, SECRET_SCHEME_DPAPI,
+    SECRET_SCHEME_PLAINTEXT,
 };
 pub use namespace::{Namespace, NamespaceId};
 pub use orchestration::{

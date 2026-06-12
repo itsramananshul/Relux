@@ -168,6 +168,11 @@ export function PrimeAiSettings() {
                 <option key={s.name} value={s.name}>
                   {s.name}
                   {s.preview ? ` (${s.preview})` : ""}
+                  {s.scheme === "dpapi_current_user"
+                    ? " · encrypted (DPAPI)"
+                    : s.scheme === "plaintext_file_v1"
+                      ? " · plaintext (file-locked)"
+                      : ""}
                 </option>
               ))}
               <option value={NEW_SECRET}>+ Create a new secret…</option>

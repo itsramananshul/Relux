@@ -49,13 +49,56 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use relux_core::{secret_preview, validate_secret, McpEnvRef, SecretError, SecretStatus};
 use serde::{Deserialize, Serialize};
 
-/// One stored secret: the plaintext value + the wall-clock seconds it was last set.
+use crate::secret_cipher::SecretCipher;
+
+/// One stored secret: the **at-rest-encoded** value (per `scheme`), the wall-clock
+/// seconds it was last set, the encoding scheme, and a precomputed redacted preview.
 /// Serialized to the local secrets file ONLY — never to the kernel snapshot, an API
-/// response, or a log.
+/// response, or a log. The `value` here is **not** plaintext unless `scheme` is
+/// [`relux_core::SECRET_SCHEME_PLAINTEXT`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SecretEntry {
+    /// The value AS STORED: `base64(DPAPI blob)` under [`relux_core::SECRET_SCHEME_DPAPI`],
+    /// or the raw plaintext under [`relux_core::SECRET_SCHEME_PLAINTEXT`].
     value: String,
     set_at: i64,
+    /// The at-rest encoding scheme. Absent in a pre-encryption (legacy) file → defaults
+    /// to plaintext, so an old file loads cleanly and is then migrated.
+    #[serde(default = "scheme_plaintext_default")]
+    scheme: String,
+    /// Precomputed redacted preview (`…cdef`). Stored so list/status NEVER need to
+    /// decrypt. Absent in a legacy file → derived live from the (plaintext) value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preview: Option<String>,
+}
+
+/// Default scheme for an entry deserialized from a pre-encryption file.
+fn scheme_plaintext_default() -> String {
+    relux_core::SECRET_SCHEME_PLAINTEXT.to_string()
+}
+
+impl SecretEntry {
+    /// The redacted preview for an operator-facing status. Prefers the stored preview;
+    /// for a legacy plaintext entry with none stored, derives it from the value (which
+    /// IS plaintext under that scheme). Never decrypts an encrypted value.
+    fn redacted_preview(&self) -> Option<String> {
+        if let Some(p) = &self.preview {
+            return Some(p.clone());
+        }
+        if self.scheme == relux_core::SECRET_SCHEME_PLAINTEXT {
+            return secret_preview(&self.value);
+        }
+        None
+    }
+
+    fn status(&self, name: &str) -> SecretStatus {
+        SecretStatus {
+            name: name.to_string(),
+            set_at: self.set_at,
+            preview: self.redacted_preview(),
+            scheme: self.scheme.clone(),
+        }
+    }
 }
 
 /// The mutable inner state behind the store's lock: the on-disk path (when persisted)
@@ -67,11 +110,16 @@ struct Inner {
     secrets: BTreeMap<String, SecretEntry>,
 }
 
-/// A local, file-backed secret store. Thread-safe via an internal `RwLock`. Plaintext
-/// lives only here (and in the permission-hardened file); every operator-facing read
-/// returns a redacted [`SecretStatus`], never the value.
+/// A local, file-backed secret store. Thread-safe via an internal `RwLock`. The value
+/// at rest is **encrypted where the host supports it** (Windows DPAPI; permission-
+/// hardened plaintext otherwise — see [`crate::secret_cipher`]). Plaintext exists only
+/// transiently in memory at resolve time; every operator-facing read returns a redacted
+/// [`SecretStatus`] (now carrying the at-rest `scheme`), never the value.
 pub struct SecretStore {
     inner: RwLock<Inner>,
+    /// The at-rest writer for new/rewritten values. Reads dispatch on each entry's own
+    /// stored scheme, so a mixed-scheme file (mid-migration) still resolves correctly.
+    cipher: Box<dyn SecretCipher>,
 }
 
 impl Default for SecretStore {
@@ -81,36 +129,92 @@ impl Default for SecretStore {
 }
 
 impl SecretStore {
-    /// An empty, non-persisted (in-memory) store — used by tests/CLI before any file
-    /// is attached.
+    /// An empty, non-persisted (in-memory) store with the host default at-rest cipher —
+    /// used by tests/CLI before any file is attached.
     pub fn in_memory() -> Self {
+        Self::with_cipher(crate::secret_cipher::default_writer())
+    }
+
+    /// An empty, non-persisted store with an explicit at-rest cipher. Lets tests inject a
+    /// deterministic, cross-platform cipher (and the platform default to be overridden).
+    pub fn with_cipher(cipher: Box<dyn SecretCipher>) -> Self {
         Self {
             inner: RwLock::new(Inner::default()),
+            cipher,
         }
     }
 
-    /// Open a store backed by `path`, loading any existing secrets. A missing /
-    /// unreadable / malformed file loads as empty (with a warning) so a corrupt file
+    /// Open a store backed by `path` with the host default cipher, loading any existing
+    /// secrets and migrating any legacy plaintext entries to the active scheme. A missing
+    /// / unreadable / malformed file loads as empty (with a warning) so a corrupt file
     /// never blocks boot — exactly like the legacy bridge secrets.
     pub fn open(path: impl Into<PathBuf>) -> Self {
+        Self::open_with_cipher(path, crate::secret_cipher::default_writer())
+    }
+
+    /// [`open`](Self::open) with an explicit at-rest cipher (used by tests).
+    pub fn open_with_cipher(path: impl Into<PathBuf>, cipher: Box<dyn SecretCipher>) -> Self {
         let path = path.into();
         let secrets = load_file(&path);
-        Self {
+        let store = Self {
             inner: RwLock::new(Inner {
                 path: Some(path),
                 secrets,
             }),
-        }
+            cipher,
+        };
+        store.migrate_plaintext_entries();
+        store
     }
 
-    /// Attach a backing file to an already-created (e.g. process-global) store: load
-    /// the file's secrets and persist subsequent mutations there.
+    /// Attach a backing file to an already-created (e.g. process-global) store: load the
+    /// file's secrets, persist subsequent mutations there, and migrate any legacy
+    /// plaintext entries to the active at-rest scheme.
     pub fn attach(&self, path: impl Into<PathBuf>) {
         let path = path.into();
         let secrets = load_file(&path);
+        {
+            let mut g = self.write();
+            g.secrets = secrets;
+            g.path = Some(path);
+        }
+        self.migrate_plaintext_entries();
+    }
+
+    /// Re-seal any entry still stored as plaintext under the active encrypting writer,
+    /// then persist if anything changed. No-op when the active writer does not encrypt
+    /// (non-Windows / DPAPI-unavailable): a plaintext file stays plaintext rather than
+    /// being pointlessly rewritten. Fail-safe — an entry whose re-seal fails is left
+    /// exactly as it was (never dropped).
+    fn migrate_plaintext_entries(&self) {
+        if !self.cipher.encrypts() {
+            return;
+        }
         let mut g = self.write();
-        g.secrets = secrets;
-        g.path = Some(path);
+        let mut changed = false;
+        for (name, e) in g.secrets.iter_mut() {
+            if e.scheme != relux_core::SECRET_SCHEME_PLAINTEXT {
+                continue;
+            }
+            match self.cipher.seal(&e.value) {
+                Ok(sealed) => {
+                    // Capture the preview from the plaintext BEFORE we drop it.
+                    e.preview = secret_preview(&e.value);
+                    e.value = sealed;
+                    e.scheme = self.cipher.scheme().to_string();
+                    changed = true;
+                }
+                Err(err) => {
+                    eprintln!(
+                        "secret store: migrate '{name}' to {} failed ({err}); left as plaintext",
+                        self.cipher.scheme()
+                    );
+                }
+            }
+        }
+        if changed {
+            persist(&g);
+        }
     }
 
     fn read(&self) -> std::sync::RwLockReadGuard<'_, Inner> {
@@ -133,18 +237,38 @@ impl SecretStore {
             return Err(SecretError::StoreFull);
         }
         let set_at = unix_secs();
+        let preview = secret_preview(value);
+        // Encrypt at rest with the active writer. On a sealing failure (e.g. DPAPI
+        // unavailable on this Windows host) fall back to plaintext so the secret is
+        // never lost — the scheme marker stays honest about what actually happened.
+        let (stored_value, scheme) = match self.cipher.seal(value) {
+            Ok(sealed) => (sealed, self.cipher.scheme().to_string()),
+            Err(err) => {
+                eprintln!(
+                    "secret store: seal '{name}' with {} failed ({err}); storing permission-hardened plaintext",
+                    self.cipher.scheme()
+                );
+                (
+                    value.to_string(),
+                    relux_core::SECRET_SCHEME_PLAINTEXT.to_string(),
+                )
+            }
+        };
         g.secrets.insert(
             name.clone(),
             SecretEntry {
-                value: value.to_string(),
+                value: stored_value,
                 set_at,
+                scheme: scheme.clone(),
+                preview: preview.clone(),
             },
         );
         persist(&g);
         Ok(SecretStatus {
             name,
             set_at,
-            preview: secret_preview(value),
+            preview,
+            scheme,
         })
     }
 
@@ -159,40 +283,71 @@ impl SecretStore {
         existed
     }
 
-    /// Every stored secret's REDACTED status, sorted by name. Never carries a value.
+    /// Every stored secret's REDACTED status, sorted by name. Never carries a value;
+    /// never decrypts (the preview is precomputed / derived).
     pub fn list(&self) -> Vec<SecretStatus> {
         let g = self.read();
-        g.secrets
-            .iter()
-            .map(|(name, e)| SecretStatus {
-                name: name.clone(),
-                set_at: e.set_at,
-                preview: secret_preview(&e.value),
-            })
-            .collect()
+        g.secrets.iter().map(|(name, e)| e.status(name)).collect()
     }
 
     /// The redacted status of one secret by name, or `None` when absent.
     pub fn status(&self, name: &str) -> Option<SecretStatus> {
         let name = name.trim();
         let g = self.read();
-        g.secrets.get(name).map(|e| SecretStatus {
-            name: name.to_string(),
-            set_at: e.set_at,
-            preview: secret_preview(&e.value),
-        })
+        g.secrets.get(name).map(|e| e.status(name))
     }
 
-    /// Whether a secret with this name exists.
+    /// Whether a secret with this name exists (independent of whether it can be
+    /// decrypted on this host — see [`resolve`](Self::resolve)).
     pub fn has(&self, name: &str) -> bool {
         self.read().secrets.contains_key(name.trim())
     }
 
+    /// Decrypt one entry's stored value to plaintext, dispatching on its stored scheme.
+    /// A plaintext entry returns its value verbatim; an entry sealed under the active
+    /// writer's scheme is unsealed; any other scheme (e.g. a DPAPI file moved to a host
+    /// that cannot decrypt it) is a clean, value-free error naming the secret + scheme.
+    fn decrypt_entry(&self, name: &str, e: &SecretEntry) -> Result<String, String> {
+        if e.scheme == relux_core::SECRET_SCHEME_PLAINTEXT {
+            return Ok(e.value.clone());
+        }
+        if e.scheme == self.cipher.scheme() {
+            return self
+                .cipher
+                .open(&e.value)
+                .map_err(|err| format!("secret '{name}' could not be decrypted: {err}"));
+        }
+        Err(format!(
+            "secret '{name}' is stored with scheme '{}', which this host cannot decrypt",
+            e.scheme
+        ))
+    }
+
     /// Resolve a secret to its PLAINTEXT value. **Internal only** — this is the single
-    /// method that returns plaintext, called solely at managed-stdio spawn time to seed
-    /// the child env. The value is never logged, stored back, or returned over HTTP.
+    /// method that returns plaintext, called solely at managed-stdio spawn / Prime-brain
+    /// request time. The value is never logged, stored back, or returned over HTTP. A
+    /// missing OR un-decryptable secret yields `None`; a decrypt failure is logged with
+    /// the secret NAME (never the value) so the failure is diagnosable. Use
+    /// [`resolve_result`](Self::resolve_result) when you need to distinguish the two.
     pub fn resolve(&self, name: &str) -> Option<String> {
-        self.read().secrets.get(name.trim()).map(|e| e.value.clone())
+        match self.resolve_result(name) {
+            Ok(v) => v,
+            Err(err) => {
+                eprintln!("secret store: {err}");
+                None
+            }
+        }
+    }
+
+    /// Resolve a secret to plaintext, distinguishing **absent** (`Ok(None)`) from
+    /// **present-but-undecryptable** (`Err(message)`). The error message names the secret
+    /// + scheme, never the value.
+    pub fn resolve_result(&self, name: &str) -> Result<Option<String>, String> {
+        let g = self.read();
+        match g.secrets.get(name.trim()) {
+            None => Ok(None),
+            Some(e) => self.decrypt_entry(name.trim(), e).map(Some),
+        }
     }
 }
 
@@ -442,15 +597,18 @@ pub fn resolve_managed_env_and_cwd(
     let store = secret_store();
     let mut env: Vec<(String, String)> = Vec::with_capacity(env_refs.len());
     for (var, r) in env_refs {
-        match store.resolve(&r.secret) {
-            Some(value) => env.push((var.clone(), value)),
+        match store.resolve_result(&r.secret) {
+            Ok(Some(value)) => env.push((var.clone(), value)),
             // Name the missing secret + env var (config identifiers), never a value.
-            None => {
+            Ok(None) => {
                 return Err(format!(
                     "missing secret '{}' for env var '{}'",
                     r.secret, var
                 ))
             }
+            // Present but un-decryptable on this host: a clean, value-free error that
+            // names the secret + env var (the inner message already names the scheme).
+            Err(err) => return Err(format!("{err} (for env var '{var}')")),
         }
     }
     let cwd = match cwd {
@@ -469,6 +627,8 @@ pub fn resolve_managed_env_and_cwd(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secret_cipher::{DpapiCipher, PlaintextCipher, SecretCipher};
+
     fn env_refs(env: &[(&str, &str)]) -> BTreeMap<String, McpEnvRef> {
         let mut m = BTreeMap::new();
         for (var, secret) in env {
@@ -482,29 +642,182 @@ mod tests {
         m
     }
 
+    /// A deterministic, cross-platform **encrypting** cipher test-double. XOR-then-base64
+    /// so (a) the at-rest string contains no plaintext substring, (b) the round-trip is
+    /// exact, and (c) `open` of a malformed payload errors cleanly — exactly the surface
+    /// the store relies on, without depending on a live OS keychain / DPAPI.
+    struct FakeCipher;
+    const FAKE_SCHEME: &str = "test_fake_xor_v1";
+    impl SecretCipher for FakeCipher {
+        fn scheme(&self) -> &'static str {
+            FAKE_SCHEME
+        }
+        fn encrypts(&self) -> bool {
+            true
+        }
+        fn seal(&self, plaintext: &str) -> Result<String, String> {
+            use base64::{engine::general_purpose::STANDARD, Engine};
+            let xored: Vec<u8> = plaintext.bytes().map(|b| b ^ 0x5A).collect();
+            Ok(STANDARD.encode(xored))
+        }
+        fn open(&self, encoded: &str) -> Result<String, String> {
+            use base64::{engine::general_purpose::STANDARD, Engine};
+            let xored = STANDARD
+                .decode(encoded)
+                .map_err(|_| "fake cipher: malformed payload".to_string())?;
+            let bytes: Vec<u8> = xored.into_iter().map(|b| b ^ 0x5A).collect();
+            String::from_utf8(bytes).map_err(|_| "fake cipher: non-UTF-8".to_string())
+        }
+    }
+
     #[test]
     fn set_list_delete_never_return_plaintext() {
-        let store = SecretStore::in_memory();
+        // Inject the encrypting test cipher so the assertions hold on every OS and the
+        // value is genuinely sealed at rest.
+        let store = SecretStore::with_cipher(Box::new(FakeCipher));
         let value = ["sk", "test", "9876543210abcdef"].join("-");
         let status = store.set("openai", &value).unwrap();
-        // The set response carries only a redacted preview — never the value.
+        // The set response carries only a redacted preview + the scheme — never the value.
         let json = serde_json::to_string(&status).unwrap();
         assert!(!json.contains(&value), "value leaked in set response: {json}");
         assert_eq!(status.preview.as_deref(), Some("…cdef"));
+        assert_eq!(status.scheme, FAKE_SCHEME);
 
         let list = store.list();
         assert_eq!(list.len(), 1);
         let json = serde_json::to_string(&list).unwrap();
         assert!(!json.contains(&value), "value leaked in list: {json}");
         assert!(json.contains("…cdef"));
+        assert!(json.contains(FAKE_SCHEME), "scheme should surface in status");
 
-        // Resolve (internal) IS the only place plaintext comes back.
+        // Resolve (internal) IS the only place plaintext comes back, decrypted on the fly.
         assert_eq!(store.resolve("openai").as_deref(), Some(value.as_str()));
 
         assert!(store.delete("openai"));
         assert!(!store.delete("openai")); // idempotent
         assert!(store.list().is_empty());
         assert!(store.resolve("openai").is_none());
+    }
+
+    #[test]
+    fn serialized_file_holds_ciphertext_not_plaintext_under_encrypting_cipher() {
+        // Pure format test: with an encrypting cipher, the on-disk file must contain the
+        // scheme marker and NOT the plaintext anywhere.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("secrets.json");
+        let store = SecretStore::open_with_cipher(&path, Box::new(FakeCipher));
+        let value = "super-secret-plaintext-value-7777";
+        store.set("k", value).unwrap();
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !on_disk.contains(value),
+            "plaintext leaked into the on-disk file: {on_disk}"
+        );
+        assert!(
+            on_disk.contains(FAKE_SCHEME),
+            "scheme marker missing from the file: {on_disk}"
+        );
+        // The preview is the only fingerprint persisted, and it's the tail only.
+        assert!(on_disk.contains("…7777"));
+        // A fresh open with the same cipher decrypts it back.
+        let reopened = SecretStore::open_with_cipher(&path, Box::new(FakeCipher));
+        assert_eq!(reopened.resolve("k").as_deref(), Some(value));
+    }
+
+    #[test]
+    fn legacy_plaintext_file_migrates_to_active_scheme_on_open() {
+        // Write a pre-encryption file by hand (no `scheme`/`preview` fields), then open
+        // it with an encrypting cipher: it must migrate in place to the active scheme,
+        // drop the plaintext from disk, and still resolve.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("secrets.json");
+        let legacy = r#"{"legacy":{"value":"old-plaintext-key-4321","set_at":1700000000}}"#;
+        std::fs::write(&path, legacy).unwrap();
+
+        let store = SecretStore::open_with_cipher(&path, Box::new(FakeCipher));
+        // Still resolvable.
+        assert_eq!(store.resolve("legacy").as_deref(), Some("old-plaintext-key-4321"));
+        // Status now reports the encrypted scheme + a derived preview.
+        let st = store.status("legacy").unwrap();
+        assert_eq!(st.scheme, FAKE_SCHEME);
+        assert_eq!(st.preview.as_deref(), Some("…4321"));
+        // The file on disk was rewritten: no plaintext, scheme marker present.
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(!on_disk.contains("old-plaintext-key-4321"), "{on_disk}");
+        assert!(on_disk.contains(FAKE_SCHEME), "{on_disk}");
+    }
+
+    #[test]
+    fn plaintext_host_leaves_legacy_file_as_plaintext() {
+        // A non-encrypting writer (the non-Windows / DPAPI-unavailable default) must NOT
+        // rewrite a plaintext file, and reads it verbatim.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("secrets.json");
+        let legacy = r#"{"legacy":{"value":"keep-plain-1234","set_at":1700000000}}"#;
+        std::fs::write(&path, legacy).unwrap();
+        let store = SecretStore::open_with_cipher(&path, Box::new(PlaintextCipher));
+        assert_eq!(store.resolve("legacy").as_deref(), Some("keep-plain-1234"));
+        let st = store.status("legacy").unwrap();
+        assert_eq!(st.scheme, relux_core::SECRET_SCHEME_PLAINTEXT);
+    }
+
+    #[test]
+    fn corrupt_encrypted_payload_fails_cleanly_naming_the_key() {
+        // An entry sealed under the active scheme whose ciphertext is corrupt must fail
+        // closed: resolve → None, resolve_result → Err naming the key (never the value),
+        // and the env resolver surfaces a clean, value-free error.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("secrets.json");
+        // `value` is not valid base64 for FakeCipher.open → a clean decrypt error.
+        let corrupt = r#"{"brokenkey":{"value":"!!!not-base64!!!","set_at":1700000000,"scheme":"test_fake_xor_v1"}}"#;
+        std::fs::write(&path, corrupt).unwrap();
+        let store = SecretStore::open_with_cipher(&path, Box::new(FakeCipher));
+        assert!(store.resolve("brokenkey").is_none());
+        let err = store.resolve_result("brokenkey").unwrap_err();
+        assert!(err.contains("brokenkey"), "error should name the key: {err}");
+        assert!(!err.contains("not-base64"), "error must not echo the value: {err}");
+    }
+
+    #[test]
+    fn entry_with_unknown_scheme_fails_closed() {
+        // A value sealed on another host (scheme the active writer can't open) is refused
+        // cleanly, naming the scheme — e.g. a DPAPI file copied to a plaintext host.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("secrets.json");
+        let foreign = r#"{"k":{"value":"AQAAdeadbeef","set_at":1700000000,"scheme":"dpapi_current_user","preview":"…beef"}}"#;
+        std::fs::write(&path, foreign).unwrap();
+        // Active writer is plaintext → cannot decrypt a dpapi entry.
+        let store = SecretStore::open_with_cipher(&path, Box::new(PlaintextCipher));
+        let err = store.resolve_result("k").unwrap_err();
+        assert!(err.contains("dpapi_current_user"), "{err}");
+        assert!(err.contains('k'));
+        // But status/list still work (no decrypt needed) — operator sees the stranded key.
+        assert_eq!(store.status("k").unwrap().scheme, "dpapi_current_user");
+        assert_eq!(store.status("k").unwrap().preview.as_deref(), Some("…beef"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dpapi_store_round_trips_and_seals_at_rest() {
+        // Real Windows DPAPI through the store, gated to Windows. If DPAPI is genuinely
+        // unavailable in this environment the value falls back to plaintext — assert the
+        // round-trip either way, and that an encrypted entry hides the plaintext on disk.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("secrets.json");
+        let store = SecretStore::open_with_cipher(&path, Box::new(DpapiCipher::new()));
+        let value = "dpapi-real-secret-5150";
+        let st = store.set("winkey", value).unwrap();
+        // Round-trips back to plaintext regardless of which scheme landed.
+        assert_eq!(store.resolve("winkey").as_deref(), Some(value));
+        if st.scheme == relux_core::SECRET_SCHEME_DPAPI {
+            // When DPAPI actually sealed it, the file must not contain the plaintext.
+            let on_disk = std::fs::read_to_string(&path).unwrap();
+            assert!(!on_disk.contains(value), "plaintext leaked under DPAPI: {on_disk}");
+            // And a fresh open (new DpapiCipher) still decrypts — same user/machine key.
+            let reopened = SecretStore::open_with_cipher(&path, Box::new(DpapiCipher::new()));
+            assert_eq!(reopened.resolve("winkey").as_deref(), Some(value));
+        }
     }
 
     #[test]
