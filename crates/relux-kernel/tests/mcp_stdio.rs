@@ -577,3 +577,142 @@ fn kernel_remove_stops_the_managed_process() {
     k.remove_mcp_server("rm-fs").expect("remove ok");
     assert!(!pool().is_running("rm-fs"), "removed server's process is stopped");
 }
+
+// --- Managed-stdio MCP prompts (prompts/list + prompts/get) -----------------
+
+#[test]
+fn lists_prompts_from_a_real_stdio_server() {
+    // Spawn-per-operation listing (no managed process running).
+    let prompts = mcp_stdio::list_prompts(fixture(), &[], &[], None, 5_000).expect("list ok");
+    let names: Vec<&str> = prompts.iter().map(|p| p.name.as_str()).collect();
+    assert!(names.contains(&"greet"), "names: {names:?}");
+    assert!(names.contains(&"leaky"), "names: {names:?}");
+    let greet = prompts.iter().find(|p| p.name == "greet").unwrap();
+    assert_eq!(greet.arguments.len(), 1);
+    assert_eq!(greet.arguments[0].name, "who");
+    assert!(greet.arguments[0].required);
+}
+
+#[test]
+fn gets_a_prompt_forwarding_arguments() {
+    let result = mcp_stdio::get_prompt(
+        fixture(),
+        &[],
+        &[],
+        None,
+        "greet",
+        &serde_json::json!({ "who": "Ada" }),
+        5_000,
+    )
+    .expect("get ok");
+    assert_eq!(result.name, "greet");
+    assert_eq!(result.description.as_deref(), Some("A greeting."));
+    assert_eq!(result.messages.len(), 1);
+    assert_eq!(result.messages[0].role, "user");
+    // The forwarded argument was materialized into the template message.
+    assert!(result.messages[0].content.contains("Hello, Ada!"), "msg: {}", result.messages[0].content);
+}
+
+#[test]
+fn gets_a_prompt_and_redacts_secrets() {
+    let result = mcp_stdio::get_prompt(fixture(), &[], &[], None, "leaky", &serde_json::json!({}), 5_000)
+        .expect("get ok");
+    let content = &result.messages[0].content;
+    assert!(content.contains("remember"), "content: {content}");
+    // The embedded fake secret is redacted, never returned verbatim.
+    assert!(
+        !content.contains("sk-fixturepromptsecret1234567890"),
+        "secret must be redacted: {content}"
+    );
+}
+
+#[test]
+fn an_unknown_prompt_name_fails_cleanly() {
+    let err = mcp_stdio::get_prompt(fixture(), &[], &[], None, "nope", &serde_json::json!({}), 5_000)
+        .unwrap_err();
+    // A JSON-RPC error from the server, surfaced honestly (never a fabricated body).
+    assert!(matches!(err, McpClientError::ServerError { .. }), "got {err:?}");
+}
+
+#[test]
+fn pool_lists_and_gets_prompts_reusing_one_process() {
+    let id = "pool-prompts";
+    let start = pool().start(id, fixture(), &[], &[], None, 5_000);
+    assert_eq!(start.state, ManagedStdioState::Running, "start → running: {start:?}");
+
+    // prompts/list reuses the running process.
+    let prompts = pool().list_prompts(id, 5_000).expect("list ok");
+    assert!(prompts.iter().any(|p| p.name == "greet"), "prompts: {prompts:?}");
+
+    // prompts/get reuses the SAME process and returns shaped, redacted content.
+    let result = pool()
+        .get_prompt(id, "leaky", &serde_json::json!({}), 5_000)
+        .expect("get ok");
+    assert!(
+        !result.messages[0].content.contains("sk-fixturepromptsecret1234567890"),
+        "secret must be redacted: {}",
+        result.messages[0].content
+    );
+
+    pool().stop(id);
+}
+
+#[test]
+fn pool_prompt_reuse_requires_an_explicit_start() {
+    let id = "pool-prompts-not-started";
+    assert!(!pool().is_running(id));
+    let err = pool().list_prompts(id, 2_000).unwrap_err();
+    assert!(matches!(err, McpClientError::ProcessExited), "got {err:?}");
+}
+
+#[test]
+fn kernel_lists_and_gets_prompts_over_managed_stdio() {
+    let mut k = KernelState::new();
+    k.register_mcp_stdio_server(
+        "prm-fs",
+        fixture(),
+        &[],
+        Default::default(),
+        None,
+        "prompts stdio server",
+        true,
+        Some(5_000),
+    )
+    .expect("register ok");
+
+    // The kernel surface lists prompts over the stdio transport (spawn-per-op here).
+    let prompts = k.list_mcp_prompts("prm-fs").expect("list ok");
+    assert!(prompts.iter().any(|p| p.name == "greet"), "prompts: {prompts:?}");
+
+    // And materializes ONE, with the name validated and the body shaped + redacted.
+    let result = k
+        .get_mcp_prompt("prm-fs", "greet", &serde_json::json!({ "who": "Bee" }))
+        .expect("get ok");
+    assert!(result.messages[0].content.contains("Hello, Bee!"), "msg: {}", result.messages[0].content);
+
+    // An invalid name is fail-closed (never dialed), even over stdio.
+    assert!(matches!(
+        k.get_mcp_prompt("prm-fs", "bad\r\nname", &serde_json::json!({})),
+        Err(relux_kernel::KernelError::InvalidMcpPromptName { .. })
+    ));
+}
+
+#[test]
+fn kernel_disabled_stdio_server_refuses_prompt_list() {
+    let mut k = KernelState::new();
+    k.register_mcp_stdio_server(
+        "prm-off",
+        fixture(),
+        &[],
+        Default::default(),
+        None,
+        "disabled",
+        false,
+        Some(5_000),
+    )
+    .expect("register ok");
+    assert!(matches!(
+        k.list_mcp_prompts("prm-off"),
+        Err(relux_kernel::KernelError::McpServerDisabled(_))
+    ));
+}

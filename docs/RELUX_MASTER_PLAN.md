@@ -1870,6 +1870,30 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **Unreleased (on `main`, post-v0.1.29)** — **MCP prompts v1.** MCP **prompts**
+  (`prompts/list` / `prompts/get`) are now bridged over **both** the loopback-HTTP and governed
+  managed-stdio transports — a THIRD **read-only** surface alongside tools + resources. They are
+  read-only by construction: listing/getting a prompt performs no action, and a `prompts/get` returns
+  **template text Relux shows as context, never a turn Relux executes** (full mapping in `docs/mcp.md`
+  "MCP prompts (v1)"; reference-first against Hermes `tools/mcp_tool.py` `_make_list_prompts_handler`
+  L2552-2612 / `_make_get_prompt_handler` L2615-2681). The HTTP client (`crate::mcp::list_prompts` /
+  `get_prompt`, with `parse_prompts_list` / `shape_get_prompt_result`) and the managed-stdio client
+  (`crate::mcp_stdio::list_prompts` / `get_prompt` + the `ManagedPool` reuse methods) reuse the SAME
+  shapers — bounded to `MAX_MCP_PROMPTS` / `MAX_MCP_PROMPT_MESSAGES` / `MAX_MCP_PROMPT_MESSAGE_CHARS`,
+  every string sanitized, message content **secret-redacted**, a non-text block summarized, the raw
+  JSON-RPC envelope never returned, and the prompt name validated fail-closed
+  (`is_valid_mcp_prompt_name`) before any dial/spawn. The kernel dispatches on transport
+  (`list_mcp_prompts` / `get_mcp_prompt`, reusing a running managed process and falling back to a
+  spawn-per-op read). New operator routes `GET …/:id/prompts` + `POST …/:id/prompts/get { name,
+  arguments? }` (read-locked — a `prompts/get` mutates nothing), the read-only Prime context tools
+  `mcp_list_prompts` / `mcp_get_prompt` (which return template text as an **observation**, never
+  auto-run as a user turn), and a dashboard **Prompts** panel (`McpPromptsPanel` / `McpPromptRow`, a
+  minimal arguments form) all dispatch on transport with no new authority. The real-subprocess fixture
+  advertises a `greet` (argument-forwarding) + a `leaky` (redaction) prompt, exercised end to end in
+  `tests/mcp_stdio.rs` + HTTP shaper/route tests in `mcp.rs` / `state.rs` / `server.rs`; dashboard
+  tests/typecheck/build green with the tracked `dashboard-dist` bundle rebuilt in sync. Still **out of
+  scope**: MCP **sampling** (inverts the trust direction) and resource **subscriptions**. Every safety
+  property from the resources bullet still holds.
 - **Unreleased (on `main`, post-v0.1.29)** — **managed-stdio MCP resources v1.** MCP **resources**
   (`resources/list` / `resources/read`), previously an HTTP-only surface, are now bridged over the
   governed managed-stdio transport — **read-only context only**, no `tools/call`, no mutation, no new
@@ -1887,7 +1911,8 @@ stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
   (`mcp_list_resources` / `mcp_read_resource`), and the dashboard **Resources** panel (no longer hidden
   for a stdio server) all dispatch on transport with no new route. A real-subprocess fixture
   (`relux_mcp_test_server.rs`) advertises a text + a binary resource, exercised end to end in
-  `tests/mcp_stdio.rs`. Still **out of scope** over stdio: MCP **prompts**, **sampling**, and resource
+  `tests/mcp_stdio.rs`. (MCP **prompts** are now bridged too — see the MCP prompts v1 bullet above.)
+  Still **out of scope** over stdio: MCP **sampling** and resource
   **subscriptions**. `cargo test` + `clippy --all-targets` clean on `relux-kernel`, dashboard
   tests/typecheck/build green, the tracked `dashboard-dist` bundle rebuilt in sync. Every safety
   property from v0.1.29 still holds.

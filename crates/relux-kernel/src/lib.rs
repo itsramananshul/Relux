@@ -373,4 +373,8 @@ pub enum KernelError {
     InvalidMcpResourceUri { server: String, uri: String },
     #[error("MCP resource fetch against server '{id}' failed: {message}")]
     McpResourceFetchFailed { id: String, message: String },
+    #[error("invalid MCP prompt name '{name}' for server '{server}' (must be non-empty, bounded, control-char free)")]
+    InvalidMcpPromptName { server: String, name: String },
+    #[error("MCP prompt fetch against server '{id}' failed: {message}")]
+    McpPromptFetchFailed { id: String, message: String },
 }

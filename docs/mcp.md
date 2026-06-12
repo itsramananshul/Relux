@@ -119,12 +119,14 @@ and goes **stricter** than Hermes.
   auto-approve its tools**. The plan-proposal grounding (`discover_proposal_mcp_catalog`)
   dispatches on transport too, so an `mcp:<server>/<tool>` step grounds against a live
   stdio `tools/list` the same way it does an HTTP one.
-- **JSON-RPC subset (tools + read-only resources).** The stdio bridge speaks
-  `initialize`, `notifications/initialized`, `tools/list`, `tools/call`, and — as of
-  **managed stdio resources v1** — the two **read-only** MCP **resource** methods
-  `resources/list` and `resources/read` (see "Managed-stdio MCP resources (v1)" below).
-  It does **not** speak any mutating/streaming method (prompts, sampling, resource
-  subscriptions); those remain out of scope (see "Remaining gaps").
+- **JSON-RPC subset (tools + read-only resources + read-only prompts).** The stdio
+  bridge speaks `initialize`, `notifications/initialized`, `tools/list`, `tools/call`,
+  the two **read-only** MCP **resource** methods `resources/list` / `resources/read`
+  (managed stdio resources v1, below), and — as of **managed stdio prompts v1** — the
+  two **read-only** MCP **prompt** methods `prompts/list` / `prompts/get` (see
+  "Managed-stdio MCP prompts (v1)" below). It does **not** speak any
+  mutating/streaming method (sampling, resource subscriptions); those remain out of
+  scope (see "Remaining gaps").
 
 ### Plugin MCP hint → managed-stdio prefill (advisory, never auto-run)
 
@@ -243,6 +245,62 @@ transport differs and the result handling does not.
   (`mem://notes`, embedding an obvious fake secret to prove redaction) and a binary one
   (`mem://image`, a `blob`), exercised end to end (spawn-per-op, pool reuse, and through
   the kernel registry) in `crates/relux-kernel/tests/mcp_stdio.rs`.
+
+### MCP prompts (v1) — `prompts/list` + `prompts/get` (HTTP + managed stdio)
+
+MCP **prompts** are a **read-only template surface**: a server advertises named,
+parameterizable prompt templates via `prompts/list`, and a client materializes one (with
+arguments) into chat messages via `prompts/get`. They are a THIRD read-only surface
+alongside tools (which act) and resources (read-only data). They stay **read-only by
+construction** — listing or getting a prompt performs no action and mutates nothing, and
+crucially a `prompts/get` returns **template text Relux shows as context, NOT a turn Relux
+executes**. There is **no new authority**: no `tools/call`, no mutation, no auto-run.
+
+Reference (`docs/reference-driven-development.md`, BINDING):
+`reference/hermes-agent-main/tools/mcp_tool.py` — `_make_list_prompts_handler` (L2552-2612)
+collects `{ name, description?, arguments:[{name, description?, required?}] }`;
+`_make_get_prompt_handler` (L2615-2681) maps `GetPromptResult.messages` to `{ role,
+content }`, taking a content block's `.text` (or a bare string) as the message text. Relux
+ports that shaping for **both** transports: the HTTP client (`crate::mcp::list_prompts` /
+`get_prompt`, with `parse_prompts_list` / `shape_get_prompt_result`) and the managed-stdio
+client (`crate::mcp_stdio::list_prompts` / `get_prompt` + `ManagedPool` reuse), which reuse
+the **same** shapers — the transport differs, the result handling does not.
+
+- **Two read-only methods, both transports, same two process modes.** `prompts/list` and
+  `prompts/get` work over loopback HTTP (dial the endpoint, streamable-HTTP session) and
+  managed stdio (reuse the operator-started `initialize`d process, else fall back to the
+  safe spawn-per-operation read — resolving `env` secrets + validating `cwd` first, exactly
+  like the tools/resources paths). The kernel dispatches on transport
+  (`mcp_list_prompts` / `mcp_get_prompt` in `state.rs`).
+- **Bounded, sanitized, redacted shaping.** `prompts/list` is bounded to
+  `MAX_MCP_PROMPTS`; each prompt's name/description and its declared `arguments` (bounded
+  to `MAX_MCP_PROMPT_ARGS`, each `{name, description, required}`) are sanitized + clamped; a
+  nameless entry is skipped rather than fatal. `prompts/get` maps each message (bounded to
+  `MAX_MCP_PROMPT_MESSAGES`) to `{ role, content }`: a `{ text }` (or `{ type:"text", text
+  }`) block is taken verbatim, a bare string is used as-is, an array of blocks is joined
+  (a non-text block summarized as `[non-text content: <type>]`), and the content is then
+  sanitized, **secret-redacted** (`relux_core::redact_secrets` — a credential embedded in a
+  prompt template never leaks verbatim), and clamped to `MAX_MCP_PROMPT_MESSAGE_CHARS`. The
+  **raw JSON-RPC envelope is never returned**. The prompt name is validated fail-closed
+  (`is_valid_mcp_prompt_name` — non-empty, bounded, control-char free) before any spawn/dial.
+- **Surfaces (operator API + read-only Prime context tools).** New operator routes
+  `GET /v1/relux/mcp/servers/:id/prompts` (list) and
+  `POST /v1/relux/mcp/servers/:id/prompts/get { name, arguments? }` (materialize one — POST
+  carries the structured args object but holds only a **read lock**; a `prompts/get`
+  mutates nothing). Honest by construction: an unknown server → 404, a disabled one → 409,
+  an invalid/empty name → 400, a transport/protocol failure → 502 (never a fabricated
+  list/body). The read-only Prime context tools `mcp_list_prompts` / `mcp_get_prompt`
+  (`prime_tools.rs`) dispatch on transport off-lock; `mcp_get_prompt` returns the template
+  text as an **observation** (context the brain reads) — it is **never** auto-run as a user
+  turn. The dashboard's **Prompts** action + panel (`apps/dashboard/src/pages/Plugins.tsx`
+  `McpPromptsPanel` / `McpPromptRow`) is shown for both transports; it runs the read-only
+  `prompts/list` and an inline `prompts/get` with a minimal arguments form.
+- **Test fixture.** The pure-Rust MCP stdio fixture now advertises a `greet` prompt
+  (a required `who` argument materialized into a message) and a `leaky` prompt (its message
+  embeds an obvious fake secret to prove redaction), exercised end to end (spawn-per-op,
+  pool reuse, through the kernel registry, and the Prime snapshot tool) in
+  `crates/relux-kernel/tests/mcp_stdio.rs` + the HTTP shaper/route tests in
+  `crates/relux-kernel/src/mcp.rs` + `state.rs` + `server.rs`.
 
 ### Local secrets & environment (API keys for managed-stdio MCP servers)
 
@@ -414,9 +472,11 @@ The servers list shows each server's transport (`http` / `stdio`), its
 status, and **Discover** + **Remove** actions. For a managed-stdio server a **Process**
 control row also shows the live process **status** (state badge with pid, start time,
 tools-discovered count, redacted **last error** + **log tail**) and **Start** / **Stop**
-/ **Restart** buttons (`ManagedStdioControls`). The **Resources** action is shown for
-**both** transports (managed stdio reads resources read-only too — see "Managed-stdio
-MCP resources (v1)" above).
+/ **Restart** buttons (`ManagedStdioControls`). The **Resources** and **Prompts**
+actions are shown for **both** transports (managed stdio reads resources + prompts
+read-only too — see "Managed-stdio MCP resources (v1)" and "MCP prompts (v1)" above);
+Prompts runs a live `prompts/list` and an inline `prompts/get` with a minimal arguments
+form.
 (`apps/dashboard/src/pages/Plugins.tsx`, `apps/dashboard/src/plugins.ts`,
 `managedStdioStatusBadge`.)
 
@@ -432,11 +492,15 @@ MCP resources (v1)" above).
   environment" below. The config still stores **no plaintext** (only secret
   *references* + a path), the resolved values are never serialized/logged, and a `cwd`
   must canonicalize INSIDE the configured safe workspace root.
-- **Resources are now bridged (read-only).** `resources/list` / `resources/read` work
-  over managed stdio as of **resources v1** (see "Managed-stdio MCP resources (v1)"
-  above) — read-only context only. Still **not** bridged: MCP **prompts**, **sampling**,
-  and resource **subscriptions** (an MCP server that exposes those over stdio surfaces
-  only its tools + resources to Relux; the rest is out of scope by design).
+- **Resources + prompts are now bridged (read-only).** `resources/list` /
+  `resources/read` (resources v1) and `prompts/list` / `prompts/get` (prompts v1) work
+  over **both** loopback HTTP and managed stdio (see "Managed-stdio MCP resources (v1)"
+  and "MCP prompts (v1)" above) — read-only context/templates only. Still **not**
+  bridged: MCP **sampling** (server-initiated LLM calls back to the client) and resource
+  **subscriptions** (live change notifications). An MCP server that exposes those over
+  stdio surfaces only its tools + resources + prompts to Relux; the rest is out of scope
+  by design — sampling especially inverts the trust direction (the server drives the
+  client's model), so it stays unbuilt until there is an explicit, gated design for it.
 - **Status polling, not push.** The dashboard reads status on demand (no live stream);
   a crash between reads surfaces on the next status read / call, not instantly.
 

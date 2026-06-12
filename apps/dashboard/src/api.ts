@@ -3267,6 +3267,46 @@ export interface ReluxMcpResourceContent {
   binary: boolean;
 }
 
+// One declared argument of an MCP prompt (prompts/list). Pure metadata — it
+// carries no value, only the name + optional description + whether it is required.
+export interface ReluxMcpPromptArgument {
+  name: string;
+  description: string;
+  required: boolean;
+}
+
+// One read-only prompt template advertised by an MCP server (prompts/list).
+// Prompts are inert templates — listing or getting one performs no action and
+// mutates nothing; getting one returns template text, NOT a turn Relux runs.
+export interface ReluxMcpPrompt {
+  name: string;
+  description: string;
+  arguments?: ReluxMcpPromptArgument[];
+}
+
+// The live prompts/list result for one server. `reachable` is true only when the
+// probe succeeded — never a faked empty list.
+export interface ReluxMcpPromptsResult {
+  server_id: string;
+  reachable: boolean;
+  prompts: ReluxMcpPrompt[];
+}
+
+// One materialized message from a prompts/get result: a role + the sanitized,
+// secret-redacted, bounded content text (never the raw content envelope).
+export interface ReluxMcpPromptMessage {
+  role: string;
+  content: string;
+}
+
+// The shaped, sanitized, secret-redacted result of a prompts/get: the prompt's
+// optional description plus its materialized messages. Inert — template text only.
+export interface ReluxMcpPromptResult {
+  name: string;
+  description?: string;
+  messages: ReluxMcpPromptMessage[];
+}
+
 // The lifecycle status of a managed-stdio MCP server's long-lived process. A
 // managed-stdio server is registered (config) independently of whether its process
 // is running; the operator starts/stops/restarts it and discovery/invocation reuse
@@ -3350,6 +3390,21 @@ export const reluxMcp = {
   readResource: (id: string, uri: string) =>
     api.get<ReluxMcpResourceContent>(
       `/v1/relux/mcp/servers/${encodeURIComponent(id)}/resources/read?uri=${encodeURIComponent(uri)}`,
+    ),
+  // Run a live prompts/list (read-only template source). 404 unknown · 409
+  // disabled · 502 unreachable — never a faked empty list.
+  prompts: (id: string) =>
+    api.get<ReluxMcpPromptsResult>(
+      `/v1/relux/mcp/servers/${encodeURIComponent(id)}/prompts`,
+    ),
+  // Materialize one prompt by name (with optional arguments), returning the
+  // shaped/redacted messages. 404 unknown · 409 disabled · 400 invalid name ·
+  // 502 unreachable. Read-only: a prompts/get returns template text, never a turn
+  // Relux runs.
+  getPrompt: (id: string, name: string, args?: Record<string, unknown>) =>
+    api.post<ReluxMcpPromptResult>(
+      `/v1/relux/mcp/servers/${encodeURIComponent(id)}/prompts/get`,
+      { name, arguments: args ?? {} },
     ),
   // --- Managed-stdio process lifecycle (managed_stdio servers only) ---------
   // The managed-process status for every registered managed-stdio server.

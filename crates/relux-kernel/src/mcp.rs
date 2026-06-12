@@ -228,6 +228,58 @@ pub fn read_resource(
     })
 }
 
+/// Run the MCP `initialize` handshake, then `prompts/list`, against the loopback
+/// `endpoint`, returning the discovered prompts (sanitized + bounded) or an honest
+/// [`McpClientError`].
+///
+/// `endpoint` must already be a validated loopback URL; it is re-validated here. The
+/// requests share a streamable-HTTP session (see [`Session`]). Prompts are READ-ONLY
+/// templates — this performs a bounded loopback read and changes nothing on the server.
+pub fn list_prompts(
+    endpoint: &str,
+    timeout_ms: u64,
+) -> Result<Vec<relux_core::McpPrompt>, McpClientError> {
+    // Re-validate the loopback endpoint on every call (defense in depth).
+    let _ =
+        parse_loopback_url(endpoint).map_err(|e| McpClientError::InvalidEndpoint(e.to_string()))?;
+
+    run_with_session(endpoint, timeout_ms, |session| {
+        let result = session.request("prompts/list", &serde_json::json!({}))?;
+        parse_prompts_list(&result)
+    })
+}
+
+/// Run the MCP `initialize` handshake, then `prompts/get` for `name` with
+/// `arguments`, against the loopback `endpoint`, returning a **shaped, sanitized,
+/// secret-redacted** [`relux_core::McpPromptResult`] (never the raw JSON-RPC
+/// envelope) or an honest [`McpClientError`].
+///
+/// `endpoint` must already be a validated loopback URL; it is re-validated here.
+/// `name` is the prompt name forwarded as the `prompts/get` `{ name }` param (the
+/// caller is responsible for validating it with
+/// [`relux_core::is_valid_mcp_prompt_name`]); `arguments` is the operator-supplied
+/// JSON args object forwarded as `{ arguments }`. Mirrors Hermes' `prompts/get`
+/// shaping (`reference/hermes-agent-main/tools/mcp_tool.py` L2633-2654): the result's
+/// `messages` are mapped to `{ role, content }`, each content materialized to text,
+/// sanitized, secret-redacted, and bounded. Getting a prompt is inert — it returns
+/// template text, NOT a turn Relux executes.
+pub fn get_prompt(
+    endpoint: &str,
+    name: &str,
+    arguments: &serde_json::Value,
+    timeout_ms: u64,
+) -> Result<relux_core::McpPromptResult, McpClientError> {
+    // Re-validate the loopback endpoint on every call (defense in depth).
+    let _ =
+        parse_loopback_url(endpoint).map_err(|e| McpClientError::InvalidEndpoint(e.to_string()))?;
+
+    run_with_session(endpoint, timeout_ms, |session| {
+        let params = serde_json::json!({ "name": name, "arguments": arguments });
+        let result = session.request("prompts/get", &params)?;
+        shape_get_prompt_result(&result, name)
+    })
+}
+
 /// Open a streamable-HTTP [`Session`] against `endpoint` (run the `initialize`
 /// handshake), then run `op` (the `tools/list` or `tools/call` step) under it. If
 /// the server rejects an established session with HTTP `404` (the streamable-HTTP
@@ -572,6 +624,153 @@ pub(crate) fn shape_resource_read_result(
         text,
         binary,
     })
+}
+
+/// Parse a `prompts/list` JSON-RPC result into bounded, sanitized
+/// [`relux_core::McpPrompt`]s. Mirrors Hermes' `_make_list_prompts_handler`
+/// (`mcp_tool.py` L2566-2582): collect `{ name, description?, arguments:[{name,
+/// description?, required?}] }`, skipping any entry without a usable name. Every
+/// string is sanitized + clamped; the argument list is bounded.
+///
+/// `pub(crate)` so the managed-stdio client ([`crate::mcp_stdio`]) reuses the SAME
+/// bounding/sanitizing — only the transport differs.
+pub(crate) fn parse_prompts_list(
+    result: &serde_json::Value,
+) -> Result<Vec<relux_core::McpPrompt>, McpClientError> {
+    let prompts = result
+        .get("prompts")
+        .and_then(|t| t.as_array())
+        .ok_or_else(|| McpClientError::BadResponse("result had no `prompts` array".to_string()))?;
+    let mut out = Vec::new();
+    for prompt in prompts.iter().take(relux_core::MAX_MCP_PROMPTS) {
+        // A prompt with no usable name is unfetchable; skip it rather than fail the
+        // whole listing (one malformed entry shouldn't hide the rest).
+        let Some(name) = prompt.get("name").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let description = prompt
+            .get("description")
+            .and_then(|d| d.as_str())
+            .map(relux_core::sanitize_mcp_prompt_description)
+            .unwrap_or_default();
+        let mut arguments = Vec::new();
+        if let Some(args) = prompt.get("arguments").and_then(|a| a.as_array()) {
+            for arg in args.iter().take(relux_core::MAX_MCP_PROMPT_ARGS) {
+                let Some(arg_name) = arg.get("name").and_then(|n| n.as_str()) else {
+                    continue;
+                };
+                let arg_name = arg_name.trim();
+                if arg_name.is_empty() {
+                    continue;
+                }
+                let arg_desc = arg
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .map(relux_core::sanitize_mcp_prompt_description)
+                    .unwrap_or_default();
+                let required = arg.get("required").and_then(|r| r.as_bool()).unwrap_or(false);
+                arguments.push(relux_core::McpPromptArgument {
+                    name: arg_name
+                        .chars()
+                        .take(relux_core::MAX_MCP_PROMPT_NAME_CHARS)
+                        .collect(),
+                    description: arg_desc,
+                    required,
+                });
+            }
+        }
+        out.push(relux_core::McpPrompt {
+            name: name.chars().take(relux_core::MAX_MCP_PROMPT_NAME_CHARS).collect(),
+            description,
+            arguments,
+        });
+    }
+    Ok(out)
+}
+
+/// Shape a raw `prompts/get` JSON-RPC result into a bounded, sanitized,
+/// secret-redacted [`relux_core::McpPromptResult`]. Mirrors Hermes'
+/// `_make_get_prompt_handler` (`mcp_tool.py` L2637-2654): map each `messages` entry
+/// to `{ role, content }`, materializing the content (a `{ text }` block taken
+/// verbatim, a bare string used as-is, a non-text block summarized), then sanitize,
+/// **secret-redact** ([`relux_core::redact_secrets`] — a credential embedded in a
+/// prompt template never leaks verbatim), and clamp it. The message list is bounded.
+/// Never returns the raw envelope.
+///
+/// `pub(crate)` so the managed-stdio client ([`crate::mcp_stdio`]) reuses the SAME
+/// security-sensitive shaping/redaction — the transport differs, the result handling
+/// does not.
+pub(crate) fn shape_get_prompt_result(
+    result: &serde_json::Value,
+    name: &str,
+) -> Result<relux_core::McpPromptResult, McpClientError> {
+    let description = result
+        .get("description")
+        .and_then(|d| d.as_str())
+        .map(relux_core::sanitize_mcp_prompt_description)
+        .filter(|s| !s.is_empty());
+    let mut messages = Vec::new();
+    if let Some(items) = result.get("messages").and_then(|m| m.as_array()) {
+        for msg in items.iter().take(relux_core::MAX_MCP_PROMPT_MESSAGES) {
+            let role = msg
+                .get("role")
+                .and_then(|r| r.as_str())
+                .map(|s| relux_core::sanitize_mcp_text(s, relux_core::MAX_MCP_PROMPT_ROLE_CHARS))
+                .unwrap_or_default();
+            let raw = extract_prompt_message_content(msg.get("content"));
+            let sanitized = sanitize_result_text(&raw, relux_core::MAX_MCP_PROMPT_MESSAGE_CHARS);
+            // Redact obvious secrets so a credential embedded in a template never leaks.
+            let content = relux_core::redact_secrets(&sanitized);
+            messages.push(relux_core::McpPromptMessage { role, content });
+        }
+    }
+    Ok(relux_core::McpPromptResult {
+        name: name.chars().take(relux_core::MAX_MCP_PROMPT_NAME_CHARS).collect(),
+        description,
+        messages,
+    })
+}
+
+/// Materialize one prompt message's `content` to text. Mirrors Hermes' content
+/// handling (`mcp_tool.py` L2643-2649): a `{ text }` object (optionally `{ type:
+/// "text", text }`) uses its text; a bare string is used as-is; an array of content
+/// blocks is joined (text verbatim, a non-text block summarized as a `[non-text
+/// content: <type>]` marker); anything else is summarized rather than dumped raw.
+fn extract_prompt_message_content(content: Option<&serde_json::Value>) -> String {
+    match content {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Object(obj)) => {
+            if let Some(t) = obj.get("text").and_then(|t| t.as_str()) {
+                t.to_string()
+            } else {
+                let kind = obj
+                    .get("type")
+                    .and_then(|k| k.as_str())
+                    .unwrap_or("unknown");
+                format!("[non-text content: {kind}]")
+            }
+        }
+        Some(serde_json::Value::Array(items)) => {
+            let mut parts: Vec<String> = Vec::new();
+            for block in items {
+                if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                    parts.push(t.to_string());
+                    continue;
+                }
+                let kind = block
+                    .get("type")
+                    .and_then(|k| k.as_str())
+                    .unwrap_or("unknown");
+                parts.push(format!("[non-text content: {kind}]"));
+            }
+            parts.join("\n")
+        }
+        _ => String::new(),
+    }
 }
 
 /// POST one JSON-RPC request to the loopback endpoint and return `(result_value,
@@ -1296,6 +1495,120 @@ mod tests {
         ];
         let (endpoint, _rx) = mock_server(responses);
         let err = list_resources(&endpoint, 2_000).unwrap_err();
+        assert!(matches!(err, McpClientError::ServerError { code: -32601, .. }));
+    }
+
+    // --- MCP prompts (prompts/list + prompts/get) --------------------------
+
+    #[test]
+    fn lists_prompts_after_initialize() {
+        let responses = vec![
+            http_json(init_ok()),
+            http_empty_ok(),
+            http_json(serde_json::json!({
+                "jsonrpc": "2.0", "id": 2,
+                "result": { "prompts": [
+                    { "name": "greet", "description": "Greet a person.",
+                      "arguments": [ { "name": "who", "description": "Name.", "required": true } ] },
+                    { "name": "summary" },
+                    { "description": "no-name-skipped" }
+                ]}
+            })),
+        ];
+        let (endpoint, rx) = mock_server(responses);
+        let prompts = list_prompts(&endpoint, 2_000).expect("list ok");
+        // The entry with no name is skipped, not fatal.
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts[0].name, "greet");
+        assert_eq!(prompts[0].description, "Greet a person.");
+        assert_eq!(prompts[0].arguments.len(), 1);
+        assert_eq!(prompts[0].arguments[0].name, "who");
+        assert!(prompts[0].arguments[0].required);
+        assert!(prompts[1].arguments.is_empty());
+        let first = rx.recv().unwrap();
+        assert!(first.contains("initialize"), "first req: {first}");
+    }
+
+    #[test]
+    fn get_prompt_shapes_messages_forwards_args_and_redacts_secrets() {
+        let responses = vec![
+            http_json(init_ok()),
+            http_empty_ok(),
+            http_json(serde_json::json!({
+                "jsonrpc": "2.0", "id": 2,
+                "result": {
+                    "description": "A greeting.",
+                    "messages": [
+                        { "role": "user", "content": { "type": "text",
+                          "text": "Hello alice. token=sk-supersecretvalue1234567890" } },
+                        { "role": "assistant", "content": "Hi!" }
+                    ]
+                }
+            })),
+        ];
+        let (endpoint, rx) = mock_server(responses);
+        let out = get_prompt(&endpoint, "greet", &serde_json::json!({ "who": "alice" }), 2_000)
+            .expect("get ok");
+        assert_eq!(out.name, "greet");
+        assert_eq!(out.description.as_deref(), Some("A greeting."));
+        assert_eq!(out.messages.len(), 2);
+        assert_eq!(out.messages[0].role, "user");
+        // The legit prose survives; the embedded secret is redacted (never verbatim).
+        assert!(out.messages[0].content.contains("Hello alice"), "msg: {}", out.messages[0].content);
+        assert!(
+            !out.messages[0].content.contains("sk-supersecretvalue1234567890"),
+            "secret must be redacted: {}",
+            out.messages[0].content
+        );
+        // A bare-string content block is used as-is.
+        assert_eq!(out.messages[1].role, "assistant");
+        assert_eq!(out.messages[1].content, "Hi!");
+        // The raw JSON-RPC envelope is never surfaced.
+        let _init = rx.recv().unwrap();
+        let _notif = rx.recv().unwrap();
+        let get = rx.recv().unwrap();
+        assert!(get.contains("prompts/get"), "get req: {get}");
+        assert!(get.contains("alice"), "get req carried args: {get}");
+    }
+
+    #[test]
+    fn get_prompt_summarizes_non_text_content() {
+        let responses = vec![
+            http_json(init_ok()),
+            http_empty_ok(),
+            http_json(serde_json::json!({
+                "jsonrpc": "2.0", "id": 2,
+                "result": { "messages": [
+                    { "role": "user", "content": { "type": "image", "data": "…", "mimeType": "image/png" } }
+                ]}
+            })),
+        ];
+        let (endpoint, _rx) = mock_server(responses);
+        let out = get_prompt(&endpoint, "snap", &serde_json::json!({}), 2_000).unwrap();
+        assert_eq!(out.messages[0].content, "[non-text content: image]");
+    }
+
+    #[test]
+    fn prompt_calls_reject_non_loopback_before_dialing() {
+        let err = list_prompts("https://evil.example.com/mcp", 500).unwrap_err();
+        assert!(matches!(err, McpClientError::InvalidEndpoint(_)));
+        let err = get_prompt("https://evil.example.com/mcp", "x", &serde_json::json!({}), 500)
+            .unwrap_err();
+        assert!(matches!(err, McpClientError::InvalidEndpoint(_)));
+    }
+
+    #[test]
+    fn prompts_list_jsonrpc_error_is_surfaced_honestly() {
+        let responses = vec![
+            http_json(init_ok()),
+            http_empty_ok(),
+            http_json(serde_json::json!({
+                "jsonrpc": "2.0", "id": 2,
+                "error": { "code": -32601, "message": "prompts not supported" }
+            })),
+        ];
+        let (endpoint, _rx) = mock_server(responses);
+        let err = list_prompts(&endpoint, 2_000).unwrap_err();
         assert!(matches!(err, McpClientError::ServerError { code: -32601, .. }));
     }
 }

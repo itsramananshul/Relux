@@ -208,6 +208,19 @@ pub const READ_ONLY_TOOLS: &[ContextTool] = &[
                   bounded). Read-only context — performs no action.",
         args_hint: "{\"server_id\":\"<mcp server id>\",\"uri\":\"<resource uri from mcp_list_resources>\"}",
     },
+    ContextTool {
+        name: "mcp_list_prompts",
+        summary: "List the read-only prompt templates an MCP server advertises: name, description, \
+                  arguments. Performs a bounded read; mutates nothing.",
+        args_hint: "{\"server_id\":\"<registered MCP server id>\"}",
+    },
+    ContextTool {
+        name: "mcp_get_prompt",
+        summary: "Materialize ONE MCP prompt by name (with optional arguments) into messages \
+                  (secrets redacted; bounded). Read-only context — returns template text, NOT a \
+                  turn to run.",
+        args_hint: "{\"server_id\":\"<mcp server id>\",\"name\":\"<prompt name>\",\"arguments\":{…}}",
+    },
 ];
 
 /// The fail-closed read-only classification of a requested tool name. The first slice has only
@@ -460,6 +473,21 @@ fn read_uri_arg(args: &serde_json::Map<String, serde_json::Value>, key: &str) ->
     }
 }
 
+/// Read a required prompt-name argument: trim and validate against
+/// [`relux_core::is_valid_mcp_prompt_name`] (non-empty, bounded, control-char free). Returns
+/// `None` when missing or unsafe (the executor then reports an honest refusal), never forwarding a
+/// malformed name to the server. Like [`read_uri_arg`] it preserves inner structure (a prompt name
+/// may contain spaces/punctuation), unlike the id-collapsing [`read_id_arg`].
+fn read_prompt_name_arg(args: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+    let raw = args.get(key)?.as_str()?;
+    let trimmed = raw.trim();
+    if relux_core::is_valid_mcp_prompt_name(trimmed) {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
 /// The self-correction message fed back when the brain names a tool that is not on the read-only
 /// allowlist (Hermes's `"Tool '…' does not exist. Available: …"`). The loop re-prompts with this;
 /// it never executes the off-list name.
@@ -558,6 +586,8 @@ pub fn execute_context_tool(snapshot: &ContextSnapshot, call: &ToolCall) -> Cont
         "list_mcp_servers" => list_mcp_servers_read(snapshot),
         "mcp_list_resources" => mcp_list_resources_read(snapshot, &call.args),
         "mcp_read_resource" => mcp_read_resource_read(snapshot, &call.args),
+        "mcp_list_prompts" => mcp_list_prompts_read(snapshot, &call.args),
+        "mcp_get_prompt" => mcp_get_prompt_read(snapshot, &call.args),
         other => ContextRead {
             tool: other.to_string(),
             ok: false,
@@ -1038,6 +1068,155 @@ fn mcp_read_resource_read(
             tool,
             ok: false,
             summary: format!("read of {uri} from '{server_id}' failed"),
+            detail: sanitize_line(&e.to_string(), MAX_RESULT_CHARS),
+        },
+    }
+}
+
+/// `mcp_list_prompts` — live, READ-ONLY `prompts/list` against one registered MCP server.
+/// Performs a bounded read (loopback HTTP or managed-stdio subprocess, dispatched on the server's
+/// transport) OUTSIDE the kernel lock and mutates nothing. Honest by construction: a
+/// missing/unknown/disabled server, or a transport failure, is an `ok:false` read with the
+/// reason — never a fabricated list.
+fn mcp_list_prompts_read(
+    snapshot: &ContextSnapshot,
+    args: &serde_json::Map<String, serde_json::Value>,
+) -> ContextRead {
+    let tool = "mcp_list_prompts".to_string();
+    let Some(server_id) = read_id_arg(args, "server_id") else {
+        return ContextRead {
+            tool,
+            ok: false,
+            summary: "mcp_list_prompts needs a server_id".to_string(),
+            detail: "Provide {\"server_id\":\"<registered MCP server id>\"}. Use list_mcp_servers \
+                     to see the available ids."
+                .to_string(),
+        };
+    };
+    let Some(server) = snapshot.mcp_servers.iter().find(|s| s.id == server_id) else {
+        return ContextRead {
+            tool,
+            ok: false,
+            summary: format!("no MCP server '{server_id}'"),
+            detail: format!("No MCP server '{server_id}' is registered. Use list_mcp_servers."),
+        };
+    };
+    if !server.enabled {
+        return ContextRead {
+            tool,
+            ok: false,
+            summary: format!("MCP server '{server_id}' is disabled"),
+            detail: format!("MCP server '{server_id}' is registered but disabled; an operator must enable it."),
+        };
+    }
+    match crate::state::mcp_view_list_prompts(server) {
+        Ok(prompts) if prompts.is_empty() => ContextRead {
+            tool,
+            ok: true,
+            summary: format!("MCP server '{server_id}' lists no prompts"),
+            detail: "(no prompts advertised)".to_string(),
+        },
+        Ok(prompts) => {
+            let detail = bounded_lines(&prompts, |p| {
+                let args_n = p.arguments.len();
+                format!("{} args={} {}", p.name, args_n, p.description).trim().to_string()
+            });
+            ContextRead {
+                tool,
+                ok: true,
+                summary: format!("{} prompts from '{server_id}'", prompts.len()),
+                detail: clamp_detail(detail),
+            }
+        }
+        Err(e) => ContextRead {
+            tool,
+            ok: false,
+            summary: format!("MCP server '{server_id}' prompt list failed"),
+            detail: sanitize_line(&e.to_string(), MAX_RESULT_CHARS),
+        },
+    }
+}
+
+/// `mcp_get_prompt` — live, READ-ONLY `prompts/get` of ONE prompt by name (with optional
+/// arguments) from a registered MCP server. Performs a bounded read (loopback HTTP or
+/// managed-stdio subprocess, dispatched on the server's transport) OUTSIDE the lock and mutates
+/// nothing; the materialized messages are already sanitized, secret-redacted, and clamped by the
+/// client. CRUCIALLY this returns the prompt template text as CONTEXT — it is never auto-run as a
+/// user turn. Honest: a missing/invalid name, an unknown/disabled server, or a transport failure
+/// is an `ok:false` read — never a fabricated body.
+fn mcp_get_prompt_read(
+    snapshot: &ContextSnapshot,
+    args: &serde_json::Map<String, serde_json::Value>,
+) -> ContextRead {
+    let tool = "mcp_get_prompt".to_string();
+    let Some(server_id) = read_id_arg(args, "server_id") else {
+        return ContextRead {
+            tool,
+            ok: false,
+            summary: "mcp_get_prompt needs a server_id".to_string(),
+            detail: "Provide {\"server_id\":\"<id>\",\"name\":\"<prompt name>\"}.".to_string(),
+        };
+    };
+    let Some(server) = snapshot.mcp_servers.iter().find(|s| s.id == server_id) else {
+        return ContextRead {
+            tool,
+            ok: false,
+            summary: format!("no MCP server '{server_id}'"),
+            detail: format!("No MCP server '{server_id}' is registered. Use list_mcp_servers."),
+        };
+    };
+    if !server.enabled {
+        return ContextRead {
+            tool,
+            ok: false,
+            summary: format!("MCP server '{server_id}' is disabled"),
+            detail: format!("MCP server '{server_id}' is registered but disabled."),
+        };
+    }
+    let Some(name) = read_prompt_name_arg(args, "name") else {
+        return ContextRead {
+            tool,
+            ok: false,
+            summary: "mcp_get_prompt needs a valid name".to_string(),
+            detail: "Provide a non-empty, bounded prompt name (from mcp_list_prompts).".to_string(),
+        };
+    };
+    // The optional arguments object is forwarded as-is (an object, else {}). It is never
+    // executed — only used to materialize the template the server returns.
+    let arguments = match args.get("arguments") {
+        Some(v) if v.is_object() => v.clone(),
+        _ => serde_json::json!({}),
+    };
+    match crate::state::mcp_view_get_prompt(server, &name, &arguments) {
+        Ok(result) => {
+            let mut body = String::new();
+            if let Some(desc) = &result.description {
+                body.push_str(&format!("description: {desc}\n"));
+            }
+            for msg in &result.messages {
+                body.push_str(&format!("[{}] {}\n", msg.role, msg.content));
+            }
+            let body = if body.trim().is_empty() {
+                "(empty prompt)".to_string()
+            } else {
+                body
+            };
+            ContextRead {
+                tool,
+                ok: true,
+                summary: format!(
+                    "prompt {} from '{server_id}' ({} message{})",
+                    name,
+                    result.messages.len(),
+                    if result.messages.len() == 1 { "" } else { "s" }
+                ),
+                detail: clamp_detail(body),
+            }
+        }
+        Err(e) => ContextRead {
+            tool,
+            ok: false,
+            summary: format!("get of prompt {name} from '{server_id}' failed"),
             detail: sanitize_line(&e.to_string(), MAX_RESULT_CHARS),
         },
     }

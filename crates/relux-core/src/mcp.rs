@@ -823,6 +823,117 @@ pub fn sanitize_mcp_resource_description(s: &str) -> String {
     sanitize_mcp_text(s, MAX_MCP_RESOURCE_DESC_CHARS)
 }
 
+// --- MCP prompts (read-only prompt templates) -----------------------------
+//
+// MCP prompts are a THIRD read-only surface alongside tools + resources: a
+// server advertises named, parameterizable prompt templates via `prompts/list`,
+// and a client materializes one (with arguments) into chat messages via
+// `prompts/get`. Like resources they are inert — listing or getting a prompt
+// performs no action and mutates nothing; getting one returns template text, NOT
+// a turn Relux executes. That is exactly why they are safe to expose as a
+// read-only context surface. See `docs/mcp.md` "MCP prompts" and Hermes
+// `reference/hermes-agent-main/tools/mcp_tool.py` (`_make_list_prompts_handler`
+// L2552-2612 → `{name, description?, arguments:[{name,description?,required?}]}`;
+// `_make_get_prompt_handler` L2615-2681 → `GetPromptResult{messages:[{role,
+// content}], description?}` shaped to per-message text). We mirror that shaping;
+// the actual JSON-RPC client is `relux-kernel::mcp` / `::mcp_stdio`.
+
+/// Hard cap on how many prompts a single server may surface in one
+/// `prompts/list`, so a misbehaving server cannot flood the context.
+pub const MAX_MCP_PROMPTS: usize = 256;
+/// Max characters kept for a prompt name. A prompt name is echoed verbatim into a
+/// `prompts/get` request, so it is bounded; the shape is checked by
+/// [`is_valid_mcp_prompt_name`].
+pub const MAX_MCP_PROMPT_NAME_CHARS: usize = 256;
+/// Max characters kept for a prompt / prompt-argument description.
+pub const MAX_MCP_PROMPT_DESC_CHARS: usize = 600;
+/// Max number of declared arguments kept per prompt.
+pub const MAX_MCP_PROMPT_ARGS: usize = 64;
+/// Max number of messages kept from a `prompts/get` result.
+pub const MAX_MCP_PROMPT_MESSAGES: usize = 64;
+/// Max characters of a single materialized prompt message's content (model/
+/// operator-facing), so a large template message never floods the UI or a prompt.
+pub const MAX_MCP_PROMPT_MESSAGE_CHARS: usize = 8_000;
+/// Max characters kept for a prompt message role label.
+pub const MAX_MCP_PROMPT_ROLE_CHARS: usize = 32;
+
+/// One declared argument of an MCP prompt (from `prompts/list`). Pure metadata —
+/// it carries no value, only the name + optional description + whether it is
+/// required. Every string is already sanitized + clamped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpPromptArgument {
+    /// The argument name the caller supplies in `prompts/get` `arguments`.
+    pub name: String,
+    /// The sanitized, bounded argument description (may be empty).
+    pub description: String,
+    /// Whether the server marks this argument required.
+    pub required: bool,
+}
+
+/// One prompt template discovered from a server's live `prompts/list` response.
+///
+/// Built by the kernel client; every string is already sanitized + clamped. Pure
+/// data — it carries no transport state and no materialized body (only the
+/// addressable metadata). The body is fetched separately, on demand, via
+/// `prompts/get`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpPrompt {
+    /// The prompt name as advertised by the server (the `prompts/get` key).
+    pub name: String,
+    /// The sanitized, bounded prompt description (may be empty).
+    pub description: String,
+    /// The prompt's declared arguments (may be empty), bounded to
+    /// [`MAX_MCP_PROMPT_ARGS`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arguments: Vec<McpPromptArgument>,
+}
+
+/// One materialized message from a `prompts/get` result: a role + the sanitized,
+/// secret-redacted, bounded content text. Never the raw content envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpPromptMessage {
+    /// The message role as advertised (e.g. `user` / `assistant`), bounded.
+    pub role: String,
+    /// The message content: a text block taken verbatim, a non-text block
+    /// summarized with a `[non-text content: <type>]` marker, then sanitized,
+    /// **secret-redacted**, and clamped to [`MAX_MCP_PROMPT_MESSAGE_CHARS`].
+    pub content: String,
+}
+
+/// The shaped, sanitized, secret-redacted result of a `prompts/get`: the prompt's
+/// optional description plus its materialized messages. Never the raw JSON-RPC
+/// envelope. Getting a prompt is inert — it returns template text Relux shows as
+/// context, never a turn Relux executes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpPromptResult {
+    /// The prompt name that was materialized (echoed back from the request).
+    pub name: String,
+    /// The server's optional description of the materialized prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The materialized messages (bounded to [`MAX_MCP_PROMPT_MESSAGES`]).
+    pub messages: Vec<McpPromptMessage>,
+}
+
+/// Whether `name` is a safe MCP prompt name to fetch: non-empty, at most
+/// [`MAX_MCP_PROMPT_NAME_CHARS`] characters, and free of control characters
+/// (including `CR`/`LF`/`NUL`). A prompt name carries arbitrary text (it is echoed
+/// inside a JSON-encoded `prompts/get` request, which quotes it safely), so — like
+/// a resource URI and unlike a tool name — it is NOT restricted to an identifier
+/// charset; it is bounded + control-char-free here. A name that fails this is
+/// refused on get (fail closed) rather than forwarded to the server.
+pub fn is_valid_mcp_prompt_name(name: &str) -> bool {
+    let name = name.trim();
+    !name.is_empty()
+        && name.chars().count() <= MAX_MCP_PROMPT_NAME_CHARS
+        && !name.chars().any(|c| c.is_control())
+}
+
+/// Sanitize + clamp a discovered MCP prompt (or prompt-argument) description.
+pub fn sanitize_mcp_prompt_description(s: &str) -> String {
+    sanitize_mcp_text(s, MAX_MCP_PROMPT_DESC_CHARS)
+}
+
 /// Heuristic prompt-injection patterns for MCP tool descriptions. Lower-cased
 /// needles checked with `contains` — dependency-free (no `regex`), WARNING-level
 /// only. Mirrors Hermes `_MCP_INJECTION_PATTERNS` (`tools/mcp_tool.py` L340-365):
@@ -1250,6 +1361,18 @@ mod tests {
         assert!(!is_valid_mcp_resource_uri("file:///a\r\nb"));
         assert!(!is_valid_mcp_resource_uri("file:///a\u{0}b"));
         assert!(!is_valid_mcp_resource_uri(&"x".repeat(MAX_MCP_RESOURCE_URI_CHARS + 1)));
+    }
+
+    #[test]
+    fn valid_prompt_names_are_bounded_and_control_free() {
+        assert!(is_valid_mcp_prompt_name("greet"));
+        assert!(is_valid_mcp_prompt_name("summarize a thread"));
+        // Empty, control chars (CRLF/NUL), and over-long are refused (fail closed).
+        assert!(!is_valid_mcp_prompt_name(""));
+        assert!(!is_valid_mcp_prompt_name("   "));
+        assert!(!is_valid_mcp_prompt_name("a\r\nb"));
+        assert!(!is_valid_mcp_prompt_name("a\u{0}b"));
+        assert!(!is_valid_mcp_prompt_name(&"x".repeat(MAX_MCP_PROMPT_NAME_CHARS + 1)));
     }
 
     #[test]

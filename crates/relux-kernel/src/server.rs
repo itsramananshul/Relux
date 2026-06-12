@@ -278,6 +278,8 @@ async fn serve() -> Result<(), KernelError> {
     println!("   POST   /v1/relux/mcp/servers/:id/restart   (stop then start the managed-stdio process)");
     println!("   GET    /v1/relux/mcp/servers/:id/resources (live resources/list → McpResource[]; read-only context)");
     println!("   GET    /v1/relux/mcp/servers/:id/resources/read?uri=…  (read one resource → shaped, redacted text)");
+    println!("   GET    /v1/relux/mcp/servers/:id/prompts   (live prompts/list → McpPrompt[]; read-only templates)");
+    println!("   POST   /v1/relux/mcp/servers/:id/prompts/get  {{ \"name\":…, \"arguments\"?:{{…}} }}  (materialize one prompt → shaped, redacted messages)");
     println!("   PUT    /v1/relux/mcp/servers/:id/tools/:tool/classification  {{ \"risk\":\"low|medium|high|critical\", \"approval\":\"never|required\" }}");
     println!("   DELETE /v1/relux/mcp/servers/:id/tools/:tool/classification  (revert to the gated default)");
     println!("          (MCP tools invoke through /v1/relux/tools/invoke etc. with plugin_id \"mcp:<server>\")");
@@ -594,6 +596,12 @@ fn protected_router() -> Router<AppState> {
         .route(
             "/v1/relux/mcp/servers/:id/resources/read",
             get(mcp_read_resource_route),
+        )
+        // MCP prompts — read-only template source (prompts/list + prompts/get).
+        .route("/v1/relux/mcp/servers/:id/prompts", get(mcp_server_prompts))
+        .route(
+            "/v1/relux/mcp/servers/:id/prompts/get",
+            post(mcp_get_prompt_route),
         )
         .route(
             "/v1/relux/mcp/servers/:id/tools/:tool/classification",
@@ -8398,6 +8406,70 @@ async fn mcp_read_resource_route(
     Ok(Json(content))
 }
 
+/// The live `prompts/list` response for one MCP server. Honest by construction: on a
+/// transport/protocol failure the route surfaces the error (4xx/5xx via [`ApiError`]);
+/// a successful probe returns the advertised prompt templates. Prompts are READ-ONLY
+/// — listing them performs no action and changes nothing.
+#[derive(Debug, Serialize)]
+struct McpPromptsResponse {
+    server_id: String,
+    /// True when the live `prompts/list` probe succeeded.
+    reachable: bool,
+    prompts: Vec<relux_core::McpPrompt>,
+}
+
+/// GET `/v1/relux/mcp/servers/:id/prompts` — run a live `prompts/list` against the
+/// server. Unknown id → 404; disabled → 409; a transport/protocol failure → 502
+/// (never a fabricated empty list). Read-only: a read lock is enough.
+async fn mcp_server_prompts(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<McpPromptsResponse>, ApiError> {
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err(ApiError::bad_request("MCP server id is required"));
+    }
+    let prompts = locked_read(&state, |kernel| kernel.list_mcp_prompts(&id))?;
+    Ok(Json(McpPromptsResponse {
+        server_id: id,
+        reachable: true,
+        prompts,
+    }))
+}
+
+/// Request body for `POST /v1/relux/mcp/servers/:id/prompts/get`. The `name` selects
+/// the prompt; `arguments` (optional) is the JSON args object forwarded to the server.
+/// POST (not GET) because the arguments are a structured object — but the handler is
+/// still **read-only** (it holds only a read lock and a `prompts/get` mutates nothing).
+#[derive(Debug, Deserialize)]
+struct McpGetPromptBody {
+    name: String,
+    #[serde(default)]
+    arguments: Option<serde_json::Value>,
+}
+
+/// POST `/v1/relux/mcp/servers/:id/prompts/get` — materialize ONE prompt by name (with
+/// arguments), returning the shaped, sanitized, secret-redacted messages. Unknown id →
+/// 404; disabled → 409; an invalid/empty name → 400; a transport/protocol failure →
+/// 502. Read-only: a `prompts/get` returns template text, never a turn Relux runs.
+async fn mcp_get_prompt_route(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<McpGetPromptBody>,
+) -> Result<Json<relux_core::McpPromptResult>, ApiError> {
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err(ApiError::bad_request("MCP server id is required"));
+    }
+    let name = body.name.trim().to_string();
+    if name.is_empty() {
+        return Err(ApiError::bad_request("a prompt `name` is required"));
+    }
+    let arguments = body.arguments.unwrap_or_else(|| serde_json::json!({}));
+    let result = locked_read(&state, |kernel| kernel.get_mcp_prompt(&id, &name, &arguments))?;
+    Ok(Json(result))
+}
+
 // --- Store access (serialized) ---------------------------------------------
 
 /// Lock, open the store, load + bootstrap, run `f`, then SAVE. For mutations.
@@ -8954,14 +9026,14 @@ fn status_for(err: &KernelError) -> StatusCode {
         KernelError::McpServerDisabled(_) => StatusCode::CONFLICT,
         // A live resource list/read failure against the operator's loopback server is
         // an upstream (bad gateway) failure, surfaced honestly (never a fake empty).
-        KernelError::McpDiscoveryFailed { .. } | KernelError::McpResourceFetchFailed { .. } => {
-            StatusCode::BAD_GATEWAY
-        }
-        // An invalid MCP tool name / resource URI (classification, invocation, read)
-        // is bad input.
-        KernelError::InvalidMcpToolName { .. } | KernelError::InvalidMcpResourceUri { .. } => {
-            StatusCode::BAD_REQUEST
-        }
+        KernelError::McpDiscoveryFailed { .. }
+        | KernelError::McpResourceFetchFailed { .. }
+        | KernelError::McpPromptFetchFailed { .. } => StatusCode::BAD_GATEWAY,
+        // An invalid MCP tool name / resource URI / prompt name (classification,
+        // invocation, read, get) is bad input.
+        KernelError::InvalidMcpToolName { .. }
+        | KernelError::InvalidMcpResourceUri { .. }
+        | KernelError::InvalidMcpPromptName { .. } => StatusCode::BAD_REQUEST,
         // A lifecycle action (start/stop/restart) was asked for a non-stdio server.
         KernelError::NotAManagedStdioServer(_) => StatusCode::BAD_REQUEST,
         // A configured tool that requires approval cannot be invoked directly yet:
@@ -12213,6 +12285,49 @@ mod tests {
             "/v1/relux/mcp/servers/fs/resources/read?uri=file:///x.md",
             None,
             None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn mcp_prompt_routes_are_honest_on_bad_input() {
+        let (state, _dir) = auth_state(true);
+        // Prompts on an unknown server → 404 (never a fabricated empty list).
+        let (status, _, _) =
+            call(&state, "GET", "/v1/relux/mcp/servers/nope/prompts", None, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // Get with a missing name → 400.
+        let (status, _, _) = call(
+            &state,
+            "POST",
+            "/v1/relux/mcp/servers/nope/prompts/get",
+            None,
+            Some(r#"{"name":""}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Register, then a disabled server: prompts on a disabled server → 409.
+        let (status, _, _) = call(
+            &state,
+            "POST",
+            "/v1/relux/mcp/servers",
+            None,
+            Some(r#"{"id":"fs","endpoint":"http://127.0.0.1:8000/mcp","enabled":false}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, _) =
+            call(&state, "GET", "/v1/relux/mcp/servers/fs/prompts", None, None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        // Get with a name but a disabled server → 409 (gate before dialing).
+        let (status, _, _) = call(
+            &state,
+            "POST",
+            "/v1/relux/mcp/servers/fs/prompts/get",
+            None,
+            Some(r#"{"name":"greet"}"#),
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT);

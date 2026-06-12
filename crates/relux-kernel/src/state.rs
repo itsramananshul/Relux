@@ -1635,6 +1635,71 @@ impl KernelState {
         })
     }
 
+    /// Run a live `prompts/list` against an enabled MCP server, returning the bounded,
+    /// sanitized prompt templates it advertises.
+    ///
+    /// MCP **prompts** are a read-only template surface (named, parameterizable prompt
+    /// snippets a server offers) — distinct from tools (which act) and resources (read-
+    /// only data). Listing them performs a bounded read (loopback HTTP or managed-stdio
+    /// subprocess, dispatched on the server's transport) and mutates nothing. Honest by
+    /// construction: an unknown server is [`KernelError::UnknownMcpServer`]; a disabled
+    /// one is [`KernelError::McpServerDisabled`]; a transport/protocol failure is
+    /// [`KernelError::McpPromptFetchFailed`] (never a fabricated empty list). Read-only
+    /// (`&self`): no audit mutation, mirroring [`Self::discover_mcp_tools`].
+    pub fn list_mcp_prompts(&self, id: &str) -> Result<Vec<relux_core::McpPrompt>, KernelError> {
+        let server = self
+            .mcp_servers
+            .get(id)
+            .ok_or_else(|| KernelError::UnknownMcpServer(id.to_string()))?;
+        if !server.enabled {
+            return Err(KernelError::McpServerDisabled(id.to_string()));
+        }
+        mcp_list_prompts(server).map_err(|e| KernelError::McpPromptFetchFailed {
+            id: id.to_string(),
+            message: e.to_string(),
+        })
+    }
+
+    /// Materialize ONE MCP prompt by name (with `arguments`) from an enabled MCP
+    /// server, returning the shaped, sanitized, secret-redacted
+    /// [`relux_core::McpPromptResult`] (per-message text only; secrets redacted —
+    /// never the raw envelope).
+    ///
+    /// A `prompts/get` is inert: it returns template text Relux shows as context, NOT
+    /// a turn Relux executes — so this is safe to expose as a read-only context source
+    /// (loopback HTTP or managed-stdio subprocess, dispatched on the server's
+    /// transport). Honest by construction: an unknown server is
+    /// [`KernelError::UnknownMcpServer`]; a disabled one is
+    /// [`KernelError::McpServerDisabled`]; an invalid name is
+    /// [`KernelError::InvalidMcpPromptName`] (fail closed, never dialed); a
+    /// transport/protocol failure is [`KernelError::McpPromptFetchFailed`]. Read-only
+    /// (`&self`): no audit mutation.
+    pub fn get_mcp_prompt(
+        &self,
+        id: &str,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<relux_core::McpPromptResult, KernelError> {
+        let server = self
+            .mcp_servers
+            .get(id)
+            .ok_or_else(|| KernelError::UnknownMcpServer(id.to_string()))?;
+        if !server.enabled {
+            return Err(KernelError::McpServerDisabled(id.to_string()));
+        }
+        let name = name.trim();
+        if !relux_core::is_valid_mcp_prompt_name(name) {
+            return Err(KernelError::InvalidMcpPromptName {
+                server: id.to_string(),
+                name: name.chars().take(120).collect(),
+            });
+        }
+        mcp_get_prompt(server, name, arguments).map_err(|e| KernelError::McpPromptFetchFailed {
+            id: id.to_string(),
+            message: e.to_string(),
+        })
+    }
+
     /// Set (or replace) the operator's risk + approval classification for ONE MCP
     /// tool, so a discovered tool can become directly runnable (Low + auto-approve)
     /// or stay gated. The server must exist and the tool name must be a safe
@@ -11868,6 +11933,78 @@ fn mcp_read_resource(
     }
 }
 
+/// Run a `prompts/list` against one MCP server, dispatching on its transport.
+/// Loopback HTTP dials the endpoint ([`crate::mcp`]); managed-stdio reuses the running
+/// process or spawns the command per-operation ([`crate::mcp_stdio`]). Prompts are a
+/// READ-ONLY template surface — both transports perform a bounded read and mutate
+/// nothing. The result handling (bounding/sanitizing) is the SAME for both. Used by
+/// [`KernelState::list_mcp_prompts`].
+fn mcp_list_prompts(
+    server: &relux_core::McpServerConfig,
+) -> Result<Vec<relux_core::McpPrompt>, crate::mcp::McpClientError> {
+    match server.transport {
+        relux_core::McpTransport::HttpLoopback => {
+            crate::mcp::list_prompts(&server.endpoint, server.timeout_ms)
+        }
+        relux_core::McpTransport::ManagedStdio => {
+            if crate::mcp_stdio::pool().is_running(&server.id) {
+                crate::mcp_stdio::pool().list_prompts(&server.id, server.timeout_ms)
+            } else {
+                let (env, cwd) = crate::secret_store::resolve_managed_env_and_cwd(
+                    &server.env,
+                    server.cwd.as_deref(),
+                )
+                .map_err(crate::mcp::McpClientError::Spawn)?;
+                let command = server.command.as_deref().unwrap_or("");
+                crate::mcp_stdio::list_prompts(
+                    command,
+                    &server.args,
+                    &env,
+                    cwd.as_deref(),
+                    server.timeout_ms,
+                )
+            }
+        }
+    }
+}
+
+/// Run a `prompts/get` for `name` (with `arguments`) against one MCP server,
+/// dispatching on its transport. Returns the SHAPED, sanitized, secret-redacted result
+/// (never the raw envelope) for both transports. A `prompts/get` is inert. Used by
+/// [`KernelState::get_mcp_prompt`] (the caller validates `name` first).
+fn mcp_get_prompt(
+    server: &relux_core::McpServerConfig,
+    name: &str,
+    arguments: &serde_json::Value,
+) -> Result<relux_core::McpPromptResult, crate::mcp::McpClientError> {
+    match server.transport {
+        relux_core::McpTransport::HttpLoopback => {
+            crate::mcp::get_prompt(&server.endpoint, name, arguments, server.timeout_ms)
+        }
+        relux_core::McpTransport::ManagedStdio => {
+            if crate::mcp_stdio::pool().is_running(&server.id) {
+                crate::mcp_stdio::pool().get_prompt(&server.id, name, arguments, server.timeout_ms)
+            } else {
+                let (env, cwd) = crate::secret_store::resolve_managed_env_and_cwd(
+                    &server.env,
+                    server.cwd.as_deref(),
+                )
+                .map_err(crate::mcp::McpClientError::Spawn)?;
+                let command = server.command.as_deref().unwrap_or("");
+                crate::mcp_stdio::get_prompt(
+                    command,
+                    &server.args,
+                    &env,
+                    cwd.as_deref(),
+                    name,
+                    arguments,
+                    server.timeout_ms,
+                )
+            }
+        }
+    }
+}
+
 /// Live `resources/list` for an off-lock [`crate::prime_tools::McpServerView`],
 /// dispatching on its transport. Used by the read-only Prime context tool
 /// `mcp_list_resources` OUTSIDE the kernel lock.
@@ -11920,6 +12057,61 @@ pub(crate) fn mcp_view_read_resource(
             }
         }
         _ => crate::mcp::read_resource(&s.endpoint, uri, s.timeout_ms),
+    }
+}
+
+/// Live `prompts/list` for an off-lock [`crate::prime_tools::McpServerView`],
+/// dispatching on its transport. Used by the read-only Prime context tool
+/// `mcp_list_prompts` OUTSIDE the kernel lock.
+pub(crate) fn mcp_view_list_prompts(
+    s: &crate::prime_tools::McpServerView,
+) -> Result<Vec<relux_core::McpPrompt>, crate::mcp::McpClientError> {
+    match s.transport {
+        relux_core::McpTransport::ManagedStdio => {
+            if crate::mcp_stdio::pool().is_running(&s.id) {
+                crate::mcp_stdio::pool().list_prompts(&s.id, s.timeout_ms)
+            } else {
+                let (env, cwd) =
+                    crate::secret_store::resolve_managed_env_and_cwd(&s.env, s.cwd.as_deref())
+                        .map_err(crate::mcp::McpClientError::Spawn)?;
+                let command = s.command.as_deref().unwrap_or("");
+                crate::mcp_stdio::list_prompts(command, &s.args, &env, cwd.as_deref(), s.timeout_ms)
+            }
+        }
+        _ => crate::mcp::list_prompts(&s.endpoint, s.timeout_ms),
+    }
+}
+
+/// Live `prompts/get` of ONE prompt by `name` (with `arguments`) for an off-lock
+/// [`crate::prime_tools::McpServerView`], dispatching on its transport. Used by the
+/// read-only Prime context tool `mcp_get_prompt` OUTSIDE the kernel lock (the caller
+/// validates `name` first).
+pub(crate) fn mcp_view_get_prompt(
+    s: &crate::prime_tools::McpServerView,
+    name: &str,
+    arguments: &serde_json::Value,
+) -> Result<relux_core::McpPromptResult, crate::mcp::McpClientError> {
+    match s.transport {
+        relux_core::McpTransport::ManagedStdio => {
+            if crate::mcp_stdio::pool().is_running(&s.id) {
+                crate::mcp_stdio::pool().get_prompt(&s.id, name, arguments, s.timeout_ms)
+            } else {
+                let (env, cwd) =
+                    crate::secret_store::resolve_managed_env_and_cwd(&s.env, s.cwd.as_deref())
+                        .map_err(crate::mcp::McpClientError::Spawn)?;
+                let command = s.command.as_deref().unwrap_or("");
+                crate::mcp_stdio::get_prompt(
+                    command,
+                    &s.args,
+                    &env,
+                    cwd.as_deref(),
+                    name,
+                    arguments,
+                    s.timeout_ms,
+                )
+            }
+        }
+        _ => crate::mcp::get_prompt(&s.endpoint, name, arguments, s.timeout_ms),
     }
 }
 
@@ -14672,6 +14864,27 @@ mod tests {
         ]
     }
 
+    /// The three response bodies for one successful prompts/list.
+    fn mcp_prompts_list_bodies() -> Vec<String> {
+        vec![
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{}}}"#.to_string(),
+            "{}".to_string(),
+            r#"{"jsonrpc":"2.0","id":2,"result":{"prompts":[{"name":"greet","description":"Greet.","arguments":[{"name":"who","required":true}]},{"name":"plain"}]}}"#.to_string(),
+        ]
+    }
+
+    /// The three response bodies for one successful prompts/get (the message embeds
+    /// `text` so a test can assert shaping + redaction).
+    fn mcp_prompt_get_bodies(text: &str) -> Vec<String> {
+        vec![
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{}}}"#.to_string(),
+            "{}".to_string(),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":2,"result":{{"description":"A greeting.","messages":[{{"role":"user","content":{{"type":"text","text":"{text}"}}}}]}}}}"#
+            ),
+        ]
+    }
+
     #[test]
     fn mcp_list_resources_maps_and_is_honest() {
         let mut k = KernelState::new();
@@ -14722,6 +14935,61 @@ mod tests {
     }
 
     #[test]
+    fn mcp_list_prompts_maps_and_is_honest() {
+        let mut k = KernelState::new();
+        let endpoint = mock_mcp(mcp_prompts_list_bodies());
+        k.register_mcp_server("fs", &endpoint, "fs server", true, Some(2000))
+            .unwrap();
+        let prompts = k.list_mcp_prompts("fs").expect("list ok");
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts[0].name, "greet");
+        assert_eq!(prompts[0].arguments.len(), 1);
+        assert_eq!(prompts[0].arguments[0].name, "who");
+        assert!(prompts[0].arguments[0].required);
+        assert!(prompts[1].arguments.is_empty());
+        // Unknown / disabled servers are honest, not a fabricated empty list.
+        assert!(matches!(
+            k.list_mcp_prompts("ghost"),
+            Err(KernelError::UnknownMcpServer(_))
+        ));
+        k.set_mcp_server_enabled("fs", false).unwrap();
+        assert!(matches!(
+            k.list_mcp_prompts("fs"),
+            Err(KernelError::McpServerDisabled(_))
+        ));
+    }
+
+    #[test]
+    fn mcp_get_prompt_shapes_redacts_and_rejects_bad_name() {
+        let mut k = KernelState::new();
+        let endpoint = mock_mcp(mcp_prompt_get_bodies("hi token=sk-abcdefghijklmnop123456"));
+        k.register_mcp_server("fs", &endpoint, "fs server", true, Some(2000))
+            .unwrap();
+        let result = k
+            .get_mcp_prompt("fs", "greet", &serde_json::json!({ "who": "x" }))
+            .expect("get ok");
+        assert_eq!(result.name, "greet");
+        assert_eq!(result.description.as_deref(), Some("A greeting."));
+        assert!(result.messages[0].content.contains("hi"), "msg: {}", result.messages[0].content);
+        // An embedded secret is redacted, never returned verbatim.
+        assert!(
+            !result.messages[0].content.contains("sk-abcdefghijklmnop123456"),
+            "secret leaked: {}",
+            result.messages[0].content
+        );
+        // An invalid (control-char) name is refused before any dial.
+        assert!(matches!(
+            k.get_mcp_prompt("fs", "a\r\nb", &serde_json::json!({})),
+            Err(KernelError::InvalidMcpPromptName { .. })
+        ));
+        // An empty name is refused.
+        assert!(matches!(
+            k.get_mcp_prompt("fs", "   ", &serde_json::json!({})),
+            Err(KernelError::InvalidMcpPromptName { .. })
+        ));
+    }
+
+    #[test]
     fn prime_context_tool_reads_mcp_resource_via_snapshot() {
         // End-to-end: the snapshot carries the registered server, and the read-only
         // context tool `mcp_read_resource` dials it through the live loopback client,
@@ -14762,6 +15030,38 @@ mod tests {
         let miss = crate::prime_tools::execute_context_tool(
             &snap,
             &crate::prime_tools::ToolCall { tool: "mcp_read_resource".to_string(), args: bad },
+        );
+        assert!(!miss.ok);
+    }
+
+    #[test]
+    fn prime_context_tool_gets_mcp_prompt_via_snapshot() {
+        // End-to-end: the read-only context tool `mcp_get_prompt` materializes a prompt
+        // template through the live loopback client. It returns the template text as
+        // CONTEXT (an observation), never auto-running it as a user turn.
+        let (mut k, ctx) = prime_chat_kernel();
+        let endpoint = mock_mcp(mcp_prompt_get_bodies("prompt body text"));
+        k.register_mcp_server("fs", &endpoint, "fs server", true, Some(2000))
+            .unwrap();
+        let snap = k.context_snapshot(&ctx);
+
+        let mut args = serde_json::Map::new();
+        args.insert("server_id".to_string(), serde_json::json!("fs"));
+        args.insert("name".to_string(), serde_json::json!("greet"));
+        args.insert("arguments".to_string(), serde_json::json!({ "who": "x" }));
+        let got = crate::prime_tools::execute_context_tool(
+            &snap,
+            &crate::prime_tools::ToolCall { tool: "mcp_get_prompt".to_string(), args },
+        );
+        assert!(got.ok, "get failed: {}", got.detail);
+        assert!(got.detail.contains("prompt body text"), "detail: {}", got.detail);
+
+        // A missing name is an honest ok:false read (no fabrication, no network).
+        let mut bad = serde_json::Map::new();
+        bad.insert("server_id".to_string(), serde_json::json!("fs"));
+        let miss = crate::prime_tools::execute_context_tool(
+            &snap,
+            &crate::prime_tools::ToolCall { tool: "mcp_get_prompt".to_string(), args: bad },
         );
         assert!(!miss.ok);
     }

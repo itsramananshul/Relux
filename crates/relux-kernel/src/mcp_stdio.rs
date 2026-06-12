@@ -69,11 +69,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use relux_core::{McpResource, McpResourceContent, McpTool};
+use relux_core::{McpPrompt, McpPromptResult, McpResource, McpResourceContent, McpTool};
 
 use crate::mcp::{
-    parse_resources_list, parse_tools_list, shape_resource_read_result, shape_tool_call_result,
-    McpClientError,
+    parse_prompts_list, parse_resources_list, parse_tools_list, shape_get_prompt_result,
+    shape_resource_read_result, shape_tool_call_result, McpClientError,
 };
 
 /// The MCP protocol version Relux advertises in the `initialize` handshake (matches
@@ -173,8 +173,52 @@ pub fn read_resource(
     })
 }
 
+/// Spawn the managed command, run `initialize` → `prompts/list`, reap the child, and
+/// return the discovered prompts (bounded + sanitized) or an honest [`McpClientError`].
+///
+/// MCP **prompts** are READ-ONLY templates — distinct from tools (which act). This
+/// performs a bounded subprocess read and mutates nothing on the server. The result
+/// reuses the SAME bounding/sanitizing as the HTTP client ([`parse_prompts_list`]);
+/// only the transport differs.
+pub fn list_prompts(
+    command: &str,
+    args: &[String],
+    env: &[(String, String)],
+    cwd: Option<&Path>,
+    timeout_ms: u64,
+) -> Result<Vec<McpPrompt>, McpClientError> {
+    run_op(command, args, env, cwd, timeout_ms, |child, timeout| {
+        let result = child.request("prompts/list", &serde_json::json!({}), timeout)?;
+        parse_prompts_list(&result)
+    })
+}
+
+/// Spawn the managed command, run `initialize` → `prompts/get` for `name` with
+/// `arguments`, reap the child, and return a **shaped, sanitized, secret-redacted**
+/// [`McpPromptResult`] (never the raw JSON-RPC envelope) or an honest
+/// [`McpClientError`]. Getting a prompt is inert — it returns template text, NOT a turn
+/// Relux executes. `name` is the caller's responsibility to validate
+/// ([`relux_core::is_valid_mcp_prompt_name`]); the result reuses the SAME shaping +
+/// redaction as the HTTP client ([`shape_get_prompt_result`]).
+pub fn get_prompt(
+    command: &str,
+    args: &[String],
+    env: &[(String, String)],
+    cwd: Option<&Path>,
+    name: &str,
+    arguments: &serde_json::Value,
+    timeout_ms: u64,
+) -> Result<McpPromptResult, McpClientError> {
+    run_op(command, args, env, cwd, timeout_ms, |child, timeout| {
+        let params = serde_json::json!({ "name": name, "arguments": arguments });
+        let result = child.request("prompts/get", &params, timeout)?;
+        shape_get_prompt_result(&result, name)
+    })
+}
+
 /// Spawn the managed command, initialize it, run `op` (one `tools/list`, `tools/call`,
-/// `resources/list`, or `resources/read`), then reap the child. On any failure the
+/// `resources/list`, `resources/read`, `prompts/list`, or `prompts/get`), then reap the
+/// child. On any failure the
 /// error is **enriched** with the child's bounded, secret-redacted stderr tail so the
 /// operator can see why.
 fn run_op<T>(
@@ -1050,6 +1094,36 @@ impl ManagedPool {
         let params = serde_json::json!({ "uri": uri });
         let result = entry.request_reuse("resources/read", &params, timeout_ms)?;
         shape_resource_read_result(&result, uri)
+    }
+
+    /// Reuse the running process to run `prompts/list` (READ-ONLY templates). Errors
+    /// with [`McpClientError::ProcessExited`] when no process is running (the caller then
+    /// decides whether to fall back to a spawn-per-operation listing).
+    pub fn list_prompts(
+        &self,
+        id: &str,
+        timeout_ms: u64,
+    ) -> Result<Vec<McpPrompt>, McpClientError> {
+        let entry = self.lookup(id).ok_or(McpClientError::ProcessExited)?;
+        let result = entry.request_reuse("prompts/list", &serde_json::json!({}), timeout_ms)?;
+        parse_prompts_list(&result)
+    }
+
+    /// Reuse the running process to run `prompts/get` for `name` with `arguments`,
+    /// returning the SHAPED, sanitized, secret-redacted result (never the raw envelope).
+    /// Getting a prompt is inert. Errors with [`McpClientError::ProcessExited`] when no
+    /// process is running.
+    pub fn get_prompt(
+        &self,
+        id: &str,
+        name: &str,
+        arguments: &serde_json::Value,
+        timeout_ms: u64,
+    ) -> Result<McpPromptResult, McpClientError> {
+        let entry = self.lookup(id).ok_or(McpClientError::ProcessExited)?;
+        let params = serde_json::json!({ "name": name, "arguments": arguments });
+        let result = entry.request_reuse("prompts/get", &params, timeout_ms)?;
+        shape_get_prompt_result(&result, name)
     }
 
     /// Stop and forget `id` entirely (used when its registration is removed).

@@ -4,10 +4,11 @@
 //!
 //! It speaks the same JSON-RPC-over-stdio subset Relux's managed-stdio client uses —
 //! `initialize`, `notifications/initialized`, `tools/list`, `tools/call`,
-//! `resources/list`, `resources/read` — so the integration test exercises a genuine
-//! subprocess (real spawn → handshake → list → call/read → reap), not the kernel's
-//! built-in echo tool. Pure Rust + serde_json: no node/python/network dependency, so it
-//! runs identically on every platform/CI.
+//! `resources/list`, `resources/read`, `prompts/list`, `prompts/get` — so the
+//! integration test exercises a genuine subprocess (real spawn → handshake →
+//! list → call/read/get → reap), not the kernel's built-in echo tool. Pure Rust +
+//! serde_json: no node/python/network dependency, so it runs identically on every
+//! platform/CI.
 //!
 //! Tools it advertises:
 //! - `status.summary` — returns a small computed text result.
@@ -31,6 +32,12 @@
 //!   so a test can PROVE the client redacts it on read.
 //! - `mem://image` (binary) — a `blob` content block, so a test can PROVE the client
 //!   summarizes binary honestly and never surfaces the raw bytes.
+//!
+//! Prompts it advertises (READ-ONLY templates — `prompts/list` / `prompts/get`):
+//! - `greet` — takes a required `who` argument and materializes a one-message
+//!   template echoing it back, proving arguments are forwarded.
+//! - `leaky` — materializes a message embedding an obvious fake secret, so a test can
+//!   PROVE the client redacts it on get.
 
 use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -206,6 +213,54 @@ fn main() {
                     other => serde_json::json!({
                         "jsonrpc": "2.0", "id": id,
                         "error": { "code": -32602, "message": format!("no such resource: {other}") }
+                    }),
+                }
+            }
+            "prompts/list" => serde_json::json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": { "prompts": [
+                    { "name": "greet", "description": "Greet a person by name.",
+                      "arguments": [ { "name": "who", "description": "Who to greet.", "required": true } ] },
+                    { "name": "leaky", "description": "A prompt whose body embeds a fake secret." }
+                ]}
+            }),
+            "prompts/get" => {
+                let name = req
+                    .get("params")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("");
+                let args = req
+                    .get("params")
+                    .and_then(|p| p.get("arguments"))
+                    .cloned()
+                    .unwrap_or(serde_json::json!({}));
+                match name {
+                    "greet" => {
+                        let who = args.get("who").and_then(|w| w.as_str()).unwrap_or("world");
+                        serde_json::json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": {
+                                "description": "A greeting.",
+                                "messages": [ {
+                                    "role": "user",
+                                    "content": { "type": "text", "text": format!("Hello, {who}! Please help.") }
+                                } ]
+                            }
+                        })
+                    }
+                    "leaky" => serde_json::json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": { "messages": [ {
+                            "role": "user",
+                            // Embeds an obvious fake secret so a test proves redaction.
+                            "content": { "type": "text",
+                                "text": "remember api_key=sk-fixturepromptsecret1234567890" }
+                        } ] }
+                    }),
+                    other => serde_json::json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": { "code": -32602, "message": format!("no such prompt: {other}") }
                     }),
                 }
             }

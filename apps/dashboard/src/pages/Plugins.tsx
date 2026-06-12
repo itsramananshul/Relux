@@ -18,6 +18,9 @@ import {
   type ReluxMcpResource,
   type ReluxMcpResourcesResult,
   type ReluxMcpResourceContent,
+  type ReluxMcpPrompt,
+  type ReluxMcpPromptsResult,
+  type ReluxMcpPromptResult,
   type ReluxPlugin,
   type ReluxPluginHints,
   type ReluxPluginRuntime,
@@ -444,6 +447,7 @@ function McpServerRow({
   const [err, setErr] = useState<string | null>(null);
   const [toolsOpen, setToolsOpen] = useState(false);
   const [resourcesOpen, setResourcesOpen] = useState(false);
+  const [promptsOpen, setPromptsOpen] = useState(false);
   const status = mcpServerStatusBadge(server);
 
   async function remove() {
@@ -517,6 +521,19 @@ function McpServerRow({
           <button
             className="btn ghost sm"
             style={{ marginLeft: 6 }}
+            onClick={() => setPromptsOpen((v) => !v)}
+            aria-expanded={promptsOpen}
+            title={
+              server.transport === "managed_stdio"
+                ? "Spawn the command (or reuse the running process) and run a live prompts/list (read-only templates)"
+                : "Run a live prompts/list against this server (read-only templates)"
+            }
+          >
+            {promptsOpen ? "Close" : "Prompts"}
+          </button>
+          <button
+            className="btn ghost sm"
+            style={{ marginLeft: 6 }}
             disabled={busy}
             onClick={() => void remove()}
           >
@@ -542,6 +559,13 @@ function McpServerRow({
         <tr>
           <td colSpan={4} style={{ background: "transparent" }}>
             <McpResourcesPanel server={server} />
+          </td>
+        </tr>
+      )}
+      {promptsOpen && (
+        <tr>
+          <td colSpan={4} style={{ background: "transparent" }}>
+            <McpPromptsPanel server={server} />
           </td>
         </tr>
       )}
@@ -888,6 +912,219 @@ function McpResourceRow({
                 </pre>
               </div>
             ) : null}
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
+// The live prompts panel: runs `prompts/list` against the MCP server (loopback HTTP
+// or managed-stdio command, dispatched server-side on the registered transport) and
+// lists the read-only prompt templates it advertises. Prompts are inert templates —
+// listing or getting one performs NO action and mutates nothing; getting one returns
+// template text, NOT a turn Relux runs. So there is no classification/approval gate
+// here (unlike tools). Honest about every outcome — a disabled, unreachable, or
+// non-MCP server shows its real reason, never a faked empty list. Each prompt can be
+// materialized (a read-only `prompts/get`) inline via a minimal arguments form; the
+// returned messages are sanitized + secret-redacted + bounded server-side.
+function McpPromptsPanel({ server }: { server: ReluxMcpServer }) {
+  const { data, loading, error } = useAsync<ReluxMcpPromptsResult>(
+    () => reluxMcp.prompts(server.id),
+    [server.id, server.enabled],
+  );
+  const prompts = data?.prompts ?? [];
+
+  return (
+    <div className="card" style={{ margin: "6px 0", padding: 12 }}>
+      <div className="row" style={{ marginBottom: 8, alignItems: "center" }}>
+        <strong style={{ fontSize: 13 }}>Prompts (read-only templates)</strong>
+        <div className="spacer" style={{ flex: 1 }} />
+        {!loading && !error && (
+          <span className="badge done">{prompts.length} listed</span>
+        )}
+      </div>
+      <p className="muted" style={{ marginTop: 0, marginBottom: 10, fontSize: 11 }}>
+        A real <span className="mono">prompts/list</span> against the{" "}
+        {server.transport === "managed_stdio" ? "managed-stdio command" : "loopback server"}.
+        Prompts are <strong>read-only templates</strong> — getting one runs{" "}
+        <span className="mono">prompts/get</span> and returns template text (NOT a turn
+        Relux runs); the messages are sanitized, secret-redacted, and bounded server-side.
+      </p>
+      {error ? (
+        <div className="banner err" style={{ fontSize: 12 }}>
+          Prompt listing failed ({error}). The server may be down, disabled, or not
+          exposing prompts over this endpoint. Relux does not fake a list.
+        </div>
+      ) : loading ? (
+        <div className="loading">Running prompts/list…</div>
+      ) : prompts.length === 0 ? (
+        <div className="empty" style={{ fontSize: 12 }}>
+          The server advertises no prompts.
+        </div>
+      ) : (
+        <div className="table-scroll">
+          <table className="table">
+            <thead>
+              <tr>
+                <th>Prompt</th>
+                <th>Arguments</th>
+                <th style={{ textAlign: "right" }}>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {prompts.map((p) => (
+                <McpPromptRow key={p.name} serverId={server.id} prompt={p} />
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// One prompt row: name/description + declared arguments, plus a read-only "Get" that
+// materializes the template inline. When the prompt declares arguments, a minimal
+// form collects them; the returned messages are shaped + secret-redacted server-side.
+// Never mutates; getting a prompt returns template text, never a turn Relux runs.
+function McpPromptRow({
+  serverId,
+  prompt,
+}: {
+  serverId: string;
+  prompt: ReluxMcpPrompt;
+}) {
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<ReluxMcpPromptResult | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [argValues, setArgValues] = useState<Record<string, string>>({});
+  const args = prompt.arguments ?? [];
+
+  async function get() {
+    setBusy(true);
+    setErr(null);
+    setResult(null);
+    try {
+      // Only forward non-empty values; the server applies its own arg validation.
+      const payload: Record<string, string> = {};
+      for (const [k, v] of Object.entries(argValues)) {
+        if (v.trim() !== "") payload[k] = v;
+      }
+      setResult(await reluxMcp.getPrompt(serverId, prompt.name, payload));
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Get failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <>
+      <tr>
+        <td>
+          <strong style={{ fontSize: 12 }}>{prompt.name}</strong>
+          {prompt.description && (
+            <div className="muted" style={{ fontSize: 11, marginTop: 2, maxWidth: 360 }}>
+              {prompt.description}
+            </div>
+          )}
+        </td>
+        <td className="mono muted" style={{ fontSize: 11 }}>
+          {args.length === 0
+            ? "—"
+            : args.map((a) => a.name + (a.required ? "*" : "")).join(", ")}
+        </td>
+        <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
+          <button
+            className="btn ghost sm"
+            onClick={() => setOpen((v) => !v)}
+            aria-expanded={open}
+          >
+            {open ? "Hide" : "Get"}
+          </button>
+        </td>
+      </tr>
+      {open && (
+        <tr>
+          <td colSpan={3} style={{ background: "transparent" }}>
+            <div className="card" style={{ padding: 10, margin: "4px 0" }}>
+              {args.length > 0 && (
+                <div style={{ marginBottom: 8 }}>
+                  {args.map((a) => (
+                    <label
+                      key={a.name}
+                      style={{ display: "block", fontSize: 11, marginBottom: 6 }}
+                    >
+                      <span className="mono">
+                        {a.name}
+                        {a.required ? " *" : ""}
+                      </span>
+                      {a.description && (
+                        <span className="muted" style={{ marginLeft: 6 }}>
+                          {a.description}
+                        </span>
+                      )}
+                      <input
+                        className="input"
+                        style={{ display: "block", marginTop: 2, width: "100%", maxWidth: 360 }}
+                        value={argValues[a.name] ?? ""}
+                        onChange={(e) =>
+                          setArgValues((prev) => ({ ...prev, [a.name]: e.target.value }))
+                        }
+                        placeholder={a.required ? "required" : "optional"}
+                      />
+                    </label>
+                  ))}
+                </div>
+              )}
+              <button className="btn ghost sm" disabled={busy} onClick={() => void get()}>
+                {busy ? "Getting…" : "Get prompt"}
+              </button>
+              {err && (
+                <div className="banner err" style={{ fontSize: 12, marginTop: 8 }}>
+                  Get failed ({err}). Relux does not fake a prompt.
+                </div>
+              )}
+              {result && (
+                <div style={{ marginTop: 8 }}>
+                  {result.description && (
+                    <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>
+                      {result.description}
+                    </div>
+                  )}
+                  {result.messages.length === 0 ? (
+                    <div className="empty" style={{ fontSize: 12 }}>
+                      The prompt materialized no messages.
+                    </div>
+                  ) : (
+                    result.messages.map((m, i) => (
+                      <div key={i} style={{ marginBottom: 6 }}>
+                        <span className="badge" style={{ marginRight: 6 }}>
+                          {m.role || "?"}
+                        </span>
+                        <pre
+                          className="mono"
+                          style={{
+                            display: "inline-block",
+                            fontSize: 11,
+                            whiteSpace: "pre-wrap",
+                            wordBreak: "break-word",
+                            maxHeight: 220,
+                            overflow: "auto",
+                            margin: "4px 0 0",
+                            verticalAlign: "top",
+                          }}
+                        >
+                          {m.content || "(empty)"}
+                        </pre>
+                      </div>
+                    ))
+                  )}
+                </div>
+              )}
+            </div>
           </td>
         </tr>
       )}
