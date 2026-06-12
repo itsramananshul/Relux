@@ -9,6 +9,43 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.28 (Windows bundle).** The `relux-kernel` and
+  `relux-core` crates move `0.1.27` → `0.1.28` in lockstep, packaging the
+  post-v0.1.27 **dashboard Work-board oversight** line into a fresh Windows
+  bundle. Everything here is read-from / written-through the real kernel state
+  (no mocked data) and conforms to `docs/relix-dashboard-design.md` §6.x.
+  No master-plan safety property is weakened. Headlines:
+  - **Board Oversight v1.** A composed `GET /v1/relux/oversight` read backs a
+    Work oversight strip plus a visible **Blocked / Failed** column, with
+    run / continuation controls (continue, cancel, retry, open-approval). The
+    `current_prime_continuation_handle` survives a refresh.
+  - **Inline approval decisions on the oversight strip.** Pending approvals are
+    approved/denied in place on the Work strip without leaving the board.
+  - **Work hierarchy + progress v1.** Sub-work and progress render on the board
+    from real orchestration data (orchestration is the only real parent→child
+    link).
+  - **Ad-hoc task subtrees v1.** `Task.parent_task` is now populated via
+    `create_task_with_parent`, so parent/child tasks created outside an
+    orchestration render as subtrees on the Work board.
+  - **Work board status movement v1.** `POST /v1/relux/tasks/:id/status` reuses
+    the settable-status allowlist + terminal guard; a compact Block / Cancel
+    `StatusMoveControl` appears on cards and the detail view.
+  - **Per-subtree run / cost rollup v1.** A pure client-side join
+    (`runrollup.ts`, no new route) shows honest run / cost / duration / token
+    chips on Work groups and ad-hoc subtrees — "cost unavailable" rather than a
+    fake `$0` when a run reports no cost.
+  - **Dashboard route + live-browser smokes.** Relux Approvals was rebuilt on
+    the B&W `styles.css` design system (it had been the lone Tailwind page); all
+    Relux routes gained a render smoke (`routes-render.test.mjs`) and a
+    dependency-free CDP live-browser click smoke
+    (`browser-smoke.mjs` / `relux-browser-smoke.ps1`) was added.
+
+  `cargo test` + `clippy` clean on `relux-core` / `relux-kernel`; dashboard tests
+  + typecheck + build green; the tracked `dashboard-dist` bundle is in sync.
+  Packaged with `scripts\relux-package-local.ps1 -FullE2E`. This version line is
+  the `relux-kernel` crate version (separate from the legacy Relix workspace
+  versions in the dated sections below). See `docs/RELUX_MASTER_PLAN.md` →
+  *Release history*. Every safety property from v0.1.27 still holds.
 - **Relux local release v0.1.27 (Windows bundle).** The `relux-kernel` crate
   moves `0.1.26` → `0.1.27` and `relux-core` `0.1.25` → `0.1.27` (restoring the
   two crates to lockstep — `0.1.26` had been cut from a feature commit that bumped

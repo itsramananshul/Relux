@@ -17,11 +17,11 @@
     cache (which lagged a full version behind after v0.1.10 shipped).
     On every release, bump the tag `relux-vX.Y.Z` in BOTH the href and the badge
     `message` below (hyphens in the badge message are doubled: relux--vX.Y.Z),
-    then bump the matching `v0.1.27` / `relux-local-0.1.27-...` strings in the
+    then bump the matching `v0.1.28` / `relux-local-0.1.28-...` strings in the
     "Run the packaged release" section. `scripts/relux-package-local.ps1` warns
     if these drift from the crate version being packaged.
   -->
-  <a href="https://github.com/itsramananshul/Relux/releases/tag/relux-v0.1.27"><img src="https://img.shields.io/badge/release-relux--v0.1.27-blue?style=for-the-badge" alt="Release relux-v0.1.27"></a>
+  <a href="https://github.com/itsramananshul/Relux/releases/tag/relux-v0.1.28"><img src="https://img.shields.io/badge/release-relux--v0.1.28-blue?style=for-the-badge" alt="Release relux-v0.1.28"></a>
   <a href="https://github.com/itsramananshul/Relux/releases"><img src="https://img.shields.io/badge/all%20releases-list-lightgrey?style=for-the-badge" alt="All releases"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg?style=for-the-badge" alt="MIT OR Apache-2.0"></a>
 </p>
@@ -103,16 +103,16 @@ unset means cargo's default. The port preflight uses `nc` when present and falls
 back to bash's `/dev/tcp`; if neither is available it skips the probe and the
 kernel still reports a clear bind error on a real conflict.
 
-#### Run the packaged release (v0.1.27, Windows-x64 only, no build needed)
+#### Run the packaged release (v0.1.28, Windows-x64 only, no build needed)
 
 Prefer a prebuilt Windows bundle over building from source? Grab the latest
 [**Relux local release**](https://github.com/itsramananshul/Relux/releases) zip
-(`relux-local-0.1.27-windows-x64.zip`), extract it, and launch it - no Rust, no npm.
+(`relux-local-0.1.28-windows-x64.zip`), extract it, and launch it - no Rust, no npm.
 (The packaged zip is **Windows-x64 only**; on macOS/Linux use `./start-relux.sh`
 from a source checkout, above.)
 
 ```powershell
-# inside the extracted relux-local-0.1.27-windows-x64 folder
+# inside the extracted relux-local-0.1.28-windows-x64 folder
 powershell -NoProfile -ExecutionPolicy Bypass -File .\Start-Relux.ps1
 # override the port if 19891 is taken:  .\Start-Relux.ps1 -Port 20000
 ```

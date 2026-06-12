@@ -1845,6 +1845,21 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.28** (2026-06-12) — **dashboard Work-board oversight** rollup. The `relux-kernel` / `relux-core`
+  crates move `0.1.27` → `0.1.28` in lockstep, packaging the post-v0.1.27 oversight line per
+  `docs/relix-dashboard-design.md` §6.x: (1) **Board Oversight v1** — a composed `GET /v1/relux/oversight`
+  read backing a Work oversight strip + a visible **Blocked / Failed** column with run / continuation
+  controls (continue, cancel, retry, open-approval), the `current_prime_continuation_handle` surviving a
+  refresh; (2) **inline approval decisions** on the oversight strip; (3) **Work hierarchy + progress v1**
+  (sub-work + progress from real orchestration data); (4) **ad-hoc task subtrees v1** (`Task.parent_task`
+  populated via `create_task_with_parent`); (5) **Work board status movement v1**
+  (`POST /v1/relux/tasks/:id/status`, settable-status allowlist + terminal guard, compact Block / Cancel
+  control); (6) **per-subtree run / cost rollup v1** (pure client join `runrollup.ts`, honest "cost
+  unavailable" not a fake `$0`); (7) **dashboard route + dependency-free live-browser click smokes** (Relux
+  Approvals rebuilt on the B&W design system, per-route render smoke). All reads/writes hit real kernel
+  state. No master-plan safety property is weakened. `cargo test` + `clippy` clean on
+  `relux-core`/`relux-kernel`; dashboard green; `dashboard-dist` in sync. Every safety property from v0.1.27
+  holds.
 - **v0.1.27** (2026-06-12) — **autonomy policy + managed-stdio MCP + encrypted local secrets** rollup. The
   `relux-kernel` crate moves `0.1.26` → `0.1.27` and `relux-core` `0.1.25` → `0.1.27` (restoring lockstep —
   `0.1.26` had been cut from a feature commit that bumped only the kernel). First packaged bundle since
