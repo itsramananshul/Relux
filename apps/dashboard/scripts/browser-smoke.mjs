@@ -535,6 +535,45 @@ async function main() {
         `/blocked \\/ failed/i.test(document.querySelector('.workspace')?.innerText || '')`,
       );
       record("Work board shows the Blocked / Failed column", hasBlockedCol, hasBlockedCol ? "rendered" : "column missing");
+      // Inline approval controls in the oversight strip: when a pending approval is
+      // present the strip renders Approve & run / Allow always / Deny INLINE. We do
+      // NOT click them here — every one of those decisions is a real mutation that
+      // approves/executes/denies a governed action against the live kernel, and this
+      // smoke deliberately clicks only non-destructive surfaces (see the Plugins/
+      // Approvals section: "never a destructive action button"). The wiring of each
+      // button → reluxApprovals route is covered by the action-model unit test
+      // (test/approvalactions.test.ts), the component render test
+      // (test/oversight-approvals-render.test.mjs), and the backend approval routes.
+      // The smoke's seed (one task) creates no pending approval, so this only
+      // asserts the controls render WHEN one exists; otherwise it records the honest
+      // "no seeded approval" state rather than a false pass.
+      {
+        const approvalState = await evaluate(
+          `(() => {
+             const heads = Array.from(document.querySelectorAll('.workspace h5'));
+             const head = heads.find(h => /pending approvals/i.test(h.textContent || ''));
+             if (!head) return { seeded: false };
+             // The approval rows are siblings under the same column container.
+             const col = head.parentElement;
+             const btns = Array.from(col ? col.querySelectorAll('button') : [])
+               .map(b => (b.textContent || '').trim());
+             return {
+               seeded: true,
+               hasApprove: btns.some(t => /^Approve/.test(t)),
+               hasDeny: btns.includes('Deny'),
+             };
+           })()`,
+        );
+        if (!approvalState.seeded) {
+          record("Work oversight inline approval controls (no approval seeded)", true, "no pending approval in this smoke seed; not clickable");
+        } else {
+          record(
+            "Work oversight strip renders inline approval controls",
+            approvalState.hasApprove && approvalState.hasDeny,
+            approvalState.hasApprove && approvalState.hasDeny ? "Approve + Deny rendered (not clicked — destructive)" : "inline controls missing",
+          );
+        }
+      }
       // The task list loads async (useAsync). Give it a bounded moment to settle
       // before deciding empty-vs-seeded, so a slow fetch is not misread as "no
       // tasks" (which would skip the Inspect→detail binding this step exists for).

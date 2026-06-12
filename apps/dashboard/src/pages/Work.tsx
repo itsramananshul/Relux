@@ -7,6 +7,7 @@ import {
   hasOversightAttention,
   continuationActionLabel,
 } from "../oversight";
+import { approvalInlineActions } from "../approvalactions";
 import {
   latestReluxEventId,
   mergeReluxRunEvents,
@@ -19,7 +20,7 @@ import {
   runLogSourceLabel,
   runLogTruncationNote,
 } from "../reluxrunlog";
-import { reluxWork, reluxAudit, reluxOversight, reluxPrime, type ReluxTask, type ReluxRun, type ReluxAgent, type ReluxTaskDetail, type ReluxRunDetail, type ReluxAuditEntry, type ReluxRunEvent, type ReluxRunLog, type ReluxOversight } from "../api";
+import { reluxWork, reluxAudit, reluxOversight, reluxPrime, reluxApprovals, type ReluxTask, type ReluxRun, type ReluxAgent, type ReluxTaskDetail, type ReluxRunDetail, type ReluxAuditEntry, type ReluxRunEvent, type ReluxRunLog, type ReluxOversight, type ReluxApproval } from "../api";
 import { useAsync } from "../components/common";
 import {
   runStatusTone,
@@ -297,7 +298,8 @@ export function Work() {
 // Runs): one composed, dense panel at the top of Work that makes live work visible
 // and controllable without opening each run. It shows the operational counts, the
 // in-flight runs (Inspect / Cancel), the runs needing attention (Inspect / Retry),
-// the pending approvals (Open in the Approvals surface), and any resumable Prime
+// the pending approvals (the common Approve & run / Allow always / Deny decisions
+// INLINE, plus Open → for the detailed Approvals surface), and any resumable Prime
 // continuation (Continue). Every control reuses an EXISTING backend route — nothing
 // new is executed here. A read failure degrades to an inline note, never a blank.
 function OversightStrip({
@@ -483,8 +485,13 @@ function OversightStrip({
             </div>
           )}
 
-          {/* Pending approvals — the gate list. Decide on the dedicated Approvals
-              surface (it owns the typed payload + Approve/Reject/Allow-always). */}
+          {/* Pending approvals — the gate list, now with the common low-friction
+              decisions INLINE (Approve & run / Allow always / Deny for a per-call
+              tool invocation; Approve / Deny for a generic approval). Each button
+              drives the SAME reluxApprovals route the dedicated Approvals page and
+              the Prime approval card use — no new authority. "Open →" stays the
+              link to the detailed Approvals audit surface (typed payload, grants,
+              permissions). The action set per row is decided by approvalInlineActions. */}
           {oversight.pending_approvals.length > 0 && (
             <div style={{ flex: 1, minWidth: 280 }}>
               <h5 style={{ margin: "0 0 6px", fontSize: 12, textTransform: "uppercase", letterSpacing: "0.05em" }}>
@@ -492,17 +499,7 @@ function OversightStrip({
               </h5>
               <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                 {oversight.pending_approvals.map(a => (
-                  <div key={a.id} className="card sm" style={{ padding: 8, border: "1px solid var(--border)" }}>
-                    <div className="row" style={{ alignItems: "center", gap: 8 }}>
-                      <span className={`badge ${a.risk === "critical" || a.risk === "high" ? "failed" : "in_progress"}`} style={{ fontSize: 9 }}>
-                        {a.risk}
-                      </span>
-                      <span style={{ fontSize: 12, fontWeight: 600 }}>{a.action}</span>
-                      <div className="spacer" style={{ flex: 1 }} />
-                      <Link to="/approvals" className="link" style={{ fontSize: 12 }}>Open →</Link>
-                    </div>
-                    {a.reason && <div className="muted" style={{ fontSize: 10, marginTop: 4 }}>{a.reason}</div>}
-                  </div>
+                  <OversightApprovalRow key={a.id} approval={a} onReload={onReload} />
                 ))}
               </div>
             </div>
@@ -552,6 +549,161 @@ function OversightRunRow({
         <div className="muted" style={{ fontSize: 10, marginTop: 4, wordBreak: "break-word" }}>
           {run.error || run.summary}
         </div>
+      )}
+    </div>
+  );
+}
+
+// One pending-approval row in the oversight strip with the common decisions INLINE.
+// The action set is decided by approvalInlineActions (a per-call tool invocation
+// gets Approve & run / Allow always / Deny; a generic approval gets Approve / Deny;
+// anything else degrades to Open → only with an honest reason). Each button drives
+// the SAME reluxApprovals route the dedicated Approvals page and the Prime approval
+// card use — decide / execute / allow-always — so this invents NO new authority and
+// runs nothing the operator did not choose. After any decision the strip refreshes
+// (onReload re-reads the composed oversight in place) and a compact, shaped one-line
+// result/error is shown — never the raw tool envelope. "Open →" always links to the
+// detailed Approvals surface (typed payload, grants, permissions).
+export function OversightApprovalRow({
+  approval,
+  onReload,
+}: {
+  approval: ReluxApproval;
+  onReload: () => void;
+}) {
+  const [working, setWorking] = useState<null | "approve" | "always" | "deny">(null);
+  // The honest one-line result of the last decision, so a click is never a silent
+  // no-op. No raw JSON — just the shaped confirmation or the backend's error.
+  const [note, setNote] = useState<string | null>(null);
+  const a = approval;
+  const ti = a.tool_invocation;
+  const actions = approvalInlineActions(a);
+  const locked = working !== null;
+
+  // Approve: for a per-call tool invocation this is the exact two-step the Approvals
+  // page + Prime card use (decide(approved) then execute once); for a generic
+  // approval it is just decide(approved) — it records the decision and runs nothing.
+  async function approve() {
+    setWorking("approve");
+    setNote(null);
+    try {
+      await reluxApprovals.decide(a.id, "approved");
+      if (actions.approve?.kind === "approve_run") {
+        await reluxApprovals.execute(a.id);
+        setNote(`Approved & ran ${a.action} once.`);
+      } else {
+        setNote(`Approved ${a.action}.`);
+      }
+      onReload();
+    } catch (e) {
+      setNote(e instanceof Error ? e.message : "Approve failed.");
+    } finally {
+      setWorking(null);
+    }
+  }
+
+  // Allow always: approves AND persists a standing allow-always grant for this exact
+  // (agent, tool), then runs the bound call once — future matching calls skip the
+  // prompt. Only offered for a tool-invocation approval (the route 404s otherwise).
+  async function allowAlways() {
+    setWorking("always");
+    setNote(null);
+    try {
+      await reluxApprovals.allowAlways(a.id);
+      await reluxApprovals.execute(a.id);
+      setNote(`Allowed ${a.action} always & ran it once.`);
+      onReload();
+    } catch (e) {
+      setNote(e instanceof Error ? e.message : "Allow-always failed.");
+    } finally {
+      setWorking(null);
+    }
+  }
+
+  // Deny: decide(rejected). A bound invocation is dropped and cannot run without a
+  // fresh approval.
+  async function deny() {
+    setWorking("deny");
+    setNote(null);
+    try {
+      await reluxApprovals.decide(a.id, "rejected");
+      setNote(`Denied ${a.action}.`);
+      onReload();
+    } catch (e) {
+      setNote(e instanceof Error ? e.message : "Deny failed.");
+    } finally {
+      setWorking(null);
+    }
+  }
+
+  return (
+    <div className="card sm" style={{ padding: 8, border: "1px solid var(--border)" }}>
+      <div className="row" style={{ alignItems: "center", gap: 8 }}>
+        <span className={`badge ${a.risk === "critical" || a.risk === "high" ? "failed" : "in_progress"}`} style={{ fontSize: 9 }}>
+          {a.risk}
+        </span>
+        <span style={{ fontSize: 12, fontWeight: 600 }}>{a.action}</span>
+        <div className="spacer" style={{ flex: 1 }} />
+        <Link to="/approvals" className="link" style={{ fontSize: 12 }}>Open →</Link>
+      </div>
+      {a.reason && <div className="muted" style={{ fontSize: 10, marginTop: 4 }}>{a.reason}</div>}
+      {ti && (
+        <div className="muted mono" style={{ fontSize: 9, marginTop: 4, wordBreak: "break-all" }}>
+          {ti.tool_name} on {ti.plugin_id} as {ti.agent_id}
+        </div>
+      )}
+      {actions.actionable ? (
+        <div className="row wrap" style={{ gap: 6, marginTop: 8 }}>
+          {actions.approve && (
+            <button
+              className="btn sm"
+              style={{ height: 22, padding: "0 8px" }}
+              disabled={locked}
+              onClick={() => void approve()}
+              title={
+                actions.approve.kind === "approve_run"
+                  ? "Approve this single call and run it once through the existing per-call execute path"
+                  : "Approve this request — it records the decision; nothing runs here"
+              }
+            >
+              {working === "approve" ? "…" : actions.approve.label}
+            </button>
+          )}
+          {actions.allowAlways && (
+            <button
+              className="btn ghost sm"
+              style={{ height: 22, padding: "0 8px" }}
+              disabled={locked}
+              onClick={() => void allowAlways()}
+              title={ti ? `Allow ${ti.tool_name} for ${ti.agent_id} without asking again, then run it once` : undefined}
+            >
+              {working === "always" ? "…" : "Allow always"}
+            </button>
+          )}
+          {actions.deny && (
+            <button
+              className="btn ghost sm"
+              style={{ height: 22, padding: "0 8px" }}
+              disabled={locked}
+              onClick={() => void deny()}
+              title="Deny this request — it is dropped and cannot run without a fresh approval"
+            >
+              {working === "deny" ? "…" : "Deny"}
+            </button>
+          )}
+        </div>
+      ) : (
+        actions.reason && (
+          <div className="muted" style={{ fontSize: 10, marginTop: 8, fontStyle: "italic" }}>
+            {actions.reason}
+          </div>
+        )
+      )}
+      {actions.actionable && actions.reason && (
+        <div className="muted" style={{ fontSize: 9, marginTop: 6, fontStyle: "italic" }}>{actions.reason}</div>
+      )}
+      {note && (
+        <div className="muted" style={{ fontSize: 10, marginTop: 6, wordBreak: "break-word" }}>{note}</div>
       )}
     </div>
   );
