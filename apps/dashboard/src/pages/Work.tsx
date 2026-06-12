@@ -38,6 +38,7 @@ import {
   columnDropTarget,
   encodeTaskDrag,
   parseTaskDrag,
+  reopenEligibility,
   TASK_DRAG_MIME,
   type BoardColumn,
 } from "../taskmove";
@@ -1198,6 +1199,82 @@ export function StatusMoveControl({
   );
 }
 
+// REOPEN control (design §6.9): a compact lifecycle action on a BLOCKED task that
+// re-queues it (Blocked -> Queued) through the run lifecycle so its assigned operative
+// can run it again — the safe inverse of the operator Block move. It is NOT a status
+// decree (the §6.4 status select deliberately refuses the machine-driven Open/Running
+// lanes), so it is its own action calling `POST /v1/relux/tasks/:id/reopen`. Mirrors
+// the kernel `reopen_task` eligibility (reopenEligibility): the button appears ONLY for
+// a blocked task, is offered only when it has an assigned operative, and otherwise
+// shows the honest reason (a screen-reader-readable note) instead of a dead button —
+// never for a non-blocked task. On success it reloads so the card re-buckets (Blocked
+// -> Open) and the existing "Run (Assigned)" action then runs it; a rejection (state
+// changed underneath) surfaces the real backend reason inline.
+export function ReopenControl({
+  task,
+  onReopened,
+  showReason = false,
+}: {
+  task: ReluxTask;
+  onReopened: () => void;
+  // When true (the Task Detail panel), a blocked-but-ineligible task renders the clear
+  // reason it can't be reopened (no assignee) as a role=note line, so a keyboard /
+  // screen-reader user learns WHY there is no button. On a board card this stays false:
+  // the card shows nothing when ineligible (no dead affordance, matching §6.4/§6.8).
+  showReason?: boolean;
+}) {
+  const eligibility = useMemo(() => reopenEligibility(task), [task]);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  // Not a blocked task → no reopen affordance at all (non-blocked work moves through
+  // the normal run lifecycle, not a reopen).
+  if (!eligibility.applicable) return null;
+
+  // Blocked but not eligible (no assignee): surface the honest reason in the detail
+  // panel; stay silent (compact) on a board card.
+  if (!eligibility.eligible) {
+    if (!showReason) return null;
+    return (
+      <span className="reopen-note muted" role="note" style={{ fontSize: 10 }}>
+        {eligibility.reason}
+      </span>
+    );
+  }
+
+  async function reopen() {
+    setBusy(true);
+    setErr(null);
+    try {
+      await reluxWork.reopenTask(task.id);
+      onReopened();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Reopen failed.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <span className="reopen-control" style={{ display: "inline-flex", flexDirection: "column", gap: 2 }}>
+      <button
+        className="btn sm"
+        style={{ height: 24, padding: "0 8px", fontSize: 10 }}
+        disabled={busy}
+        title="Reopen this blocked task — re-queues it so its assigned operative can run it again"
+        onClick={() => void reopen()}
+      >
+        {busy ? "Reopening…" : "Reopen"}
+      </button>
+      {err && (
+        <span className="badge failed" style={{ fontSize: 9, whiteSpace: "normal" }} title={err}>
+          {err}
+        </span>
+      )}
+    </span>
+  );
+}
+
 // SAFE REPARENT control (design §6.6): a compact "Move under…" selector + a "Remove
 // parent" button on the task detail. Candidate parents come from reparent.ts, which
 // excludes self, all descendants (no cycle), the current parent (no-op), and any
@@ -1427,6 +1504,10 @@ function TaskCard({ task, onAction, onInspectTask, agents, subtaskCount }: { tas
             {busy ? "..." : "Run (Assigned)"}
           </button>
         )}
+        {/* REOPEN (design §6.9): a blocked task's run-lifecycle action — re-queues it
+            so its assigned operative can run it again. Shown only for a blocked task
+            with an assignee (reopenEligibility); the card stays silent otherwise. */}
+        <ReopenControl task={task} onReopened={onAction} />
         {/* Status MOVE (design §6): a compact Block / Cancel control, offered only for
             a non-terminal task (taskmove.ts). On success the board reloads so the card
             re-buckets into its new column. */}
@@ -1522,6 +1603,11 @@ function TaskDetailPanel({
             <span>Status:</span>
             <span className="row" style={{ alignItems: "center", gap: 8, flexWrap: "wrap" }}>
               <span>{task.status}</span>
+              {/* REOPEN (design §6.9): the blocked task's run-lifecycle action. In the
+                  detail panel it also surfaces the clear reason a blocked task can't be
+                  reopened (no assignee) via showReason, so a keyboard / screen-reader
+                  user learns WHY there is no button. */}
+              <ReopenControl task={task} onReopened={onStatusMoved} showReason />
               {/* Status MOVE (design §6): the same compact Block / Cancel control the
                   board cards show. In the detail panel it also surfaces the clear
                   reason a finished task can't be moved (showUnsupportedNote), so a

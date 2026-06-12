@@ -116,6 +116,64 @@ export function statusMoveGuidance(status: string): StatusMoveGuidance {
 }
 
 // ---------------------------------------------------------------------------
+// Reopen a blocked task (design §6.9). The board status allowlist deliberately
+// refuses the machine-driven lanes (Open/Running), so re-opening held work is NOT a
+// status set — it is a separate run-LIFECYCLE action that re-queues the task
+// (Blocked -> Queued) through `POST /v1/relux/tasks/:id/reopen`, after which the
+// existing Run path runs it. This pure helper mirrors the kernel `reopen_task`
+// eligibility (only a blocked task, and only one with an assigned operative), so the
+// control offers Reopen only when the route would accept it, and otherwise shows the
+// honest reason — never a dead button. Kept dependency-free.
+// ---------------------------------------------------------------------------
+
+// The whole status the reopen action targets: only a BLOCKED task is reopenable
+// (mirrors the kernel `TaskNotReopenable` guard — a terminal/running/queued task is
+// not held work).
+const REOPENABLE_STATUS = "blocked";
+
+// The minimal task shape the eligibility check needs (a subset of ReluxTask), kept
+// local so this module stays free of the api types.
+export interface ReopenableTask {
+  status: string;
+  assigned_agent?: string | null;
+}
+
+// Whether (and why) a task can be reopened from the board, and the human reason when
+// it can't. `applicable` is true only for a blocked task — the control renders nothing
+// for any other status (no dead affordance; non-blocked work moves through the normal
+// run lifecycle, not a reopen). For a blocked task, `eligible` mirrors the kernel:
+// it needs an assigned operative (a run needs an assignee), else the honest reason.
+export interface ReopenEligibility {
+  // True only for a blocked task — the only status the control appears for.
+  applicable: boolean;
+  // True when the reopen route would accept it (blocked + assigned).
+  eligible: boolean;
+  // The honest reason it can't be reopened (shown when applicable && !eligible),
+  // or empty when eligible / not applicable.
+  reason: string;
+}
+
+// Compute reopen eligibility for a task, mirroring kernel `reopen_task`: a blocked
+// task with an assigned operative is eligible; a blocked task with no assignee is
+// not (assign one first — a run needs an assignee); any non-blocked task is not
+// applicable (the control is not shown). A task waiting on an approval is not blocked,
+// so it is handled by the Approvals surface, not here.
+export function reopenEligibility(task: ReopenableTask): ReopenEligibility {
+  if (task.status !== REOPENABLE_STATUS) {
+    return { applicable: false, eligible: false, reason: "" };
+  }
+  const assigned = !!(task.assigned_agent && task.assigned_agent.length > 0);
+  if (!assigned) {
+    return {
+      applicable: true,
+      eligible: false,
+      reason: "Assign an operative before reopening — a run needs an assignee.",
+    };
+  }
+  return { applicable: true, eligible: true, reason: "" };
+}
+
+// ---------------------------------------------------------------------------
 // Drag-to-column status movement (design §6 "Drag a card to a column → status
 // mutation, with transition validation; an invalid drop shows a toast").
 //

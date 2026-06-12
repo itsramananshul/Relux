@@ -268,6 +268,8 @@ pub enum KernelError {
     TaskStatusNotSettable { task: String, status: String },
     #[error("task {task} is already {status}; a finished task's status cannot be changed from the board")]
     TaskTerminalStatus { task: String, status: String },
+    #[error("task {task} is not reopenable in status {status}; only a blocked task can be reopened (reopening re-queues held work through the run lifecycle — it is not a status decree)")]
+    TaskNotReopenable { task: String, status: String },
     #[error("parent task {parent} is in namespace {parent_ns}, not the child's namespace {child_ns}; an ad-hoc subtask lives in its parent's namespace")]
     TaskParentScope {
         parent: String,

@@ -3118,6 +3118,79 @@ impl KernelState {
         Ok(())
     }
 
+    /// Reopen a BLOCKED task as a lifecycle action (`docs/relix-dashboard-design.md`
+    /// §6.9). This is the safe inverse of the operator Block move (§6.4): the board
+    /// status allowlist deliberately refuses the machine-driven lanes
+    /// (`running`/`queued`/`completed`/…), so reopening held work cannot be a raw
+    /// status decree. Instead it RE-QUEUES the task through the run lifecycle so its
+    /// assigned operative can run it again — `set_task_status` to a machine-driven
+    /// status would (correctly) reject, which is exactly why this is its own lifecycle
+    /// action and not a status set.
+    ///
+    /// Eligibility (all checked BEFORE any mutation, fail-closed):
+    /// - the task must EXIST (`UnknownTask`),
+    /// - it must currently be `Blocked` (`TaskNotReopenable` naming the live status —
+    ///   a terminal/running/queued/created task is not reopenable; only held work is),
+    ///   and
+    /// - it must have an assigned agent (`TaskNotAssigned` — a run needs an assignee,
+    ///   so reopening unassigned work would only dead-end at the run gate; the operator
+    ///   assigns one first).
+    ///
+    /// On success the task moves `Blocked` -> `Queued` (the normal pre-run state, so
+    /// the unchanged Run path / [`execute_assigned_run`] can run it), `updated_at`
+    /// advances, and the change is audited (`task:update`, the same row the §6.4 board
+    /// move writes, tagged `reopen`). It touches NO run and does NOT auto-start
+    /// execution: reopening makes the work runnable again; running it stays the
+    /// operator's explicit next action through the unchanged run gate. Persistence is
+    /// the caller's (the route's `locked_save`).
+    pub fn reopen_task(&mut self, task_id: &TaskId) -> Result<(), KernelError> {
+        let (current, assigned, namespace) = {
+            let task = self
+                .tasks
+                .get(task_id)
+                .ok_or_else(|| KernelError::UnknownTask(task_id.to_string()))?;
+            (
+                task.status.clone(),
+                task.assigned_agent.clone(),
+                task.namespace_id.clone(),
+            )
+        };
+        // (1) Only a BLOCKED task is reopenable. A terminal/running/queued/created task
+        //     is not — reopening is the inverse of an operator Block, not a generic set.
+        if !matches!(current, TaskStatus::Blocked) {
+            return Err(KernelError::TaskNotReopenable {
+                task: task_id.to_string(),
+                status: crate::prime_update_slots::status_label(&current).to_string(),
+            });
+        }
+        // (2) A run needs an assignee; reopening unassigned work would dead-end at the
+        //     run gate. Route pending-approval/continuation work elsewhere — a task in
+        //     `WaitingForApproval` is not `Blocked`, so it never reaches this path.
+        if assigned.is_none() {
+            return Err(KernelError::TaskNotAssigned(task_id.to_string()));
+        }
+        let now = self.clock.tick();
+        if let Some(task) = self.tasks.get_mut(task_id) {
+            task.status = TaskStatus::Queued;
+            task.updated_at = now;
+        }
+        self.record_audit(
+            "kernel",
+            "kernel",
+            "task:update",
+            Some("task"),
+            Some(task_id.as_str()),
+            Some(&namespace),
+            AuditResult::Success,
+            serde_json::json!({
+                "changes": { "status": "queued" },
+                "source": "board",
+                "action": "reopen",
+            }),
+        );
+        Ok(())
+    }
+
     pub fn task(&self, id: &TaskId) -> Option<&Task> {
         self.tasks.get(id)
     }
@@ -15596,6 +15669,67 @@ mod tests {
             k.audit_log().iter().filter(|e| e.action == "task:update").count() >= 2,
             "both moves audited as task:update"
         );
+    }
+
+    #[test]
+    fn reopen_task_requeues_a_blocked_task_and_guards_the_rest() {
+        // The operator board REOPEN lifecycle action (design §6.9): a blocked task is
+        // re-queued through the run lifecycle (Blocked -> Queued), never decreed to a
+        // machine-driven status. Eligibility is enforced before any mutation.
+        let (mut k, ctx) = prime_chat_kernel();
+        let id = make_task(&mut k, &ctx); // auto-assigned to Prime → Queued.
+
+        // A non-blocked task is NOT reopenable (only held work is) — nothing changes.
+        let err = k.reopen_task(&id).unwrap_err();
+        assert!(
+            matches!(err, KernelError::TaskNotReopenable { .. }),
+            "a queued task is not reopenable: {err:?}"
+        );
+        assert_eq!(k.task(&id).unwrap().status, TaskStatus::Queued, "unchanged");
+
+        // Block it (the operator Block move), then reopen → it re-queues for its agent.
+        k.set_task_status(&id, &TaskStatus::Blocked).unwrap();
+        let audits_before = k.audit_log().iter().filter(|e| e.action == "task:update").count();
+        k.reopen_task(&id).unwrap();
+        assert_eq!(k.task(&id).unwrap().status, TaskStatus::Queued, "blocked → queued");
+        // The assigned agent and (no) run are untouched — reopening only re-queues.
+        assert_eq!(
+            k.task(&id).unwrap().assigned_agent.as_ref(),
+            Some(&AgentId::new("prime"))
+        );
+        // The reopen is audited as task:update (the same row the board move writes).
+        assert!(
+            k.audit_log().iter().filter(|e| e.action == "task:update").count() > audits_before,
+            "reopen audited as task:update"
+        );
+
+        // The re-queue survives a snapshot roundtrip (a dashboard refresh / restart).
+        let restored = KernelState::from_snapshot(k.snapshot());
+        assert_eq!(restored.task(&id).unwrap().status, TaskStatus::Queued);
+
+        // A blocked task with NO assignee fails closed (a run needs an assignee).
+        let id2 = make_task(&mut k, &ctx);
+        k.tasks.get_mut(&id2).unwrap().assigned_agent = None;
+        k.set_task_status(&id2, &TaskStatus::Blocked).unwrap();
+        let err = k.reopen_task(&id2).unwrap_err();
+        assert!(
+            matches!(err, KernelError::TaskNotAssigned(_)),
+            "an unassigned blocked task is not reopenable: {err:?}"
+        );
+        assert_eq!(k.task(&id2).unwrap().status, TaskStatus::Blocked, "unchanged");
+
+        // A terminal task is not reopenable (retry semantics live on the run, not here).
+        let id3 = make_task(&mut k, &ctx);
+        k.set_task_status(&id3, &TaskStatus::Cancelled).unwrap();
+        let err = k.reopen_task(&id3).unwrap_err();
+        assert!(
+            matches!(err, KernelError::TaskNotReopenable { .. }),
+            "a cancelled task is not reopenable: {err:?}"
+        );
+
+        // An unknown task fails closed.
+        let err = k.reopen_task(&TaskId::new("task_9999")).unwrap_err();
+        assert!(matches!(err, KernelError::UnknownTask(_)), "unknown task: {err:?}");
     }
 
     #[test]

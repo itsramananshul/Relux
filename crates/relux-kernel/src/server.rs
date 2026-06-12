@@ -525,6 +525,7 @@ fn protected_router() -> Router<AppState> {
         .route("/v1/relux/tasks/:id/execute-assigned", post(execute_assigned_task))
         .route("/v1/relux/tasks/:id/assign", post(assign_task_to_agent))
         .route("/v1/relux/tasks/:id/status", post(set_task_status_route))
+        .route("/v1/relux/tasks/:id/reopen", post(reopen_task_route))
         .route("/v1/relux/tasks/:id/parent", post(reparent_task_route))
         .route("/v1/relux/tools", get(list_tools))
         .route("/v1/relux/tools/invoke", post(invoke_tool))
@@ -2798,6 +2799,31 @@ async fn reparent_task_route(
         .map(relux_core::TaskId::new);
     let task = locked_save(&state, |kernel| {
         kernel.reparent_task(&task_id, new_parent.as_ref())?;
+        Ok(kernel.task(&task_id).cloned().unwrap())
+    })?;
+    Ok(Json(task))
+}
+
+/// POST `/v1/relux/tasks/:id/reopen` — the operator board REOPEN lifecycle action
+/// (`docs/relix-dashboard-design.md` §6.9 "reopen a blocked task to running is a
+/// run-lifecycle action, not a status decree"). Reopens a BLOCKED task by re-queuing
+/// it through the run lifecycle (`reopen_task`): the board status allowlist refuses
+/// the machine-driven lanes, so reopening held work cannot be a `set_task_status`
+/// call — it is its own validated lifecycle action.
+///
+/// Eligibility is enforced in the kernel before any mutation: an unknown task is a
+/// 400 (`UnknownTask`), a non-blocked task a 409 (`TaskNotReopenable` — only held work
+/// is reopenable), and a blocked task with no assignee a 400 (`TaskNotAssigned` — a run
+/// needs an assignee). On success the task moves `Blocked` -> `Queued` and the updated
+/// task is returned; running it stays the operator's next action (the existing Run
+/// path). Touches no run; does not auto-start. Session-gated like every board mutation.
+async fn reopen_task_route(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<relux_core::Task>, ApiError> {
+    let task_id = relux_core::TaskId::new(id);
+    let task = locked_save(&state, |kernel| {
+        kernel.reopen_task(&task_id)?;
         Ok(kernel.task(&task_id).cloned().unwrap())
     })?;
     Ok(Json(task))
@@ -8232,6 +8258,11 @@ fn status_for(err: &KernelError) -> StatusCode {
         // off-allowlist target is bad input (400 — the route also pre-validates it).
         KernelError::TaskTerminalStatus { .. } => StatusCode::CONFLICT,
         KernelError::TaskStatusNotSettable { .. } => StatusCode::BAD_REQUEST,
+        // Reopening a task that is not blocked is a resolvable conflict (409): the
+        // operator must target held work (a blocked task). A missing task / a blocked
+        // task with no assignee fall through to the default 400 (UnknownTask /
+        // TaskNotAssigned), the same honest mapping every task route uses.
+        KernelError::TaskNotReopenable { .. } => StatusCode::CONFLICT,
         // An ad-hoc parent edge (create or board reparent) that crosses a namespace or
         // would close a cycle is bad input (400) — the same honest mapping §6.3/§6.6
         // documents; the create/reparent paths reject it before any state change.
@@ -12174,6 +12205,88 @@ mod tests {
             Some(r#"{"status":"blocked"}"#),
         )
         .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "must not mutate without a session");
+    }
+
+    /// End-to-end HTTP for the operator board REOPEN lifecycle action
+    /// (`POST /v1/relux/tasks/:id/reopen`, design §6.9). Reopening re-queues a BLOCKED
+    /// task (Blocked -> Queued) through the run lifecycle — it is not a status decree:
+    /// a queued/terminal task is a 409 (not reopenable), an unknown task a 400, and a
+    /// blocked task re-queues and is audited as task:update.
+    #[tokio::test]
+    async fn reopen_task_route_requeues_blocked_and_rejects_the_rest() {
+        let (state, _dir) = auth_state(true);
+
+        // Create a task (auto-assigned to Prime → queued).
+        let (status, _, tb) =
+            call(&state, "POST", "/v1/relux/tasks", None, Some(r#"{"title":"ship it"}"#)).await;
+        assert_eq!(status, StatusCode::OK, "task create failed: {tb}");
+        let task: serde_json::Value = serde_json::from_str(&tb).unwrap();
+        let task_id = task["id"].as_str().unwrap().to_string();
+        let reopen_path = format!("/v1/relux/tasks/{task_id}/reopen");
+        let status_path = format!("/v1/relux/tasks/{task_id}/status");
+
+        // A queued (non-blocked) task is NOT reopenable → 409.
+        let (status, _, _) = call(&state, "POST", &reopen_path, None, None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "a queued task is not reopenable");
+
+        // Block it, then reopen → it re-queues for its assigned agent.
+        let (status, _, _) =
+            call(&state, "POST", &status_path, None, Some(r#"{"status":"blocked"}"#)).await;
+        assert_eq!(status, StatusCode::OK, "block failed");
+        let (status, _, b) = call(&state, "POST", &reopen_path, None, None).await;
+        assert_eq!(status, StatusCode::OK, "reopen failed: {b}");
+        assert!(b.contains("\"status\":\"queued\""), "blocked → queued: {b}");
+        assert!(
+            b.contains("\"assigned_agent\":\"prime\""),
+            "the assignee is preserved: {b}"
+        );
+
+        // A terminal task is not reopenable (retry lives on the run, not the task) → 409.
+        let (status, _, tb) =
+            call(&state, "POST", "/v1/relux/tasks", None, Some(r#"{"title":"done one"}"#)).await;
+        assert_eq!(status, StatusCode::OK, "task create failed: {tb}");
+        let done_id = serde_json::from_str::<serde_json::Value>(&tb).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, _, _) = call(
+            &state,
+            "POST",
+            &format!("/v1/relux/tasks/{done_id}/status"),
+            None,
+            Some(r#"{"status":"cancelled"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "cancel failed");
+        let (status, _, _) = call(
+            &state,
+            "POST",
+            &format!("/v1/relux/tasks/{done_id}/reopen"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "a cancelled task is not reopenable");
+
+        // An unknown task is a 400 (the kernel's UnknownTask mapping for task routes).
+        let (status, _, _) =
+            call(&state, "POST", "/v1/relux/tasks/task_does_not_exist/reopen", None, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "unknown task is a 400");
+
+        // The reopen is audited as task:update (the same row the board move writes).
+        let (status, _, audit) = call(&state, "GET", "/v1/relux/audit?limit=500", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(audit.contains("task:update"), "reopen audit missing: {audit}");
+    }
+
+    /// The board REOPEN route is session-gated like every other protected route: no
+    /// cookie (auth enabled) is a 401, never an unauthenticated mutation.
+    #[tokio::test]
+    async fn reopen_task_route_requires_a_session() {
+        let (state, _dir) = auth_state(false);
+        let (status, _, _) =
+            call(&state, "POST", "/v1/relux/tasks/task_0001/reopen", None, None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "must not mutate without a session");
     }
 

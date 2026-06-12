@@ -2763,6 +2763,16 @@ export const reluxWork = {
       parent_task: parentTask,
     }),
 
+  // REOPEN a blocked task as a run-LIFECYCLE action (design §6.9): re-queues held
+  // work (Blocked -> Queued) so its assigned operative can run it again — NOT a status
+  // decree (the status allowlist refuses the machine-driven lanes). Throws an ApiError
+  // carrying the real reason on rejection (a non-blocked task is a 409, a blocked task
+  // with no assignee a 400). The UI only offers Reopen when reopenEligibility allows it,
+  // so a valid call never 4xxs in normal use; the throw is the honest fallback if state
+  // changed underneath. Returns the updated (re-queued) task.
+  reopenTask: (id: string) =>
+    api.post<ReluxTask>(`/v1/relux/tasks/${encodeURIComponent(id)}/reopen`),
+
   // Execute a running task locally as its assigned agent.
   executeAssignedTask: (id: string) =>
     api.post<{ run_id: string }>(`/v1/relux/tasks/${encodeURIComponent(id)}/execute-assigned`),

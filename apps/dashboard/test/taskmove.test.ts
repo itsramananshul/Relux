@@ -19,6 +19,7 @@ import {
   columnDropTarget,
   encodeTaskDrag,
   parseTaskDrag,
+  reopenEligibility,
 } from "../src/taskmove.ts";
 
 test("a non-terminal task offers the operator-settable moves except its own status", () => {
@@ -202,4 +203,56 @@ test("the drag payload round-trips and a foreign payload is ignored, not thrown"
   assert.equal(parseTaskDrag("not json"), null);
   assert.equal(parseTaskDrag('{"id":""}'), null); // empty id rejected
   assert.equal(parseTaskDrag('{"status":"queued"}'), null); // no id
+});
+
+// ---------------------------------------------------------------------------
+// Reopen eligibility (design §6.9). Reopening is a run-lifecycle action ONLY for a
+// blocked task, and only one with an assigned operative — mirroring the kernel
+// `reopen_task` guard (TaskNotReopenable for a non-blocked task, TaskNotAssigned for
+// an unassigned one). The control is shown ONLY for a blocked task.
+// ---------------------------------------------------------------------------
+
+test("a blocked task with an assignee is reopenable", () => {
+  const e = reopenEligibility({ status: "blocked", assigned_agent: "prime" });
+  assert.equal(e.applicable, true);
+  assert.equal(e.eligible, true);
+  assert.equal(e.reason, "");
+});
+
+test("a blocked task with NO assignee is applicable but not eligible, with an honest reason", () => {
+  for (const assigned of [undefined, null, ""]) {
+    const e = reopenEligibility({ status: "blocked", assigned_agent: assigned });
+    assert.equal(e.applicable, true, `assigned=${String(assigned)}`);
+    assert.equal(e.eligible, false);
+    assert.match(e.reason, /assign an operative/i);
+  }
+});
+
+test("a non-blocked task is NOT applicable (the reopen control never appears)", () => {
+  // Reopen is the inverse of Block — only held work is reopened. Every other status
+  // (open lanes, the machine-driven run states, terminal) is out of scope here.
+  for (const s of [
+    "created",
+    "queued",
+    "running",
+    "leased",
+    "waiting_for_tool",
+    "waiting_for_approval",
+    "completed",
+    "failed",
+    "cancelled",
+    "expired",
+  ]) {
+    const e = reopenEligibility({ status: s, assigned_agent: "prime" });
+    assert.equal(e.applicable, false, `${s} must not be reopenable`);
+    assert.equal(e.eligible, false, `${s} not eligible`);
+    assert.equal(e.reason, "", `${s} carries no reason (the control is not shown)`);
+  }
+});
+
+test("a task waiting on an approval is not reopenable here (it routes to Approvals)", () => {
+  // A WaitingForApproval task is not Blocked, so reopen never applies — the Approvals
+  // surface handles it, not a raw resume (the mission's routing rule).
+  const e = reopenEligibility({ status: "waiting_for_approval", assigned_agent: "prime" });
+  assert.equal(e.applicable, false);
 });

@@ -719,6 +719,21 @@ after creation via `KernelState::reparent_task` / `POST /v1/relux/tasks/:id/pare
 (move under a new parent or clear it) — the same exist/namespace/cycle validation,
 structural only (status / agent / runs untouched); §6.6.
 
+**Reopening blocked work is a lifecycle action, not a status decree.** The board's
+operator status allowlist (§6.4) offers only `blocked` / `cancelled` — the
+machine-driven lanes (`running`/`queued`/`completed`/…) are set by the run lifecycle,
+never decreed from the board. So putting a **blocked** task back into the run lifecycle
+is its own validated action, not a `set_task_status` call: `KernelState::reopen_task` /
+`POST /v1/relux/tasks/:id/reopen` re-queues a blocked task (`Blocked` → `Queued`) after
+validating it exists, is currently blocked (`TaskNotReopenable` → 409 otherwise), and
+has an assigned operative (`TaskNotAssigned` otherwise — a run needs an assignee). It
+touches no run and does not auto-execute; the existing **Run (Assigned)** path then runs
+the re-queued task through the unchanged run gate. This is distinct from the run-level
+**retry** (a fresh attempt of a failed *run*, §10.2) and **resume** (continuing a
+captured Claude *session*, `POST /v1/relux/runs/:id/resume`) — reopen targets the
+*task*, those target a *run*. A task waiting on an approval is not blocked, so it routes
+to Approvals, not reopen. Dashboard surface: `docs/relix-dashboard-design.md` §6.9.
+
 ### 9.6 Run
 
 One execution attempt for a task.
