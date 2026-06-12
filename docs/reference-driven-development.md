@@ -2883,6 +2883,14 @@ reference-first rule, so the grounding is recorded.
 - `reference/hermes-agent-main/hermes_cli/kanban_db.py` `task_links(parent_id, child_id)`
   — parent↔child lives in a join table, not a field on the task. (Relux's analogue is
   the orchestration's `steps[].depends_on` index edges + `steps[].task_id`.)
+- `reference/hermes-agent-main/plugins/kanban/dashboard/dist/index.js` (the built board
+  bundle — no source ships) — the **native HTML5 drag-to-column** pattern: a private
+  MIME `MIME_TASK = "text/x-hermes-task"`, cards `draggable: true` with an `onDragStart`
+  that records the dragged id, a column `onDragOver` that `preventDefault()`s + toggles a
+  `dragOver` highlight, and an `onDrop` that reads the MIME payload and applies the move,
+  with `dataTransfer.effectAllowed/dropEffect = "move"`. **Pattern: column status moves
+  ride the browser's native DnD under a private MIME — no DnD library — and the drop
+  resolves the target column to a status mutation.**
 
 ### How Relux maps it
 
@@ -2893,6 +2901,7 @@ reference-first rule, so the grounding is recorded.
 | Hermes: **parent↔child in a join table, not a task field** | Relux records **two** real parent→child links: the orchestration's `steps[].depends_on` + `steps[].task_id` (one kind of parent), and the now-**populated** `relux_core::Task.parent_task` edge for hand-made ad-hoc subtasks (the other — see `relix-dashboard-design.md` §6.3). A task in neither is genuinely standalone; no subtree is fabricated. |
 | Paperclip `agentIsInSubtree` / Hermes `delegate_tool` `MAX_DEPTH`: **a bounded, cycle-guarded parent-pointer walk** | The org-lattice walk in `relux_core::hierarchy` is mirrored for the **task tree** in `relux_core::task` (`task_ancestors` / `is_in_task_subtree` / `would_create_task_cycle`, bounded by `MAX_TASK_DEPTH`). The kernel's `create_task_with_parent` calls `would_create_task_cycle` before persisting a `parent_task` edge (defence in depth — a fresh create can't cycle; it guards a reparent), and rejects a cross-namespace parent (`TaskParentScope`). |
 | In-kernel reparent precedent: the org-lattice **Lead (`reports_to`) change** validates a set parent before mutating (self / existence / `would_create_cycle`) | `KernelState::reparent_task` (`relix-dashboard-design.md` §6.6) is that precedent reused for the **task tree**: it validates a set `parent_task` before any mutation (existence → `UnknownTask`, same namespace → `TaskParentScope`, no self/cycle → `would_create_task_cycle` → `TaskParentCycle`) exactly as `update_agent_with_skills` validates a set Lead, and is **structural only** (the edge + `updated_at`, never status / agent / runs). The UI `candidateParents` (`apps/dashboard/src/reparent.ts`) ports the same bounded subtree walk client-side so the control never offers a parent the kernel would reject. |
+| Hermes kanban: **native HTML5 drag-to-column under a private MIME, no DnD library; the drop resolves a column → a status move** | `apps/dashboard/src/pages/Work.tsx` `Column`/`TaskCard` use the same native API under `TASK_DRAG_MIME = "application/x-relux-task"` (`relix-dashboard-design.md` §6.7): cards are `draggable` with `onDragStart` encoding `{id,status}`, the column `onDragOver` `preventDefault()`s + highlights, `onDrop` decodes the payload and resolves the target column via `taskmove.ts::columnDropTarget`. Relux's adaptation is **tighter**: the drop maps only to the operator-settable lanes (Blocked→`blocked`, Done→`cancelled`) and reuses the SAME validated `set_task_status` route + allowlist as the §6.4 select — Open/Running drops, terminal cards, and no-ops are rejected inline, never silently applied. Drag is **additive** over the keyboard select; a foreign (non-task) drop decodes to `null` and is ignored. |
 
 **What we deliberately do differently:** no backend route or authority was added —
 the board composes two reads it already makes (the orchestration list + the task

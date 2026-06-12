@@ -15,6 +15,9 @@ import {
   operatorStatusMoves,
   canMoveStatus,
   isTerminalStatus,
+  columnDropTarget,
+  encodeTaskDrag,
+  parseTaskDrag,
 } from "../src/taskmove.ts";
 
 test("a non-terminal task offers the operator-settable moves except its own status", () => {
@@ -64,4 +67,86 @@ test("canMoveStatus is true exactly when a move exists", () => {
   assert.equal(canMoveStatus("blocked"), true); // can still cancel
   assert.equal(canMoveStatus("completed"), false);
   assert.equal(isTerminalStatus("queued"), false);
+});
+
+// ---------------------------------------------------------------------------
+// Drag-to-column resolution (design §6 "Drag a card to a column → status mutation,
+// with transition validation"). The drop must resolve to EXACTLY the move the select
+// would offer, and reject everything else with an honest reason.
+// ---------------------------------------------------------------------------
+
+test("dropping a non-terminal task on Blocked → block; on Done → cancel", () => {
+  for (const s of ["created", "queued", "running", "leased", "waiting_for_approval"]) {
+    const toBlocked = columnDropTarget("blocked", s);
+    assert.equal(toBlocked.ok, true, `${s} → blocked column`);
+    if (toBlocked.ok) {
+      assert.equal(toBlocked.status, "blocked");
+      assert.equal(toBlocked.label, "Block");
+    }
+    const toDone = columnDropTarget("done", s);
+    assert.equal(toDone.ok, true, `${s} → done column`);
+    if (toDone.ok) {
+      assert.equal(toDone.status, "cancelled");
+      assert.equal(toDone.label, "Cancel");
+    }
+  }
+});
+
+test("dropping on the Open or Running (machine-driven) lanes is rejected with a reason", () => {
+  for (const col of ["open", "running"] as const) {
+    const res = columnDropTarget(col, "queued");
+    assert.equal(res.ok, false, `${col} is not operator-settable`);
+    if (!res.ok) assert.ok(res.reason.length > 0, `${col} carries a reason`);
+  }
+  // The Running reason names the run lifecycle (it is machine-driven, not a decree).
+  const running = columnDropTarget("running", "created");
+  assert.equal(running.ok, false);
+  if (!running.ok) assert.match(running.reason, /run lifecycle/i);
+});
+
+test("dropping a blocked task on the Blocked column is a rejected no-op (already there)", () => {
+  const res = columnDropTarget("blocked", "blocked");
+  assert.equal(res.ok, false);
+  if (!res.ok) assert.match(res.reason, /already/i);
+  // …but a blocked task CAN still be dropped on Done → cancel.
+  const cancel = columnDropTarget("done", "blocked");
+  assert.equal(cancel.ok, true);
+  if (cancel.ok) assert.equal(cancel.status, "cancelled");
+});
+
+test("a terminal task is rejected from every column (a finished task is never moved)", () => {
+  for (const s of ["completed", "failed", "cancelled", "expired"]) {
+    for (const col of ["open", "running", "blocked", "done"] as const) {
+      const res = columnDropTarget(col, s);
+      assert.equal(res.ok, false, `terminal ${s} → ${col}`);
+      if (!res.ok) assert.match(res.reason, /finished/i);
+    }
+  }
+});
+
+test("columnDropTarget never resolves to a move the select would not offer", () => {
+  // For every (source status, column) pair, an ok drop must be in operatorStatusMoves.
+  for (const s of ["created", "queued", "running", "blocked", "waiting_for_approval", "completed"]) {
+    for (const col of ["open", "running", "blocked", "done"] as const) {
+      const res = columnDropTarget(col, s);
+      if (res.ok) {
+        assert.ok(
+          operatorStatusMoves(s).some((m) => m.status === res.status),
+          `${s} → ${col} resolved ${res.status} the select does not offer`,
+        );
+      }
+    }
+  }
+});
+
+test("the drag payload round-trips and a foreign payload is ignored, not thrown", () => {
+  const enc = encodeTaskDrag({ id: "task_7", status: "queued" });
+  const back = parseTaskDrag(enc);
+  assert.deepEqual(back, { id: "task_7", status: "queued" });
+  // Foreign / malformed payloads decode to null (a non-task drop is ignored).
+  assert.equal(parseTaskDrag(""), null);
+  assert.equal(parseTaskDrag(null), null);
+  assert.equal(parseTaskDrag("not json"), null);
+  assert.equal(parseTaskDrag('{"id":""}'), null); // empty id rejected
+  assert.equal(parseTaskDrag('{"status":"queued"}'), null); // no id
 });

@@ -665,6 +665,36 @@ async function main() {
           }
         }
       }
+      // ---- 4c) Work drag-to-column affordances (design §6) -------------------
+      // Drag-to-column status movement is ADDITIVE over the select (4b). Native
+      // HTML5 drag is not reliably synthesizable via CDP, so we assert the
+      // deterministic affordances the real handlers hang off: a draggable card and
+      // a labelled column drop region. The drop → setTaskStatus binding itself is
+      // pinned by the pure helper test (taskmove columnDropTarget) + the backend
+      // route tests; the select path (4b) already proves the live move→reload edge.
+      {
+        const drag = await evaluate(
+          `(() => {
+             const card = document.querySelector('.workspace .board-column .card[draggable="true"]');
+             const col = document.querySelector('.workspace .board-column[data-bucket]');
+             const label = col ? (col.getAttribute('aria-label') || '') : '';
+             return {
+               draggableCard: !!card,
+               roleDesc: card ? (card.getAttribute('aria-roledescription') || '') : '',
+               dropRegion: !!col,
+               labelled: /drop a task here/i.test(label),
+             };
+           })()`,
+        );
+        const ok = !!(drag && drag.draggableCard && drag.dropRegion && drag.labelled);
+        record(
+          "Work cards are draggable and columns are labelled drop targets",
+          ok,
+          ok
+            ? `card draggable (${drag.roleDesc}); column drop region labelled`
+            : `draggableCard=${drag && drag.draggableCard} dropRegion=${drag && drag.dropRegion} labelled=${drag && drag.labelled}`,
+        );
+      }
       const probs = newProblems(before);
       record("Work clean (no console/page/5xx errors)", probs.length === 0, probs.slice(0, 3).join(" | "));
     }

@@ -31,7 +31,15 @@ import {
   adhocSubtreeTaskIds,
   type RollupChip,
 } from "../runrollup";
-import { operatorStatusMoves, canMoveStatus } from "../taskmove";
+import {
+  operatorStatusMoves,
+  canMoveStatus,
+  columnDropTarget,
+  encodeTaskDrag,
+  parseTaskDrag,
+  TASK_DRAG_MIME,
+  type BoardColumn,
+} from "../taskmove";
 import { candidateParents } from "../reparent";
 import { orchestrationStatusTone } from "../orchestration";
 import { approvalInlineActions } from "../approvalactions";
@@ -267,10 +275,10 @@ export function Work() {
             />
 
             <div className="row wrap" style={{ gap: 16, alignItems: "flex-start" }}>
-              <Column title="Open" tasks={columns.open} onAction={handleReload} onInspectTask={handleInspectTask} agents={agents || []} subtaskCounts={subCounts} />
-              <Column title="Running" tasks={columns.running} onAction={handleReload} onInspectTask={handleInspectTask} agents={agents || []} subtaskCounts={subCounts} />
-              <Column title="Blocked / Failed" tasks={columns.blocked} onAction={handleReload} onInspectTask={handleInspectTask} agents={agents || []} subtaskCounts={subCounts} />
-              <Column title="Done" tasks={columns.done} onAction={handleReload} onInspectTask={handleInspectTask} agents={agents || []} subtaskCounts={subCounts} />
+              <Column title="Open" bucket="open" tasks={columns.open} onAction={handleReload} onInspectTask={handleInspectTask} agents={agents || []} subtaskCounts={subCounts} />
+              <Column title="Running" bucket="running" tasks={columns.running} onAction={handleReload} onInspectTask={handleInspectTask} agents={agents || []} subtaskCounts={subCounts} />
+              <Column title="Blocked / Failed" bucket="blocked" tasks={columns.blocked} onAction={handleReload} onInspectTask={handleInspectTask} agents={agents || []} subtaskCounts={subCounts} />
+              <Column title="Done" bucket="done" tasks={columns.done} onAction={handleReload} onInspectTask={handleInspectTask} agents={agents || []} subtaskCounts={subCounts} />
             </div>
 
             {(selectedTaskId || selectedRunId) && (
@@ -1006,13 +1014,89 @@ function WorkChecklist({
   );
 }
 
-function Column({ title, tasks, onAction, onInspectTask, agents, subtaskCounts }: { title: string; tasks: ReluxTask[]; onAction: () => void; onInspectTask: (taskId: string) => void; agents: ReluxAgent[]; subtaskCounts: Map<string, number> }) {
+// A board column. Beyond rendering its cards it is now a DROP TARGET (design §6
+// "Drag a card to a column → status mutation, with transition validation"): a card
+// dragged onto it resolves via taskmove.ts::columnDropTarget to the SAME settable
+// move the StatusMoveControl select offers — Blocked → block, Done → cancel. A drop
+// on a machine-driven lane (Open/Running), on a terminal card, or a no-op shows an
+// honest inline reason instead of silently failing. Drag is ADDITIVE — the select
+// stays for keyboard/accessibility; the column exposes a labelled drop region.
+export function Column({ title, bucket, tasks, onAction, onInspectTask, agents, subtaskCounts }: { title: string; bucket: BoardColumn; tasks: ReluxTask[]; onAction: () => void; onInspectTask: (taskId: string) => void; agents: ReluxAgent[]; subtaskCounts: Map<string, number> }) {
+  const [dragOver, setDragOver] = useState(false);
+  const [dropBusy, setDropBusy] = useState(false);
+  const [dropMsg, setDropMsg] = useState<string | null>(null);
+
+  function onDragOver(e: React.DragEvent<HTMLDivElement>) {
+    // Only react to our own task drags (never text/files dropped from elsewhere).
+    if (!Array.from(e.dataTransfer.types).includes(TASK_DRAG_MIME)) return;
+    e.preventDefault(); // required to allow a drop
+    e.dataTransfer.dropEffect = "move";
+    if (!dragOver) setDragOver(true);
+  }
+
+  function onDragLeave() {
+    if (dragOver) setDragOver(false);
+  }
+
+  async function onDrop(e: React.DragEvent<HTMLDivElement>) {
+    setDragOver(false);
+    const payload = parseTaskDrag(e.dataTransfer.getData(TASK_DRAG_MIME));
+    if (!payload) return; // not our drag — ignore
+    e.preventDefault();
+    const res = columnDropTarget(bucket, payload.status);
+    if (!res.ok) {
+      setDropMsg(res.reason); // honest inline reason, no silent no-op
+      return;
+    }
+    setDropMsg(null);
+    setDropBusy(true);
+    try {
+      await reluxWork.setTaskStatus(payload.id, res.status);
+      onAction(); // reload so the card re-buckets into this column
+    } catch (err) {
+      setDropMsg(err instanceof Error ? err.message : "Move failed.");
+    } finally {
+      setDropBusy(false);
+    }
+  }
+
   return (
     <div style={{ flex: 1, minWidth: 280 }}>
       <h4 style={{ marginBottom: 8, fontSize: 13, textTransform: "uppercase", letterSpacing: "0.05em" }}>
         {title} <span className="muted" style={{ fontWeight: 400 }}>{tasks.length}</span>
       </h4>
-      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <div
+        className={`board-column${dragOver ? " drag-over" : ""}`}
+        data-bucket={bucket}
+        role="list"
+        aria-label={`${title} column — drop a task here to move it`}
+        aria-busy={dropBusy || undefined}
+        onDragOver={onDragOver}
+        onDragLeave={onDragLeave}
+        onDrop={(e) => void onDrop(e)}
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          gap: 8,
+          minHeight: 48,
+          borderRadius: 6,
+          padding: 4,
+          outline: dragOver ? "2px dashed var(--fg)" : "2px dashed transparent",
+          background: dragOver ? "var(--bg-subtle, rgba(0,0,0,0.04))" : "transparent",
+          transition: "outline-color 0.1s ease",
+        }}
+      >
+        {dropMsg && (
+          <div
+            className="badge failed"
+            role="status"
+            style={{ fontSize: 9, whiteSpace: "normal", marginBottom: 4 }}
+            title={dropMsg}
+            onClick={() => setDropMsg(null)}
+          >
+            {dropMsg} <span className="muted">(dismiss)</span>
+          </div>
+        )}
         {tasks.map(t => (
           <TaskCard key={t.id} task={t} onAction={onAction} onInspectTask={onInspectTask} agents={agents} subtaskCount={subtaskCounts.get(t.id) ?? 0} />
         ))}
@@ -1216,10 +1300,36 @@ function TaskCard({ task, onAction, onInspectTask, agents, subtaskCount }: { tas
 
   const isAssigned = !!task.assigned_agent;
   const isRunnableByAssignedAgent = isAssigned && task.status === "queued";
+  // A card is draggable exactly when it has a settable move (a non-terminal task) —
+  // a finished card offers no move, so it is not draggable (no dead drag affordance).
+  // Drag is ADDITIVE over the StatusMoveControl select, which stays for keyboard use.
+  const draggable = canMoveStatus(task.status);
+
+  function onDragStart(e: React.DragEvent<HTMLDivElement>) {
+    if (!draggable) {
+      e.preventDefault();
+      return;
+    }
+    e.dataTransfer.setData(TASK_DRAG_MIME, encodeTaskDrag({ id: task.id, status: task.status }));
+    e.dataTransfer.effectAllowed = "move";
+  }
 
   return (
-    <div className="card sm" style={{ padding: 12, border: "1px solid var(--border)" }}>
+    <div
+      className="card sm"
+      role="listitem"
+      draggable={draggable}
+      onDragStart={onDragStart}
+      aria-roledescription={draggable ? "draggable task card" : undefined}
+      title={draggable ? "Drag to the Blocked or Done column to change status" : undefined}
+      style={{ padding: 12, border: "1px solid var(--border)", cursor: draggable ? "grab" : "default" }}
+    >
       <div className="row" style={{ marginBottom: 4 }}>
+        {draggable && (
+          <span className="muted" aria-hidden="true" title="Drag handle" style={{ fontSize: 11, marginRight: 6, cursor: "grab", userSelect: "none" }}>
+            ⠿
+          </span>
+        )}
         <div className="mono muted" style={{ fontSize: 10 }}>{task.id}</div>
         <div className="spacer" style={{ flex: 1 }} />
         <div className={`badge sm ${task.status === "completed" ? "done" : task.status === "running" ? "running" : "backlog"}`} style={{ fontSize: 9 }}>
