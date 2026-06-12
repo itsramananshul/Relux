@@ -83,9 +83,14 @@ test("Work RENDERS under a declarative router (no render-time throw)", () => {
   // error/loading branches), so the surface is useful even with zero tasks/runs.
   assert.match(html, /Work/);
   assert.match(html, /Create a new task/);
-  // The three-column board and the runs section render in the same view.
+  // The board and the runs section render in the same view.
   assert.match(html, /Open/);
   assert.match(html, /Recent Runs/);
+  // Board Oversight v1: the oversight strip and the now-rendered Blocked/Failed
+  // column are part of the first paint (the strip shows its loading state until
+  // the effect fetches, which never fires under renderToStaticMarkup).
+  assert.match(html, /Oversight/);
+  assert.match(html, /Blocked \/ Failed/);
 });
 
 test("the committed dashboard bundle carries the Work copy (no stale dist)", () => {

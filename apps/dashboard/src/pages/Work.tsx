@@ -1,6 +1,12 @@
 import { useState, useMemo, useEffect, useRef } from "react";
-import { useLocation, useNavigate } from "react-router-dom";
+import { useLocation, useNavigate, Link } from "react-router-dom";
 import { runIdFromSearch, taskIdFromSearch, workRunShareUrl } from "../routing";
+import {
+  bucketTasks,
+  oversightCountChips,
+  hasOversightAttention,
+  continuationActionLabel,
+} from "../oversight";
 import {
   latestReluxEventId,
   mergeReluxRunEvents,
@@ -13,7 +19,7 @@ import {
   runLogSourceLabel,
   runLogTruncationNote,
 } from "../reluxrunlog";
-import { reluxWork, reluxAudit, type ReluxTask, type ReluxRun, type ReluxAgent, type ReluxTaskDetail, type ReluxRunDetail, type ReluxAuditEntry, type ReluxRunEvent, type ReluxRunLog } from "../api";
+import { reluxWork, reluxAudit, reluxOversight, reluxPrime, type ReluxTask, type ReluxRun, type ReluxAgent, type ReluxTaskDetail, type ReluxRunDetail, type ReluxAuditEntry, type ReluxRunEvent, type ReluxRunLog, type ReluxOversight } from "../api";
 import { useAsync } from "../components/common";
 import {
   runStatusTone,
@@ -79,6 +85,14 @@ export function Work() {
     () => reluxWork.listAgents(),
     [],
   );
+  // The composed Board Oversight summary (counts + in-flight/attention runs +
+  // pending approvals + any resumable Prime continuation). A failure here must NOT
+  // blank the board — the kanban + create + runs all still work — so its error is
+  // surfaced inline in the strip and excluded from the page-level error gate.
+  const { data: oversight, error: errorOversight, reload: reloadOversight } = useAsync<ReluxOversight>(
+    () => reluxOversight.get(),
+    [],
+  );
 
   const [newTaskTitle, setNewTaskTitle] = useState("");
   const [creating, setCreating] = useState(false);
@@ -114,6 +128,10 @@ export function Work() {
     }
   }
 
+  // Four board columns, one per WorkBucket. Every task status maps to exactly one
+  // column (oversight.ts::taskBucket), so blocked / waiting-on-approval / failed
+  // work is now VISIBLE on the board (the prior "other" bucket was computed but
+  // never rendered — the reported gap). Filters apply before bucketing.
   const columns = useMemo(() => {
     let list = tasks ?? [];
 
@@ -124,12 +142,7 @@ export function Work() {
       list = list.filter(t => t.status === filterStatus);
     }
 
-    return {
-      open: list.filter(t => t.status === "created" || t.status === "queued"),
-      running: list.filter(t => t.status === "running"),
-      done: list.filter(t => t.status === "completed"),
-      other: list.filter(t => !["created", "queued", "running", "completed"].includes(t.status)),
-    };
+    return bucketTasks(list);
   }, [tasks, filterAgentId, filterStatus]);
 
   const error = errorTasks || errorRuns || errorAgents;
@@ -139,6 +152,7 @@ export function Work() {
     reloadTasks();
     reloadRuns();
     reloadAgents();
+    reloadOversight();
   };
 
   // focusDetail already clears the other panel, so each inspect is a single nav.
@@ -179,9 +193,18 @@ export function Work() {
               </div>
             </div>
 
+            <OversightStrip
+              oversight={oversight}
+              error={errorOversight ? String(errorOversight) : null}
+              agents={agents || []}
+              onInspectRun={handleInspectRun}
+              onReload={handleReload}
+            />
+
             <div className="row wrap" style={{ gap: 16, alignItems: "flex-start" }}>
               <Column title="Open" tasks={columns.open} onAction={handleReload} onInspectTask={handleInspectTask} agents={agents || []} />
               <Column title="Running" tasks={columns.running} onAction={handleReload} onInspectTask={handleInspectTask} agents={agents || []} />
+              <Column title="Blocked / Failed" tasks={columns.blocked} onAction={handleReload} onInspectTask={handleInspectTask} agents={agents || []} />
               <Column title="Done" tasks={columns.done} onAction={handleReload} onInspectTask={handleInspectTask} agents={agents || []} />
             </div>
 
@@ -266,6 +289,270 @@ export function Work() {
           </>
         )}
       </div>
+    </div>
+  );
+}
+
+// Board Oversight v1 strip (docs/relix-dashboard-design.md §5 Inbox / §11 Active
+// Runs): one composed, dense panel at the top of Work that makes live work visible
+// and controllable without opening each run. It shows the operational counts, the
+// in-flight runs (Inspect / Cancel), the runs needing attention (Inspect / Retry),
+// the pending approvals (Open in the Approvals surface), and any resumable Prime
+// continuation (Continue). Every control reuses an EXISTING backend route — nothing
+// new is executed here. A read failure degrades to an inline note, never a blank.
+function OversightStrip({
+  oversight,
+  error,
+  agents,
+  onInspectRun,
+  onReload,
+}: {
+  oversight: ReluxOversight | null;
+  error: string | null;
+  agents: ReluxAgent[];
+  onInspectRun: (runId: string) => void;
+  onReload: () => void;
+}) {
+  const [continuing, setContinuing] = useState(false);
+  const [busyRun, setBusyRun] = useState<string | null>(null);
+  // The honest one-line result of the last cross-cutting action (continue / cancel /
+  // retry), so a click is never a silent no-op. Cleared when a new action starts.
+  const [note, setNote] = useState<string | null>(null);
+
+  const agentName = (id: string) => agents.find(a => a.id === id)?.name || id;
+
+  // Resume the paused Prime agent loop from its stored continuation. A loop still
+  // waiting on a tool approval is NOT resumed here (the operator must approve the
+  // tool first via Approvals) — the button is disabled with that reason.
+  async function continueLoop(id: string) {
+    setContinuing(true);
+    setNote(null);
+    try {
+      const turn = await reluxPrime.continue(id, false);
+      setNote(turn.reply ? `Resumed: ${turn.reply.slice(0, 160)}` : "Resumed the paused loop.");
+      onReload();
+    } catch (e) {
+      setNote(e instanceof Error ? e.message : "Continue failed.");
+    } finally {
+      setContinuing(false);
+    }
+  }
+
+  async function cancel(runId: string) {
+    setBusyRun(runId);
+    setNote(null);
+    try {
+      const res = await reluxWork.cancelRun(runId);
+      setNote(res.message);
+      onReload();
+    } catch (e) {
+      setNote(e instanceof Error ? e.message : "Cancel failed.");
+    } finally {
+      setBusyRun(null);
+    }
+  }
+
+  async function retry(runId: string) {
+    setBusyRun(runId);
+    setNote(null);
+    try {
+      const res = await reluxWork.retryRun(runId);
+      onReload();
+      onInspectRun(res.run_id); // jump to the fresh attempt
+    } catch (e) {
+      setNote(e instanceof Error ? e.message : "Retry failed.");
+    } finally {
+      setBusyRun(null);
+    }
+  }
+
+  if (error) {
+    return (
+      <div className="card" style={{ marginBottom: 20, padding: 12 }}>
+        <div className="row" style={{ alignItems: "center", marginBottom: 6 }}>
+          <h4 style={{ margin: 0 }}>Oversight</h4>
+        </div>
+        <div className="muted" style={{ fontSize: 11 }}>
+          Oversight summary unavailable ({error}). The board below still works.
+        </div>
+      </div>
+    );
+  }
+  if (!oversight) {
+    return (
+      <div className="card" style={{ marginBottom: 20, padding: 12 }}>
+        <h4 style={{ margin: "0 0 6px" }}>Oversight</h4>
+        <div className="muted" style={{ fontSize: 12 }}>Loading oversight…</div>
+      </div>
+    );
+  }
+
+  const chips = oversightCountChips(oversight.counts);
+  const cont = oversight.continuation;
+  const showAttention = hasOversightAttention(oversight);
+
+  return (
+    <div className="card" style={{ marginBottom: 20, padding: 12 }}>
+      <div className="row" style={{ alignItems: "center", marginBottom: 10 }}>
+        <h4 style={{ margin: 0 }}>Oversight</h4>
+        <span className="muted" style={{ fontSize: 11, marginLeft: 8 }}>
+          live work at a glance — composed from runs, approvals &amp; the paused-loop continuation
+        </span>
+      </div>
+
+      {/* Dense count chips: what is live → what is stuck → what needs me. */}
+      <div className="row wrap" style={{ gap: 6, marginBottom: showAttention ? 12 : 0 }}>
+        {chips.map(c => (
+          <span
+            key={c.label}
+            className={`badge ${c.value > 0 ? c.tone : "backlog"}`}
+            style={{ fontSize: 10, fontWeight: 600 }}
+            title={c.label}
+          >
+            {c.label}: {c.value}
+          </span>
+        ))}
+      </div>
+
+      {note && (
+        <div className="muted" style={{ fontSize: 11, margin: "8px 0", wordBreak: "break-word" }}>{note}</div>
+      )}
+
+      {/* Resumable Prime continuation (survives a refresh). Continue resumes a
+          limit-paused loop; one awaiting a tool approval routes the operator to
+          Approvals first (resume proceeds only after the tool is approved). */}
+      {cont && (
+        <div className="card sm" style={{ padding: 10, marginBottom: 10, border: "1px solid var(--border)" }}>
+          <div className="row" style={{ alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <span className="badge in_progress" style={{ fontSize: 9, fontWeight: 600 }}>paused agent loop</span>
+            <span className="mono muted" style={{ fontSize: 10 }}>{cont.id}</span>
+            <div className="spacer" style={{ flex: 1 }} />
+            {cont.awaiting_approval ? (
+              <Link to="/approvals" className="link" style={{ fontSize: 12 }}>Open Approvals →</Link>
+            ) : (
+              <button className="btn sm" disabled={continuing} onClick={() => void continueLoop(cont.id)}>
+                {continuing ? "Continuing…" : "Continue"}
+              </button>
+            )}
+          </div>
+          <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>{continuationActionLabel(cont)}</div>
+        </div>
+      )}
+
+      {showAttention && (
+        <div className="row wrap" style={{ gap: 16, alignItems: "flex-start" }}>
+          {/* In-flight runs — the live work to watch (Inspect, Cancel when cancellable). */}
+          {oversight.active_runs.length > 0 && (
+            <div style={{ flex: 1, minWidth: 280 }}>
+              <h5 style={{ margin: "0 0 6px", fontSize: 12, textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                In flight <span className="muted" style={{ fontWeight: 400 }}>{oversight.active_runs.length}</span>
+              </h5>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {oversight.active_runs.map(run => (
+                  <OversightRunRow
+                    key={run.id}
+                    run={run}
+                    agentName={agentName(run.agent_id)}
+                    busy={busyRun === run.id}
+                    onInspect={() => onInspectRun(run.id)}
+                    action={canCancelRun(run) ? { label: "Cancel", ghost: true, run: () => cancel(run.id) } : null}
+                  />
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Runs needing attention — failed/cancelled (Inspect, Retry when retryable). */}
+          {oversight.attention_runs.length > 0 && (
+            <div style={{ flex: 1, minWidth: 280 }}>
+              <h5 style={{ margin: "0 0 6px", fontSize: 12, textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                Needs attention <span className="muted" style={{ fontWeight: 400 }}>{oversight.attention_runs.length}</span>
+              </h5>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {oversight.attention_runs.map(run => (
+                  <OversightRunRow
+                    key={run.id}
+                    run={run}
+                    agentName={agentName(run.agent_id)}
+                    busy={busyRun === run.id}
+                    onInspect={() => onInspectRun(run.id)}
+                    action={canRetryRun(run) ? { label: "Retry", ghost: false, run: () => retry(run.id) } : null}
+                  />
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Pending approvals — the gate list. Decide on the dedicated Approvals
+              surface (it owns the typed payload + Approve/Reject/Allow-always). */}
+          {oversight.pending_approvals.length > 0 && (
+            <div style={{ flex: 1, minWidth: 280 }}>
+              <h5 style={{ margin: "0 0 6px", fontSize: 12, textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                Pending approvals <span className="muted" style={{ fontWeight: 400 }}>{oversight.pending_approvals.length}</span>
+              </h5>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {oversight.pending_approvals.map(a => (
+                  <div key={a.id} className="card sm" style={{ padding: 8, border: "1px solid var(--border)" }}>
+                    <div className="row" style={{ alignItems: "center", gap: 8 }}>
+                      <span className={`badge ${a.risk === "critical" || a.risk === "high" ? "failed" : "in_progress"}`} style={{ fontSize: 9 }}>
+                        {a.risk}
+                      </span>
+                      <span style={{ fontSize: 12, fontWeight: 600 }}>{a.action}</span>
+                      <div className="spacer" style={{ flex: 1 }} />
+                      <Link to="/approvals" className="link" style={{ fontSize: 12 }}>Open →</Link>
+                    </div>
+                    {a.reason && <div className="muted" style={{ fontSize: 10, marginTop: 4 }}>{a.reason}</div>}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// One compact run row in the oversight strip: status, ids, a one-line summary/error,
+// an Inspect button (opens the full Run Detail panel with the deep controls) and at
+// most one inline action (Cancel for in-flight, Retry for attention).
+function OversightRunRow({
+  run,
+  agentName,
+  busy,
+  onInspect,
+  action,
+}: {
+  run: ReluxRun;
+  agentName: string;
+  busy: boolean;
+  onInspect: () => void;
+  action: { label: string; ghost: boolean; run: () => void } | null;
+}) {
+  return (
+    <div className="card sm" style={{ padding: 8, border: "1px solid var(--border)" }}>
+      <div className="row" style={{ alignItems: "center", gap: 8 }}>
+        <span className={`badge ${runStatusTone(run.status)}`} style={{ fontSize: 9 }}>{run.status}</span>
+        <span className="mono muted" style={{ fontSize: 10 }}>{run.id}</span>
+        <span className="muted" style={{ fontSize: 10 }}>· {agentName}</span>
+        <div className="spacer" style={{ flex: 1 }} />
+        <button className="btn ghost sm" style={{ height: 22, padding: "0 8px" }} onClick={onInspect}>Inspect</button>
+        {action && (
+          <button
+            className={`btn sm ${action.ghost ? "ghost" : ""}`}
+            style={{ height: 22, padding: "0 8px" }}
+            disabled={busy}
+            onClick={() => void action.run()}
+          >
+            {busy ? "…" : action.label}
+          </button>
+        )}
+      </div>
+      {(run.summary || run.error) && (
+        <div className="muted" style={{ fontSize: 10, marginTop: 4, wordBreak: "break-word" }}>
+          {run.error || run.summary}
+        </div>
+      )}
     </div>
   );
 }

@@ -8589,6 +8589,24 @@ impl KernelState {
         handle
     }
 
+    /// The compact handle for the current live (non-expired) resumable Prime agent-loop continuation,
+    /// if any — WITHOUT needing the continuation token. The dashboard learns a continuation only from
+    /// the live Prime turn that produced it, so after a refresh it has no way to know a paused loop is
+    /// still resumable; the Board Oversight strip reads this to surface a "Continue" affordance that
+    /// survives a reload. Read-only: it grants no authority (the handle carries only id/reason/counts),
+    /// and the resume itself still flows through the unchanged continue route + gates. At most one
+    /// continuation exists per conversation; the most recently created live one is returned.
+    pub fn current_prime_continuation_handle(
+        &self,
+    ) -> Option<relux_core::PrimeContinuationHandle> {
+        let now = self.clock.secs();
+        self.prime_agent_continuations
+            .values()
+            .filter(|c| now < c.expires_at_secs)
+            .max_by_key(|c| c.created_at_secs)
+            .map(|c| c.handle())
+    }
+
     /// Read (clone, WITHOUT consuming) the continuation for this conversation IF the supplied token
     /// matches and it is not expired. `None` (fail closed) on an unknown / mismatched / expired
     /// token — a stale or wrong token can never resume a loop, and a mismatched token never disturbs
@@ -16763,6 +16781,38 @@ mod tests {
         assert_eq!(rec.steps.len(), 2);
         assert_eq!(rec.steps[0].label, "relux-tools-status/summary");
         assert!(rec.original_message.contains("keep working"));
+    }
+
+    #[test]
+    fn current_continuation_handle_reads_the_live_record_without_a_token() {
+        // The Board Oversight strip surfaces a resumable continuation after a refresh (when it no
+        // longer holds the per-turn handle), so the kernel must yield the live one WITHOUT a token.
+        let (mut k, ctx) = prime_chat_kernel();
+        // Fresh: nothing to resume.
+        assert!(k.current_prime_continuation_handle().is_none());
+
+        let (o, s) = cont_obs("relux-tools-status/summary", serde_json::json!({}), serde_json::json!({"queued": 1}));
+        let handle = k.create_prime_continuation(
+            &ctx,
+            "keep working",
+            false,
+            &[o],
+            &[s],
+            ContinuationPause::Limit("tool-call limit".to_string()),
+        );
+        // Now the tokenless read returns the same live handle.
+        let current = k.current_prime_continuation_handle().expect("a live continuation is surfaced");
+        assert_eq!(current.id, handle.id);
+        assert_eq!(current.observation_count, 1);
+        assert_eq!(current.reason, "tool-call limit");
+
+        // Past its TTL it is no longer surfaced (fail closed, same boundary as peek).
+        let exp = k.peek_prime_continuation(&ctx, &handle.id).expect("still live").expires_at_secs;
+        k.clock = Clock::from_secs(exp);
+        assert!(
+            k.current_prime_continuation_handle().is_none(),
+            "an expired continuation is not offered for resume"
+        );
     }
 
     #[test]

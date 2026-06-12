@@ -519,6 +519,7 @@ fn protected_router() -> Router<AppState> {
             "/v1/relux/runs/:id/proposed-changes/apply",
             post(apply_proposed_change_set),
         )
+        .route("/v1/relux/oversight", get(get_oversight))
         .route("/v1/relux/audit", get(list_audit_events))
         .route("/v1/relux/tasks/:id/start", post(start_task))
         .route("/v1/relux/tasks/:id/execute-assigned", post(execute_assigned_task))
@@ -1701,6 +1702,88 @@ async fn list_approvals(
             .collect::<Vec<_>>())
     })?;
     Ok(Json(approvals))
+}
+
+/// Composed Board Oversight summary (`docs/relix-dashboard-design.md` §5 Inbox / §11 Active Runs).
+///
+/// One read that stitches the four things an operator needs to oversee live work — counts, the
+/// in-flight runs, the runs that need attention (failed/cancelled), the pending approvals, and any
+/// resumable Prime continuation — so the Work surface does not have to fan out to four endpoints and
+/// glue them together poorly. Every field is composed from existing, already-honest state: the
+/// counts are `inspect_state`, the run lists are the same `relux_core::Run` records `list_runs`
+/// serves (filtered, not re-projected), the approvals reuse [`approval_record`], and the continuation
+/// is the read-only handle (it grants no authority — resume still flows through the continue route).
+#[derive(Debug, Serialize)]
+struct OversightResponse {
+    /// The same aggregate counts as `GET /v1/relux/state` (active runs, open/blocked/failed tasks,
+    /// waiting-on-approval, pending approvals).
+    counts: StateResponse,
+    /// Runs currently executing (status `running`), most-recent first — the live work to watch.
+    active_runs: Vec<relux_core::Run>,
+    /// Recent runs that ended in a non-success terminal state (failed/cancelled), most-recent first —
+    /// the work that may need a Retry or inspection. Bounded to the most recent few.
+    attention_runs: Vec<relux_core::Run>,
+    /// Pending approvals (gate list), reusing the same record shape as `GET /v1/relux/approvals`.
+    pending_approvals: Vec<ReluxApprovalRecord>,
+    /// The current live resumable Prime agent-loop continuation, if a paused loop is still resumable.
+    /// Survives a dashboard refresh (unlike the per-turn handle), so the board can offer Continue.
+    continuation: Option<relux_core::PrimeContinuationHandle>,
+}
+
+/// The cap on how many attention (failed/cancelled) runs the oversight strip carries — it is a glance
+/// surface, not the full ledger (the Recent Runs table and per-run inspect cover the rest).
+const OVERSIGHT_ATTENTION_RUN_LIMIT: usize = 8;
+
+/// `GET /v1/relux/oversight` — the composed Board Oversight read (`docs/relix-dashboard-design.md`
+/// §5 / §11). Composes existing state; adds no new authority and mutates nothing.
+async fn get_oversight(State(state): State<AppState>) -> Result<Json<OversightResponse>, ApiError> {
+    let resp = locked_read(&state, |kernel| {
+        let counts = state_response(kernel, &state.db_path);
+        // The same Run records list_runs serves, sorted by id; categorize by status. Most-recent
+        // first (ids are zero-padded so lexical == numeric) so the freshest work leads each list.
+        let runs: Vec<relux_core::Run> = kernel.runs().into_iter().cloned().collect();
+        let active_runs: Vec<relux_core::Run> = runs
+            .iter()
+            .rev()
+            .filter(|r| matches!(r.status, relux_core::RunStatus::Running))
+            .cloned()
+            .collect();
+        let attention_runs: Vec<relux_core::Run> = runs
+            .iter()
+            .rev()
+            .filter(|r| {
+                matches!(
+                    r.status,
+                    relux_core::RunStatus::Failed | relux_core::RunStatus::Cancelled
+                )
+            })
+            .take(OVERSIGHT_ATTENTION_RUN_LIMIT)
+            .cloned()
+            .collect();
+        let pending_approvals: Vec<ReluxApprovalRecord> = {
+            let mut pending: Vec<relux_core::Approval> = kernel
+                .approvals
+                .values()
+                .filter(|a| a.status == relux_core::ApprovalStatus::Pending)
+                .cloned()
+                .collect();
+            // Newest pending first, matching the Approvals page's pending ordering.
+            pending.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            pending
+                .into_iter()
+                .map(|a| approval_record(kernel, a))
+                .collect()
+        };
+        let continuation = kernel.current_prime_continuation_handle();
+        Ok(OversightResponse {
+            counts,
+            active_runs,
+            attention_runs,
+            pending_approvals,
+            continuation,
+        })
+    })?;
+    Ok(Json(resp))
 }
 
 #[derive(Debug, Deserialize)]
@@ -10319,6 +10402,41 @@ mod tests {
             v["extended"]["max_active_jobs"].as_u64().unwrap()
                 > v["standard"]["max_active_jobs"].as_u64().unwrap(),
             "extended profile must admit more concurrent jobs than standard"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversight_route_composes_counts_runs_approvals_and_continuation() {
+        // The composed Board Oversight read returns a well-formed envelope on a fresh store:
+        // the same counts as /state, empty run/approval lists, and no continuation. Creating a
+        // task then bumps open_tasks — proving the counts are live, not stubbed.
+        let (state, _dir) = auth_state(true);
+
+        let (status, _, body) = call(&state, "GET", "/v1/relux/oversight", None, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        // The four composed sections are always present (arrays/object, never absent).
+        assert!(v["counts"].is_object(), "counts present");
+        assert!(v["active_runs"].is_array(), "active_runs present");
+        assert!(v["attention_runs"].is_array(), "attention_runs present");
+        assert!(v["pending_approvals"].is_array(), "pending_approvals present");
+        // Fresh store: nothing in flight, nothing failed, no paused loop.
+        assert_eq!(v["active_runs"].as_array().unwrap().len(), 0);
+        assert_eq!(v["attention_runs"].as_array().unwrap().len(), 0);
+        assert_eq!(v["pending_approvals"].as_array().unwrap().len(), 0);
+        assert!(v["continuation"].is_null(), "no resumable continuation yet");
+        let open_before = v["counts"]["open_tasks"].as_u64().unwrap();
+
+        // Create a task through the real route; the composed counts must reflect it.
+        let (cs, _, cb) =
+            call(&state, "POST", "/v1/relux/tasks", None, Some(r#"{"title":"oversight probe"}"#)).await;
+        assert_eq!(cs, StatusCode::OK, "{cb}");
+        let (_s2, _, body2) = call(&state, "GET", "/v1/relux/oversight", None, None).await;
+        let v2: serde_json::Value = serde_json::from_str(&body2).unwrap();
+        assert_eq!(
+            v2["counts"]["open_tasks"].as_u64().unwrap(),
+            open_before + 1,
+            "a newly created task is counted as open in the oversight summary"
         );
     }
 

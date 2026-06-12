@@ -123,6 +123,25 @@ One surface owns list↔board, and it's the most-used screen. Mirror Paperclip's
 
 Cards show: identifier (mono), title, priority icon, assignee avatar, a pulsing **"Live"** dot when an agent is running it, and a "Next step" chip when a successful run needs a disposition.
 
+### 6.1 Board Oversight v1 (IMPLEMENTED)
+
+The Relux-shell **Work** page (`apps/dashboard/src/pages/Work.tsx`) is the operational board today, and it now makes live work **visible and controllable at a glance** — not just a static task list (design §5 Inbox + §11 Active Runs, scaled to the current single-board surface).
+
+**What is visible.**
+- **Four board columns** — Open · Running · **Blocked / Failed** · Done. Every `TaskStatus` maps to exactly one column (`apps/dashboard/src/oversight.ts::taskBucket`, unit-tested), so blocked / waiting-on-approval / failed work is now on the board. (Previously the page computed an "other" bucket that was *never rendered* — that work was invisible. Fixed.)
+- **An Oversight strip** at the top, fed by one composed read: dense count chips (active runs · open · blocked · failed · waiting-approval · pending approvals), an **In flight** run list, a **Needs attention** (failed/cancelled) run list, the **pending approvals** gate list, and any **resumable Prime continuation**.
+
+**What is controllable** (every control reuses an EXISTING backend route — nothing new executes):
+- **Continue** a paused Prime agent loop. The continuation is read from the kernel (not just the live turn), so it **survives a dashboard refresh**; a loop still awaiting a tool approval routes the operator to Approvals first rather than offering a dead Continue.
+- **Cancel** an in-flight, process-backed run (the honest `canCancelRun` gate; the kernel reports `not_running` for a non-cancellable run).
+- **Retry** a failed/cancelled run that is retryable (`canRetryRun`), jumping to the fresh attempt.
+- **Open** a pending approval in the dedicated Approvals surface (which owns the typed payload + Approve/Reject/Allow-always).
+- **Inspect** any run → the existing Run Detail panel (transcript, logs, proposed-changes, retry/resume/cancel).
+
+**Backend (one small composed route).** `GET /v1/relux/oversight` (`crates/relux-kernel/src/server.rs::get_oversight`) stitches `inspect_state` counts + the in-flight/attention `Run` records (the same shape `list_runs` serves, filtered — not re-projected) + pending approvals (the same `approval_record` shape as `/approvals`) + the resumable continuation handle (`KernelState::current_prime_continuation_handle`, read-only — it grants no authority; resume still flows through the unchanged continue route + gates). It composes existing honest state so the UI does not fan out to four endpoints and glue them poorly. Read-only; mutates nothing. Tests: `oversight_route_composes_counts_runs_approvals_and_continuation` (server), `current_continuation_handle_reads_the_live_record_without_a_token` (state), `apps/dashboard/test/oversight.test.ts` (bucketing + summary helpers), the `work-render` strip/column assertions, and a live-browser click check (`apps/dashboard/scripts/browser-smoke.mjs`: the strip loads its composed summary via a real `onClick → network → re-render`, and the Blocked/Failed column renders).
+
+**Still pending (not built here, deliberately):** drag-to-change-status, list↔board toggle, sub-issue nesting / workflow-checklist rendering, per-subtree progress strips and live cost, and inline approve/reject *on the strip* (today the strip links out to the Approvals surface). These remain §6/§7 targets.
+
 ---
 
 ## 7. The Issue detail (the heart)

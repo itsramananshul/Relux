@@ -513,6 +513,28 @@ async function main() {
         { timeout: 12000, desc: "work title" },
       );
       await waitForContent("Work");
+      // Board Oversight v1: the composed oversight strip must load (not stay stuck
+      // on "Loading oversight…") and render its count chips. This is the onClick →
+      // GET /v1/relux/oversight → re-render binding a first-paint test cannot see.
+      try {
+        await waitFor(
+          `(() => {
+             const t = (document.querySelector('.workspace')?.innerText || '');
+             return t.includes('Oversight') && t.includes('Active runs') && !t.includes('Loading oversight');
+           })()`,
+          { timeout: 12000, desc: "oversight strip loaded" },
+        );
+        record("Work oversight strip loads its composed summary", true, "counts rendered");
+      } catch (e) {
+        record("Work oversight strip loads its composed summary", false, e.message);
+      }
+      // The Blocked/Failed column is now part of the board (the previously invisible bucket).
+      // The column heading uses CSS text-transform:uppercase, and innerText returns the
+      // RENDERED (uppercased) text — so compare case-insensitively.
+      const hasBlockedCol = await evaluate(
+        `/blocked \\/ failed/i.test(document.querySelector('.workspace')?.innerText || '')`,
+      );
+      record("Work board shows the Blocked / Failed column", hasBlockedCol, hasBlockedCol ? "rendered" : "column missing");
       // The task list loads async (useAsync). Give it a bounded moment to settle
       // before deciding empty-vs-seeded, so a slow fetch is not misread as "no
       // tasks" (which would skip the Inspect→detail binding this step exists for).

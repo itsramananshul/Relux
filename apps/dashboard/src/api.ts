@@ -3396,6 +3396,26 @@ export const reluxApprovals = {
     ),
 };
 
+// -- Relux Board Oversight --------------------------------------------------
+
+// The composed Board Oversight summary (GET /v1/relux/oversight): one read that
+// stitches the counts, in-flight runs, runs needing attention, pending approvals,
+// and any resumable Prime continuation. Each field reuses an existing wire shape
+// (ReluxState / ReluxRun / ReluxApproval / ReluxPrimeContinuation), so the board
+// renders it with the same components the dedicated pages use.
+export interface ReluxOversight {
+  counts: ReluxState;
+  active_runs: ReluxRun[];
+  attention_runs: ReluxRun[];
+  pending_approvals: ReluxApproval[];
+  continuation?: ReluxPrimeContinuation | null;
+}
+
+export const reluxOversight = {
+  // Composed oversight snapshot for the Work board. Cheap, read-only, mutates nothing.
+  get: () => api.get<ReluxOversight>("/v1/relux/oversight"),
+};
+
 // -- Relux persistent allow-always grants -----------------------------------
 
 // A standing grant that lets a future matching tool invocation bypass the
