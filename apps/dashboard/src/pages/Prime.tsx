@@ -2,13 +2,16 @@ import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   reluxAi,
+  reluxApprovals,
   reluxPrime,
   reluxWork,
   type ReluxAiStatus,
   type ReluxPrimeProposal,
   type ReluxPrimeSuggestion,
+  type ReluxPrimeToolApprovalRequest,
   type ReluxPrimeToolPlanProposal,
   type ReluxPrimeTurn,
+  type ReluxToolInvocationResult,
 } from "../api";
 import { afterActionLabel, boundedContextReads, brainSourceLabel, contextReadDetail, contextReadsHadMiss, contextReadsUsedLabel, decisionSourceLabel, hasSteps, intentProvenance, pendingClarificationLabel, polishProvenance, PRIME_GREETING, PRIME_HINT, PRIME_PLACEHOLDER, PRIME_SUGGESTIONS, proposalDisplaySummary, replyPolishLabel, requestedToolLabel, slotProvenance, stepDisplayTitle, updateProvenance } from "../prime";
 import { workTaskHref, workRunHref } from "../routing";
@@ -438,6 +441,15 @@ function PrimeTurnCard({
 
       <ToolResult turn={turn} />
 
+      {/* A pending per-call tool approval Prime staged because an explicit chat tool
+          invocation named a gated (needs_approval) tool with no standing grant. The
+          card drives the EXISTING approval routes (approve once → execute, allow
+          always, deny) — Prime ran nothing by showing it, and nothing is auto-approved
+          (docs/mcp.md "Invocation"; §7.4). */}
+      {turn.pending_tool_approval && (
+        <ApprovalCard request={turn.pending_tool_approval} busy={busy} />
+      )}
+
       {/* The reviewable plan proposal (RELUX_MASTER_PLAN §10 planning layer, §11.1):
           a compact card showing the proposed shape — goal, steps, roles, and the
           agents work would land on. It is informational only; nothing runs from
@@ -771,6 +783,205 @@ function PrimeTurnCard({
 // A compact, B&W plan proposal card (RELUX_MASTER_PLAN §10 planning layer, §11.1).
 // It renders STRICTLY what Prime's proposal carried — the goal as a heading, a
 // summary line, and (for a genuine multi-step plan) the proposed steps with their
+// A compact, chat-first pending-approval card for a gated tool call Prime staged
+// (docs/mcp.md "Invocation"; RELUX_MASTER_PLAN §7.4 per-call approval). It shows the
+// tool + source, the risk/reason, and a bounded, secret-redacted args preview, then
+// offers exactly the decisions the existing approval machinery supports — "Approve &
+// run" (decide → execute), "Allow always" (allow-always: persist a standing grant +
+// execute), and "Deny" (decide:rejected, which drops the bound invocation). It calls
+// ONLY the existing /v1/relux/approvals/:id/{decide,execute,allow-always} routes — it
+// invents no parallel security path and never auto-approves. Mirrors openclaw's
+// allow-once / allow-always / deny permission options (src/acp/permission-relay.ts).
+function ApprovalCard({
+  request,
+  busy,
+}: {
+  request: ReluxPrimeToolApprovalRequest;
+  busy: boolean;
+}) {
+  const [working, setWorking] = useState<null | "approve" | "always" | "deny">(null);
+  const [outcome, setOutcome] = useState<
+    null | { kind: "ran"; result: ReluxToolInvocationResult } | { kind: "denied" }
+  >(null);
+  const [err, setErr] = useState<string | null>(null);
+  const id = request.approval_id;
+  const locked = busy || working !== null || outcome !== null;
+
+  async function approveAndRun() {
+    if (locked) return;
+    setErr(null);
+    setWorking("approve");
+    try {
+      // The exact two-step the Approvals page uses: decide(approved) then execute once.
+      await reluxApprovals.decide(id, "approved");
+      const result = await reluxApprovals.execute(id);
+      setOutcome({ kind: "ran", result });
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Could not approve and run the tool");
+    } finally {
+      setWorking(null);
+    }
+  }
+
+  async function allowAlways() {
+    if (locked) return;
+    setErr(null);
+    setWorking("always");
+    try {
+      // allow-always approves AND persists a standing grant; then run the bound call once.
+      await reluxApprovals.allowAlways(id);
+      const result = await reluxApprovals.execute(id);
+      setOutcome({ kind: "ran", result });
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Could not allow-always and run the tool");
+    } finally {
+      setWorking(null);
+    }
+  }
+
+  async function deny() {
+    if (locked) return;
+    setErr(null);
+    setWorking("deny");
+    try {
+      await reluxApprovals.decide(id, "rejected");
+      setOutcome({ kind: "denied" });
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Could not deny the tool call");
+    } finally {
+      setWorking(null);
+    }
+  }
+
+  let ranOutput = "";
+  if (outcome?.kind === "ran" && outcome.result.output !== undefined && outcome.result.output !== null) {
+    try {
+      ranOutput = JSON.stringify(outcome.result.output, null, 2);
+    } catch {
+      ranOutput = String(outcome.result.output);
+    }
+  }
+
+  return (
+    <div
+      style={{
+        marginTop: 10,
+        border: "1px solid var(--border)",
+        borderRadius: 6,
+        padding: "10px 12px",
+      }}
+    >
+      <div className="row wrap" style={{ gap: 6, alignItems: "center", marginBottom: 4 }}>
+        <span className="badge in_review" style={{ fontSize: 9 }} title="A gated tool call awaiting your decision — nothing ran yet">
+          approval needed
+        </span>
+        {request.source === "mcp" && request.server ? (
+          <span className="badge todo" style={{ fontSize: 8 }} title={`Live tool from MCP server "${request.server}"`}>
+            MCP · {request.server}
+          </span>
+        ) : (
+          <span className="badge backlog" style={{ fontSize: 8 }} title="An installed plugin tool">
+            plugin
+          </span>
+        )}
+        <span className="mono" style={{ fontSize: 13, fontWeight: 600 }}>{request.label}</span>
+        <span className="badge backlog" style={{ fontSize: 9 }} title="Declared/derived risk of this tool">
+          {request.risk}
+        </span>
+      </div>
+      <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>{request.reason}</div>
+      <div className="row wrap" style={{ gap: 6, fontSize: 10, marginBottom: 6 }}>
+        <span className="mono muted" title="The permission this call requires">{request.permission}</span>
+      </div>
+      {request.args_preview && (
+        <pre
+          className="mono"
+          style={{
+            margin: "0 0 8px",
+            padding: "6px 8px",
+            fontSize: 11,
+            maxHeight: 140,
+            overflow: "auto",
+            border: "1px solid var(--border)",
+            borderRadius: 4,
+            whiteSpace: "pre-wrap",
+          }}
+          title="A bounded, secret-redacted preview of the arguments — never the raw values"
+        >
+          {request.args_preview}
+        </pre>
+      )}
+
+      {outcome === null ? (
+        <div className="row wrap" style={{ gap: 8 }}>
+          <button
+            className="btn"
+            style={{ fontSize: 12, padding: "4px 12px" }}
+            disabled={locked}
+            onClick={() => void approveAndRun()}
+            title="Approve this single call and run it once through the existing per-call execute path"
+          >
+            {working === "approve" ? "Running…" : "Approve & run"}
+          </button>
+          {request.allow_always_supported && (
+            <button
+              className="btn"
+              style={{ fontSize: 12, padding: "4px 12px" }}
+              disabled={locked}
+              onClick={() => void allowAlways()}
+              title="Approve and persist a standing allow-always grant, then run it once — future matching calls skip the prompt"
+            >
+              {working === "always" ? "Running…" : "Allow always"}
+            </button>
+          )}
+          <button
+            className="btn ghost"
+            style={{ fontSize: 12, padding: "4px 12px" }}
+            disabled={locked}
+            onClick={() => void deny()}
+            title="Deny this call — it is dropped and can never run without a fresh approval"
+          >
+            {working === "deny" ? "Denying…" : "Deny"}
+          </button>
+        </div>
+      ) : outcome.kind === "denied" ? (
+        <div className="banner" style={{ fontSize: 11, margin: 0 }}>
+          Denied — the call was dropped and will not run.
+        </div>
+      ) : (
+        <div>
+          <div className="banner" style={{ fontSize: 11, margin: 0 }}>
+            Ran <span className="mono">{request.label}</span> once through the approved path.
+          </div>
+          {ranOutput && (
+            <pre
+              className="mono"
+              style={{
+                margin: "6px 0 0",
+                padding: "6px 8px",
+                fontSize: 11,
+                maxHeight: 220,
+                overflow: "auto",
+                border: "1px solid var(--border)",
+                borderRadius: 4,
+                whiteSpace: "pre-wrap",
+              }}
+            >
+              {ranOutput}
+            </pre>
+          )}
+        </div>
+      )}
+      {err && (
+        <div className="banner err" style={{ fontSize: 11, marginTop: 8 }}>{err}</div>
+      )}
+      <div className="muted" style={{ fontSize: 10, marginTop: 8, fontStyle: "italic" }}>
+        Nothing ran yet — your decision runs through the same permission/approval/grant/audit gates.
+      </div>
+    </div>
+  );
+}
+
 // role and the agent each would land on. It mints nothing and runs nothing: the
 // only commit path is Prime's explicit "Create these tasks" suggestion rendered
 // below the card. The card invents no step or assignee (§17.1).

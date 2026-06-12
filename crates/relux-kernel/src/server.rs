@@ -7454,6 +7454,7 @@ mod tests {
             update: None,
             context_reads: vec![],
             tool_plan_proposal: None,
+            pending_tool_approval: None,
         }
     }
 
@@ -8894,6 +8895,7 @@ mod tests {
             update: None,
             context_reads: vec![],
             tool_plan_proposal: None,
+            pending_tool_approval: None,
         };
         let wire = serde_json::to_value(&turn).expect("PrimeTurn serializes");
         assert!(

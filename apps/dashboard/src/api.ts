@@ -1678,6 +1678,36 @@ export interface ReluxPendingClarification {
   source: string;
 }
 
+// A pending per-call tool approval Prime staged this turn, present ONLY when an
+// EXPLICIT chat tool invocation hit a gated (`needs_approval`) tool with no standing
+// allow-always grant. Presentation/correlation only — the real fail-closed binding
+// lives in the kernel; the chat card drives the EXISTING approval routes
+// (decide → execute, allow-always, deny). Carries only a bounded, secret-redacted
+// args preview, never the raw arguments. (docs/mcp.md "Invocation"; §7.4)
+export interface ReluxPrimeToolApprovalRequest {
+  // The pending approval id — the key the card uses on the existing routes.
+  approval_id: string;
+  // The tool label `<plugin_id>/<tool_name>`.
+  label: string;
+  // The plugin id (`mcp:<server>` for an MCP tool, else the installed plugin id).
+  plugin_id: string;
+  tool_name: string;
+  // The source kind for the badge: "mcp" or "plugin".
+  source: "mcp" | "plugin";
+  // The MCP server id when this is an MCP tool; omitted for a plugin tool.
+  server?: string;
+  // Lowercase wire risk (`low`/`medium`/`high`/`critical`).
+  risk: string;
+  // The human reason recorded on the approval.
+  reason: string;
+  // A bounded, secret-redacted preview of the bound args.
+  args_preview: string;
+  // The permission the call requires.
+  permission: string;
+  // Whether "Allow always" is offered (a persistent grant the existing route stands up).
+  allow_always_supported: boolean;
+}
+
 export interface ReluxPrimeTurn {
   intent: string;
   reply: string;
@@ -1687,6 +1717,11 @@ export interface ReluxPrimeTurn {
   started_run: string | null;
   created_agent: string | null;
   approval: string | null;
+  // A pending per-call tool approval Prime staged this turn (see the interface above),
+  // present ONLY when an explicit chat tool invocation hit a gated tool with no standing
+  // grant. The chat renders a compact approval card wired to the existing routes; nothing
+  // ran by showing it. Omitted on every other turn.
+  pending_tool_approval?: ReluxPrimeToolApprovalRequest;
   // One-click next actions Prime suggests for this turn (§11.1). Omitted when
   // there are none.
   suggested_actions?: ReluxPrimeSuggestion[];

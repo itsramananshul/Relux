@@ -1836,6 +1836,34 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **unreleased** — **chat-staged tool approvals (gated chat tool calls become usable)** on top of the
+  single-invoke slice, continuing the §9 ("P2 — MCP tool support") line, built reference-first against
+  openclaw's `src/acp/permission-relay.ts` (the canonical allow-once / allow-always / deny decision model
+  + stable approval-id correlation key) and `src/acp/approval-classifier.ts` (unknown → fail-closed, never
+  auto-approve), per `docs/reference-driven-development.md` (mapping in `docs/mcp.md`, "Chat-staged
+  approval"; `docs/REFERENCE_CODE_MAP.md`). No master-plan safety property is weakened — no gate is
+  bypassed, nothing is auto-approved, and no dangerous/bypass flag is ever passed to an adapter.
+  **What closes:** a gated (`needs_approval`) tool an operator names in Prime chat used to **dead-end** in
+  an honest-but-useless refusal. Now `prime_invoke_tool`'s `NeedsApproval` arm (1) runs the call directly
+  when a standing **allow-always grant** already authorizes the exact `(agent, plugin, tool, permission,
+  risk)` (the §7.4 grant fast path, via `matching_persistent_grant_id` → `invoke_tool`), or (2) **stages a
+  pending per-call approval** through the EXISTING `request_tool_invocation_approval` machinery (re-checks
+  the permission, re-confirms approval is required, bounds the args, binds the consume-once
+  `PendingToolInvocation`) and returns `disposition = awaiting_approval` carrying
+  `PrimeTurn.pending_tool_approval` (`relux_core::PrimeToolApprovalRequest`: approval id, `<plugin>/<tool>`
+  label, `mcp`/`plugin` source + server, lowercase risk, reason, **secret-redacted** args preview, required
+  permission, `allow_always_supported`). **Nothing runs** at stage time. **UI:** a compact chat
+  `ApprovalCard` (`apps/dashboard/src/pages/Prime.tsx`) offers the three openclaw decisions wired to the
+  EXISTING routes ONLY — "Approve & run" (`/approvals/:id/decide` approved → `/execute`), "Allow always"
+  (`/approvals/:id/allow-always` → `/execute`), "Deny" (`/approvals/:id/decide` rejected, which drops the
+  bound invocation) — no parallel security path, no new backend. **Fail-closed + honest:** a missing /
+  unreachable / disabled / unregistered tool still surfaces a clean `tool_error` (it never stages an
+  approval); normal chat / profanity / vague ideas / deliberative questions never reach the arm
+  (`is_chat_guarded`), so they never stage an approval. `cargo test` + `clippy` clean on
+  `relux-core`/`relux-kernel` (incl. new targeted tests: gated MCP + gated plugin chat invocation each
+  stage a pending approval not a dead refusal, allow-always grant runs directly, the staged approval runs
+  once through the existing execute route, deny drops the binding/stays safe). The dashboard typechecks,
+  builds, and its tests pass; the committed bundle was rebuilt. Every safety property from v0.1.25 holds.
 - **unreleased** — **single MCP tool invocation from Prime chat** on top of v0.1.25, continuing the §9
   ("P2 — MCP tool support") line from `docs/HERMES_OPENCLAW_DEEP_AUDIT.md`, built reference-first against
   the vendored Hermes one-off tool-call path (`agent/conversation_loop.py` valid-tool gate +

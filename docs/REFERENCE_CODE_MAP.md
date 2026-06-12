@@ -89,6 +89,25 @@ Read for: **the fail-closed default — an UNKNOWN action is treated as mutating
 ### `src/acp/approval-classifier.ts`
 Read for: **approval/risk classification of a tool action** (maps to Relux's
 `approval_blocks_direct_invocation` predicate + `McpToolClassification` default Medium+Required).
+- An UNKNOWN tool → `autoApprove: false` (fail closed); a mutating/exec/control-plane tool
+  never auto-approves. Relux mirrors the posture: an unclassified MCP tool is fail-closed
+  Medium + Required, and a chat-staged gated call is never auto-approved.
+
+### `src/acp/permission-relay.ts`
+Read for: **the canonical three-decision approval model surfaced to a human** — the exact
+shape a chat-initiated gated tool approval must offer.
+- `GatewayExecApprovalDecision = "allow-once" | "allow-always" | "deny"`;
+  `buildAcpPermissionOptions` renders them as "Allow once" / "Allow always" / "Deny", and
+  falls back to `["allow-once", "deny"]` when allow-always is not applicable (L24, L50-77).
+  The **approval id is the stable correlation key** for an early prompt (L141-150).
+- **Relux mapping:** the Prime chat **approval card** (`apps/dashboard/src/pages/Prime.tsx`
+  `ApprovalCard`) offers the SAME three decisions wired to the EXISTING routes — "Approve &
+  run" (`decide:approved` → `execute`), "Allow always" (`allow-always` → `execute`), "Deny"
+  (`decide:rejected`, which drops the bound invocation). The pending `ApprovalId` is the
+  stable key; `PrimeToolApprovalRequest.allow_always_supported` gates the middle button
+  exactly as `buildAcpPermissionOptions` gates `allow-always`. The kernel staging
+  (`KernelState::request_tool_invocation_approval`) is the consume-once exec-approval
+  register; nothing runs until the human decides (`docs/mcp.md` "Chat-staged approval").
 
 ---
 

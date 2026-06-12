@@ -763,6 +763,7 @@ mod tests {
             update: None,
             context_reads: vec![],
             tool_plan_proposal: None,
+            pending_tool_approval: None,
         }
     }
 

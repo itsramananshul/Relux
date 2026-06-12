@@ -114,13 +114,63 @@ PROPOSAL below, and not a brain freely choosing tools.
   the same **shaped** `{ "result": <text>, "structuredContent"?: … }` (the raw JSON-RPC
   envelope is never surfaced). The reply carries it on the turn's `invoked_tool`
   (`mcp:<server>/<tool>`, the source/tool label) + `tool_output` fields.
-- **Fail closed, honest, never auto-allowed.** An unclassified / Medium+Required MCP tool
-  is `needs_approval` and Prime **refuses to run it directly** — the reply names the
-  existing routes (classify it low-risk + auto-approve, stand up an allow-always grant, or
-  run it once via the per-call approval on the Plugins page). A tool the server does not
-  advertise, an unreachable/disabled server, or an unregistered server each surface a
-  clean, MCP-aware `tool_error` on the turn (no blank page, no raw JSON dump). Nothing is
-  ever auto-approved from chat.
+- **Gated → a staged approval card, never a dead-end refusal (never auto-allowed).** An
+  unclassified / Medium+Required MCP tool is `needs_approval`, so Prime **does not run it
+  directly**. Instead of dead-ending, the turn **stages a pending per-call approval** bound
+  to the EXACT call and surfaces a compact approval card (see "Chat-staged approval"
+  below). If a standing **allow-always grant** already authorizes this exact call, Prime
+  runs it directly through the audited `invoke_tool` path instead (no second prompt — the
+  operator already authorized it). Nothing is ever auto-approved from chat, and no
+  bypass/dangerous flag is ever passed to an adapter.
+- **Honest failures stay honest.** A tool the server does not advertise, an
+  unreachable/disabled server, or an unregistered server each surface a clean, MCP-aware
+  `tool_error` on the turn (no blank page, no raw JSON dump) — these never stage an
+  approval (there is nothing real to approve).
+
+### Chat-staged approval (gated tool → pending approval card → existing routes)
+
+When an EXPLICIT chat tool invocation (a single `mcp:<server>/<tool>` ref, or an explicit
+`relux-tools-<plugin>/<tool>` ref) resolves to a gated (`needs_approval`) tool and there is
+no standing allow-always grant, the chat path is now **usable** rather than a dead end. It
+reuses the EXISTING per-call approval machinery end to end — it invents no parallel security
+system (`docs/RELUX_MASTER_PLAN.md` §7.4 per-call approval; openclaw
+`src/acp/permission-relay.ts` allow-once / allow-always / deny).
+
+- **Staging (kernel, fail closed).** `prime_invoke_tool`'s `NeedsApproval` arm calls
+  `KernelState::request_tool_invocation_approval` (the same call the Plugins
+  `/v1/relux/tools/request-approval` route uses): it re-checks the agent holds the tool's
+  permission, re-confirms the tool actually requires approval, bounds the args, and binds a
+  one-shot `PendingToolInvocation` to the exact `(agent, plugin, tool, args snapshot +
+  SHA-256)` alongside a `Pending` `Approval`. **Nothing runs.** The turn comes back
+  `disposition = awaiting_approval` carrying `PrimeTurn.pending_tool_approval`
+  (`relux_core::PrimeToolApprovalRequest`: the approval id, the `<plugin>/<tool>` label, the
+  source `mcp`/`plugin` + server id, the lowercase risk, the human reason, a bounded
+  **secret-redacted** args preview, the required permission, and `allow_always_supported`).
+  The raw args are never put on the turn.
+- **Standing-grant fast path (§7.4 preserved).** Before staging, the arm checks
+  `matching_persistent_grant_id` for this exact `(agent, plugin, tool, permission, risk)`. A
+  match means the operator already chose "allow always", so the call runs **directly**
+  through `invoke_tool` (which records the grant use + audits) and the turn is
+  `disposition = executed` with the shaped `tool_output` — no card, no second prompt.
+- **The card drives the EXISTING routes only (UI, `apps/dashboard/src/pages/Prime.tsx`
+  `ApprovalCard`).** The chat renders a compact B&W card — tool + source badge, risk,
+  reason, the redacted args preview — with exactly the decisions the existing machinery
+  supports:
+  - **Approve & run** → `POST /v1/relux/approvals/:id/decide {decision:"approved"}` then
+    `POST /v1/relux/approvals/:id/execute` (the consume-once bound invocation runs exactly
+    once, shaped result shown inline).
+  - **Allow always** → `POST /v1/relux/approvals/:id/allow-always` (approves AND persists a
+    standing grant so future matching calls skip the prompt), then `…/execute` once. Offered
+    only when `allow_always_supported` (always true for a per-call tool approval today).
+  - **Deny** → `POST /v1/relux/approvals/:id/decide {decision:"rejected"}`, which **drops
+    the bound invocation** outright — the gated call can never run without a fresh approval.
+  Nothing is auto-approved by showing the card; every decision flows through the unchanged
+  permission/approval/grant/audit gates.
+- **Normal chat never stages an approval.** Staging happens ONLY on an already-classified
+  `ToolInvocation` turn whose tool is gated. A greeting, an insult/frustration, a vague
+  idea/brainstorm, or a deliberative question about a tool resolves to no tool (gated by
+  `is_chat_guarded`) — so it never reaches the `NeedsApproval` arm and never stages an
+  approval.
 
 ## Session continuity (streamable-HTTP `Mcp-Session-Id`)
 

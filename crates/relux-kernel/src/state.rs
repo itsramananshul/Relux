@@ -6633,6 +6633,7 @@ impl KernelState {
                 update: None,
                 context_reads: vec![],
                 tool_plan_proposal: None,
+                pending_tool_approval: None,
             },
             PrimePlan::Clarify { text } => PrimeTurn {
                 intent,
@@ -6655,6 +6656,7 @@ impl KernelState {
                 update: None,
                 context_reads: vec![],
                 tool_plan_proposal: None,
+                pending_tool_approval: None,
             },
             PrimePlan::Act { action, text } => {
                 // Brain-assisted slot sharpening (validated): a create action takes
@@ -6736,6 +6738,7 @@ impl KernelState {
                     update: None,
                     context_reads: vec![],
                     tool_plan_proposal: None,
+                    pending_tool_approval: None,
                 }
             }
         };
@@ -6849,6 +6852,7 @@ impl KernelState {
             update: None,
             context_reads: vec![],
             tool_plan_proposal: None,
+            pending_tool_approval: None,
         }
     }
 
@@ -7052,6 +7056,7 @@ impl KernelState {
             update: None,
             context_reads: vec![],
             tool_plan_proposal: None,
+            pending_tool_approval: None,
         }
     }
 
@@ -7132,6 +7137,7 @@ impl KernelState {
                     update: None,
                     context_reads: vec![],
                     tool_plan_proposal: None,
+                    pending_tool_approval: None,
                 })
             }
             PrimeAction::CreateAndRunTask { title } => {
@@ -7200,6 +7206,7 @@ impl KernelState {
                     update: None,
                     context_reads: vec![],
                     tool_plan_proposal: None,
+                    pending_tool_approval: None,
                 })
             }
             PrimeAction::StartRun { task_id } => {
@@ -7230,6 +7237,7 @@ impl KernelState {
                     update: None,
                     context_reads: vec![],
                     tool_plan_proposal: None,
+                    pending_tool_approval: None,
                 })
             }
             PrimeAction::CreateAgent {
@@ -7304,6 +7312,7 @@ impl KernelState {
                     update: None,
                     context_reads: vec![],
                     tool_plan_proposal: None,
+                    pending_tool_approval: None,
                 })
             }
             PrimeAction::AssignTask { task_id, agent_id } => {
@@ -7332,6 +7341,7 @@ impl KernelState {
                     update: None,
                     context_reads: vec![],
                     tool_plan_proposal: None,
+                    pending_tool_approval: None,
                 })
             }
             PrimeAction::UpdateTask { task_id, patch } => {
@@ -7476,6 +7486,7 @@ impl KernelState {
                     }),
                     context_reads: vec![],
                     tool_plan_proposal: None,
+                    pending_tool_approval: None,
                 })
             }
             PrimeAction::DiscoverTools => {
@@ -7508,6 +7519,7 @@ impl KernelState {
                     update: None,
                     context_reads: vec![],
                     tool_plan_proposal: None,
+                    pending_tool_approval: None,
                 })
             }
             PrimeAction::ProposeToolPlan { goal } => {
@@ -7547,6 +7559,7 @@ impl KernelState {
                     update: None,
                     context_reads: vec![],
                     tool_plan_proposal: Some(proposal),
+                    pending_tool_approval: None,
                 })
             }
             PrimeAction::InvokeTool {
@@ -7581,6 +7594,7 @@ impl KernelState {
                         update: None,
                         context_reads: vec![],
                         tool_plan_proposal: None,
+                        pending_tool_approval: None,
                     })
                 }
                 Err(KernelError::OrchestrationNotMultiAgent) => Ok(PrimeTurn {
@@ -7604,6 +7618,7 @@ impl KernelState {
                     update: None,
                     context_reads: vec![],
                     tool_plan_proposal: None,
+                    pending_tool_approval: None,
                 }),
                 Err(e) => Err(e),
             },
@@ -7640,6 +7655,7 @@ impl KernelState {
                         update: None,
                         context_reads: vec![],
                         tool_plan_proposal: None,
+                        pending_tool_approval: None,
                     });
                 }
                 match self.run_orchestration(&oid, 25, 2) {
@@ -7666,6 +7682,7 @@ impl KernelState {
                             update: None,
                             context_reads: vec![],
                             tool_plan_proposal: None,
+                            pending_tool_approval: None,
                         })
                     }
                     Err(e) => Err(e),
@@ -7695,6 +7712,7 @@ impl KernelState {
                 update: None,
                 context_reads: vec![],
                 tool_plan_proposal: None,
+                pending_tool_approval: None,
             }),
         }
     }
@@ -7761,6 +7779,7 @@ impl KernelState {
                 update: None,
                 context_reads: vec![],
                 tool_plan_proposal: None,
+                pending_tool_approval: None,
             }
         };
 
@@ -7880,25 +7899,130 @@ impl KernelState {
                 ))
             }
             Some(ToolExecutability::NeedsApproval) => {
-                // A gated tool is NOT auto-run from chat — the same fail-closed posture as a
-                // gated plugin tool. For an MCP tool (unclassified → fail-closed Medium +
-                // Required) name the existing approval/grant routes; never imply auto-allow.
-                let note = if plugin_id.starts_with("mcp:") {
-                    format!(
-                        "{label} requires approval, so I won't run it directly. Either classify it low-risk + auto-approve on the Plugins page, stand up an allow-always grant for it, or run it once via the per-call approval there — then ask me again"
-                    )
-                } else {
-                    format!(
-                        "{label} is configured as a higher-risk tool that requires approval, so I will not run it directly; lower its risk (or mark it low-risk + auto-approve) to make it directly callable"
-                    )
-                };
-                Ok(turn(
-                    with_prose(note.clone()),
-                    PrimeDisposition::NeedsClarification,
-                    None,
-                    None,
-                    Some(note),
-                ))
+                // A gated tool is NEVER auto-run from chat (fail closed). But a dead-end
+                // refusal is bad UX, so instead of stopping here we either (7) run it
+                // directly when a standing allow-always grant already authorizes this
+                // EXACT call, or stage a PENDING per-call approval bound to the exact
+                // invocation and surface a compact approval card. Nothing is auto-approved
+                // and no bypass flag is ever passed (`docs/mcp.md` "Invocation"; §7.4).
+                let plugin = PluginId::new(plugin_id.to_string());
+                let input: serde_json::Value =
+                    serde_json::from_str(input_json).unwrap_or_else(|_| serde_json::json!({}));
+
+                // (7) Preserve persistent allow-always grants: a standing grant for this
+                // exact (agent, plugin, tool, permission, risk) means the operator already
+                // authorized it — run it directly through the SAME audited `invoke_tool`
+                // path (which records the grant use), never a second approval prompt.
+                if self
+                    .matching_persistent_grant_id(&ctx.agent, &plugin, &tool)
+                    .is_some()
+                {
+                    return match self.invoke_tool(&ctx.agent, &plugin, &tool, input) {
+                        Ok(result) => {
+                            let reply = if prose.is_empty() {
+                                text.trim().to_string()
+                            } else {
+                                prose.clone()
+                            };
+                            Ok(turn(
+                                reply.trim().to_string(),
+                                PrimeDisposition::Executed,
+                                Some(label),
+                                Some(result.output),
+                                None,
+                            ))
+                        }
+                        Err(e) => {
+                            let note = format!("{label} could not run: {e}");
+                            Ok(turn(
+                                with_prose(note.clone()),
+                                PrimeDisposition::NeedsClarification,
+                                None,
+                                None,
+                                Some(note),
+                            ))
+                        }
+                    };
+                }
+
+                // No standing grant: stage a PENDING per-call approval with the EXISTING
+                // machinery (`request_tool_invocation_approval` re-checks the permission,
+                // re-confirms the tool actually requires approval, bounds the args, and
+                // binds the exact invocation for a consume-once execute). Nothing runs.
+                match self.request_tool_invocation_approval(
+                    &ctx.actor,
+                    &ctx.agent,
+                    &plugin,
+                    &tool,
+                    input,
+                ) {
+                    Ok(approval_id) => {
+                        // Build the card straight from the bound invocation + the approval
+                        // reason. The card carries only a bounded, secret-redacted args
+                        // preview (never the raw args) and is wired to the existing
+                        // approve/execute · allow-always · deny routes.
+                        let binding = self.pending_tool_invocations.get(&approval_id);
+                        let (args_preview, permission, risk_str) = match binding {
+                            Some(b) => (
+                                b.args_preview.clone(),
+                                b.permission.clone(),
+                                risk_wire_label(&b.risk),
+                            ),
+                            None => (String::new(), String::new(), "medium".to_string()),
+                        };
+                        let reason = self
+                            .approval(&approval_id)
+                            .map(|a| a.reason.clone())
+                            .unwrap_or_default();
+                        let (source, server) = match plugin_id.strip_prefix("mcp:") {
+                            Some(s) => ("mcp".to_string(), Some(s.to_string())),
+                            None => ("plugin".to_string(), None),
+                        };
+                        let reply = if prose.is_empty() {
+                            format!(
+                                "{label} needs your approval before I run it. Review it below — approve once, allow always, or deny."
+                            )
+                        } else {
+                            prose.clone()
+                        };
+                        let mut t = turn(
+                            reply.trim().to_string(),
+                            PrimeDisposition::AwaitingApproval,
+                            None,
+                            None,
+                            None,
+                        );
+                        t.approval = Some(approval_id.clone());
+                        t.pending_tool_approval = Some(relux_core::PrimeToolApprovalRequest {
+                            approval_id: approval_id.to_string(),
+                            label,
+                            plugin_id: plugin_id.to_string(),
+                            tool_name: tool.clone(),
+                            source,
+                            server,
+                            risk: risk_str,
+                            reason,
+                            args_preview,
+                            permission,
+                            allow_always_supported: true,
+                        });
+                        Ok(t)
+                    }
+                    // Honest fallback: if staging the approval itself fails (e.g. a
+                    // permission was revoked between resolution and staging, or the args
+                    // exceed the cap), report it cleanly — never a fabricated run.
+                    Err(e) => {
+                        let note =
+                            format!("{label} requires approval and I could not stage one: {e}");
+                        Ok(turn(
+                            with_prose(note.clone()),
+                            PrimeDisposition::NeedsClarification,
+                            None,
+                            None,
+                            Some(note),
+                        ))
+                    }
+                }
             }
             Some(ToolExecutability::Ready) => {
                 let input: serde_json::Value =
@@ -10088,6 +10212,15 @@ fn approval_status_label(status: &ApprovalStatus) -> String {
         .ok()
         .and_then(|v| v.as_str().map(|s| s.to_string()))
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Lowercase wire form of a [`RiskLevel`] (`low`/`medium`/`high`/`critical`), for the
+/// Prime approval-card projection. Mirrors the server's `wire_label`; pure.
+fn risk_wire_label(risk: &RiskLevel) -> String {
+    serde_json::to_value(risk)
+        .ok()
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "medium".to_string())
 }
 
 /// Lowercase hex SHA-256 of `bytes`. Used to bind a per-tool-call approval to the
@@ -16421,10 +16554,12 @@ mod tests {
     }
 
     #[test]
-    fn single_mcp_invoke_respects_the_approval_gate_no_auto_allow() {
-        // An UNCLASSIFIED MCP tool is fail-closed (Medium + Required). Even with the
-        // permission held, Prime refuses to run it directly — never auto-allowed — and the
-        // honest "requires approval" reason names the existing approval/grant routes.
+    fn single_mcp_invoke_gated_stages_a_pending_approval_not_a_dead_refusal() {
+        // An UNCLASSIFIED MCP tool is fail-closed (Medium + Required). With the permission
+        // held but no standing grant, Prime does NOT auto-run it (never auto-allowed) and no
+        // longer dead-ends — it STAGES a pending per-call approval bound to the exact call
+        // and surfaces a compact approval card wired to the existing routes
+        // (`docs/mcp.md` "Invocation"; §7.4).
         let (mut k, ctx) = prime_chat_kernel();
         let endpoint = mock_mcp(mcp_tools_list_bodies(
             r#"[{"name":"search","description":"Find things."}]"#,
@@ -16435,16 +16570,72 @@ mod tests {
             .unwrap();
         inject_proposal_mcp_catalog(&mut k, &ctx);
 
-        let turn = k.prime_turn(&ctx, "use mcp:fs/search").unwrap();
+        let turn = k.prime_turn(&ctx, "call mcp:fs/search with {\"q\":\"a\"}").unwrap();
         assert_eq!(turn.intent, relux_core::PrimeIntent::ToolInvocation);
-        assert_eq!(turn.disposition, PrimeDisposition::NeedsClarification);
-        assert!(turn.invoked_tool.is_none(), "a gated tool is NOT run: {turn:?}");
+        // The behavior CHANGED: not a dead refusal, a staged approval awaiting a decision.
+        assert_eq!(turn.disposition, PrimeDisposition::AwaitingApproval);
+        assert!(turn.invoked_tool.is_none(), "nothing ran yet: {turn:?}");
         assert!(turn.tool_output.is_none(), "nothing ran, so no output");
-        let err = turn.tool_error.expect("an honest refusal reason");
-        assert!(
-            err.contains("approval"),
-            "the refusal explains the approval gate: {err:?}"
+        assert!(turn.tool_error.is_none(), "a staged approval is not an error: {turn:?}");
+        // The card carries the tool, source, risk, reason, a redacted args preview, and the
+        // approval id — all wired to the existing approve/execute · allow-always · deny routes.
+        let card = turn.pending_tool_approval.expect("a pending approval card");
+        assert_eq!(card.label, "mcp:fs/search");
+        assert_eq!(card.source, "mcp");
+        assert_eq!(card.server.as_deref(), Some("fs"));
+        assert_eq!(card.tool_name, "search");
+        assert_eq!(card.risk, "medium", "unclassified MCP tool is fail-closed Medium");
+        assert_eq!(card.permission, "tool:mcp-fs:search");
+        assert!(card.allow_always_supported);
+        assert!(!card.args_preview.is_empty(), "the redacted args preview is shown");
+        assert_eq!(
+            turn.approval.as_ref().map(|a| a.as_str()),
+            Some(card.approval_id.as_str())
         );
+        // A real, fail-closed pending invocation exists in the kernel, bound to this call.
+        let appr_id = relux_core::ApprovalId::new(card.approval_id.clone());
+        let binding = k.pending_tool_invocation(&appr_id).expect("a bound invocation");
+        assert_eq!(binding.plugin_id.as_str(), "mcp:fs");
+        assert_eq!(binding.tool_name, "search");
+        assert!(!binding.consumed, "nothing has executed");
+        // The approval is Pending — nothing was auto-approved.
+        assert_eq!(
+            k.approval(&appr_id).map(|a| a.status.clone()),
+            Some(ApprovalStatus::Pending)
+        );
+    }
+
+    #[test]
+    fn single_mcp_invoke_with_allow_always_grant_executes_directly() {
+        // (7) A standing allow-always grant for this EXACT call means the operator already
+        // authorized it: a future chat invocation runs DIRECTLY through the audited invoke
+        // path — no pending approval, no second prompt — and returns the SHAPED result.
+        let (mut k, ctx) = prime_chat_kernel();
+        let mut bodies =
+            mcp_tools_list_bodies(r#"[{"name":"search","description":"Find things."}]"#);
+        bodies.extend(mcp_call_bodies("found 3 files"));
+        let endpoint = mock_mcp(bodies);
+        k.register_mcp_server("fs", &endpoint, "fs server", true, Some(2000))
+            .unwrap();
+        // Gated tool (unclassified → Medium + Required), permission held, PLUS a standing grant.
+        k.grant_permission_to_agent(&ctx.agent, Permission::new("tool:mcp-fs:search").unwrap())
+            .unwrap();
+        k.grant_persistent_tool_invocation(
+            "founder",
+            &ctx.agent,
+            &PluginId::new("mcp:fs".to_string()),
+            "search",
+        )
+        .unwrap();
+        inject_proposal_mcp_catalog(&mut k, &ctx);
+
+        let turn = k.prime_turn(&ctx, "use mcp:fs/search").unwrap();
+        assert_eq!(turn.disposition, PrimeDisposition::Executed);
+        assert_eq!(turn.invoked_tool.as_deref(), Some("mcp:fs/search"));
+        assert!(turn.pending_tool_approval.is_none(), "a grant skips the approval card");
+        assert!(turn.tool_error.is_none(), "a granted run is clean: {turn:?}");
+        let out = turn.tool_output.expect("the shaped result rides along");
+        assert_eq!(out.get("result").and_then(|v| v.as_str()), Some("found 3 files"));
     }
 
     #[test]
@@ -16494,6 +16685,113 @@ mod tests {
         assert!(
             err.contains("fs") && err.to_lowercase().contains("reachable"),
             "the reason names the unreachable server: {err:?}"
+        );
+    }
+
+    // --- Chat-initiated gated PLUGIN tool → pending approval (same machinery) ---
+
+    /// Install a wrapper plugin with one HIGH-risk (approval-required) configured tool
+    /// plus a one-shot loopback runtime, and grant Prime its permission. Returns the
+    /// tool's `<plugin>/<tool>` label so a chat invocation can name it.
+    fn gated_plugin_tool(k: &mut KernelState, ctx: &PrimeContext) -> (PluginId, String) {
+        let id = PluginId::new("relux-tools-acme".to_string());
+        k.install_plugin(
+            wrapper_manifest("relux-tools-acme"),
+            PluginSourceKind::LocalDir,
+            "/tmp/acme".to_string(),
+            "/data/acme".to_string(),
+            true,
+        );
+        // A high-risk tool is approval-required (gated), never directly runnable.
+        let def = k
+            .configure_plugin_tool(&id, tool_input(r#"{"name":"secret.run","risk":"high"}"#))
+            .expect("configure gated tool");
+        assert_eq!(def.approval, ApprovalRequirement::Required);
+        // A runtime so the APPROVED call can actually execute later (single shot).
+        let base = one_shot_http(
+            "HTTP/1.1 200 OK\r\nContent-Length: 22\r\nConnection: close\r\n\r\n{\"output\":{\"ran\":1}}\n\n\n\n",
+        );
+        k.configure_tool_runtime(&id, &base, true, Some(2_000)).unwrap();
+        k.grant_permission_to_agent(&ctx.agent, def.permission.clone())
+            .unwrap();
+        (id, "relux-tools-acme/secret.run".to_string())
+    }
+
+    #[test]
+    fn single_plugin_invoke_gated_stages_a_pending_approval_not_a_dead_refusal() {
+        // An explicit chat invocation of a gated (needs_approval) INSTALLED plugin tool no
+        // longer dead-ends: Prime stages a pending per-call approval bound to the exact call
+        // and surfaces an approval card (source "plugin"), nothing auto-approved (§7.4).
+        let (mut k, ctx) = prime_chat_kernel();
+        let (_id, _label) = gated_plugin_tool(&mut k, &ctx);
+
+        let turn = k.prime_turn(&ctx, "use relux-tools-acme/secret.run").unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::ToolInvocation);
+        assert_eq!(turn.disposition, PrimeDisposition::AwaitingApproval);
+        assert!(turn.invoked_tool.is_none(), "nothing ran yet: {turn:?}");
+        assert!(turn.tool_error.is_none(), "a staged approval is not an error: {turn:?}");
+        let card = turn.pending_tool_approval.expect("a pending approval card");
+        assert_eq!(card.label, "relux-tools-acme/secret.run");
+        assert_eq!(card.source, "plugin");
+        assert!(card.server.is_none(), "a plugin tool has no MCP server");
+        assert_eq!(card.risk, "high");
+        assert_eq!(card.permission, "tool:relux-tools-acme:run");
+        let appr_id = relux_core::ApprovalId::new(card.approval_id.clone());
+        assert_eq!(
+            k.approval(&appr_id).map(|a| a.status.clone()),
+            Some(ApprovalStatus::Pending),
+            "nothing is auto-approved"
+        );
+    }
+
+    #[test]
+    fn chat_staged_approval_runs_once_through_the_existing_execute_route() {
+        // The full lifecycle: chat stages the approval → operator approves it → the bound
+        // one-shot executes EXACTLY once through the existing per-call execute path. The
+        // chat path reuses the same machinery; it invents no parallel security system.
+        let (mut k, ctx) = prime_chat_kernel();
+        let (_id, _label) = gated_plugin_tool(&mut k, &ctx);
+
+        let turn = k.prime_turn(&ctx, "use relux-tools-acme/secret.run").unwrap();
+        let appr_id = relux_core::ApprovalId::new(
+            turn.pending_tool_approval.expect("card").approval_id,
+        );
+        // Operator approves on the existing route, then executes the bound one-shot.
+        k.resolve_approval(&appr_id, true, "founder", None).unwrap();
+        let result = k
+            .execute_approved_tool_invocation(&appr_id, "founder")
+            .expect("the approved call runs once");
+        assert_eq!(result.plugin_id, "relux-tools-acme");
+        assert_eq!(result.tool_name, "secret.run");
+        // Consume-once: a second execute is refused (no re-run without a fresh approval).
+        let err = k
+            .execute_approved_tool_invocation(&appr_id, "founder")
+            .unwrap_err();
+        assert!(matches!(err, KernelError::ToolInvocationConsumed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn chat_staged_approval_deny_stays_safe_and_drops_the_binding() {
+        // Deny path: rejecting the staged approval drops the bound invocation outright, so
+        // the gated call can never run — fail closed, no parallel bypass (§7.4).
+        let (mut k, ctx) = prime_chat_kernel();
+        let (_id, _label) = gated_plugin_tool(&mut k, &ctx);
+        let turn = k.prime_turn(&ctx, "use relux-tools-acme/secret.run").unwrap();
+        let appr_id = relux_core::ApprovalId::new(
+            turn.pending_tool_approval.expect("card").approval_id,
+        );
+
+        k.resolve_approval(&appr_id, false, "founder", None).unwrap();
+        assert!(
+            k.pending_tool_invocation(&appr_id).is_none(),
+            "a denied approval drops its bound invocation"
+        );
+        let err = k
+            .execute_approved_tool_invocation(&appr_id, "founder")
+            .unwrap_err();
+        assert!(
+            matches!(err, KernelError::ToolInvocationNotApproved { .. }),
+            "a denied call can never execute: {err:?}"
         );
     }
 

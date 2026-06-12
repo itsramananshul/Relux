@@ -878,6 +878,58 @@ pub struct PrimeTurn {
     /// they did before (`docs/mcp.md` "Run-driven multi-tool plan"; §10.5, §17.1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_plan_proposal: Option<PrimeToolPlanProposal>,
+    /// A pending per-call tool approval Prime staged this turn, present ONLY when an
+    /// EXPLICIT chat tool invocation hit a gated (`needs_approval`) tool with no
+    /// standing allow-always grant (see [`PrimeToolApprovalRequest`]). The chat renders
+    /// a compact approval card wired to the EXISTING approval routes (approve + execute,
+    /// allow-always, deny); the bound invocation runs only after the operator approves,
+    /// through the unchanged permission/approval/grant/audit gates. Prime ran nothing by
+    /// showing it. Omitted on every other turn, so existing clients see the same JSON
+    /// they did before (`docs/mcp.md` "Invocation"; `docs/RELUX_MASTER_PLAN.md` §7.4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_tool_approval: Option<PrimeToolApprovalRequest>,
+}
+
+/// A pending per-call tool approval Prime created when an explicit chat tool
+/// invocation named a gated (`needs_approval`) tool and there was no standing
+/// allow-always grant for it. This is presentation/correlation only: the real,
+/// fail-closed binding lives in the kernel's `PendingToolInvocation` (bound to the
+/// exact agent + plugin + tool + args snapshot), and the operator decides + runs it
+/// through the EXISTING `/v1/relux/approvals/:id/{decide,execute,allow-always}`
+/// routes. Prime executed nothing by staging it; nothing here grants authority.
+///
+/// Spec ref: `docs/mcp.md` "Single MCP tool invocation from Prime chat",
+/// `docs/RELUX_MASTER_PLAN.md` §7.4 (per-call approval).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrimeToolApprovalRequest {
+    /// The pending approval id — the stable key the chat card uses to approve /
+    /// execute / allow-always / deny through the existing routes.
+    pub approval_id: String,
+    /// The tool label `<plugin_id>/<tool_name>` shown on the card.
+    pub label: String,
+    /// The plugin id the call routes through (`mcp:<server>` for an MCP tool, else the
+    /// installed plugin id).
+    pub plugin_id: String,
+    /// The bare tool name.
+    pub tool_name: String,
+    /// The source kind for the card badge: `"mcp"` or `"plugin"`.
+    pub source: String,
+    /// The MCP server id when this is an MCP tool (`plugin_id == "mcp:<server>"`); omitted
+    /// for an installed plugin tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    /// The tool's declared/derived risk, lowercase wire form (`low`/`medium`/`high`/`critical`).
+    pub risk: String,
+    /// The human reason recorded on the approval (why it is gated).
+    pub reason: String,
+    /// A bounded, secret-redacted preview of the bound args — never the raw arguments.
+    pub args_preview: String,
+    /// The permission the call requires (`tool:…`).
+    pub permission: String,
+    /// Whether an "Allow always" decision is offered for this call (a persistent grant
+    /// the existing allow-always route can stand up). Always `true` for a per-call tool
+    /// approval today; carried explicitly so the card never invents the affordance.
+    pub allow_always_supported: bool,
 }
 
 /// The scope a Prime turn runs in: which namespace work lands in, which agent
@@ -1154,6 +1206,7 @@ mod tests {
             update: None,
             context_reads: vec![],
             tool_plan_proposal: None,
+            pending_tool_approval: None,
         };
         let json = serde_json::to_string(&turn).unwrap();
         assert!(
