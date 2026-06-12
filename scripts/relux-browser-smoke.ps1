@@ -142,6 +142,22 @@ try {
     }
     $http.Dispose()
 
+    # -- 4b) seed a throwaway MANIFESTLESS plugin fixture for the live import smoke
+    # A folder with NO relux-plugin.json — exactly the common case (any GitHub repo /
+    # local folder). The browser smoke drives Plugins → + Install → Local folder →
+    # this HOST path → Install and asserts the metadata-only result card with working
+    # next-action buttons (the import path must never dead-end). The path is read on
+    # THIS host (the kernel process host), which is the same machine driving Chrome,
+    # and lives under the throwaway $TempRoot that cleanup removes.
+    $fixtureDir = Join-Path $TempRoot 'manifestless-plugin'
+    New-Item -ItemType Directory -Path $fixtureDir | Out-Null
+    Set-Content -LiteralPath (Join-Path $fixtureDir 'README.md') `
+        -Value "# smoke-manifestless`nA throwaway source with no relux-plugin.json." -Encoding utf8
+    Set-Content -LiteralPath (Join-Path $fixtureDir 'package.json') `
+        -Value '{ "name": "smoke-manifestless", "version": "0.0.0", "bin": { "smoke": "index.js" } }' -Encoding utf8
+    $env:RELUX_SMOKE_PLUGIN_DIR = $fixtureDir
+    Write-Host ("  manifestless fixture: {0}" -f $fixtureDir) -ForegroundColor DarkGray
+
     # -- 5) drive the browser over CDP ------------------------------------
     Write-Host ''
     $env:RELUX_SMOKE_BASE = $base
@@ -158,7 +174,7 @@ finally {
     if ($serveProc) {
         try { if (-not $serveProc.HasExited) { Stop-Process -Id $serveProc.Id -Force -ErrorAction SilentlyContinue } } catch {}
     }
-    foreach ($v in 'RELUX_SMOKE_BASE', 'RELUX_SMOKE_USER', 'RELUX_SMOKE_PASS', 'RELUX_SMOKE_HEADFUL') {
+    foreach ($v in 'RELUX_SMOKE_BASE', 'RELUX_SMOKE_USER', 'RELUX_SMOKE_PASS', 'RELUX_SMOKE_HEADFUL', 'RELUX_SMOKE_PLUGIN_DIR') {
         Remove-Item "Env:\$v" -ErrorAction SilentlyContinue
     }
     if ($null -eq $oldDb) { Remove-Item Env:\RELUX_DB -ErrorAction SilentlyContinue } else { $env:RELUX_DB = $oldDb }

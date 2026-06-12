@@ -188,6 +188,16 @@ What it actually clicks and asserts:
   with no blank.
 - **Plugins / Approvals:** asserts the route renders and **stays rendered** after
   expanding any disclosures, with no console error / page exception / 5xx.
+- **Plugins manifestless import (live):** drives **+ Install → Local folder →** a
+  throwaway host folder with **no `relux-plugin.json`** (the wrapper seeds it under
+  its temp root) **→ Install**, then asserts the form is replaced by an honest
+  **metadata-only — no Relux manifest needed** result card whose next-action buttons
+  (**Configure & review hints / Copy install path / Install another / Done**) and
+  auto-opened **detected-hints + Configure tools** panel all render — i.e. the
+  import path never dead-ends. This is the real onClick → `POST
+  /v1/relux/plugins/install-dir` → result-card binding the static render test
+  (`install-result-render.test.mjs`) cannot see. The step self-skips when the
+  driver is run by hand without `RELUX_SMOKE_PLUGIN_DIR` (never faked).
 
 Throughout, it captures `Runtime.consoleAPICalled` (errors), `Runtime.
 exceptionThrown`, and `Network` 5xx / failed JS-CSS chunk loads, attributing each

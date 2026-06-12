@@ -54,6 +54,12 @@ const BASE = (process.env.RELUX_SMOKE_BASE || "").replace(/\/+$/, "");
 const USER = process.env.RELUX_SMOKE_USER || "admin";
 const PASS = process.env.RELUX_SMOKE_PASS || "";
 const HEADFUL = process.env.RELUX_SMOKE_HEADFUL === "1";
+// Optional: a host folder with NO relux-plugin.json. When set, the smoke drives a
+// LIVE manifestless import through Plugins → + Install → Local folder → this path,
+// and asserts the metadata-only result card does not dead-end. The path is read on
+// the kernel host (this machine); the wrapper seeds a throwaway folder under its
+// temp root. Absent (driver run by hand) → the step is skipped, never faked.
+const PLUGIN_DIR = process.env.RELUX_SMOKE_PLUGIN_DIR || "";
 
 if (!BASE) {
   console.error("RELUX_SMOKE_BASE is required (e.g. http://127.0.0.1:19891).");
@@ -736,6 +742,158 @@ async function main() {
       } else if (probs.length) {
         record(`${page} interactions clean`, false, probs.slice(0, 3).join(" | "));
       }
+    }
+
+    // ---- 6) Plugins — a LIVE manifestless import must not dead-end --------
+    // The real operator pain this whole slice exists for: importing a source with
+    // NO relux-plugin.json (any GitHub repo / local folder) and landing on a dead
+    // end. The render test (install-result-render.test.mjs) proves the result CARD
+    // mounts its buttons under a static first paint, but only a live import proves
+    // the full onClick → POST /v1/relux/plugins/install-dir → state swap → result
+    // card binding: the form is replaced by an honest "metadata-only — no Relux
+    // manifest needed" summary with WORKING next-action buttons and the auto-opened
+    // Configure + detected-hints panel — never a blank, never a dead end. The Local
+    // folder source is a plain TEXT input (not an OS file picker), so it is fully
+    // drivable; the path is read on the kernel host (this machine). Gated on
+    // RELUX_SMOKE_PLUGIN_DIR (the wrapper seeds a throwaway manifestless folder); if
+    // unset we skip honestly rather than fabricate the step.
+    if (PLUGIN_DIR) {
+      section("Plugins — live manifestless import (Local folder, no relux-plugin.json)");
+      const before = snapshot();
+      await evaluate(
+        `(() => {
+           const items = Array.from(document.querySelectorAll('#app-sidebar a.nav-item'));
+           const el = items.find(a => (a.textContent||'').trim().indexOf('Plugins') !== -1);
+           if (el) el.click();
+         })()`,
+      );
+      await waitFor(
+        `(() => { const h = document.querySelector('.topbar h1'); return h && h.textContent.trim()==='Plugins'; })()`,
+        { timeout: 12000, desc: "plugins title" },
+      );
+      await waitForContent("Plugins");
+      // Open the install panel via the "+ Install" toggle.
+      const opened = await evaluate(
+        `(() => {
+           const b = Array.from(document.querySelectorAll('.workspace button'))
+             .find(b => /\\+\\s*Install/.test((b.textContent||'').trim()));
+           if (!b) return false;
+           b.click();
+           return true;
+         })()`,
+      );
+      if (!opened) {
+        record("Plugins + Install opens the install panel", false, "no + Install toggle found");
+      } else {
+        // Pick the Local folder segment, then type the HOST path into its text input.
+        await waitFor(
+          `Array.from(document.querySelectorAll('.workspace .seg-btn')).some(b => (b.textContent||'').trim()==='Local folder')`,
+          { timeout: 8000, desc: "install panel segments" },
+        );
+        await evaluate(
+          `(() => {
+             const b = Array.from(document.querySelectorAll('.workspace .seg-btn'))
+               .find(b => (b.textContent||'').trim()==='Local folder');
+             if (b) b.click();
+           })()`,
+        );
+        await waitFor(
+          `!!document.querySelector('.workspace input[placeholder="/path/to/plugin-folder"]')`,
+          { timeout: 8000, desc: "local folder input" },
+        );
+        await evaluate(
+          `(() => {
+             const el = document.querySelector('.workspace input[placeholder="/path/to/plugin-folder"]');
+             const set = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;
+             set.call(el, ${JSON.stringify(PLUGIN_DIR)});
+             el.dispatchEvent(new Event('input',{bubbles:true}));
+           })()`,
+        );
+        // Click the install panel's submit button (text exactly "Install" — distinct
+        // from the "+ Install" toggle, which now reads "Close", and from the result
+        // card's "Install another").
+        const submitted = await evaluate(
+          `(() => {
+             const b = Array.from(document.querySelectorAll('.workspace button.btn'))
+               .find(b => (b.textContent||'').trim()==='Install');
+             if (!b) return false;
+             b.click();
+             return true;
+           })()`,
+        );
+        record("Plugins manifestless install submits", submitted, submitted ? "Local folder path entered + Install clicked" : "no Install submit button");
+        if (submitted) {
+          let cardArrived = true;
+          try {
+            // The form is replaced by the result card; its hallmark is the "Copy
+            // install path" button (the form has Install/Cancel). An error banner
+            // would mean the install itself failed — surfaced honestly below.
+            await waitFor(
+              `Array.from(document.querySelectorAll('.workspace button')).some(b => (b.textContent||'').trim()==='Copy install path') || !!document.querySelector('.workspace .banner.err')`,
+              { timeout: 20000, desc: "install result card or error" },
+            );
+          } catch (e) {
+            cardArrived = false;
+            record("Plugins manifestless install returns a result card", false, e.message);
+          }
+          if (cardArrived) {
+            const errBanner = await evaluate(
+              `(() => { const b = document.querySelector('.workspace .banner.err'); return b ? (b.textContent||'').trim() : ''; })()`,
+            );
+            if (errBanner) {
+              record("Plugins manifestless install returns a result card", false, "install error banner: " + errBanner);
+            } else {
+              const card = await evaluate(
+                `(() => {
+                   const ws = document.querySelector('.workspace');
+                   if (!ws) return null;
+                   const txt = (ws.innerText || '');
+                   const has = (t) => Array.from(ws.querySelectorAll('button,a'))
+                     .some(b => (b.textContent||'').trim().indexOf(t) !== -1);
+                   return {
+                     metaOnly: /metadata-only/i.test(txt),
+                     noManifest: /no Relux manifest needed/i.test(txt),
+                     setupBtn: has('Hide setup') || has('Configure & review hints'),
+                     copyPath: has('Copy install path'),
+                     installAnother: has('Install another'),
+                     done: has('Done'),
+                     hints: /Detected in source|Inspecting source|Could not inspect/i.test(txt),
+                     configureTools: /Configure tools/i.test(txt),
+                   };
+                 })()`,
+              );
+              if (!card) {
+                record("Plugins manifestless install returns a result card", false, "no .workspace after install");
+              } else {
+                record(
+                  "Plugins manifestless result is honest (metadata-only, no manifest needed)",
+                  card.metaOnly && card.noManifest,
+                  card.metaOnly && card.noManifest
+                    ? "metadata-only summary, manifest explicitly optional"
+                    : `metaOnly=${card.metaOnly} noManifest=${card.noManifest}`,
+                );
+                record(
+                  "Plugins manifestless result renders working next-action buttons",
+                  card.setupBtn && card.copyPath && card.installAnother && card.done,
+                  card.setupBtn && card.copyPath && card.installAnother && card.done
+                    ? "Configure/Copy install path/Install another/Done all present"
+                    : `setup=${card.setupBtn} copy=${card.copyPath} another=${card.installAnother} done=${card.done}`,
+                );
+                record(
+                  "Plugins manifestless result auto-opens the configure + detected-hints path",
+                  card.hints && card.configureTools,
+                  card.hints && card.configureTools
+                    ? "DetectedHints + Configure tools mounted inline (no dead end)"
+                    : `hints=${card.hints} configureTools=${card.configureTools}`,
+                );
+                await assertNotBlank("Plugins stays rendered after the manifestless import");
+              }
+            }
+          }
+        }
+      }
+      const probs = newProblems(before);
+      record("Plugins manifestless import clean (no console/page/5xx errors)", probs.length === 0, probs.slice(0, 3).join(" | "));
     }
 
     if (apiWarnings.length) {
