@@ -234,8 +234,9 @@ through the gated chokepoint.
   (validated; an empty plugin/tool is a `400`) and serializes it into the canonical
   input — then runs it with the existing "Run (Assigned)" /
   `POST /v1/relux/tasks/:id/execute-assigned` action. The resulting `mcp_tool_call`
-  event surfaces in the Work run detail's existing Transcript table. No bespoke MCP-run
-  UI is added in this slice.
+  event surfaces in the Work run detail's existing Transcript table. A later slice
+  added a compact operator form for this (a single-step "Create a tool-run task" posts
+  exactly this `tool_call`) — see "Run-driven multi-tool plan" → "Operating it" below.
 
 **Scope (deliberately narrow).** This is a **deterministic, operator-named** run path:
 one tool, fixed in the task input, gated end-to-end. It is NOT a brain freely choosing
@@ -282,10 +283,24 @@ still without a brain choosing the tools.
   `tool_call*` for a plugin step. A two-step plan therefore shows two tool-call events,
   in order. No new run-event kind and no new UI surface is added in this slice — the
   plan reuses the existing transcript path end to end.
-- **Operating it (no new UI).** An operator creates such a task over the existing
-  `POST /v1/relux/tasks` route, which now also accepts an optional `tool_plan` body
-  (validated as above), then runs it with the existing "Run (Assigned)" /
-  `POST /v1/relux/tasks/:id/execute-assigned` action.
+- **Operating it (compact UI on the Plugins → Tools section).** The Plugins page's
+  **Tools** section now carries a small **"Create a tool-run task"** form
+  (`apps/dashboard/src/pages/Plugins.tsx` `CreateToolRunTask`, payload built by the
+  React-free `apps/dashboard/src/toolruntask.ts` `buildToolRunTaskPayload`). An
+  operator gives the task a title and adds **1–5 steps**, each picking a tool from the
+  discovered tool list and supplying optional **JSON args** (blank = `{}`). One step
+  posts a `tool_call`; two-or-more post a `tool_plan` — the SAME existing
+  `POST /v1/relux/tasks` body (no new backend). The builder fails closed the way the
+  kernel does (title required, ≤5 steps never silently truncated, a tool must be
+  chosen per step, args must be valid JSON) so the form never sends a request the
+  kernel would `400`. It is **honest about approval**: a chosen gated
+  (`needs_approval`) tool can be put in a plan, but the form shows a banner that the
+  run will **block/fail** on that step unless a standing allow-always grant exists —
+  it never implies auto-approval. On success it shows the new task id and a link to
+  **Work**, where the operator runs it with "Run (Assigned)" /
+  `POST /v1/relux/tasks/:id/execute-assigned`. The raw `POST /v1/relux/tasks` route
+  (with the optional `tool_plan` / `tool_call` body) remains available for scripted
+  use.
 
 **Scope (still narrow).** A `tool_plan` is a **fixed, operator-authored** sequence,
 validated and capped, gated per step. It is NOT a brain choosing tools mid-run, NOT

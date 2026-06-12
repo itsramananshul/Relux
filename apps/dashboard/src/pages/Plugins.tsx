@@ -6,6 +6,7 @@ import {
   reluxPluginRuntime,
   reluxPlugins,
   reluxTools,
+  reluxWork,
   type ReluxAdapterStatus,
   type ReluxManifestTemplate,
   type McpToolClassification,
@@ -35,6 +36,11 @@ import {
   type StatusVariant,
   type ToolReadiness,
 } from "../plugins";
+import {
+  buildToolRunTaskPayload,
+  MAX_TOOL_RUN_STEPS,
+  type ToolRunStep,
+} from "../toolruntask";
 
 // Map a derived status variant to the shared badge palette (B&W + semantic
 // accent only): ready=green, needs-config=amber, disabled=faint.
@@ -898,6 +904,8 @@ function ToolsSection() {
         permission-checked and audited.
       </p>
 
+      <CreateToolRunTask tools={tools} />
+
       {error ? (
         <div className="banner err" style={{ fontSize: 12 }}>
           Could not reach the Relux tools API ({error}). Start it with{" "}
@@ -936,6 +944,209 @@ function ToolsSection() {
               ))}
             </tbody>
           </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Compact operator form to create a "tool-run task": a task whose run drives one
+// gated tool call (a `tool_call` directive) or a bounded sequence of them (a
+// `tool_plan`, ≤5 steps, run in order, stopping on the first failure). It posts the
+// SAME `POST /v1/relux/tasks` the Work page uses, with the optional directive body
+// the kernel already accepts — no new backend. (`docs/mcp.md` "Run-driven MCP tool
+// call" + "Run-driven multi-tool plan".)
+//
+// HONEST about approval: a step whose tool is gated (`needs_approval`) can be put in
+// a plan, but the RUN will block/fail on that step unless a standing allow-always
+// grant exists — the form labels such steps and never pretends the run will
+// auto-approve. The task is created and assigned to Prime; run it from Work with
+// "Run (Assigned)".
+function CreateToolRunTask({ tools }: { tools: ReluxToolDescriptor[] }) {
+  const [open, setOpen] = useState(false);
+  const [title, setTitle] = useState("");
+  const [steps, setSteps] = useState<ToolRunStep[]>([{ plugin: "", tool: "", argsText: "" }]);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [created, setCreated] = useState<string | null>(null);
+
+  // The tool options the operator picks from: every discovered tool, ready or gated.
+  // A gated (non-"ready") tool is offered too — the run will simply need an approval
+  // grant — so the dropdown label flags it honestly rather than hiding it.
+  const options = tools.map((t) => {
+    const gated = toolReadiness(t).runnable ? "" : " — needs approval";
+    return {
+      key: `${t.plugin_id} ${t.tool_name}`,
+      plugin: t.plugin_id,
+      tool: t.tool_name,
+      label: `${t.tool_name} (${t.plugin_id})${gated}`,
+    };
+  });
+
+  // Does any chosen step reference a gated tool? Drives the honest approval caveat.
+  const anyGated = steps.some((s) => {
+    if (!s.plugin || !s.tool) return false;
+    const match = tools.find((t) => t.plugin_id === s.plugin && t.tool_name === s.tool);
+    return match ? !toolReadiness(match).runnable : false;
+  });
+
+  function setStep(i: number, patch: Partial<ToolRunStep>) {
+    setSteps((prev) => prev.map((s, idx) => (idx === i ? { ...s, ...patch } : s)));
+  }
+  function addStep() {
+    setSteps((prev) => (prev.length >= MAX_TOOL_RUN_STEPS ? prev : [...prev, { plugin: "", tool: "", argsText: "" }]));
+  }
+  function removeStep(i: number) {
+    setSteps((prev) => (prev.length <= 1 ? prev : prev.filter((_, idx) => idx !== i)));
+  }
+
+  async function submit() {
+    setErr(null);
+    setCreated(null);
+    const built = buildToolRunTaskPayload(title, steps);
+    if (!built.ok) {
+      setErr(built.error);
+      return;
+    }
+    const { title: builtTitle, ...directive } = built.payload;
+    setBusy(true);
+    try {
+      const task = await reluxWork.createTask(builtTitle, directive);
+      setCreated(task.id);
+      // Reset the form for the next one; keep it open so the operator sees success.
+      setTitle("");
+      setSteps([{ plugin: "", tool: "", argsText: "" }]);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Could not create the task.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="card" style={{ margin: "0 0 12px", padding: 12 }}>
+      <div className="row" style={{ alignItems: "center" }}>
+        <strong style={{ fontSize: 13 }}>Create a tool-run task</strong>
+        <div className="spacer" style={{ flex: 1 }} />
+        <button
+          className="btn ghost sm"
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+          title="Create a task whose run drives one or more gated tool calls"
+        >
+          {open ? "Close" : "New"}
+        </button>
+      </div>
+      {open && (
+        <div style={{ marginTop: 10 }}>
+          <p className="muted" style={{ marginTop: 0, marginBottom: 10, fontSize: 12 }}>
+            One step creates a single <span className="mono">tool_call</span>; two-to-{MAX_TOOL_RUN_STEPS} steps
+            create a <span className="mono">tool_plan</span> that runs in order and stops on the first
+            failure. The task is assigned to Prime — run it from{" "}
+            <Link to="/work">Work</Link> with “Run (Assigned)”.
+          </p>
+
+          <label className="field" style={{ margin: 0 }}>
+            <span style={{ fontSize: 12 }}>Task title</span>
+            <input
+              className="input"
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder="e.g. search the docs index"
+            />
+          </label>
+
+          {steps.map((step, i) => (
+            <div
+              key={i}
+              className="card"
+              style={{ margin: "10px 0 0", padding: 10, background: "transparent" }}
+            >
+              <div className="row" style={{ alignItems: "center", marginBottom: 6 }}>
+                <span className="muted" style={{ fontSize: 12 }}>
+                  Step {i + 1}
+                  {steps.length > 1 ? ` of ${steps.length}` : ""}
+                </span>
+                <div className="spacer" style={{ flex: 1 }} />
+                {steps.length > 1 && (
+                  <button className="btn ghost sm" onClick={() => removeStep(i)} title="Remove this step">
+                    Remove
+                  </button>
+                )}
+              </div>
+              <label className="field" style={{ margin: 0 }}>
+                <span style={{ fontSize: 12 }}>Tool</span>
+                <select
+                  className="input"
+                  value={step.plugin && step.tool ? `${step.plugin} ${step.tool}` : ""}
+                  onChange={(e) => {
+                    const [plugin, tool] = e.target.value.split(" ");
+                    setStep(i, { plugin: plugin ?? "", tool: tool ?? "" });
+                  }}
+                >
+                  <option value="">
+                    {options.length === 0 ? "No tools discovered yet" : "Choose a tool…"}
+                  </option>
+                  {options.map((o) => (
+                    <option key={o.key} value={o.key}>
+                      {o.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="field" style={{ margin: "8px 0 0" }}>
+                <span style={{ fontSize: 12 }}>JSON arguments (blank = {"{}"})</span>
+                <textarea
+                  className="input"
+                  style={{ minHeight: 64, fontFamily: "monospace", fontSize: 12 }}
+                  value={step.argsText}
+                  onChange={(e) => setStep(i, { argsText: e.target.value })}
+                  placeholder='{ "query": "files" }'
+                />
+              </label>
+            </div>
+          ))}
+
+          <div className="row wrap" style={{ gap: 8, marginTop: 10, alignItems: "center" }}>
+            <button
+              className="btn ghost sm"
+              onClick={addStep}
+              disabled={steps.length >= MAX_TOOL_RUN_STEPS}
+              title={
+                steps.length >= MAX_TOOL_RUN_STEPS
+                  ? `A plan may have at most ${MAX_TOOL_RUN_STEPS} steps`
+                  : "Add another step (creates a tool_plan)"
+              }
+            >
+              Add step
+            </button>
+            <span className="muted" style={{ fontSize: 11 }}>
+              {steps.length}/{MAX_TOOL_RUN_STEPS} steps
+            </span>
+            <div className="spacer" style={{ flex: 1 }} />
+            <button className="btn" disabled={busy} onClick={() => void submit()}>
+              {busy ? "Creating…" : "Create task"}
+            </button>
+          </div>
+
+          {anyGated && (
+            <div className="banner" style={{ fontSize: 12, marginTop: 10 }}>
+              A chosen tool needs approval. The plan can be created, but the run will
+              <strong> block or fail</strong> on that step unless a standing
+              allow-always grant exists — Relux never auto-approves it.
+            </div>
+          )}
+          {err && (
+            <div className="banner err" style={{ fontSize: 12, marginTop: 10 }}>
+              {err}
+            </div>
+          )}
+          {created && (
+            <div className="banner" style={{ fontSize: 12, marginTop: 10 }}>
+              Created task <span className="mono">{created}</span>, assigned to Prime. Run it
+              from <Link to="/work">Work</Link> with “Run (Assigned)”.
+            </div>
+          )}
         </div>
       )}
     </div>

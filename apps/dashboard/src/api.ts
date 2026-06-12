@@ -2512,8 +2512,18 @@ export const reluxWork = {
     api.del<{ ok: boolean; revoked: string }>(
       `/v1/relux/agents/${encodeURIComponent(id)}/tokens/${encodeURIComponent(tokenId)}`,
     ),
-  // Create a new task and assign it to Prime.
-  createTask: (title: string) => api.post<ReluxTask>("/v1/relux/tasks", { title }),
+  // Create a new task and assign it to Prime. An optional `extra` carries the
+  // run-driven tool directive the backend's `CreateTaskReq` accepts: a single
+  // `tool_call` ({ plugin, tool, args }) OR a bounded `tool_plan` (≤5 of the same
+  // shape). They are mutually exclusive — the kernel 400s if both are supplied.
+  // Omitting `extra` keeps the plain echo task. (`docs/mcp.md` "Run-driven …".)
+  createTask: (
+    title: string,
+    extra?: {
+      tool_call?: { plugin: string; tool: string; args: unknown };
+      tool_plan?: Array<{ plugin: string; tool: string; args: unknown }>;
+    },
+  ) => api.post<ReluxTask>("/v1/relux/tasks", { title, ...(extra ?? {}) }),
   // Start an execution attempt for a task.
   startTask: (id: string) =>
     api.post<{ task: ReluxTask; run: ReluxRun }>(
