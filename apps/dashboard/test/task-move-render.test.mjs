@@ -42,6 +42,17 @@ export function renderForStatus(status) {
     </StaticRouter>
   );
 }
+
+// The Task Detail variant: a finished task shows the clear "can't be moved" note
+// (showUnsupportedNote) instead of nothing, so a keyboard / screen-reader user
+// learns WHY there is no control.
+export function renderDetail(status) {
+  return renderToStaticMarkup(
+    <StaticRouter location="/work">
+      <StatusMoveControl taskId={"task_1"} status={status} onMoved={() => {}} showUnsupportedNote />
+    </StaticRouter>
+  );
+}
 `;
 
 let tmp = null;
@@ -76,21 +87,49 @@ test("StatusMoveControl offers Block + Cancel for a non-terminal (queued) task",
   const html = mod.renderForStatus("queued");
   assert.match(html, /Move…/);
   assert.match(html, /<select/);
-  assert.match(html, /Move task status/); // the accessible label
   assert.match(html, /<option value="blocked">Block<\/option>/);
   assert.match(html, /<option value="cancelled">Cancel<\/option>/);
+});
+
+test("StatusMoveControl is keyboard-accessible: a descriptive aria-label + a described-by helper", () => {
+  const html = mod.renderForStatus("queued");
+  // The select carries a DESCRIPTIVE label (the allowed verbs + effects), not a bare
+  // "Move…" — so a screen reader announces the move semantics.
+  assert.match(html, /aria-label="Move task status — Block to hold this task, Cancel to stop it"/);
+  // It is tied to a VISIBLE helper line via aria-describedby, and that helper explains
+  // the Block/Cancel semantics AND the machine-driven lanes.
+  assert.match(html, /aria-describedby="status-move-help-task_1"/);
+  assert.match(html, /id="status-move-help-task_1"/);
+  assert.match(html, /Block holds the task; Cancel stops it\./);
+  assert.match(html, /set by the run lifecycle/);
 });
 
 test("StatusMoveControl drops Block (its own status) for a blocked task, keeps Cancel", () => {
   const html = mod.renderForStatus("blocked");
   assert.match(html, /<option value="cancelled">Cancel<\/option>/);
   assert.doesNotMatch(html, /<option value="blocked">Block<\/option>/);
+  // The label describes only the offered move (Cancel), never the dropped Block.
+  assert.match(html, /aria-label="Move task status — Cancel to stop it"/);
 });
 
-test("StatusMoveControl renders NOTHING for a terminal task (no move possible)", () => {
+test("StatusMoveControl renders NOTHING for a terminal task on a board card (no dead affordance)", () => {
   for (const s of ["completed", "failed", "cancelled", "expired"]) {
     const html = mod.renderForStatus(s);
     assert.doesNotMatch(html, /Move…/, `terminal ${s} must not show a move control`);
     assert.doesNotMatch(html, /<select/, `terminal ${s} must not render a select`);
   }
+});
+
+test("StatusMoveControl in the detail panel explains WHY a finished task can't be moved", () => {
+  for (const s of ["completed", "failed", "cancelled", "expired"]) {
+    const html = mod.renderDetail(s);
+    // No control, but a clear, screen-reader-readable note (role=note) with the reason.
+    assert.doesNotMatch(html, /<select/, `terminal ${s} still has no select`);
+    assert.match(html, /role="note"/, `terminal ${s} surfaces a note`);
+    assert.match(html, /finished and can/i, `terminal ${s} explains why`);
+  }
+  // A movable task in the detail panel still renders the real select (note only for terminal).
+  const movable = mod.renderDetail("queued");
+  assert.match(movable, /<select/);
+  assert.doesNotMatch(movable, /role="note"/);
 });

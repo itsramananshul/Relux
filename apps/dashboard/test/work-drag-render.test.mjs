@@ -108,7 +108,9 @@ test("a non-terminal card is draggable with a drag handle; a terminal card is no
 
 test("the select stays alongside drag (additive, keyboard-accessible)", () => {
   // The non-terminal card still carries the StatusMoveControl select — drag does not
-  // replace the keyboard/accessibility path.
+  // replace the keyboard/accessibility path. The select now announces a DESCRIPTIVE
+  // label + a described-by helper (the keyboard-accessible movement path, §6.8).
   const html = mod.renderColumn("blocked", "Blocked / Failed");
-  assert.match(html, /aria-label="Move task status"/, "the keyboard move select remains");
+  assert.match(html, /aria-label="Move task status — [^"]+"/, "the keyboard move select remains, now described");
+  assert.match(html, /aria-describedby="status-move-help-task_open"/, "the select is tied to its helper text");
 });

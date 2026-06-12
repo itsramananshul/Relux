@@ -13,6 +13,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   operatorStatusMoves,
+  statusMoveGuidance,
   canMoveStatus,
   isTerminalStatus,
   columnDropTarget,
@@ -67,6 +68,58 @@ test("canMoveStatus is true exactly when a move exists", () => {
   assert.equal(canMoveStatus("blocked"), true); // can still cancel
   assert.equal(canMoveStatus("completed"), false);
   assert.equal(isTerminalStatus("queued"), false);
+});
+
+// ---------------------------------------------------------------------------
+// Keyboard-accessible move guidance (design §6.7 still-pending "keyboard drag —
+// keyboard users use the select, the accessible equivalent"). The select's
+// descriptive aria-label + visible helper text must match the offered moves exactly
+// and explain the Block/Cancel semantics + the machine-driven lanes; a finished task
+// gets an honest "can't be moved" reason, never an empty label.
+// ---------------------------------------------------------------------------
+
+test("guidance for a non-terminal task names both Block and Cancel and the machine lanes", () => {
+  const g = statusMoveGuidance("queued");
+  assert.equal(g.canMove, true);
+  // The aria-label describes BOTH offered verbs + effects (not a bare "Move…").
+  assert.match(g.ariaLabel, /Move task status/);
+  assert.match(g.ariaLabel, /Block to hold this task/);
+  assert.match(g.ariaLabel, /Cancel to stop it/);
+  // The visible helper explains the semantics AND the machine-driven lanes.
+  assert.match(g.helper, /Block holds the task/);
+  assert.match(g.helper, /Cancel stops it/);
+  assert.match(g.helper, /run lifecycle/i);
+});
+
+test("guidance for a blocked task drops Block and describes only Cancel", () => {
+  const g = statusMoveGuidance("blocked");
+  assert.equal(g.canMove, true);
+  assert.match(g.ariaLabel, /Cancel to stop it/);
+  assert.doesNotMatch(g.ariaLabel, /Block to hold/);
+  assert.match(g.helper, /Cancel stops it/);
+  assert.doesNotMatch(g.helper, /Block holds/);
+});
+
+test("guidance for a finished task offers no control but a clear, honest reason", () => {
+  for (const s of ["completed", "failed", "cancelled", "expired"]) {
+    const g = statusMoveGuidance(s);
+    assert.equal(g.canMove, false, `${s} cannot move`);
+    assert.equal(g.ariaLabel, "", `${s} has no control label`);
+    assert.match(g.helper, /finished and can't be moved/i, `${s} explains why`);
+  }
+});
+
+test("every offered move has human guidance (no unlabelled option)", () => {
+  // If SETTABLE_MOVES grows a status with no MOVE_SEMANTICS entry the aria-label/helper
+  // would fall back to the bare label — assert the descriptive phrase is always present.
+  for (const s of ["created", "queued", "running", "blocked", "waiting_for_approval"]) {
+    const g = statusMoveGuidance(s);
+    for (const m of operatorStatusMoves(s)) {
+      // The helper must mention each offered move's effect verb.
+      const verb = m.status === "blocked" ? /Block holds/ : /Cancel stops/;
+      assert.match(g.helper, verb, `${s} helper describes ${m.status}`);
+    }
+  }
 });
 
 // ---------------------------------------------------------------------------

@@ -54,6 +54,68 @@ export function canMoveStatus(status: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Keyboard-accessible board movement (design §6 "status (clickable to change)";
+// §6.7 still-pending "keyboard drag — today keyboard users use the §6.4 select,
+// which is the accessible equivalent"). Drag is a POINTER affordance; the select
+// is the keyboard/screen-reader path. A tiny unlabelled "Move…" select is not
+// clear enough for a non-pointer user, so these pure helpers produce the human
+// description of the moves — the descriptive aria-label, the visible helper text
+// that explains the Block/Cancel semantics, and the honest reason a finished task
+// can't be moved — all derived from the SAME operatorStatusMoves allowlist so the
+// words never disagree with what the control actually offers. Kept dependency-free.
+// ---------------------------------------------------------------------------
+
+// The human meaning of each operator-settable move: the short phrase for the
+// aria-label and the sentence for the visible helper text. Keyed by wire status so
+// it stays in lockstep with SETTABLE_MOVES (a move with no entry is a bug, surfaced
+// by the unit test that every offered move has guidance).
+const MOVE_SEMANTICS: Record<string, { phrase: string; sentence: string }> = {
+  blocked: { phrase: "Block to hold this task", sentence: "Block holds the task" },
+  cancelled: { phrase: "Cancel to stop it", sentence: "Cancel stops it" },
+};
+
+// The clear reason a task that offers no move can't be moved from the board (a
+// finished task). Mirrors the columnDropTarget terminal reason word-for-word.
+const TERMINAL_REASON = "This task is finished and can't be moved.";
+
+// Why the Open / Running columns are not operator-settable, appended to the helper
+// so a screen-reader user learns the machine-driven lanes without seeing the board.
+const MACHINE_LANE_NOTE =
+  "Open and Running are set by the run lifecycle, not by a board move.";
+
+// The accessible description of the board moves available for a task in `status`.
+export interface StatusMoveGuidance {
+  // True when at least one move is offered (the control renders a select).
+  canMove: boolean;
+  // The descriptive label for the move select (names the allowed verbs + effects),
+  // so a screen reader announces the semantics, not just "Move…". Empty when no
+  // move is offered.
+  ariaLabel: string;
+  // Visible helper text: the Block/Cancel semantics for a movable task, or the clear
+  // reason a finished task can't be moved. Always present so the control is never a
+  // bare, unexplained select.
+  helper: string;
+}
+
+// Build the accessible guidance for a task in `status`, derived from the SAME
+// operatorStatusMoves allowlist the control renders — so the announced/visible words
+// always match the offered options (no move is described that isn't offered, and a
+// finished task gets an honest "can't be moved" reason, not an empty/dead label).
+export function statusMoveGuidance(status: string): StatusMoveGuidance {
+  const moves = operatorStatusMoves(status);
+  if (moves.length === 0) {
+    return { canMove: false, ariaLabel: "", helper: TERMINAL_REASON };
+  }
+  const phrases = moves.map((m) => MOVE_SEMANTICS[m.status]?.phrase ?? m.label);
+  const sentences = moves.map((m) => MOVE_SEMANTICS[m.status]?.sentence ?? m.label);
+  return {
+    canMove: true,
+    ariaLabel: `Move task status — ${phrases.join(", ")}`,
+    helper: `${sentences.join("; ")}. ${MACHINE_LANE_NOTE}`,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Drag-to-column status movement (design §6 "Drag a card to a column → status
 // mutation, with transition validation; an invalid drop shows a toast").
 //

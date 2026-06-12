@@ -33,6 +33,7 @@ import {
 } from "../runrollup";
 import {
   operatorStatusMoves,
+  statusMoveGuidance,
   canMoveStatus,
   columnDropTarget,
   encodeTaskDrag,
@@ -1118,16 +1119,33 @@ export function StatusMoveControl({
   taskId,
   status,
   onMoved,
+  showUnsupportedNote = false,
 }: {
   taskId: string;
   status: string;
   onMoved: () => void;
+  // When true (the Task Detail panel), a task that can't move renders a clear,
+  // screen-reader-readable note ("this task is finished and can't be moved") instead
+  // of nothing — so a keyboard user learns WHY there is no control. On a board card
+  // this stays false: a finished card shows nothing (no dead affordance, §6.4).
+  showUnsupportedNote?: boolean;
 }) {
   const moves = useMemo(() => operatorStatusMoves(status), [status]);
+  const guidance = useMemo(() => statusMoveGuidance(status), [status]);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const helpId = `status-move-help-${taskId}`;
 
-  if (moves.length === 0) return null;
+  if (moves.length === 0) {
+    // No move is possible (a finished task). Keep the card compact (no dead control),
+    // but in the detail panel surface the clear reason for assistive tech + keyboard.
+    if (!showUnsupportedNote) return null;
+    return (
+      <span className="status-move-note muted" role="note" style={{ fontSize: 10 }}>
+        {guidance.helper}
+      </span>
+    );
+  }
 
   async function move(target: string) {
     if (!target) return;
@@ -1143,12 +1161,19 @@ export function StatusMoveControl({
     }
   }
 
+  // The select IS the keyboard / screen-reader path (drag is the pointer affordance,
+  // §6.7). It carries a DESCRIPTIVE aria-label (the allowed verbs + effects, not a
+  // bare "Move…") and is tied via aria-describedby to a VISIBLE helper line that
+  // explains the Block/Cancel semantics and the machine-driven lanes — so a non-pointer
+  // user understands the move without seeing the columns. Both come from statusMoveGuidance,
+  // so the words always match the offered options.
   return (
     <span className="status-move" style={{ display: "inline-flex", flexDirection: "column", gap: 2 }}>
       <select
         className="input sm"
-        aria-label="Move task status"
-        title="Move this task to a new status"
+        aria-label={guidance.ariaLabel}
+        aria-describedby={helpId}
+        title={guidance.ariaLabel}
         value=""
         disabled={busy}
         style={{ fontSize: 10, padding: "4px 8px", minWidth: 92, height: 24 }}
@@ -1161,6 +1186,9 @@ export function StatusMoveControl({
           </option>
         ))}
       </select>
+      <span id={helpId} className="status-move-help muted" style={{ fontSize: 9, whiteSpace: "normal", maxWidth: 200 }}>
+        {guidance.helper}
+      </span>
       {err && (
         <span className="badge failed" style={{ fontSize: 9, whiteSpace: "normal" }} title={err}>
           {err}
@@ -1495,10 +1523,10 @@ function TaskDetailPanel({
             <span className="row" style={{ alignItems: "center", gap: 8, flexWrap: "wrap" }}>
               <span>{task.status}</span>
               {/* Status MOVE (design §6): the same compact Block / Cancel control the
-                  board cards show, offered only for a non-terminal task. */}
-              {canMoveStatus(task.status) && (
-                <StatusMoveControl taskId={task.id} status={task.status} onMoved={onStatusMoved} />
-              )}
+                  board cards show. In the detail panel it also surfaces the clear
+                  reason a finished task can't be moved (showUnsupportedNote), so a
+                  keyboard / screen-reader user learns WHY there is no control. */}
+              <StatusMoveControl taskId={task.id} status={task.status} onMoved={onStatusMoved} showUnsupportedNote />
             </span>
           </div>
           {/* Parent edge + SAFE REPARENT (design §6.6): show the current parent (if any,
