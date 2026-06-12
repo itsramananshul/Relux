@@ -3867,6 +3867,39 @@ Adapters supported/detected in v1: `relux-adapter-claude-cli` (Claude CLI),
 `relux-adapter-codex-cli` (Codex CLI), and a generic command adapter. Detection
 probes `PATH` (and `PATHEXT` on Windows) read-only for the configured binary.
 
+#### Local Prime is deterministic — it fails closed on real external work
+
+The local Prime adapter performs **no external work**: no cloning a repository, no
+filesystem/network access, no plugin import. It drives only the in-memory
+control-plane loop (the deterministic echo, plus any operator-authored
+`tool_call`/`tool_plan` directive that runs through the gated `call_tool`
+chokepoint). A plain echo/test task keeps the echo behavior; a directive task runs
+its gated tools.
+
+But a task that carries a **free-form natural-language goal** Prime was handed (a
+non-empty `prime_request`) with **no executable directive** is something the
+deterministic adapter cannot turn into actions. Earlier such a run could be *started*
+and then sit in `Running` forever with nothing executing it (the "running but nothing
+happens" bug) — or fake-echo the input back as "done". Adapter Runtime v1 closes
+this with a **fail-closed branch** in `execute_local_run`
+(`relux_core::is_unfulfillable_local_request`):
+
+- the run reaches a terminal **`Failed`** state classified `adapter_missing` (never
+  an infinite `Running`, never a fabricated success), and the task is parked
+  **`Blocked`** (operator-actionable + reopenable once a real adapter is assigned);
+- the run transcript + `run.error` carry **actionable guidance** naming both
+  remedies: import a repository as a plugin via **Plugins → + Install → GitHub URL**,
+  or assign the task to a configured **Claude/Codex** adapter, then run it again
+  (`KernelError::LocalAdapterUnsupported`, HTTP 422).
+
+The two Prime-chat entry points that *create and run* / *start* a task
+(`PrimeAction::CreateAndRunTask`, `PrimeAction::StartRun`) now **drive the run to a
+terminal state** through the same governed `execute_assigned_run` path the Work
+page's "Run (Assigned)" uses — a started run is never left dangling. The Work page's
+recovery card recognizes the local-Prime case (an `adapter_missing` failure whose run
+adapter is `relux-adapter-local-prime`) and offers **Open Plugins** + **Reassign**
+rather than the generic "install your CLI" guidance.
+
 ### Bundled plugin refresh is idempotent (existing stores pick up new capabilities)
 
 The shipped bundled plugins/adapters under `examples/relux-plugins`

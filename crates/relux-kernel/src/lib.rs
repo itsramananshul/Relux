@@ -310,6 +310,8 @@ pub enum KernelError {
     AdapterBinaryMissing { plugin: String, binary: String },
     #[error("adapter {plugin} run failed: {message}")]
     AdapterExecutionFailed { plugin: String, message: String },
+    #[error("the local Prime adapter is deterministic and cannot fulfil task {0}: it performs no external work (cloning a repository, filesystem or network access, or importing a plugin). To import a repository as a plugin, open Plugins → + Install → GitHub URL; to run this as real agent work, assign the task to a configured Claude or Codex adapter on Crew → Adapters, then run it again.")]
+    LocalAdapterUnsupported(String),
     #[error("permission denied: agent {agent} lacks {permission}")]
     PermissionDenied { agent: String, permission: String },
     #[error("permission '{1}' already granted to agent {0}")]

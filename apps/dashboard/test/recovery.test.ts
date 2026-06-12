@@ -78,6 +78,32 @@ test("adapter_missing omits Retry when the run is not retry-eligible", () => {
   assert.ok(kinds(a.actions).includes("inspect"));
 });
 
+test("adapter_missing on the local Prime adapter points at plugin import + a real adapter", () => {
+  // The "running but nothing happens" fix: a local-prime run that refused a free-form
+  // external request (clone/import) surfaces the plugin-import flow, NOT the generic
+  // "install your CLI" guidance (local Prime is never a missing CLI).
+  const a = assessRunRecovery(
+    run({
+      adapter_plugin: "relux-adapter-local-prime",
+      failure_class: "adapter_missing",
+      status: "failed",
+      retryable: false,
+    }),
+  )!;
+  assert.match(a.classLabel, /local adapter/i);
+  assert.match(a.rootCause, /deterministic/i);
+  assert.match(a.recommendation, /Plugins/);
+  assert.match(a.recommendation, /Claude or Codex/);
+  // The primary, recommended action opens the Plugins page (the import flow).
+  assert.equal(a.actions[0].kind, "open_plugins");
+  assert.equal(a.actions[0].primary, true);
+  // It offers reassigning to a real adapter and inspecting — never the generic
+  // "configure adapter" CLI card (local Prime isn't a missing CLI).
+  assert.ok(kinds(a.actions).includes("reassign"));
+  assert.ok(kinds(a.actions).includes("inspect"));
+  assert.ok(!kinds(a.actions).includes("configure_agent"));
+});
+
 // ── Auth required ──────────────────────────────────────────────────────────
 test("auth_required recommends fixing the credential", () => {
   const a = assessRunRecovery(run({ failure_class: "auth_required", retryable: true }))!;

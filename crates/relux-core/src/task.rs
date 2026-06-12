@@ -279,6 +279,31 @@ pub fn parse_task_tool_call(input: &serde_json::Value) -> Option<TaskToolCall> {
     Some(TaskToolCall { plugin, tool, args })
 }
 
+/// True when a Task `input` is a free-form natural-language request Prime was handed
+/// (a non-empty `prime_request`) that carries NO executable directive
+/// (`tool_call` / `tool_plan`).
+///
+/// The local Prime adapter is deterministic and has no real tools (it drives only the
+/// in-memory echo loop), so it cannot turn such a goal into actions — cloning a repo,
+/// touching the filesystem/network, or importing a plugin are all outside it. A run on
+/// the local adapter for one of these requests must therefore refuse HONESTLY with
+/// guidance (and park the task as `Blocked`) rather than echo a no-op back as "done"
+/// or sit forever in `Running`. This is the structural discriminator the kernel's
+/// `execute_local_run` uses for that fail-closed branch.
+///
+/// A plain echo/test task (no `prime_request`) is NOT this — it keeps the documented
+/// deterministic echo behavior. A request that DID carry a `tool_call`/`tool_plan`
+/// directive is handled by the gated tool path before this is ever consulted, so the
+/// `None` checks here are a belt-and-braces guard for direct callers.
+pub fn is_unfulfillable_local_request(input: &serde_json::Value) -> bool {
+    let has_request = input
+        .get("prime_request")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    has_request && parse_task_tool_call(input).is_none() && parse_task_tool_plan(input).is_none()
+}
+
 /// A durable unit of work.
 ///
 /// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 9.5 (Task).
@@ -650,5 +675,36 @@ mod tool_plan_tests {
             &serde_json::json!({ "tool_call": { "plugin": "mcp:fs", "tool": "search" } })
         )
         .is_none());
+    }
+
+    #[test]
+    fn freeform_prime_request_is_unfulfillable_locally() {
+        // A free-form natural-language goal Prime was handed, with no directive: the
+        // local deterministic adapter cannot action it.
+        assert!(is_unfulfillable_local_request(
+            &serde_json::json!({ "prime_request": "Clone nousresearch/hermes-agent and import it as a plugin" })
+        ));
+        // Details alongside the request do not change that.
+        assert!(is_unfulfillable_local_request(
+            &serde_json::json!({ "prime_request": "Do the thing", "details": "with care" })
+        ));
+    }
+
+    #[test]
+    fn echo_and_directive_inputs_are_fulfillable_locally() {
+        // A plain echo/test task keeps the documented deterministic echo behavior.
+        assert!(!is_unfulfillable_local_request(&serde_json::json!({ "message": "hello relux" })));
+        // An empty/blank prime_request is not a real request.
+        assert!(!is_unfulfillable_local_request(&serde_json::json!({ "prime_request": "   " })));
+        // A request that carries an executable directive is handled by the gated tool
+        // path, NOT refused here — even when a prime_request string is also present.
+        assert!(!is_unfulfillable_local_request(&serde_json::json!({
+            "prime_request": "search the repo",
+            "tool_call": { "plugin": "mcp:fs", "tool": "search" }
+        })));
+        assert!(!is_unfulfillable_local_request(&serde_json::json!({
+            "prime_request": "run the plan",
+            "tool_plan": [ { "plugin": "mcp:fs", "tool": "search" } ]
+        })));
     }
 }

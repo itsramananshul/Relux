@@ -9157,6 +9157,10 @@ fn status_for(err: &KernelError) -> StatusCode {
         KernelError::ProposedChangeSetNotApplicable { .. } => StatusCode::UNPROCESSABLE_ENTITY,
         KernelError::AdapterBinaryMissing { .. } => StatusCode::UNPROCESSABLE_ENTITY,
         KernelError::AdapterExecutionFailed { .. } => StatusCode::BAD_GATEWAY,
+        // The local Prime adapter cannot fulfil this task (it does no external work):
+        // a well-formed request the deterministic adapter can't action — unprocessable.
+        // The run is left Failed + the task Blocked with actionable guidance.
+        KernelError::LocalAdapterUnsupported(_) => StatusCode::UNPROCESSABLE_ENTITY,
         KernelError::AdapterNotConfigurable { .. } | KernelError::InvalidAdapterConfig { .. } => {
             StatusCode::BAD_REQUEST
         }

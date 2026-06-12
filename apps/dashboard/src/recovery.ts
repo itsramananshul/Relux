@@ -19,6 +19,12 @@ import type { ReluxRun, ReluxRunDetail, ReluxTask } from "./api";
 import { canRetryRun, canResumeRun } from "./runview.ts";
 import { reopenEligibility, type ReopenableTask } from "./taskmove.ts";
 
+// The stable wire id of the built-in deterministic local adapter
+// (relux_core::adapter::LOCAL_PRIME_ADAPTER_ID). A run on this adapter that fails
+// `adapter_missing` is the "local Prime can't do external work" case, not a real
+// missing-CLI — it gets the plugin-import / real-adapter guidance instead.
+const LOCAL_PRIME_ADAPTER_ID = "relux-adapter-local-prime";
+
 // One proposed recovery action. The `kind` is a stable key the renderer maps to an
 // EXISTING affordance/route (it never invents authority); `label` is the button
 // text and `hint` the one-line "what this does / why". `primary` marks the single
@@ -31,6 +37,7 @@ export type RecoveryActionKind =
   | "reassign" // POST /v1/relux/tasks/:id/assign — hand to another operative
   | "open_approval" // the Approvals surface — decide a pending gate
   | "configure_agent" // the Crew / Settings surface — adapter / credential / permission
+  | "open_plugins" // the Plugins surface — import a repo/ZIP/folder as a plugin (Add from GitHub)
   | "inspect" // the run transcript + logs already on this surface
   | "analyze" // POST /v1/relux/runs/:id/diagnose — cheap read-only diagnostic narrative
   | "investigate"; // open Prime seeded with the diagnosis (§3.3b chat companion)
@@ -164,6 +171,38 @@ function assessRunRecoveryInner(
 
   switch (cls) {
     case "adapter_missing":
+      // The local Prime adapter is a special, structurally-distinct case: it is never
+      // "missing" (it ships built in), so an adapter_missing failure on it means the
+      // DETERMINISTIC local adapter was asked to do real external work it cannot do —
+      // clone a repo, touch the filesystem/network, or import a plugin. Point the
+      // operator at the actual remedies (the plugin install flow / a real adapter)
+      // rather than the generic "install your CLI" guidance.
+      if (run.adapter_plugin === LOCAL_PRIME_ADAPTER_ID) {
+        return {
+          subject: "run",
+          classLabel: "Not supported by the local adapter",
+          failureClass: cls,
+          rootCause:
+            "This run used Prime's local adapter, which is deterministic and performs no external work — it cannot clone a repository, access the filesystem/network, or import a plugin.",
+          recommendation:
+            "To import a repository as a plugin, open Plugins → + Install → GitHub URL. To run this as real agent work, reassign the task to an operative backed by a configured Claude or Codex adapter, then run it again.",
+          actions: [
+            {
+              kind: "open_plugins",
+              label: "Open Plugins",
+              hint: "Go to Plugins → + Install to import a repository (GitHub URL / ZIP / folder) as a plugin. No repo code runs at install.",
+              primary: true,
+            },
+            {
+              kind: "reassign",
+              label: "Reassign",
+              hint: "Hand the task to an operative backed by a configured Claude or Codex adapter.",
+            },
+            INSPECT_ACTION,
+          ],
+          missingInfo: null,
+        };
+      }
       return {
         subject: "run",
         classLabel: "Adapter not available",

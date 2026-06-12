@@ -2467,6 +2467,8 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
             resume_session: { onClick: () => void resume(), disabled: resuming },
             // Adapter credentials live in Settings; adapter enable + agent config in Crew.
             configure_agent: { to: recovery.failureClass === "auth_required" ? "/settings" : "/crew" },
+            // Plugin import lives on the Plugins page (+ Install → GitHub URL / ZIP / folder).
+            open_plugins: { to: "/plugins" },
             // Reassign lives on the task surface (the board card / task detail picker).
             reassign: { to: `/work?task=${encodeURIComponent(run.task_id)}` },
             // inspect: unwired → the transcript + log tail are already on this panel below.

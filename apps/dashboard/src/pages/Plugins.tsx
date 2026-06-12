@@ -133,6 +133,16 @@ export function Plugins() {
           across restarts until removed. Bundled fixtures are protected and cannot
           be removed.
         </p>
+        <p className="muted" style={{ marginTop: -8, marginBottom: 12, fontSize: 12 }}>
+          To add one — for example to import a GitHub repository like{" "}
+          <span className="mono">nousresearch/hermes-agent</span> as a plugin — use{" "}
+          <strong>+ Install</strong> and paste a GitHub URL (or upload a ZIP / point at a
+          local folder). If the source has a{" "}
+          <span className="mono">relux-plugin.json</span> manifest it is installed as a
+          plugin; if not, Relux imports it safely as <em>metadata only</em>, scans it for
+          hints (MCP server, tools, scripts), and lets you configure tools / register an
+          MCP server afterward. <strong>No repository code runs during install.</strong>
+        </p>
 
         {open && (
           <InstallPanel
@@ -3168,6 +3178,13 @@ function InstallPanel({
       {banner && (
         <div className={"banner " + banner.kind} style={{ fontSize: 12 }}>{banner.msg}</div>
       )}
+
+      <p className="muted" style={{ marginTop: 0, marginBottom: 10, fontSize: 11 }}>
+        Installing only reads the source and records it — <strong>no repository code is
+        executed</strong>. A source without a <span className="mono">relux-plugin.json</span>{" "}
+        manifest is imported as a safe metadata-only wrapper (no runnable tools) you
+        configure afterward.
+      </p>
 
       {source === "github" && (
         <label className="field" style={{ margin: 0 }}>

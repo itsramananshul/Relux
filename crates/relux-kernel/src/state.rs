@@ -7956,15 +7956,29 @@ impl KernelState {
                 self.assign_task(&task, &ctx.agent)?;
                 self.apply_slot_priority(&task, slots);
                 let run = self.start_run(&task)?;
+                // Actually DRIVE the run to a terminal state through the same governed
+                // path the Work page's "Run (Assigned)" uses — never leave it sitting
+                // in `Running` with nothing executing it (the "running but nothing
+                // happens" bug). The task is assigned to Prime (local adapter), so this
+                // runs the deterministic local path synchronously: a directive task
+                // completes, a free-form goal Prime cannot fulfil is refused honestly
+                // (the run fails + the task is parked `Blocked` with guidance). The Err
+                // is NOT propagated — it is a real outcome to report, not a chat fault.
+                let exec = self.execute_assigned_run(&task);
 
                 let head = if slots.is_some() {
                     format!("Creating and running task: \"{eff_title}\".")
                 } else {
                     text
                 };
-                let reply = format!(
-                    "{head} Created {task} and started {run}. The task is now running and awaiting further action from the assigned agent."
-                );
+                let reply = match &exec {
+                    Ok(_) => format!(
+                        "{head} Created {task} and ran {run} to completion."
+                    ),
+                    Err(e) => format!(
+                        "{head} Created {task} and started {run}, but it could not be completed: {e} The task is now Blocked — open it on the Work board for recovery options."
+                    ),
+                };
                 // Provenance reflects only what was applied: the assignee is never
                 // applied on this path, and a proposal that contributed nothing but
                 // a (dropped) assignee shows no chip.
@@ -8008,10 +8022,21 @@ impl KernelState {
             PrimeAction::StartRun { task_id } => {
                 let tid = TaskId::new(task_id.clone());
                 let run = self.start_run(&tid)?;
+                // Drive the run to a terminal state through the same governed path the
+                // Work "Run (Assigned)" action uses, so a started run never dangles in
+                // `Running` with nothing executing it. For a local-prime task this runs
+                // synchronously (a directive completes; a free-form goal it cannot do is
+                // refused + the task parked `Blocked`); for a configured CLI adapter it
+                // spawns that adapter, exactly as the route does. The Err is reported,
+                // not propagated as a chat fault.
+                let exec = self.execute_assigned_run(&tid);
 
-                let reply = format!(
-                    "{text} Started {run}. The task is now running and awaiting further action from the assigned agent."
-                );
+                let reply = match &exec {
+                    Ok(_) => format!("{text} Ran {run} to completion."),
+                    Err(e) => format!(
+                        "{text} Started {run}, but it could not be completed: {e} The task is now Blocked — open it on the Work board for recovery options."
+                    ),
+                };
                 Ok(PrimeTurn {
                     intent,
                     reply,
@@ -9256,6 +9281,38 @@ impl KernelState {
                     Err(e)
                 }
             }
+        } else if relux_core::is_unfulfillable_local_request(&input) {
+            // The task is a free-form natural-language goal Prime was handed, with no
+            // executable directive. The local Prime adapter is deterministic and has no
+            // real tools, so it CANNOT do this work (clone a repo, touch the
+            // filesystem/network, import a plugin). Refuse honestly with actionable
+            // guidance and PARK the task as `Blocked` — never echo a no-op back as
+            // "done", and never leave the run sitting in `Running` forever (the
+            // "running but nothing happens" bug). The run reaches a terminal `Failed`
+            // state classified `AdapterMissing` so the Work page's recovery card +
+            // the cross-Guild Inbox surface it with one-click choices; the task is
+            // `Blocked` so it is reopenable once a real adapter is assigned.
+            // (`docs/RELUX_MASTER_PLAN.md` §8.1 Adapter Runtime — local Prime does no
+            // external work; `docs/mcp.md` "Importing a repository as a plugin".)
+            let guidance = KernelError::LocalAdapterUnsupported(task_id.to_string()).to_string();
+            self.fail_run_classified(&run_id, &guidance, RunFailureClass::AdapterMissing)?;
+            let blocked_at = self.clock.tick();
+            let namespace = self.tasks.get_mut(task_id).map(|task| {
+                task.status = TaskStatus::Blocked;
+                task.updated_at = blocked_at;
+                task.namespace_id.clone()
+            });
+            self.record_audit(
+                "agent",
+                agent_id_for_call.as_str(),
+                "run:refuse_local_unsupported",
+                Some("run"),
+                Some(run_id.as_str()),
+                namespace.as_ref(),
+                AuditResult::Failed,
+                serde_json::json!({ "task": task_id.as_str() }),
+            );
+            Err(KernelError::LocalAdapterUnsupported(task_id.to_string()))
         } else {
             // Default: the deterministic echo cycle on the task's own input.
             let echo_plugin = PluginId::new("relux-tools-echo");
@@ -16770,9 +16827,11 @@ mod tests {
         let started = k.prime_turn(&ctx, "start it").unwrap();
         assert_eq!(started.disposition, PrimeDisposition::Executed);
         let run_id = started.started_run.expect("a run was started");
-        // start it now only starts the run, does not complete it.
-        assert_eq!(k.run(&run_id).unwrap().status, RunStatus::Running);
-        assert_eq!(k.task(&task_id).unwrap().status, TaskStatus::Running);
+        // "start it" now DRIVES the run to a terminal state — it is never left dangling
+        // in Running. The local adapter cannot fulfil this free-form goal, so the run
+        // Fails and the task is parked Blocked (operator-actionable, reopenable).
+        assert_eq!(k.run(&run_id).unwrap().status, RunStatus::Failed);
+        assert_eq!(k.task(&task_id).unwrap().status, TaskStatus::Blocked);
     }
 
     /// Add a second specialist agent so an assignee slot has a real target.
@@ -17700,16 +17759,21 @@ mod tests {
         let task_id = turn.created_task.expect("a task was created");
         let run_id = turn.started_run.expect("a run was started");
 
-        assert_eq!(k.task(&task_id).unwrap().status, TaskStatus::Running);
-        assert_eq!(k.run(&run_id).unwrap().status, RunStatus::Running);
+        // The run is DRIVEN to a terminal state in the same turn — it is never left
+        // dangling in Running (the "running but nothing happens" bug). A free-form goal
+        // the local Prime adapter cannot fulfil is refused honestly: the run Fails and
+        // the task is parked Blocked with actionable guidance.
+        assert_eq!(k.task(&task_id).unwrap().status, TaskStatus::Blocked);
+        assert_eq!(k.run(&run_id).unwrap().status, RunStatus::Failed);
 
-        // Transcript shows run_started event, but no tool_call or run_completed yet
+        // Transcript shows the start then the honest failure — never a fabricated
+        // completion and never a stuck run_started with nothing after it.
         let kinds: Vec<&str> = k
             .run_events(&run_id)
             .iter()
             .map(|e| e.kind.as_str())
             .collect();
-        assert_eq!(kinds, vec!["run_started"]);
+        assert_eq!(kinds, vec!["run_started", "run_failed"]);
     }
 
     #[test]
@@ -19168,8 +19232,10 @@ mod tests {
         assert_eq!(restored.agent_count(), k.agent_count());
         assert_eq!(restored.task_count(), k.task_count());
         assert_eq!(restored.run_count(), k.run_count());
-        assert_eq!(restored.task(&task).unwrap().status, TaskStatus::Running);
-        assert_eq!(restored.run(&run).unwrap().status, RunStatus::Running);
+        // The run was driven to a terminal state in the turn (the local adapter refuses
+        // the free-form goal), so the round trip preserves the terminal states.
+        assert_eq!(restored.task(&task).unwrap().status, TaskStatus::Blocked);
+        assert_eq!(restored.run(&run).unwrap().status, RunStatus::Failed);
         assert_eq!(restored.run_events(&run).len(), k.run_events(&run).len());
         assert_eq!(restored.audit_log().len(), k.audit_log().len());
 
@@ -20195,6 +20261,102 @@ mod tests {
         let completed = k.execute_assigned_run(&task).expect("echo path ok");
         assert_eq!(completed, run);
         assert_eq!(k.task(&task).unwrap().status, TaskStatus::Completed);
+    }
+
+    // Build a local-prime kernel + a task carrying a free-form `prime_request` goal
+    // (no executable directive) — the "clone a repo and import it as a plugin" shape.
+    fn local_prime_freeform_task() -> (KernelState, AgentId, TaskId) {
+        let mut k = KernelState::new();
+        k.register_plugin(echo_manifest());
+        k.register_plugin(adapter_manifest());
+        let ns = k.create_namespace("workspace", "Workspace", NamespaceKind::Personal);
+        let adapter = PluginId::new("relux-adapter-local-prime");
+        let prime = k
+            .create_agent(
+                "prime",
+                "Prime",
+                "The control-plane operator.",
+                &adapter,
+                &ns,
+                None,
+                vec![],
+            )
+            .unwrap();
+        let task = k.create_task(
+            "Clone nousresearch/hermes-agent and import it as a plugin",
+            serde_json::json!({
+                "prime_request": "Clone nousresearch/hermes-agent and import it as a plugin"
+            }),
+            "founder",
+            &ns,
+            vec![],
+        );
+        k.assign_task(&task, &prime).unwrap();
+        (k, prime, task)
+    }
+
+    #[test]
+    fn local_prime_refuses_unfulfillable_request_instead_of_hanging() {
+        // The reported bug: a local-prime task like "clone a repo and import a plugin"
+        // sat in Running forever. It must instead reach a terminal state with honest,
+        // actionable guidance — never an infinite Running run, never a fake echo.
+        let (mut k, _prime, task) = local_prime_freeform_task();
+
+        let err = k.execute_assigned_run(&task).unwrap_err();
+        assert!(matches!(err, KernelError::LocalAdapterUnsupported(_)));
+
+        // The run is terminally Failed (NOT Running), classified for the recovery card.
+        let run = k
+            .runs()
+            .into_iter()
+            .find(|r| r.task_id == task)
+            .expect("a run exists");
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(run.failure_class, Some(RunFailureClass::AdapterMissing));
+        assert_ne!(run.status, RunStatus::Running, "the run must never dangle in Running");
+
+        // The task is parked Blocked — operator-actionable + reopenable once a real
+        // adapter is assigned (the §6.9 recovery lifecycle).
+        assert_eq!(k.task(&task).unwrap().status, TaskStatus::Blocked);
+
+        // The transcript carries the honest start + failure with the guidance, and the
+        // guidance names both remedies (Plugins import / a real adapter).
+        let run_id = run.id.clone();
+        let kinds: Vec<&str> = k.run_events(&run_id).iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["run_started", "run_failed"]);
+        let msg = run.error.clone().unwrap_or_default();
+        assert!(msg.contains("Plugins"), "guidance points to the plugin import flow: {msg}");
+        assert!(msg.contains("Claude or Codex"), "guidance offers a real adapter: {msg}");
+    }
+
+    #[test]
+    fn create_and_run_freeform_task_does_not_leave_a_running_run() {
+        // The chat entry point: "create and run" a free-form goal on Prime must drive
+        // the run to a terminal state, not leave it Running (the screenshot bug). The
+        // turn still succeeds (it reports the honest Blocked outcome in its reply).
+        let (mut k, ctx) = prime_chat_kernel();
+        let (turn, _) = k
+            .prime_turn_with_intent_and_slots(
+                &ctx,
+                "create a task to clone nousresearch/hermes-agent and import it as a plugin and run it",
+                None,
+                Some(&slots(
+                    "Clone nousresearch/hermes-agent and import it as a plugin",
+                    0.9,
+                )),
+            )
+            .unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::CreateAndRunTask);
+        let task_id = turn.created_task.clone().expect("a task was created");
+        // No run for this task is left in Running.
+        assert!(
+            !k.runs().into_iter().any(|r| r.task_id == task_id && r.status == RunStatus::Running),
+            "a created-and-run local task must not dangle in Running"
+        );
+        // The task is Blocked (honest: local Prime could not do external work).
+        assert_eq!(k.task(&task_id).unwrap().status, TaskStatus::Blocked);
+        // The reply is honest about the outcome (not a false "now running" claim).
+        assert!(turn.reply.contains("Blocked"), "reply states the block: {}", turn.reply);
     }
 
     #[test]

@@ -605,6 +605,45 @@ form.
 - **Status polling, not push.** The dashboard reads status on demand (no live stream);
   a crash between reads surfaces on the next status read / call, not instantly.
 
+## Importing a repository as a plugin (the "add a plugin" flow)
+
+Adding a plugin is an explicit operator action on the **Plugins** page → **+ Install**.
+Three sources, all governed, none of which **execute repository code at install time**:
+
+- **GitHub URL** — `POST /v1/relux/plugins/install-github { url }`. Validated
+  (`https://github.com/owner/repo[.git]`, no embedded credentials), then cloned with
+  `git clone --depth 1` (argv-only, no shell) on the Relux host.
+- **ZIP upload** — `POST /v1/relux/plugins/install-zip` (multipart). Extracted +
+  validated on the host; path-traversal entries are refused.
+- **Local folder** — `POST /v1/relux/plugins/install-dir { path }`. Read on the Relux
+  process host (not the browser machine).
+
+What install does with the source (`crate::plugin_install`):
+
+- If the source has a **`relux-plugin.json` manifest**, it is validated and installed
+  as a plugin.
+- If it has **no manifest**, Relux generates a safe **metadata-only wrapper** (no
+  runnable tools, `TrustLevel::Unverified`), scans it for read-only **hints** (MCP
+  server, npm/python entrypoints, scripts, README), and lets the operator configure
+  tools / register an MCP server afterward (see the next section). Arbitrary plugin
+  code is never executed by install.
+
+So "**Clone `nousresearch/hermes-agent` and import it as a plugin**" is a Plugins →
+**+ Install** → **GitHub URL** action — paste the repo URL and install. It is **not**
+a Prime *task*: Prime's local adapter is deterministic and cannot clone/import (below).
+
+### Local Prime cannot clone/import — it fails closed with guidance
+
+If a user instead phrases this as a Prime-chat *task* ("clone … and import it as a
+plugin, and run it"), Prime creates the task on its **local** adapter, which is
+deterministic and performs no external work. Rather than sit forever in `Running`
+(the old "running but nothing happens" bug) or fake-echo it as done, the run now
+**fails closed**: it reaches a terminal `Failed` (classified `adapter_missing`), the
+task is parked **`Blocked`**, and the transcript + the Work page's recovery card carry
+actionable guidance — **Open Plugins** (the import flow above) or **Reassign** to a
+configured Claude/Codex adapter. See `docs/RELUX_MASTER_PLAN.md` §8.1 "Local Prime is
+deterministic — it fails closed on real external work."
+
 ## MCP hint → review → register (one-click from imported plugin details)
 
 An operator who imports an arbitrary repo with no `relux-plugin.json` gets a
