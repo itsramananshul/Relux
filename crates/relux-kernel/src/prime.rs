@@ -162,10 +162,19 @@ pub fn classify_intent(message: &str) -> PrimeIntent {
     // clean message, never a raw dump (`docs/mcp.md` "Invocation"; §10.5, §17.1).
     let references_mcp_tool = parse_tool_request(message)
         .is_some_and(|(plugin, tool, _)| plugin.starts_with("mcp:") && !tool.is_empty());
+    // An EXPLICIT installed-plugin tool ref whose id is NOT the `relux-tools-` keyword
+    // convention (e.g. "use acme-crm/crm.lookup"), resolved via the SAME
+    // [`parse_tool_request`] rule the relux refs use so any registered plugin id can be
+    // named in chat — not only `relux-tools-*`. Requires an explicit invoke verb (below)
+    // and is fail-closed: an id not in the live catalog returns an honest "no such tool".
+    let references_plugin_tool = m
+        .split(|c: char| c.is_whitespace())
+        .filter(|t| t.contains('/') && !t.starts_with("mcp:"))
+        .any(|t| parse_tool_request(t).is_some_and(|(p, tool, _)| !p.starts_with("mcp:") && !tool.is_empty()));
     if has(&["echo.say", "status.summary"])
         || (first_word == "echo")
         || (invoke_verb && has(&[" tool", "echo", "status tool"]))
-        || (invoke_verb && m.contains("relux-tools-"))
+        || (invoke_verb && (m.contains("relux-tools-") || references_plugin_tool))
         || has(&["use the echo", "use the status", "the echo tool", "the status tool"])
         || (references_mcp_tool && (invoke_verb || !is_chat_guarded(message)))
     {
@@ -1674,19 +1683,23 @@ pub(crate) fn parse_tool_request(message: &str) -> Option<(String, String, Strin
     let lower = trimmed.to_lowercase();
     let json = extract_json(trimmed);
 
-    // 1. Explicit "<plugin>/<tool>" reference, e.g. "relux-tools-github/github.create_pr".
-    if let Some(tok) = lower
+    // 1. Explicit "<plugin>/<tool>" reference, e.g. "relux-tools-github/github.create_pr"
+    //    or a third-party "acme-crm/crm.lookup". Scans for the FIRST token that is a
+    //    genuine plugin tool ref ([`explicit_plugin_tool_ref`]), stepping past ordinary
+    //    prose pairs ("and/or", a path) so a later real ref is not missed. Resolution is
+    //    purely syntactic and fail-closed: an id not in the live catalog returns an honest
+    //    "no such tool" downstream (`prime_invoke_tool`), never a raw dump.
+    if let Some((plugin, tool)) = lower
         .split(|c: char| c.is_whitespace())
-        .find(|t| t.contains('/') && t.starts_with("relux-"))
+        .filter(|t| t.contains('/'))
+        .find_map(|t| {
+            let mut parts = t.splitn(2, '/');
+            let plugin = trim_token(parts.next()?);
+            let tool = trim_token(parts.next()?);
+            explicit_plugin_tool_ref(&plugin, &tool).then_some((plugin, tool))
+        })
     {
-        let mut parts = tok.splitn(2, '/');
-        if let (Some(plugin), Some(tool)) = (parts.next(), parts.next()) {
-            let plugin = trim_token(plugin);
-            let tool = trim_token(tool);
-            if !plugin.is_empty() && !tool.is_empty() {
-                return Some((plugin, tool, json.unwrap_or_else(|| "{}".to_string())));
-            }
-        }
+        return Some((plugin, tool, json.unwrap_or_else(|| "{}".to_string())));
     }
 
     // 1b. Explicit MCP tool reference: "mcp:<server>/<tool>" — the stable ref form a
@@ -1880,6 +1893,37 @@ fn strip_tool_plan_lead_in(message: &str) -> String {
 }
 
 /// Trim a token down to a plugin/tool-id shape (ASCII alnum, `-`, `_`, `.`).
+/// Whether a `<plugin>/<tool>` pair (already split + [`trim_token`]-cleaned) is an
+/// EXPLICIT installed-plugin tool reference this resolver should accept. Two shapes,
+/// both resolved fail-closed against the live catalog downstream (an id that is not
+/// installed → an honest "no such tool", never a raw dump):
+///   - the `relux-*` bundled/installed convention (`relux-tools-echo/echo.say`); and
+///   - a THIRD-PARTY plugin whose id is a HYPHENATED kebab id with a DOTTED tool name
+///     (`acme-crm/crm.lookup`) — mirroring openclaw's `plugin:<pluginId>:<toolName>`
+///     executor ref (`reference/openclaw-main/src/tools/execution.ts`), so a registry
+///     plugin whose id is not `relux-tools-*` can still be named in chat.
+///
+/// The hyphen + dotted-tool guard on the third-party shape keeps ordinary prose pairs
+/// ("and/or", "client-side/server-side", "tcp/ip", "src/main", "12/25") from being
+/// mistaken for a tool ref — precision, fail closed. An `mcp:<server>` ref is NOT
+/// matched here; it has its own dedicated branch.
+fn explicit_plugin_tool_ref(plugin: &str, tool: &str) -> bool {
+    if plugin.is_empty() || tool.is_empty() || plugin.starts_with("mcp:") {
+        return false;
+    }
+    let is_kebab_id = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+            && !s.starts_with('-')
+            && !s.ends_with('-')
+    };
+    if plugin.starts_with("relux-") {
+        return is_kebab_id(plugin);
+    }
+    is_kebab_id(plugin) && plugin.contains('-') && tool.contains('.')
+}
+
 fn trim_token(tok: &str) -> String {
     tok.trim_matches(|c: char| {
         !c.is_ascii_alphanumeric() && c != '-' && c != '_' && c != '.'
@@ -2938,6 +2982,62 @@ mod tests {
         );
         // nothing nameable -> None (Prime will ask).
         assert_eq!(parse_tool_request("do the thing"), None);
+    }
+
+    #[test]
+    fn resolves_third_party_plugin_tool_ref_beyond_relux_prefix() {
+        // A registered plugin whose id is NOT `relux-tools-*` can still be named in chat
+        // via an explicit `<plugin>/<tool.name>` ref (the hyphenated-id + dotted-tool
+        // shape mirroring openclaw's `plugin:<id>:<tool>`), resolved fail-closed against
+        // the live catalog downstream. (`docs/mcp.md` "Chat-staged approval".)
+        assert_eq!(
+            parse_tool_request("use acme-crm/crm.lookup {\"id\":7}"),
+            Some((
+                "acme-crm".to_string(),
+                "crm.lookup".to_string(),
+                "{\"id\":7}".to_string()
+            ))
+        );
+        // The first prose pair is stepped over; a later REAL ref still resolves.
+        assert_eq!(
+            parse_tool_request("weigh the and/or, then use acme-crm/crm.lookup"),
+            Some((
+                "acme-crm".to_string(),
+                "crm.lookup".to_string(),
+                "{}".to_string()
+            ))
+        );
+        // Precision / fail-closed: ordinary prose pairs are NOT mistaken for tool refs
+        // (no hyphenated id + dotted tool), so they resolve to nothing.
+        assert_eq!(parse_tool_request("either/or"), None);
+        assert_eq!(parse_tool_request("client-side/server-side rendering"), None);
+        assert_eq!(parse_tool_request("compare tcp/ip stacks"), None);
+        // A bare single-word id with a dotted tool is NOT a third-party ref (needs a
+        // hyphen) — it falls through to the keyword path, unchanged: "github" still maps
+        // to the relux-tools-github plugin rather than a phantom "github" id.
+        assert_eq!(
+            parse_tool_request("use github/foo.bar"),
+            Some((
+                "relux-tools-github".to_string(),
+                String::new(),
+                "{}".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn classifies_explicit_third_party_plugin_ref_as_tool_invocation() {
+        // An explicit invoke verb + a third-party plugin tool ref is a tool invocation,
+        // exactly like an explicit relux-tools ref. Fail-closed resolution happens later.
+        assert_eq!(
+            classify_intent("use acme-crm/crm.lookup"),
+            PrimeIntent::ToolInvocation
+        );
+        // Without an invoke verb a bare prose mention never invokes (Hermes-first chat).
+        assert_ne!(
+            classify_intent("we debated client-side/server-side tradeoffs"),
+            PrimeIntent::ToolInvocation
+        );
     }
 
     #[test]

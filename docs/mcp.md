@@ -130,11 +130,29 @@ PROPOSAL below, and not a brain freely choosing tools.
 ### Chat-staged approval (gated tool → pending approval card → existing routes)
 
 When an EXPLICIT chat tool invocation (a single `mcp:<server>/<tool>` ref, or an explicit
-`relux-tools-<plugin>/<tool>` ref) resolves to a gated (`needs_approval`) tool and there is
-no standing allow-always grant, the chat path is now **usable** rather than a dead end. It
-reuses the EXISTING per-call approval machinery end to end — it invents no parallel security
-system (`docs/RELUX_MASTER_PLAN.md` §7.4 per-call approval; openclaw
-`src/acp/permission-relay.ts` allow-once / allow-always / deny).
+plugin-tool ref — see "Supported explicit tool-ref syntax" below) resolves to a gated
+(`needs_approval`) tool and there is no standing allow-always grant, the chat path is now
+**usable** rather than a dead end. It reuses the EXISTING per-call approval machinery end to
+end — it invents no parallel security system (`docs/RELUX_MASTER_PLAN.md` §7.4 per-call
+approval; openclaw `src/acp/permission-relay.ts` allow-once / allow-always / deny).
+
+**Supported explicit tool-ref syntax (chat).** An operator names a tool to run by typing one
+of these forms after an invoke verb (`use` / `run` / `call` / `invoke` / `execute` / `test`);
+the ref is resolved fail-closed against the live catalog, so an id that is not installed/live
+returns an honest "no such tool", never a raw dump (`crate::prime::parse_tool_request`):
+
+- `mcp:<server>/<tool>` — a live MCP-discovered tool under the stable `mcp:<server>`
+  synthetic plugin id (mirroring openclaw's `mcp:<serverId>:<toolName>` ref).
+- `relux-tools-<plugin>/<tool>` — the bundled/installed `relux-tools-*` convention
+  (e.g. `relux-tools-github/github.create_pr`).
+- `<plugin-id>/<tool.name>` — ANY registered plugin whose id is a hyphenated kebab id and
+  whose tool name is dotted (e.g. `acme-crm/crm.lookup`) — so a plugin whose id is **not**
+  `relux-tools-*` can still be named in chat (mirroring openclaw's `plugin:<pluginId>:<toolName>`
+  executor ref, `src/tools/execution.ts`). The hyphen + dotted-tool guard is deliberate: it
+  keeps ordinary prose pairs ("and/or", "client-side/server-side", "tcp/ip") from being
+  mistaken for a tool ref. A single-word plugin keyword (`use the github tool`) still resolves
+  through the keyword path as before. If a ref is ambiguous or unresolved, Prime asks a
+  clarifying question / says which tools are available rather than guessing (fail closed).
 
 - **Staging (kernel, fail closed).** `prime_invoke_tool`'s `NeedsApproval` arm calls
   `KernelState::request_tool_invocation_approval` (the same call the Plugins

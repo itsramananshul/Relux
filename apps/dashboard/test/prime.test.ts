@@ -21,6 +21,7 @@ import {
   contextReadsHadMiss,
   contextReadDetail,
   boundedContextReads,
+  formatToolOutput,
   PRIME_GREETING,
   PRIME_HINT,
   PRIME_PLACEHOLDER,
@@ -375,4 +376,31 @@ test("boundedContextReads caps the detail list and reports the hidden count", ()
   // Empty / absent -> nothing shown, nothing hidden.
   assert.deepEqual(boundedContextReads(undefined), { shown: [], hidden: 0 });
   assert.deepEqual(boundedContextReads([]), { shown: [], hidden: 0 });
+});
+
+// formatToolOutput renders a tool's shaped result chat-naturally and bounded — never
+// the raw transport envelope (docs/mcp.md "Invocation"). Used by both the ran-tool
+// result block and the post-approval result inside the chat approval card.
+test("formatToolOutput surfaces the shaped result text without wrapper braces", () => {
+  // The shaped MCP/tool envelope { result: <text> } shows the text directly.
+  assert.equal(formatToolOutput({ result: "all systems nominal" }), "all systems nominal");
+  // structuredContent is appended as compact JSON only when present.
+  const withStructured = formatToolOutput({ result: "found 2 rows", structuredContent: { rows: 2 } });
+  assert.ok(withStructured.startsWith("found 2 rows"));
+  assert.ok(withStructured.includes("\"rows\": 2"));
+});
+
+test("formatToolOutput handles plain strings, plain objects, and empty output", () => {
+  assert.equal(formatToolOutput("hello"), "hello");
+  // A plain plugin tool's structured output (no `result` key) is pretty JSON.
+  assert.equal(formatToolOutput({ said: "hi" }), "{\n  \"said\": \"hi\"\n}");
+  // Empty / absent output renders nothing, so the caller shows no result block.
+  assert.equal(formatToolOutput(undefined), "");
+  assert.equal(formatToolOutput(null), "");
+});
+
+test("formatToolOutput clamps a pathologically large output so it never floods chat", () => {
+  const huge = formatToolOutput({ result: "x".repeat(10000) });
+  assert.ok(huge.length <= 4000);
+  assert.ok(huge.endsWith("…"));
 });

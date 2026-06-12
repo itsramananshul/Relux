@@ -13,7 +13,7 @@ import {
   type ReluxPrimeTurn,
   type ReluxToolInvocationResult,
 } from "../api";
-import { afterActionLabel, boundedContextReads, brainSourceLabel, contextReadDetail, contextReadsHadMiss, contextReadsUsedLabel, decisionSourceLabel, hasSteps, intentProvenance, pendingClarificationLabel, polishProvenance, PRIME_GREETING, PRIME_HINT, PRIME_PLACEHOLDER, PRIME_SUGGESTIONS, proposalDisplaySummary, replyPolishLabel, requestedToolLabel, slotProvenance, stepDisplayTitle, updateProvenance } from "../prime";
+import { afterActionLabel, boundedContextReads, brainSourceLabel, contextReadDetail, contextReadsHadMiss, contextReadsUsedLabel, decisionSourceLabel, formatToolOutput, hasSteps, intentProvenance, pendingClarificationLabel, polishProvenance, PRIME_GREETING, PRIME_HINT, PRIME_PLACEHOLDER, PRIME_SUGGESTIONS, proposalDisplaySummary, replyPolishLabel, requestedToolLabel, slotProvenance, stepDisplayTitle, updateProvenance } from "../prime";
 import { workTaskHref, workRunHref } from "../routing";
 import { PrimeAutonomyPanel } from "../components/PrimeAutonomyPanel";
 import { OrchestrationPanel } from "../components/OrchestrationPanel";
@@ -238,14 +238,8 @@ export function Prime() {
 // never fabricates a tool result. Nothing renders for a turn that touched no tool.
 function ToolResult({ turn }: { turn: ReluxPrimeTurn }) {
   if (turn.invoked_tool) {
-    let output = "";
-    if (turn.tool_output !== undefined && turn.tool_output !== null) {
-      try {
-        output = JSON.stringify(turn.tool_output, null, 2);
-      } catch {
-        output = String(turn.tool_output);
-      }
-    }
+    // Chat-natural, bounded rendering of the shaped result — never the raw envelope.
+    const output = formatToolOutput(turn.tool_output);
     return (
       <div style={{ marginTop: 8 }}>
         <div className="row wrap" style={{ gap: 6, alignItems: "center", fontSize: 11 }}>
@@ -853,14 +847,9 @@ function ApprovalCard({
     }
   }
 
-  let ranOutput = "";
-  if (outcome?.kind === "ran" && outcome.result.output !== undefined && outcome.result.output !== null) {
-    try {
-      ranOutput = JSON.stringify(outcome.result.output, null, 2);
-    } catch {
-      ranOutput = String(outcome.result.output);
-    }
-  }
+  // The same chat-natural, bounded shaping the ran-tool result uses — surface the
+  // shaped result text directly, never the raw transport envelope.
+  const ranOutput = outcome?.kind === "ran" ? formatToolOutput(outcome.result.output) : "";
 
   return (
     <div

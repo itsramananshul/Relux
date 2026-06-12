@@ -267,3 +267,50 @@ export function pendingClarificationLabel(pc: ReluxPendingClarification | undefi
   const needs = pc.needs?.trim();
   return needs ? `waiting for: ${needs}` : "waiting for your answer";
 }
+
+// Render a tool's output for the chat in a CHAT-NATURAL, bounded way — used by both
+// the ran-tool result (a turn's `tool_output`) and the post-approval result inside
+// the approval card. The kernel already returns a SHAPED, secret-redacted result and
+// never the raw JSON-RPC envelope (`docs/mcp.md` "Invocation"); this just presents it
+// so the operator is never left staring at wrapper braces:
+//   - a plain string  -> shown as-is;
+//   - the shaped `{ result: <text>, structuredContent?: … }` envelope (the Hermes
+//     `mcp_tool.py` shape) -> the human `result` text is surfaced directly, with the
+//     machine `structuredContent` appended as compact JSON only when present;
+//   - anything else -> pretty-printed JSON (a plain plugin tool's structured output).
+// The result is clamped so a pathological tool can never flood the chat. Returns ""
+// for an empty/absent output (the caller then renders no result block). It fabricates
+// nothing — it only reshapes what the turn already carried.
+const MAX_TOOL_OUTPUT_CHARS = 4000;
+export function formatToolOutput(output: unknown): string {
+  if (output === undefined || output === null) return "";
+  let text: string;
+  if (typeof output === "string") {
+    text = output;
+  } else if (typeof output === "object") {
+    const o = output as Record<string, unknown>;
+    if (typeof o.result === "string") {
+      text = o.result;
+      if (o.structuredContent !== undefined && o.structuredContent !== null) {
+        try {
+          text += `\n\n${JSON.stringify(o.structuredContent, null, 2)}`;
+        } catch {
+          /* a non-serializable structuredContent is simply omitted */
+        }
+      }
+    } else {
+      try {
+        text = JSON.stringify(output, null, 2);
+      } catch {
+        text = String(output);
+      }
+    }
+  } else {
+    text = String(output);
+  }
+  text = text.trimEnd();
+  if (text.length > MAX_TOOL_OUTPUT_CHARS) {
+    text = `${text.slice(0, MAX_TOOL_OUTPUT_CHARS - 1)}…`;
+  }
+  return text;
+}
