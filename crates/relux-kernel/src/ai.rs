@@ -824,6 +824,31 @@ pub async fn complete_tool_round(cfg: &AiConfig, prompt: String) -> Option<Strin
     complete_json_only(cfg, prompt).await
 }
 
+/// Make one bounded, READ-ONLY diagnostic call: hand the brain a pre-built,
+/// already-bounded + redacted diagnostic prompt
+/// ([`crate::run_diagnosis::build_diagnostic_prompt`]) under a no-authority system
+/// message and return its prose narrative, or `None` on ANY failure (no key,
+/// disabled, network, empty). Unlike [`complete_json_only`] this asks for free
+/// prose (the four-part diagnosis), not JSON. The caller assembles + re-bounds the
+/// result (`crate::run_diagnosis::assemble`); this is just the "prompt → text"
+/// primitive. The brain has no tools and changes nothing (§3.3b "diagnosis only").
+pub async fn diagnose_via_openrouter(cfg: &AiConfig, prompt: String) -> Option<String> {
+    if !cfg.enabled() || cfg.api_key.is_none() {
+        return None;
+    }
+    let messages = vec![
+        ChatMessage {
+            role: "system",
+            content: crate::run_diagnosis::DIAGNOSTIC_SYSTEM.to_string(),
+        },
+        ChatMessage {
+            role: "user",
+            content: prompt,
+        },
+    ];
+    request_completion(cfg, messages).await.ok()
+}
+
 async fn complete_json_only(cfg: &AiConfig, prompt: String) -> Option<String> {
     if !cfg.enabled() || cfg.api_key.is_none() {
         return None;

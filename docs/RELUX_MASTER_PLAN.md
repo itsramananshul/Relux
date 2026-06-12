@@ -1884,7 +1884,15 @@ stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
   the create-path exist/namespace/cycle validation reused, structural only, compact Move-under… /
   Remove-parent control whose candidates exclude self + descendants client-side); (7) **dashboard route +
   dependency-free live-browser click smokes** (Relux
-  Approvals rebuilt on the B&W design system, per-route render smoke). All reads/writes hit real kernel
+  Approvals rebuilt on the B&W design system, per-route render smoke); (8) the post-v0.1.28 **recovery
+  line** (`docs/relix-dashboard-design.md` §6.8–§6.10; `relix-execution-and-issue-design.md` §3.3b):
+  keyboard-accessible board movement, reopen-blocked-work + one-click Reopen & run, the **recovery
+  decision cards** (deterministic root cause + recommendation + existing-route choices), **Investigate
+  with Prime** (a safe redacted chat seed), and the **diagnostic narrative pass** — an explicit,
+  operator-triggered, **read-only** `POST /v1/relux/runs/:id/diagnose` (`run_diagnosis.rs` pure model)
+  that hands a bounded + redacted run context to the configured brain off-lock for a concise four-part
+  narrative (likely cause / evidence / next action / uncertainty), mutating nothing, gated to failed
+  runs, with a clean no-provider fallback and an inline result on the card. All reads/writes hit real kernel
   state. No master-plan safety property is weakened. `cargo test` + `clippy` clean on
   `relux-core`/`relux-kernel`; dashboard green; `dashboard-dist` in sync. Every safety property from v0.1.27
   holds.

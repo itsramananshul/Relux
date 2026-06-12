@@ -197,6 +197,41 @@ test("a healthy run still yields no card (Investigate is not forced onto null)",
   assert.equal(assessTaskRecovery(task({ status: "open" }), null), null);
 });
 
+// ── Analyze-failure choice (§3.3b cheap diagnostic pass; §6.10) ──────────────
+test("a run card offers a non-primary Analyze action just before Investigate", () => {
+  const a = assessRunRecovery(run({ status: "failed", failure_class: "auth_required" }))!;
+  const ks = kinds(a.actions);
+  // Analyze and Investigate are appended in that order, both after the primary.
+  assert.ok(ks.includes("analyze"), "run card offers Analyze");
+  assert.equal(ks[ks.length - 1], "investigate", "Investigate stays last");
+  assert.equal(ks[ks.length - 2], "analyze", "Analyze sits just before Investigate");
+  const analyze = a.actions.find((x) => x.kind === "analyze")!;
+  assert.notEqual(analyze.primary, true); // never steals the recommended first action
+  assert.match(analyze.label, /Analyze failure/);
+  // The deterministic primary still leads.
+  assert.equal(a.actions[0].kind, "configure_agent");
+  assert.equal(a.actions[0].primary, true);
+});
+
+test("a blocked task offers Analyze ONLY when its latest run failed", () => {
+  // With a failed latest run there is something to diagnose → Analyze is offered.
+  const withFail = assessTaskRecovery(
+    task({ status: "blocked", assigned_agent: "prime" }),
+    run({ id: "run_0009", failure_class: "adapter_missing", status: "failed" }),
+  )!;
+  assert.ok(kinds(withFail.actions).includes("analyze"), "blocked + failed run → Analyze");
+  assert.equal(kinds(withFail.actions).at(-1), "investigate", "Investigate still last");
+
+  // With no failed run (null, or a non-failed run) there is nothing to read → no Analyze.
+  const noRun = assessTaskRecovery(task({ status: "blocked", assigned_agent: "prime" }), null)!;
+  assert.ok(!kinds(noRun.actions).includes("analyze"), "blocked + no run → no Analyze");
+  const healthyRun = assessTaskRecovery(
+    task({ status: "blocked", assigned_agent: "prime" }),
+    run({ id: "run_0010", status: "completed", failure_class: undefined }),
+  )!;
+  assert.ok(!kinds(healthyRun.actions).includes("analyze"), "blocked + healthy run → no Analyze");
+});
+
 test("a blocked task folds its last failed run's root cause into the card", () => {
   const lastRun = run({ id: "run_0009", failure_class: "adapter_missing", status: "failed" });
   const a = assessTaskRecovery(task({ status: "blocked", assigned_agent: "prime" }), lastRun)!;

@@ -70,7 +70,7 @@ import {
   runLogSourceLabel,
   runLogTruncationNote,
 } from "../reluxrunlog";
-import { reluxWork, reluxAudit, reluxOversight, reluxPrime, reluxApprovals, reluxOrchestration, type ReluxTask, type ReluxRun, type ReluxAgent, type ReluxTaskDetail, type ReluxRunDetail, type ReluxAuditEntry, type ReluxRunEvent, type ReluxRunLog, type ReluxOversight, type ReluxApproval, type ReluxOrchestration } from "../api";
+import { reluxWork, reluxAudit, reluxOversight, reluxPrime, reluxApprovals, reluxOrchestration, type ReluxTask, type ReluxRun, type ReluxAgent, type ReluxTaskDetail, type ReluxRunDetail, type ReluxAuditEntry, type ReluxRunEvent, type ReluxRunLog, type ReluxOversight, type ReluxApproval, type ReluxOrchestration, type ReluxDiagnostic } from "../api";
 import { useAsync } from "../components/common";
 import {
   runStatusTone,
@@ -1229,10 +1229,20 @@ type RecoveryActionWiring =
 // state, or a blocked task's reopen eligibility — so it is an honest read of recorded data,
 // never a fabricated guess. Every offered action is backed by an EXISTING route; an action
 // the surface can't wire degrades to a muted pointer (its hint) rather than a dead button.
+// The inline diagnostic-narrative state for a RecoveryCard's "Analyze failure"
+// action (§3.3b cheap diagnostic pass; §6.10). The parent panel owns the state
+// (a fetch lifecycle); the card just renders it below the actions. Absent until
+// the operator clicks Analyze.
+export type DiagnosticState =
+  | { status: "loading" }
+  | { status: "done"; result: ReluxDiagnostic }
+  | { status: "error"; message: string };
+
 export function RecoveryCard({
   assessment,
   handlers,
   busyKind = null,
+  diagnostic = null,
 }: {
   assessment: RecoveryAssessment;
   // Per-action wiring for THIS surface. An action kind absent from the map renders as a
@@ -1240,6 +1250,9 @@ export function RecoveryCard({
   handlers: Partial<Record<RecoveryActionKind, RecoveryActionWiring>>;
   // The action kind currently in flight (its button shows "…"), or null.
   busyKind?: RecoveryActionKind | null;
+  // The inline result of the §3.3b diagnostic pass (Analyze failure), or null when
+  // not yet requested. Rendered below the action row; the deterministic card stays.
+  diagnostic?: DiagnosticState | null;
 }) {
   // The badge tone: a run failure class drives the shared tone vocabulary; a task hold
   // (no class) reads as the "blocked" tone. (failureClassTone is the single source.)
@@ -1330,6 +1343,41 @@ export function RecoveryCard({
       {assessment.missingInfo && (
         <div className="muted" role="note" style={{ fontSize: 11, marginTop: 8 }}>
           {assessment.missingInfo}
+        </div>
+      )}
+      {/* The §3.3b cheap diagnostic pass result, inline, BELOW the deterministic
+          card (which stays visible). A model narrative reads as a quoted block; an
+          "unavailable" result reads as an honest note (no provider / hiccup); an
+          error surfaces the real reason. Never replaces the deterministic card. */}
+      {diagnostic && (
+        <div
+          className="diagnostic-narrative"
+          role="note"
+          aria-label="Diagnostic result"
+          style={{ marginTop: 10, paddingTop: 8, borderTop: "1px solid var(--border)" }}
+        >
+          {diagnostic.status === "loading" && (
+            <div className="muted" style={{ fontSize: 11 }}>Analyzing the failure…</div>
+          )}
+          {diagnostic.status === "error" && (
+            <div className="banner err" style={{ fontSize: 11 }}>
+              Analysis failed: {diagnostic.message}
+            </div>
+          )}
+          {diagnostic.status === "done" && (
+            <>
+              <div
+                className="muted"
+                style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 4 }}
+              >
+                {diagnostic.result.mode === "model" ? "Diagnostic narrative" : "Diagnostic unavailable"}
+                {diagnostic.result.mode === "model" && diagnostic.result.model
+                  ? ` · ${diagnostic.result.model}`
+                  : ""}
+              </div>
+              <div style={{ fontSize: 12, whiteSpace: "pre-wrap" }}>{diagnostic.result.narrative}</div>
+            </>
+          )}
         </div>
       )}
     </div>
@@ -1789,6 +1837,23 @@ function TaskDetailPanel({
     navigate("/prime");
   }
 
+  // §3.3b cheap diagnostic pass (§6.10) for a blocked task: diagnose its LATEST
+  // FAILED run (the only run there is anything to read). The Analyze action is only
+  // offered when such a run exists (recovery.ts gates it), so this is wired to that
+  // run's id. Read-only: POST /runs/:id/diagnose mutates nothing; the result renders
+  // inline on the card.
+  const [taskDiagnostic, setTaskDiagnostic] = useState<DiagnosticState | null>(null);
+  async function analyzeTask() {
+    if (!latestRun) return;
+    setTaskDiagnostic({ status: "loading" });
+    try {
+      const result = await reluxWork.diagnoseRun(latestRun.id);
+      setTaskDiagnostic({ status: "done", result });
+    } catch (e) {
+      setTaskDiagnostic({ status: "error", message: e instanceof Error ? e.message : "Analysis failed." });
+    }
+  }
+
   return (
     <div style={{ paddingBottom: 16 }}>
       <div className="row" style={{ alignItems: "center", marginBottom: 12 }}>
@@ -1845,7 +1910,8 @@ function TaskDetailPanel({
           <>
             <RecoveryCard
               assessment={recovery}
-              busyKind={recoveryBusy}
+              busyKind={taskDiagnostic?.status === "loading" ? "analyze" : recoveryBusy}
+              diagnostic={taskDiagnostic}
               handlers={{
                 reopen_and_run: { onClick: () => void recoveryReopen(true), disabled: recoveryBusy != null },
                 reopen: { onClick: () => void recoveryReopen(false), disabled: recoveryBusy != null },
@@ -1856,6 +1922,9 @@ function TaskDetailPanel({
                     onReassign: (id) => void recoveryReassign(id),
                   },
                 },
+                // analyze: the cheap §3.3b diagnostic pass on the task's latest failed run
+                // (only present when such a run exists; read-only, renders inline below).
+                analyze: { onClick: () => void analyzeTask(), disabled: taskDiagnostic?.status === "loading" },
                 investigate: { onClick: () => investigateTask() },
               }}
             />
@@ -2340,6 +2409,23 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
     navigate("/prime");
   }
 
+  // §3.3b cheap diagnostic pass (§6.10): an explicit, READ-ONLY request for a
+  // written narrative diagnosis of this failed run. Calls POST /runs/:id/diagnose,
+  // which bounds + redacts the context server-side and mutates nothing; the result
+  // (a model narrative, or a clean "unavailable" fallback) renders inline on the
+  // card. The deterministic card stays; this only adds the narrative.
+  const [runDiagnostic, setRunDiagnostic] = useState<DiagnosticState | null>(null);
+  async function analyzeRun() {
+    if (!run) return;
+    setRunDiagnostic({ status: "loading" });
+    try {
+      const result = await reluxWork.diagnoseRun(run.id);
+      setRunDiagnostic({ status: "done", result });
+    } catch (e) {
+      setRunDiagnostic({ status: "error", message: e instanceof Error ? e.message : "Analysis failed." });
+    }
+  }
+
   async function reviewChange(index: number, decision: "approve" | "reject") {
     setPcBusy(index);
     try {
@@ -2480,7 +2566,16 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
       {recovery && run && (
         <RecoveryCard
           assessment={recovery}
-          busyKind={retrying ? "retry_run" : resuming ? "resume_session" : null}
+          busyKind={
+            retrying
+              ? "retry_run"
+              : resuming
+                ? "resume_session"
+                : runDiagnostic?.status === "loading"
+                  ? "analyze"
+                  : null
+          }
+          diagnostic={runDiagnostic}
           handlers={{
             retry_run: { onClick: () => void retry(), disabled: retrying },
             resume_session: { onClick: () => void resume(), disabled: resuming },
@@ -2489,6 +2584,8 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
             // Reassign lives on the task surface (the board card / task detail picker).
             reassign: { to: `/work?task=${encodeURIComponent(run.task_id)}` },
             // inspect: unwired → the transcript + log tail are already on this panel below.
+            // analyze: the cheap §3.3b diagnostic pass — read-only, renders inline below.
+            analyze: { onClick: () => void analyzeRun(), disabled: runDiagnostic?.status === "loading" },
             investigate: { onClick: () => investigateRun() },
           }}
         />

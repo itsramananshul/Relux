@@ -505,6 +505,7 @@ fn protected_router() -> Router<AppState> {
         .route("/v1/relux/runs/:id", get(get_run))
         .route("/v1/relux/runs/:id/events", get(get_run_events))
         .route("/v1/relux/runs/:id/logs", get(get_run_logs))
+        .route("/v1/relux/runs/:id/diagnose", post(diagnose_run))
         .route("/v1/relux/runs/:id/retry", post(retry_run))
         .route("/v1/relux/runs/:id/resume", post(resume_run))
         .route("/v1/relux/runs/:id/cancel", post(cancel_run))
@@ -1564,6 +1565,116 @@ async fn get_run_logs(
             .unwrap_or(persisted)
     };
     Ok(Json(log))
+}
+
+/// `POST /v1/relux/runs/:id/diagnose` — the cheap, READ-ONLY diagnostic narrative
+/// pass for a failed run (`docs/relix-execution-and-issue-design.md` §3.3b "Spawn
+/// a cheap diagnostic pass … diagnosis only"; `docs/relix-dashboard-design.md`
+/// §6.10 "the diagnostic LLM pass that writes a richer narrative root cause").
+///
+/// Explicit + operator-triggered (a POST, never run automatically). It reads the
+/// run + its bounded redacted log tail under the lock, builds a bounded redacted
+/// context ([`relux_kernel::run_diagnosis::DiagnosticContext`]), and — if a brain
+/// provider is configured — asks it for a concise four-part diagnosis off-lock.
+/// It mutates NOTHING: no tools, no task creation, no run change. With no provider
+/// configured (or on a provider hiccup) it returns a clean fallback that points at
+/// the deterministic recovery card and offers the configure path. Only a run that
+/// actually recorded a failure is diagnosed; a healthy run gets an honest "nothing
+/// to diagnose" instead of a wasted model call.
+async fn diagnose_run(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<relux_kernel::run_diagnosis::DiagnosticNarrative>, ApiError> {
+    use relux_kernel::run_diagnosis as diag;
+
+    let run_id = relux_core::RunId::new(id);
+    // Resolve the brain live so a dashboard-selected provider takes effect without
+    // a restart (mirrors run_prime). `enabled()` is the "is a usable key present
+    // and not disabled" gate.
+    let ai_config = resolve_ai(&state);
+    let configured = ai_config.enabled();
+
+    // Snapshot the run + its task title + its bounded redacted log tail under one
+    // short read-only lock (also the 404 validation). No mutation.
+    let (run, task_title, has_persisted, persisted_log) = locked_read(&state, |kernel| {
+        let run = kernel
+            .run(&run_id)
+            .ok_or_else(|| KernelError::UnknownRun(run_id.to_string()))?
+            .clone();
+        let task_title = kernel.task(&run.task_id).map(|t| t.title.clone());
+        Ok((
+            run,
+            task_title,
+            kernel.has_run_log(&run_id),
+            kernel.run_log(&run_id, None),
+        ))
+    })?;
+
+    // Precedence matches get_run_logs: the finalized durable log wins; until it
+    // exists, the live off-lock tail; with neither, the empty durable tail.
+    let log = if has_persisted {
+        persisted_log
+    } else {
+        state
+            .live_run_logs
+            .snapshot(&run_id, None)
+            .unwrap_or(persisted_log)
+    };
+
+    let status_str = match run.status {
+        relux_core::RunStatus::Pending => "pending",
+        relux_core::RunStatus::Running => "running",
+        relux_core::RunStatus::WaitingForApproval => "waiting_for_approval",
+        relux_core::RunStatus::Completed => "completed",
+        relux_core::RunStatus::Failed => "failed",
+        relux_core::RunStatus::Cancelled => "cancelled",
+    };
+
+    // Only diagnose a run that recorded a failure — otherwise there is nothing to
+    // explain, so don't spend a model call.
+    let is_failure = matches!(
+        run.status,
+        relux_core::RunStatus::Failed | relux_core::RunStatus::Cancelled
+    ) || run.failure_class.is_some();
+    if !is_failure {
+        return Ok(Json(diag::DiagnosticNarrative {
+            run_id: run_id.to_string(),
+            mode: diag::DiagnosticMode::Unavailable,
+            model: None,
+            narrative:
+                "This run has not recorded a failure, so there is nothing to diagnose.".to_string(),
+            provider_configured: configured,
+        }));
+    }
+
+    let log_lines: Vec<String> = log.lines.iter().map(|l| l.text.clone()).collect();
+    let failure_text = run.error.as_deref().or(run.summary.as_deref());
+    let ctx = diag::DiagnosticContext::build(
+        run.id.to_string(),
+        run.task_id.to_string(),
+        task_title.as_deref(),
+        status_str,
+        run.failure_class.map(|c| c.as_str()),
+        Some(run.adapter_plugin.as_str()),
+        failure_text,
+        &log_lines,
+    );
+
+    // The provider call is the only impure step, and it is off-lock. The narrative
+    // shape is assembled (and re-bounded) purely from its result.
+    let model_output = if configured {
+        relux_kernel::ai::diagnose_via_openrouter(&ai_config, diag::build_diagnostic_prompt(&ctx))
+            .await
+    } else {
+        None
+    };
+    let model_name = if configured {
+        Some(ai_config.model.clone())
+    } else {
+        None
+    };
+
+    Ok(Json(diag::assemble(&ctx, model_output, model_name, configured)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -12406,6 +12517,152 @@ mod tests {
         assert!(resp["run_refused"].is_null(), "no refusal on the happy path: {b}");
         // The task left Blocked — it ran (Prime echo completes), never rolled back.
         assert_ne!(resp["task"]["status"], "blocked", "task left blocked: {b}");
+    }
+
+    /// Seed a FAILED run on a freshly assigned task and return its run id. Used by
+    /// the diagnostic-narrative route tests so they exercise the real run-failure
+    /// shape (`failure_class` + error text) without a network call.
+    fn seed_failed_run(state: &AppState, class: relux_core::RunFailureClass, error: &str) -> String {
+        let mut store = SqliteStore::open(&state.db_path).expect("open");
+        let mut kernel = store.load().expect("load");
+        let ns = relux_core::NamespaceId::new("workspace");
+        let adapter = relux_core::PluginId::new("relux-adapter-claude-cli");
+        let agent = kernel
+            .create_agent("coder", "Coder", "writes code", &adapter, &ns, None, vec![])
+            .expect("agent");
+        let task = kernel.create_task(
+            "Summarize the report",
+            serde_json::json!({ "path": "." }),
+            "founder",
+            &ns,
+            vec![],
+        );
+        kernel.assign_task(&task, &agent).expect("assign");
+        let run = kernel.start_run(&task).expect("start run");
+        kernel
+            .fail_run_classified(&run, error, class)
+            .expect("fail run");
+        store.save(&kernel).expect("save");
+        run.to_string()
+    }
+
+    /// §3.3b / §6.10 diagnostic narrative — NO provider configured: the route reads
+    /// the failed run and returns a CLEAN fallback that points at the deterministic
+    /// recovery card and offers the configure path. Never fabricates a diagnosis,
+    /// never mutates anything. (The brain is forced off via a stored config so the
+    /// path is deterministic regardless of any RELUX_OPENROUTER_* env on the box.)
+    #[tokio::test]
+    async fn diagnose_route_returns_clean_fallback_when_no_provider() {
+        let (state, _dir) = auth_state(true);
+        std::fs::write(&state.ai_config_path, r#"{"disabled": true}"#).expect("write ai config");
+        let run_id = seed_failed_run(
+            &state,
+            relux_core::RunFailureClass::AuthRequired,
+            "401 Unauthorized: invalid api key",
+        );
+
+        let (status, _, b) = call(
+            &state,
+            "POST",
+            &format!("/v1/relux/runs/{run_id}/diagnose"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{b}");
+        let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+        assert_eq!(v["run_id"], run_id, "{b}");
+        assert_eq!(v["mode"], "unavailable", "{b}");
+        assert_eq!(v["provider_configured"], false, "{b}");
+        assert!(v["model"].is_null(), "no model when unavailable: {b}");
+        assert!(
+            v["narrative"]
+                .as_str()
+                .unwrap()
+                .contains("No diagnostic model is configured"),
+            "clean configure message: {b}"
+        );
+        // The run is untouched — diagnosis mutates nothing.
+        let (status, _, rb) =
+            call(&state, "GET", &format!("/v1/relux/runs/{run_id}"), None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&rb).unwrap()["status"],
+            "failed",
+            "run still failed, unchanged: {rb}"
+        );
+    }
+
+    /// A run that has NOT failed gets an honest "nothing to diagnose" instead of a
+    /// wasted model call.
+    #[tokio::test]
+    async fn diagnose_route_says_nothing_to_diagnose_for_a_healthy_run() {
+        let (state, _dir) = auth_state(true);
+        // A Prime-assigned task that ran to completion (the local echo completes).
+        let (status, _, tb) =
+            call(&state, "POST", "/v1/relux/tasks", None, Some(r#"{"title":"ship it"}"#)).await;
+        assert_eq!(status, StatusCode::OK, "{tb}");
+        let task_id = serde_json::from_str::<serde_json::Value>(&tb).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, _, eb) = call(
+            &state,
+            "POST",
+            &format!("/v1/relux/tasks/{task_id}/execute-assigned"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "execute: {eb}");
+        let run_id = serde_json::from_str::<serde_json::Value>(&eb).unwrap()["run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let (status, _, b) = call(
+            &state,
+            "POST",
+            &format!("/v1/relux/runs/{run_id}/diagnose"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{b}");
+        let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+        assert_eq!(v["mode"], "unavailable", "{b}");
+        assert!(
+            v["narrative"].as_str().unwrap().contains("nothing to diagnose"),
+            "{b}"
+        );
+    }
+
+    /// The diagnostic route is session-gated like every protected route, and 404s
+    /// an unknown run.
+    #[tokio::test]
+    async fn diagnose_route_is_session_gated_and_404s_unknown() {
+        let (state, _dir) = auth_state(false); // sessions enforced
+        let (status, _, _) = call(
+            &state,
+            "POST",
+            "/v1/relux/runs/run_0001/diagnose",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "no cookie → 401");
+
+        // With auth disabled, an unknown run is the kernel's UnknownRun 400.
+        let (state, _dir) = auth_state(true);
+        let (status, _, b) = call(
+            &state,
+            "POST",
+            "/v1/relux/runs/run_9999/diagnose",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "unknown run → 400: {b}");
     }
 
     /// §6.9 Reopen & run, run-refused path: a BLOCKED task assigned to a CLI adapter whose

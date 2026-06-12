@@ -32,6 +32,7 @@ export type RecoveryActionKind =
   | "open_approval" // the Approvals surface — decide a pending gate
   | "configure_agent" // the Crew / Settings surface — adapter / credential / permission
   | "inspect" // the run transcript + logs already on this surface
+  | "analyze" // POST /v1/relux/runs/:id/diagnose — cheap read-only diagnostic narrative
   | "investigate"; // open Prime seeded with the diagnosis (§3.3b chat companion)
 
 export interface RecoveryActionSpec {
@@ -98,11 +99,30 @@ const INVESTIGATE_ACTION: RecoveryActionSpec = {
   hint: "Open Prime pre-loaded with this diagnosis to debug it conversationally — Prime answers, it doesn't change anything.",
 };
 
-// Append the Investigate choice to an assessment (in place) and return it. Central
-// so every recovery card offers the §3.3b chat-companion path without each branch
-// repeating it. Null passes through unchanged (nothing to recover).
-function withInvestigate(a: RecoveryAssessment | null): RecoveryAssessment | null {
-  if (a) a.actions.push(INVESTIGATE_ACTION);
+// The §3.3b cheap "diagnostic pass": a one-shot, read-only model narrative
+// (likely cause / evidence / next action / uncertainty) layered on top of the
+// deterministic card. It is the lighter sibling of Investigate — a quick written
+// explanation rather than a full chat — and it changes nothing (it calls the
+// read-only POST /runs/:id/diagnose, which never creates tasks or runs).
+const ANALYZE_ACTION: RecoveryActionSpec = {
+  kind: "analyze",
+  label: "Analyze failure",
+  hint: "Ask the configured brain for a concise written diagnosis of this failure (read-only — it changes nothing). Falls back cleanly if no brain is configured.",
+};
+
+// Append the follow-up choices to an assessment (in place) and return it. Central
+// so every recovery card offers the same paths without each branch repeating them.
+// The order is: the cheap one-shot Analyze (when there's enough context to diagnose),
+// then the deeper Investigate-with-Prime chat — both AFTER the recommended actions,
+// so neither steals the primary. Null passes through unchanged (nothing to recover).
+function withFollowups(
+  a: RecoveryAssessment | null,
+  opts: { analyze: boolean },
+): RecoveryAssessment | null {
+  if (a) {
+    if (opts.analyze) a.actions.push(ANALYZE_ACTION);
+    a.actions.push(INVESTIGATE_ACTION);
+  }
   return a;
 }
 
@@ -113,7 +133,9 @@ function withInvestigate(a: RecoveryAssessment | null): RecoveryAssessment | nul
 export function assessRunRecovery(
   run: ReluxRun | ReluxRunDetail,
 ): RecoveryAssessment | null {
-  return withInvestigate(assessRunRecoveryInner(run));
+  // A run recovery card always concerns a failed/cancelled/classified run, so
+  // there is always enough context for the diagnostic pass — offer Analyze.
+  return withFollowups(assessRunRecoveryInner(run), { analyze: true });
 }
 
 function assessRunRecoveryInner(
@@ -356,7 +378,13 @@ export function assessTaskRecovery(
   task: ReluxTask,
   latestRun: ReluxRun | null,
 ): RecoveryAssessment | null {
-  return withInvestigate(assessTaskRecoveryInner(task, latestRun));
+  // A blocked task has enough context to diagnose ONLY when its latest run failed
+  // (the diagnostic pass needs a failed run to read). A blocked-with-no-failed-run
+  // task gets the deterministic card + Investigate, but no Analyze (nothing for the
+  // model to read) — honest, not a dead button.
+  const hasFailedRun =
+    !!latestRun && (latestRun.status === "failed" || !!latestRun.failure_class);
+  return withFollowups(assessTaskRecoveryInner(task, latestRun), { analyze: hasFailedRun });
 }
 
 function assessTaskRecoveryInner(

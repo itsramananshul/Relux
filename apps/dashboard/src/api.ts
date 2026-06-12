@@ -2633,6 +2633,19 @@ export interface ReluxRunDetail extends ReluxRun {
   resumable?: boolean;
 }
 
+// The diagnostic-narrative response for a failed run (POST /runs/:id/diagnose).
+// `mode` is "model" when the configured brain wrote `narrative`; "unavailable"
+// when no provider is configured or it didn't return one (then `narrative` is the
+// honest fallback and `model` is absent). `provider_configured` lets the UI offer
+// the configure path. The kernel bounds + redacts everything (run_diagnosis.rs).
+export interface ReluxDiagnostic {
+  run_id: string;
+  mode: "model" | "unavailable";
+  model?: string;
+  narrative: string;
+  provider_configured: boolean;
+}
+
 export const reluxWork = {
   // All tasks, sorted by id.
   listTasks: () => api.get<ReluxTask[]>("/v1/relux/tasks"),
@@ -2795,6 +2808,17 @@ export const reluxWork = {
   // prime.retry_run). Returns the new run's id.
   retryRun: (id: string) =>
     api.post<{ run_id: string }>(`/v1/relux/runs/${encodeURIComponent(id)}/retry`),
+
+  // Cheap, READ-ONLY diagnostic narrative pass for a failed run (§3.3b "the cheap
+  // diagnostic pass … diagnosis only"; dashboard §6.10). Explicit + operator-
+  // triggered: hands a bounded, redacted slice of the run's context to the
+  // configured brain and returns a concise four-part narrative (likely cause /
+  // evidence / recommended next action / uncertainty). Mutates NOTHING — no tools,
+  // no task creation, no run change. With no provider configured (or a provider
+  // hiccup) `mode` is "unavailable" and `narrative` is a clean fallback that points
+  // at the deterministic recovery card / offers the configure path.
+  diagnoseRun: (id: string) =>
+    api.post<ReluxDiagnostic>(`/v1/relux/runs/${encodeURIComponent(id)}/diagnose`),
 
   // Resume a run's captured provider session (HERMES_OPENCLAW_DEEP_AUDIT §3):
   // continues the recorded adapter session via the governed `--resume` gate.
