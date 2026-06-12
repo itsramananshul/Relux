@@ -728,7 +728,13 @@ is its own validated action, not a `set_task_status` call: `KernelState::reopen_
 validating it exists, is currently blocked (`TaskNotReopenable` → 409 otherwise), and
 has an assigned operative (`TaskNotAssigned` otherwise — a run needs an assignee). It
 touches no run and does not auto-execute; the existing **Run (Assigned)** path then runs
-the re-queued task through the unchanged run gate. This is distinct from the run-level
+the re-queued task through the unchanged run gate. A one-click **Reopen & run**
+(`KernelState::reopen_task` then `KernelState::execute_assigned_run`, exposed as
+`POST /v1/relux/tasks/:id/reopen-and-run`) chains those two **existing** chokepoints in a
+single governed call — same eligibility guard, same run gate, no bypass: an ineligible
+task fails (4xx) before any run; a reopen that succeeds but whose run is honestly refused
+returns 200 with `reopened: true` / `run_id: null` / a `run_refused` message and the
+reopened state preserved. This is distinct from the run-level
 **retry** (a fresh attempt of a failed *run*, §10.2) and **resume** (continuing a
 captured Claude *session*, `POST /v1/relux/runs/:id/resume`) — reopen targets the
 *task*, those target a *run*. A task waiting on an approval is not blocked, so it routes
@@ -1707,6 +1713,7 @@ Also available:
   GET /v1/relux/health
   GET /v1/relux/tasks/:id
   POST /v1/relux/tasks/:id/execute-assigned
+  POST /v1/relux/tasks/:id/reopen-and-run   # re-queue a blocked task, then run it through the unchanged run gate
   GET /v1/relux/runs/:id
   GET /v1/relux/runs/:id/events[?since=<event_id>]   # since = exclusive tail cursor; absent = full transcript
   GET /v1/relux/audit?limit=N

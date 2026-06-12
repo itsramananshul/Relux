@@ -2773,6 +2773,20 @@ export const reluxWork = {
   reopenTask: (id: string) =>
     api.post<ReluxTask>(`/v1/relux/tasks/${encodeURIComponent(id)}/reopen`),
 
+  // One-click REOPEN & RUN (design §6.9): chain the re-queue into the unchanged
+  // assigned-run path in a single governed call — same eligibility guard, same run gate,
+  // no bypass. An INELIGIBLE reopen throws an ApiError (4xx) before any run. When the
+  // reopen succeeds but the run is honestly refused (adapter not configured/disabled,
+  // etc.), this RESOLVES (200) with `reopened: true`, `run_id: null`, and the honest
+  // `run_refused` message — the reopened state is preserved; the UI shows the refusal.
+  reopenAndRunTask: (id: string) =>
+    api.post<{
+      task: ReluxTask;
+      reopened: boolean;
+      run_id: string | null;
+      run_refused: string | null;
+    }>(`/v1/relux/tasks/${encodeURIComponent(id)}/reopen-and-run`),
+
   // Execute a running task locally as its assigned agent.
   executeAssignedTask: (id: string) =>
     api.post<{ run_id: string }>(`/v1/relux/tasks/${encodeURIComponent(id)}/execute-assigned`),

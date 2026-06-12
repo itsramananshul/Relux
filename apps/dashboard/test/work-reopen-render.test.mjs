@@ -102,6 +102,14 @@ test("ReopenControl shows the Reopen button for a blocked, assigned task", () =>
   assert.match(html, /re-queues it/i);
 });
 
+test("ReopenControl shows the one-click Reopen & run button for a blocked, assigned task", () => {
+  const html = mod.renderCard("blocked", "prime");
+  // Both the plain Reopen and the chained Reopen & run are offered for eligible work.
+  assert.match(html, /Reopen &amp; run|Reopen & run/);
+  // Its title makes the no-bypass guarantee explicit (same run gate).
+  assert.match(html, /same run gate/i);
+});
+
 test("ReopenControl renders NOTHING on a board card for a blocked task with no assignee", () => {
   for (const a of [undefined, ""]) {
     const html = mod.renderCard("blocked", a);

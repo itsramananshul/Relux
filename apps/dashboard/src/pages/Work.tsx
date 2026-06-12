@@ -1226,6 +1226,10 @@ export function ReopenControl({
   const eligibility = useMemo(() => reopenEligibility(task), [task]);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // The honest run-refusal message when Reopen & run re-queued the task but the run
+  // gate refused it (adapter not configured, etc.): the reopen IS preserved, so this is
+  // an informative note, not a failure of the reopen.
+  const [runRefused, setRunRefused] = useState<string | null>(null);
 
   // Not a blocked task → no reopen affordance at all (non-blocked work moves through
   // the normal run lifecycle, not a reopen).
@@ -1245,6 +1249,7 @@ export function ReopenControl({
   async function reopen() {
     setBusy(true);
     setErr(null);
+    setRunRefused(null);
     try {
       await reluxWork.reopenTask(task.id);
       onReopened();
@@ -1255,20 +1260,60 @@ export function ReopenControl({
     }
   }
 
+  // One-click §6.9 "Reopen & run": chain the re-queue into the unchanged assigned-run
+  // path. An ineligible reopen throws (4xx) before any run; a reopen that succeeds but
+  // whose run is refused resolves with run_refused — we surface that honest message
+  // inline while the reopen itself is preserved. Either outcome reloads the board.
+  async function reopenAndRun() {
+    setBusy(true);
+    setErr(null);
+    setRunRefused(null);
+    try {
+      const res = await reluxWork.reopenAndRunTask(task.id);
+      if (res.run_refused) setRunRefused(res.run_refused);
+      onReopened();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Reopen & run failed.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <span className="reopen-control" style={{ display: "inline-flex", flexDirection: "column", gap: 2 }}>
-      <button
-        className="btn sm"
-        style={{ height: 24, padding: "0 8px", fontSize: 10 }}
-        disabled={busy}
-        title="Reopen this blocked task — re-queues it so its assigned operative can run it again"
-        onClick={() => void reopen()}
-      >
-        {busy ? "Reopening…" : "Reopen"}
-      </button>
+      <span style={{ display: "inline-flex", gap: 4 }}>
+        <button
+          className="btn sm"
+          style={{ height: 24, padding: "0 8px", fontSize: 10 }}
+          disabled={busy}
+          title="Reopen this blocked task — re-queues it so its assigned operative can run it again"
+          onClick={() => void reopen()}
+        >
+          {busy ? "Reopening…" : "Reopen"}
+        </button>
+        <button
+          className="btn sm"
+          style={{ height: 24, padding: "0 8px", fontSize: 10 }}
+          disabled={busy}
+          title="Reopen this blocked task and run it now — re-queues it, then runs it through the same run gate (no bypass)"
+          onClick={() => void reopenAndRun()}
+        >
+          {busy ? "Working…" : "Reopen & run"}
+        </button>
+      </span>
       {err && (
         <span className="badge failed" style={{ fontSize: 9, whiteSpace: "normal" }} title={err}>
           {err}
+        </span>
+      )}
+      {runRefused && (
+        <span
+          className="badge"
+          role="note"
+          style={{ fontSize: 9, whiteSpace: "normal" }}
+          title={runRefused}
+        >
+          Reopened, but the run was refused: {runRefused}
         </span>
       )}
     </span>

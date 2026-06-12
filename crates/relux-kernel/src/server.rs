@@ -239,6 +239,7 @@ async fn serve() -> Result<(), KernelError> {
     println!("   POST   /v1/relux/tasks                     {{ \"title\": \"...\" }}");
     println!("   POST   /v1/relux/tasks/:id/start");
     println!("   POST   /v1/relux/tasks/:id/execute-assigned");
+    println!("   POST   /v1/relux/tasks/:id/reopen-and-run  (re-queue a blocked task, then run it through the unchanged run gate)");
     println!("   GET    /v1/relux/tools                      (installed tools + executable status)");
     println!("   POST   /v1/relux/tools/invoke              {{ \"plugin_id\":\"...\", \"tool_name\":\"...\", \"input\":{{}} }}");
     println!("   POST   /v1/relux/tools/request-approval    {{ \"plugin_id\":\"...\", \"tool_name\":\"...\", \"input\":{{}} }} (per-call approval for a gated tool)");
@@ -526,6 +527,7 @@ fn protected_router() -> Router<AppState> {
         .route("/v1/relux/tasks/:id/assign", post(assign_task_to_agent))
         .route("/v1/relux/tasks/:id/status", post(set_task_status_route))
         .route("/v1/relux/tasks/:id/reopen", post(reopen_task_route))
+        .route("/v1/relux/tasks/:id/reopen-and-run", post(reopen_and_run_task))
         .route("/v1/relux/tasks/:id/parent", post(reparent_task_route))
         .route("/v1/relux/tools", get(list_tools))
         .route("/v1/relux/tools/invoke", post(invoke_tool))
@@ -2827,6 +2829,77 @@ async fn reopen_task_route(
         Ok(kernel.task(&task_id).cloned().unwrap())
     })?;
     Ok(Json(task))
+}
+
+/// The honest result of the chained REOPEN-then-RUN action.
+#[derive(Debug, Serialize)]
+struct ReopenAndRunResponse {
+    /// The task AFTER the action — reflects what really happened: `queued` then the
+    /// run's outcome (e.g. `running`/`completed` on success, `failed` on an honest run
+    /// refusal that started then failed, or still `queued` if the run was refused before
+    /// it started). Never rolled back to `blocked` once reopened.
+    task: relux_core::Task,
+    /// The reopen stage succeeded (the task left `Blocked`). Always true on a 200 — an
+    /// ineligible reopen fails before the run and is a 4xx, never this body.
+    reopened: bool,
+    /// `Some(run_id)` when the run started through the unchanged run gate; `None` when
+    /// the run was honestly refused (see `run_refused`).
+    run_id: Option<relux_core::RunId>,
+    /// The honest run-refusal message when the reopen succeeded but the run was blocked
+    /// (missing/disabled adapter, unknown agent, etc.) — the SAME message the standalone
+    /// run path would return. `None` on a clean run start.
+    run_refused: Option<String>,
+}
+
+/// POST `/v1/relux/tasks/:id/reopen-and-run` — the one-click §6.9 "Reopen & run":
+/// chain the re-queue (`reopen_task`) into the unchanged assigned-run path
+/// (`execute_assigned_run`) in a single governed call, so the operator does not have to
+/// click Reopen then Run separately. It is NOT a looser path: it reuses BOTH existing
+/// chokepoints verbatim — the same eligibility guard, the same run gate, no
+/// auto-approval, no bypass flag.
+///
+/// Atomic-ish, honest staging:
+/// - If the task is NOT eligible to reopen (unknown / non-blocked / unassigned), it
+///   fails BEFORE any run — the standalone `reopen_task` error (4xx), never a run.
+/// - If the reopen SUCCEEDS but the run is refused (adapter not configured/disabled,
+///   unknown agent, …), this returns 200 with `reopened: true`, `run_id: None`, and the
+///   honest `run_refused` message: the reopened state is PRESERVED (the task stays out
+///   of `Blocked`) and the refusal surfaces cleanly rather than as a conflated error.
+/// - If both succeed, 200 with `reopened: true` and the new `run_id`.
+///
+/// Persists in both 200 cases (the reopen's re-queue + any failed-run transcript must
+/// survive), matching the assigned-run path. Session-gated like every board mutation.
+async fn reopen_and_run_task(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<ReopenAndRunResponse>, ApiError> {
+    let task_id = relux_core::TaskId::new(id);
+    // `locked_save_persisting` saves the kernel even when the closure returns Err, so an
+    // ineligible reopen (no mutation) is harmless and a reopen+failed-run is durable.
+    let resp = locked_save_persisting(&state, |kernel| {
+        // (1) Reopen through the unchanged eligibility guard. An ineligible task `?`-errors
+        //     here → propagated as the standalone 4xx, BEFORE any run is attempted.
+        kernel.reopen_task(&task_id)?;
+        // (2) Run through the unchanged assigned-run gate. Capture (don't `?`) its outcome
+        //     so a reopen-then-refused-run still returns 200 with the reopen preserved.
+        let run_result = kernel.execute_assigned_run(&task_id);
+        let task = kernel.task(&task_id).cloned().unwrap();
+        Ok(match run_result {
+            Ok(run_id) => ReopenAndRunResponse {
+                task,
+                reopened: true,
+                run_id: Some(run_id),
+                run_refused: None,
+            },
+            Err(e) => ReopenAndRunResponse {
+                task,
+                reopened: true,
+                run_id: None,
+                run_refused: Some(e.to_string()),
+            },
+        })
+    })?;
+    Ok(Json(resp))
 }
 
 #[derive(Debug, Serialize)]
@@ -12287,6 +12360,160 @@ mod tests {
         let (state, _dir) = auth_state(false);
         let (status, _, _) =
             call(&state, "POST", "/v1/relux/tasks/task_0001/reopen", None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "must not mutate without a session");
+    }
+
+    /// §6.9 one-click Reopen & run, happy path: a BLOCKED task assigned to local Prime
+    /// re-queues AND runs through the unchanged assigned-run path in one call. The local
+    /// Prime adapter echoes (no fabricated intelligence), so the run starts and completes:
+    /// the body reports `reopened: true` with a real `run_id` and no refusal, and the task
+    /// has left `Blocked`.
+    #[tokio::test]
+    async fn reopen_and_run_route_reopens_then_runs_for_local_prime() {
+        let (state, _dir) = auth_state(true);
+
+        // Create a task (auto-assigned to Prime → queued), then Block it.
+        let (status, _, tb) =
+            call(&state, "POST", "/v1/relux/tasks", None, Some(r#"{"title":"ship it"}"#)).await;
+        assert_eq!(status, StatusCode::OK, "task create failed: {tb}");
+        let task_id = serde_json::from_str::<serde_json::Value>(&tb).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, _, _) = call(
+            &state,
+            "POST",
+            &format!("/v1/relux/tasks/{task_id}/status"),
+            None,
+            Some(r#"{"status":"blocked"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "block failed");
+
+        // Reopen & run in one call.
+        let (status, _, b) = call(
+            &state,
+            "POST",
+            &format!("/v1/relux/tasks/{task_id}/reopen-and-run"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "reopen-and-run failed: {b}");
+        let resp: serde_json::Value = serde_json::from_str(&b).unwrap();
+        assert_eq!(resp["reopened"], true, "reopen stage succeeded: {b}");
+        assert!(resp["run_id"].is_string(), "a real run started: {b}");
+        assert!(resp["run_refused"].is_null(), "no refusal on the happy path: {b}");
+        // The task left Blocked — it ran (Prime echo completes), never rolled back.
+        assert_ne!(resp["task"]["status"], "blocked", "task left blocked: {b}");
+    }
+
+    /// §6.9 Reopen & run, run-refused path: a BLOCKED task assigned to a CLI adapter whose
+    /// runtime is NOT configured re-queues, then the run is honestly refused by the
+    /// UNCHANGED run gate. The action returns 200 with `reopened: true`, NO `run_id`, and
+    /// the honest `run_refused` message — the reopened state is PRESERVED (the task is no
+    /// longer `Blocked`), never conflated with an ineligibility error.
+    #[tokio::test]
+    async fn reopen_and_run_route_preserves_reopen_when_run_refused() {
+        let (state, _dir) = auth_state(true);
+
+        // Seed a BLOCKED task assigned to an UNCONFIGURED claude-cli agent (bootstrap
+        // installs the adapter; we deliberately never enable its runtime).
+        let task_id = {
+            let mut store = SqliteStore::open(&state.db_path).expect("open");
+            let mut kernel = store.load().expect("load");
+            let ns = relux_core::NamespaceId::new("workspace");
+            let adapter = relux_core::PluginId::new("relux-adapter-claude-cli");
+            let agent = kernel
+                .create_agent("coder", "Coder", "writes code", &adapter, &ns, None, vec![])
+                .expect("agent");
+            let task = kernel.create_task(
+                "Summarize",
+                serde_json::json!({ "path": "." }),
+                "founder",
+                &ns,
+                vec![],
+            );
+            kernel.assign_task(&task, &agent).expect("assign");
+            kernel
+                .set_task_status(&task, &relux_core::TaskStatus::Blocked)
+                .expect("block");
+            store.save(&kernel).expect("save");
+            task.to_string()
+        };
+
+        let (status, _, b) = call(
+            &state,
+            "POST",
+            &format!("/v1/relux/tasks/{task_id}/reopen-and-run"),
+            None,
+            None,
+        )
+        .await;
+        // 200 even though the run was refused — the reopen succeeded and is preserved.
+        assert_eq!(status, StatusCode::OK, "reopen-and-run should 200 with a staged refusal: {b}");
+        let resp: serde_json::Value = serde_json::from_str(&b).unwrap();
+        assert_eq!(resp["reopened"], true, "reopen stage succeeded: {b}");
+        assert!(resp["run_id"].is_null(), "no run id on a refusal: {b}");
+        assert!(
+            resp["run_refused"].as_str().unwrap_or_default().len() > 0,
+            "an honest run-refusal message is surfaced: {b}"
+        );
+        // The reopen is PRESERVED: the task is no longer Blocked (it ran and failed).
+        assert_ne!(resp["task"]["status"], "blocked", "reopen preserved, not rolled back: {b}");
+    }
+
+    /// §6.9 Reopen & run fails BEFORE running for an ineligible task: a queued (non-blocked)
+    /// task is `TaskNotReopenable` (409) and a run is never attempted; an unknown task is a
+    /// 400 — the same fail-closed guard as the standalone reopen, just chained.
+    #[tokio::test]
+    async fn reopen_and_run_route_rejects_ineligible_before_running() {
+        let (state, _dir) = auth_state(true);
+
+        // A freshly created task is queued (not blocked) → 409, no run.
+        let (status, _, tb) =
+            call(&state, "POST", "/v1/relux/tasks", None, Some(r#"{"title":"queued one"}"#)).await;
+        assert_eq!(status, StatusCode::OK, "task create failed: {tb}");
+        let task_id = serde_json::from_str::<serde_json::Value>(&tb).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, _, b) = call(
+            &state,
+            "POST",
+            &format!("/v1/relux/tasks/{task_id}/reopen-and-run"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "a queued task is not reopenable: {b}");
+
+        // No run was created for it (the reopen guard fired before the run path).
+        let (status, _, runs) = call(&state, "GET", "/v1/relux/runs", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !runs.contains(&task_id),
+            "no run should exist for an ineligible task: {runs}"
+        );
+
+        // An unknown task is a 400 (the kernel's UnknownTask mapping).
+        let (status, _, _) = call(
+            &state,
+            "POST",
+            "/v1/relux/tasks/task_does_not_exist/reopen-and-run",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "unknown task is a 400");
+    }
+
+    /// The Reopen & run route is session-gated like every board mutation.
+    #[tokio::test]
+    async fn reopen_and_run_route_requires_a_session() {
+        let (state, _dir) = auth_state(false);
+        let (status, _, _) =
+            call(&state, "POST", "/v1/relux/tasks/task_0001/reopen-and-run", None, None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "must not mutate without a session");
     }
 
