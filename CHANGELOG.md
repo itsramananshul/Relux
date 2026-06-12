@@ -9,6 +9,59 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.23 (Windows bundle).** The `relux-kernel` /
+  `relux-core` crates move from `0.1.22` to `0.1.23`, bundling the post-v0.1.22
+  **first safe MCP (Model Context Protocol) surface** into a fresh Windows
+  release. Both slices are driven by `docs/HERMES_OPENCLAW_DEEP_AUDIT.md`
+  (§9, "P2 — MCP tool support") and `docs/RELUX_MASTER_PLAN.md` §8.2/§18, and were
+  built reference-first against the vendored Hermes (`tools/mcp_tool.py`,
+  `hermes_cli/mcp_config.py`), the legacy `relix-runtime` streamable-HTTP client,
+  and openclaw's `mcp:<server>:<tool>` executor namespace per
+  `docs/reference-driven-development.md` (see `docs/mcp.md`). No master-plan safety
+  property is weakened: MCP is **loopback-only**, no downloaded code is ever run,
+  and every MCP tool call flows through the SAME permission / approval / grant /
+  audit gates a real plugin tool uses — never a separate, weaker path. Headlines:
+  - **Loopback-only MCP server registry + live tools/list discovery
+    (`HERMES_OPENCLAW_DEEP_AUDIT.md` §9).** An operator can register a
+    loopback-only MCP server (`{ id, endpoint, description?, enabled?, timeout_ms? }`,
+    validated with the same `validate_loopback_url` rule as the plugin runtime —
+    `https`, remote hosts, embedded credentials, query/fragment, and `..` paths are
+    rejected), list registrations with an honest one-word status (no secrets stored
+    or returned), and **discover** an enabled server's tools via a live
+    `initialize` → `tools/list` handshake mapped into the standard
+    `relux_core::ToolDescriptor` shape (`plugin_id = "mcp:<id>"`, enforced
+    permission `tool:mcp-<id>:<verb>`, classified risk, `source_kind = "Mcp"`).
+    Descriptions are sanitized, clamped, and scanned for prompt-injection patterns
+    (advisory, mirrors Hermes `_scan_mcp_description`); bounds (timeouts, body caps,
+    ≤256 tools/server) mirror the loopback-tool runtime. A new dashboard MCP UI on
+    the Plugins page drives register → discover → classify.
+  - **Gated MCP invocation through the existing tool-invoke gates
+    (`HERMES_OPENCLAW_DEEP_AUDIT.md` §9).** MCP tools are first-class tool-invoke
+    citizens: they flow through the kernel's existing `call_tool` / `invoke_tool` /
+    per-call-approval / persistent-grant path using the synthetic
+    `plugin_id = "mcp:<server>"` — there is **no separate MCP invoke endpoint**. A
+    discovered tool's real risk is unknown, so it defaults to the fail-closed
+    `McpToolClassification` (risk `Medium`, approval `Required`) and is refused on
+    the direct invoke path until the operator classifies it low-risk + `Never`
+    (then `ready`) or it is run via a per-call approval / standing allow-always
+    grant. On invocation the kernel re-resolves + checks the
+    `tool:mcp-<server>:<verb>` permission, re-applies the risk/approval gate,
+    re-validates the loopback endpoint, runs `initialize` →
+    `notifications/initialized` → `tools/call` bounded by the per-call timeout and
+    size caps, **shapes/sanitizes** the result (text content concatenated; raw
+    JSON-RPC envelope never returned; `isError` → honest failure), and audits the
+    call. Honest limitations stated in `docs/mcp.md`: no stdio servers, no remote /
+    `https` / SSE-subscription transport, single-POST subset of streamable HTTP, no
+    OAuth, `tools/*` only (no resources/prompts/sampling).
+
+  Built reference-first per `docs/reference-driven-development.md`. `cargo test`
+  + `clippy` clean on `relux-core` / `relux-kernel`; dashboard tests + typecheck +
+  build green; the tracked `dashboard-dist` bundle rebuilt and committed in sync.
+  Build the bundle with `scripts\relux-package-local.ps1 -FullE2E`. This version
+  line is the `relux-kernel` crate version (separate from the legacy Relix
+  workspace versions in the dated sections below). See
+  `docs/RELUX_MASTER_PLAN.md` → *Release history*. Every safety property from
+  v0.1.22 still holds.
 - **Relux local release v0.1.22 (Windows bundle).** The `relux-kernel` /
   `relux-core` crates move from `0.1.21` to `0.1.22`, bundling the post-v0.1.21
   **run-log observability + safe mid-run cancellation** work into a fresh Windows

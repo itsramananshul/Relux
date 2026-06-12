@@ -1836,6 +1836,36 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.23** (2026-06-12) — the **first safe MCP (Model Context Protocol) surface** on top of
+  v0.1.22, driven by `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` (§9, "P2 — MCP tool support") and
+  `docs/RELUX_MASTER_PLAN.md` §8.2/§18, built reference-first against the vendored Hermes
+  (`tools/mcp_tool.py`, `hermes_cli/mcp_config.py`), the legacy `relix-runtime` streamable-HTTP
+  client, and openclaw's `mcp:<server>:<tool>` executor namespace per
+  `docs/reference-driven-development.md` (full mapping in `docs/mcp.md`). No master-plan safety
+  property is weakened: MCP is **loopback-only**, no downloaded code is ever run, and every MCP tool
+  call flows through the SAME permission / approval / grant / audit gates a real plugin tool uses.
+  **Loopback registry + live discovery (§9):** an operator registers a loopback-only MCP server
+  (`{ id, endpoint, description?, enabled?, timeout_ms? }`, validated with the same
+  `validate_loopback_url` rule as the plugin runtime), lists registrations with an honest one-word
+  status (no secrets stored/returned), and discovers an enabled server's tools via a live
+  `initialize` → `tools/list` handshake mapped into the standard `relux_core::ToolDescriptor` shape
+  (`plugin_id = "mcp:<id>"`, enforced permission `tool:mcp-<id>:<verb>`, classified risk,
+  `source_kind = "Mcp"`); descriptions are sanitized, clamped, and prompt-injection-scanned
+  (advisory), with timeouts/body-caps/≤256-tools bounds mirrored from the loopback-tool runtime. A new
+  dashboard MCP UI on the Plugins page drives register → discover → classify. **Gated invocation
+  (§9):** MCP tools are first-class tool-invoke citizens routed through the existing `call_tool` /
+  `invoke_tool` / per-call-approval / persistent-grant path with the synthetic
+  `plugin_id = "mcp:<server>"` — no separate MCP invoke endpoint. A discovered tool defaults to the
+  fail-closed `McpToolClassification` (risk `Medium`, approval `Required`) and is refused on the direct
+  path until classified low-risk + `Never` (or run via a per-call approval / allow-always grant); on
+  invocation the kernel re-checks the `tool:mcp-<server>:<verb>` permission, re-applies the
+  risk/approval gate, re-validates the loopback endpoint, runs `initialize` →
+  `notifications/initialized` → `tools/call` bounded by the per-call timeout + size caps, shapes and
+  sanitizes the result (raw JSON-RPC envelope never returned; `isError` → honest failure), and audits
+  the call. Honest limits (stated in `docs/mcp.md`): no stdio servers, no remote/`https`/SSE-subscription
+  transport, single-POST subset of streamable HTTP, no OAuth, `tools/*` only. `cargo test` + `clippy`
+  clean on `relux-core`/`relux-kernel`, dashboard tests + typecheck + build green, the tracked
+  `dashboard-dist` bundle rebuilt and committed in sync. Every safety property from v0.1.22 still holds.
 - **v0.1.22** (2026-06-11) — **run-log observability + safe mid-run cancellation** on top of
   v0.1.21, driven by `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` (§24/§25/§26; §8/§10 P2) and built
   reference-first against the vendored Paperclip/openclaw process-execution paths per
