@@ -44,6 +44,12 @@ import {
 } from "../taskmove";
 import { candidateParents } from "../reparent";
 import {
+  buildInvestigationSeed,
+  runInvestigationInput,
+  taskInvestigationInput,
+  stashInvestigationSeed,
+} from "../investigateseed";
+import {
   assessRunRecovery,
   assessTaskRecovery,
   latestRunForTask,
@@ -1713,6 +1719,7 @@ function TaskDetailPanel({
   onChanged: () => void;
   onClose: () => void;
 }) {
+  const navigate = useNavigate();
   const { data: task, loading, error, reload: reloadTask } = useAsync<ReluxTaskDetail>(
     () => reluxWork.getTask(taskId),
     [taskId],
@@ -1769,6 +1776,17 @@ function TaskDetailPanel({
     } finally {
       setRecoveryBusy(null);
     }
+  }
+
+  // §3.3b "Investigate → chat companion pre-loaded with the diagnosis": stash a safe,
+  // bounded, redacted investigation seed (the blocked task + its latest failed run's
+  // diagnosis) and open Prime, which picks it up once on mount and answers it as a
+  // debugging question — it creates/changes nothing (investigateseed.ts; §6.10).
+  function investigateTask() {
+    if (!task || !recovery) return;
+    const seed = buildInvestigationSeed(taskInvestigationInput(task, latestRun, recovery));
+    stashInvestigationSeed(window.sessionStorage, seed);
+    navigate("/prime");
   }
 
   return (
@@ -1838,6 +1856,7 @@ function TaskDetailPanel({
                     onReassign: (id) => void recoveryReassign(id),
                   },
                 },
+                investigate: { onClick: () => investigateTask() },
               }}
             />
             {recoveryNote && (
@@ -2035,6 +2054,7 @@ export function AdhocSubtaskSection({
 }
 
 function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: string; onClose: () => void; onOpenRun: (runId: string) => void; onRetried: (newRunId: string) => void }) {
+  const navigate = useNavigate();
   const { data: run, loading: loadingRun, error: errorRun, reload: reloadRun } = useAsync<ReluxRunDetail>(
     () => reluxWork.getRun(runId),
     [runId],
@@ -2304,6 +2324,22 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
   // already below (a muted pointer, not a dead button).
   const recovery = run ? assessRunRecovery(run) : null;
 
+  // §3.3b "Investigate → chat companion pre-loaded with the diagnosis": stash a safe,
+  // bounded, redacted investigation seed and open Prime. Since this panel already
+  // holds the bounded, server-redacted run-log tail, fold its most recent lines into
+  // the seed so Prime starts with real context; Prime can still read the full
+  // transcript via its read-only tools. Prime answers it as a debugging question —
+  // it creates/changes nothing (investigateseed.ts; §6.10).
+  function investigateRun() {
+    if (!run || !recovery) return;
+    const tail = runLog && runLog.lines.length
+      ? runLog.lines.slice(-30).map((l) => l.text).join("\n")
+      : null;
+    const seed = buildInvestigationSeed(runInvestigationInput(run, recovery, tail));
+    stashInvestigationSeed(window.sessionStorage, seed);
+    navigate("/prime");
+  }
+
   async function reviewChange(index: number, decision: "approve" | "reject") {
     setPcBusy(index);
     try {
@@ -2453,6 +2489,7 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
             // Reassign lives on the task surface (the board card / task detail picker).
             reassign: { to: `/work?task=${encodeURIComponent(run.task_id)}` },
             // inspect: unwired → the transcript + log tail are already on this panel below.
+            investigate: { onClick: () => investigateRun() },
           }}
         />
       )}

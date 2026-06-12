@@ -15,6 +15,7 @@ import {
 } from "../api";
 import { afterActionLabel, boundedContextReads, brainSourceLabel, contextReadDetail, contextReadsHadMiss, contextReadsUsedLabel, decisionSourceLabel, formatToolOutput, hasSteps, intentProvenance, pendingClarificationLabel, polishProvenance, PRIME_GREETING, PRIME_HINT, PRIME_PLACEHOLDER, PRIME_SUGGESTIONS, proposalDisplaySummary, replyPolishLabel, requestedToolLabel, slotProvenance, stepDisplayTitle, updateProvenance } from "../prime";
 import { workTaskHref, workRunHref } from "../routing";
+import { consumeInvestigationSeed } from "../investigateseed";
 import { PrimeAutonomyPanel } from "../components/PrimeAutonomyPanel";
 import { OrchestrationPanel } from "../components/OrchestrationPanel";
 
@@ -72,6 +73,9 @@ export function Prime() {
   const [aiStatus, setAiStatus] = useState<ReluxAiStatus | null>(null);
   const logRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  // Guards the one-shot investigation-seed pickup so a re-render / StrictMode
+  // double-invoke never re-sends it (the consume also removes it from storage).
+  const seedConsumedRef = useRef(false);
 
   async function refreshAi() {
     try {
@@ -84,6 +88,20 @@ export function Prime() {
 
   useEffect(() => {
     void refreshAi();
+  }, []);
+
+  // "Investigate with Prime" handoff (recovery decision card §3.3b / §6.10): when the
+  // operator opened Prime from a recovery card, a safe, bounded, redacted investigation
+  // seed was stashed in sessionStorage. Pick it up ONCE on mount and send it as the
+  // first user message, so Prime answers it like a debugging partner. The seed itself
+  // instructs Prime not to create or run anything; it is a normal "answered" turn, so
+  // nothing is materialized. No seed → normal chat, untouched (investigateseed.ts).
+  useEffect(() => {
+    if (seedConsumedRef.current) return;
+    seedConsumedRef.current = true;
+    const seed = consumeInvestigationSeed(window.sessionStorage);
+    if (seed) void send(seed);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function scroll() {

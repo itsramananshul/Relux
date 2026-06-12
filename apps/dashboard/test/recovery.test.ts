@@ -164,15 +164,37 @@ test("a blocked + assigned task recommends reopen & run, reopen, reassign", () =
   assert.equal(a.classLabel, "Blocked");
   assert.equal(a.actions[0].kind, "reopen_and_run");
   assert.equal(a.actions[0].primary, true);
-  assert.deepEqual(kinds(a.actions), ["reopen_and_run", "reopen", "reassign"]);
+  assert.deepEqual(kinds(a.actions), ["reopen_and_run", "reopen", "reassign", "investigate"]);
   assert.equal(a.missingInfo, null);
 });
 
 test("a blocked + UNASSIGNED task says assign first and surfaces the honest reason", () => {
   const a = assessTaskRecovery(task({ status: "blocked", assigned_agent: undefined }), null)!;
-  assert.deepEqual(kinds(a.actions), ["reassign"]);
+  assert.deepEqual(kinds(a.actions), ["reassign", "investigate"]);
   assert.match(a.actions[0].label, /Assign operative/);
   assert.ok(a.missingInfo && /assign an operative/i.test(a.missingInfo));
+});
+
+// ── Investigate-with-Prime choice (§3.3b chat companion; §6.10) ─────────────
+test("every recovery card appends a non-primary Investigate action last", () => {
+  // A failed run, a blocked task, and an unassigned blocked task all end with it.
+  const runA = assessRunRecovery(run({ status: "failed", failure_class: "auth_required" }))!;
+  const taskA = assessTaskRecovery(task({ status: "blocked", assigned_agent: "prime" }), null)!;
+  const unassignedA = assessTaskRecovery(task({ status: "blocked", assigned_agent: undefined }), null)!;
+  for (const a of [runA, taskA, unassignedA]) {
+    const last = a.actions[a.actions.length - 1];
+    assert.equal(last.kind, "investigate");
+    assert.notEqual(last.primary, true); // never steals the recommended first action
+    assert.match(last.label, /Investigate with Prime/);
+  }
+  // It is appended, never substituted: the run still leads with its own primary.
+  assert.equal(runA.actions[0].kind, "configure_agent");
+  assert.equal(runA.actions[0].primary, true);
+});
+
+test("a healthy run still yields no card (Investigate is not forced onto null)", () => {
+  assert.equal(assessRunRecovery(run({ status: "running", failure_class: undefined })), null);
+  assert.equal(assessTaskRecovery(task({ status: "open" }), null), null);
 });
 
 test("a blocked task folds its last failed run's root cause into the card", () => {

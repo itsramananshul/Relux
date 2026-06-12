@@ -31,7 +31,8 @@ export type RecoveryActionKind =
   | "reassign" // POST /v1/relux/tasks/:id/assign — hand to another operative
   | "open_approval" // the Approvals surface — decide a pending gate
   | "configure_agent" // the Crew / Settings surface — adapter / credential / permission
-  | "inspect"; // the run transcript + logs already on this surface
+  | "inspect" // the run transcript + logs already on this surface
+  | "investigate"; // open Prime seeded with the diagnosis (§3.3b chat companion)
 
 export interface RecoveryActionSpec {
   kind: RecoveryActionKind;
@@ -87,11 +88,35 @@ const INSPECT_ACTION: RecoveryActionSpec = {
   hint: "Read this run's transcript and log tail to see exactly what happened.",
 };
 
+// The §3.3b "Investigate" choice: open Prime seeded with this diagnosis so the
+// operator can debug it conversationally. Appended (non-primary) to every
+// assessment by `withInvestigate` — it never replaces the recommended first action,
+// it adds a "talk it through" path. The seed is safe + read-only (see investigateseed.ts).
+const INVESTIGATE_ACTION: RecoveryActionSpec = {
+  kind: "investigate",
+  label: "Investigate with Prime",
+  hint: "Open Prime pre-loaded with this diagnosis to debug it conversationally — Prime answers, it doesn't change anything.",
+};
+
+// Append the Investigate choice to an assessment (in place) and return it. Central
+// so every recovery card offers the §3.3b chat-companion path without each branch
+// repeating it. Null passes through unchanged (nothing to recover).
+function withInvestigate(a: RecoveryAssessment | null): RecoveryAssessment | null {
+  if (a) a.actions.push(INVESTIGATE_ACTION);
+  return a;
+}
+
 // Build the recovery assessment for a run, or null when there is nothing to recover
 // (the run is not failed/cancelled and carries no failure class — e.g. it is still
 // running or completed cleanly). Pure: it reads only the run record + the derived
 // retry/resume eligibility, never a clock or the network.
 export function assessRunRecovery(
+  run: ReluxRun | ReluxRunDetail,
+): RecoveryAssessment | null {
+  return withInvestigate(assessRunRecoveryInner(run));
+}
+
+function assessRunRecoveryInner(
   run: ReluxRun | ReluxRunDetail,
 ): RecoveryAssessment | null {
   const failed = run.status === "failed";
@@ -331,13 +356,21 @@ export function assessTaskRecovery(
   task: ReluxTask,
   latestRun: ReluxRun | null,
 ): RecoveryAssessment | null {
+  return withInvestigate(assessTaskRecoveryInner(task, latestRun));
+}
+
+function assessTaskRecoveryInner(
+  task: ReluxTask,
+  latestRun: ReluxRun | null,
+): RecoveryAssessment | null {
   if (task.status !== "blocked") return null;
 
   const elig = reopenEligibility(task as ReopenableTask);
   // The latest run's diagnosis, when it failed, gives the honest "why blocked" context.
+  // Use the INNER assessment (no appended Investigate) — we only fold its prose in.
   const runFail =
     latestRun && (latestRun.status === "failed" || latestRun.failure_class)
-      ? assessRunRecovery(latestRun)
+      ? assessRunRecoveryInner(latestRun)
       : null;
 
   const rootCause = runFail
