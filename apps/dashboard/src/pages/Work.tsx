@@ -43,6 +43,13 @@ import {
   type BoardColumn,
 } from "../taskmove";
 import { candidateParents } from "../reparent";
+import {
+  assessRunRecovery,
+  assessTaskRecovery,
+  latestRunForTask,
+  type RecoveryAssessment,
+  type RecoveryActionKind,
+} from "../recovery";
 import { orchestrationStatusTone } from "../orchestration";
 import { approvalInlineActions } from "../approvalactions";
 import {
@@ -1199,6 +1206,130 @@ export function StatusMoveControl({
   );
 }
 
+// How one recovery action is wired on a given surface. An action is rendered as a
+// BUTTON (`onClick`), a navigation LINK (`to` an existing page), or a REASSIGN picker
+// (an agent <select> driving the existing assign route) — or, when the surface has no
+// clean affordance for it, as a muted POINTER showing the action's hint (never a dead
+// button, never invented authority). The renderer picks based on which field is set.
+type RecoveryActionWiring =
+  | { onClick: () => void; disabled?: boolean }
+  | { to: string }
+  | { reassign: { agents: ReluxAgent[]; current: string | null; onReassign: (agentId: string) => void } };
+
+// RECOVERY DECISION CARD (execution-and-issue §3.3b; dashboard §6.9 remaining gap).
+// A compact, read-only card that turns a failed run / blocked task into a plain-language
+// ROOT CAUSE + RECOMMENDATION + one-click CHOICES. The content comes from the deterministic
+// recovery model (src/recovery.ts) — the run's structured failure class + retry/session
+// state, or a blocked task's reopen eligibility — so it is an honest read of recorded data,
+// never a fabricated guess. Every offered action is backed by an EXISTING route; an action
+// the surface can't wire degrades to a muted pointer (its hint) rather than a dead button.
+export function RecoveryCard({
+  assessment,
+  handlers,
+  busyKind = null,
+}: {
+  assessment: RecoveryAssessment;
+  // Per-action wiring for THIS surface. An action kind absent from the map renders as a
+  // muted pointer (the recommendation already explains it).
+  handlers: Partial<Record<RecoveryActionKind, RecoveryActionWiring>>;
+  // The action kind currently in flight (its button shows "…"), or null.
+  busyKind?: RecoveryActionKind | null;
+}) {
+  // The badge tone: a run failure class drives the shared tone vocabulary; a task hold
+  // (no class) reads as the "blocked" tone. (failureClassTone is the single source.)
+  const tone = failureClassTone(assessment.failureClass);
+  return (
+    <div
+      className="card sm recovery-card"
+      role="group"
+      aria-label="Recovery suggestion"
+      style={{ padding: 12, marginBottom: 12, border: "1px solid var(--border)" }}
+    >
+      <div className="row" style={{ alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
+        <span className="muted" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.05em" }}>
+          Recovery
+        </span>
+        <span className={`badge ${tone}`} style={{ fontSize: 9 }}>{assessment.classLabel}</span>
+      </div>
+      <div style={{ fontSize: 12, marginBottom: 4 }}>
+        <span className="muted">Root cause: </span>{assessment.rootCause}
+      </div>
+      <div style={{ fontSize: 12, marginBottom: 8 }}>
+        <span className="muted">Recommended: </span>{assessment.recommendation}
+      </div>
+      <div className="row" style={{ gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+        {assessment.actions.map((action) => {
+          const wiring = handlers[action.kind];
+          const busy = busyKind === action.kind;
+          // A reassign picker: an agent <select> that drives the existing assign route.
+          if (wiring && "reassign" in wiring) {
+            const { agents, current, onReassign } = wiring.reassign;
+            return (
+              <select
+                key={action.kind}
+                className="input sm"
+                aria-label={action.label}
+                title={action.hint}
+                value=""
+                disabled={busy || !agents.length}
+                style={{ fontSize: 10, padding: "4px 8px", height: 24, minWidth: 130 }}
+                onChange={(e) => e.target.value && onReassign(e.target.value)}
+              >
+                <option value="">{busy ? "Reassigning…" : action.label + "…"}</option>
+                {agents.map((a) => (
+                  <option key={a.id} value={a.id} disabled={current === a.id}>
+                    {a.name}{current === a.id ? " (current)" : ""}
+                  </option>
+                ))}
+              </select>
+            );
+          }
+          // A navigation link to an existing page (Crew / Settings / Approvals).
+          if (wiring && "to" in wiring) {
+            return (
+              <Link
+                key={action.kind}
+                to={wiring.to}
+                className={`btn sm ${action.primary ? "" : "ghost"}`}
+                style={{ height: 24, padding: "0 8px", fontSize: 10 }}
+                title={action.hint}
+              >
+                {action.label}
+              </Link>
+            );
+          }
+          // A wired button (calls an existing mutation route).
+          if (wiring && "onClick" in wiring) {
+            return (
+              <button
+                key={action.kind}
+                className={`btn sm ${action.primary ? "" : "ghost"}`}
+                style={{ height: 24, padding: "0 8px", fontSize: 10 }}
+                disabled={busy || wiring.disabled}
+                title={action.hint}
+                onClick={() => wiring.onClick()}
+              >
+                {busy ? "…" : action.label}
+              </button>
+            );
+          }
+          // No affordance on this surface → an honest muted pointer, never a dead button.
+          return (
+            <span key={action.kind} className="muted" style={{ fontSize: 10 }} title={action.hint}>
+              → {action.label}
+            </span>
+          );
+        })}
+      </div>
+      {assessment.missingInfo && (
+        <div className="muted" role="note" style={{ fontSize: 11, marginTop: 8 }}>
+          {assessment.missingInfo}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // REOPEN control (design §6.9): a compact lifecycle action on a BLOCKED task that
 // re-queues it (Blocked -> Queued) through the run lifecycle so its assigned operative
 // can run it again — the safe inverse of the operator Block move. It is NOT a status
@@ -1595,6 +1726,51 @@ function TaskDetailPanel({
     onChanged();
   };
 
+  // Recovery decision card (execution-and-issue §3.3b) wiring for a BLOCKED task. The
+  // assessment folds in the task's latest failed run's diagnosed root cause; the actions
+  // reuse the SAME routes the inline controls use (reopen / reopen-and-run / assign) —
+  // no new authority. `recoveryBusy` shows the in-flight action; `recoveryNote` surfaces
+  // an honest run-refusal (Reopen & run re-queued but the run gate refused) or an error.
+  const latestRun = useMemo(() => (task ? latestRunForTask(runs, task.id) : null), [runs, task]);
+  const recovery = task ? assessTaskRecovery(task, latestRun) : null;
+  const [recoveryBusy, setRecoveryBusy] = useState<RecoveryActionKind | null>(null);
+  const [recoveryNote, setRecoveryNote] = useState<string | null>(null);
+
+  async function recoveryReopen(andRun: boolean) {
+    if (!task) return;
+    setRecoveryBusy(andRun ? "reopen_and_run" : "reopen");
+    setRecoveryNote(null);
+    try {
+      if (andRun) {
+        const res = await reluxWork.reopenAndRunTask(task.id);
+        if (res.run_refused) setRecoveryNote(`Reopened, but the run was refused: ${res.run_refused}`);
+      } else {
+        await reluxWork.reopenTask(task.id);
+      }
+      onStatusMoved();
+    } catch (e) {
+      setRecoveryNote(e instanceof Error ? e.message : "Reopen failed.");
+    } finally {
+      setRecoveryBusy(null);
+    }
+  }
+
+  async function recoveryReassign(agentId: string) {
+    if (!task) return;
+    setRecoveryBusy("reassign");
+    setRecoveryNote(null);
+    try {
+      // The existing assign route reassigns AND re-queues (Blocked → Queued), so a
+      // reassigned task lands back in the run lifecycle — the §3.3b operator reassign.
+      await reluxWork.assignTask(task.id, agentId);
+      onStatusMoved();
+    } catch (e) {
+      setRecoveryNote(e instanceof Error ? e.message : "Reassign failed.");
+    } finally {
+      setRecoveryBusy(null);
+    }
+  }
+
   return (
     <div style={{ paddingBottom: 16 }}>
       <div className="row" style={{ alignItems: "center", marginBottom: 12 }}>
@@ -1641,6 +1817,36 @@ function TaskDetailPanel({
           Error loading task: {String(error)}
         </div>
       ) : task ? (
+        <>
+        {/* RECOVERY DECISION CARD (execution-and-issue §3.3b; §6.9 remaining gap): for a
+            BLOCKED task, the plain-language root cause (folding in the last failed run's
+            diagnosis) + recommendation + one-click choices. Reopen / Reopen & run / Reassign
+            all reuse existing routes; a refusal/error shows inline. Absent for a non-blocked
+            task (assessTaskRecovery returns null) — run-level recovery handles a failed run. */}
+        {recovery && (
+          <>
+            <RecoveryCard
+              assessment={recovery}
+              busyKind={recoveryBusy}
+              handlers={{
+                reopen_and_run: { onClick: () => void recoveryReopen(true), disabled: recoveryBusy != null },
+                reopen: { onClick: () => void recoveryReopen(false), disabled: recoveryBusy != null },
+                reassign: {
+                  reassign: {
+                    agents,
+                    current: task.assigned_agent ?? null,
+                    onReassign: (id) => void recoveryReassign(id),
+                  },
+                },
+              }}
+            />
+            {recoveryNote && (
+              <div className="muted" role="note" style={{ fontSize: 11, marginTop: -6, marginBottom: 12 }}>
+                {recoveryNote}
+              </div>
+            )}
+          </>
+        )}
         <div className="grid" style={{ gap: 8, fontSize: 12 }}>
           <div className="kv"><span>ID:</span><span className="mono">{task.id}</span></div>
           <div className="kv"><span>Title:</span><span>{task.title}</span></div>
@@ -1690,6 +1896,7 @@ function TaskDetailPanel({
           <div className="kv"><span>Updated At:</span><span>{new Date(task.updated_at).toLocaleString()}</span></div>
           <div className="kv stretch"><span>Input:</span><pre className="code" style={{ whiteSpace: "pre-wrap" }}>{JSON.stringify(task.input, null, 2)}</pre></div>
         </div>
+        </>
       ) : (
         <div className="empty sm">No task details found.</div>
       )}
@@ -2090,6 +2297,12 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
   // apply-eligible changes (Apply all approved). The backend re-validates both.
   const reviewableIndices = reviewableProposedChangeIndices(proposedChanges);
   const applyEligibleIndices = applyEligibleProposedChangeIndices(proposedChanges);
+  // Recovery decision card (execution-and-issue §3.3b): for a failed/cancelled run,
+  // the deterministic root-cause + recommendation + one-click choices. Null for a
+  // healthy run (no card). Retry/Resume reuse THIS panel's handlers; configure/reassign
+  // are links to the existing Crew/Settings/board surfaces; inspect is the transcript
+  // already below (a muted pointer, not a dead button).
+  const recovery = run ? assessRunRecovery(run) : null;
 
   async function reviewChange(index: number, decision: "approve" | "reject") {
     setPcBusy(index);
@@ -2227,6 +2440,21 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
       )}
       {shareNote && (
         <div className="muted mono" style={{ fontSize: 11, marginBottom: 8, wordBreak: "break-all" }}>{shareNote}</div>
+      )}
+      {recovery && run && (
+        <RecoveryCard
+          assessment={recovery}
+          busyKind={retrying ? "retry_run" : resuming ? "resume_session" : null}
+          handlers={{
+            retry_run: { onClick: () => void retry(), disabled: retrying },
+            resume_session: { onClick: () => void resume(), disabled: resuming },
+            // Adapter credentials live in Settings; adapter enable + agent config in Crew.
+            configure_agent: { to: recovery.failureClass === "auth_required" ? "/settings" : "/crew" },
+            // Reassign lives on the task surface (the board card / task detail picker).
+            reassign: { to: `/work?task=${encodeURIComponent(run.task_id)}` },
+            // inspect: unwired → the transcript + log tail are already on this panel below.
+          }}
+        />
       )}
       {loadingRun && !run ? (
         <div className="loading">Loading run details...</div>
