@@ -104,6 +104,7 @@ pub use runtime::{
 pub use task::{
     parse_task_tool_call, parse_task_tool_plan, Task, TaskId, TaskStatus, TaskToolCall,
     TaskToolPlan, TaskToolPlanError, MAX_TASK_TOOL_PLAN_ARGS_BYTES, MAX_TASK_TOOL_PLAN_STEPS,
+    MAX_TASK_TOOL_PLAN_STEPS_CEIL,
 };
 pub use tool::{
     approval_blocks_direct_invocation, ToolDescriptor, ToolExecutability, ToolInvocationResult,

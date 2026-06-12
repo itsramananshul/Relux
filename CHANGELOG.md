@@ -9,6 +9,23 @@ once a stable release is cut.
 
 ### Added
 
+- **Configurable tool-plan step policy (retires the hidden `MAX_TASK_TOOL_PLAN_STEPS
+  = 5`).** The toy 5-step cap on operator-authored / Prime-proposed multi-tool plans
+  becomes two configurable `PrimeAgentPolicy` fields: `max_tool_plan_steps` (standard,
+  default **16**, aligned with the orchestration width) and
+  `extended_max_tool_plan_steps` (default **64**), both clamped to the absolute hard
+  ceiling `MAX_TASK_TOOL_PLAN_STEPS_CEIL` (**64**). `TaskToolPlan::validate_with_limit`
+  is the new operator-facing validator (the no-arg `validate()` keeps a conservative
+  static default for tests/CLI). The configured limit is applied at the Prime tool-plan
+  proposal, the UI-created tool-run task route, and the `/v1/relux/prime/agent-policy`
+  route + `prime agent-policy configure` CLI (`--max-tool-plan-steps` /
+  `--ext-max-tool-plan-steps`); the dashboard Prime Autonomy Limits panel gains a **Tool
+  plan** row. An over-limit plan is an honest `400` / blocking issue that **names the
+  limit** — never silently truncated; the run-driven read path bounds only at the
+  ceiling so a plan created under a raised limit still reads back. Built reference-first
+  against Hermes `agent/iteration_budget.py` (a tunable bound, not a tiny constant) per
+  `docs/reference-driven-development.md`; promotes the last big LATER item in
+  `docs/ARTIFICIAL_CONSTRAINT_AUDIT.md` to FIXED.
 - **Relux local release v0.1.25 (Windows bundle).** The `relux-kernel` /
   `relux-core` crates move from `0.1.24` to `0.1.25`, bundling the post-v0.1.24
   **run-driven multi-tool plans** into a fresh Windows release: an

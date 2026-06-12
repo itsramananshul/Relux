@@ -1,10 +1,11 @@
 // Pure, dependency-free builder for a "tool-run task" creation payload — the
 // compact operator UI for the backend's run-driven single tool-call directive and
 // bounded multi-tool plan (`docs/mcp.md` "Run-driven MCP tool call" + "Run-driven
-// multi-tool plan"). One step builds a `tool_call`; two-to-five steps build a
-// `tool_plan`. The bounds and shape mirror the kernel's create-time validation
-// (`relux_core::TaskToolPlan::validate` + `CreateTaskReq`) so the UI fails closed
-// the SAME way the backend does, rather than posting a request the kernel will 400.
+// multi-tool plan"). One step builds a `tool_call`; two-or-more steps (up to the
+// configured limit) build a `tool_plan`. The bounds and shape mirror the kernel's
+// create-time validation (`relux_core::TaskToolPlan::validate_with_limit` +
+// `CreateTaskReq`, bounded by the operator's `max_tool_plan_steps` policy) so the UI
+// fails closed the SAME way the backend does, rather than posting a request it will 400.
 //
 // Kept React-free (like ./plugins and ./routing) so `node --test` can pin the
 // payload shape and every validation branch without a DOM. The form renders
@@ -43,10 +44,13 @@ export type BuildResult =
   | { ok: true; payload: ToolRunTaskPayload }
   | { ok: false; error: string };
 
-// Mirrors `relux_core::MAX_TASK_TOOL_PLAN_STEPS` (5). A plan may carry at most this
-// many steps; the kernel 400s an over-long plan (never silently truncates), so the
-// UI refuses it up front with the same ceiling.
-export const MAX_TOOL_RUN_STEPS = 5;
+// The CONSERVATIVE fallback step limit, mirroring `relux_core::MAX_TASK_TOOL_PLAN_STEPS`
+// (the static default, 16 — aligned with the orchestration width, NOT the retired toy 5).
+// Used when the live operator policy has not been fetched. The real bound is the
+// per-deployment `max_tool_plan_steps` from `/v1/relux/prime/agent-policy`; pass it as the
+// `maxSteps` arg to `buildToolRunTaskPayload` so the UI refuses an over-long plan up front
+// with the SAME limit the kernel enforces.
+export const MAX_TOOL_RUN_STEPS = 16;
 
 // Parse one step's JSON args exactly as the kernel will read them: a blank textarea
 // is the canonical empty `{}`; any other text must be valid JSON. Returns the parsed
@@ -64,21 +68,28 @@ function parseStepArgs(argsText: string, stepNo: number): { ok: true; args: unkn
 // Build the create-task payload from a title + ordered steps, failing closed the
 // same way the backend does:
 //   - title required (trimmed);
-//   - at least one step, at most MAX_TOOL_RUN_STEPS (never silently truncated);
+//   - at least one step, at most `maxSteps` (never silently truncated);
 //   - every step needs a non-empty plugin + tool (trimmed);
 //   - every step's args must be valid JSON (blank => {}).
 // One valid step => a `tool_call`; two-or-more => a `tool_plan` (run sequentially,
 // stopping on the first failure). The caller posts the returned payload verbatim to
-// `POST /v1/relux/tasks` (`reluxWork.createTask`).
-export function buildToolRunTaskPayload(title: string, steps: ToolRunStep[]): BuildResult {
+// `POST /v1/relux/tasks` (`reluxWork.createTask`). `maxSteps` defaults to the
+// conservative `MAX_TOOL_RUN_STEPS`; pass the live operator limit
+// (`max_tool_plan_steps`) so the UI mirrors the configured backend bound exactly.
+export function buildToolRunTaskPayload(
+  title: string,
+  steps: ToolRunStep[],
+  maxSteps: number = MAX_TOOL_RUN_STEPS,
+): BuildResult {
   const trimmedTitle = title.trim();
   if (!trimmedTitle) return { ok: false, error: "A task title is required." };
 
+  const limit = Math.max(1, Math.floor(maxSteps) || MAX_TOOL_RUN_STEPS);
   if (steps.length === 0) return { ok: false, error: "Add at least one tool step." };
-  if (steps.length > MAX_TOOL_RUN_STEPS) {
+  if (steps.length > limit) {
     return {
       ok: false,
-      error: `A tool plan may have at most ${MAX_TOOL_RUN_STEPS} steps (you have ${steps.length}).`,
+      error: `A tool plan may have at most ${limit} steps (you have ${steps.length}).`,
     };
   }
 

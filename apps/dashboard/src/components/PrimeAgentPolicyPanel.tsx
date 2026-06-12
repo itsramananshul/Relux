@@ -21,6 +21,8 @@ type Draft = Pick<
   | "extended_max_tool_calls"
   | "extended_max_brain_rounds"
   | "extended_max_duration_secs"
+  | "max_tool_plan_steps"
+  | "extended_max_tool_plan_steps"
 >;
 
 function toDraft(c: ReluxPrimeAgentPolicy): Draft {
@@ -31,6 +33,8 @@ function toDraft(c: ReluxPrimeAgentPolicy): Draft {
     extended_max_tool_calls: c.extended_max_tool_calls,
     extended_max_brain_rounds: c.extended_max_brain_rounds,
     extended_max_duration_secs: c.extended_max_duration_secs,
+    max_tool_plan_steps: c.max_tool_plan_steps,
+    extended_max_tool_plan_steps: c.extended_max_tool_plan_steps,
   };
 }
 
@@ -100,6 +104,13 @@ export function PrimeAgentPolicyPanel() {
           ext {resp.extended.max_tool_calls}t · {resp.extended.max_brain_rounds}r ·{" "}
           {resp.extended.max_duration_secs}s
         </span>
+        <span
+          className="badge todo"
+          style={{ fontSize: 9, marginLeft: 6 }}
+          title="Resolved multi-tool-plan step limit (standard / extended)"
+        >
+          plan {resp.standard.max_tool_plan_steps}/{resp.extended.max_tool_plan_steps} steps
+        </span>
       </div>
       <p className="muted" style={{ marginTop: -2, marginBottom: 10, fontSize: 12, lineHeight: 1.6 }}>
         How far Prime's chat <strong>agent loop</strong> may go in one turn before it stops and asks.
@@ -132,6 +143,25 @@ export function PrimeAgentPolicyPanel() {
         onBrainRounds={(v) => set("extended_max_brain_rounds", v)}
         onDuration={(v) => set("extended_max_duration_secs", v)}
       />
+
+      {/* The configurable multi-tool-PLAN step limit (operator-authored / Prime-proposed
+          plans), replacing the retired hard-coded 5. Standard bounds an ordinary tool-run
+          task; Extended a long-work plan. Both are clamped to a safe ceiling on the server. */}
+      <div className="row wrap" style={{ alignItems: "center", gap: 8, marginTop: 2, marginBottom: 4 }}>
+        <strong style={{ fontSize: 12, width: 72 }}>Tool plan</strong>
+        <Field
+          label="std steps"
+          value={draft.max_tool_plan_steps}
+          disabled={busy}
+          onChange={(v) => set("max_tool_plan_steps", Math.max(0, parseInt(v, 10) || 0))}
+        />
+        <Field
+          label="ext steps"
+          value={draft.extended_max_tool_plan_steps}
+          disabled={busy}
+          onChange={(v) => set("extended_max_tool_plan_steps", Math.max(0, parseInt(v, 10) || 0))}
+        />
+      </div>
 
       <div className="row" style={{ gap: 8, marginTop: 8 }}>
         <button className="btn sm" onClick={() => void save()} disabled={busy || !dirty}>

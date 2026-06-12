@@ -11,10 +11,12 @@ import { toolReadiness } from "../src/plugins.ts";
 import type { ReluxToolDescriptor } from "../src/api.ts";
 
 // The tool-run-task builder must fail closed the SAME way the kernel does
-// (`relux_core::TaskToolPlan::validate` + `CreateTaskReq`): one valid step is a
-// `tool_call`, two-to-five a `tool_plan`, and every invalid shape (no title, no
-// step, >5 steps, an unchosen tool, bad JSON args) is rejected BEFORE any POST so
-// the UI never sends a request the backend would 400. These assertions pin that.
+// (`relux_core::TaskToolPlan::validate_with_limit` + `CreateTaskReq`): one valid step
+// is a `tool_call`, two-or-more (up to the configured limit) a `tool_plan`, and every
+// invalid shape (no title, no step, over the limit, an unchosen tool, bad JSON args) is
+// rejected BEFORE any POST so the UI never sends a request the backend would 400. The
+// step limit is the operator's `max_tool_plan_steps` policy (default 16, not the retired
+// toy 5), passed in as `maxSteps`. These assertions pin that.
 
 function step(over: Partial<ToolRunStep> = {}): ToolRunStep {
   return { plugin: "mcp:fs", tool: "search", argsText: "", ...over };
@@ -75,6 +77,26 @@ test("exactly MAX_TOOL_RUN_STEPS steps is accepted (boundary)", () => {
   const r = buildToolRunTaskPayload("t", max);
   assert.ok(r.ok);
   assert.equal(r.payload.tool_plan?.length, MAX_TOOL_RUN_STEPS);
+});
+
+test("the default limit (16) permits more than the retired toy 5 steps", () => {
+  const six: ToolRunStep[] = Array.from({ length: 6 }, () => step());
+  const r = buildToolRunTaskPayload("six-step", six);
+  assert.ok(r.ok, "a 6-step plan must be accepted at the default limit");
+  assert.equal(r.payload.tool_plan?.length, 6);
+});
+
+test("an explicit maxSteps (the live operator policy) is honored", () => {
+  const three: ToolRunStep[] = Array.from({ length: 3 }, () => step());
+  // Lowered limit of 2 rejects a 3-step plan, naming the limit.
+  const rejected = buildToolRunTaskPayload("t", three, 2);
+  assert.ok(!rejected.ok);
+  assert.match(rejected.error, /at most 2/);
+  // A raised limit (e.g. extended 40) accepts a plan the default would too.
+  const big: ToolRunStep[] = Array.from({ length: 20 }, () => step());
+  const accepted = buildToolRunTaskPayload("t", big, 40);
+  assert.ok(accepted.ok);
+  assert.equal(accepted.payload.tool_plan?.length, 20);
 });
 
 test("a step with no tool chosen is rejected, naming the step", () => {

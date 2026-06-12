@@ -576,7 +576,9 @@ safe (adds no authority), bounded, feasible in one commit, and reuses existing v
   a multi-step / brain-chosen MCP run stays out of scope. *(core, kernel, API, tests, docs.)*
 - **P2 — run-driven multi-tool plan (bounded, operator-authored sequence)** — ✅ DONE: a `Task` may
   carry `{ "tool_plan": [ { plugin, tool, args }, … ] }` (`relux_core::TaskToolPlan`), strictly
-  validated at create time (non-empty, ≤ `MAX_TASK_TOOL_PLAN_STEPS` (5), non-empty plugin/tool,
+  validated at create time (non-empty, ≤ the configurable `PrimeAgentPolicy::max_tool_plan_steps`
+  limit — standard default 16, extended 64, ceiling 64 — via `TaskToolPlan::validate_with_limit`;
+  non-empty plugin/tool,
   args ≤ 256 KiB; `tool_plan`/`tool_call` mutually exclusive), executed step-by-step through the SAME
   gated `call_tool` chokepoint and **stopping on the first failure/denial**. Plus a compact operator
   UI (Plugins → Tools "Create a tool-run task", live-MCP-tool picker). The brain never chooses a step.

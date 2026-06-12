@@ -4175,7 +4175,13 @@ impl KernelState {
         ctx: &PrimeContext,
         goal: &str,
     ) -> relux_core::PrimeToolPlanProposal {
-        use relux_core::task::{TaskToolCall, TaskToolPlan, MAX_TASK_TOOL_PLAN_STEPS};
+        use relux_core::task::{TaskToolCall, TaskToolPlan};
+
+        // The Prime tool-plan proposal is an ordinary (standard-profile) chat action, so it
+        // is bounded by the CONFIGURED standard tool-plan step limit — the SAME limit the
+        // task-create route enforces — never a hard-coded constant. A longer request is
+        // reported as too-long (honest issue), never silently truncated.
+        let max_steps = self.prime_agent_policy.tool_plan_steps(false);
 
         // The SHARED, read-only proposal tool catalog: installed plugin tools PLUS the
         // live MCP-discovered tools the server pre-fetched off-lock for this turn. A
@@ -4195,7 +4201,7 @@ impl KernelState {
         for (i, segment) in segments.iter().enumerate() {
             // Cap the previewed steps at the same bound the task-create route enforces;
             // a longer request is reported as too-long rather than silently truncated.
-            if steps.len() >= MAX_TASK_TOOL_PLAN_STEPS {
+            if steps.len() >= max_steps {
                 over_cap = true;
                 break;
             }
@@ -4312,10 +4318,11 @@ impl KernelState {
             }
         }
 
-        if over_cap || segments.len() > MAX_TASK_TOOL_PLAN_STEPS {
+        if over_cap || segments.len() > max_steps {
             all_resolved = false;
             issues.push(format!(
-                "a tool plan can have at most {MAX_TASK_TOOL_PLAN_STEPS} steps; you listed {}",
+                "a tool plan can have at most {max_steps} steps; you listed {} — raise the \
+                 tool-plan step limit in Prime Autonomy settings to plan more",
                 segments.len()
             ));
         }
@@ -4327,7 +4334,7 @@ impl KernelState {
             if let Err(e) = (TaskToolPlan {
                 steps: resolved_calls.clone(),
             })
-            .validate()
+            .validate_with_limit(max_steps)
             {
                 validates = false;
                 all_resolved = false;
@@ -17530,6 +17537,10 @@ mod tests {
     #[test]
     fn tool_plan_over_the_step_cap_is_bounded_not_silently_truncated() {
         let (mut k, ctx) = prime_chat_kernel();
+        // The proposal honors the CONFIGURED standard tool-plan limit, not a constant: lower
+        // it to 3 so a 6-step request is over the operator's bound and the preview is capped
+        // there (proving the limit is read from the policy, not hard-coded).
+        k.prime_agent_policy.max_tool_plan_steps = 3;
         let turn = k
             .prime_turn(
                 &ctx,
@@ -17542,8 +17553,8 @@ mod tests {
         let plan = turn.tool_plan_proposal.expect("a preview is attached");
         assert!(!plan.ready_to_create, "an over-long plan is not creatable");
         assert!(
-            plan.steps.len() <= relux_core::task::MAX_TASK_TOOL_PLAN_STEPS,
-            "the preview is capped at the step bound: {}",
+            plan.steps.len() <= 3,
+            "the preview is capped at the configured limit: {}",
             plan.steps.len()
         );
         assert!(

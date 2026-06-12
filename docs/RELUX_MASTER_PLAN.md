@@ -1851,10 +1851,26 @@ stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
   caps): the clamped `PrimeAgentPolicy` ceilings (already configurable), the echo fixture's demotion to
   internal-only (`is_internal_plugin` — verified, not rebuilt), `create_agent`'s least-privilege grant, the
   MCP loopback/size bounds, and every char/byte/HTTP-body clamp. **LATER** (recorded with exact next steps):
-  making `MAX_TASK_TOOL_PLAN_STEPS`, the orchestration width, and `MAX_TOOL_ROUNDS` operator-configurable
-  policy fields, and lifting `MAX_ACTIVE_JOBS`. No release cut; no safety property weakened. `cargo test` +
+  folding the orchestration width and `MAX_TOOL_ROUNDS` into operator-configurable policy fields, and lifting
+  `MAX_ACTIVE_JOBS`. No release cut; no safety property weakened. `cargo test` +
   `clippy` clean on `relux-core`/`relux-kernel` (orchestration/​slots/​context-loop/​decision tests pin the
   raised-but-bounded caps via the named constants).
+- **unreleased** — **Configurable tool-plan step policy (retires the hidden `MAX_TASK_TOOL_PLAN_STEPS = 5`)**,
+  the next LATER item from `docs/ARTIFICIAL_CONSTRAINT_AUDIT.md` promoted to FIXED, continuing the
+  autonomy-policy line (§10.5/§17.1) and built reference-first against Hermes `agent/iteration_budget.py`
+  (a tunable bound, not a tiny constant) — `docs/reference-driven-development.md` (BINDING). **What changes
+  (safe, bounded):** the toy `5` becomes two new `relux_core::PrimeAgentPolicy` fields — `max_tool_plan_steps`
+  (standard, default **16**, aligned with `MAX_ORCHESTRATION_STEPS`) and `extended_max_tool_plan_steps`
+  (default **64**) — clamped to the absolute hard backstop `MAX_TASK_TOOL_PLAN_STEPS_CEIL` (**64**, also the
+  read-path bound). `TaskToolPlan::validate_with_limit(max)` is the new operator-facing validator; the no-arg
+  `validate()` keeps a conservative static default (`MAX_TASK_TOOL_PLAN_STEPS`, now **16**) for tests/CLI. The
+  configured limit is applied consistently at the Prime tool-plan proposal, the UI-created tool-run task route,
+  and the `/v1/relux/prime/agent-policy` route + `prime agent-policy configure` CLI; the dashboard Prime
+  Autonomy Limits panel gains a **Tool plan** row. An over-limit plan is an honest `400` / blocking issue that
+  **names the limit** — never silently truncated. No release cut; no safety property weakened (the bound is
+  still finite and clamped, just configurable). `cargo test` + `clippy` clean on `relux-core`/`relux-kernel`;
+  dashboard typecheck/build/tests green (tests pin: standard permits >5, over-limit named, extended > standard,
+  static default safe, proposal + create-route honor the configured limit).
 - **unreleased** — **Resumable Prime agent-loop continuation (the real "keep working")** on top of the
   configurable autonomy policy, continuing the §10.5/§17.1 line, built reference-first against Hermes'
   `agent/conversation_loop.py` (`run_conversation(conversation_history=…)` seeds `messages =

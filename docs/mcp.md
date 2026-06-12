@@ -282,12 +282,26 @@ the loop stops, reports it, and offers to continue — so "keep working" is a go
 continuation, not an ungoverned loop. Approvals still pause the loop and a high-risk tool never
 auto-runs, regardless of the limits.
 
+**Tool-plan step limit (same policy).** The same `PrimeAgentPolicy` also carries the configurable
+**multi-tool-plan step limit** — `max_tool_plan_steps` (standard, default **16**, aligned with the
+orchestration width) and `extended_max_tool_plan_steps` (default **64**), each clamped to the
+absolute ceiling `MAX_TASK_TOOL_PLAN_STEPS_CEIL` (**64**). This replaces the retired hard-coded toy
+`5`. It bounds an operator-authored / Prime-proposed [`TaskToolPlan`](#run-driven-multi-tool-plan):
+the task-create route and the Prime tool-plan proposal both validate against the configured standard
+limit via `TaskToolPlan::validate_with_limit`, and an over-limit plan is an honest `400` / blocking
+issue that **names the limit and how to raise it** — never a silent truncation. The permissive read
+path (`parse_task_tool_plan`, run execution) bounds only at the absolute ceiling, so a plan created
+under a raised limit still reads back. (The static `MAX_TASK_TOOL_PLAN_STEPS` (16) is the
+conservative default `validate()` uses in tests/CLI where no policy is threaded.)
+
 **Configuring + continuing.** The policy is served at `GET/PUT/PATCH /v1/relux/prime/agent-policy`
-(response carries the resolved standard/extended limits), set in the dashboard's **Prime Autonomy
-Limits** panel (Health → Prime Brain), or via `relux-kernel prime agent-policy <status|configure>`.
-To run long work: tell Prime to "keep working" / "use extended mode" (raises this turn to the
-extended profile), or click the **Keep working (extended)** button Prime offers when a limit is hit
-(which resumes the paused loop — see below).
+(response carries the resolved standard/extended limits, including `max_tool_plan_steps`), set in the
+dashboard's **Prime Autonomy Limits** panel (Health → Prime Brain) — which now has a **Tool plan**
+row for the standard/extended step limits — or via `relux-kernel prime agent-policy
+<status|configure>` (flags `--max-tool-plan-steps N` / `--ext-max-tool-plan-steps N`). To run long
+work: tell Prime to "keep working" / "use extended mode" (raises this turn to the extended profile),
+or click the **Keep working (extended)** button Prime offers when a limit is hit (which resumes the
+paused loop — see below).
 
 ### Resumable continuation (the real "keep working")
 
@@ -502,9 +516,15 @@ still without a brain choosing the tools.
   step is the same `{plugin, tool, args}` directive shape, where `plugin` is a synthetic
   `mcp:<server>` MCP server **or** a real installed plugin id. The plan is **fixed at
   task creation** — the brain never adds, removes, reorders, or chooses a step.
-- **Bounds + strict create-time validation (`TaskToolPlan::validate`, fail closed).** A
-  plan must be **non-empty** and carry **at most `MAX_TASK_TOOL_PLAN_STEPS` (5)** steps;
-  every step must have a **non-empty plugin + tool** (trimmed); and every step's
+- **Bounds + strict create-time validation (`TaskToolPlan::validate_with_limit`, fail
+  closed).** A plan must be **non-empty** and carry **at most the configured tool-plan
+  step limit** steps. That limit is the operator's
+  `PrimeAgentPolicy::max_tool_plan_steps` (standard, default **16** — aligned with the
+  orchestration width, replacing the retired toy `5`), clamped to an absolute hard ceiling
+  `MAX_TASK_TOOL_PLAN_STEPS_CEIL` (**64**, also the extended default). The static
+  `MAX_TASK_TOOL_PLAN_STEPS` (16) is the conservative default `validate()` uses where no
+  policy is threaded (tests/CLI). Every step must have a **non-empty plugin + tool**
+  (trimmed); and every step's
   serialized `args` must be **≤ `MAX_TASK_TOOL_PLAN_ARGS_BYTES` (256 KiB)** — mirroring
   the loopback request cap so a step can never carry args `call_tool` would itself
   reject. An empty plan, an over-long plan (never silently truncated), an empty
@@ -751,9 +771,11 @@ Files read before implementing:
 
 Run-driven path files: `crates/relux-core/src/task.rs` (`TaskToolCall` +
 `parse_task_tool_call` — the operator-named single directive type/parser; **plus
-`TaskToolPlan` + `TaskToolPlanError` + `parse_task_tool_plan` + `TaskToolPlan::validate`
-+ the `MAX_TASK_TOOL_PLAN_STEPS`/`MAX_TASK_TOOL_PLAN_ARGS_BYTES` bounds — the bounded
-multi-tool plan type/parser/validator**), `crates/relux-kernel/src/state.rs`
+`TaskToolPlan` + `TaskToolPlanError` + `parse_task_tool_plan` +
+`TaskToolPlan::validate_with_limit` + the configurable
+`PrimeAgentPolicy::max_tool_plan_steps` limit / `MAX_TASK_TOOL_PLAN_STEPS_CEIL` /
+`MAX_TASK_TOOL_PLAN_ARGS_BYTES` bounds — the bounded multi-tool plan
+type/parser/validator**), `crates/relux-kernel/src/state.rs`
 (`execute_local_run` routes a single directive — **or, before it, each step of a
 `tool_plan` in order, stopping on the first failure/denial** — through `call_tool`
 instead of echo, failing the run/task honestly on a gate refusal),

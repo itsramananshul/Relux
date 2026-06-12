@@ -59,6 +59,36 @@ presented as a capability).
   so the bound stays enforced at the new value.
 - **Files:** `crates/relux-kernel/src/prime_tools.rs`.
 
+### 3. Tool-plan step cap `5` → configurable policy (standard 16 / extended 64, ceiling 64)
+- **Was:** `relux_core::MAX_TASK_TOOL_PLAN_STEPS = 5` — a hidden toy constant baked into
+  `TaskToolPlan::validate`, `parse_task_tool_plan`, the Prime tool-plan proposal, the
+  task-create route, the dashboard builder copy, and several tests. A serious operator
+  multi-tool plan ("search, then read, then summarize, then file, then notify, then …")
+  was rejected at the sixth step with no way to raise it.
+- **Now:** a real **configurable policy**, folded into the existing operator-facing
+  autonomy surface (`relux_core::PrimeAgentPolicy`) alongside the agent-loop limits — the
+  Hermes `iteration_budget.py` precedent (a tunable bound, not a tiny constant) applied to
+  operator-authored plans. Two new fields: `max_tool_plan_steps` (standard, default **16**,
+  aligned with `MAX_ORCHESTRATION_STEPS`) and `extended_max_tool_plan_steps` (default
+  **64**), both clamped to the absolute hard backstop `MAX_TASK_TOOL_PLAN_STEPS_CEIL`
+  (**64**). `TaskToolPlan::validate_with_limit(max)` (clamped to the ceiling) is the new
+  operator-facing validator; the no-arg `validate()` keeps the conservative static default
+  (`MAX_TASK_TOOL_PLAN_STEPS`, now **16**) for tests/CLI. The configured limit is applied
+  consistently at: the **Prime tool-plan proposal** (`build_tool_plan_proposal`), the
+  **UI-created tool-run task** route (`create_task`), and **any policy route** (the new
+  `max_tool_plan_steps` / `extended_max_tool_plan_steps` fields on
+  `/v1/relux/prime/agent-policy` + the `prime agent-policy configure` CLI flags). The
+  permissive **run-driven read path** (`parse_task_tool_plan`) bounds only at the ceiling
+  so a plan created under a raised limit still reads back. An over-limit plan is a clean
+  `400` / blocking issue that **names the limit and how to raise it** — never silently
+  truncated. Dashboard: a **Tool plan** row in the Prime Autonomy Limits panel; the
+  builder takes the live limit (`MAX_TOOL_RUN_STEPS` fallback raised 5 → 16).
+- **Files:** `crates/relux-core/src/task.rs`, `crates/relux-core/src/prime.rs`,
+  `crates/relux-core/src/lib.rs`, `crates/relux-kernel/src/state.rs`,
+  `crates/relux-kernel/src/server.rs`, `crates/relux-kernel/src/main.rs`,
+  `apps/dashboard/src/api.ts`, `apps/dashboard/src/components/PrimeAgentPolicyPanel.tsx`,
+  `apps/dashboard/src/toolruntask.ts`.
+
 ---
 
 ## KEEP (with reason) — real guardrails, not toy caps
@@ -97,13 +127,6 @@ presented as a capability).
 
 ## LATER — real lifts, too large for this slice
 
-- **`MAX_TASK_TOOL_PLAN_STEPS = 5`** (operator-authored multi-tool plan): a documented bound
-  surfaced in `docs/mcp.md`, the Plugins "Create a tool-run task" form, `toolruntask.ts`, and
-  several tests. Raising it is reasonable (the plan is operator-authored and gated per step),
-  but it touches doc copy + UI labels + builder validation + tests. **Next step:** lift the
-  constant, then sweep the "1–5 steps" / "at most 5" copy in `docs/mcp.md`,
-  `apps/dashboard/src/{pages/Plugins.tsx,toolruntask.ts}`, and pin the new bound in the
-  builder + kernel `validate` tests.
 - **Orchestration step cap as an operator policy** (not just a raised constant): fold
   `MAX_ORCHESTRATION_STEPS` into a configurable policy alongside `PrimeAgentPolicy` so an
   operator can tune fan-out width per deployment. **Next step:** add an

@@ -74,6 +74,33 @@ pub struct PrimeAgentPolicy {
     pub extended_max_brain_rounds: u32,
     /// Extended profile: max wall-clock seconds for one chat turn's loop. `0` disables it.
     pub extended_max_duration_secs: u64,
+    /// Standard profile: max steps in an operator-authored / Prime-proposed multi-tool
+    /// plan ([`crate::task::TaskToolPlan`]). This is the per-deployment limit the
+    /// task-create route and the Prime tool-plan proposal enforce via
+    /// [`crate::task::TaskToolPlan::validate_with_limit`] — replacing the retired toy
+    /// hard-coded `5`. A plan is a fixed, gated-per-step sequence (not an agent loop), so
+    /// a serious default is safe; it is still bounded and clamped to
+    /// [`crate::task::MAX_TASK_TOOL_PLAN_STEPS_CEIL`].
+    ///
+    /// `#[serde(default)]` so a snapshot persisted before this field existed deserializes
+    /// with the serious default instead of failing the whole load.
+    #[serde(default = "default_max_tool_plan_steps")]
+    pub max_tool_plan_steps: u32,
+    /// Extended profile: max multi-tool-plan steps for an explicit long-work plan.
+    /// Substantially higher than standard, clamped to the same absolute ceiling.
+    #[serde(default = "default_extended_max_tool_plan_steps")]
+    pub extended_max_tool_plan_steps: u32,
+}
+
+/// Serde default for [`PrimeAgentPolicy::max_tool_plan_steps`] (older snapshots) — the
+/// serious standard width aligned with [`crate::MAX_ORCHESTRATION_STEPS`].
+fn default_max_tool_plan_steps() -> u32 {
+    crate::task::MAX_TASK_TOOL_PLAN_STEPS as u32
+}
+
+/// Serde default for [`PrimeAgentPolicy::extended_max_tool_plan_steps`] (older snapshots).
+fn default_extended_max_tool_plan_steps() -> u32 {
+    crate::task::MAX_TASK_TOOL_PLAN_STEPS_CEIL as u32
 }
 
 impl PrimeAgentPolicy {
@@ -87,6 +114,10 @@ impl PrimeAgentPolicy {
     pub const MAX_BRAIN_ROUNDS_CEIL: u32 = 1024;
     /// The largest wall-clock cap (24h); `0` (disabled) is also allowed.
     pub const MAX_DURATION_CEIL: u64 = 86_400;
+    /// The largest a multi-tool-plan step limit may be set to — the absolute hard backstop
+    /// shared with the read path ([`crate::task::MAX_TASK_TOOL_PLAN_STEPS_CEIL`]). A single
+    /// source of truth so a configured limit and the read-back bound can never drift.
+    pub const MAX_TOOL_PLAN_STEPS_CEIL: u32 = crate::task::MAX_TASK_TOOL_PLAN_STEPS_CEIL as u32;
 
     /// Clamp every field into its safe operator range. Defensive — the route clamps too, but any
     /// path that mutates the policy can call this so an out-of-range value never reaches the loop.
@@ -102,6 +133,10 @@ impl PrimeAgentPolicy {
             self.extended_max_brain_rounds.clamp(Self::MIN_STEPS, Self::MAX_BRAIN_ROUNDS_CEIL);
         self.extended_max_duration_secs =
             self.extended_max_duration_secs.min(Self::MAX_DURATION_CEIL);
+        self.max_tool_plan_steps =
+            self.max_tool_plan_steps.clamp(Self::MIN_STEPS, Self::MAX_TOOL_PLAN_STEPS_CEIL);
+        self.extended_max_tool_plan_steps =
+            self.extended_max_tool_plan_steps.clamp(Self::MIN_STEPS, Self::MAX_TOOL_PLAN_STEPS_CEIL);
         self
     }
 
@@ -115,6 +150,7 @@ impl PrimeAgentPolicy {
                 max_tool_calls: c.extended_max_tool_calls,
                 max_brain_rounds: c.extended_max_brain_rounds,
                 max_duration_secs: c.extended_max_duration_secs,
+                max_tool_plan_steps: c.extended_max_tool_plan_steps,
             }
         } else {
             PrimeAgentLimits {
@@ -122,8 +158,17 @@ impl PrimeAgentPolicy {
                 max_tool_calls: c.max_tool_calls,
                 max_brain_rounds: c.max_brain_rounds,
                 max_duration_secs: c.max_duration_secs,
+                max_tool_plan_steps: c.max_tool_plan_steps,
             }
         }
+    }
+
+    /// The effective, clamped multi-tool-plan step limit for the requested mode — the
+    /// single accessor every operator-facing tool-plan surface (task-create route, Prime
+    /// proposal) uses to bound a plan, so the limit is read from one place. `extended`
+    /// selects the higher long-work profile.
+    pub fn tool_plan_steps(&self, extended: bool) -> usize {
+        self.limits(extended).max_tool_plan_steps as usize
     }
 }
 
@@ -140,6 +185,10 @@ impl Default for PrimeAgentPolicy {
             extended_max_tool_calls: 64,
             extended_max_brain_rounds: 96,
             extended_max_duration_secs: 1_800,
+            // Standard tool-plan width aligns with MAX_ORCHESTRATION_STEPS (16) — a serious
+            // multi-step plan, not the retired toy 5. Extended rises to the absolute ceiling.
+            max_tool_plan_steps: crate::task::MAX_TASK_TOOL_PLAN_STEPS as u32,
+            extended_max_tool_plan_steps: crate::task::MAX_TASK_TOOL_PLAN_STEPS_CEIL as u32,
         }
     }
 }
@@ -157,6 +206,8 @@ pub struct PrimeAgentLimits {
     pub max_brain_rounds: u32,
     /// Max wall-clock seconds for the turn's loop; `0` means no wall-clock cap.
     pub max_duration_secs: u64,
+    /// Max steps in a multi-tool plan created/proposed under this profile.
+    pub max_tool_plan_steps: u32,
 }
 
 /// The result of a single Prime autonomy tick.
@@ -1363,6 +1414,11 @@ mod tests {
         assert!(p.extended_max_tool_calls > p.max_tool_calls);
         assert!(p.extended_max_brain_rounds > p.max_brain_rounds);
         assert!(p.extended_max_tool_calls <= PrimeAgentPolicy::MAX_TOOL_CALLS_CEIL);
+        // Tool-plan width: the standard default beats the retired toy 5, extended is higher
+        // still, and both stay within the absolute ceiling.
+        assert!(p.max_tool_plan_steps > 5, "standard tool-plan steps must beat the toy 5");
+        assert!(p.extended_max_tool_plan_steps > p.max_tool_plan_steps);
+        assert!(p.extended_max_tool_plan_steps <= PrimeAgentPolicy::MAX_TOOL_PLAN_STEPS_CEIL);
     }
 
     #[test]
@@ -1374,6 +1430,10 @@ mod tests {
         assert_eq!(std.max_tool_calls, p.max_tool_calls);
         assert_eq!(ext.max_tool_calls, p.extended_max_tool_calls);
         assert!(ext.max_tool_calls > std.max_tool_calls, "extended must allow more tool calls");
+        // The tool-plan step limit resolves per mode too, extended higher than standard.
+        assert_eq!(std.max_tool_plan_steps, p.max_tool_plan_steps);
+        assert_eq!(ext.max_tool_plan_steps, p.extended_max_tool_plan_steps);
+        assert!(p.tool_plan_steps(true) > p.tool_plan_steps(false), "extended plan allows more steps");
         // An out-of-range policy is clamped to the safe ceilings (no "infinite").
         let wild = PrimeAgentPolicy {
             max_tool_calls: 0,
@@ -1382,6 +1442,8 @@ mod tests {
             extended_max_tool_calls: u32::MAX,
             extended_max_brain_rounds: u32::MAX,
             extended_max_duration_secs: u64::MAX,
+            max_tool_plan_steps: 0,
+            extended_max_tool_plan_steps: u32::MAX,
         }
         .clamped();
         assert_eq!(wild.max_tool_calls, PrimeAgentPolicy::MIN_STEPS);
@@ -1389,6 +1451,8 @@ mod tests {
         assert_eq!(wild.max_duration_secs, PrimeAgentPolicy::MAX_DURATION_CEIL);
         assert_eq!(wild.extended_max_tool_calls, PrimeAgentPolicy::MAX_TOOL_CALLS_CEIL);
         assert_eq!(wild.extended_max_duration_secs, PrimeAgentPolicy::MAX_DURATION_CEIL);
+        assert_eq!(wild.max_tool_plan_steps, PrimeAgentPolicy::MIN_STEPS);
+        assert_eq!(wild.extended_max_tool_plan_steps, PrimeAgentPolicy::MAX_TOOL_PLAN_STEPS_CEIL);
     }
 
     #[test]

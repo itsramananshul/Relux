@@ -1934,6 +1934,11 @@ export interface ReluxPrimeAgentPolicy {
   extended_max_tool_calls: number;
   extended_max_brain_rounds: number;
   extended_max_duration_secs: number;
+  // The configurable multi-tool-PLAN step limit (operator-authored / Prime-proposed
+  // tool plans), replacing the retired hard-coded 5. Standard + extended, both clamped
+  // to an absolute ceiling on the server.
+  max_tool_plan_steps: number;
+  extended_max_tool_plan_steps: number;
 }
 
 // The resolved per-turn limits for one profile (clamped on the server).
@@ -1942,6 +1947,7 @@ export interface ReluxPrimeAgentLimits {
   max_tool_calls: number;
   max_brain_rounds: number;
   max_duration_secs: number;
+  max_tool_plan_steps: number;
 }
 
 export interface ReluxPrimeAgentPolicyResponse {

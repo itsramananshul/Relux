@@ -2509,8 +2509,15 @@ async fn create_task(
             built
         }
         (None, Some(steps)) => {
+            // A UI-created tool-run task is an ordinary (standard-profile) operator action,
+            // so it is bounded by the CONFIGURED standard tool-plan step limit (not a
+            // hard-coded constant). Over-limit is an honest 400 naming the limit — never a
+            // silent truncation. (`docs/ARTIFICIAL_CONSTRAINT_AUDIT.md` configurable
+            // tool-plan policy; `docs/mcp.md` "Run-driven multi-tool plan".)
+            let max_steps =
+                locked_read(&state, |kernel| Ok(kernel.prime_agent_policy.tool_plan_steps(false)))?;
             let plan = relux_core::TaskToolPlan { steps: steps.clone() };
-            plan.validate()
+            plan.validate_with_limit(max_steps)
                 .map_err(|e| ApiError::bad_request(e.to_string()))?;
             let built = plan.to_input();
             // Defensive: the validated plan must also read back as a plan (it always
@@ -5321,6 +5328,8 @@ struct UpdateAgentPolicyReq {
     extended_max_tool_calls: Option<u32>,
     extended_max_brain_rounds: Option<u32>,
     extended_max_duration_secs: Option<u64>,
+    max_tool_plan_steps: Option<u32>,
+    extended_max_tool_plan_steps: Option<u32>,
 }
 
 /// PUT/PATCH `/v1/relux/prime/agent-policy` — update one or more autonomy ceilings. Every field is
@@ -5349,6 +5358,12 @@ async fn update_agent_policy(
         }
         if let Some(v) = req.extended_max_duration_secs {
             config.extended_max_duration_secs = v;
+        }
+        if let Some(v) = req.max_tool_plan_steps {
+            config.max_tool_plan_steps = v;
+        }
+        if let Some(v) = req.extended_max_tool_plan_steps {
+            config.extended_max_tool_plan_steps = v;
         }
         // Clamp into the safe ranges before it can reach the loop.
         config = config.clamped();
@@ -9739,6 +9754,14 @@ mod tests {
                 > v["standard"]["max_tool_calls"].as_u64().unwrap(),
             "extended profile must allow more than standard"
         );
+        // The configurable tool-plan step limit is part of the surface: standard beats the
+        // retired toy 5, extended is higher still.
+        assert!(v["config"]["max_tool_plan_steps"].as_u64().unwrap() > 5, "standard plan steps beat 5");
+        assert!(
+            v["extended"]["max_tool_plan_steps"].as_u64().unwrap()
+                > v["standard"]["max_tool_plan_steps"].as_u64().unwrap(),
+            "extended profile must allow more plan steps than standard"
+        );
     }
 
     #[tokio::test]
@@ -9882,13 +9905,52 @@ mod tests {
 
     #[tokio::test]
     async fn create_task_with_too_many_plan_steps_is_rejected() {
-        // A plan over MAX_TASK_TOOL_PLAN_STEPS is a 400 — never silently truncated.
+        // A plan over the configured standard tool-plan limit (default == the static
+        // MAX_TASK_TOOL_PLAN_STEPS) is a 400 — never silently truncated — and the message
+        // names the limit so the operator knows what to raise.
         let (state, _dir) = auth_state(true);
         let step = r#"{"plugin":"mcp:fs","tool":"search"}"#;
         let steps = [step; relux_core::MAX_TASK_TOOL_PLAN_STEPS + 1].join(",");
         let body = format!(r#"{{"title":"toomany","tool_plan":[{steps}]}}"#);
         let (status, _, b) = call(&state, "POST", "/v1/relux/tasks", None, Some(&body)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{b}");
+        assert!(
+            b.contains(&relux_core::MAX_TASK_TOOL_PLAN_STEPS.to_string())
+                && b.contains("maximum"),
+            "the limit is named in the rejection: {b}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_task_with_more_than_five_plan_steps_is_accepted() {
+        // The retired toy cap was 5. The configurable standard default (16) must now permit
+        // a serious multi-step plan that the old constant would have rejected.
+        let (state, _dir) = auth_state(true);
+        let step = r#"{"plugin":"mcp:fs","tool":"search"}"#;
+        let steps = [step; 8].join(",");
+        let body = format!(r#"{{"title":"eight-step","tool_plan":[{steps}]}}"#);
+        let (status, _, b) = call(&state, "POST", "/v1/relux/tasks", None, Some(&body)).await;
+        assert_eq!(status, StatusCode::OK, "an 8-step plan must be accepted now: {b}");
+        let task: serde_json::Value = serde_json::from_str(&b).unwrap();
+        assert_eq!(task["input"]["tool_plan"].as_array().unwrap().len(), 8);
+    }
+
+    #[tokio::test]
+    async fn create_task_tool_plan_honors_the_configured_limit() {
+        // The route reads the CONFIGURED standard limit, not a constant. Lower it to 2 and a
+        // 3-step plan is rejected naming that limit; the SAME plan was fine at the default.
+        let (state, _dir) = auth_state(true);
+        let three = [r#"{"plugin":"mcp:fs","tool":"search"}"#; 3].join(",");
+        let body = format!(r#"{{"title":"three","tool_plan":[{three}]}}"#);
+        let (ok_status, _, _ob) = call(&state, "POST", "/v1/relux/tasks", None, Some(&body)).await;
+        assert_eq!(ok_status, StatusCode::OK, "3 steps fits the default limit");
+
+        let patch = r#"{"max_tool_plan_steps":2}"#;
+        let (ps, _, _pb) = call(&state, "PATCH", "/v1/relux/prime/agent-policy", None, Some(patch)).await;
+        assert_eq!(ps, StatusCode::OK);
+        let (rej, _, rb) = call(&state, "POST", "/v1/relux/tasks", None, Some(&body)).await;
+        assert_eq!(rej, StatusCode::BAD_REQUEST, "now over the lowered limit: {rb}");
+        assert!(rb.contains("maximum is 2"), "the lowered limit is named: {rb}");
     }
 
     #[tokio::test]
