@@ -275,8 +275,41 @@ tail-redacted preview. Relux ports that posture to the relux layer.
   rest is protected by file permissions (no OS keychain / DPAPI integration yet), so it
   is hardened-but-not-encrypted. Secret **rotation** is manual (set the same name again).
   `env` resolution is **per-process** — a running managed process keeps the env it was
-  started with; change a secret and **Restart** to pick it up. Adapters do not yet
-  consume the store (the foundation is shared, the wiring is a future slice).
+  started with; change a secret and **Restart** to pick it up. The **Prime brain
+  provider** (OpenRouter) now consumes the store by reference (see "Prime brain provider
+  key by reference" below); the CLI adapters (Claude/Codex) authenticate through their
+  own local CLI login and need no key here.
+
+### Prime brain provider key by reference (OpenRouter)
+
+Spec: `docs/RELUX_MASTER_PLAN.md` §8.1 (adapter plugins) + "Optional LLM-backed Prime".
+
+The OpenRouter brain (the one HTTP/API provider that takes a key) sources its API key
+by **secret reference**, exactly like a managed-stdio server's `env`: the key value lives
+**only** in the write-only secret store, and the AI config carries only the secret's
+**name**.
+
+- **Stored as a reference, never plaintext.** `relux_kernel::StoredAiConfig` has an
+  `api_key_secret` field (the secret NAME) that is **mutually exclusive** with the legacy
+  plaintext `api_key` — `write_stored_config` clears one when the other is set, so there
+  is a single source of truth. The dashboard writes **only** `api_key_secret`; it never
+  sends or stores a plaintext key. (`api_key` remains only for the legacy env/CLI path.)
+- **Resolved at request time, off-snapshot.** `AiConfig::resolve` (and the pure,
+  testable `AiConfig::resolve_with`) resolves the referenced secret to plaintext through
+  the **same** `secret_store()` at the moment Prime needs it, holds it privately on the
+  in-memory `AiConfig`, and uses it only in the `Authorization` header
+  (`request_completion`). The plaintext is never serialized, logged, or returned.
+- **Missing secret fails cleanly.** If `api_key_secret` names a secret that is not set,
+  resolution yields **no usable key**, `AiStatus { configured: false, secret_missing:
+  true }`, and a `reason` that **names the missing secret** and what to do — Prime stays
+  deterministic instead of silently failing. No raw key ever appears.
+- **Status is key-free.** `GET /v1/relux/ai/status` returns the brain, `configured`,
+  `secret_missing`, and the referenced `api_key_secret` **name** (never the value).
+- **Set it from the dashboard.** The Prime Brain panel → OpenRouter → **Prime AI
+  settings** (`PrimeAiSettings`) offers a secret **picker** (existing secrets, by name +
+  redacted preview) plus an inline **"Create a new secret…"** (write-only value) that
+  stores the key in the secret store and references it in one step. "Clear key reference"
+  drops the reference without deleting the stored secret.
 
 ### Operating it (dashboard)
 

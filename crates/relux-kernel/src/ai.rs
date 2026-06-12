@@ -86,8 +86,10 @@ const MAX_POLISH_RISKS: usize = 4;
 /// see [`AiStatus`], which is the only thing this config exposes to the wire.
 #[derive(Debug, Clone)]
 pub struct AiConfig {
-    /// Present only when a non-empty `RELUX_OPENROUTER_API_KEY` was set. Private
-    /// by construction: nothing serializes or logs this.
+    /// The resolved plaintext API key, or `None`. Sourced (in precedence order)
+    /// from the referenced secret in the local secret store, a legacy plaintext
+    /// value in the config file, or `RELUX_OPENROUTER_API_KEY`. Private by
+    /// construction: nothing serializes or logs this.
     api_key: Option<String>,
     /// The model id to request (resolved, never empty).
     pub model: String,
@@ -98,6 +100,15 @@ pub struct AiConfig {
     /// The explicitly-selected Prime brain, or `None` for the legacy auto choice
     /// (OpenRouter when a key is present and not disabled, otherwise Local).
     pub brain: Option<PrimeBrain>,
+    /// The NAME of the secret referenced for the API key, when the operator
+    /// selected the key by reference (the preferred, write-only path). This is the
+    /// secret's name only — never its value — kept so the status surface can show
+    /// which secret is in use and whether it currently resolves.
+    pub api_key_secret: Option<String>,
+    /// `true` when [`AiConfig::api_key_secret`] names a secret that is NOT present
+    /// in the secret store (so no usable key was resolved). Drives a clear
+    /// "missing secret" status instead of a silent fall-through.
+    pub secret_missing: bool,
 }
 
 impl AiConfig {
@@ -153,6 +164,8 @@ impl AiConfig {
             disabled,
             timeout_ms,
             brain: None,
+            api_key_secret: None,
+            secret_missing: false,
         }
     }
 
@@ -208,16 +221,28 @@ impl AiConfig {
             PrimeBrain::CodexCli => AiMode::CodexCli,
         };
         let reason = match brain {
-            PrimeBrain::Openrouter if self.enabled() => format!(
-                "OpenRouter configured; conversational replies use {}. Actions stay deterministic and kernel-grounded.",
-                self.model
-            ),
+            PrimeBrain::Openrouter if self.enabled() => match &self.api_key_secret {
+                Some(name) => format!(
+                    "OpenRouter configured; key from secret '{name}'. Conversational replies use {}. Actions stay deterministic and kernel-grounded.",
+                    self.model
+                ),
+                None => format!(
+                    "OpenRouter configured; conversational replies use {}. Actions stay deterministic and kernel-grounded.",
+                    self.model
+                ),
+            },
             PrimeBrain::Openrouter if self.configured() && self.disabled => {
                 "An OpenRouter key is set but RELUX_LLM_DISABLED forces deterministic Prime."
                     .to_string()
             }
+            PrimeBrain::Openrouter if self.secret_missing => match &self.api_key_secret {
+                Some(name) => format!(
+                    "OpenRouter brain selected but the referenced secret '{name}' is not set; add it under Secrets and Prime activates the key automatically. Until then Prime stays deterministic."
+                ),
+                None => "OpenRouter brain selected but its API key secret is missing; Prime stays deterministic until you set it.".to_string(),
+            },
             PrimeBrain::Openrouter => {
-                "OpenRouter brain selected but no API key is configured; Prime stays deterministic until you add one."
+                "OpenRouter brain selected but no API key is configured; Prime stays deterministic until you add one (set a secret, then reference it here)."
                     .to_string()
             }
             PrimeBrain::ClaudeCli => {
@@ -239,6 +264,8 @@ impl AiConfig {
             disabled: self.disabled,
             model: self.model.clone(),
             timeout_ms: self.timeout_ms,
+            api_key_secret: self.api_key_secret.clone(),
+            secret_missing: self.secret_missing,
             reason,
         }
     }
@@ -253,6 +280,30 @@ impl AiConfig {
     /// existing CLI-only `RELUX_OPENROUTER_*` setup keeps working. The key is held
     /// privately and is never serialized back out (see [`AiStatus`]).
     pub fn resolve(path: Option<&Path>) -> Self {
+        Self::resolve_with(path, |name| {
+            crate::secret_store::secret_store().resolve(name)
+        })
+    }
+
+    /// Resolve the effective config like [`AiConfig::resolve`], but with an
+    /// injected secret resolver so the key-by-reference path is unit-testable
+    /// without the process-global secret store.
+    ///
+    /// Key-source precedence (highest first):
+    /// 1. A referenced secret (`StoredAiConfig::api_key_secret`) resolved through
+    ///    `resolve_secret`. If the named secret is absent/blank the key is treated
+    ///    as missing — `secret_missing` is set and no key is used (no silent
+    ///    fall-through to a stale plaintext value).
+    /// 2. A legacy plaintext key stored in the config file (`api_key`).
+    /// 3. The `RELUX_OPENROUTER_API_KEY` environment value.
+    ///
+    /// The resolved plaintext is held privately and is never serialized; only the
+    /// secret NAME (never its value) is carried on the config for the status
+    /// surface.
+    pub fn resolve_with(
+        path: Option<&Path>,
+        resolve_secret: impl Fn(&str) -> Option<String>,
+    ) -> Self {
         let env = Self::from_env();
         let Some(path) = path else {
             return env;
@@ -260,11 +311,6 @@ impl AiConfig {
         let Some(stored) = read_stored_config(path) else {
             return env;
         };
-        let api_key = stored
-            .api_key
-            .map(|k| k.trim().to_string())
-            .filter(|k| !k.is_empty())
-            .or(env.api_key);
         let model = stored
             .model
             .map(|m| m.trim().to_string())
@@ -276,12 +322,35 @@ impl AiConfig {
             .as_deref()
             .and_then(PrimeBrain::parse)
             .or(env.brain);
+
+        let secret_name = stored
+            .api_key_secret
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let (api_key, api_key_secret, secret_missing) = match secret_name {
+            Some(name) => match resolve_secret(&name) {
+                Some(v) if !v.trim().is_empty() => (Some(v), Some(name), false),
+                // Referenced but unset/blank: surface a clean missing-secret state
+                // and use no key (never fall back to a stale plaintext value).
+                _ => (None, Some(name), true),
+            },
+            None => {
+                let plain = stored
+                    .api_key
+                    .map(|k| k.trim().to_string())
+                    .filter(|k| !k.is_empty())
+                    .or(env.api_key);
+                (plain, None, false)
+            }
+        };
         Self {
             api_key,
             model,
             disabled,
             timeout_ms: env.timeout_ms,
             brain,
+            api_key_secret,
+            secret_missing,
         }
     }
 }
@@ -301,9 +370,18 @@ pub struct StoredAiConfig {
     /// forward-compatibility and so the dashboard can show what is configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
-    /// The OpenRouter API key. Present only when the operator configured one.
+    /// A legacy plaintext OpenRouter API key. Present only when an older config
+    /// stored one directly; the dashboard no longer writes this — it references a
+    /// secret instead (see [`StoredAiConfig::api_key_secret`]). Kept for backward
+    /// compatibility and the env/CLI path; mutually exclusive with `api_key_secret`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// The NAME of a secret in the local secret store that holds the API key. This
+    /// is the preferred, write-only path: the config (and every API response)
+    /// stores only the reference, never the value — the plaintext is resolved from
+    /// the store at request time. Mutually exclusive with `api_key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_secret: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -324,14 +402,17 @@ pub fn read_stored_config(path: &Path) -> Option<StoredAiConfig> {
 /// Persist (merge) the dashboard-configured AI settings to `path`.
 ///
 /// Each `Some` field is applied over any existing file so a partial update keeps
-/// the rest; passing `api_key: Some("")` (or whitespace) clears the stored key
-/// without disturbing the model/disabled flags. Parent directories are created.
-/// On Unix the file is written `0600`. Returns an io error on failure; never logs
-/// the key.
+/// the rest; passing `api_key: Some("")` / `api_key_secret: Some("")` (or
+/// whitespace) clears that source without disturbing the model/disabled flags.
+/// The plaintext `api_key` and the `api_key_secret` reference are mutually
+/// exclusive: setting one (to a non-empty value) clears the other so there is a
+/// single source of truth for the key. Parent directories are created. On Unix
+/// the file is written `0600`. Returns an io error on failure; never logs the key.
 pub fn write_stored_config(
     path: &Path,
     provider: Option<String>,
     api_key: Option<String>,
+    api_key_secret: Option<String>,
     model: Option<String>,
     disabled: Option<bool>,
     brain: Option<String>,
@@ -343,7 +424,25 @@ pub fn write_stored_config(
     }
     if let Some(k) = api_key {
         let k = k.trim().to_string();
-        current.api_key = if k.is_empty() { None } else { Some(k) };
+        if k.is_empty() {
+            current.api_key = None;
+        } else {
+            // A plaintext key supersedes any secret reference — keep one source of
+            // truth so a stale reference can't shadow the value just set.
+            current.api_key = Some(k);
+            current.api_key_secret = None;
+        }
+    }
+    if let Some(s) = api_key_secret {
+        let s = s.trim().to_string();
+        if s.is_empty() {
+            current.api_key_secret = None;
+        } else {
+            // A secret reference supersedes any stored plaintext key (the secure
+            // path wins): the value lives only in the write-only secret store.
+            current.api_key_secret = Some(s);
+            current.api_key = None;
+        }
     }
     if let Some(m) = model {
         let m = m.trim().to_string();
@@ -459,11 +558,20 @@ pub struct AiStatus {
     /// The selected Prime brain wire string (`local` | `openrouter` |
     /// `claude_cli` | `codex_cli`).
     pub brain: String,
-    /// Whether an API key is present (never the key itself).
+    /// Whether a usable API key is present (never the key itself). `false` when a
+    /// referenced secret is missing (see [`AiStatus::secret_missing`]).
     pub configured: bool,
     pub disabled: bool,
     pub model: String,
     pub timeout_ms: u64,
+    /// The NAME of the secret the API key is referenced from (never the value), or
+    /// `null` when the key is configured another way / not configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_secret: Option<String>,
+    /// `true` when [`AiStatus::api_key_secret`] names a secret that is not set in
+    /// the secret store, so no key was resolved. The dashboard shows a clear
+    /// "set this secret" prompt rather than a silent deterministic fallback.
+    pub secret_missing: bool,
     /// A human-readable, secret-free explanation of the current mode.
     pub reason: String,
 }
@@ -1519,10 +1627,14 @@ mod tests {
                 "mode",
                 "model",
                 "reason",
+                "secret_missing",
                 "timeout_ms"
             ]
         );
+        // No plaintext key under any name. `api_key_secret` is omitted entirely
+        // here (this config used a plaintext key, not a reference).
         assert!(!obj.contains_key("api_key"));
+        assert!(!obj.contains_key("api_key_secret"));
     }
 
     #[test]
@@ -1611,6 +1723,7 @@ mod tests {
             &path,
             Some("openrouter".into()),
             Some(secret.clone()),
+            None,
             Some("anthropic/claude-3.5-haiku".into()),
             None,
             None,
@@ -1626,13 +1739,13 @@ mod tests {
         assert!(!json.contains(&secret), "status leaked the key: {json}");
 
         // A partial update keeps the key but flips disabled.
-        write_stored_config(&path, None, None, None, Some(true), None).unwrap();
+        write_stored_config(&path, None, None, None, None, Some(true), None).unwrap();
         let resolved = AiConfig::resolve(Some(&path));
         assert!(resolved.configured(), "key preserved across partial update");
         assert!(!resolved.enabled(), "disabled flag applied");
 
         // Clearing only the key (empty string) removes it.
-        write_stored_config(&path, None, Some("   ".into()), None, None, None).unwrap();
+        write_stored_config(&path, None, Some("   ".into()), None, None, None, None).unwrap();
         let resolved = AiConfig::resolve(Some(&path));
         assert!(!resolved.configured(), "blank key clears the stored key");
 
@@ -1640,6 +1753,112 @@ mod tests {
         clear_stored_config(&path).unwrap();
         assert!(!path.exists());
         assert!(!AiConfig::resolve(Some(&path)).configured());
+    }
+
+    #[test]
+    fn provider_key_resolves_from_a_secret_reference_without_storing_plaintext() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ai-config.json");
+
+        // The dashboard path: store ONLY a reference to a named secret, never the
+        // value. The config file must not contain the plaintext key.
+        let secret_value = ["sk", "or", "v1", "REFERENCED-NEVER-IN-CONFIG"].join("-");
+        write_stored_config(
+            &path,
+            Some("openrouter".into()),
+            None,
+            Some("openrouter_api_key".into()),
+            None,
+            None,
+            Some("openrouter".into()),
+        )
+        .unwrap();
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !on_disk.contains(&secret_value),
+            "config file must never carry the plaintext key: {on_disk}"
+        );
+        assert!(
+            on_disk.contains("openrouter_api_key"),
+            "config keeps the secret NAME reference: {on_disk}"
+        );
+
+        // Resolve with a store that HAS the secret: the key is usable, enabled,
+        // and the status carries the secret name but never the value.
+        let resolved = AiConfig::resolve_with(Some(&path), |name| {
+            if name == "openrouter_api_key" {
+                Some(secret_value.clone())
+            } else {
+                None
+            }
+        });
+        assert!(resolved.configured(), "referenced secret resolves to a key");
+        assert!(resolved.enabled());
+        assert!(!resolved.secret_missing);
+        assert_eq!(resolved.api_key_secret.as_deref(), Some("openrouter_api_key"));
+        let json = serde_json::to_string(&resolved.status()).unwrap();
+        assert!(
+            !json.contains(&secret_value),
+            "status leaked the resolved key: {json}"
+        );
+        assert!(json.contains("openrouter_api_key"), "status names the secret");
+    }
+
+    #[test]
+    fn missing_referenced_secret_fails_cleanly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ai-config.json");
+        write_stored_config(
+            &path,
+            Some("openrouter".into()),
+            None,
+            Some("absent_key".into()),
+            None,
+            None,
+            Some("openrouter".into()),
+        )
+        .unwrap();
+
+        // The store does not have the secret -> no usable key, a clean missing
+        // state, never a leak, and Prime stays deterministic (not enabled).
+        let resolved = AiConfig::resolve_with(Some(&path), |_| None);
+        assert!(!resolved.configured(), "missing secret => no usable key");
+        assert!(!resolved.enabled());
+        assert!(resolved.secret_missing, "missing-secret state is surfaced");
+        assert_eq!(resolved.api_key_secret.as_deref(), Some("absent_key"));
+        let status = resolved.status();
+        assert!(status.secret_missing);
+        assert!(
+            status.reason.contains("absent_key") && status.reason.contains("not set"),
+            "reason should name the missing secret and what to do: {}",
+            status.reason
+        );
+    }
+
+    #[test]
+    fn secret_reference_and_plaintext_key_are_mutually_exclusive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ai-config.json");
+
+        // Start with a legacy plaintext key.
+        let legacy = ["sk", "or", "LEGACY-PLAINTEXT"].join("-");
+        write_stored_config(&path, None, Some(legacy.clone()), None, None, None, None).unwrap();
+        assert_eq!(
+            read_stored_config(&path).unwrap().api_key.as_deref(),
+            Some(legacy.as_str())
+        );
+
+        // Setting a secret reference clears the stored plaintext key.
+        write_stored_config(&path, None, None, Some("ref_name".into()), None, None, None).unwrap();
+        let stored = read_stored_config(&path).unwrap();
+        assert_eq!(stored.api_key, None, "plaintext cleared by secret ref");
+        assert_eq!(stored.api_key_secret.as_deref(), Some("ref_name"));
+
+        // Setting a plaintext key again clears the reference.
+        write_stored_config(&path, None, Some(legacy.clone()), None, None, None, None).unwrap();
+        let stored = read_stored_config(&path).unwrap();
+        assert_eq!(stored.api_key_secret, None, "ref cleared by plaintext key");
+        assert_eq!(stored.api_key.as_deref(), Some(legacy.as_str()));
     }
 
     #[test]
@@ -1708,11 +1927,12 @@ mod tests {
     fn brain_persists_through_stored_config() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("ai-config.json");
-        write_stored_config(&path, None, None, None, None, Some("claude_cli".into())).unwrap();
+        write_stored_config(&path, None, None, None, None, None, Some("claude_cli".into()))
+            .unwrap();
         let resolved = AiConfig::resolve(Some(&path));
         assert_eq!(resolved.effective_brain(), PrimeBrain::ClaudeCli);
         // An unknown brain string clears the selection (back to auto).
-        write_stored_config(&path, None, None, None, None, Some("nope".into())).unwrap();
+        write_stored_config(&path, None, None, None, None, None, Some("nope".into())).unwrap();
         let resolved = AiConfig::resolve(Some(&path));
         assert_eq!(resolved.brain, None);
     }

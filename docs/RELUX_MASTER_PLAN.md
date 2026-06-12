@@ -3716,16 +3716,24 @@ in kernel state.
   absolute grounding. The LLM is never asked to narrate real state changes.
 - **Conversational Shaping**: For greetings, status queries, and general chat, the
   LLM rephrases the kernel's grounded facts into natural dialogue.
-- **Configuration (dashboard, recommended; no env vars)**: Health → Prime AI
-  settings lets an operator set the OpenRouter key/model without environment
-  variables (§18: "do not hardcode one model provider"). The key is stored in a
-  local, gitignored secrets file under the data root (`<data-root>/ai-config.json`,
-  `0600` on Unix), is resolved live by `serve`/CLI, and is **never** returned by the
-  API. Endpoints:
-  - `GET /v1/relux/ai/status` — key-free status (mode/configured/model/reason).
-  - `PUT /v1/relux/ai/config` — `{ provider:"openrouter", api_key, model?, disabled? }`.
-  - `DELETE /v1/relux/ai/config` — clear the stored key/config.
-  Only OpenRouter takes a key; Claude/Codex adapters use their own local CLI login.
+- **Configuration (dashboard, recommended; no env vars)**: Prime Brain → OpenRouter →
+  Prime AI settings lets an operator point Prime at an OpenRouter key/model without
+  environment variables (§18: "do not hardcode one model provider"). The key is supplied
+  **by reference**: its value lives write-only in the local secret store, and the AI
+  config (`<data-root>/ai-config.json`, `0600` on Unix) stores **only the secret's name**
+  (`api_key_secret`), never the value. It is resolved live by `serve`/CLI through the same
+  `secret_store()` and is **never** returned by the API (see `docs/mcp.md` "Prime brain
+  provider key by reference"). Endpoints:
+  - `GET /v1/relux/ai/status` — key-free status (mode/configured/`secret_missing`/
+    referenced `api_key_secret` name/model/reason).
+  - `PUT /v1/relux/ai/config` — `{ provider:"openrouter", api_key_secret, model?,
+    disabled? }` (the dashboard sends the secret NAME, not a key; the legacy plaintext
+    `api_key` field is still accepted for env/CLI setups and is mutually exclusive with
+    `api_key_secret`).
+  - `DELETE /v1/relux/ai/config` — clear the stored config (reference + model).
+  A referenced secret that is not set yields a clean `secret_missing` status (Prime stays
+  deterministic, the reason names the missing secret) — no raw key ever leaks. Only
+  OpenRouter takes a key; Claude/Codex adapters use their own local CLI login.
 - **Configuration (environment, CLI-only setups)**:
   - `RELUX_OPENROUTER_API_KEY`: Enables OpenRouter when set.
   - `RELUX_OPENROUTER_MODEL`: Model ID (default `openai/gpt-4o-mini`).

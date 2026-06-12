@@ -2207,11 +2207,18 @@ export interface ReluxAiStatus {
     | "codex_cli";
   /// The selected Prime brain.
   brain: ReluxPrimeBrain;
-  /// Whether an OpenRouter API key is present (never the key itself).
+  /// Whether a usable OpenRouter API key is present (never the key itself).
+  /// `false` when a referenced secret is missing (see `secret_missing`).
   configured: boolean;
   disabled: boolean;
   model: string;
   timeout_ms: number;
+  /// The NAME of the secret the API key is referenced from (never the value), or
+  /// absent when the key is configured another way / not configured.
+  api_key_secret?: string | null;
+  /// True when `api_key_secret` names a secret that is not set in the secret
+  /// store, so no key was resolved — the UI prompts to set that secret.
+  secret_missing: boolean;
   /// A human-readable, secret-free explanation of the current mode.
   reason: string;
 }
@@ -2252,12 +2259,16 @@ export const reluxAi = {
   status: () => api.get<ReluxAiStatus>("/v1/relux/ai/status"),
   // Configure Prime's AI provider/brain from the dashboard (no env vars). Only
   // OpenRouter takes a key; Claude/Codex adapters use local CLI auth. The key is
-  // stored locally (gitignored) and never returned — the response is the
-  // key-free status. Pass api_key:"" to clear the stored key. Pass `brain` to
-  // pick which provider answers Prime's conversational turns.
+  // never sent or stored in plaintext here — reference a write-only secret by
+  // name via `api_key_secret` (the value lives only in the secret store). The
+  // response is the key-free status. Pass api_key_secret:"" to clear the
+  // reference. Pass `brain` to pick which provider answers Prime's
+  // conversational turns. (`api_key` remains for the legacy env/CLI path; the
+  // dashboard does not send it.)
   setConfig: (body: {
     provider?: string;
     api_key?: string;
+    api_key_secret?: string;
     model?: string;
     disabled?: boolean;
     brain?: ReluxPrimeBrain | "";

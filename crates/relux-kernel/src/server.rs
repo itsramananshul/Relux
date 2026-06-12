@@ -1147,10 +1147,23 @@ async fn set_ai_config(
             )));
         }
     }
+    // Validate the API-key secret reference NAME (the preferred path: the key is
+    // held write-only in the secret store and only referenced here). An empty
+    // string clears the reference. The secret need NOT exist yet — status reports
+    // a clean "missing secret" until the operator sets it under Secrets.
+    if let Some(s) = req.api_key_secret.as_ref() {
+        let s = s.trim();
+        if !s.is_empty() && !relux_core::is_valid_secret_name(s) {
+            return Err(ApiError::bad_request(format!(
+                "invalid secret name '{s}'. Use letters, digits, '.', '-', '_' (max 128 chars)."
+            )));
+        }
+    }
     relux_kernel::write_stored_config(
         &state.ai_config_path,
         req.provider,
         req.api_key,
+        req.api_key_secret,
         req.model,
         req.disabled,
         req.brain,
@@ -1173,7 +1186,14 @@ async fn clear_ai_config(State(state): State<AppState>) -> Result<Json<AiStatus>
 #[derive(Debug, Deserialize)]
 struct SetAiConfigReq {
     provider: Option<String>,
+    /// A legacy plaintext key. The dashboard no longer sends this — it references
+    /// a write-only secret via `api_key_secret`. Accepted for the env/CLI path and
+    /// backward compatibility; never echoed back. Mutually exclusive with
+    /// `api_key_secret` (whichever is set last wins; the reference is preferred).
     api_key: Option<String>,
+    /// The NAME of a secret in the local secret store that holds the API key (the
+    /// preferred, write-only path). An empty string clears the reference.
+    api_key_secret: Option<String>,
     model: Option<String>,
     disabled: Option<bool>,
     /// The selected Prime brain (`local` | `openrouter` | `claude_cli` |

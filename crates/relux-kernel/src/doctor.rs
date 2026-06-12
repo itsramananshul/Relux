@@ -578,6 +578,8 @@ mod tests {
             disabled,
             model: model.to_string(),
             timeout_ms: 0,
+            api_key_secret: None,
+            secret_missing: false,
             reason: String::new(),
         }
     }
