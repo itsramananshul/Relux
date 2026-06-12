@@ -68,6 +68,11 @@ const BADGE_CLASS: Record<StatusVariant, string> = {
   muted: "backlog",
 };
 
+// MCP sampling input/output character bounds (mirrors the kernel's
+// MAX_MCP_SAMPLING_INPUT_CHARS / _OUTPUT_CHARS), shown in the sampling control copy.
+const MAX_SAMPLING_INPUT_CHARS = 16_000;
+const MAX_SAMPLING_OUTPUT_CHARS = 8_000;
+
 // Plugins page (RELUX_MASTER_PLAN section 11.6): the installed-plugin surface for
 // the local Relux control plane. It lists what is installed (id, kind, version,
 // source, enabled, protected/bundled, description) and drives the durable
@@ -586,6 +591,25 @@ function ManagedStdioControls({ server }: { server: ReluxMcpServer }) {
   );
   const [busy, setBusy] = useState<null | "start" | "stop" | "restart">(null);
   const [actionErr, setActionErr] = useState<string | null>(null);
+  const [samplingEnabled, setSamplingEnabled] = useState<boolean>(
+    server.sampling_enabled ?? false,
+  );
+  const [samplingBusy, setSamplingBusy] = useState(false);
+  const [samplingErr, setSamplingErr] = useState<string | null>(null);
+
+  async function toggleSampling() {
+    const next = !samplingEnabled;
+    setSamplingBusy(true);
+    setSamplingErr(null);
+    try {
+      const updated = await reluxMcp.setSampling(server.id, next);
+      setSamplingEnabled(updated.sampling_enabled ?? next);
+    } catch (e) {
+      setSamplingErr(e instanceof Error ? e.message : "could not update sampling");
+    } finally {
+      setSamplingBusy(false);
+    }
+  }
 
   async function act(kind: "start" | "stop" | "restart") {
     setBusy(kind);
@@ -689,6 +713,48 @@ function ManagedStdioControls({ server }: { server: ReluxMcpServer }) {
           {data.log_tail.join("\n")}
         </pre>
       )}
+      <div
+        style={{
+          marginTop: 10,
+          paddingTop: 10,
+          borderTop: "1px solid var(--hair, #e5e5e5)",
+        }}
+      >
+        <div className="row" style={{ alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          <strong style={{ fontSize: 13 }}>Sampling</strong>
+          <span
+            className={"badge " + (samplingEnabled ? BADGE_CLASS.warn : BADGE_CLASS.muted)}
+            title="MCP sampling lets this server ask Relux to run its OWN configured LLM on the server's behalf. Default deny."
+          >
+            {samplingEnabled ? "enabled" : "disabled (default)"}
+          </span>
+          <div className="spacer" style={{ flex: 1 }} />
+          <button
+            className="btn ghost sm"
+            disabled={samplingBusy}
+            onClick={() => void toggleSampling()}
+            title="Enable/disable server-initiated sampling/createMessage. Takes effect on the next Start/Restart."
+          >
+            {samplingBusy ? "…" : samplingEnabled ? "Disable" : "Enable"}
+          </button>
+        </div>
+        <p className="muted" style={{ marginTop: 8, marginBottom: 0, fontSize: 11 }}>
+          MCP <strong>sampling</strong> inverts the trust direction: the server asks Relux
+          to run its <strong>own</strong> configured Prime/AI provider and return the
+          completion. It is <strong>off by default</strong>. Even when enabled, a request
+          is refused unless a Prime/AI provider is configured, and the provider key is{" "}
+          <strong>never</strong> shared with the server. Input/output are bounded
+          (≤{MAX_SAMPLING_INPUT_CHARS.toLocaleString()} in /{" "}
+          ≤{MAX_SAMPLING_OUTPUT_CHARS.toLocaleString()} out chars) and secret-redacted; no
+          tool calls and no task/run changes are possible. Enabling takes effect on the
+          next <strong>Start/Restart</strong>.
+        </p>
+        {samplingErr && (
+          <div className="banner err" style={{ fontSize: 11, marginTop: 8, marginBottom: 0 }}>
+            {samplingErr}
+          </div>
+        )}
+      </div>
     </div>
   );
 }

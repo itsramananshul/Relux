@@ -1167,6 +1167,9 @@ impl KernelState {
             timeout_ms: relux_core::clamp_mcp_timeout(timeout_ms),
             // Filled in by `upsert_mcp_server` from any existing registration.
             tool_overrides: std::collections::BTreeMap::new(),
+            // Sampling is disabled by default and (per validation) unsupported on HTTP;
+            // `upsert_mcp_server` preserves any prior policy.
+            sampling: relux_core::McpSamplingPolicy::default(),
         };
         self.upsert_mcp_server(config)
     }
@@ -1219,6 +1222,9 @@ impl KernelState {
             enabled,
             timeout_ms: relux_core::clamp_mcp_timeout(timeout_ms),
             tool_overrides: std::collections::BTreeMap::new(),
+            // Sampling is disabled by default; `upsert_mcp_server` preserves any prior
+            // policy, and the operator enables it via `set_mcp_sampling_policy`.
+            sampling: relux_core::McpSamplingPolicy::default(),
         };
         self.upsert_mcp_server(config)
     }
@@ -1232,11 +1238,12 @@ impl KernelState {
         mut config: relux_core::McpServerConfig,
     ) -> Result<relux_core::McpServerConfig, KernelError> {
         let id = config.id.clone();
-        config.tool_overrides = self
-            .mcp_servers
-            .get(&id)
-            .map(|existing| existing.tool_overrides.clone())
-            .unwrap_or_default();
+        if let Some(existing) = self.mcp_servers.get(&id) {
+            config.tool_overrides = existing.tool_overrides.clone();
+            // Preserve the operator's sampling policy across a re-registration so
+            // re-pointing a server's transport/description never silently resets it.
+            config.sampling = existing.sampling;
+        }
         relux_core::validate_mcp_server_config(&config).map_err(|e| {
             KernelError::InvalidMcpConfig {
                 id: id.clone(),
@@ -1343,15 +1350,24 @@ impl KernelState {
     /// killed + reaped on a later stop/restart/shutdown. A disabled server is refused
     /// (enable it first). A spawn/handshake failure is surfaced honestly as a `failed`
     /// status carrying the redacted reason (not a fabricated `running`).
+    ///
+    /// `sampling_provider` is the synchronous provider the gated MCP **sampling** path
+    /// uses, built by the server layer from the configured AI provider
+    /// (`crate::ai::build_sampling_sampler`) — `None` when no provider is configured. It
+    /// is attached to the session ONLY when the server's `sampling.enabled` policy is on;
+    /// otherwise the session runs with sampling off (capability never advertised, any
+    /// server-initiated sampling request cleanly refused).
     pub fn start_mcp_stdio_server(
         &mut self,
         id: &str,
+        sampling_provider: Option<crate::mcp_sampling::Sampler>,
     ) -> Result<relux_core::ManagedStdioStatus, KernelError> {
         let server = self.managed_stdio_config(id)?;
         if !server.enabled {
             return Err(KernelError::McpServerDisabled(id.to_string()));
         }
         let command = server.command.clone().unwrap_or_default();
+        let sampling = Self::sampling_context_for(&server, sampling_provider);
         // Resolve env secrets + validate cwd BEFORE spawning. A missing secret / bad
         // cwd is a clean `failed` status naming the missing KEY (never a value) — not a
         // fabricated `running`, and not a hard error (the operator fixes it and retries).
@@ -1366,6 +1382,7 @@ impl KernelState {
                 &env,
                 cwd.as_deref(),
                 server.timeout_ms,
+                sampling,
             ),
             Err(reason) => crate::mcp_stdio::pool().fail(id, &reason),
         };
@@ -1408,12 +1425,14 @@ impl KernelState {
     pub fn restart_mcp_stdio_server(
         &mut self,
         id: &str,
+        sampling_provider: Option<crate::mcp_sampling::Sampler>,
     ) -> Result<relux_core::ManagedStdioStatus, KernelError> {
         let server = self.managed_stdio_config(id)?;
         if !server.enabled {
             return Err(KernelError::McpServerDisabled(id.to_string()));
         }
         let command = server.command.clone().unwrap_or_default();
+        let sampling = Self::sampling_context_for(&server, sampling_provider);
         let status = match crate::secret_store::resolve_managed_env_and_cwd(
             &server.env,
             server.cwd.as_deref(),
@@ -1425,6 +1444,7 @@ impl KernelState {
                 &env,
                 cwd.as_deref(),
                 server.timeout_ms,
+                sampling,
             ),
             Err(reason) => crate::mcp_stdio::pool().fail(id, &reason),
         };
@@ -1439,6 +1459,62 @@ impl KernelState {
             serde_json::json!({ "state": status.state.as_str() }),
         );
         Ok(status)
+    }
+
+    /// Build the gated sampling context for a session: the provider is attached ONLY
+    /// when the server's `sampling.enabled` policy is on; otherwise sampling is off
+    /// (capability never advertised, requests cleanly refused). Fail-closed by default.
+    fn sampling_context_for(
+        server: &relux_core::McpServerConfig,
+        sampler: Option<crate::mcp_sampling::Sampler>,
+    ) -> crate::mcp_sampling::SamplingContext {
+        if server.sampling.enabled {
+            crate::mcp_sampling::SamplingContext {
+                enabled: true,
+                server_id: server.id.clone(),
+                sampler,
+            }
+        } else {
+            crate::mcp_sampling::SamplingContext::disabled()
+        }
+    }
+
+    /// Enable/disable MCP **sampling** for a registered managed-stdio server. Fail-closed:
+    /// sampling is rejected for an HTTP-loopback server (it has no persistent session to
+    /// carry a server-initiated request — `relux_core::validate_mcp_server_config`). The
+    /// change takes effect on the next **Start/Restart** of the managed process (the
+    /// capability is advertised at handshake time), mirroring the per-process env model.
+    /// Audited; persists the updated config.
+    pub fn set_mcp_sampling_policy(
+        &mut self,
+        id: &str,
+        enabled: bool,
+    ) -> Result<relux_core::McpServerConfig, KernelError> {
+        let id = id.trim();
+        let mut config = self
+            .mcp_servers
+            .get(id)
+            .cloned()
+            .ok_or_else(|| KernelError::UnknownMcpServer(id.to_string()))?;
+        config.sampling.enabled = enabled;
+        relux_core::validate_mcp_server_config(&config).map_err(|e| {
+            KernelError::InvalidMcpConfig {
+                id: id.to_string(),
+                message: e.to_string(),
+            }
+        })?;
+        self.record_audit(
+            "kernel",
+            "kernel",
+            "mcp:sampling_policy",
+            Some("mcp_server"),
+            Some(id),
+            None,
+            AuditResult::Success,
+            serde_json::json!({ "sampling_enabled": enabled }),
+        );
+        self.mcp_servers.insert(id.to_string(), config.clone());
+        Ok(config)
     }
 
     /// The managed-process status for a registered managed-stdio server. Read-only:

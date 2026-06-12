@@ -26,6 +26,10 @@
 //!   it is present plus a non-cryptographic FNV-1a hash of its value (never the raw
 //!   value), so a test can PROVE the managed-stdio child received a resolved secret in
 //!   its environment without that secret ever being printed/returned.
+//! - `sample_probe` — during its `tools/call`, sends a SERVER→client
+//!   `sampling/createMessage` request (id `9001`) back to Relux and returns whatever the
+//!   client answered (a gated completion, or a JSON-RPC refusal), so a test can PROVE the
+//!   gated MCP sampling round trip end to end (capability gating, default-deny, redaction).
 //!
 //! Resources it advertises (READ-ONLY context — `resources/list` / `resources/read`):
 //! - `mem://notes` (text) — a small text body that also embeds an obvious fake secret,
@@ -57,14 +61,62 @@ fn fnv1a_hex(s: &str) -> String {
 /// Per-process invocation counter for `whoami`, proving process reuse across calls.
 static CALLS: AtomicU64 = AtomicU64::new(0);
 
+/// Read the client's response to the server-initiated `sampling/createMessage` request
+/// (id `9001`), draining notifications / unrelated lines, and summarize the outcome into
+/// a structured value the `sample_probe` tool returns. Used to PROVE the gated sampling
+/// round trip end to end (capability gating, decision, redaction). On EOF or a malformed
+/// reply it returns an honest marker rather than hanging.
+fn read_sampling_outcome<R: BufRead>(reader: &mut R) -> serde_json::Value {
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        match reader.read_line(&mut buf) {
+            Ok(0) | Err(_) => return serde_json::json!({ "kind": "eof" }),
+            Ok(_) => {}
+        }
+        let trimmed = buf.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if value.get("id").and_then(|i| i.as_u64()) != Some(9001) {
+            continue;
+        }
+        if let Some(result) = value.get("result") {
+            let text = result
+                .get("content")
+                .and_then(|c| c.get("text"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            let model = result.get("model").and_then(|m| m.as_str()).unwrap_or("");
+            return serde_json::json!({ "kind": "result", "text": text, "model": model });
+        }
+        if let Some(err) = value.get("error") {
+            let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+            let message = err.get("message").and_then(|m| m.as_str()).unwrap_or("");
+            return serde_json::json!({ "kind": "error", "code": code, "message": message });
+        }
+        return serde_json::json!({ "kind": "malformed" });
+    }
+}
+
 fn main() {
     let stdin = std::io::stdin();
+    let mut reader = std::io::BufReader::new(stdin.lock());
     let mut stdout = std::io::stdout();
     let mut stderr = std::io::stderr();
+    let mut buf = String::new();
 
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
-        let trimmed = line.trim();
+    loop {
+        buf.clear();
+        match reader.read_line(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let trimmed = buf.trim();
         if trimmed.is_empty() {
             continue;
         }
@@ -77,6 +129,49 @@ fn main() {
         let Some(id) = req.get("id").cloned() else {
             continue;
         };
+
+        // `sample_probe` round-trips a SERVER→client `sampling/createMessage` request,
+        // then returns whatever the client answered (a completion or a refusal). It needs
+        // the stdin reader (to read the client's response), so it is handled before the
+        // method match. The request id `9001` is distinct from the client's monotonic ids
+        // — proving the client distinguishes a server request from its own response.
+        if method == "tools/call"
+            && req
+                .get("params")
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str())
+                == Some("sample_probe")
+        {
+            let prompt = req
+                .get("params")
+                .and_then(|p| p.get("arguments"))
+                .and_then(|a| a.get("prompt"))
+                .and_then(|p| p.as_str())
+                .unwrap_or("Summarize the project status.");
+            let sampling_request = serde_json::json!({
+                "jsonrpc": "2.0", "id": 9001, "method": "sampling/createMessage",
+                "params": {
+                    "messages": [ { "role": "user", "content": { "type": "text", "text": prompt } } ],
+                    "maxTokens": 100
+                }
+            });
+            if writeln!(stdout, "{sampling_request}").is_err() || stdout.flush().is_err() {
+                break;
+            }
+            let outcome = read_sampling_outcome(&mut reader);
+            let response = serde_json::json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": {
+                    "content": [ { "type": "text", "text": "sample_probe done" } ],
+                    "structuredContent": outcome,
+                    "isError": false
+                }
+            });
+            if writeln!(stdout, "{response}").is_err() || stdout.flush().is_err() {
+                break;
+            }
+            continue;
+        }
 
         let response = match method {
             "initialize" => serde_json::json!({
@@ -95,7 +190,8 @@ fn main() {
                     { "name": "noisy", "description": "Writes to stderr, then returns ok." },
                     { "name": "whoami", "description": "Return this process pid + per-process call count." },
                     { "name": "crash", "description": "Exit the process without responding (death test)." },
-                    { "name": "env_probe", "description": "Report presence + FNV hash of an env var (never its value)." }
+                    { "name": "env_probe", "description": "Report presence + FNV hash of an env var (never its value)." },
+                    { "name": "sample_probe", "description": "Round-trip a server-initiated sampling/createMessage request and report the client's answer." }
                 ]}
             }),
             "tools/call" => {

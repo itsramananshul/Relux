@@ -3226,6 +3226,11 @@ export interface ReluxMcpServer {
   // Operator-set per-tool classifications, keyed by tool name. Empty when no tool
   // has been classified (each then uses the gated default: Medium + Required).
   tool_overrides: Record<string, McpToolClassification>;
+  // Whether the operator has enabled MCP sampling (`sampling/createMessage`) for this
+  // server. Default false (deny). Only meaningful for a managed-stdio server; even when
+  // true, sampling is only served when a Prime/AI provider is configured. (docs/mcp.md
+  // "MCP sampling (v1)".)
+  sampling_enabled?: boolean;
 }
 
 // The live discovery result for one server. `reachable` is true only when the
@@ -3435,7 +3440,31 @@ export const reluxMcp = {
       `/v1/relux/mcp/servers/${encodeURIComponent(id)}/restart`,
       {},
     ),
+  // Enable/disable MCP sampling (`sampling/createMessage`) for one server. Fail-closed:
+  // 400 on an HTTP-loopback server (no persistent session); 404 unknown. Takes effect on
+  // the next Start/Restart. Returns the updated (secret-free) config.
+  setSampling: (id: string, enabled: boolean) =>
+    api.put<ReluxMcpServer>(
+      `/v1/relux/mcp/servers/${encodeURIComponent(id)}/sampling`,
+      { enabled },
+    ),
+  // The secret-free audit tail of server-initiated sampling decisions (oldest first).
+  samplingAudit: () =>
+    api.get<ReluxMcpSamplingAuditRecord[]>("/v1/relux/mcp/sampling/audit"),
 };
+
+// One secret-free audit record of a server-initiated sampling request: the decision,
+// a redacted reason, and bounded size metadata. Never carries plaintext. (docs/mcp.md
+// "MCP sampling (v1)".)
+export interface ReluxMcpSamplingAuditRecord {
+  server_id: string;
+  // "allowed" | "denied_policy" | "denied_no_provider" | "bounds_error" | "provider_error".
+  decision: string;
+  reason: string;
+  input_chars: number;
+  output_chars: number;
+  model?: string;
+}
 
 // The redacted status of one stored secret. NEVER carries a plaintext value — only
 // the name, when it was set, a tail preview (e.g. "…cdef"), and the at-rest scheme.

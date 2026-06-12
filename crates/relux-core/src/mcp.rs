@@ -161,6 +161,89 @@ pub fn is_valid_env_var_name(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// The operator policy for **MCP sampling** (`sampling/createMessage`) on one server.
+///
+/// MCP sampling **inverts the trust direction**: a managed MCP server can, mid-operation,
+/// send a `sampling/createMessage` REQUEST back to Relux asking Relux to run its OWN
+/// configured LLM on the server's behalf and return the completion. Relux treats this
+/// fail-closed: it is **disabled by default** and the capability is **never advertised**
+/// to a server unless the operator has explicitly enabled it here AND a Prime/AI provider
+/// is configured. A server-initiated sampling request against a server with sampling
+/// disabled (or with no provider configured) is **cleanly refused** with a JSON-RPC error
+/// — never silently dropped (which would hang the server until timeout) and never run.
+/// See `docs/mcp.md` "MCP sampling (v1)".
+///
+/// Sampling is only meaningful on a **managed-stdio** server (the persistent
+/// `initialize`d session can carry a server→client request); enabling it on an
+/// HTTP-loopback server is rejected by [`validate_mcp_server_config`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpSamplingPolicy {
+    /// Whether the operator has enabled sampling for this server. Default `false`
+    /// (deny). Even when `true`, sampling is only *serviceable* when a Prime/AI
+    /// provider is configured; otherwise a request is cleanly refused (no provider).
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl McpSamplingPolicy {
+    /// Whether this is the disabled default (used to omit it from the wire shape).
+    pub fn is_disabled(&self) -> bool {
+        !self.enabled
+    }
+}
+
+/// One audit record for a server-initiated `sampling/createMessage` request: the
+/// decision, a redacted/value-free reason, and bounded size metadata. Carries **no
+/// plaintext** — never the request messages, never the completion text, never any
+/// provider key — only counts + the model id + a short reason. Surfaced read-only on
+/// the operator audit tail (`GET /v1/relux/mcp/sampling/audit`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpSamplingAuditRecord {
+    /// The MCP server id whose session initiated the sampling request.
+    pub server_id: String,
+    /// The decision: one of [`SAMPLING_DECISION_ALLOWED`],
+    /// [`SAMPLING_DECISION_DENIED_POLICY`], [`SAMPLING_DECISION_DENIED_NO_PROVIDER`],
+    /// [`SAMPLING_DECISION_BOUNDS_ERROR`], or [`SAMPLING_DECISION_PROVIDER_ERROR`].
+    pub decision: String,
+    /// A short, secret-free, value-free reason (already redacted).
+    pub reason: String,
+    /// Characters of bounded input handed to the provider (0 when denied pre-call).
+    pub input_chars: usize,
+    /// Characters of the bounded, redacted completion returned to the server (0 unless
+    /// allowed).
+    pub output_chars: usize,
+    /// The model id used for an allowed completion, when known. Never a key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// Sampling audit decision: the request was allowed and a completion returned.
+pub const SAMPLING_DECISION_ALLOWED: &str = "allowed";
+/// Sampling audit decision: refused because the operator has not enabled sampling.
+pub const SAMPLING_DECISION_DENIED_POLICY: &str = "denied_policy";
+/// Sampling audit decision: refused because no Prime/AI provider is configured.
+pub const SAMPLING_DECISION_DENIED_NO_PROVIDER: &str = "denied_no_provider";
+/// Sampling audit decision: refused because the request was malformed/over bounds.
+pub const SAMPLING_DECISION_BOUNDS_ERROR: &str = "bounds_error";
+/// Sampling audit decision: the provider call failed (honest runtime failure).
+pub const SAMPLING_DECISION_PROVIDER_ERROR: &str = "provider_error";
+
+/// Max chat messages accepted from one server-initiated sampling request (bounded so a
+/// hostile server cannot make Relux run an unbounded prompt against its own provider).
+pub const MAX_MCP_SAMPLING_MESSAGES: usize = 32;
+/// Max characters of the optional system prompt accepted from a sampling request.
+pub const MAX_MCP_SAMPLING_SYSTEM_CHARS: usize = 4_000;
+/// Max characters of one sampling message's text (each message is clamped).
+pub const MAX_MCP_SAMPLING_MESSAGE_CHARS: usize = 8_000;
+/// Max total characters of input (system + all messages) handed to the provider.
+pub const MAX_MCP_SAMPLING_INPUT_CHARS: usize = 16_000;
+/// Max characters of the completion text returned to the server (clamped + redacted).
+pub const MAX_MCP_SAMPLING_OUTPUT_CHARS: usize = 8_000;
+/// Hard ceiling for the server-requested `maxTokens` (clamped to this).
+pub const MAX_MCP_SAMPLING_MAX_TOKENS: u32 = 1_024;
+/// Max sampling audit records kept on the process-global tail.
+pub const MAX_MCP_SAMPLING_AUDIT_RECORDS: usize = 100;
+
 /// A durable, operator-curated MCP server registration.
 ///
 /// Persisted locally alongside the rest of the control plane. Carries no secrets —
@@ -219,6 +302,14 @@ pub struct McpServerConfig {
     /// when empty, so a server that has classified no tools is unchanged.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tool_overrides: BTreeMap<String, McpToolClassification>,
+    /// The operator policy for MCP **sampling** (`sampling/createMessage`) on this
+    /// server. Disabled by default (deny). Only meaningful for a managed-stdio server;
+    /// enabling it on an HTTP-loopback server is rejected by
+    /// [`validate_mcp_server_config`]. Omitted from the wire shape when disabled (the
+    /// default), so a server that never enabled sampling has an unchanged shape. See
+    /// [`McpSamplingPolicy`].
+    #[serde(default, skip_serializing_if = "McpSamplingPolicy::is_disabled")]
+    pub sampling: McpSamplingPolicy,
 }
 
 impl McpServerConfig {
@@ -305,6 +396,11 @@ pub enum McpConfigError {
     CwdTooLong,
     #[error("managed-stdio MCP server cwd is not safe: {0}")]
     InvalidCwd(String),
+    #[error(
+        "MCP sampling can only be enabled on a managed-stdio server (an HTTP-loopback \
+         endpoint has no persistent session to carry a server-initiated request)"
+    )]
+    SamplingNotSupportedOnHttp,
 }
 
 /// Shell metacharacters refused in a managed-stdio `command` token. Relux spawns the
@@ -487,8 +583,16 @@ pub fn validate_mcp_server_config(config: &McpServerConfig) -> Result<(), McpCon
         return Err(McpConfigError::InvalidId);
     }
     match config.transport {
-        McpTransport::HttpLoopback => validate_loopback_url(&config.endpoint)
-            .map_err(|e| McpConfigError::InvalidEndpoint(e.to_string()))?,
+        McpTransport::HttpLoopback => {
+            validate_loopback_url(&config.endpoint)
+                .map_err(|e| McpConfigError::InvalidEndpoint(e.to_string()))?;
+            // Sampling needs a persistent server→client session; an HTTP-loopback
+            // server (stateless POST-per-op) has none, so enabling it there is a
+            // fail-closed rejection rather than a silently-inert flag.
+            if config.sampling.enabled {
+                return Err(McpConfigError::SamplingNotSupportedOnHttp);
+            }
+        }
         McpTransport::ManagedStdio => {
             let command = config.command.as_deref().unwrap_or("");
             validate_stdio_command(command, &config.args)?;
@@ -988,6 +1092,7 @@ mod tests {
             enabled: true,
             timeout_ms: DEFAULT_MCP_TIMEOUT_MS,
             tool_overrides: BTreeMap::new(),
+            sampling: McpSamplingPolicy::default(),
         }
     }
 
@@ -1004,6 +1109,7 @@ mod tests {
             enabled: true,
             timeout_ms: DEFAULT_MCP_TIMEOUT_MS,
             tool_overrides: BTreeMap::new(),
+            sampling: McpSamplingPolicy::default(),
         }
     }
 
@@ -1059,6 +1165,23 @@ mod tests {
         // A full path command (Windows or unix) is allowed (no shell metachars).
         assert!(validate_mcp_server_config(&stdio_cfg("p", "C:\\tools\\node.exe", &[])).is_ok());
         assert!(validate_mcp_server_config(&stdio_cfg("p", "/usr/bin/node", &[])).is_ok());
+    }
+
+    #[test]
+    fn sampling_policy_defaults_off_and_is_rejected_on_http() {
+        // Default policy is disabled (deny).
+        assert!(!McpSamplingPolicy::default().enabled);
+        // Enabling sampling on a managed-stdio server is fine.
+        let mut stdio = stdio_cfg("s", "node", &["server.js"]);
+        stdio.sampling.enabled = true;
+        assert!(validate_mcp_server_config(&stdio).is_ok());
+        // Enabling it on an HTTP-loopback server is fail-closed (no persistent session).
+        let mut http = cfg("h", "http://127.0.0.1:8000/mcp");
+        http.sampling.enabled = true;
+        assert_eq!(
+            validate_mcp_server_config(&http),
+            Err(McpConfigError::SamplingNotSupportedOnHttp)
+        );
     }
 
     #[test]

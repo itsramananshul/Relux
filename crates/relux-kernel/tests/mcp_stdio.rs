@@ -13,6 +13,13 @@ fn fixture() -> &'static str {
     env!("CARGO_BIN_EXE_relux_mcp_test_server")
 }
 
+/// The disabled sampling context (capability never advertised, every server-initiated
+/// sampling request cleanly refused) — the default for a session that does not exercise
+/// gated sampling.
+fn no_sampling() -> relux_kernel::mcp_sampling::SamplingContext {
+    relux_kernel::mcp_sampling::SamplingContext::disabled()
+}
+
 #[test]
 fn discovers_tools_from_a_real_stdio_server() {
     let tools = mcp_stdio::discover_tools(fixture(), &[], &[], None, 5_000).expect("discovery ok");
@@ -141,7 +148,7 @@ fn pid_from_whoami(out: &serde_json::Value) -> u64 {
 #[test]
 fn pool_start_status_list_call_stop_lifecycle() {
     let id = "pool-lifecycle";
-    let status = pool().start(id, fixture(), &[], &[], None, 5_000);
+    let status = pool().start(id, fixture(), &[], &[], None, 5_000, no_sampling());
     assert_eq!(status.state, ManagedStdioState::Running, "start → running: {status:?}");
     assert!(status.pid.is_some(), "a running process has a pid");
     assert!(status.started_at_ms.is_some(), "a running process has a start time");
@@ -168,7 +175,7 @@ fn pool_start_status_list_call_stop_lifecycle() {
 #[test]
 fn pool_reuses_one_process_across_calls() {
     let id = "pool-reuse";
-    let start = pool().start(id, fixture(), &[], &[], None, 5_000);
+    let start = pool().start(id, fixture(), &[], &[], None, 5_000, no_sampling());
     let started_pid = start.pid.expect("running pid");
 
     let first = pool().call_tool(id, "whoami", &serde_json::json!({}), 5_000).expect("ok");
@@ -196,13 +203,13 @@ fn pool_reuse_requires_an_explicit_start() {
 #[test]
 fn pool_restart_replaces_the_process() {
     let id = "pool-restart";
-    let first = pool().start(id, fixture(), &[], &[], None, 5_000);
+    let first = pool().start(id, fixture(), &[], &[], None, 5_000, no_sampling());
     let pid1 = first.pid.expect("pid1");
     // whoami once on the first process.
     let a = pool().call_tool(id, "whoami", &serde_json::json!({}), 5_000).expect("ok");
     assert_eq!(calls_from_whoami(&a), 1);
 
-    let second = pool().restart(id, fixture(), &[], &[], None, 5_000);
+    let second = pool().restart(id, fixture(), &[], &[], None, 5_000, no_sampling());
     let pid2 = second.pid.expect("pid2");
     assert_ne!(pid1, pid2, "restart spawns a NEW process (different pid)");
     // The fresh process's counter starts over at 1 (it is genuinely a new process).
@@ -215,7 +222,7 @@ fn pool_restart_replaces_the_process() {
 #[test]
 fn pool_process_crash_marks_failed_and_records_error() {
     let id = "pool-crash";
-    let start = pool().start(id, fixture(), &[], &[], None, 5_000);
+    let start = pool().start(id, fixture(), &[], &[], None, 5_000, no_sampling());
     assert_eq!(start.state, ManagedStdioState::Running);
 
     // The `crash` tool exits the process without responding; the call sees EOF and
@@ -240,7 +247,7 @@ fn pool_start_failure_is_an_honest_failed_status() {
     let id = "pool-bad-binary";
     // Nothing by this name is on PATH; the start fails → a `failed` status with a
     // redacted reason (never a fabricated `running`).
-    let status = pool().start(id, "relux-mcp-no-such-binary-xyzzy", &[], &[], None, 1_000);
+    let status = pool().start(id, "relux-mcp-no-such-binary-xyzzy", &[], &[], None, 1_000, no_sampling());
     assert_eq!(status.state, ManagedStdioState::Failed, "bad binary → failed: {status:?}");
     assert!(status.last_error.is_some(), "a failed start records why");
     assert!(status.pid.is_none());
@@ -262,7 +269,7 @@ fn kernel_managed_stdio_lifecycle_through_the_registry() {
     .expect("register ok");
 
     // Start through the kernel (audited); the process comes up.
-    let status = k.start_mcp_stdio_server("life-fs").expect("start ok");
+    let status = k.start_mcp_stdio_server("life-fs", None).expect("start ok");
     assert_eq!(status.state, ManagedStdioState::Running);
 
     // Discovery now REUSES the running process (still mapped into ToolDescriptors).
@@ -285,7 +292,7 @@ fn kernel_lifecycle_refuses_http_and_disabled_servers() {
     k.register_mcp_server("http-one", "http://127.0.0.1:8000/mcp", "http", true, Some(5_000))
         .expect("register http ok");
     assert!(matches!(
-        k.start_mcp_stdio_server("http-one"),
+        k.start_mcp_stdio_server("http-one", None),
         Err(relux_kernel::KernelError::NotAManagedStdioServer(_))
     ));
 
@@ -302,13 +309,13 @@ fn kernel_lifecycle_refuses_http_and_disabled_servers() {
     )
     .expect("register ok");
     assert!(matches!(
-        k.start_mcp_stdio_server("off-stdio"),
+        k.start_mcp_stdio_server("off-stdio", None),
         Err(relux_kernel::KernelError::McpServerDisabled(_))
     ));
 
     // An unknown server is a clean not-found.
     assert!(matches!(
-        k.start_mcp_stdio_server("nope"),
+        k.start_mcp_stdio_server("nope", None),
         Err(relux_kernel::KernelError::UnknownMcpServer(_))
     ));
 }
@@ -357,7 +364,7 @@ fn managed_stdio_child_receives_a_resolved_env_secret_end_to_end() {
     .expect("register ok");
 
     // Start RESOLVES the secret ref and injects the plaintext into the child env.
-    let status = k.start_mcp_stdio_server("env-e2e").expect("start ok");
+    let status = k.start_mcp_stdio_server("env-e2e", None).expect("start ok");
     assert_eq!(status.state, ManagedStdioState::Running, "start → running: {status:?}");
     // The status surface carries NO secret value (defense in depth).
     let status_json = serde_json::to_string(&status).unwrap();
@@ -411,7 +418,7 @@ fn managed_stdio_start_fails_cleanly_when_a_referenced_secret_is_missing() {
 
     // Start does NOT spawn — it fails cleanly, naming the missing secret KEY (never a
     // value), as a `failed` status rather than a fabricated `running`.
-    let status = k.start_mcp_stdio_server("env-missing").expect("start returns a status");
+    let status = k.start_mcp_stdio_server("env-missing", None).expect("start returns a status");
     assert_eq!(status.state, ManagedStdioState::Failed, "missing secret → failed: {status:?}");
     let reason = status.last_error.clone().unwrap_or_default();
     assert!(reason.contains("definitely_absent_secret_e2e_xyz"), "names the secret: {reason}");
@@ -473,7 +480,7 @@ fn an_unknown_resource_uri_fails_cleanly() {
 #[test]
 fn pool_lists_and_reads_resources_reusing_one_process() {
     let id = "pool-resources";
-    let start = pool().start(id, fixture(), &[], &[], None, 5_000);
+    let start = pool().start(id, fixture(), &[], &[], None, 5_000, no_sampling());
     assert_eq!(start.state, ManagedStdioState::Running, "start → running: {start:?}");
 
     // resources/list reuses the running process.
@@ -571,7 +578,7 @@ fn kernel_remove_stops_the_managed_process() {
         Some(5_000),
     )
     .expect("register ok");
-    let status = k.start_mcp_stdio_server("rm-fs").expect("start ok");
+    let status = k.start_mcp_stdio_server("rm-fs", None).expect("start ok");
     assert_eq!(status.state, ManagedStdioState::Running);
     // Removing the registration stops + reaps the process so no daemon lingers.
     k.remove_mcp_server("rm-fs").expect("remove ok");
@@ -637,7 +644,7 @@ fn an_unknown_prompt_name_fails_cleanly() {
 #[test]
 fn pool_lists_and_gets_prompts_reusing_one_process() {
     let id = "pool-prompts";
-    let start = pool().start(id, fixture(), &[], &[], None, 5_000);
+    let start = pool().start(id, fixture(), &[], &[], None, 5_000, no_sampling());
     assert_eq!(start.state, ManagedStdioState::Running, "start → running: {start:?}");
 
     // prompts/list reuses the running process.
@@ -715,4 +722,171 @@ fn kernel_disabled_stdio_server_refuses_prompt_list() {
         k.list_mcp_prompts("prm-off"),
         Err(relux_kernel::KernelError::McpServerDisabled(_))
     ));
+}
+
+// --- Gated MCP sampling (server-initiated sampling/createMessage) ---------------
+//
+// These drive the `sample_probe` fixture tool, which (during its tools/call) sends a
+// SERVER→client `sampling/createMessage` request back to the managed-stdio session and
+// returns whatever the client answered. They prove the gated round trip end to end:
+// default-deny, allowed-with-a-(test)-provider, missing-provider, output redaction, the
+// secret-free audit tail, and that no provider key ever reaches the server.
+
+use relux_kernel::mcp_sampling::{
+    self, Sampler, SamplingCompletion, SamplingContext, SAMPLING_ERR_DENIED_POLICY,
+    SAMPLING_ERR_NO_PROVIDER,
+};
+
+/// A deterministic test provider whose completion embeds an obvious fake secret AND
+/// overflows the output cap — so a test can PROVE the handler redacts + clamps before the
+/// text ever reaches the (possibly hostile) server.
+fn leaky_test_sampler() -> Sampler {
+    std::sync::Arc::new(|_req| {
+        Ok(SamplingCompletion {
+            text: format!(
+                "ANSWER api_key=sk-providerleaksecret1234567890 {}",
+                "z".repeat(relux_core::MAX_MCP_SAMPLING_OUTPUT_CHARS + 200)
+            ),
+            model: "test/sampling-model".to_string(),
+        })
+    })
+}
+
+#[test]
+fn sampling_is_denied_by_default() {
+    let id = "samp-denied";
+    // Disabled policy (the default): capability not advertised; a non-compliant server
+    // that asks anyway is cleanly REFUSED, never run, never hung.
+    let ctx = SamplingContext {
+        enabled: false,
+        server_id: id.to_string(),
+        sampler: Some(leaky_test_sampler()),
+    };
+    pool().start(id, fixture(), &[], &[], None, 5_000, ctx);
+    let out = pool()
+        .call_tool(id, "sample_probe", &serde_json::json!({ "prompt": "hi" }), 5_000)
+        .expect("call ok");
+    let sc = &out["structuredContent"];
+    assert_eq!(sc["kind"], "error", "denied → JSON-RPC error: {out}");
+    assert_eq!(sc["code"], SAMPLING_ERR_DENIED_POLICY);
+    let rec = mcp_sampling::audit_tail()
+        .into_iter()
+        .rev()
+        .find(|r| r.server_id == id)
+        .expect("an audit record");
+    assert_eq!(rec.decision, relux_core::SAMPLING_DECISION_DENIED_POLICY);
+    assert_eq!(rec.output_chars, 0);
+    pool().stop(id);
+}
+
+#[test]
+fn sampling_is_allowed_with_a_provider_and_is_redacted_and_audited() {
+    let id = "samp-allowed";
+    let ctx = SamplingContext {
+        enabled: true,
+        server_id: id.to_string(),
+        sampler: Some(leaky_test_sampler()),
+    };
+    pool().start(id, fixture(), &[], &[], None, 5_000, ctx);
+    let out = pool()
+        .call_tool(id, "sample_probe", &serde_json::json!({ "prompt": "summarize" }), 5_000)
+        .expect("call ok");
+    let sc = &out["structuredContent"];
+    assert_eq!(sc["kind"], "result", "allowed → a completion: {out}");
+    let text = sc["text"].as_str().expect("completion text");
+    // The fake provider secret was redacted BEFORE it reached the server, and the output
+    // was clamped to the cap.
+    assert!(!text.contains("sk-providerleaksecret"), "secret must be redacted: {text}");
+    assert!(
+        text.chars().count() <= relux_core::MAX_MCP_SAMPLING_OUTPUT_CHARS,
+        "output clamped"
+    );
+    assert_eq!(sc["model"], "test/sampling-model");
+
+    // Audit recorded the decision + metadata, never any plaintext.
+    let rec = mcp_sampling::audit_tail()
+        .into_iter()
+        .rev()
+        .find(|r| r.server_id == id)
+        .expect("an audit record");
+    assert_eq!(rec.decision, relux_core::SAMPLING_DECISION_ALLOWED);
+    assert!(rec.input_chars > 0 && rec.output_chars > 0);
+    assert_eq!(rec.model.as_deref(), Some("test/sampling-model"));
+    assert!(!rec.reason.contains("sk-"), "audit reason carries no secret");
+    pool().stop(id);
+}
+
+#[test]
+fn sampling_enabled_without_provider_is_a_clean_no_provider_refusal() {
+    let id = "samp-noprov";
+    let ctx = SamplingContext {
+        enabled: true,
+        server_id: id.to_string(),
+        sampler: None,
+    };
+    pool().start(id, fixture(), &[], &[], None, 5_000, ctx);
+    let out = pool()
+        .call_tool(id, "sample_probe", &serde_json::json!({ "prompt": "hi" }), 5_000)
+        .expect("call ok");
+    let sc = &out["structuredContent"];
+    assert_eq!(sc["kind"], "error");
+    assert_eq!(sc["code"], SAMPLING_ERR_NO_PROVIDER);
+    let rec = mcp_sampling::audit_tail()
+        .into_iter()
+        .rev()
+        .find(|r| r.server_id == id)
+        .expect("an audit record");
+    assert_eq!(rec.decision, relux_core::SAMPLING_DECISION_DENIED_NO_PROVIDER);
+    pool().stop(id);
+}
+
+#[test]
+fn kernel_set_sampling_policy_is_rejected_on_an_http_server() {
+    let mut k = KernelState::new();
+    k.register_mcp_server("http-samp", "http://127.0.0.1:8765/mcp", "http", true, Some(5_000))
+        .expect("register ok");
+    // Sampling needs a persistent session; an HTTP-loopback server has none → fail-closed.
+    assert!(matches!(
+        k.set_mcp_sampling_policy("http-samp", true),
+        Err(relux_kernel::KernelError::InvalidMcpConfig { .. })
+    ));
+}
+
+#[test]
+fn kernel_set_sampling_policy_persists_on_a_stdio_server() {
+    let mut k = KernelState::new();
+    k.register_mcp_stdio_server(
+        "stdio-samp",
+        fixture(),
+        &[],
+        Default::default(),
+        None,
+        "stdio",
+        true,
+        Some(5_000),
+    )
+    .expect("register ok");
+    let updated = k.set_mcp_sampling_policy("stdio-samp", true).expect("enable ok");
+    assert!(updated.sampling.enabled);
+    // Re-registering preserves the operator's sampling policy (not silently reset).
+    k.register_mcp_stdio_server(
+        "stdio-samp",
+        fixture(),
+        &[],
+        Default::default(),
+        None,
+        "stdio re-registered",
+        true,
+        Some(5_000),
+    )
+    .expect("re-register ok");
+    assert!(
+        k.mcp_servers()
+            .into_iter()
+            .find(|s| s.id == "stdio-samp")
+            .expect("server present")
+            .sampling
+            .enabled,
+        "sampling policy preserved across re-registration"
+    );
 }

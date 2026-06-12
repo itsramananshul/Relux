@@ -124,9 +124,10 @@ and goes **stricter** than Hermes.
   the two **read-only** MCP **resource** methods `resources/list` / `resources/read`
   (managed stdio resources v1, below), and — as of **managed stdio prompts v1** — the
   two **read-only** MCP **prompt** methods `prompts/list` / `prompts/get` (see
-  "Managed-stdio MCP prompts (v1)" below). It does **not** speak any
-  mutating/streaming method (sampling, resource subscriptions); those remain out of
-  scope (see "Remaining gaps").
+  "Managed-stdio MCP prompts (v1)" below), and — as of **MCP sampling v1** — handles a
+  SERVER-initiated `sampling/createMessage` request as a **gated, default-deny** safe
+  subset (see "MCP sampling (v1)" below). It still does **not** speak resource
+  **subscriptions** (a streaming method); that remains out of scope (see "Remaining gaps").
 
 ### Plugin MCP hint → managed-stdio prefill (advisory, never auto-run)
 
@@ -301,6 +302,105 @@ the **same** shapers — the transport differs, the result handling does not.
   pool reuse, through the kernel registry, and the Prime snapshot tool) in
   `crates/relux-kernel/tests/mcp_stdio.rs` + the HTTP shaper/route tests in
   `crates/relux-kernel/src/mcp.rs` + `state.rs` + `server.rs`.
+
+### MCP sampling (v1) — gated, default-deny server-initiated LLM calls
+
+MCP **sampling** (`sampling/createMessage`) **inverts the trust direction** of every
+other MCP method. For tools / resources / prompts, Relux drives the server. For sampling,
+the server — mid-operation, over a managed-stdio **session** — sends a
+`sampling/createMessage` REQUEST *back to Relux* and blocks until Relux runs its OWN
+configured LLM and returns the completion. That is genuinely dangerous: a
+hostile/compromised server could drive Relux's model, burn the operator's provider
+budget, or try to exfiltrate a secret. So Relux ships a **gated safe subset**, fail-closed
+by construction — never a faked capability, never a silent hang.
+
+Reference (`docs/reference-driven-development.md`, BINDING):
+`reference/hermes-agent-main/tools/mcp_tool.py` +
+`reference/hermes-agent-main/website/docs/user-guide/features/mcp.md` (Hermes exposes a
+per-server sampling handler over its MCP client). Relux ports the *shape* (a client-side
+handler for a server-initiated request) but goes **stricter**: default-deny,
+capability-gated, provider-key-isolated, bounded, redacted, audited, and limited to a
+single text completion (no tool calls, no task/run mutation).
+
+- **Managed-stdio sessions only.** Sampling is served **only** from an operator-started
+  **managed-stdio process** (the warm `initialize`d session) — the one transport with a
+  persistent server→client channel. The spawn-per-operation fallback is **not** a session:
+  it runs with sampling off and cleanly refuses any server-initiated request. Enabling
+  sampling on an **HTTP-loopback** server is rejected fail-closed by
+  `relux_core::validate_mcp_server_config` (a stateless POST-per-op endpoint has no
+  session to carry the request).
+- **Default deny + capability gating.** `McpServerConfig.sampling.enabled` is **`false` by
+  default**. The `sampling` capability is **advertised in the `initialize` handshake ONLY
+  when the session is serviceable** — the operator enabled it AND a Prime/AI provider is
+  configured (`SamplingContext::serviceable`). So a spec-compliant server will not even
+  ask when sampling is off; and if a non-compliant one asks anyway, the request is still
+  cleanly **refused** (it is never run).
+- **Clean refusal, never a hang (the real gap closed).** Before this slice, the stdio
+  client silently drained any server→client message that was not the response it was
+  waiting for — so a `sampling/createMessage` request hung the server until the per-call
+  timeout killed it. Now the pump (`StdioChild::request` in
+  `crates/relux-kernel/src/mcp_stdio.rs`) detects a server-initiated request (a message
+  carrying a `method`, checked **before** the id-match so a server id that collides
+  numerically with ours is never confused for our response) and dispatches it to
+  `crate::mcp_sampling::handle_inbound_request`: a gated `sampling/createMessage`, or a
+  clean **`-32601`** for any other server-initiated method. The response is written back
+  immediately and the client keeps waiting for ITS response — the server degrades instead
+  of hanging.
+- **The decision (fail-closed, `crate::mcp_sampling`).** `sampling/createMessage` is
+  refused with an honest JSON-RPC error when: sampling is **disabled** by policy
+  (`-32001`), **enabled but no provider** is configured (`-32002`), or the request is
+  **malformed / over the input bounds** (`-32003`). Only an enabled + provider-backed +
+  well-formed request is served; a provider failure is an honest `-32010` (never a
+  fabricated completion).
+- **The provider key NEVER reaches the server.** An allowed completion is produced by a
+  synchronous `Sampler` the kernel builds from the resolved `AiConfig`
+  (`crate::ai::build_sampling_sampler`) — the OpenRouter key lives only on the in-memory
+  config (sourced by **secret reference**, see "Prime brain provider key by reference")
+  and travels solely in the `Authorization` header inside `request_completion`. The stdio
+  pump is synchronous and may already be inside the server's async runtime, so the
+  provider call runs on a **dedicated OS thread with its own current-thread Tokio runtime**
+  (a fresh thread is never a Tokio worker, so `block_on` there is safe). Only the
+  completion **text** — clamped and `relux_core::redact_secrets`-redacted — is returned to
+  the server. A credential the model echoes is masked **before** it leaves for the
+  (possibly hostile) server.
+- **Bounded input + output.** Input is bounded to `MAX_MCP_SAMPLING_MESSAGES` (32)
+  messages, `MAX_MCP_SAMPLING_MESSAGE_CHARS` (8 000) per message, and a total of
+  `MAX_MCP_SAMPLING_INPUT_CHARS` (16 000) chars (the system prompt is bounded too); the
+  server-requested `maxTokens` is clamped to `MAX_MCP_SAMPLING_MAX_TOKENS` (1 024). Output
+  is clamped to `MAX_MCP_SAMPLING_OUTPUT_CHARS` (8 000) and redacted. **No tool calls** are
+  possible (it is a single text completion — no tools are exposed to that model) and **no
+  task/run mutation** can occur.
+- **Audited (secret-free).** Every request records a `relux_core::McpSamplingAuditRecord`
+  on a process-global tail (`crate::mcp_sampling::audit_tail`, outside `KernelState` like
+  the managed pool): the server id, the decision (`allowed` / `denied_policy` /
+  `denied_no_provider` / `bounds_error` / `provider_error`), a redacted reason, the input/
+  output **char counts**, and the model id — **never** the request messages, the
+  completion text, or any key.
+- **Policy is per-process (Start/Restart to apply).** Like the env model, the sampling
+  context is attached to the session at **Start/Restart** (the capability is advertised at
+  handshake time). Enabling/disabling sampling takes effect on the next Start/Restart of
+  the managed process.
+- **Surfaces.** `PUT/PATCH /v1/relux/mcp/servers/:id/sampling { "enabled": bool }` sets
+  the per-server policy (fail-closed: 400 on an HTTP server, 404 unknown); the server
+  listing carries `sampling_enabled`; `GET /v1/relux/mcp/sampling/audit` returns the
+  secret-free audit tail. The dashboard's managed-stdio **Process** card has a **Sampling**
+  row (`apps/dashboard/src/pages/Plugins.tsx` `ManagedStdioControls`) showing the policy
+  badge, an Enable/Disable toggle, and the honest limits + provider/restart note.
+- **Why per-request UI approval is future (honest).** The MCP `sampling/createMessage`
+  request is **synchronous** — the server blocks the in-flight operation until the client
+  answers. Pausing for an interactive operator approval mid-request would hold the server
+  (and the kernel call) blocked indefinitely, risking a deadlock and a timeout teardown of
+  the warm process. So v1 is **policy-based allow/deny** (a standing per-server toggle),
+  not a per-request prompt. A future async-approval design (answer the request with a
+  "pending" and resolve out of band) can layer on top without changing the gates.
+- **Test fixture + tests.** The pure-Rust MCP stdio fixture
+  (`crates/relux-kernel/src/bin/relux_mcp_test_server.rs`) advertises a `sample_probe`
+  tool that, during its `tools/call`, sends a SERVER→client `sampling/createMessage`
+  request (id `9001`, distinct from the client's monotonic ids) and returns whatever the
+  client answered. End-to-end tests in `crates/relux-kernel/tests/mcp_stdio.rs` prove
+  denied-by-default, allowed-with-a-test-provider (output redacted + clamped + audited),
+  missing-provider clean refusal, the HTTP-rejection + policy-persistence, plus the pure
+  decision/bounds/redaction unit tests in `crate::mcp_sampling`.
 
 ### Local secrets & environment (API keys for managed-stdio MCP servers)
 
@@ -492,15 +592,16 @@ form.
   environment" below. The config still stores **no plaintext** (only secret
   *references* + a path), the resolved values are never serialized/logged, and a `cwd`
   must canonicalize INSIDE the configured safe workspace root.
-- **Resources + prompts are now bridged (read-only).** `resources/list` /
-  `resources/read` (resources v1) and `prompts/list` / `prompts/get` (prompts v1) work
-  over **both** loopback HTTP and managed stdio (see "Managed-stdio MCP resources (v1)"
-  and "MCP prompts (v1)" above) — read-only context/templates only. Still **not**
-  bridged: MCP **sampling** (server-initiated LLM calls back to the client) and resource
-  **subscriptions** (live change notifications). An MCP server that exposes those over
-  stdio surfaces only its tools + resources + prompts to Relux; the rest is out of scope
-  by design — sampling especially inverts the trust direction (the server drives the
-  client's model), so it stays unbuilt until there is an explicit, gated design for it.
+- **Resources + prompts are bridged (read-only); sampling is now a gated subset.**
+  `resources/list` / `resources/read` (resources v1) and `prompts/list` / `prompts/get`
+  (prompts v1) work over **both** loopback HTTP and managed stdio — read-only
+  context/templates only. MCP **sampling** (`sampling/createMessage`) is now implemented as
+  a **gated, default-deny safe subset** on managed-stdio sessions (see "MCP sampling (v1)"
+  above): off by default, capability-gated, provider-key-isolated, bounded, redacted, and
+  audited, with a clean JSON-RPC refusal when disabled / no provider / over bounds (a
+  server is never left hanging). Still **not** bridged: resource **subscriptions** (live
+  change notifications), and a *per-request* interactive sampling approval (v1 is
+  policy-based allow/deny — see the "Why per-request UI approval is future" note above).
 - **Status polling, not push.** The dashboard reads status on demand (no live stream);
   a crash between reads surfaces on the next status read / call, not instantly.
 

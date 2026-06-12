@@ -315,6 +315,11 @@ struct StdioChild {
     stderr_tail: Arc<Mutex<StderrTail>>,
     stderr_handle: Option<JoinHandle<()>>,
     next_id: u64,
+    /// The gated MCP **sampling** context for this session. Default-disabled (the
+    /// spawn-per-operation fallback is not a "session", so it never serves sampling and
+    /// cleanly refuses any server-initiated request); a managed-pool session sets it
+    /// from the server's policy + the configured provider via [`Self::set_sampling`].
+    sampling: crate::mcp_sampling::SamplingContext,
 }
 
 impl StdioChild {
@@ -399,7 +404,16 @@ impl StdioChild {
             stderr_tail,
             stderr_handle: Some(stderr_handle),
             next_id: 1,
+            sampling: crate::mcp_sampling::SamplingContext::disabled(),
         })
+    }
+
+    /// Attach the gated sampling context for a managed-pool session (so a serviceable
+    /// session advertises the `sampling` capability and serves a gated
+    /// `sampling/createMessage`). Must be set BEFORE `initialize` so the capability is
+    /// advertised in the handshake.
+    fn set_sampling(&mut self, sampling: crate::mcp_sampling::SamplingContext) {
+        self.sampling = sampling;
     }
 
     fn next_id(&mut self) -> u64 {
@@ -412,9 +426,18 @@ impl StdioChild {
     /// `notifications/initialized` (a notification — no id, no response awaited). A
     /// failed handshake is an honest error.
     fn initialize(&mut self, timeout: Duration) -> Result<(), McpClientError> {
+        // Advertise the `sampling` capability ONLY when this session can actually serve
+        // it (operator-enabled AND a provider wired). A spec-compliant server will not
+        // send a `sampling/createMessage` request unless we advertise it; if a
+        // non-compliant one does anyway, the request is still cleanly refused.
+        let capabilities = if self.sampling.serviceable() {
+            serde_json::json!({ "sampling": {} })
+        } else {
+            serde_json::json!({})
+        };
         let params = serde_json::json!({
             "protocolVersion": MCP_PROTOCOL_VERSION,
-            "capabilities": {},
+            "capabilities": capabilities,
             "clientInfo": { "name": "relux", "version": env!("CARGO_PKG_VERSION") },
         });
         let _ = self.request("initialize", &params, timeout)?;
@@ -478,6 +501,32 @@ impl StdioChild {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
+                    // A message carrying a `method` is server→CLIENT (the trust direction
+                    // inverts): either a server-initiated REQUEST (has an `id`) or a
+                    // notification (no `id`). Check `method` BEFORE the id-match so a
+                    // server request whose id numerically collides with ours is never
+                    // mistaken for our response. A request is handled here — gated MCP
+                    // sampling, or a clean `-32601` for anything else — and its response
+                    // written back, then we keep waiting for OUR response. Before this,
+                    // such a request was silently dropped and the server hung until the
+                    // timeout; now it gets an immediate, honest answer.
+                    if let Some(method) = value.get("method").and_then(|m| m.as_str()) {
+                        if let Some(req_id) = value.get("id") {
+                            if !req_id.is_null() {
+                                let response = crate::mcp_sampling::handle_inbound_request(
+                                    &self.sampling,
+                                    method,
+                                    req_id,
+                                    value.get("params"),
+                                );
+                                // Best effort: if the write fails the next read surfaces
+                                // an honest transport error and the deadline still bounds us.
+                                let _ = self.write_line(&response);
+                            }
+                        }
+                        // Notification or handled request — neither is our response.
+                        continue;
+                    }
                     // A notification (no `id`) is not our response; keep reading.
                     // A response whose `id` does not match THIS request's id is a
                     // stale reply (e.g. a previous request that timed out and answered
@@ -761,6 +810,7 @@ impl ManagedEntry {
         env: &[(String, String)],
         cwd: Option<&Path>,
         timeout_ms: u64,
+        sampling: crate::mcp_sampling::SamplingContext,
     ) {
         self.state.store(STATE_STARTING, Ordering::SeqCst);
         let timeout = Duration::from_millis(timeout_ms);
@@ -770,26 +820,31 @@ impl ManagedEntry {
         self.pid.store(0, Ordering::SeqCst);
         self.started_at_ms.store(0, Ordering::SeqCst);
         match StdioChild::spawn(command, args, env, cwd) {
-            Ok(mut child) => match child.initialize(timeout) {
-                Ok(()) => {
-                    self.pid.store(child.pid(), Ordering::SeqCst);
-                    self.started_at_ms.store(now_ms(), Ordering::SeqCst);
-                    {
-                        let mut m = self.meta();
-                        m.last_error = None;
-                        m.tools_count = None;
-                        m.log_tail.clear();
+            Ok(mut child) => {
+                // Attach the gated sampling context BEFORE the handshake so the
+                // `sampling` capability is advertised only for a serviceable session.
+                child.set_sampling(sampling);
+                match child.initialize(timeout) {
+                    Ok(()) => {
+                        self.pid.store(child.pid(), Ordering::SeqCst);
+                        self.started_at_ms.store(now_ms(), Ordering::SeqCst);
+                        {
+                            let mut m = self.meta();
+                            m.last_error = None;
+                            m.tools_count = None;
+                            m.log_tail.clear();
+                        }
+                        self.state.store(STATE_RUNNING, Ordering::SeqCst);
+                        *guard = Some(child);
                     }
-                    self.state.store(STATE_RUNNING, Ordering::SeqCst);
-                    *guard = Some(child);
+                    Err(err) => {
+                        // Fold the child's stderr tail into the reason, then reap it.
+                        let enriched = child.enrich_error(err);
+                        *guard = None;
+                        self.fail(&enriched.to_string());
+                    }
                 }
-                Err(err) => {
-                    // Fold the child's stderr tail into the reason, then reap it.
-                    let enriched = child.enrich_error(err);
-                    *guard = None;
-                    self.fail(&enriched.to_string());
-                }
-            },
+            }
             Err(err) => {
                 *guard = None;
                 self.fail(&err.to_string());
@@ -970,6 +1025,9 @@ impl ManagedPool {
 
     /// Start (or replace) the managed process for `id`. Returns its status — `Running`
     /// on success, `Failed` (with `last_error`) if the spawn/handshake failed.
+    // Mirrors the spawn parameters (command/args/env/cwd/timeout) plus the gated
+    // sampling context; grouping them would only shift the shape, not reduce it.
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         &self,
         id: &str,
@@ -978,9 +1036,10 @@ impl ManagedPool {
         env: &[(String, String)],
         cwd: Option<&Path>,
         timeout_ms: u64,
+        sampling: crate::mcp_sampling::SamplingContext,
     ) -> relux_core::ManagedStdioStatus {
         let entry = self.entry(id);
-        entry.start(command, args, env, cwd, timeout_ms);
+        entry.start(command, args, env, cwd, timeout_ms, sampling);
         entry.status()
     }
 
@@ -1008,6 +1067,7 @@ impl ManagedPool {
     }
 
     /// Restart: stop the current process then start a fresh one.
+    #[allow(clippy::too_many_arguments)]
     pub fn restart(
         &self,
         id: &str,
@@ -1016,10 +1076,11 @@ impl ManagedPool {
         env: &[(String, String)],
         cwd: Option<&Path>,
         timeout_ms: u64,
+        sampling: crate::mcp_sampling::SamplingContext,
     ) -> relux_core::ManagedStdioStatus {
         let entry = self.entry(id);
         entry.stop();
-        entry.start(command, args, env, cwd, timeout_ms);
+        entry.start(command, args, env, cwd, timeout_ms, sampling);
         entry.status()
     }
 

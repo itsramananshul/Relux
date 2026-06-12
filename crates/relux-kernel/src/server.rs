@@ -603,6 +603,13 @@ fn protected_router() -> Router<AppState> {
             "/v1/relux/mcp/servers/:id/prompts/get",
             post(mcp_get_prompt_route),
         )
+        // MCP sampling — gated, default-deny server-initiated LLM calls. Enable/disable
+        // the per-server policy; read the secret-free audit tail of sampling decisions.
+        .route(
+            "/v1/relux/mcp/servers/:id/sampling",
+            put(set_mcp_sampling_policy).patch(set_mcp_sampling_policy),
+        )
+        .route("/v1/relux/mcp/sampling/audit", get(mcp_sampling_audit))
         .route(
             "/v1/relux/mcp/servers/:id/tools/:tool/classification",
             put(set_mcp_tool_classification)
@@ -8006,6 +8013,9 @@ struct McpServerResponse {
     /// Empty when no tool has been classified (every tool then uses the fail-closed
     /// default: Medium + Required → gated).
     tool_overrides: std::collections::BTreeMap<String, relux_core::McpToolClassification>,
+    /// Whether the operator has enabled MCP **sampling** (`sampling/createMessage`) for
+    /// this server. Default `false` (deny). Only meaningful for a managed-stdio server.
+    sampling_enabled: bool,
 }
 
 impl McpServerResponse {
@@ -8024,6 +8034,7 @@ impl McpServerResponse {
             timeout_ms: c.timeout_ms,
             status: c.status_str().to_string(),
             tool_overrides: c.tool_overrides.clone(),
+            sampling_enabled: c.sampling.enabled,
         }
     }
 }
@@ -8266,7 +8277,11 @@ async fn start_mcp_stdio(
     if id.is_empty() {
         return Err(ApiError::bad_request("MCP server id is required"));
     }
-    let status = locked_save(&state, |kernel| kernel.start_mcp_stdio_server(&id))?;
+    // Build the gated sampling provider from the configured AI provider (key by secret
+    // reference, held only on the in-memory config). It is attached to the session ONLY
+    // when the server's sampling policy is enabled; otherwise sampling stays off.
+    let sampler = relux_kernel::ai::build_sampling_sampler(&resolve_ai(&state));
+    let status = locked_save(&state, |kernel| kernel.start_mcp_stdio_server(&id, sampler))?;
     Ok(Json(status))
 }
 
@@ -8294,8 +8309,44 @@ async fn restart_mcp_stdio(
     if id.is_empty() {
         return Err(ApiError::bad_request("MCP server id is required"));
     }
-    let status = locked_save(&state, |kernel| kernel.restart_mcp_stdio_server(&id))?;
+    let sampler = relux_kernel::ai::build_sampling_sampler(&resolve_ai(&state));
+    let status = locked_save(&state, |kernel| kernel.restart_mcp_stdio_server(&id, sampler))?;
     Ok(Json(status))
+}
+
+/// Body of `PUT/PATCH /v1/relux/mcp/servers/:id/sampling` — enable/disable MCP sampling.
+#[derive(Debug, Deserialize)]
+struct McpSamplingPolicyReq {
+    enabled: bool,
+}
+
+/// PUT/PATCH `/v1/relux/mcp/servers/:id/sampling` — set the operator policy for MCP
+/// **sampling** (`sampling/createMessage`) on one server. Fail-closed: enabling it on an
+/// HTTP-loopback server is a 400 (it has no persistent session to carry a server request);
+/// an unknown server is 404. The change takes effect on the next Start/Restart of the
+/// managed process. Returns the updated (secret-free) server config.
+async fn set_mcp_sampling_policy(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<McpSamplingPolicyReq>,
+) -> Result<Json<relux_core::McpServerConfig>, ApiError> {
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err(ApiError::bad_request("MCP server id is required"));
+    }
+    let config = locked_save(&state, |kernel| {
+        kernel.set_mcp_sampling_policy(&id, body.enabled)
+    })?;
+    Ok(Json(config))
+}
+
+/// GET `/v1/relux/mcp/sampling/audit` — the process-global, secret-free audit tail of
+/// server-initiated sampling requests (decision + counts + model only; never any
+/// plaintext). Read-only, oldest first.
+async fn mcp_sampling_audit(
+    State(_state): State<AppState>,
+) -> Result<Json<Vec<relux_core::McpSamplingAuditRecord>>, ApiError> {
+    Ok(Json(relux_kernel::mcp_sampling::audit_tail()))
 }
 
 /// The operator-set risk/approval classification for one MCP tool. Accepts the

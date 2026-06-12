@@ -1519,6 +1519,77 @@ async fn request_completion(cfg: &AiConfig, messages: Vec<ChatMessage>) -> Resul
     Ok(truncate_chars(&text, MAX_REPLY_CHARS))
 }
 
+/// Build the synchronous [`crate::mcp_sampling::Sampler`] an MCP managed-stdio session
+/// uses to serve a gated `sampling/createMessage` request, or `None` when no usable
+/// Prime/AI provider is configured (disabled, or no key) — in which case sampling
+/// refuses cleanly with "no provider".
+///
+/// The key lives **only** on the in-memory [`AiConfig`] (resolved by secret reference)
+/// and travels solely in the OpenRouter `Authorization` header inside
+/// [`request_completion`]; it is **never** handed to the MCP server. Only the bounded,
+/// redacted completion text crosses back. The output is bounded by the existing
+/// [`MAX_TOKENS`] / [`MAX_REPLY_CHARS`] caps, then re-clamped + redacted by the sampling
+/// handler before it leaves for the server.
+pub fn build_sampling_sampler(cfg: &AiConfig) -> Option<crate::mcp_sampling::Sampler> {
+    if !cfg.enabled() || cfg.api_key.is_none() {
+        return None;
+    }
+    let cfg = cfg.clone();
+    Some(std::sync::Arc::new(
+        move |req: &crate::mcp_sampling::SamplingRequest| {
+            let messages = build_sampling_chat_messages(req);
+            run_blocking_completion(&cfg, messages).map(|text| {
+                crate::mcp_sampling::SamplingCompletion {
+                    text,
+                    model: cfg.model.clone(),
+                }
+            })
+        },
+    ))
+}
+
+/// Map a bounded [`crate::mcp_sampling::SamplingRequest`] to OpenRouter chat messages.
+fn build_sampling_chat_messages(req: &crate::mcp_sampling::SamplingRequest) -> Vec<ChatMessage> {
+    let mut messages: Vec<ChatMessage> = Vec::new();
+    if let Some(system) = &req.system {
+        messages.push(ChatMessage {
+            role: "system",
+            content: system.clone(),
+        });
+    }
+    for m in &req.messages {
+        let role: &'static str = match m.role.as_str() {
+            "assistant" => "assistant",
+            "system" => "system",
+            _ => "user",
+        };
+        messages.push(ChatMessage {
+            role,
+            content: m.text.clone(),
+        });
+    }
+    messages
+}
+
+/// Run [`request_completion`] to completion **synchronously**, on a dedicated OS thread
+/// with its own current-thread Tokio runtime. The MCP stdio pump is synchronous and may
+/// already be inside the server's async runtime; a fresh thread is never a Tokio worker,
+/// so `block_on` there is safe (it would panic on a worker thread). Bounded by the
+/// provider's own request timeout. Returns a short, secret-free reason on failure.
+fn run_blocking_completion(cfg: &AiConfig, messages: Vec<ChatMessage>) -> Result<String, String> {
+    let cfg = cfg.clone();
+    let handle = std::thread::spawn(move || -> Result<String, String> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| "sampling runtime init failed".to_string())?;
+        rt.block_on(request_completion(&cfg, messages))
+    });
+    handle
+        .join()
+        .map_err(|_| "sampling worker panicked".to_string())?
+}
+
 /// Map a reqwest send error to a short, stable, secret-free reason.
 fn classify_send_error(e: &reqwest::Error) -> String {
     if e.is_timeout() {

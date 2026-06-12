@@ -31,6 +31,7 @@ pub mod live_run_log;
 pub mod loader;
 pub mod mcp;
 pub mod mcp_proposal;
+pub mod mcp_sampling;
 pub mod mcp_stdio;
 pub mod plugin_install;
 pub mod plugin_tool_config;
