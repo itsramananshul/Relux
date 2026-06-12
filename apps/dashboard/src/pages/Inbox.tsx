@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useAsync } from "../components/common";
 import {
   reluxInbox,
@@ -21,7 +21,8 @@ import {
   inboxAgeDetail,
   filterInbox,
   inboxFilterCount,
-  inboxEmptyMessage,
+  searchInbox,
+  inboxSearchEmptyMessage,
   INBOX_FILTERS,
   type InboxFilter,
 } from "../inbox";
@@ -256,11 +257,32 @@ export function InboxRow({ item, onActed }: { item: ReluxInboxItem; onActed: () 
 export function Inbox() {
   const { data, loading, error, reload } = useAsync<ReluxInbox>(() => reluxInbox.get(), []);
   const [filter, setFilter] = useState<InboxFilter>("all");
+  // The free-text search lives in the URL (`/inbox?q=…`) so a narrowed view is
+  // shareable and survives refresh/back-forward (mirrors the Briefs `?brief=` /
+  // Agents `?agent=` pattern). It is a purely local cut over the loaded items.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const query = searchParams.get("q") ?? "";
+  function setQuery(next: string) {
+    setSearchParams(
+      (prev) => {
+        const p = new URLSearchParams(prev);
+        if (next.trim()) p.set("q", next);
+        else p.delete("q");
+        return p;
+      },
+      { replace: true },
+    );
+  }
+
   const allItems = data?.items ?? [];
-  const visible = filterInbox(allItems, filter);
+  // Search first (across all kinds), then the kind/overdue filter narrows it. The
+  // filter chip counts reflect the SEARCHED set, so each chip honestly reads "how
+  // many of this kind match your search".
+  const searched = searchInbox(allItems, query);
+  const visible = filterInbox(searched, filter);
   const groups = groupInbox(visible);
-  // The active filter narrowed a non-empty queue to nothing (vs. a globally empty
-  // Inbox) — the empty state reflects which.
+  // A search and/or the kind filter narrowed a non-empty queue to nothing (vs. a
+  // globally empty Inbox) — the empty state names the active query/filter.
   const filteredToEmpty = allItems.length > 0 && visible.length === 0;
 
   return (
@@ -281,12 +303,33 @@ export function Inbox() {
         runs without your click.
       </p>
 
+      {/* Search box — a purely local, free-text cut over the loaded items (title,
+          summary, kind, severity, ids, failure class, action labels). The query
+          lives in the URL so the narrowed view is shareable. */}
+      <div className="row" style={{ gap: 6, marginBottom: 4, alignItems: "center" }}>
+        <input
+          type="search"
+          className="input"
+          aria-label="Search the attention queue"
+          placeholder="Search the queue — title, id, kind, failure class, action…"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          style={{ flex: 1, fontSize: 12 }}
+        />
+        {query && (
+          <button className="btn ghost sm" onClick={() => setQuery("")} title="Clear the search">
+            Clear
+          </button>
+        )}
+      </div>
+
       {/* Filter chips — a cheap cut by kind, plus an overdue-only band. The active
-          chip carries the live count; selecting one narrows the queue below. */}
+          chip carries the live count (over the searched set); selecting one narrows
+          the queue below. */}
       <div className="row wrap" style={{ gap: 6, marginBottom: 4 }}>
         {INBOX_FILTERS.map((f) => {
           const active = filter === f.key;
-          const count = inboxFilterCount(allItems, f.key);
+          const count = inboxFilterCount(searched, f.key);
           return (
             <button
               key={f.key}
@@ -323,9 +366,12 @@ export function Inbox() {
       {filteredToEmpty && (
         <div className="card">
           <div className="empty" style={{ padding: 24, textAlign: "center" }}>
-            <div style={{ fontWeight: 600, marginBottom: 4 }}>{inboxEmptyMessage(filter)}</div>
+            <div style={{ fontWeight: 600, marginBottom: 4 }}>
+              {inboxSearchEmptyMessage(filter, query)}
+            </div>
             <div className="muted" style={{ fontSize: 12 }}>
-              Other attention items are still queued — clear the filter to see them.
+              Other attention items are still queued — clear the{" "}
+              {query ? "search or filter" : "filter"} to see them.
             </div>
           </div>
         </div>

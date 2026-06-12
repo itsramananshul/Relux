@@ -304,6 +304,78 @@ export function inboxFilterCount(items: ReluxInboxItem[], filter: InboxFilter): 
   return filterInbox(items, filter).length;
 }
 
+// The human label for a filter key (the chip text), looked up from the single
+// source above so the empty-state copy and the chip never drift.
+export function inboxFilterLabel(filter: InboxFilter): string {
+  return INBOX_FILTERS.find((f) => f.key === filter)?.label ?? "All";
+}
+
+// ---------------------------------------------------------------------------
+// Search (docs/relix-dashboard-design.md §6.11 "cross-project search of the
+// queue"). A purely LOCAL, free-text filter over the items already loaded — it
+// fetches nothing and grants no authority; it only narrows what is shown.
+// ---------------------------------------------------------------------------
+
+// Normalize a raw query: trimmed + lowercased for case-insensitive matching. An
+// absent / blank query normalizes to "" (which matches everything).
+export function normalizeInboxQuery(query: string | null | undefined): string {
+  return (query ?? "").trim().toLowerCase();
+}
+
+// The searchable text blob for one item: its identity (the category-prefixed id
+// + every related id), its kind/severity, its title/summary/failure class, and
+// its action button labels — so a search by "retry", "auth_required", a run id,
+// or a word in the title all hit. Lowercased once for the predicate below.
+export function inboxItemSearchText(item: ReluxInboxItem): string {
+  const parts: (string | null | undefined)[] = [
+    item.title,
+    item.summary,
+    item.kind,
+    item.severity,
+    item.id,
+    item.task_id,
+    item.run_id,
+    item.approval_id,
+    item.continuation_id,
+    item.failure_class,
+    ...item.actions.map((kind) => inboxActionSpec(kind).label),
+  ];
+  return parts.filter((p) => typeof p === "string" && p.length > 0).join(" ").toLowerCase();
+}
+
+// Does an item match the free-text query? Empty query → everything matches.
+// Multi-term is AND (every whitespace-separated term must appear somewhere in
+// the item's text), so "task auth" narrows to items mentioning both.
+export function inboxItemMatchesQuery(item: ReluxInboxItem, query: string): boolean {
+  const q = normalizeInboxQuery(query);
+  if (!q) return true;
+  const text = inboxItemSearchText(item);
+  return q.split(/\s+/).every((term) => text.includes(term));
+}
+
+// Apply the free-text search to the list. Empty query passes everything through
+// unchanged; otherwise keeps only matching items, order-preserving (the backend's
+// severity-then-oldest order is retained). Pure — composes with filterInbox.
+export function searchInbox(items: ReluxInboxItem[], query: string): ReluxInboxItem[] {
+  const q = normalizeInboxQuery(query);
+  if (!q) return items;
+  return items.filter((it) => inboxItemMatchesQuery(it, q));
+}
+
+// The honest empty-state line when a search (and/or a kind/overdue filter) has
+// narrowed a non-empty queue to nothing. Names the active query verbatim and, when
+// a filter is also active, the filter — so the operator sees exactly what they're
+// looking through (vs. the global all-clear). Falls back to the filter-specific
+// line when no query is set.
+export function inboxSearchEmptyMessage(filter: InboxFilter, query: string): string {
+  const raw = (query ?? "").trim();
+  if (raw) {
+    const scope = filter === "all" ? "" : ` in ${inboxFilterLabel(filter)}`;
+    return `No items match '${raw}'${scope}.`;
+  }
+  return inboxEmptyMessage(filter);
+}
+
 // The honest empty-state line for the ACTIVE filter, so an empty filtered view reads
 // correctly ("No overdue items", not the global "Nothing needs you").
 export function inboxEmptyMessage(filter: InboxFilter): string {

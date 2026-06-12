@@ -23,7 +23,13 @@ import {
   inboxAgeDetail,
   filterInbox,
   inboxFilterCount,
+  inboxFilterLabel,
   inboxEmptyMessage,
+  normalizeInboxQuery,
+  inboxItemSearchText,
+  inboxItemMatchesQuery,
+  searchInbox,
+  inboxSearchEmptyMessage,
   INBOX_AGE_THRESHOLDS,
   INBOX_FILTERS,
   type InboxActionMode,
@@ -223,6 +229,95 @@ test("filterInbox keeps all / a kind / only overdue", () => {
   assert.equal(inboxFilterCount(items, "all"), 4);
   assert.equal(inboxFilterCount(items, "overdue"), 2);
   assert.equal(inboxFilterCount(items, "paused_continuation"), 0);
+});
+
+test("normalizeInboxQuery trims + lowercases; blank/absent → empty", () => {
+  assert.equal(normalizeInboxQuery("  AuTh  "), "auth");
+  assert.equal(normalizeInboxQuery(""), "");
+  assert.equal(normalizeInboxQuery("   "), "");
+  assert.equal(normalizeInboxQuery(null), "");
+  assert.equal(normalizeInboxQuery(undefined), "");
+});
+
+test("inboxItemSearchText covers identity, content, and action labels", () => {
+  const text = inboxItemSearchText(
+    item({
+      id: "run:abc",
+      kind: "failed_run",
+      severity: "critical",
+      title: "Login flow broke",
+      summary: "the adapter timed out",
+      task_id: "tk-77",
+      run_id: "run-abc",
+      failure_class: "auth_required",
+      actions: ["retry", "diagnose"],
+    }),
+  );
+  // Identity + ids.
+  assert.match(text, /run:abc/);
+  assert.match(text, /tk-77/);
+  assert.match(text, /run-abc/);
+  // Kind + severity + failure class + content.
+  assert.match(text, /failed_run/);
+  assert.match(text, /critical/);
+  assert.match(text, /auth_required/);
+  assert.match(text, /login flow broke/);
+  assert.match(text, /adapter timed out/);
+  // Action button labels ("Retry", "Analyze failure"), lowercased.
+  assert.match(text, /retry/);
+  assert.match(text, /analyze failure/);
+});
+
+test("inboxItemMatchesQuery: empty matches all; case-insensitive; multi-term is AND", () => {
+  const it = item({
+    title: "Login flow broke",
+    failure_class: "auth_required",
+    run_id: "run-abc",
+    actions: ["retry"],
+  });
+  assert.equal(inboxItemMatchesQuery(it, ""), true);
+  assert.equal(inboxItemMatchesQuery(it, "   "), true);
+  assert.equal(inboxItemMatchesQuery(it, "LOGIN"), true);
+  assert.equal(inboxItemMatchesQuery(it, "auth_required"), true);
+  assert.equal(inboxItemMatchesQuery(it, "run-abc"), true);
+  // Multi-term AND: both terms must appear somewhere in the item's text.
+  assert.equal(inboxItemMatchesQuery(it, "login auth"), true);
+  assert.equal(inboxItemMatchesQuery(it, "login nope"), false);
+  assert.equal(inboxItemMatchesQuery(it, "zzz"), false);
+});
+
+test("searchInbox filters by free text; empty query passes everything, order-preserving", () => {
+  const items: ReluxInboxItem[] = [
+    item({ id: "approval:1", kind: "pending_approval", title: "Approve hire" }),
+    item({ id: "run:1", kind: "failed_run", failure_class: "auth_required", title: "Run broke" }),
+    item({ id: "task:1", kind: "blocked_task", title: "Ship the auth page" }),
+  ];
+  // Empty query → unchanged list (same order, same length).
+  assert.deepEqual(searchInbox(items, "").map((i) => i.id), ["approval:1", "run:1", "task:1"]);
+  // "auth" hits the failure_class on run:1 AND the title on task:1.
+  assert.deepEqual(searchInbox(items, "auth").map((i) => i.id), ["run:1", "task:1"]);
+  // A specific id narrows to one.
+  assert.deepEqual(searchInbox(items, "approval:1").map((i) => i.id), ["approval:1"]);
+  // No match → empty.
+  assert.equal(searchInbox(items, "nonesuch").length, 0);
+});
+
+test("inboxFilterLabel resolves the chip label, defaulting to All", () => {
+  assert.equal(inboxFilterLabel("all"), "All");
+  assert.equal(inboxFilterLabel("pending_approval"), "Approvals");
+  assert.equal(inboxFilterLabel("overdue"), "Overdue");
+});
+
+test("inboxSearchEmptyMessage names the query + filter, or falls back to the filter line", () => {
+  // No query → the existing filter-specific line.
+  assert.equal(inboxSearchEmptyMessage("overdue", ""), inboxEmptyMessage("overdue"));
+  assert.equal(inboxSearchEmptyMessage("all", "   "), inboxEmptyMessage("all"));
+  // Query under "all" names the query verbatim, no scope clause.
+  assert.match(inboxSearchEmptyMessage("all", "auth"), /No items match 'auth'\./);
+  // Query under a filter names BOTH the query and the filter scope.
+  const msg = inboxSearchEmptyMessage("failed_run", "auth");
+  assert.match(msg, /No items match 'auth'/);
+  assert.match(msg, /Failed runs/);
 });
 
 test("INBOX_FILTERS covers all/kinds/overdue and inboxEmptyMessage reflects the active filter", () => {
