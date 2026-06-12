@@ -27,6 +27,8 @@ type Draft = Pick<
   | "extended_max_orchestration_steps"
   | "max_context_rounds"
   | "extended_max_context_rounds"
+  | "max_active_jobs"
+  | "extended_max_active_jobs"
 >;
 
 function toDraft(c: ReluxPrimeAgentPolicy): Draft {
@@ -43,6 +45,8 @@ function toDraft(c: ReluxPrimeAgentPolicy): Draft {
     extended_max_orchestration_steps: c.extended_max_orchestration_steps,
     max_context_rounds: c.max_context_rounds,
     extended_max_context_rounds: c.extended_max_context_rounds,
+    max_active_jobs: c.max_active_jobs,
+    extended_max_active_jobs: c.extended_max_active_jobs,
   };
 }
 
@@ -133,6 +137,13 @@ export function PrimeAgentPolicyPanel() {
         >
           ctx {resp.standard.max_context_rounds}/{resp.extended.max_context_rounds} rounds
         </span>
+        <span
+          className="badge backlog"
+          style={{ fontSize: 9, marginLeft: 6 }}
+          title="Resolved concurrent background-job admission cap — max active run-jobs across the fleet (standard / extended)"
+        >
+          jobs {resp.standard.max_active_jobs}/{resp.extended.max_active_jobs} active
+        </span>
       </div>
       <p className="muted" style={{ marginTop: -2, marginBottom: 10, fontSize: 12, lineHeight: 1.6 }}>
         How far Prime's chat <strong>agent loop</strong> may go in one turn before it stops and asks.
@@ -221,6 +232,28 @@ export function PrimeAgentPolicyPanel() {
           value={draft.extended_max_context_rounds}
           disabled={busy}
           onChange={(v) => set("extended_max_context_rounds", Math.max(0, parseInt(v, 10) || 0))}
+        />
+      </div>
+
+      {/* The configurable concurrent background-job admission cap (the async run-async fleet
+          limit), replacing the retired hidden MAX_ACTIVE_JOBS=4. A REAL resource guardrail —
+          each active job drives live adapter processes — so Standard stays conservative and
+          Extended (opt-in per start) admits more for a busy operator. Both clamped to a safe
+          ceiling on the server; the over-limit response names the configured limit and how to
+          raise it. */}
+      <div className="row wrap" style={{ alignItems: "center", gap: 8, marginTop: 2, marginBottom: 4 }}>
+        <strong style={{ fontSize: 12, width: 72 }}>Active jobs</strong>
+        <Field
+          label="std jobs"
+          value={draft.max_active_jobs}
+          disabled={busy}
+          onChange={(v) => set("max_active_jobs", Math.max(0, parseInt(v, 10) || 0))}
+        />
+        <Field
+          label="ext jobs"
+          value={draft.extended_max_active_jobs}
+          disabled={busy}
+          onChange={(v) => set("extended_max_active_jobs", Math.max(0, parseInt(v, 10) || 0))}
         />
       </div>
 

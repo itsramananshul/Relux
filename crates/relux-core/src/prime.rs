@@ -117,6 +117,25 @@ pub struct PrimeAgentPolicy {
     /// Higher than standard, clamped to the same absolute ceiling.
     #[serde(default = "default_extended_max_context_rounds")]
     pub extended_max_context_rounds: u32,
+    /// Standard profile: the most non-terminal background run-jobs allowed at once across
+    /// the whole fleet (the async `run-async` orchestration-job admission cap). This is a
+    /// REAL resource guardrail — each active job drives real adapter processes on a
+    /// dedicated OS thread — not a per-turn agent dial, so it bounds concurrent **load**,
+    /// not how far one turn reasons. It replaces the retired hidden `MAX_ACTIVE_JOBS = 4`
+    /// constant so a busy operator can raise it (and a constrained host can lower it)
+    /// instead of being stuck at a fixed wall. The admission route reads this through
+    /// [`Self::active_jobs`]; the limit is still bounded and clamped to
+    /// [`Self::MAX_ACTIVE_JOBS_CEIL`] so a burst can never spawn unbounded workers.
+    ///
+    /// `#[serde(default)]` so a snapshot persisted before this field existed deserializes
+    /// with the serious default instead of failing the whole load.
+    #[serde(default = "default_max_active_jobs")]
+    pub max_active_jobs: u32,
+    /// Extended profile: max concurrent background run-jobs for an explicit high-throughput
+    /// operator ("extended"/"high" admission). Substantially higher than standard, clamped to
+    /// the same absolute ceiling — a real guardrail even at the top, never "unlimited".
+    #[serde(default = "default_extended_max_active_jobs")]
+    pub extended_max_active_jobs: u32,
 }
 
 /// Serde default for [`PrimeAgentPolicy::max_tool_plan_steps`] (older snapshots) — the
@@ -152,11 +171,31 @@ fn default_extended_max_context_rounds() -> u32 {
     DEFAULT_EXTENDED_MAX_CONTEXT_ROUNDS
 }
 
+/// Serde default for [`PrimeAgentPolicy::max_active_jobs`] (older snapshots) — the practical
+/// standard background-job admission cap (the value the retired `MAX_ACTIVE_JOBS` held).
+fn default_max_active_jobs() -> u32 {
+    DEFAULT_MAX_ACTIVE_JOBS
+}
+
+/// Serde default for [`PrimeAgentPolicy::extended_max_active_jobs`] (older snapshots).
+fn default_extended_max_active_jobs() -> u32 {
+    DEFAULT_EXTENDED_MAX_ACTIVE_JOBS
+}
+
 /// The STANDARD default read-only context-round budget. Kept aligned with the kernel's
 /// `relux_kernel::MAX_TOOL_ROUNDS` (the bare-constant default the read path still uses).
 const DEFAULT_MAX_CONTEXT_ROUNDS: u32 = 8;
 /// The EXTENDED default read-only context-round budget for an explicit long-work inspection.
 const DEFAULT_EXTENDED_MAX_CONTEXT_ROUNDS: u32 = 32;
+
+/// The STANDARD default concurrent background-job admission cap — the practical value the
+/// retired hidden `MAX_ACTIVE_JOBS` constant held. Conservative so an ordinary host is not
+/// flooded; an operator can raise it on the agent-policy route.
+const DEFAULT_MAX_ACTIVE_JOBS: u32 = 4;
+/// The EXTENDED default concurrent background-job admission cap for a high-throughput operator.
+/// Higher than standard but still well under the safe ceiling (mirrors Hermes's configurable
+/// `max_concurrent` admission knob — a named, raisable limit, not a hidden wall).
+const DEFAULT_EXTENDED_MAX_ACTIVE_JOBS: u32 = 16;
 
 impl PrimeAgentPolicy {
     /// The smallest a tool-call / brain-round cap may be set to (a turn must allow at least one).
@@ -181,6 +220,11 @@ impl PrimeAgentPolicy {
     /// on a loop that mutates nothing (it bounds only brain-call count). Operators cannot set
     /// "infinite".
     pub const MAX_CONTEXT_ROUNDS_CEIL: u32 = 64;
+    /// The largest concurrent background-job admission cap an operator may set — a real
+    /// resource ceiling: each active job drives live adapter processes on its own OS thread,
+    /// so the absolute backstop keeps even an "extended" operator from spawning unbounded
+    /// workers. A configured value above this is clamped down here.
+    pub const MAX_ACTIVE_JOBS_CEIL: u32 = 64;
 
     /// Clamp every field into its safe operator range. Defensive — the route clamps too, but any
     /// path that mutates the policy can call this so an out-of-range value never reaches the loop.
@@ -209,6 +253,10 @@ impl PrimeAgentPolicy {
             self.max_context_rounds.clamp(Self::MIN_STEPS, Self::MAX_CONTEXT_ROUNDS_CEIL);
         self.extended_max_context_rounds =
             self.extended_max_context_rounds.clamp(Self::MIN_STEPS, Self::MAX_CONTEXT_ROUNDS_CEIL);
+        self.max_active_jobs =
+            self.max_active_jobs.clamp(Self::MIN_STEPS, Self::MAX_ACTIVE_JOBS_CEIL);
+        self.extended_max_active_jobs =
+            self.extended_max_active_jobs.clamp(Self::MIN_STEPS, Self::MAX_ACTIVE_JOBS_CEIL);
         self
     }
 
@@ -225,6 +273,7 @@ impl PrimeAgentPolicy {
                 max_tool_plan_steps: c.extended_max_tool_plan_steps,
                 max_orchestration_steps: c.extended_max_orchestration_steps,
                 max_context_rounds: c.extended_max_context_rounds,
+                max_active_jobs: c.extended_max_active_jobs,
             }
         } else {
             PrimeAgentLimits {
@@ -235,6 +284,7 @@ impl PrimeAgentPolicy {
                 max_tool_plan_steps: c.max_tool_plan_steps,
                 max_orchestration_steps: c.max_orchestration_steps,
                 max_context_rounds: c.max_context_rounds,
+                max_active_jobs: c.max_active_jobs,
             }
         }
     }
@@ -262,6 +312,14 @@ impl PrimeAgentPolicy {
     /// operator dial rather than a module constant. `extended` selects the higher long-work profile.
     pub fn context_rounds(&self, extended: bool) -> usize {
         self.limits(extended).max_context_rounds as usize
+    }
+
+    /// The effective, clamped concurrent background-job admission cap for the requested mode —
+    /// the single accessor the async `run-async` admission route reads, so the operator-visible
+    /// policy is the one source of truth instead of a hidden constant. `extended` selects the
+    /// higher high-throughput profile. Returns a value in `1..=MAX_ACTIVE_JOBS_CEIL`.
+    pub fn active_jobs(&self, extended: bool) -> usize {
+        self.limits(extended).max_active_jobs as usize
     }
 }
 
@@ -291,6 +349,11 @@ impl Default for PrimeAgentPolicy {
             // extended allows a deeper inspection for explicit long work.
             max_context_rounds: DEFAULT_MAX_CONTEXT_ROUNDS,
             extended_max_context_rounds: DEFAULT_EXTENDED_MAX_CONTEXT_ROUNDS,
+            // Standard background-job admission keeps the practical value the retired hidden
+            // MAX_ACTIVE_JOBS held (4); extended raises throughput for a busy operator, both
+            // clamped to the shared MAX_ACTIVE_JOBS_CEIL.
+            max_active_jobs: DEFAULT_MAX_ACTIVE_JOBS,
+            extended_max_active_jobs: DEFAULT_EXTENDED_MAX_ACTIVE_JOBS,
         }
     }
 }
@@ -314,6 +377,10 @@ pub struct PrimeAgentLimits {
     pub max_orchestration_steps: u32,
     /// Max rounds the read-only context loop runs under this profile.
     pub max_context_rounds: u32,
+    /// Max concurrent background run-jobs admitted across the fleet under this profile. Unlike
+    /// the others this is a fleet-wide RESOURCE guardrail (not a per-turn loop bound), resolved
+    /// here so the operator sees one clamped value per profile.
+    pub max_active_jobs: u32,
 }
 
 /// The result of a single Prime autonomy tick.
@@ -1534,6 +1601,11 @@ mod tests {
         assert!(p.max_context_rounds > 4, "standard context rounds must beat the toy 4");
         assert!(p.extended_max_context_rounds > p.max_context_rounds);
         assert!(p.extended_max_context_rounds <= PrimeAgentPolicy::MAX_CONTEXT_ROUNDS_CEIL);
+        // Background-job admission: standard keeps the practical guardrail (≥ the retired
+        // hidden MAX_ACTIVE_JOBS=4), extended is higher for a busy operator, both bounded.
+        assert!(p.max_active_jobs >= 4, "standard active-jobs must keep the practical guardrail");
+        assert!(p.extended_max_active_jobs > p.max_active_jobs, "extended must admit more jobs");
+        assert!(p.extended_max_active_jobs <= PrimeAgentPolicy::MAX_ACTIVE_JOBS_CEIL);
     }
 
     #[test]
@@ -1556,6 +1628,10 @@ mod tests {
         assert_eq!(std.max_context_rounds, p.max_context_rounds);
         assert_eq!(ext.max_context_rounds, p.extended_max_context_rounds);
         assert!(p.context_rounds(true) > p.context_rounds(false), "extended allows more context rounds");
+        // Background-job admission resolves per mode, extended higher than standard.
+        assert_eq!(std.max_active_jobs, p.max_active_jobs);
+        assert_eq!(ext.max_active_jobs, p.extended_max_active_jobs);
+        assert!(p.active_jobs(true) > p.active_jobs(false), "extended admits more concurrent jobs");
         // An out-of-range policy is clamped to the safe ceilings (no "infinite").
         let wild = PrimeAgentPolicy {
             max_tool_calls: 0,
@@ -1570,6 +1646,8 @@ mod tests {
             extended_max_orchestration_steps: u32::MAX,
             max_context_rounds: 0,
             extended_max_context_rounds: u32::MAX,
+            max_active_jobs: 0,
+            extended_max_active_jobs: u32::MAX,
         }
         .clamped();
         assert_eq!(wild.max_tool_calls, PrimeAgentPolicy::MIN_STEPS);
@@ -1583,6 +1661,8 @@ mod tests {
         assert_eq!(wild.extended_max_orchestration_steps, PrimeAgentPolicy::MAX_ORCHESTRATION_STEPS_CEIL);
         assert_eq!(wild.max_context_rounds, PrimeAgentPolicy::MIN_STEPS);
         assert_eq!(wild.extended_max_context_rounds, PrimeAgentPolicy::MAX_CONTEXT_ROUNDS_CEIL);
+        assert_eq!(wild.max_active_jobs, PrimeAgentPolicy::MIN_STEPS);
+        assert_eq!(wild.extended_max_active_jobs, PrimeAgentPolicy::MAX_ACTIVE_JOBS_CEIL);
     }
 
     #[test]

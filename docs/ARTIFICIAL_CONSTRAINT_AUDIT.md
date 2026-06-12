@@ -129,6 +129,39 @@ presented as a capability).
   `crates/relux-kernel/src/lib.rs`, `apps/dashboard/src/api.ts`,
   `apps/dashboard/src/components/PrimeAgentPolicyPanel.tsx`.
 
+### 5. Background-job concurrency `MAX_ACTIVE_JOBS = 4` → configurable policy (named resource guardrail)
+- **Was:** the async `run-async` orchestration-job path carried a hidden
+  `const MAX_ACTIVE_JOBS: usize = 4` in `server.rs`. It is a **real** resource guardrail —
+  each active job drives live adapter processes on a dedicated OS thread, so unbounded jobs
+  would exhaust the host — but it was a fixed, invisible `4`: a busy operator could not raise
+  it and a constrained host could not lower it, and the over-limit 429 named the constant
+  internally (`{n}/{MAX_ACTIVE_JOBS}`) rather than an operator-visible knob. This was the last
+  **LATER** item.
+- **Now:** a real **configurable policy**, folded into the same operator-facing autonomy
+  surface (`relux_core::PrimeAgentPolicy`) as the other dials — the Hermes precedent here is
+  the api-server's configurable `max_concurrent` admission knob (`reference/hermes-agent-main/
+  .plans/openai-api-server.md`: a named, raisable concurrency limit, not a hidden wall). Two
+  new fields: `max_active_jobs` (standard, default **4** — the practical value the retired
+  constant held) and `extended_max_active_jobs` (default **16**), both clamped to the absolute
+  hard backstop `MAX_ACTIVE_JOBS_CEIL` (**64**). It stays a real guardrail — even "extended"
+  is bounded, never unlimited — so a request burst can never spawn unbounded workers.
+  - **Admission:** `JobRegistry::start` takes the resolved cap as an argument (the registry no
+    longer hard-codes a number); the `run-async` route reads it from the policy via
+    `PrimeAgentPolicy::active_jobs(extended)`. A request may opt into the higher profile with
+    `{"extended": true}`.
+  - **Honest refusal:** the over-limit `429` now **names the configured limit and how to raise
+    it** — `"background-job concurrency limit reached: {active}/{limit} jobs active under the
+    standard admission profile. Wait for one to finish, retry with {"extended": true} …, or
+    raise max_active_jobs on PUT /v1/relux/prime/agent-policy (clamped to 64)."` — never a
+    generic "too many".
+  - **Surface:** the two fields are on `/v1/relux/prime/agent-policy` (GET resolves them per
+    profile; PUT/PATCH clamps them) and the `prime agent-policy configure` CLI
+    (`--max-active-jobs` / `--ext-max-active-jobs`), with an **Active jobs** row + a resolved
+    `jobs std/ext active` chip in the dashboard Prime Autonomy Limits panel.
+- **Files:** `crates/relux-core/src/prime.rs`, `crates/relux-kernel/src/server.rs`,
+  `crates/relux-kernel/src/main.rs`, `apps/dashboard/src/api.ts`,
+  `apps/dashboard/src/components/PrimeAgentPolicyPanel.tsx`.
+
 ---
 
 ## KEEP (with reason) — real guardrails, not toy caps
@@ -167,9 +200,11 @@ presented as a capability).
 
 ## LATER — real lifts, too large for this slice
 
-- **`MAX_ACTIVE_JOBS = 4`** (`server.rs`, async run-job concurrency): a real concurrency
-  guardrail, but `4` may be low for a busy operator. **Next step:** make it an operator
-  setting with a sane clamp, surfaced in the dashboard, rather than a fixed constant.
+- **None.** The last LATER item — `MAX_ACTIVE_JOBS = 4` (`server.rs`, async run-job
+  concurrency) — was completed as **FIX NOW #5** above: it is now the configurable
+  `PrimeAgentPolicy::max_active_jobs` / `extended_max_active_jobs` (default 4/16, clamped to
+  a 64 ceiling), surfaced on the agent-policy route + CLI + dashboard, with an honest
+  over-limit message. No artificial toy-cap items remain open in the relux-\* product layer.
 
 ---
 

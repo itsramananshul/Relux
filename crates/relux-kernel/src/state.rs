@@ -6879,7 +6879,8 @@ impl KernelState {
         // renders (`docs/RELUX_MASTER_PLAN.md` §11.1 "Prime suggested next
         // actions"). Each is just a pre-written user message, so it can do
         // nothing the user could not type.
-        attach_suggestions(&mut turn, message, &summary);
+        let orch_width = self.prime_agent_policy.orchestration_steps(false);
+        attach_suggestions(&mut turn, message, &summary, orch_width);
         Ok((turn, intent_source))
     }
 
@@ -10700,6 +10701,7 @@ fn attach_suggestions(
     turn: &mut PrimeTurn,
     message: &str,
     summary: &relux_core::StateSummary,
+    orch_width: usize,
 ) {
     use relux_core::{PrimeIntent, PrimeSuggestion};
 
@@ -10800,7 +10802,11 @@ fn attach_suggestions(
     // privileged path - and nothing is created until they send it.
     if turn.intent == PrimeIntent::PlanRequest {
         let goal = plan_goal(message);
-        let plan = relux_core::plan_orchestration(&goal, summary);
+        // Preview at the operator-configured STANDARD orchestration width — the SAME limit
+        // the `orchestrate <goal>` commit path uses ([`KernelState::prime_orchestrate`] →
+        // `orchestration_steps(false)`), so the previewed step count matches what "Create
+        // these tasks" would actually create instead of drifting on the bare module default.
+        let plan = relux_core::plan_orchestration_with_limit(&goal, summary, orch_width);
         let multi = plan.is_multi_agent();
         let suggestion = if multi {
             PrimeSuggestion {

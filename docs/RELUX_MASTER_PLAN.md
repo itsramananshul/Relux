@@ -1836,6 +1836,31 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **unreleased** — **Background-job concurrency folded into the autonomy policy (retires the hidden
+  `MAX_ACTIVE_JOBS = 4`)**, the FINAL LATER item from `docs/ARTIFICIAL_CONSTRAINT_AUDIT.md` promoted to
+  FIXED, finishing the artificial-constraint pass and continuing the autonomy-policy line (§10.5/§17.1).
+  Built reference-first against the Hermes api-server's configurable `max_concurrent` admission knob
+  (`reference/hermes-agent-main/.plans/openai-api-server.md` — a named, raisable concurrency limit, not a
+  hidden wall) — `docs/reference-driven-development.md` (BINDING). **What changes (safe, bounded):** the
+  async `run-async` orchestration-job fleet cap was a hidden `const MAX_ACTIVE_JOBS: usize = 4` in
+  `server.rs` — a **real** resource guardrail (each active job drives live adapter processes on its own
+  OS thread) but a fixed, invisible one. It becomes two new `relux_core::PrimeAgentPolicy` fields —
+  `max_active_jobs` (standard **4**, the value the constant held) / `extended_max_active_jobs` (**16**) —
+  clamped to the absolute hard backstop `MAX_ACTIVE_JOBS_CEIL` (**64**); even extended is bounded, never
+  unlimited, so a request burst can never spawn unbounded workers. `JobRegistry::start` now takes the
+  resolved cap as an argument (the registry no longer hard-codes a number); the `run-async` route reads
+  it via `PrimeAgentPolicy::active_jobs(extended)` and a request may opt into the higher profile with
+  `{"extended": true}`. The over-limit `429` now **names the configured limit and how to raise it**
+  (extended retry / which policy field / the route), never a generic "too many". Surfaced on
+  `/v1/relux/prime/agent-policy` (GET resolves per profile; PUT/PATCH clamps), the `prime agent-policy
+  configure` CLI (`--max-active-jobs` / `--ext-max-active-jobs`), and the dashboard Prime Autonomy Limits
+  panel (new **Active jobs** row + `jobs std/ext active` chip). No release cut; no safety property
+  weakened (the concurrency guardrail stays finite + clamped, just configurable). `cargo test` + `clippy`
+  clean on `relux-core`/`relux-kernel`; dashboard typecheck/build/tests green (tests pin: the configured
+  admission limit is enforced, a raised limit admits strictly more than the old hard-coded 4, the
+  over-limit message names the limit, route/CLI serialization clamps the fields, no regression to
+  cancellation / run logs / tool gates). With this, **no artificial toy-cap items remain open** in the
+  relux-\* product layer.
 - **unreleased** — **Orchestration width + read-only context rounds folded into the autonomy policy
   (one operator dial)**, the last two LATER items from `docs/ARTIFICIAL_CONSTRAINT_AUDIT.md` promoted
   to FIXED, continuing the autonomy-policy line (§10.5/§17.1) and built reference-first against Hermes
@@ -2988,7 +3013,10 @@ the caller at the durable by-orchestration-id poll. The worker never spins: each
 round moves ≥1 brief to a terminal outcome and it stops as soon as a round runs no
 brief, the per-job budget is spent, or the orchestration is no longer `running`.
 Duplicate starts are rejected (409, one active job per orchestration) and the fleet
-is capped (429 past `MAX_ACTIVE_JOBS`).
+is capped (429 past the operator-configured admission limit —
+`PrimeAgentPolicy::max_active_jobs`, default 4, or `extended_max_active_jobs` when the
+start opts into `{"extended": true}`, both clamped to a 64 ceiling; the 429 names the
+configured limit and how to raise it, never a hidden constant).
 
 **Cancellation is cooperative and honest.** A cancel request sets a flag the worker
 checks **between** rounds (where the kernel lock is free and the prior round has

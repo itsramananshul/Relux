@@ -260,7 +260,8 @@ fn run_prime_agent_policy(args: &[String]) -> Result<(), KernelError> {
              --ext-max-tool-calls N --ext-max-brain-rounds N --ext-max-duration-secs N \
              --max-tool-plan-steps N --ext-max-tool-plan-steps N \
              --max-orchestration-steps N --ext-max-orchestration-steps N \
-             --max-context-rounds N --ext-max-context-rounds N"
+             --max-context-rounds N --ext-max-context-rounds N \
+             --max-active-jobs N --ext-max-active-jobs N"
                 .to_string(),
         )),
     }
@@ -291,6 +292,10 @@ fn run_agent_policy_status() -> Result<(), KernelError> {
         output.push_str(&format!(
             "  Read-only context rounds: {} standard, {} extended\n",
             std.max_context_rounds, ext.max_context_rounds
+        ));
+        output.push_str(&format!(
+            "  Concurrent background jobs: {} standard, {} extended (fleet admission cap; bounded by an absolute ceiling)\n",
+            std.max_active_jobs, ext.max_active_jobs
         ));
         output.push_str(
             "  (Extended is used when you explicitly ask Prime to keep working / use extended mode.\n\
@@ -324,6 +329,8 @@ fn run_agent_policy_configure(args: &[String]) -> Result<(), KernelError> {
     let mut ext_max_orchestration_steps: Option<u32> = None;
     let mut max_context_rounds: Option<u32> = None;
     let mut ext_max_context_rounds: Option<u32> = None;
+    let mut max_active_jobs: Option<u32> = None;
+    let mut ext_max_active_jobs: Option<u32> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -340,6 +347,8 @@ fn run_agent_policy_configure(args: &[String]) -> Result<(), KernelError> {
             "--ext-max-orchestration-steps" => ext_max_orchestration_steps = Some(parse_u32(args, &mut i, "--ext-max-orchestration-steps")?),
             "--max-context-rounds" => max_context_rounds = Some(parse_u32(args, &mut i, "--max-context-rounds")?),
             "--ext-max-context-rounds" => ext_max_context_rounds = Some(parse_u32(args, &mut i, "--ext-max-context-rounds")?),
+            "--max-active-jobs" => max_active_jobs = Some(parse_u32(args, &mut i, "--max-active-jobs")?),
+            "--ext-max-active-jobs" => ext_max_active_jobs = Some(parse_u32(args, &mut i, "--ext-max-active-jobs")?),
             other => return Err(KernelError::Storage(format!("Unknown argument: {other}"))),
         }
         i += 1;
@@ -360,6 +369,8 @@ fn run_agent_policy_configure(args: &[String]) -> Result<(), KernelError> {
         if let Some(v) = ext_max_orchestration_steps { p.extended_max_orchestration_steps = v; changed = true; }
         if let Some(v) = max_context_rounds { p.max_context_rounds = v; changed = true; }
         if let Some(v) = ext_max_context_rounds { p.extended_max_context_rounds = v; changed = true; }
+        if let Some(v) = max_active_jobs { p.max_active_jobs = v; changed = true; }
+        if let Some(v) = ext_max_active_jobs { p.extended_max_active_jobs = v; changed = true; }
         kernel.prime_agent_policy = p.clamped();
         if changed {
             Ok("Prime agent-loop policy updated (clamped to safe ranges).".to_string())

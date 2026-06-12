@@ -1946,6 +1946,11 @@ export interface ReluxPrimeAgentPolicy {
   extended_max_orchestration_steps: number;
   max_context_rounds: number;
   extended_max_context_rounds: number;
+  // The configurable concurrent background-job admission cap (the async run-async fleet
+  // limit), replacing the retired hidden MAX_ACTIVE_JOBS=4. A real resource guardrail:
+  // standard + extended, both clamped to an absolute ceiling on the server.
+  max_active_jobs: number;
+  extended_max_active_jobs: number;
 }
 
 // The resolved per-turn limits for one profile (clamped on the server).
@@ -1957,6 +1962,8 @@ export interface ReluxPrimeAgentLimits {
   max_tool_plan_steps: number;
   max_orchestration_steps: number;
   max_context_rounds: number;
+  // Resolved concurrent background-job admission cap for this profile (fleet-wide).
+  max_active_jobs: number;
 }
 
 export interface ReluxPrimeAgentPolicyResponse {

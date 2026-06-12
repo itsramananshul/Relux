@@ -220,7 +220,7 @@ async fn serve() -> Result<(), KernelError> {
     println!("   POST   /v1/relux/prime                     {{ \"message\": \"...\" }}");
     println!("   POST   /v1/relux/prime/reset               (clear this conversation's bounded memory)");
     println!("   GET    /v1/relux/prime/agent-policy        (chat agent-loop autonomy limits + resolved profiles)");
-    println!("   PUT    /v1/relux/prime/agent-policy        {{ \"max_tool_calls\"?, \"max_brain_rounds\"?, \"max_duration_secs\"?, \"max_tool_plan_steps\"?, \"max_orchestration_steps\"?, \"max_context_rounds\"?, \"extended_*\"? }}");
+    println!("   PUT    /v1/relux/prime/agent-policy        {{ \"max_tool_calls\"?, \"max_brain_rounds\"?, \"max_duration_secs\"?, \"max_tool_plan_steps\"?, \"max_orchestration_steps\"?, \"max_context_rounds\"?, \"max_active_jobs\"?, \"extended_*\"? }}");
     println!("   POST   /v1/relux/prime/agent/continue      {{ \"continuation_id\": \"cont_0001\", \"extended\"? }}  (resume a paused agent loop)");
     println!("   POST   /v1/relux/tasks                     {{ \"title\": \"...\" }}");
     println!("   POST   /v1/relux/tasks/:id/start");
@@ -244,7 +244,7 @@ async fn serve() -> Result<(), KernelError> {
     println!("   DELETE /v1/relux/plugins/:id/tools/:tool   (remove a configured tool)");
     println!("   DELETE /v1/relux/plugins/:id");
     println!("   GET    /v1/relux/adapters                  (adapter plugins + CLI runtime status)");
-    println!("   POST   /v1/relux/prime/orchestrations/:id/run-async  (start a background job; returns job + status_url)");
+    println!("   POST   /v1/relux/prime/orchestrations/:id/run-async  {{ \"max\"?, \"concurrency\"?, \"extended\"? }}  (start a background job; admission bounded by the policy's max_active_jobs)");
     println!("   GET    /v1/relux/prime/orchestrations/:id/job         (latest job for this orchestration)");
     println!("   GET    /v1/relux/orchestration-jobs/:job_id           (poll one job's status)");
     println!("   POST   /v1/relux/orchestration-jobs/:job_id/cancel    (request cancellation; stops before the next round)");
@@ -5346,6 +5346,8 @@ struct UpdateAgentPolicyReq {
     extended_max_orchestration_steps: Option<u32>,
     max_context_rounds: Option<u32>,
     extended_max_context_rounds: Option<u32>,
+    max_active_jobs: Option<u32>,
+    extended_max_active_jobs: Option<u32>,
 }
 
 /// PUT/PATCH `/v1/relux/prime/agent-policy` — update one or more autonomy ceilings. Every field is
@@ -5392,6 +5394,12 @@ async fn update_agent_policy(
         }
         if let Some(v) = req.extended_max_context_rounds {
             config.extended_max_context_rounds = v;
+        }
+        if let Some(v) = req.max_active_jobs {
+            config.max_active_jobs = v;
+        }
+        if let Some(v) = req.extended_max_active_jobs {
+            config.extended_max_active_jobs = v;
         }
         // Clamp into the safe ranges before it can reach the loop.
         config = config.clamped();
@@ -5481,6 +5489,12 @@ struct RunOrchestrationReq {
     /// round (clamped to 1..=4 by the kernel). Defaults to 2 when omitted.
     #[serde(default)]
     concurrency: Option<usize>,
+    /// Opt into the high-throughput EXTENDED background-job admission profile for this
+    /// start (the operator-configured `extended_max_active_jobs`). Defaults to the
+    /// conservative standard profile when omitted, so an ordinary start is bounded by
+    /// `max_active_jobs`. Only affects the fleet-wide admission cap, never what this job runs.
+    #[serde(default)]
+    extended: Option<bool>,
 }
 
 /// Run a governed multi-agent batch for one orchestration **synchronously**: this
@@ -5645,10 +5659,6 @@ enum JobStartError {
     TooManyActive(usize),
 }
 
-/// The most non-terminal jobs allowed at once across all orchestrations, so a
-/// burst of requests can never spawn unbounded worker threads.
-const MAX_ACTIVE_JOBS: usize = 4;
-
 /// A process-wide registry of orchestration jobs, guarded by its own short-lived
 /// mutex. Crucially this lock is NEVER held across kernel work, so polling a job
 /// stays responsive even while a worker holds the kernel lock for a round.
@@ -5666,12 +5676,17 @@ struct JobStore {
 impl JobRegistry {
     /// Atomically mint a new job for `orchestration_id`, rejecting a duplicate
     /// (one already active for the same orchestration) or an over-cap fleet. The
-    /// returned job is `Queued`; the caller spawns the worker.
+    /// returned job is `Queued`; the caller spawns the worker. `max_active` is the
+    /// operator-configured concurrent background-job admission cap
+    /// ([`relux_core::PrimeAgentPolicy::active_jobs`]) — the registry no longer
+    /// hard-codes a `4`, so a busy operator can raise it and a constrained host can
+    /// lower it; the value is already clamped to a safe ceiling by the policy.
     fn start(
         &self,
         orchestration_id: &str,
         max: usize,
         concurrency: usize,
+        max_active: usize,
     ) -> Result<OrchestrationJob, JobStartError> {
         let mut store = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let active = store
@@ -5685,7 +5700,7 @@ impl JobRegistry {
         }) {
             return Err(JobStartError::Duplicate(existing.id.clone()));
         }
-        if active >= MAX_ACTIVE_JOBS {
+        if active >= max_active {
             return Err(JobStartError::TooManyActive(active));
         }
         store.counter += 1;
@@ -6224,10 +6239,29 @@ struct StartJobResponse {
     status_url: String,
 }
 
+/// Build the honest 429 over-limit message for the background-job admission cap. Names the
+/// configured limit (not a generic "too many"), and tells the operator exactly how to raise it
+/// — opt into the extended profile or edit the policy — so the refusal is actionable. The limit
+/// is the operator-configured value, never a hidden constant.
+fn too_many_active_jobs_message(active: usize, limit: usize, extended: bool) -> String {
+    let ceil = relux_core::PrimeAgentPolicy::MAX_ACTIVE_JOBS_CEIL;
+    if extended {
+        format!(
+            "background-job concurrency limit reached: {active}/{limit} jobs active under the EXTENDED admission profile. Wait for one to finish, or raise `extended_max_active_jobs` on PUT /v1/relux/prime/agent-policy (clamped to {ceil})."
+        )
+    } else {
+        format!(
+            "background-job concurrency limit reached: {active}/{limit} jobs active under the standard admission profile. Wait for one to finish, retry with {{\"extended\": true}} for the higher profile, or raise `max_active_jobs` on PUT /v1/relux/prime/agent-policy (clamped to {ceil})."
+        )
+    }
+}
+
 /// POST `/v1/relux/prime/orchestrations/:id/run-async` — start a non-blocking
 /// run. Returns immediately with the queued job and a `status_url`. Rejects a
 /// duplicate concurrent job for the same orchestration (409) and an over-cap fleet
-/// (429). The orchestration must exist (404).
+/// (429). The orchestration must exist (404). The fleet admission cap is the
+/// operator-configured `max_active_jobs` policy value (or `extended_max_active_jobs`
+/// when the request opts in), never a hidden constant.
 async fn start_orchestration_job(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
@@ -6237,17 +6271,22 @@ async fn start_orchestration_job(
     let req = body.map(|b| b.0).unwrap_or_default();
     let max = req.max.unwrap_or(25).clamp(1, 25);
     let concurrency = req.concurrency.unwrap_or(2).clamp(1, 4);
+    let extended = req.extended.unwrap_or(false);
 
     // Validate the orchestration exists before minting a job, so a bad id is an
-    // honest 404 rather than a job that fails on its first round.
-    locked_read(&state, |kernel| {
+    // honest 404 rather than a job that fails on its first round. While we hold the
+    // read lock, resolve the operator-configured concurrent background-job admission
+    // cap from the policy (standard, or the higher extended profile when requested)
+    // so the fleet limit is the visible policy value, never a hidden constant.
+    let max_active = locked_read(&state, |kernel| {
         kernel
             .orchestration(&oid)
             .map(|_| ())
-            .ok_or_else(|| KernelError::UnknownOrchestration(id.clone()))
+            .ok_or_else(|| KernelError::UnknownOrchestration(id.clone()))?;
+        Ok(kernel.prime_agent_policy.active_jobs(extended))
     })?;
 
-    let job = state.jobs.start(&id, max, concurrency).map_err(|e| match e {
+    let job = state.jobs.start(&id, max, concurrency, max_active).map_err(|e| match e {
         JobStartError::Duplicate(existing) => ApiError {
             status: StatusCode::CONFLICT,
             message: format!(
@@ -6256,9 +6295,7 @@ async fn start_orchestration_job(
         },
         JobStartError::TooManyActive(n) => ApiError {
             status: StatusCode::TOO_MANY_REQUESTS,
-            message: format!(
-                "too many orchestration jobs are active ({n}/{MAX_ACTIVE_JOBS}); wait for one to finish"
-            ),
+            message: too_many_active_jobs_message(n, max_active, extended),
         },
     })?;
 
@@ -8343,7 +8380,7 @@ mod tests {
     #[test]
     fn registry_starts_a_queued_job_with_a_status_url_shape() {
         let reg = JobRegistry::default();
-        let job = reg.start("orch_0001", 25, 2).expect("first job starts");
+        let job = reg.start("orch_0001", 25, 2, 8).expect("first job starts");
         assert_eq!(job.state, JobState::Queued);
         assert_eq!(job.orchestration_id, "orch_0001");
         assert_eq!(job.id, "job_0001");
@@ -8357,37 +8394,61 @@ mod tests {
     #[test]
     fn registry_rejects_a_duplicate_concurrent_job_for_the_same_orchestration() {
         let reg = JobRegistry::default();
-        let first = reg.start("orch_0001", 25, 2).expect("first starts");
-        match reg.start("orch_0001", 25, 2) {
+        let first = reg.start("orch_0001", 25, 2, 8).expect("first starts");
+        match reg.start("orch_0001", 25, 2, 8) {
             Err(JobStartError::Duplicate(existing)) => assert_eq!(existing, first.id),
             other => panic!("expected duplicate rejection, got {:?}", other.is_ok()),
         }
         // A different orchestration is allowed concurrently.
-        assert!(reg.start("orch_0002", 25, 2).is_ok());
+        assert!(reg.start("orch_0002", 25, 2, 8).is_ok());
     }
 
     #[test]
     fn registry_allows_a_new_job_once_the_prior_one_is_terminal() {
         let reg = JobRegistry::default();
-        let first = reg.start("orch_0001", 25, 2).unwrap();
+        let first = reg.start("orch_0001", 25, 2, 8).unwrap();
         reg.update(&first.id, |j| j.state = JobState::Completed);
         // The completed job no longer blocks a fresh run of the same orchestration.
-        let second = reg.start("orch_0001", 25, 2).expect("a new job after completion");
+        let second = reg.start("orch_0001", 25, 2, 8).expect("a new job after completion");
         assert_ne!(second.id, first.id);
         // latest_for returns the newest (zero-padded ids sort lexically).
         assert_eq!(reg.latest_for("orch_0001").unwrap().id, second.id);
     }
 
     #[test]
-    fn registry_caps_the_number_of_active_jobs() {
+    fn registry_caps_the_number_of_active_jobs_at_the_configured_limit() {
+        // The registry no longer hard-codes a `4`: the admission cap is the
+        // operator-configured value passed in. Here we pin it to the standard default
+        // (the value the retired MAX_ACTIVE_JOBS held) and prove the (limit+1)th is rejected.
+        let limit = relux_core::PrimeAgentPolicy::default().active_jobs(false);
         let reg = JobRegistry::default();
-        for i in 0..MAX_ACTIVE_JOBS {
-            reg.start(&format!("orch_{i:04}"), 25, 2)
+        for i in 0..limit {
+            reg.start(&format!("orch_{i:04}"), 25, 2, limit)
                 .expect("under the cap");
         }
-        match reg.start("orch_overflow", 25, 2) {
-            Err(JobStartError::TooManyActive(n)) => assert_eq!(n, MAX_ACTIVE_JOBS),
+        match reg.start("orch_overflow", 25, 2, limit) {
+            Err(JobStartError::TooManyActive(n)) => assert_eq!(n, limit),
             _ => panic!("expected the active-job cap to reject the overflow"),
+        }
+    }
+
+    #[test]
+    fn registry_admits_more_jobs_when_the_configured_limit_is_raised() {
+        // A raised (extended-profile) admission cap permits strictly MORE concurrent jobs
+        // than the old hard-coded 4 — the whole point of making the limit configurable.
+        let extended = relux_core::PrimeAgentPolicy::default().active_jobs(true);
+        assert!(extended > 4, "extended admission must exceed the retired hard-coded 4");
+        let reg = JobRegistry::default();
+        for i in 0..extended {
+            reg.start(&format!("orch_{i:04}"), 25, 2, extended)
+                .expect("under the raised cap");
+        }
+        // The 5th job — which the old fixed cap of 4 would have rejected — is admitted here.
+        assert!(extended >= 5 && reg.get("job_0005").is_some(), "a 5th job is admitted under the raised cap");
+        // And the registry still enforces the higher ceiling: one past it is rejected.
+        match reg.start("orch_overflow", 25, 2, extended) {
+            Err(JobStartError::TooManyActive(n)) => assert_eq!(n, extended),
+            _ => panic!("expected the raised cap to still reject its own overflow"),
         }
     }
 
@@ -8487,7 +8548,7 @@ mod tests {
     #[test]
     fn registry_request_cancel_sets_the_flag_on_an_active_job() {
         let reg = JobRegistry::default();
-        let job = reg.start("orch_0001", 25, 2).unwrap();
+        let job = reg.start("orch_0001", 25, 2, 8).unwrap();
         assert!(!reg.is_cancel_requested(&job.id), "fresh job has no cancel");
         match reg.request_cancel(&job.id) {
             CancelOutcome::Requested(j) => assert!(j.cancel_requested),
@@ -8502,7 +8563,7 @@ mod tests {
     #[test]
     fn registry_request_cancel_is_idempotent_once_canceled() {
         let reg = JobRegistry::default();
-        let job = reg.start("orch_0001", 25, 2).unwrap();
+        let job = reg.start("orch_0001", 25, 2, 8).unwrap();
         reg.update(&job.id, |j| j.state = JobState::Canceled);
         assert!(matches!(
             reg.request_cancel(&job.id),
@@ -8513,13 +8574,13 @@ mod tests {
     #[test]
     fn registry_refuses_to_cancel_a_finished_job() {
         let reg = JobRegistry::default();
-        let done = reg.start("orch_0001", 25, 2).unwrap();
+        let done = reg.start("orch_0001", 25, 2, 8).unwrap();
         reg.update(&done.id, |j| j.state = JobState::Completed);
         assert!(matches!(
             reg.request_cancel(&done.id),
             CancelOutcome::AlreadyTerminal(_)
         ));
-        let failed = reg.start("orch_0002", 25, 2).unwrap();
+        let failed = reg.start("orch_0002", 25, 2, 8).unwrap();
         reg.update(&failed.id, |j| j.state = JobState::Failed);
         assert!(matches!(
             reg.request_cancel(&failed.id),
@@ -8539,9 +8600,9 @@ mod tests {
         // Cancellation is resumable: a canceled job is terminal, so it no longer
         // counts as the orchestration's active job and a new run can start.
         let reg = JobRegistry::default();
-        let first = reg.start("orch_0001", 25, 2).unwrap();
+        let first = reg.start("orch_0001", 25, 2, 8).unwrap();
         reg.update(&first.id, |j| j.state = JobState::Canceled);
-        let second = reg.start("orch_0001", 25, 2).expect("a new job after cancel");
+        let second = reg.start("orch_0001", 25, 2, 8).expect("a new job after cancel");
         assert_ne!(second.id, first.id);
     }
 
@@ -8587,7 +8648,7 @@ mod tests {
     #[test]
     fn worker_cancel_requested_up_front_runs_no_round_and_marks_canceled() {
         let (state, _dir, oid) = app_state_with_prime_orchestration();
-        let job = state.jobs.start(oid.as_str(), 25, 2).unwrap();
+        let job = state.jobs.start(oid.as_str(), 25, 2, 8).unwrap();
         // Request cancellation BEFORE the worker runs its first round.
         assert!(matches!(
             state.jobs.request_cancel(&job.id),
@@ -8616,7 +8677,7 @@ mod tests {
         // Positive control: the SAME seeded orchestration runs to completion when no
         // cancel is requested, proving the cancel test above is not vacuous.
         let (state, _dir, oid) = app_state_with_prime_orchestration();
-        let job = state.jobs.start(oid.as_str(), 25, 2).unwrap();
+        let job = state.jobs.start(oid.as_str(), 25, 2, 8).unwrap();
 
         drive_orchestration_job(state.clone(), job.id.clone(), oid.clone(), 25, 2);
 
@@ -8645,7 +8706,7 @@ mod tests {
         // First job, budgeted to exactly ONE brief. The round runs one ready brief,
         // then the per-job budget is spent and the worker stops — leaving the rest
         // pending, the same partial shape a mid-flight cancel leaves behind.
-        let job1 = state.jobs.start(oid.as_str(), 1, 2).unwrap();
+        let job1 = state.jobs.start(oid.as_str(), 1, 2, 8).unwrap();
         drive_orchestration_job(state.clone(), job1.id.clone(), oid.clone(), 1, 2);
         let done1 = state.jobs.get(&job1.id).expect("job1 survives");
         assert_eq!(done1.ran, 1, "first job ran exactly one brief (budget=1)");
@@ -8677,7 +8738,7 @@ mod tests {
         // (Completed), so this is accepted rather than rejected as a duplicate.
         let job2 = state
             .jobs
-            .start(oid.as_str(), 25, 2)
+            .start(oid.as_str(), 25, 2, 8)
             .expect("a fresh job resumes the partially-done orchestration");
         assert_ne!(job2.id, job1.id);
         drive_orchestration_job(state.clone(), job2.id.clone(), oid.clone(), 25, 2);
@@ -8775,7 +8836,7 @@ mod tests {
         // orchestration id reconstructs an honest `interrupted` status from the
         // durable record — never a misleading "never existed" 404.
         let (state, dir, oid) = app_state_with_prime_orchestration();
-        let job1 = state.jobs.start(oid.as_str(), 1, 2).unwrap();
+        let job1 = state.jobs.start(oid.as_str(), 1, 2, 8).unwrap();
         drive_orchestration_job(state.clone(), job1.id.clone(), oid.clone(), 1, 2);
 
         // Simulate the restart: a new state with an empty registry over the same db.
@@ -8812,7 +8873,7 @@ mod tests {
         // The positive control: a fully-run orchestration reconstructs as `completed`
         // (not `interrupted`) after a restart, since no brief is left pending.
         let (state, dir, oid) = app_state_with_prime_orchestration();
-        let job = state.jobs.start(oid.as_str(), 25, 2).unwrap();
+        let job = state.jobs.start(oid.as_str(), 25, 2, 8).unwrap();
         drive_orchestration_job(state.clone(), job.id.clone(), oid.clone(), 25, 2);
 
         let restarted = restarted_state_over(&dir);
@@ -9814,6 +9875,17 @@ mod tests {
                 > v["standard"]["max_context_rounds"].as_u64().unwrap(),
             "extended profile must allow more context rounds than standard"
         );
+        // The configurable background-job admission cap is part of the surface: standard keeps
+        // the practical guardrail (≥ the retired hidden 4), extended admits more, resolved per profile.
+        assert!(
+            v["config"]["max_active_jobs"].as_u64().unwrap() >= 4,
+            "standard active-jobs keeps the practical guardrail (>=4)"
+        );
+        assert!(
+            v["extended"]["max_active_jobs"].as_u64().unwrap()
+                > v["standard"]["max_active_jobs"].as_u64().unwrap(),
+            "extended profile must admit more concurrent jobs than standard"
+        );
     }
 
     #[tokio::test]
@@ -9855,6 +9927,36 @@ mod tests {
             relux_core::PrimeAgentPolicy::MAX_CONTEXT_ROUNDS_CEIL as u64,
             "wild context-round budget clamped to the safe ceiling"
         );
+
+        // The new background-job admission cap is configurable AND clamped through the same
+        // route: a sane raise sticks, a wild value is clamped to its safe ceiling.
+        let body = r#"{"max_active_jobs":8,"extended_max_active_jobs":100000000}"#;
+        let (status, _, rb) = call(&state, "PATCH", "/v1/relux/prime/agent-policy", None, Some(body)).await;
+        assert_eq!(status, StatusCode::OK, "{rb}");
+        let v: serde_json::Value = serde_json::from_str(&rb).unwrap();
+        assert_eq!(v["config"]["max_active_jobs"].as_u64().unwrap(), 8);
+        assert_eq!(
+            v["config"]["extended_max_active_jobs"].as_u64().unwrap(),
+            relux_core::PrimeAgentPolicy::MAX_ACTIVE_JOBS_CEIL as u64,
+            "wild active-jobs cap clamped to the safe ceiling"
+        );
+        // The resolved profile reflects the raised standard admission cap.
+        assert_eq!(v["standard"]["max_active_jobs"].as_u64().unwrap(), 8);
+    }
+
+    #[test]
+    fn too_many_active_jobs_message_names_the_configured_limit_and_how_to_raise_it() {
+        // Standard-profile refusal names the active/limit counts, points at the extended retry,
+        // and at the policy field — never a generic "too many".
+        let std = too_many_active_jobs_message(4, 4, false);
+        assert!(std.contains("4/4"), "names active/limit: {std}");
+        assert!(std.contains("max_active_jobs"), "names the policy field: {std}");
+        assert!(std.contains("extended"), "points at the higher profile: {std}");
+        assert!(std.contains("agent-policy"), "points at the config route: {std}");
+        // Extended-profile refusal names the extended field instead.
+        let ext = too_many_active_jobs_message(16, 16, true);
+        assert!(ext.contains("16/16"), "names active/limit: {ext}");
+        assert!(ext.contains("extended_max_active_jobs"), "names the extended field: {ext}");
     }
 
     #[tokio::test]

@@ -315,14 +315,28 @@ read-only `ContextLoop` / `execute_requested_reads` take the resolved `context_r
 (threaded from the server preview block into the observe-then-act `DecisionLoop` and the sidecar
 loop). Both surface in the same places as the other policy fields.
 
+**Background-job concurrency (resource guardrail, same policy).** The same `PrimeAgentPolicy` also
+carries the configurable **concurrent background-job admission cap** for the async `run-async`
+orchestration-job path — `max_active_jobs` (standard, default **4**) / `extended_max_active_jobs`
+(**16**), clamped to the absolute `MAX_ACTIVE_JOBS_CEIL` (**64**). Unlike the per-turn dials above
+this is a **fleet-wide RESOURCE guardrail**: each admitted job drives live adapter processes on its own
+OS thread, so the cap bounds concurrent *load*, not how far one turn reasons — but it is the same kind
+of named, raisable, clamped policy field (the Hermes precedent is the api-server's configurable
+`max_concurrent` admission knob, not a hidden wall), replacing the retired hidden `MAX_ACTIVE_JOBS = 4`
+constant. The `run-async` route reads the resolved `active_jobs(extended)` value and passes it into
+`JobRegistry::start` (the registry no longer hard-codes a number); a request opts into the higher
+profile with `{"extended": true}`. When the fleet is full the `429` **names the configured limit and
+how to raise it** — the extended retry, the exact policy field, and the route — never a generic refusal.
+Even "extended" is bounded, so a request burst can never spawn unbounded workers.
+
 **Configuring + continuing.** The policy is served at `GET/PUT/PATCH /v1/relux/prime/agent-policy`
 (response carries the resolved standard/extended limits, including `max_tool_plan_steps`,
-`max_orchestration_steps`, and `max_context_rounds`), set in the dashboard's **Prime Autonomy
-Limits** panel (Health → Prime Brain) — which now has **Tool plan**, **Orchestration**, and **Context
-loop** rows for the standard/extended limits — or via `relux-kernel prime agent-policy
-<status|configure>` (flags `--max-tool-plan-steps N` / `--ext-max-tool-plan-steps N`,
+`max_orchestration_steps`, `max_context_rounds`, and `max_active_jobs`), set in the dashboard's **Prime
+Autonomy Limits** panel (Health → Prime Brain) — which now has **Tool plan**, **Orchestration**,
+**Context loop**, and **Active jobs** rows for the standard/extended limits — or via `relux-kernel prime
+agent-policy <status|configure>` (flags `--max-tool-plan-steps N` / `--ext-max-tool-plan-steps N`,
 `--max-orchestration-steps N` / `--ext-max-orchestration-steps N`, `--max-context-rounds N` /
-`--ext-max-context-rounds N`). To run long
+`--ext-max-context-rounds N`, `--max-active-jobs N` / `--ext-max-active-jobs N`). To run long
 work: tell Prime to "keep working" / "use extended mode" (raises this turn to the extended profile),
 or click the **Keep working (extended)** button Prime offers when a limit is hit (which resumes the
 paused loop — see below).
