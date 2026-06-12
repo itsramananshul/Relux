@@ -51,6 +51,18 @@ Read for: **loop continuation, the bounded tool-call iteration cap, the valid-to
   pausing on a gated tool with the existing approval card; the off-lock-brain / short-locked-exec
   orchestration is `server.rs` `drive_prime_agent_loop`. Entry is gated on an explicit `ToolInvocation`
   turn (the safety wall). See `docs/mcp.md` "Prime Agent Loop v1".
+- **Relux mapping (RESUMABLE continuation):** `run_conversation(conversation_history=…)` seeds
+  `messages = list(conversation_history)` (L331) so a resumed turn carries the prior `role:"tool"`
+  results and the model does NOT re-run them; the session is persisted in `agent._session_db` keyed by
+  `agent.session_id` (`_restore_or_build_system_prompt`, L85-187). Relux mirrors this:
+  `relux_kernel::AgentLoop::resume` seeds the loop with the prior, bounded, redacted observations (and
+  their `prime_agent_loop::call_signature`s, which skip an already-completed call), and the kernel
+  persists a `relux_core::PrimeAgentContinuation` per conversation in the snapshot
+  (`KernelState::{create,peek,take}_prime_continuation`, consumed once like openclaw's exec-approval
+  handoff). The resume route is `server.rs` `drive_prime_agent_continuation` →
+  `POST /v1/relux/prime/agent/continue`; an approved gated-tool result folds back in via
+  `fold_approved_into_continuation` (called from `execute_approved_tool_invocation`). See `docs/mcp.md`
+  "Resumable continuation".
 
 ### `agent/iteration_budget.py` + `cli-config.yaml.example` — the configurable loop budget
 Read for: **why a real agent's per-turn loop bound is a CONFIGURABLE budget, not a tiny constant.**

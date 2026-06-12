@@ -62,6 +62,10 @@ pub struct KernelCounters {
     /// grants load cleanly (grants start at 0).
     #[serde(default)]
     pub next_grant: u64,
+    /// Next agent-loop continuation id. Defaulted so snapshots from before resumable
+    /// continuations load cleanly (continuations start at 0).
+    #[serde(default)]
+    pub next_continuation: u64,
 }
 
 /// A flat, serializable export of the entire [`KernelState`].
@@ -121,6 +125,11 @@ pub struct KernelSnapshot {
     /// key. Defaulted so older snapshots (which never wrote it) load cleanly.
     #[serde(default)]
     pub pending_clarifications: Vec<PendingClarificationEntry>,
+    /// Resumable Prime agent-loop continuations, one entry per conversation key, sorted by key.
+    /// Defaulted so older snapshots (which never wrote it) load cleanly
+    /// (`docs/mcp.md` "Prime Agent Loop").
+    #[serde(default)]
+    pub prime_agent_continuations: Vec<PrimeAgentContinuationEntry>,
     /// Bounded conversation history, one entry per conversation key, sorted by key.
     /// Defaulted so older snapshots (which never wrote it) load cleanly
     /// (`docs/prime-processing-audit.md` "Bounded conversation memory").
@@ -139,6 +148,35 @@ pub struct KernelSnapshot {
 /// Prime. When full, inserting a new conversation's record evicts the oldest one.
 pub const MAX_PENDING_CLARIFICATIONS: usize = 32;
 
+/// The hard cap on how many distinct conversations' resumable agent-loop continuations are kept at
+/// once, so the continuation store stays small regardless of actor count. When full, inserting a new
+/// conversation's record evicts the oldest one (by creation time). Mirrors
+/// [`MAX_PENDING_CLARIFICATIONS`].
+pub const MAX_PRIME_CONTINUATIONS: usize = 32;
+
+/// The most observation STEPS a single continuation retains (the most-recent ones), so a long chain
+/// of tool calls cannot bloat the persisted control plane. The brain still sees the recent context
+/// and the duplicate-avoidance covers the retained calls; older steps fold into the reply already
+/// shown to the operator.
+pub const MAX_CONTINUATION_STEPS: usize = 24;
+
+/// How long (in logical-clock seconds) a resumable continuation stays valid before it is treated as
+/// stale and a resume fails closed. Bounded so a paused loop cannot be silently resumed much later;
+/// matches the extended profile's default wall-clock budget order of magnitude.
+pub const PRIME_CONTINUATION_TTL_SECS: u64 = 1_800;
+
+/// Why a resumable agent-loop continuation was created — the mutually-exclusive pause cause recorded
+/// on the continuation (`docs/mcp.md` "Prime Agent Loop").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContinuationPause {
+    /// A configured autonomy ceiling was reached (the human-readable limit label, e.g.
+    /// `"tool-call limit"`).
+    Limit(String),
+    /// A gated tool is waiting on a human approval; after it is approved + run, its result folds in
+    /// and the next resume proceeds.
+    Approval(relux_core::PrimeContinuationApproval),
+}
+
 /// One persisted multi-turn clarification record, paired with the conversation key it
 /// belongs to (`namespace::actor`). A flat, serializable export of one entry of the
 /// kernel's `pending_clarifications` map (`docs/prime-processing-audit.md`
@@ -149,6 +187,18 @@ pub struct PendingClarificationEntry {
     pub key: String,
     /// The bounded pending-clarification record.
     pub pending: relux_core::PendingClarification,
+}
+
+/// One persisted resumable agent-loop continuation, paired with the conversation key it belongs to
+/// (`namespace::actor`). A flat, serializable export of one entry of the kernel's
+/// `prime_agent_continuations` map (`docs/mcp.md` "Prime Agent Loop"). The carried observation steps
+/// are already secret-redacted + bounded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrimeAgentContinuationEntry {
+    /// The conversation key (`namespace::actor`) this continuation belongs to.
+    pub key: String,
+    /// The bounded, resumable continuation record.
+    pub continuation: relux_core::PrimeAgentContinuation,
 }
 
 /// One persisted conversation's bounded turn history, paired with the conversation key it
@@ -290,6 +340,15 @@ pub struct KernelState {
     /// "Multi-turn clarify memory"; see [`crate::prime_clarify_memory`]). Bounded:
     /// the latest record per conversation, with a hard cap on total entries.
     pending_clarifications: HashMap<String, relux_core::PendingClarification>,
+    /// Resumable Prime agent-loop continuations: the bounded, redacted state of a chat agent-loop
+    /// turn that paused with work still to do (a configured ceiling reached, or a gated tool waiting
+    /// on approval), keyed by conversation (`namespace::actor`), so a "keep working" resumes EXACTLY
+    /// where the loop paused — feeding the already-gathered observations to the brain and skipping
+    /// the already-completed calls — instead of re-running the request blind (`docs/mcp.md` "Prime
+    /// Agent Loop"). Bounded: one record per conversation with a TTL, [`MAX_PRIME_CONTINUATIONS`]
+    /// overall, [`MAX_CONTINUATION_STEPS`] steps each, every field secret-redacted. Grants no
+    /// authority — every resumed execution still flows through the unchanged tool gate.
+    prime_agent_continuations: HashMap<String, relux_core::PrimeAgentContinuation>,
     /// Bounded conversation history: the last few recorded turns per conversation (keyed by
     /// namespace + actor), so the NEXT turn's brain can interpret a follow-up in context
     /// instead of reasoning only from the bare current message (`docs/prime-processing-audit.md`
@@ -316,6 +375,7 @@ pub struct KernelState {
     next_event: u64,
     next_orchestration: u64,
     next_grant: u64,
+    next_continuation: u64,
 }
 
 /// The outcome of idempotently refreshing one bundled plugin manifest into the
@@ -426,6 +486,18 @@ impl KernelState {
                 out.sort_by(|a, b| a.key.cmp(&b.key));
                 out
             },
+            prime_agent_continuations: {
+                let mut out: Vec<PrimeAgentContinuationEntry> = self
+                    .prime_agent_continuations
+                    .iter()
+                    .map(|(key, continuation)| PrimeAgentContinuationEntry {
+                        key: key.clone(),
+                        continuation: continuation.clone(),
+                    })
+                    .collect();
+                out.sort_by(|a, b| a.key.cmp(&b.key));
+                out
+            },
             conversation_histories: {
                 let mut out: Vec<ConversationHistoryEntry> = self
                     .conversation_histories
@@ -459,6 +531,7 @@ impl KernelState {
                 next_event: self.next_event,
                 next_orchestration: self.next_orchestration,
                 next_grant: self.next_grant,
+                next_continuation: self.next_continuation,
             },
         }
     }
@@ -523,6 +596,11 @@ impl KernelState {
         for entry in snapshot.pending_clarifications {
             state.pending_clarifications.insert(entry.key, entry.pending);
         }
+        for entry in snapshot.prime_agent_continuations {
+            state
+                .prime_agent_continuations
+                .insert(entry.key, entry.continuation);
+        }
         for entry in snapshot.conversation_histories {
             state.conversation_histories.insert(entry.key, entry.turns);
         }
@@ -542,6 +620,7 @@ impl KernelState {
         state.next_event = snapshot.counters.next_event;
         state.next_orchestration = snapshot.counters.next_orchestration;
         state.next_grant = snapshot.counters.next_grant;
+        state.next_continuation = snapshot.counters.next_continuation;
         state.prime_autonomy_config = snapshot.prime_autonomy_config;
         state.prime_agent_policy = snapshot.prime_agent_policy.clamped();
         state
@@ -5482,6 +5561,9 @@ impl KernelState {
         // on a non-`Approved` status; this just frees the binding eagerly).
         if !approve {
             self.pending_tool_invocations.remove(id);
+            // Drop any paused agent-loop continuation that was waiting on this denied tool, so a
+            // resume cannot linger on a tool the operator refused (`docs/mcp.md` "Prime Agent Loop").
+            self.drop_continuation_for_approval(id);
         }
         self.record_audit(
             "user",
@@ -5766,6 +5848,10 @@ impl KernelState {
                 "subject_agent": agent_id.as_str()
             }),
         );
+        // 7. If a paused agent-loop continuation was waiting on THIS approval, fold the real result
+        //    in so the next "keep working" resumes with it in context (the automatic
+        //    approval-resume path; `docs/mcp.md` "Prime Agent Loop"). No-op otherwise.
+        self.fold_approved_into_continuation(id, &plugin_id, &tool_name, &output);
         Ok(ToolInvocationResult {
             plugin_id: plugin_id.to_string(),
             tool_name: tool_name.to_string(),
@@ -7018,7 +7104,8 @@ impl KernelState {
         let had_history = self.conversation_histories.remove(&key).is_some();
         let had_summary = self.conversation_summaries.remove(&key).is_some();
         let had_pending = self.pending_clarifications.remove(&key).is_some();
-        had_history || had_summary || had_pending
+        let had_continuation = self.prime_agent_continuations.remove(&key).is_some();
+        had_history || had_summary || had_pending || had_continuation
     }
 
     /// Apply a brain-suggested, already-clamped priority to a freshly created task.
@@ -8160,6 +8247,185 @@ impl KernelState {
         // Otherwise the turn is terminal for the loop: a staged approval card (AwaitingApproval) or
         // an honest refusal (NeedsClarification with a tool_error). Surface it unchanged.
         Ok(AgentExecStep::Terminal(Box::new(turn)))
+    }
+
+    // --- Resumable agent-loop continuations --------------------------------
+    //
+    // The real continuation foundation (`docs/mcp.md` "Prime Agent Loop"): when a bounded chat
+    // agent-loop turn stops with work still to do — a configured ceiling reached, or a gated tool
+    // paused for approval — the kernel persists a small, bounded, redacted record of the loop state
+    // so a later "keep working" RESUMES from the already-gathered observations instead of re-running
+    // the request blind. The record grants no authority; every resumed execution still flows through
+    // the unchanged `prime_invoke_tool` gate, and the stored observations are bounded + secret-
+    // redacted (they come only from real `AgentObservation`s).
+
+    /// Persist (or replace) the resumable continuation for this conversation and return its
+    /// client-facing handle. `observations` + `sigs` are the loop's gathered observations and their
+    /// aligned call signatures; only the most recent [`MAX_CONTINUATION_STEPS`] are retained. The
+    /// `pause` records WHY the loop stopped (a ceiling hit, or a gated tool waiting on approval) —
+    /// the two are mutually exclusive. Mints a fresh `cont_NNNN` token each time, sets a TTL, and
+    /// evicts the oldest record when the per-conversation map is full.
+    pub fn create_prime_continuation(
+        &mut self,
+        ctx: &PrimeContext,
+        original_message: &str,
+        extended_used: bool,
+        observations: &[crate::prime_agent_loop::AgentObservation],
+        sigs: &[String],
+        pause: ContinuationPause,
+    ) -> relux_core::PrimeContinuationHandle {
+        let key = Self::conversation_key(ctx);
+        let now = self.clock.secs();
+        self.next_continuation += 1;
+        let id = format!("cont_{:04}", self.next_continuation);
+
+        // Keep only the most recent steps so a long chain cannot bloat the control plane. The brain
+        // still gets the recent context and the duplicate-avoidance covers the retained calls.
+        let total = observations.len().min(sigs.len());
+        let start = total.saturating_sub(MAX_CONTINUATION_STEPS);
+        let steps: Vec<relux_core::PrimeContinuationStep> = (start..total)
+            .map(|i| observations[i].to_continuation_step(&sigs[i]))
+            .collect();
+
+        let (limit_reason, pending_approval) = match pause {
+            ContinuationPause::Limit(reason) => (Some(reason), None),
+            ContinuationPause::Approval(appr) => (None, Some(appr)),
+        };
+        let continuation = relux_core::PrimeAgentContinuation {
+            id: id.clone(),
+            original_message: crate::prime_clarify_memory::clamp(
+                original_message,
+                crate::prime_clarify_memory::MAX_ORIGINAL_CHARS,
+            ),
+            extended_used,
+            steps,
+            limit_reason,
+            pending_approval,
+            created_at_secs: now,
+            expires_at_secs: now.saturating_add(PRIME_CONTINUATION_TTL_SECS),
+        };
+
+        // Bound the map: when full and this is a NEW conversation key, evict the oldest record.
+        if !self.prime_agent_continuations.contains_key(&key)
+            && self.prime_agent_continuations.len() >= MAX_PRIME_CONTINUATIONS
+        {
+            if let Some(oldest) = self
+                .prime_agent_continuations
+                .iter()
+                .min_by_key(|(_, c)| c.created_at_secs)
+                .map(|(k, _)| k.clone())
+            {
+                self.prime_agent_continuations.remove(&oldest);
+            }
+        }
+        let handle = continuation.handle();
+        self.prime_agent_continuations.insert(key, continuation);
+        handle
+    }
+
+    /// Read (clone, WITHOUT consuming) the continuation for this conversation IF the supplied token
+    /// matches and it is not expired. `None` (fail closed) on an unknown / mismatched / expired
+    /// token — a stale or wrong token can never resume a loop, and a mismatched token never disturbs
+    /// a valid stored record.
+    pub fn peek_prime_continuation(
+        &self,
+        ctx: &PrimeContext,
+        id: &str,
+    ) -> Option<relux_core::PrimeAgentContinuation> {
+        let key = Self::conversation_key(ctx);
+        let rec = self.prime_agent_continuations.get(&key)?;
+        if rec.id != id || self.clock.secs() >= rec.expires_at_secs {
+            return None;
+        }
+        Some(rec.clone())
+    }
+
+    /// CONSUME (remove + return) the continuation for this conversation IF the supplied token
+    /// matches and it is not expired. A matched-but-expired record is removed and `None` is
+    /// returned (it is spent); a mismatched token leaves the stored record untouched. Used by the
+    /// continue route once it has decided to actually resume.
+    pub fn take_prime_continuation(
+        &mut self,
+        ctx: &PrimeContext,
+        id: &str,
+    ) -> Option<relux_core::PrimeAgentContinuation> {
+        let key = Self::conversation_key(ctx);
+        match self.prime_agent_continuations.get(&key) {
+            Some(rec) if rec.id == id => {}
+            // Unknown key or token mismatch: do not disturb any stored record.
+            _ => return None,
+        }
+        let rec = self.prime_agent_continuations.remove(&key)?;
+        if self.clock.secs() >= rec.expires_at_secs {
+            return None;
+        }
+        Some(rec)
+    }
+
+    /// Drop any continuation whose pending approval is the given approval id (e.g. the operator
+    /// denied the tool). Idempotent.
+    pub fn drop_continuation_for_approval(&mut self, approval_id: &ApprovalId) {
+        let target = self
+            .prime_agent_continuations
+            .iter()
+            .find(|(_, c)| {
+                c.pending_approval
+                    .as_ref()
+                    .is_some_and(|p| p.approval_id == approval_id.as_str())
+            })
+            .map(|(k, _)| k.clone());
+        if let Some(key) = target {
+            self.prime_agent_continuations.remove(&key);
+        }
+    }
+
+    /// Fold a just-executed APPROVED tool result into the continuation that was waiting on it: append
+    /// the observation, clear the pending-approval marker (so the next resume PROCEEDS rather than
+    /// re-asking for approval), mark the call completed (so it is not re-run), and refresh the TTL.
+    /// This is what makes approval-resume automatic — after the operator approves + runs the gated
+    /// tool through the EXISTING routes, the brain resumes WITH that result in context. No-op when no
+    /// continuation is waiting on this approval.
+    fn fold_approved_into_continuation(
+        &mut self,
+        approval_id: &ApprovalId,
+        plugin_id: &PluginId,
+        tool_name: &str,
+        output: &serde_json::Value,
+    ) {
+        let key = match self
+            .prime_agent_continuations
+            .iter()
+            .find(|(_, c)| {
+                c.pending_approval
+                    .as_ref()
+                    .is_some_and(|p| p.approval_id == approval_id.as_str())
+            })
+            .map(|(k, _)| k.clone())
+        {
+            Some(k) => k,
+            None => return,
+        };
+        let now = self.clock.secs();
+        let source = if plugin_id.as_str().starts_with("mcp:") { "mcp" } else { "plugin" };
+        let label = format!("{}/{}", plugin_id.as_str(), tool_name);
+        let obs = crate::prime_agent_loop::AgentObservation::ran(&label, source, output);
+        if let Some(c) = self.prime_agent_continuations.get_mut(&key) {
+            let sig = c
+                .pending_approval
+                .as_ref()
+                .map(|p| p.args_sig.clone())
+                .unwrap_or_else(|| crate::prime_agent_loop::call_signature(&label, output));
+            c.steps.push(obs.to_continuation_step(&sig));
+            // Defensive bound on retained steps.
+            if c.steps.len() > MAX_CONTINUATION_STEPS {
+                let drop = c.steps.len() - MAX_CONTINUATION_STEPS;
+                c.steps.drain(0..drop);
+            }
+            // The approved tool ran — clear the pause marker and let a resume proceed.
+            c.pending_approval = None;
+            c.limit_reason = Some("approved tool ran".to_string());
+            c.expires_at_secs = now.saturating_add(PRIME_CONTINUATION_TTL_SECS);
+        }
     }
 
     /// Executes a running task locally using the echo tool and completes it.
@@ -16005,6 +16271,177 @@ mod tests {
         let ext = crate::prime_agent_loop::AgentLimits::from_policy(&restored.prime_agent_policy, true);
         assert_eq!(std.max_tool_calls, 25);
         assert!(ext.max_tool_calls > std.max_tool_calls);
+    }
+
+    /// Build one bounded, redacted observation + its call signature, the way the agent loop does.
+    fn cont_obs(label: &str, args: serde_json::Value, out: serde_json::Value)
+        -> (crate::prime_agent_loop::AgentObservation, String) {
+        (
+            crate::prime_agent_loop::AgentObservation::ran(label, "plugin", &out),
+            crate::prime_agent_loop::call_signature(label, &args),
+        )
+    }
+
+    #[test]
+    fn create_continuation_stores_observations_and_returns_a_token() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let (o1, s1) = cont_obs("relux-tools-status/summary", serde_json::json!({}), serde_json::json!({"queued": 2}));
+        let (o2, s2) = cont_obs("relux-tools-echo/echo", serde_json::json!({"n": 1}), serde_json::json!({"echo": 1}));
+        let handle = k.create_prime_continuation(
+            &ctx,
+            "check the board then echo it, keep working",
+            false,
+            &[o1, o2],
+            &[s1, s2],
+            ContinuationPause::Limit("tool-call limit".to_string()),
+        );
+        assert!(handle.id.starts_with("cont_"), "stable token minted: {}", handle.id);
+        assert_eq!(handle.observation_count, 2);
+        assert!(!handle.awaiting_approval);
+        assert_eq!(handle.reason, "tool-call limit");
+        // It can be peeked back by its exact token.
+        let rec = k.peek_prime_continuation(&ctx, &handle.id).expect("resolvable by token");
+        assert_eq!(rec.steps.len(), 2);
+        assert_eq!(rec.steps[0].label, "relux-tools-status/summary");
+        assert!(rec.original_message.contains("keep working"));
+    }
+
+    #[test]
+    fn stale_unknown_and_mismatched_continuation_tokens_fail_closed() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let (o, s) = cont_obs("relux-tools-echo/echo", serde_json::json!({}), serde_json::json!("ok"));
+        let handle = k.create_prime_continuation(&ctx, "go", false, &[o], &[s], ContinuationPause::Limit("time limit".to_string()));
+        // An unknown / mismatched token never resolves, and never disturbs the real record.
+        assert!(k.peek_prime_continuation(&ctx, "cont_9999").is_none());
+        assert!(k.take_prime_continuation(&ctx, "cont_9999").is_none());
+        let exp = k.peek_prime_continuation(&ctx, &handle.id).expect("real record untouched by a mismatch").expires_at_secs;
+        // Past its TTL it is stale: peek fails, take removes-and-fails. `now == expiry` is already
+        // stale (the boundary is exclusive).
+        k.clock = Clock::from_secs(exp);
+        assert!(k.peek_prime_continuation(&ctx, &handle.id).is_none(), "expired token fails closed");
+        assert!(k.take_prime_continuation(&ctx, &handle.id).is_none(), "expired take is spent");
+        assert!(k.peek_prime_continuation(&ctx, &handle.id).is_none(), "and removed");
+    }
+
+    #[test]
+    fn take_consumes_the_continuation_once() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let (o, s) = cont_obs("relux-tools-echo/echo", serde_json::json!({}), serde_json::json!("ok"));
+        let handle = k.create_prime_continuation(&ctx, "go", true, &[o], &[s], ContinuationPause::Limit("tool-call limit".to_string()));
+        let taken = k.take_prime_continuation(&ctx, &handle.id).expect("first take resolves");
+        assert!(taken.extended_used);
+        // A second take finds nothing — it was consumed.
+        assert!(k.take_prime_continuation(&ctx, &handle.id).is_none());
+    }
+
+    #[test]
+    fn continuation_steps_are_bounded() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let mut obs = vec![];
+        let mut sigs = vec![];
+        for i in 0..(MAX_CONTINUATION_STEPS + 8) {
+            let (o, s) = cont_obs("relux-tools-echo/echo", serde_json::json!({"i": i}), serde_json::json!({"i": i}));
+            obs.push(o);
+            sigs.push(s);
+        }
+        let handle = k.create_prime_continuation(&ctx, "go", false, &obs, &sigs, ContinuationPause::Limit("tool-call limit".to_string()));
+        let rec = k.peek_prime_continuation(&ctx, &handle.id).unwrap();
+        assert_eq!(rec.steps.len(), MAX_CONTINUATION_STEPS, "only the most recent steps are retained");
+        // The LAST (most recent) call is kept.
+        assert!(rec.steps.last().unwrap().args_sig.contains(&format!("{}", MAX_CONTINUATION_STEPS + 7)));
+    }
+
+    #[test]
+    fn continuations_round_trip_through_a_snapshot() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let (o, s) = cont_obs("relux-tools-status/summary", serde_json::json!({}), serde_json::json!({"q": 1}));
+        let handle = k.create_prime_continuation(
+            &ctx,
+            "keep working on the board",
+            true,
+            &[o],
+            &[s],
+            ContinuationPause::Approval(relux_core::PrimeContinuationApproval {
+                approval_id: "approval_0001".to_string(),
+                label: "relux-tools-fs/delete".to_string(),
+                args_sig: "sig".to_string(),
+            }),
+        );
+        let restored = KernelState::from_snapshot(k.snapshot());
+        let rec = restored.peek_prime_continuation(&ctx, &handle.id).expect("survives a snapshot");
+        assert_eq!(rec.id, handle.id);
+        assert!(rec.extended_used);
+        assert_eq!(rec.steps.len(), 1);
+        assert_eq!(rec.pending_approval.as_ref().unwrap().approval_id, "approval_0001");
+        // The id counter resumed so a new continuation mints a DISTINCT id.
+        let mut restored = restored;
+        let (o2, s2) = cont_obs("relux-tools-echo/echo", serde_json::json!({}), serde_json::json!("x"));
+        let handle2 = restored.create_prime_continuation(&ctx, "again", false, &[o2], &[s2], ContinuationPause::Limit("time limit".to_string()));
+        assert_ne!(handle2.id, handle.id, "ids never collide across a restart");
+    }
+
+    #[test]
+    fn approved_tool_result_folds_into_the_waiting_continuation() {
+        // A continuation paused on a gated tool's approval. When that approval is executed, the real
+        // result is folded in, the pending-approval marker clears, and the call is marked completed
+        // — so the next resume proceeds with the result in context (automatic approval-resume).
+        let (mut k, ctx) = prime_chat_kernel();
+        let plugin = PluginId::new("relux-tools-echo");
+        let args = serde_json::json!({"text": "hi"});
+        let sig = crate::prime_agent_loop::call_signature("relux-tools-echo/echo.say", &args);
+        let handle = k.create_prime_continuation(
+            &ctx,
+            "echo hi (needs approval)",
+            false,
+            &[],
+            &[],
+            ContinuationPause::Approval(relux_core::PrimeContinuationApproval {
+                approval_id: "approval_0042".to_string(),
+                label: "relux-tools-echo/echo.say".to_string(),
+                args_sig: sig.clone(),
+            }),
+        );
+        // Before approval: the continuation is awaiting approval (a resume would ask to approve first).
+        let before = k.peek_prime_continuation(&ctx, &handle.id).unwrap();
+        assert!(before.pending_approval.is_some());
+        // Fold the executed result in (what `execute_approved_tool_invocation` does on success).
+        let output = serde_json::json!({"echo": "hi"});
+        k.fold_approved_into_continuation(
+            &ApprovalId::new("approval_0042"),
+            &plugin,
+            "echo.say",
+            &output,
+        );
+        let after = k.peek_prime_continuation(&ctx, &handle.id).unwrap();
+        assert!(after.pending_approval.is_none(), "the approval pause is cleared");
+        assert_eq!(after.steps.len(), 1, "the approved result is now a gathered observation");
+        assert_eq!(after.steps[0].args_sig, sig, "the call is marked completed (no re-run on resume)");
+        assert!(after.steps[0].detail.contains("hi"));
+    }
+
+    #[test]
+    fn denying_an_approval_drops_its_waiting_continuation() {
+        // `resolve_approval(false)` calls `drop_continuation_for_approval`, so a continuation paused
+        // on a denied tool is removed (it can never resume on a tool the operator refused).
+        let (mut k, ctx) = prime_chat_kernel();
+        let handle = k.create_prime_continuation(
+            &ctx,
+            "delete the file",
+            false,
+            &[],
+            &[],
+            ContinuationPause::Approval(relux_core::PrimeContinuationApproval {
+                approval_id: "approval_0007".to_string(),
+                label: "relux-tools-fs/delete".to_string(),
+                args_sig: "sig".to_string(),
+            }),
+        );
+        assert!(k.peek_prime_continuation(&ctx, &handle.id).is_some());
+        k.drop_continuation_for_approval(&ApprovalId::new("approval_0007"));
+        assert!(
+            k.peek_prime_continuation(&ctx, &handle.id).is_none(),
+            "a denied tool's continuation is dropped"
+        );
     }
 
     #[test]

@@ -237,12 +237,15 @@ returns nothing and `run_prime` falls back to the normal turn path unchanged.
   turn; it never creates a tool request). A repeated identical call (no progress) still stops the
   loop early; each observation is secret-redacted (`relux_core::redact_secrets`) and clamped
   (`MAX_OBS_CHARS`).
-- **Limit reached → say so + offer to continue, never "done".** When a configured ceiling is hit
+- **Limit reached → say so + offer to RESUME, never "done".** When a configured ceiling is hit
   with work still to do, the loop returns `AgentOutcome::LimitReached(LimitKind)` (tool-calls /
   reasoning-rounds / time). The turn's reply names EXACTLY which limit was reached, shows what was
-  gathered so far, and carries a one-click **"Keep working (extended)"** suggestion that re-sends the
-  original request under the extended profile (a fresh, audited turn). Prime never fabricates a
-  finished answer it did not reach.
+  gathered so far, and the response carries a **resumable continuation handle** (`prime_continuation`
+  — a stable `cont_NNNN` token + the pause reason + how many observations were gathered). The
+  dashboard's one-click **"Keep working (extended)"** button POSTs that token to
+  `/v1/relux/prime/agent/continue`, which RESUMES the same loop from the stored observations under a
+  fresh budget — it does NOT re-send the original text. Prime never fabricates a finished answer it
+  did not reach. See "Resumable continuation" below.
 - **Gated tool → pause, not auto-run.** A `NeedsApproval` tool with no standing grant returns the
   EXISTING staged approval card (see "Chat-staged approval" above) and the loop **stops** — nothing
   ran. An allow-always grant turns that same tool into a direct run (the grant fast-path in
@@ -275,19 +278,46 @@ auto-runs, regardless of the limits.
 (response carries the resolved standard/extended limits), set in the dashboard's **Prime Autonomy
 Limits** panel (Health → Prime Brain), or via `relux-kernel prime agent-policy <status|configure>`.
 To run long work: tell Prime to "keep working" / "use extended mode" (raises this turn to the
-extended profile), or click the **Keep working (extended)** button Prime offers when a limit is hit.
+extended profile), or click the **Keep working (extended)** button Prime offers when a limit is hit
+(which resumes the paused loop — see below).
 
-**Continuation model + remaining gap (honest).** Each continuation is a **fresh, audited turn** that
-re-runs the original request under the higher profile — it does NOT yet resume mid-loop from the
-already-gathered observations (the agent-loop prompt is rebuilt from the message + live catalog, not
-the prior turn's partial trace). So continuing re-does the work with a bigger budget rather than
-picking up exactly where it paused. Full incremental resume (carry the prior observations/cursor into
-the next loop) is the next step. The loop also still does NOT: resume the brain's reasoning
-automatically AFTER an approval is granted (the operator approves + the bound call runs once via the
-existing routes; the brain resumes on the next message, now grant-covered); stream tool output live;
-branch / run tools in parallel; or let the brain pick tools the user did not explicitly request (the
-`ToolInvocation` gate is the entry condition). These stay out of scope to keep the loop local,
-bounded, and reuse-only.
+### Resumable continuation (the real "keep working")
+
+A paused agent-loop turn is RESUMABLE, not re-run. When the loop stops with work still to do — a
+configured ceiling was reached, or a gated tool is waiting on approval — the kernel persists a small,
+bounded **continuation** record for that conversation and stamps a `prime_continuation` handle on the
+response.
+
+- **What is persisted** (`relux_core::PrimeAgentContinuation`, in the kernel snapshot keyed by
+  `namespace::actor`): a stable `cont_NNNN` **token**, the original request, the profile it ran under
+  (standard / extended), the **already-gathered observations** (each bounded + secret-redacted, with
+  its call signature), the pause reason, and — for an approval pause — the staged approval id. It is
+  bounded: one record per conversation, a TTL (`PRIME_CONTINUATION_TTL_SECS`, 30 min), at most
+  `MAX_PRIME_CONTINUATIONS` conversations, `MAX_CONTINUATION_STEPS` steps each.
+- **Resuming** (`POST /v1/relux/prime/agent/continue` `{ continuation_id, extended? }`): the kernel
+  validates the token (a stale / unknown / expired token **fails closed** with a clean reply — no
+  resume), CONSUMES the record, and seeds `AgentLoop::resume` with the stored observations. The brain
+  sees those results in its prompt and **does not re-run the already-completed calls** (each is
+  skipped by call-signature, with a self-correction nudge to use the existing result or pick another
+  tool). The resumed loop runs under a **fresh per-turn budget** (and the extended profile when
+  asked), so it proceeds PAST where it stopped — behind the SAME gates as a fresh turn. If it pauses
+  again it persists a fresh continuation. This is the real "pick up where it left off", not a blind
+  re-run.
+- **Approval resume (automatic).** When the loop pauses on a gated tool, the continuation records the
+  staged approval. The operator approves + runs it through the **unchanged** approval routes
+  (`/v1/relux/approvals/:id/{decide,execute,allow-always}` — nothing is auto-approved); on success
+  `execute_approved_tool_invocation` **folds the real result into the waiting continuation** and
+  clears the approval marker. The next "Keep working" then resumes with that result already in
+  context. Denying the approval drops the continuation (it can never resume on a refused tool).
+
+**Remaining v2 gaps (honest).** The continuation is per-conversation (a new paused loop replaces the
+prior record for that conversation; older steps beyond `MAX_CONTINUATION_STEPS` fold into the reply
+already shown rather than being re-fed). The resume does NOT yet: stream tool output live; branch /
+run tools in parallel; carry the brain's intermediate *reasoning* tokens across the pause (only the
+tool observations are carried — the brain re-reasons from them); or let the brain pick tools the user
+did not explicitly request (the `ToolInvocation` gate is still the entry condition, and a continue
+only resumes an EXISTING paused loop — normal chat never creates one). These stay out of scope to
+keep the loop local, bounded, and reuse-only.
 
 ## Session continuity (streamable-HTTP `Mcp-Session-Id`)
 

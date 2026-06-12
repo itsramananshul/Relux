@@ -221,6 +221,7 @@ async fn serve() -> Result<(), KernelError> {
     println!("   POST   /v1/relux/prime/reset               (clear this conversation's bounded memory)");
     println!("   GET    /v1/relux/prime/agent-policy        (chat agent-loop autonomy limits + resolved profiles)");
     println!("   PUT    /v1/relux/prime/agent-policy        {{ \"max_tool_calls\"?, \"max_brain_rounds\"?, \"max_duration_secs\"?, \"extended_*\"? }}");
+    println!("   POST   /v1/relux/prime/agent/continue      {{ \"continuation_id\": \"cont_0001\", \"extended\"? }}  (resume a paused agent loop)");
     println!("   POST   /v1/relux/tasks                     {{ \"title\": \"...\" }}");
     println!("   POST   /v1/relux/tasks/:id/start");
     println!("   POST   /v1/relux/tasks/:id/execute-assigned");
@@ -448,6 +449,7 @@ fn protected_router() -> Router<AppState> {
         .route("/v1/relux/prime/autonomy", get(get_autonomy_config).put(update_autonomy_config).patch(update_autonomy_config))
         .route("/v1/relux/prime/autonomy/tick", post(run_autonomy_tick))
         .route("/v1/relux/prime/agent-policy", get(get_agent_policy).put(update_agent_policy).patch(update_agent_policy))
+        .route("/v1/relux/prime/agent/continue", post(continue_prime_agent_loop))
         // Multi-agent orchestration (Prime as orchestrator).
         .route(
             "/v1/relux/prime/orchestrations",
@@ -2830,6 +2832,13 @@ struct PrimeResponse {
     /// non-secret user text only. Absent when no clarification is pending.
     #[serde(skip_serializing_if = "Option::is_none")]
     pending_clarification: Option<relux_core::PendingClarification>,
+    /// Present ONLY when the bounded chat AGENT LOOP paused with work still to do — a configured
+    /// autonomy ceiling was reached, or a gated tool is waiting on approval. Carries the stable
+    /// continuation token the UI sends back to `POST /v1/relux/prime/agent/continue` to RESUME that
+    /// exact loop from the already-gathered observations (not a blind re-run). Absent on every turn
+    /// that finished or never entered the loop (`docs/mcp.md` "Prime Agent Loop"; §10.5, §17.1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prime_continuation: Option<relux_core::PrimeContinuationHandle>,
     /// Present ONLY when a single UNIFIED brain decision carried more than one proposal this
     /// turn (intent + slots + wording answered in one provider call). The value is the model
     /// id / CLI brain label. The chat renders one concise "one brain decision · <source>" chip;
@@ -3202,11 +3211,10 @@ async fn run_prime(
     // + audits the final intent and validates every slot at its single chokepoint.
     // `intent_source` records who decided. SKIPPED when the agent loop above already produced the
     // turn (an explicit tool-request turn that ran at least one tool, or paused for approval).
-    let (turn, summary, intent_source, pending_clarification) = if let Some(loop_outcome) =
-        agent_loop_turn
-    {
-        loop_outcome
-    } else {
+    let (turn, summary, intent_source, pending_clarification, prime_continuation) =
+        if let Some(loop_outcome) = agent_loop_turn {
+            loop_outcome
+        } else {
         let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut store = SqliteStore::open(&state.db_path)?;
         let mut kernel = store.load()?;
@@ -3237,7 +3245,8 @@ async fn run_prime(
         let pending_clarification = kernel.pending_clarification_for(&ctx);
         let summary = state_response(&kernel, &state.db_path);
         store.save(&kernel)?;
-        (turn, summary, intent_source, pending_clarification)
+        // The deterministic (non-loop) turn never produces a resumable continuation.
+        (turn, summary, intent_source, pending_clarification, None)
     };
 
     // 2. Produce the conversational reply through the selected brain. Actions are
@@ -3522,6 +3531,7 @@ async fn run_prime(
         intent_source: intent_source_label,
         reply_polish,
         pending_clarification,
+        prime_continuation,
         decision_source,
         requested_tool,
         after_action_source,
@@ -4342,41 +4352,37 @@ async fn agent_brain_round(
 ///
 /// When the loop stopped because a CONFIGURED autonomy limit was reached
 /// ([`relux_kernel::AgentOutcome::LimitReached`]), the reply names EXACTLY which limit was hit and
-/// the turn carries a one-click "keep working" continuation (a higher/extended-profile re-run of the
-/// SAME original request) — Prime never pretends it finished. `extended_used` says whether this turn
-/// already ran under the extended profile, so the offer is worded honestly.
+/// shows what was gathered so far — Prime never pretends it finished. The one-click resume is driven
+/// by the REAL continuation handle the caller persists (`prime_continuation` on the response →
+/// `POST /v1/relux/prime/agent/continue`), which resumes from these exact observations rather than
+/// re-running the request blind, so this turn carries no fake "re-send the text" suggestion.
+/// `extended_used` says whether this turn already ran under the extended profile, so the offer is
+/// worded honestly.
 ///
-/// Only called when `result.ran_any_tool()` is true, so `invoked_tool` is always set (honest).
+/// `message` is the ORIGINAL request (used only for length-bounded context in the reply wording).
+/// Only called when `result.ran_any_tool()` is true OR the brain gave a final answer, so the reply
+/// is always grounded (honest).
 fn build_agent_loop_turn(
     result: &relux_kernel::AgentLoopResult,
-    message: &str,
+    _message: &str,
     extended_used: bool,
 ) -> relux_core::PrimeTurn {
     let body = relux_kernel::prime_agent_loop::render_observations(&result.observations);
     let limit = result.limit_hit();
-    let mut suggested_actions: Vec<relux_core::PrimeSuggestion> = vec![];
+    let suggested_actions: Vec<relux_core::PrimeSuggestion> = vec![];
     let reply = match (&result.answer, limit) {
         // The brain gave an explicit final answer — use it verbatim (it already folds in the tools).
         (Some(a), _) => a.clone(),
         // A configured ceiling stopped the loop with work still to do: report which limit, show what
-        // was gathered, and offer to continue with higher limits.
+        // was gathered, and (via the continuation handle) offer to keep working from here.
         (None, Some(kind)) => {
             let n = result.observations.len();
             let more = if extended_used {
-                "This turn already used the extended (maximum) autonomy profile. I can keep going \
-                 if you ask me to continue."
+                "This turn already used the extended (maximum) autonomy profile. Use \"Keep working\" \
+                 to continue from here."
             } else {
-                "Tell me to keep working in extended mode and I'll continue with much higher limits."
+                "Use \"Keep working\" to continue from here in extended mode (much higher limits)."
             };
-            // The continuation re-sends the ORIGINAL request under the extended profile (a fresh,
-            // audited turn). Prefixed with an explicit "Run … (keep working)" so it re-classifies as
-            // a tool invocation AND trips the extended profile. Bounded to keep the suggestion small.
-            let seed: String = message.chars().take(400).collect();
-            suggested_actions.push(relux_core::PrimeSuggestion {
-                label: "Keep working (extended)".to_string(),
-                message: format!("Run in extended mode (keep working): {seed}"),
-                send: true,
-            });
             if body.is_empty() {
                 format!(
                     "I reached the {} for this turn before I could finish. {more}",
@@ -4438,52 +4444,22 @@ fn build_agent_loop_turn(
 ///
 /// Every brain round is OFF-LOCK; every execution takes its own short lock and is persisted, so the
 /// kernel lock never spans a network/process brain call. Bounded by [`relux_kernel::AgentLoop`].
-async fn drive_prime_agent_loop(
+/// Pump an already-constructed bounded [`relux_kernel::AgentLoop`] to completion, interleaving
+/// OFF-LOCK brain rounds with SHORT locked tool-execution steps (each through the unchanged
+/// `prime_agent_step` → `prime_invoke_tool` gate), enforcing the optional wall-clock `deadline`.
+/// Shared by the fresh-turn driver ([`drive_prime_agent_loop`]) and the resume driver
+/// ([`drive_prime_agent_continuation`]) so the interleave + locking discipline is pinned ONCE.
+/// Returns the loop result plus the terminal turn (a staged approval card / honest refusal) when one
+/// was produced.
+async fn pump_agent_loop(
     state: &AppState,
     brain: relux_kernel::PrimeBrain,
     ai_config: &relux_kernel::AiConfig,
     cli_status: Option<relux_core::AdapterRuntimeStatus>,
-    message: &str,
-    extended: bool,
     proposal_mcp_catalog: &relux_kernel::ProposalMcpCatalog,
-) -> Result<
-    Option<(
-        relux_core::PrimeTurn,
-        StateResponse,
-        relux_kernel::IntentSource,
-        Option<relux_core::PendingClarification>,
-    )>,
-    ApiError,
-> {
-    // 1. Take the live, per-agent tool catalog AND the configured autonomy policy under a short lock
-    // (MCP catalog injected so live MCP tools are included). Lock-free below.
-    let (catalog, policy) = {
-        let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
-        let store = SqliteStore::open(&state.db_path)?;
-        let mut kernel = store.load()?;
-        kernel.set_proposal_mcp_catalog(proposal_mcp_catalog.clone());
-        let ctx = crate::ensure_bootstrapped(&mut kernel)?;
-        (kernel.prime_agent_catalog(&ctx), kernel.prime_agent_policy.clone())
-    };
-    // No runnable tools at all → nothing to drive; fall back to the normal turn path.
-    if catalog.is_empty() {
-        return Ok(None);
-    }
-
-    // 2. Resolve the per-turn limits from the operator's policy (standard or extended profile) and
-    // an optional wall-clock deadline the orchestration enforces (the loop owns rounds/calls; the
-    // kernel owns the clock). Bounded by construction — even extended has a finite ceiling.
-    let limits = relux_kernel::AgentLimits::from_policy(&policy, extended);
-    let resolved = policy.limits(extended);
-    let deadline = if resolved.max_duration_secs > 0 {
-        std::time::Instant::now()
-            .checked_add(std::time::Duration::from_secs(resolved.max_duration_secs))
-    } else {
-        None
-    };
-
-    // 3. Drive the bounded loop.
-    let mut lp = relux_kernel::AgentLoop::new(message, catalog, limits);
+    mut lp: relux_kernel::AgentLoop,
+    deadline: Option<std::time::Instant>,
+) -> Result<(relux_kernel::AgentLoopResult, Option<relux_core::PrimeTurn>), ApiError> {
     let mut terminal_turn: Option<relux_core::PrimeTurn> = None;
     while let Some(prompt) = lp.next_prompt() {
         // Enforce the wall-clock deadline before spending another (possibly slow) brain round: if it
@@ -4536,27 +4512,128 @@ async fn drive_prime_agent_loop(
             }
         }
     }
-    let result = lp.into_result();
+    Ok((lp.into_result(), terminal_turn))
+}
 
-    // 3. No tool ran and nothing was staged → the brain stayed conversational. Fall back so the
+/// Build the [`relux_core::PrimeContinuationApproval`] for a loop that PAUSED on a gated tool, from
+/// the staged approval card (`approval_id`) and the pending pick (label + args signature). `None`
+/// when the loop did not pause for approval.
+fn continuation_pending_approval(
+    terminal_turn: &Option<relux_core::PrimeTurn>,
+    result: &relux_kernel::AgentLoopResult,
+) -> Option<relux_core::PrimeContinuationApproval> {
+    let appr = terminal_turn.as_ref()?.pending_tool_approval.as_ref()?;
+    let pick = result.pending_pick.as_ref()?;
+    Some(relux_core::PrimeContinuationApproval {
+        approval_id: appr.approval_id.clone(),
+        label: pick.label(),
+        args_sig: relux_kernel::prime_agent_loop::call_signature(&pick.label(), &pick.args),
+    })
+}
+
+/// Create + persist a resumable continuation for a paused agent-loop result, returning its handle.
+/// A continuation is created ONLY when the loop stopped with work still to do — a configured ceiling
+/// was reached, or a gated tool paused for approval. Returns `None` for a loop that finished (an
+/// explicit answer or an on-its-own stop below every ceiling), so a completed turn carries no
+/// continuation. Persists under the caller's lock via the passed `kernel` (the caller saves).
+fn persist_loop_continuation(
+    kernel: &mut relux_kernel::KernelState,
+    ctx: &relux_core::PrimeContext,
+    original_message: &str,
+    extended: bool,
+    result: &relux_kernel::AgentLoopResult,
+    pending_approval: Option<relux_core::PrimeContinuationApproval>,
+) -> Option<relux_core::PrimeContinuationHandle> {
+    // Approval pause takes precedence (it is the terminal stop); else a configured ceiling. When
+    // neither fired the loop finished, so there is nothing to resume.
+    let pause = if let Some(appr) = pending_approval {
+        relux_kernel::ContinuationPause::Approval(appr)
+    } else if let Some(kind) = result.limit_hit() {
+        relux_kernel::ContinuationPause::Limit(kind.label().to_string())
+    } else {
+        return None;
+    };
+    Some(kernel.create_prime_continuation(
+        ctx,
+        original_message,
+        extended,
+        &result.observations,
+        &result.observation_sigs,
+        pause,
+    ))
+}
+
+async fn drive_prime_agent_loop(
+    state: &AppState,
+    brain: relux_kernel::PrimeBrain,
+    ai_config: &relux_kernel::AiConfig,
+    cli_status: Option<relux_core::AdapterRuntimeStatus>,
+    message: &str,
+    extended: bool,
+    proposal_mcp_catalog: &relux_kernel::ProposalMcpCatalog,
+) -> Result<
+    Option<(
+        relux_core::PrimeTurn,
+        StateResponse,
+        relux_kernel::IntentSource,
+        Option<relux_core::PendingClarification>,
+        Option<relux_core::PrimeContinuationHandle>,
+    )>,
+    ApiError,
+> {
+    // 1. Take the live, per-agent tool catalog AND the configured autonomy policy under a short lock
+    // (MCP catalog injected so live MCP tools are included). Lock-free below.
+    let (catalog, policy) = {
+        let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let store = SqliteStore::open(&state.db_path)?;
+        let mut kernel = store.load()?;
+        kernel.set_proposal_mcp_catalog(proposal_mcp_catalog.clone());
+        let ctx = crate::ensure_bootstrapped(&mut kernel)?;
+        (kernel.prime_agent_catalog(&ctx), kernel.prime_agent_policy.clone())
+    };
+    // No runnable tools at all → nothing to drive; fall back to the normal turn path.
+    if catalog.is_empty() {
+        return Ok(None);
+    }
+
+    // 2. Resolve the per-turn limits from the operator's policy (standard or extended profile) and
+    // an optional wall-clock deadline the orchestration enforces (the loop owns rounds/calls; the
+    // kernel owns the clock). Bounded by construction — even extended has a finite ceiling.
+    let limits = relux_kernel::AgentLimits::from_policy(&policy, extended);
+    let resolved = policy.limits(extended);
+    let deadline = if resolved.max_duration_secs > 0 {
+        std::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(resolved.max_duration_secs))
+    } else {
+        None
+    };
+
+    // 3. Drive the bounded loop (fresh — no seeded observations).
+    let lp = relux_kernel::AgentLoop::new(message, catalog, limits);
+    let (result, terminal_turn) =
+        pump_agent_loop(state, brain, ai_config, cli_status, proposal_mcp_catalog, lp, deadline)
+            .await?;
+
+    // No tool ran and nothing was staged → the brain stayed conversational. Fall back so the
     // normal turn path (and its validated reply shaping) runs unchanged.
     if terminal_turn.is_none() && !result.ran_any_tool() {
         return Ok(None);
     }
 
-    // 4. Read back the board summary + any pending clarification under a short lock, and assemble
-    // the final turn (the staged/refused terminal turn, or a tool-result turn).
-    let (summary, pending_clarification) = {
+    // 4. Read back the board summary + any pending clarification under a short lock, PERSIST a
+    // resumable continuation when the loop paused with work still to do, and assemble the final turn.
+    let pending_approval = continuation_pending_approval(&terminal_turn, &result);
+    let (summary, pending_clarification, continuation) = {
         let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut store = SqliteStore::open(&state.db_path)?;
         let mut kernel = store.load()?;
         let ctx = crate::ensure_bootstrapped(&mut kernel)?;
         let pc = kernel.pending_clarification_for(&ctx);
+        let continuation =
+            persist_loop_continuation(&mut kernel, &ctx, message, extended, &result, pending_approval);
         let summary = state_response(&kernel, &state.db_path);
-        // ensure_bootstrapped is read-only here in practice; persist defensively in case it had to
-        // bootstrap (matches the other short read locks in run_prime).
         store.save(&kernel)?;
-        (summary, pc)
+        (summary, pc, continuation)
     };
 
     let trace = result.trace();
@@ -4570,7 +4647,302 @@ async fn drive_prime_agent_loop(
         }
         None => build_agent_loop_turn(&result, message, extended),
     };
-    Ok(Some((turn, summary, relux_kernel::IntentSource::Brain, pending_clarification)))
+    Ok(Some((
+        turn,
+        summary,
+        relux_kernel::IntentSource::Brain,
+        pending_clarification,
+        continuation,
+    )))
+}
+
+/// A minimal conversational [`relux_core::PrimeTurn`] (a plain reply with no action, slots, or tool
+/// result) — used for the continuation route's fail-closed / "approve first" replies, which carry no
+/// action of their own. Every action/slot/tool field is empty, so the turn is honest by construction.
+fn plain_prime_turn(
+    intent: relux_core::PrimeIntent,
+    disposition: relux_core::PrimeDisposition,
+    reply: String,
+) -> relux_core::PrimeTurn {
+    relux_core::PrimeTurn {
+        intent,
+        reply,
+        disposition,
+        action: None,
+        created_task: None,
+        started_run: None,
+        created_agent: None,
+        approval: None,
+        invoked_tool: None,
+        tool_output: None,
+        tool_error: None,
+        suggested_actions: vec![],
+        proposal: None,
+        slots: None,
+        agent_slots: None,
+        admin_slots: None,
+        assign_slots: None,
+        update: None,
+        context_reads: vec![],
+        tool_plan_proposal: None,
+        pending_tool_approval: None,
+        tool_trace: vec![],
+    }
+}
+
+/// The JSON body for the agent-loop continue route.
+#[derive(Debug, Deserialize)]
+struct PrimeContinueReq {
+    /// The continuation token to resume (from a prior turn's `prime_continuation.id`).
+    continuation_id: String,
+    /// Whether to resume under the EXTENDED (long-work) profile. A continuation that already ran
+    /// extended stays extended regardless; this only RAISES a standard-profile continuation.
+    #[serde(default)]
+    extended: bool,
+}
+
+/// POST `/v1/relux/prime/agent/continue` — RESUME a paused Prime agent loop from its persisted
+/// continuation (`docs/mcp.md` "Prime Agent Loop"; `docs/RELUX_MASTER_PLAN.md` §10.5, §17.1).
+///
+/// This is the real continuation foundation: instead of re-running the original request blind, it
+/// feeds the already-gathered observations back to the brain and SKIPS the already-completed calls,
+/// continuing from exactly where the loop paused with a FRESH per-turn budget (and the extended
+/// profile when asked). A stale / unknown / expired token fails closed with a clean reply. When the
+/// continuation is still waiting on a tool approval, it asks the operator to approve that tool first
+/// (the approval routes are unchanged — nothing is auto-approved). The resumed loop runs behind the
+/// SAME gates as a fresh one; if it pauses again it persists a fresh continuation.
+async fn continue_prime_agent_loop(
+    State(state): State<AppState>,
+    Json(req): Json<PrimeContinueReq>,
+) -> Result<Json<PrimeResponse>, ApiError> {
+    let continuation_id = req.continuation_id.trim().to_string();
+    if continuation_id.is_empty() {
+        return Err(ApiError::bad_request("continuation_id is required"));
+    }
+
+    let ai_config = resolve_ai(&state);
+    let brain = ai_config.effective_brain();
+    if matches!(brain, relux_kernel::PrimeBrain::Local) {
+        return Err(ApiError::bad_request(
+            "the agent loop needs a configured brain (OpenRouter / Claude CLI / Codex CLI)",
+        ));
+    }
+    let cli_adapter_id = match brain {
+        relux_kernel::PrimeBrain::ClaudeCli => Some(relux_core::CLAUDE_CLI_ADAPTER_ID),
+        relux_kernel::PrimeBrain::CodexCli => Some(relux_core::CODEX_CLI_ADAPTER_ID),
+        _ => None,
+    };
+    let cli_status = if cli_adapter_id.is_some() {
+        let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let store = SqliteStore::open(&state.db_path)?;
+        let kernel = store.load()?;
+        cli_adapter_id.and_then(|id| {
+            kernel.adapter_runtime_status().into_iter().find(|a| a.plugin_id == id)
+        })
+    } else {
+        None
+    };
+
+    let (turn, summary, intent_source, pending_clarification, prime_continuation) =
+        drive_prime_agent_continuation(
+            &state,
+            brain,
+            &ai_config,
+            cli_status,
+            &continuation_id,
+            req.extended,
+        )
+        .await?;
+
+    let outcome = unified_reply_outcome(brain, &ai_config, turn.reply.clone());
+    let intent_source_label = match intent_source {
+        relux_kernel::IntentSource::Brain => Some("brain".to_string()),
+        relux_kernel::IntentSource::Deterministic => None,
+    };
+    Ok(Json(PrimeResponse {
+        turn,
+        state: summary,
+        ai_mode: outcome.mode,
+        ai_model: outcome.model,
+        ai_note: outcome.note,
+        intent_source: intent_source_label,
+        reply_polish: None,
+        pending_clarification,
+        prime_continuation,
+        decision_source: None,
+        requested_tool: None,
+        after_action_source: None,
+    }))
+}
+
+/// Drive a RESUMED Prime agent loop from a persisted continuation token. Returns the assembled turn,
+/// a state summary, any pending clarification, and the fresh continuation handle (when it paused
+/// again). Always yields a turn (the dedicated route has no deterministic fallback): a clean
+/// fail-closed reply for a stale/unknown token, an "approve the pending tool first" reply when the
+/// continuation is still waiting on approval, or the resumed loop's grounded tool-result turn.
+async fn drive_prime_agent_continuation(
+    state: &AppState,
+    brain: relux_kernel::PrimeBrain,
+    ai_config: &relux_kernel::AiConfig,
+    cli_status: Option<relux_core::AdapterRuntimeStatus>,
+    continuation_id: &str,
+    requested_extended: bool,
+) -> Result<
+    (
+        relux_core::PrimeTurn,
+        StateResponse,
+        relux_kernel::IntentSource,
+        Option<relux_core::PendingClarification>,
+        Option<relux_core::PrimeContinuationHandle>,
+    ),
+    ApiError,
+> {
+    // 1. Resolve + CONSUME the continuation under a short lock. Validate the token fail-closed; gate
+    // a still-pending approval; otherwise take the record, build the resume seed, and read the live
+    // catalog + policy. The MCP catalog is best-effort here (resume grounds against installed tools
+    // plus whatever is live); a paused loop's tools were already validated when first picked.
+    let proposal_mcp_catalog = relux_kernel::ProposalMcpCatalog::default();
+    enum Resolved {
+        Stale,
+        AwaitingApproval(relux_core::PrimeContinuationHandle),
+        // Boxed: the continuation record dominates this variant's size.
+        Resume {
+            rec: Box<relux_core::PrimeAgentContinuation>,
+            catalog: Vec<relux_kernel::AgentTool>,
+            limits: relux_kernel::AgentLimits,
+            resolved: relux_core::PrimeAgentLimits,
+            extended: bool,
+        },
+    }
+    let resolved = {
+        let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut store = SqliteStore::open(&state.db_path)?;
+        let mut kernel = store.load()?;
+        let ctx = crate::ensure_bootstrapped(&mut kernel)?;
+        match kernel.peek_prime_continuation(&ctx, continuation_id) {
+            None => Resolved::Stale,
+            Some(rec) if rec.pending_approval.is_some() => {
+                Resolved::AwaitingApproval(rec.handle())
+            }
+            Some(_) => {
+                // Consume the record (we are resuming now) and read the live catalog + policy.
+                let rec = kernel
+                    .take_prime_continuation(&ctx, continuation_id)
+                    .expect("peek matched so take matches");
+                let extended = rec.extended_used || requested_extended;
+                let policy = kernel.prime_agent_policy.clone();
+                let limits = relux_kernel::AgentLimits::from_policy(&policy, extended);
+                let resolved = policy.limits(extended);
+                let catalog = kernel.prime_agent_catalog(&ctx);
+                // Persist the consume.
+                store.save(&kernel)?;
+                Resolved::Resume { rec: Box::new(rec), catalog, limits, resolved, extended }
+            }
+        }
+    };
+
+    // The board summary + any pending clarification, read once for whichever path we return.
+    let read_summary = |state: &AppState| -> Result<(StateResponse, Option<relux_core::PendingClarification>), ApiError> {
+        let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let store = SqliteStore::open(&state.db_path)?;
+        let mut kernel = store.load()?;
+        let ctx = crate::ensure_bootstrapped(&mut kernel)?;
+        let pc = kernel.pending_clarification_for(&ctx);
+        let summary = state_response(&kernel, &state.db_path);
+        Ok((summary, pc))
+    };
+
+    let (rec, catalog, limits, resolved_limits, extended) = match resolved {
+        Resolved::Stale => {
+            let (summary, pc) = read_summary(state)?;
+            let turn = plain_prime_turn(
+                relux_core::PrimeIntent::ToolInvocation,
+                relux_core::PrimeDisposition::NeedsClarification,
+                "That \"keep working\" session has expired or is no longer available. Send your \
+                 request again and I'll start fresh."
+                    .to_string(),
+            );
+            return Ok((turn, summary, relux_kernel::IntentSource::Brain, pc, None));
+        }
+        Resolved::AwaitingApproval(handle) => {
+            let (summary, pc) = read_summary(state)?;
+            let turn = plain_prime_turn(
+                relux_core::PrimeIntent::ToolInvocation,
+                relux_core::PrimeDisposition::NeedsClarification,
+                "That tool is still waiting for your approval. Approve (or deny) it on the card \
+                 above, then continue — I'll pick up with its result."
+                    .to_string(),
+            );
+            return Ok((turn, summary, relux_kernel::IntentSource::Brain, pc, Some(handle)));
+        }
+        Resolved::Resume { rec, catalog, limits, resolved, extended } => {
+            (rec, catalog, limits, resolved, extended)
+        }
+    };
+
+    // 2. Seed the loop with the prior observations (and their call signatures) so the brain sees
+    // them and the loop SKIPS re-running them, then drive it under a FRESH per-turn budget.
+    let seed: Vec<(relux_kernel::AgentObservation, String)> = rec
+        .steps
+        .iter()
+        .map(relux_kernel::AgentObservation::from_continuation_step)
+        .collect();
+    let deadline = if resolved_limits.max_duration_secs > 0 {
+        std::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(resolved_limits.max_duration_secs))
+    } else {
+        None
+    };
+    let lp = relux_kernel::AgentLoop::resume(&rec.original_message, catalog, limits, seed);
+    let (result, terminal_turn) = pump_agent_loop(
+        state,
+        brain,
+        ai_config,
+        cli_status,
+        &proposal_mcp_catalog,
+        lp,
+        deadline,
+    )
+    .await?;
+
+    // 3. Read back state, persist a FRESH continuation if the resumed loop paused again, assemble.
+    let pending_approval = continuation_pending_approval(&terminal_turn, &result);
+    let (summary, pending_clarification, continuation) = {
+        let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut store = SqliteStore::open(&state.db_path)?;
+        let mut kernel = store.load()?;
+        let ctx = crate::ensure_bootstrapped(&mut kernel)?;
+        let pc = kernel.pending_clarification_for(&ctx);
+        let continuation = persist_loop_continuation(
+            &mut kernel,
+            &ctx,
+            &rec.original_message,
+            extended,
+            &result,
+            pending_approval,
+        );
+        let summary = state_response(&kernel, &state.db_path);
+        store.save(&kernel)?;
+        (summary, pc, continuation)
+    };
+
+    let trace = result.trace();
+    let turn = match terminal_turn {
+        Some(mut t) => {
+            if !trace.is_empty() {
+                t.tool_trace = trace;
+            }
+            t
+        }
+        None => build_agent_loop_turn(&result, &rec.original_message, extended),
+    };
+    Ok((
+        turn,
+        summary,
+        relux_kernel::IntentSource::Brain,
+        pending_clarification,
+        continuation,
+    ))
 }
 
 /// The provenance label for brain-extracted slots: the OpenRouter model id, or the
@@ -9389,6 +9761,71 @@ mod tests {
         let (_s, _, gb) = call(&state, "GET", "/v1/relux/prime/agent-policy", None, None).await;
         let g: serde_json::Value = serde_json::from_str(&gb).unwrap();
         assert_eq!(g["config"]["max_tool_calls"].as_u64().unwrap(), 40);
+    }
+
+    #[tokio::test]
+    async fn continue_route_requires_a_continuation_id() {
+        let (state, _dir) = auth_state(true);
+        let (status, _, _b) =
+            call(&state, "POST", "/v1/relux/prime/agent/continue", None, Some(r#"{"continuation_id":"  "}"#)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "empty id rejected");
+    }
+
+    #[tokio::test]
+    async fn continue_route_needs_a_configured_brain() {
+        // With the default (Local) brain the agent loop never runs, so a continue is refused with a
+        // clear 400 rather than pretending to resume. The continuation model only exists for a real
+        // brain (the same gate the loop entry uses).
+        let (state, _dir) = auth_state(true);
+        let (status, _, _b) = call(
+            &state,
+            "POST",
+            "/v1/relux/prime/agent/continue",
+            None,
+            Some(r#"{"continuation_id":"cont_0001"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn continue_route_with_unknown_token_fails_closed_cleanly() {
+        // With a brain configured (so the route does not bail on Local), an UNKNOWN / stale token
+        // returns a clean conversational turn — never a 500, never a resumed loop, never a
+        // continuation handle.
+        let (state, _dir) = auth_state(true);
+        // Select a CLI brain by writing the stored AI config directly (no network needed — the
+        // unknown-token path returns before any brain call).
+        std::fs::write(&state.ai_config_path, r#"{"brain":"claude_cli"}"#).unwrap();
+        let (status, _, body) = call(
+            &state,
+            "POST",
+            "/v1/relux/prime/agent/continue",
+            None,
+            Some(r#"{"continuation_id":"cont_9999"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            v["reply"].as_str().unwrap().to_lowercase().contains("expired")
+                || v["reply"].as_str().unwrap().to_lowercase().contains("no longer"),
+            "fail-closed reply: {}",
+            v["reply"]
+        );
+        assert!(v.get("prime_continuation").is_none(), "no continuation handle on a stale resume");
+    }
+
+    #[tokio::test]
+    async fn normal_chat_carries_no_continuation_handle() {
+        // A plain greeting never enters the agent loop and never produces a continuation — the
+        // continuation model is strictly for an explicit, brain-driven tool-loop turn that paused.
+        let (state, _dir) = auth_state(true);
+        let (status, _, body) =
+            call(&state, "POST", "/v1/relux/prime", None, Some(r#"{"message":"hello there"}"#)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v.get("prime_continuation").is_none(), "a greeting carries no continuation");
     }
 
     #[tokio::test]

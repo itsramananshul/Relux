@@ -1724,6 +1724,25 @@ export interface ReluxPrimeToolTrace {
   summary: string;
 }
 
+// The compact, client-facing handle for a RESUMABLE Prime agent-loop continuation, present on a
+// turn ONLY when the bounded chat agent loop paused with work still to do — a configured autonomy
+// ceiling was reached, or a gated tool is waiting on approval. The UI sends `id` back to
+// POST /v1/relux/prime/agent/continue to resume that exact loop from the already-gathered
+// observations (not a blind re-run). Presentation/correlation only — it grants no authority.
+// (docs/mcp.md "Prime Agent Loop"; §10.5, §17.1)
+export interface ReluxPrimeContinuation {
+  // The stable continuation token to resume this loop.
+  id: string;
+  // A short human reason the loop paused (the limit hit, or that a tool needs approval).
+  reason: string;
+  // How many real tool observations are already gathered (carried into the resume).
+  observation_count: number;
+  // Whether the paused turn already ran under the extended (long-work) profile.
+  extended_used: boolean;
+  // Whether the loop is waiting on a tool approval (resume proceeds only after it is approved).
+  awaiting_approval: boolean;
+}
+
 export interface ReluxPrimeTurn {
   intent: string;
   reply: string;
@@ -1811,6 +1830,11 @@ export interface ReluxPrimeTurn {
   /// small "waiting for: …" chip with a cancel action; the next message is read as the
   /// answer and continues the original request. Absent when nothing is pending.
   pending_clarification?: ReluxPendingClarification;
+  /// Present ONLY when the bounded chat AGENT LOOP paused with work still to do (a configured
+  /// autonomy ceiling reached, or a gated tool waiting on approval). Carries the stable token the
+  /// "Keep working" button sends to POST /v1/relux/prime/agent/continue to RESUME that exact loop
+  /// from the already-gathered observations. Absent on every turn that finished or never looped.
+  prime_continuation?: ReluxPrimeContinuation;
   /// Present ONLY when a single UNIFIED brain decision carried more than one proposal this
   /// turn (intent + slots + wording answered in one provider call). The value is the model id
   /// / CLI brain label. The chat renders one concise "one brain decision · <source>" chip; the
@@ -1839,6 +1863,15 @@ export const reluxPrime = {
   // Clear this conversation's bounded memory (recent-turn history + any pending
   // clarification). Drops only advisory context — no task/run/agent is touched.
   reset: () => api.post<{ cleared: boolean }>("/v1/relux/prime/reset", {}),
+  // RESUME a paused agent loop from its continuation token (the "Keep working" button). Feeds the
+  // already-gathered observations back to the brain and continues from where the loop paused — it
+  // does NOT re-send the original text. `extended` raises a standard-profile continuation to the
+  // long-work profile. A stale/unknown token returns a clean conversational turn.
+  continue: (continuationId: string, extended: boolean) =>
+    api.post<ReluxPrimeTurn>("/v1/relux/prime/agent/continue", {
+      continuation_id: continuationId,
+      extended,
+    }),
 };
 
 // -- Relux Prime Autonomy --------------------------------------------------

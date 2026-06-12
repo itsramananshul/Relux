@@ -930,6 +930,126 @@ pub struct PrimeToolTrace {
     pub summary: String,
 }
 
+/// One real tool observation gathered inside a bounded Prime agent-loop turn, persisted on a
+/// [`PrimeAgentContinuation`] so a LATER continuation can resume from it instead of re-running the
+/// tool blind (`docs/mcp.md` "Prime Agent Loop"; `docs/RELUX_MASTER_PLAN.md` §10.5, §17.1).
+///
+/// Honest + bounded by construction: it is built ONLY from a real
+/// [`crate::PrimeToolTrace`]-backed `AgentObservation` (a real, gated, audited execution), and its
+/// `detail` is already secret-redacted and length-clamped before it is stored. `args_sig` is a
+/// stable, BOUNDED signature of the call (`label` + canonical args) used ONLY to skip a duplicate
+/// of an already-completed call when the loop resumes — it is never a security boundary (the kernel
+/// re-gates every execution through the unchanged `prime_invoke_tool` path).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrimeContinuationStep {
+    /// The `<plugin_id>/<tool_name>` label that ran.
+    pub label: String,
+    /// The source kind (`"mcp"` / `"plugin"`).
+    pub source: String,
+    /// Whether the call succeeded. `false` is an honest error, never a fabricated success.
+    pub ok: bool,
+    /// A short one-line summary for the trace chip.
+    pub summary: String,
+    /// The bounded, redacted detail body fed back to the brain on resume.
+    pub detail: String,
+    /// The bounded call signature (`label` + canonical args) for duplicate-call avoidance.
+    pub args_sig: String,
+}
+
+/// The gated tool a PAUSED Prime agent loop is waiting on a human to approve, recorded on the
+/// [`PrimeAgentContinuation`] so that — after the operator approves + runs it through the EXISTING
+/// per-call approval routes — the executed result is folded back into the continuation and the next
+/// resume proceeds with that observation in context (`docs/mcp.md` "Prime Agent Loop").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrimeContinuationApproval {
+    /// The pending approval id the loop staged (the stable correlation key, same id the approval
+    /// card uses).
+    pub approval_id: String,
+    /// The `<plugin_id>/<tool_name>` label awaiting approval.
+    pub label: String,
+    /// The call signature of the pending pick (so the folded-in result is marked completed).
+    pub args_sig: String,
+}
+
+/// A persisted, RESUMABLE Prime agent-loop continuation — the real foundation that lets a "keep
+/// working" pick up EXACTLY where the loop paused instead of re-running the original request blind
+/// (`docs/mcp.md` "Prime Agent Loop"; `docs/RELUX_MASTER_PLAN.md` §10.5, §17.1).
+///
+/// One record per conversation key is stored by the kernel when a bounded agent-loop turn stopped
+/// with work still to do — either a CONFIGURED autonomy ceiling was reached, or a gated tool paused
+/// for approval. It carries the bounded, redacted observations already gathered (so the next loop
+/// FEEDS them to the brain and SKIPS the already-completed calls), the original request, the profile
+/// it ran under, and the pause reason. The `id` is the stable continuation TOKEN the UI sends back
+/// to the continue route; a stale / unknown / expired token fails closed (no resume).
+///
+/// Safety: this record grants NO authority. Every resumed execution still flows through the
+/// unchanged permission/approval/grant/audit gate; the stored observations are bounded + secret-
+/// redacted; the record has a TTL and the per-conversation map is hard-capped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrimeAgentContinuation {
+    /// The stable continuation token (`cont_NNNN`) the UI echoes back to resume this exact loop.
+    pub id: String,
+    /// The original user request the loop was working on (bounded), re-fed as the resume goal.
+    pub original_message: String,
+    /// Whether the paused turn ran under the EXTENDED (long-work) profile, so a resume defaults to
+    /// at least that profile.
+    pub extended_used: bool,
+    /// The bounded, redacted observations already gathered, in order — fed to the brain on resume
+    /// and used to skip duplicate completed calls.
+    pub steps: Vec<PrimeContinuationStep>,
+    /// Which configured ceiling stopped the loop (`"tool-call limit"` / `"reasoning-round limit"` /
+    /// `"time limit"`), when a limit (not an approval pause) caused the continuation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_reason: Option<String>,
+    /// The gated tool awaiting approval, when the loop paused for one. Cleared once the approved
+    /// result is folded in, after which a resume proceeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_approval: Option<PrimeContinuationApproval>,
+    /// Logical-clock second the record was created/refreshed.
+    pub created_at_secs: u64,
+    /// Logical-clock second past which the record is stale and a resume fails closed.
+    pub expires_at_secs: u64,
+}
+
+impl PrimeAgentContinuation {
+    /// Project to the compact, client-facing handle surfaced on the Prime response.
+    pub fn handle(&self) -> PrimeContinuationHandle {
+        let reason = self.limit_reason.clone().unwrap_or_else(|| {
+            if self.pending_approval.is_some() {
+                "awaiting tool approval".to_string()
+            } else {
+                "more work available".to_string()
+            }
+        });
+        PrimeContinuationHandle {
+            id: self.id.clone(),
+            reason,
+            observation_count: self.steps.len(),
+            extended_used: self.extended_used,
+            awaiting_approval: self.pending_approval.is_some(),
+        }
+    }
+}
+
+/// The compact, client-facing handle for a resumable [`PrimeAgentContinuation`], surfaced on the
+/// Prime response ONLY when the agent loop paused at a configured limit or for approval with work
+/// still to do. The full record stays server-side; the UI sends `id` back to the continue route
+/// (`POST /v1/relux/prime/agent/continue`) to resume that exact loop. Presentation/correlation only
+/// — it grants no authority (`docs/mcp.md` "Prime Agent Loop").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrimeContinuationHandle {
+    /// The stable continuation token to resume this loop.
+    pub id: String,
+    /// A short human reason the loop paused (the limit hit, or that a tool needs approval).
+    pub reason: String,
+    /// How many real tool observations are already gathered (carried into the resume).
+    pub observation_count: usize,
+    /// Whether the paused turn already ran under the extended profile.
+    pub extended_used: bool,
+    /// Whether the loop is waiting on a tool approval (resume proceeds only after it is approved).
+    pub awaiting_approval: bool,
+}
+
 /// The full result of Prime handling one user message.
 ///
 /// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 10 (Prime Behavior Specification).

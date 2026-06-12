@@ -111,6 +111,28 @@ export function Prime() {
     }
   }
 
+  // Resume a paused agent loop ("Keep working"): call the continuation route with the stored token
+  // (NOT a re-sent message), and append the resumed loop's turn. This continues from the
+  // already-gathered observations, so it does not repeat completed tool calls.
+  async function continueLoop(id: string, extended: boolean) {
+    if (busy) return;
+    setLog((l) => [...l, { role: "user", text: extended ? "Keep working (extended)" : "Keep working" }]);
+    setBusy(true);
+    try {
+      const turn = await reluxPrime.continue(id, extended);
+      setLog((l) => [...l, { role: "prime", turn }]);
+      void refreshAi();
+    } catch (e) {
+      setLog((l) => [
+        ...l,
+        { role: "error", text: e instanceof Error ? e.message : "Could not continue the agent loop" },
+      ]);
+    } finally {
+      setBusy(false);
+      scroll();
+    }
+  }
+
   // Clear the conversation: drop the on-screen log AND the kernel's bounded memory
   // for this conversation (recent-turn history + any pending clarification), so the
   // next message starts fresh with no carried context. Advisory only — no task, run,
@@ -177,7 +199,13 @@ export function Prime() {
             );
           }
           return (
-            <PrimeTurnCard key={i} turn={m.turn} busy={busy} onSuggestion={handleSuggestion} />
+            <PrimeTurnCard
+              key={i}
+              turn={m.turn}
+              busy={busy}
+              onSuggestion={handleSuggestion}
+              onContinue={continueLoop}
+            />
           );
         })}
         {busy && <div className="msg assistant muted">...thinking</div>}
@@ -346,13 +374,16 @@ function PrimeTurnCard({
   turn,
   busy,
   onSuggestion,
+  onContinue,
 }: {
   turn: ReluxPrimeTurn;
   busy: boolean;
   onSuggestion: (s: ReluxPrimeSuggestion) => void;
+  onContinue: (id: string, extended: boolean) => void;
 }) {
   const tone = DISPOSITION_TONE[turn.disposition] ?? "todo";
   const suggestions = turn.suggested_actions ?? [];
+  const continuation = turn.prime_continuation;
   return (
     <div className="msg assistant" style={{ maxWidth: 720 }}>
       <div className="row wrap" style={{ gap: 6, marginBottom: 6, alignItems: "center" }}>
@@ -466,6 +497,43 @@ function PrimeTurnCard({
       <ToolResult turn={turn} />
 
       <ToolTrace turn={turn} />
+
+      {/* Resumable agent-loop continuation: the bounded loop paused with work still to do (a
+          configured autonomy ceiling was reached, or a gated tool is waiting on approval). The
+          "Keep working" button RESUMES that exact loop from the already-gathered observations via
+          the continuation route — it does NOT re-send the original text, and it never repeats a
+          completed tool call. When the loop is waiting on a tool approval, approve it on the card
+          first; continuing then folds the approved result back in. (docs/mcp.md "Prime Agent
+          Loop"; §10.5, §17.1) */}
+      {continuation && (
+        <div
+          className="row wrap"
+          style={{ gap: 8, marginTop: 10, alignItems: "center", fontSize: 11 }}
+        >
+          <span
+            className="badge todo"
+            style={{ fontSize: 9 }}
+            title={`Paused: ${continuation.reason}. ${continuation.observation_count} tool result(s) gathered so far.`}
+          >
+            ⏸ paused · {continuation.reason} · {continuation.observation_count} gathered
+          </span>
+          {continuation.awaiting_approval ? (
+            <span className="muted" style={{ fontSize: 10 }}>
+              Approve the tool above, then keep working.
+            </span>
+          ) : (
+            <button
+              className="btn"
+              style={{ fontSize: 12, padding: "4px 12px" }}
+              disabled={busy}
+              onClick={() => onContinue(continuation.id, true)}
+              title="Resume this loop from where it paused, with the extended (long-work) limits — continues from the gathered results, not a re-run"
+            >
+              Keep working (extended)
+            </button>
+          )}
+        </div>
+      )}
 
       {/* A pending per-call tool approval Prime staged because an explicit chat tool
           invocation named a gated (needs_approval) tool with no standing grant. The

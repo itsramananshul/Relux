@@ -1836,6 +1836,43 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **unreleased** — **Resumable Prime agent-loop continuation (the real "keep working")** on top of the
+  configurable autonomy policy, continuing the §10.5/§17.1 line, built reference-first against Hermes'
+  `agent/conversation_loop.py` (`run_conversation(conversation_history=…)` seeds `messages =
+  list(conversation_history)` so a resumed turn carries the prior `role:"tool"` results and does not
+  re-run them; session persisted in `agent._session_db` keyed by `session_id`) and openclaw's
+  consume-once exec-approval handoff, per `docs/reference-driven-development.md` (mapping in
+  `docs/mcp.md`, "Resumable continuation"; `docs/REFERENCE_CODE_MAP.md`). No release cut; no
+  master-plan safety property is weakened. **What changes:** the prior continuation was a *fresh,
+  audited turn that re-ran the original request* under the higher profile — it duplicated tool calls
+  and felt fake. It is replaced by a REAL resume: when a bounded agent-loop turn pauses with work
+  still to do (a configured ceiling hit, or a gated tool waiting on approval), the kernel persists a
+  bounded, redacted `relux_core::PrimeAgentContinuation` (the original request, the profile used, the
+  already-gathered observations + their call signatures, the pause reason, and any staged approval id)
+  keyed by conversation in the snapshot, and stamps a `prime_continuation` handle (a stable `cont_NNNN`
+  token) on the response. `POST /v1/relux/prime/agent/continue` validates the token (stale / unknown /
+  expired **fails closed**), CONSUMES the record, seeds `AgentLoop::resume` with the prior
+  observations, and continues under a FRESH per-turn budget — the brain sees the prior results and
+  **skips already-completed calls** (by call signature, bounded self-correction), so it proceeds PAST
+  where it stopped instead of re-running blind. **Approval resume is automatic:** the unchanged
+  approval routes run the gated tool once, and `execute_approved_tool_invocation` folds the real
+  result into the waiting continuation (clearing the pause); the next "Keep working" resumes with it
+  in context. Denying drops the continuation. **Bounded/safe:** one record per conversation, a TTL
+  (`PRIME_CONTINUATION_TTL_SECS`), `MAX_PRIME_CONTINUATIONS` overall, `MAX_CONTINUATION_STEPS` steps
+  each, every step secret-redacted; the continuation grants NO authority (every resumed execution
+  flows through the unchanged `prime_invoke_tool` gate); normal chat / frustration / vague ideas still
+  never create a continuation (a continue only resumes an existing paused loop). **UI:** the dashboard
+  "Keep working (extended)" button now calls the continuation route with the token (not a re-sent
+  message) and shows a compact "⏸ paused · <reason> · <N> gathered" chip; an approval-waiting
+  continuation tells the operator to approve first. **v2 gaps (honest):** no live streaming, no
+  parallel tool branches, the brain re-reasons from the carried observations (its intermediate
+  reasoning tokens are not carried), and the loop still never picks tools the user did not explicitly
+  request. `cargo test` + `clippy` clean on `relux-core`/`relux-kernel` (new tests: resumed loop feeds
+  prior observations + skips duplicate calls, a fresh budget proceeds past the prior limit, repeated
+  re-picks of a finished call stop, create/peek/take/fold/snapshot-roundtrip + bounded steps, stale /
+  unknown / mismatched / expired tokens fail closed, approved result folds in, denied drops it, the
+  continue route gates an empty id / Local brain / unknown token, normal chat carries no continuation).
+  Dashboard typechecks, builds, its 358 tests pass, and the committed bundle was rebuilt.
 - **unreleased** — **Configurable Prime autonomy policy (replaces the toy v1 loop caps)** on top of the
   Prime Agent Loop, continuing the §10.5/§17.1 line, built reference-first against Hermes'
   `agent/iteration_budget.py` (`IterationBudget(max_total)` — a configurable per-agent budget, parent
@@ -1860,9 +1897,10 @@ stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
   (response carries the resolved standard/extended limits); `relux-kernel prime agent-policy <status|configure>`
   CLI. **UI:** a compact **Prime Autonomy Limits** panel (Health → Prime Brain) with std/ext chips + editable
   rows; the "Keep working (extended)" affordance rides the existing `suggested_actions` chat buttons.
-  **Continuation model + gap (honest):** a continuation is a fresh, audited turn that re-runs the original
-  request under the extended profile; it does NOT yet resume mid-loop from the already-gathered observations
-  (incremental resume is the next step). `cargo test` + `clippy` clean on `relux-core`/`relux-kernel` (new
+  **Continuation model (at the time of this slice):** a continuation was a fresh, audited turn that re-ran the
+  original request under the extended profile — SUPERSEDED by the "Resumable Prime agent-loop continuation"
+  entry above, which makes it a real resume from the already-gathered observations. `cargo test` + `clippy`
+  clean on `relux-core`/`relux-kernel` (new
   tests: default policy is not the toy 3, configured high tool limit runs >3, extended uses higher limits than
   standard, brain-round + duration ceilings reported as limits, extended-work cue detection, policy persists +
   clamps through the snapshot, the `/agent-policy` route serves + clamps). Dashboard typechecks, builds, its

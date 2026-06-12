@@ -172,10 +172,10 @@ pub use runtime::{invoke_http_loopback, RuntimeClientError};
 pub use state::{
     discover_proposal_mcp_catalog, run_briefs_in_parallel, run_briefs_in_parallel_streaming,
     AppliedProposedChange, AppliedProposedChangeSet, BrainSlotProposals, BundledRefresh,
-    BundledRefreshSummary, FinishedBrief, KernelCounters, KernelSnapshot, KernelState,
-    PendingClarificationEntry, PendingToolInvocation, PreparedBrief, ProposalMcpCatalog,
-    ProposalMcpServer, ProposalMcpTool, RoundPrep, MAX_PENDING_CLARIFICATIONS,
-    MAX_TOOL_INVOCATION_ARGS_BYTES,
+    BundledRefreshSummary, ContinuationPause, FinishedBrief, KernelCounters, KernelSnapshot,
+    KernelState, PendingClarificationEntry, PendingToolInvocation, PreparedBrief,
+    PrimeAgentContinuationEntry, ProposalMcpCatalog, ProposalMcpServer, ProposalMcpTool, RoundPrep,
+    MAX_PENDING_CLARIFICATIONS, MAX_PRIME_CONTINUATIONS, MAX_TOOL_INVOCATION_ARGS_BYTES,
 };
 pub use store::SqliteStore;
 

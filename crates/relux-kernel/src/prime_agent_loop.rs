@@ -176,6 +176,28 @@ const MAX_LINE_CHARS: usize = 200;
 /// the prompt. A larger catalog is reported with an honest "(+N more)" note.
 const MAX_CATALOG_ADVERTISED: usize = 40;
 
+/// Max characters kept from the canonical args in a call signature, so a large args object cannot
+/// bloat the dedup key (the signature is a duplicate-avoidance convenience, never a security key).
+const MAX_SIG_ARGS_CHARS: usize = 240;
+
+/// How many times in a row the brain may re-pick an ALREADY-COMPLETED call before the loop gives up
+/// on it as no-progress. Bounded so a brain that keeps asking for the same finished call cannot spin
+/// the loop; after this many skips the loop stops as [`AgentOutcome::Exhausted`].
+const MAX_DUP_SKIPS: usize = 2;
+
+/// A stable, bounded signature of one tool call (`label` + canonical args), used ONLY to detect a
+/// duplicate of an already-completed call so a resumed loop does not re-run work it already did. It
+/// is NOT a security boundary — the kernel re-gates every execution; collisions only cause a
+/// harmless extra self-correction. Pure.
+pub fn call_signature(label: &str, args: &serde_json::Value) -> String {
+    let args_str = match args {
+        serde_json::Value::Null => String::new(),
+        other => serde_json::to_string(other).unwrap_or_default(),
+    };
+    let args_clamped: String = args_str.chars().take(MAX_SIG_ARGS_CHARS).collect();
+    format!("{label}\u{1}{args_clamped}")
+}
+
 /// One tool the brain may pick this turn — a bounded projection of a live [`ToolDescriptor`] that is
 /// actually runnable-or-gatable for this agent. This is the loop's `valid_tool_names`: the brain
 /// can choose ONLY from these, and [`interpret_agent_reply`] validates every pick against them.
@@ -384,6 +406,35 @@ impl AgentObservation {
             summary: self.summary.clone(),
         }
     }
+
+    /// Project to a persisted continuation step (paired with this observation's call signature), so
+    /// a later resume can re-feed it to the brain and skip the already-completed call.
+    pub fn to_continuation_step(&self, args_sig: &str) -> relux_core::PrimeContinuationStep {
+        relux_core::PrimeContinuationStep {
+            label: self.label.clone(),
+            source: self.source.clone(),
+            ok: self.ok,
+            summary: self.summary.clone(),
+            detail: self.detail.clone(),
+            args_sig: args_sig.to_string(),
+        }
+    }
+
+    /// Rebuild a seed `(observation, signature)` pair from a persisted continuation step. The
+    /// reverse of [`Self::to_continuation_step`] — used to seed [`AgentLoop::resume`]. The step's
+    /// fields were already bounded + secret-redacted when stored, so no re-redaction is needed.
+    pub fn from_continuation_step(step: &relux_core::PrimeContinuationStep) -> (Self, String) {
+        (
+            AgentObservation {
+                label: step.label.clone(),
+                source: step.source.clone(),
+                ok: step.ok,
+                summary: step.summary.clone(),
+                detail: step.detail.clone(),
+            },
+            step.args_sig.clone(),
+        )
+    }
 }
 
 /// The outcome of executing one [`AgentPick`] through the real gates. Returned by the injected
@@ -442,7 +493,12 @@ pub enum AgentOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentLoopResult {
     /// The tool observations gathered, in order (each a real, redacted, bounded execution result).
+    /// On a RESUMED loop this includes the observations seeded from the prior continuation, so the
+    /// trace + grounded reply reflect the whole multi-turn chain.
     pub observations: Vec<AgentObservation>,
+    /// The call signature for each observation (aligned 1:1 with `observations`), so the kernel can
+    /// persist them on a continuation for cross-turn duplicate-call avoidance.
+    pub observation_sigs: Vec<String>,
     /// The brain's explicit final answer, when it gave one.
     pub answer: Option<String>,
     /// Why the loop ended.
@@ -484,10 +540,20 @@ pub struct AgentLoop {
     /// the old fixed constants; the kernel resolves this from the operator's policy.
     limits: AgentLimits,
     observations: Vec<AgentObservation>,
+    /// The call signature for each observation (aligned 1:1 with `observations`).
+    observation_sigs: Vec<String>,
+    /// The signatures of every call already completed — seeded from a prior continuation on resume,
+    /// then grown as this turn runs — so a re-pick of an already-done call is skipped instead of
+    /// re-run (the cross-turn duplicate-avoidance contract).
+    completed_sigs: std::collections::HashSet<String>,
+    /// How many times in a row the brain has re-picked an already-completed call this turn.
+    dup_skips: usize,
     feedback: Option<String>,
     /// Brain rounds consumed (every brain call, including a self-correction re-ask).
     rounds: usize,
-    /// Tool executions performed (`Ran` outcomes count; a pause/refusal stops the loop).
+    /// Tool executions performed THIS turn (`Ran` outcomes count; a pause/refusal stops the loop).
+    /// Seeded observations from a prior continuation do NOT count here — a resume gets a fresh
+    /// per-turn tool budget.
     tool_calls: usize,
     terminal: Option<AgentOutcome>,
     answer: Option<String>,
@@ -512,13 +578,40 @@ pub enum AgentStep {
 }
 
 impl AgentLoop {
-    /// Start a loop for one user message over the live catalog, under the given configured limits.
+    /// Start a fresh loop for one user message over the live catalog, under the given configured
+    /// limits.
     pub fn new(message: &str, catalog: Vec<AgentTool>, limits: AgentLimits) -> Self {
+        Self::resume(message, catalog, limits, Vec::new())
+    }
+
+    /// RESUME a loop from a prior turn's continuation: seed the observations already gathered (with
+    /// their call signatures) so the brain sees them next round and the loop SKIPS re-running any
+    /// already-completed call. The resumed turn gets a FRESH per-turn tool/round budget (the seeded
+    /// observations do not consume it), so a continuation can proceed PAST the point the prior turn
+    /// stopped — that is what makes "keep working" real rather than a blind re-run
+    /// (`docs/mcp.md` "Prime Agent Loop"). `seed` is `(observation, call signature)` pairs in order.
+    pub fn resume(
+        message: &str,
+        catalog: Vec<AgentTool>,
+        limits: AgentLimits,
+        seed: Vec<(AgentObservation, String)>,
+    ) -> Self {
+        let mut observations = Vec::with_capacity(seed.len());
+        let mut observation_sigs = Vec::with_capacity(seed.len());
+        let mut completed_sigs = std::collections::HashSet::new();
+        for (obs, sig) in seed {
+            completed_sigs.insert(sig.clone());
+            observation_sigs.push(sig);
+            observations.push(obs);
+        }
         Self {
             message: message.to_string(),
             catalog,
             limits,
-            observations: Vec::new(),
+            observations,
+            observation_sigs,
+            completed_sigs,
+            dup_skips: 0,
             feedback: None,
             rounds: 0,
             tool_calls: 0,
@@ -599,6 +692,22 @@ impl AgentLoop {
                 AgentStep::Retry
             }
             AgentReply::Call(pick) => {
+                // Skip a re-pick of an ALREADY-COMPLETED call (cross-turn duplicate avoidance): on a
+                // resumed loop the prior turn's calls are seeded into `completed_sigs`, and this turn's
+                // calls are added as they run. The brain already sees those results in the prompt, so
+                // re-running them would waste budget and (for a mutating tool) repeat a side effect.
+                // Feed back a self-correction and re-ask, bounded by `MAX_DUP_SKIPS` so a brain that
+                // keeps re-picking a finished call cannot spin the loop — then stop as Exhausted.
+                let sig = call_signature(&pick.label(), &pick.args);
+                if self.completed_sigs.contains(&sig) {
+                    self.dup_skips += 1;
+                    if self.dup_skips > MAX_DUP_SKIPS {
+                        self.terminal = Some(AgentOutcome::Exhausted);
+                        return AgentStep::Stop;
+                    }
+                    self.feedback = Some(completed_call_feedback(&pick.label()));
+                    return AgentStep::Retry;
+                }
                 // Stop on a repeated identical call (no progress): the brain is looping on the same
                 // tool+args, so spending another execution on it is wasteful.
                 if self
@@ -622,6 +731,10 @@ impl AgentLoop {
         match outcome {
             ToolStepOutcome::Ran(obs) => {
                 self.tool_calls += 1;
+                self.dup_skips = 0;
+                let sig = call_signature(&pick.label(), &pick.args);
+                self.completed_sigs.insert(sig.clone());
+                self.observation_sigs.push(sig);
                 self.observations.push(obs);
                 // Continue only if there is budget AND rounds left; next_prompt enforces both.
                 true
@@ -664,11 +777,23 @@ impl AgentLoop {
         });
         AgentLoopResult {
             observations: self.observations,
+            observation_sigs: self.observation_sigs,
             answer: self.answer,
             outcome,
             pending_pick: self.pending_pick,
         }
     }
+}
+
+/// The self-correction message fed back when the brain re-picks a tool call whose result is already
+/// gathered (a duplicate of an already-completed call). Steers it to use the existing result or pick
+/// a different tool, rather than re-running finished work.
+pub fn completed_call_feedback(label: &str) -> String {
+    format!(
+        "You already ran '{}' with those arguments this session and its result is in the \
+         observations above. Use that result, pick a DIFFERENT tool, or reply {{\"answer\":\"...\"}}.",
+        sanitize_line(label, MAX_LINE_CHARS)
+    )
 }
 
 /// The self-correction message fed back when the brain names a tool not in the live catalog
@@ -763,14 +888,40 @@ pub fn run_agent_loop<B, E>(
     message: &str,
     catalog: Vec<AgentTool>,
     limits: AgentLimits,
-    mut brain: B,
-    mut exec: E,
+    brain: B,
+    exec: E,
 ) -> AgentLoopResult
 where
     B: FnMut(&str) -> Option<String>,
     E: FnMut(&AgentPick) -> ToolStepOutcome,
 {
-    let mut lp = AgentLoop::new(message, catalog, limits);
+    run_loop(AgentLoop::new(message, catalog, limits), brain, exec)
+}
+
+/// Drive a RESUMED bounded agent loop with synchronous brain + exec closures — the testable twin of
+/// the async kernel continuation orchestration. `seed` is the `(observation, signature)` pairs from
+/// the prior turn's continuation; the loop feeds them to the brain and skips re-running them.
+pub fn run_resumed_agent_loop<B, E>(
+    message: &str,
+    catalog: Vec<AgentTool>,
+    limits: AgentLimits,
+    seed: Vec<(AgentObservation, String)>,
+    brain: B,
+    exec: E,
+) -> AgentLoopResult
+where
+    B: FnMut(&str) -> Option<String>,
+    E: FnMut(&AgentPick) -> ToolStepOutcome,
+{
+    run_loop(AgentLoop::resume(message, catalog, limits, seed), brain, exec)
+}
+
+/// Shared driver body for [`run_agent_loop`] / [`run_resumed_agent_loop`].
+fn run_loop<B, E>(mut lp: AgentLoop, mut brain: B, mut exec: E) -> AgentLoopResult
+where
+    B: FnMut(&str) -> Option<String>,
+    E: FnMut(&AgentPick) -> ToolStepOutcome,
+{
     while let Some(prompt) = lp.next_prompt() {
         let Some(raw) = brain(&prompt) else {
             break;
@@ -1298,6 +1449,154 @@ mod tests {
         // so the kernel can still fold what it learned into the reply.
         assert_eq!(result.observations.len(), 1);
         assert_eq!(result.outcome, AgentOutcome::Exhausted);
+    }
+
+    #[test]
+    fn call_signature_is_stable_and_args_sensitive() {
+        let a = call_signature("p/t", &serde_json::json!({"x": 1}));
+        let a2 = call_signature("p/t", &serde_json::json!({"x": 1}));
+        let b = call_signature("p/t", &serde_json::json!({"x": 2}));
+        let c = call_signature("p/other", &serde_json::json!({"x": 1}));
+        assert_eq!(a, a2, "same label+args → same signature");
+        assert_ne!(a, b, "different args → different signature");
+        assert_ne!(a, c, "different label → different signature");
+        // Null and {} are distinguishable from a populated args object.
+        assert_ne!(
+            call_signature("p/t", &serde_json::Value::Null),
+            call_signature("p/t", &serde_json::json!({"x": 1}))
+        );
+    }
+
+    /// Build a seed `(observation, signature)` pair the way the kernel does from a stored step.
+    fn seed_step(label: &str, args: serde_json::Value, out: serde_json::Value) -> (AgentObservation, String) {
+        (AgentObservation::ran(label, "plugin", &out), call_signature(label, &args))
+    }
+
+    #[test]
+    fn resumed_loop_feeds_prior_observations_and_skips_duplicate_calls() {
+        // Prior turn already ran echo with {"i":1}. On resume the brain FIRST re-picks that exact
+        // call (must be skipped, not re-run), THEN picks a distinct call, THEN answers.
+        let seed = vec![seed_step(
+            "relux-tools-echo/echo",
+            serde_json::json!({"i": 1}),
+            serde_json::json!({"echoed": 1}),
+        )];
+        let mut round = 0;
+        let mut executed: Vec<serde_json::Value> = vec![];
+        let result = run_resumed_agent_loop(
+            "keep working",
+            sample_catalog(),
+            AgentLimits::standard(),
+            seed,
+            |prompt| {
+                round += 1;
+                match round {
+                    // The prior observation must be visible in the resume prompt.
+                    1 => {
+                        assert!(prompt.contains("relux-tools-echo/echo"));
+                        // Re-pick the ALREADY-COMPLETED call — should be skipped + self-corrected.
+                        Some("{\"tool\":\"relux-tools-echo/echo\",\"args\":{\"i\":1}}".to_string())
+                    }
+                    2 => {
+                        // The self-correction must have been fed back.
+                        assert!(prompt.contains("already ran"));
+                        // A genuinely NEW call now.
+                        Some("{\"tool\":\"relux-tools-echo/echo\",\"args\":{\"i\":2}}".to_string())
+                    }
+                    _ => Some("{\"answer\":\"Done with both.\"}".to_string()),
+                }
+            },
+            |pick| {
+                executed.push(pick.args.clone());
+                ToolStepOutcome::Ran(AgentObservation::ran(
+                    &pick.label(),
+                    "plugin",
+                    &serde_json::json!({"ran": pick.args.clone()}),
+                ))
+            },
+        );
+        // The duplicate {"i":1} was NEVER executed again; only the new {"i":2} ran this turn.
+        assert_eq!(executed, vec![serde_json::json!({"i": 2})], "duplicate completed call must not re-run");
+        assert_eq!(result.outcome, AgentOutcome::Answered);
+        // The trace carries BOTH the seeded observation and the new one (the whole chain).
+        assert_eq!(result.observations.len(), 2);
+        assert_eq!(result.observation_sigs.len(), 2);
+    }
+
+    #[test]
+    fn resumed_loop_gets_a_fresh_budget_to_proceed_past_the_prior_limit() {
+        // Simulate a prior turn that hit a 3-call ceiling: seed 3 completed calls. On resume under
+        // a fresh 3-call budget the loop can run 3 MORE distinct calls (proceeding past the prior
+        // stopping point), then hit the fresh ceiling.
+        let seed: Vec<(AgentObservation, String)> = (0..3)
+            .map(|i| {
+                seed_step(
+                    "relux-tools-echo/echo",
+                    serde_json::json!({"seed": i}),
+                    serde_json::json!({"seed": i}),
+                )
+            })
+            .collect();
+        let limits = AgentLimits { max_tool_calls: 3, max_brain_rounds: 20, extended: false };
+        let mut round = 0;
+        let mut execs = 0;
+        let result = run_resumed_agent_loop(
+            "keep working",
+            sample_catalog(),
+            limits,
+            seed,
+            |_p| {
+                let i = round;
+                round += 1;
+                Some(format!("{{\"tool\":\"relux-tools-echo/echo\",\"args\":{{\"fresh\":{i}}}}}"))
+            },
+            |pick| {
+                execs += 1;
+                ToolStepOutcome::Ran(AgentObservation::ran(&pick.label(), "plugin", &serde_json::json!({"n": execs})))
+            },
+        );
+        assert_eq!(execs, 3, "the fresh budget runs 3 MORE calls past the seeded 3");
+        // Total chain = 3 seeded + 3 new = 6 observations (proceeding beyond the prior stop point).
+        assert_eq!(result.observations.len(), 6);
+        assert_eq!(result.outcome, AgentOutcome::LimitReached(LimitKind::ToolCalls));
+    }
+
+    #[test]
+    fn resumed_loop_stops_if_brain_keeps_repicking_a_finished_call() {
+        // A brain that ONLY ever re-picks an already-completed call makes no progress: the loop
+        // self-corrects a bounded number of times, then stops as Exhausted (never re-running it).
+        let seed = vec![seed_step(
+            "relux-tools-echo/echo",
+            serde_json::json!({"i": 1}),
+            serde_json::json!({"done": 1}),
+        )];
+        let mut execs = 0;
+        let result = run_resumed_agent_loop(
+            "keep working",
+            sample_catalog(),
+            AgentLimits::standard(),
+            seed,
+            |_p| Some("{\"tool\":\"relux-tools-echo/echo\",\"args\":{\"i\":1}}".to_string()),
+            |_pick| {
+                execs += 1;
+                ToolStepOutcome::Ran(AgentObservation::ran("x/y", "plugin", &serde_json::json!("z")))
+            },
+        );
+        assert_eq!(execs, 0, "a finished call is never re-run");
+        assert_eq!(result.outcome, AgentOutcome::Exhausted);
+    }
+
+    #[test]
+    fn observation_continuation_step_roundtrips() {
+        let obs = AgentObservation::ran("p/t", "mcp", &serde_json::json!({"k": "v"}));
+        let sig = call_signature("p/t", &serde_json::json!({"k": "v"}));
+        let step = obs.to_continuation_step(&sig);
+        assert_eq!(step.label, "p/t");
+        assert_eq!(step.source, "mcp");
+        assert_eq!(step.args_sig, sig);
+        let (back, back_sig) = AgentObservation::from_continuation_step(&step);
+        assert_eq!(back, obs);
+        assert_eq!(back_sig, sig);
     }
 
     #[test]

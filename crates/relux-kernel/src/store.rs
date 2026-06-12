@@ -122,6 +122,9 @@ impl SqliteStore {
             pending_clarifications: self
                 .load_meta_json("pending_clarifications")?
                 .unwrap_or_default(),
+            prime_agent_continuations: self
+                .load_meta_json("prime_agent_continuations")?
+                .unwrap_or_default(),
             conversation_histories: self
                 .load_meta_json("conversation_histories")?
                 .unwrap_or_default(),
@@ -187,6 +190,7 @@ impl SqliteStore {
         put_counter(&tx, "next_event", c.next_event)?;
         put_counter(&tx, "next_orchestration", c.next_orchestration)?;
         put_counter(&tx, "next_grant", c.next_grant)?;
+        put_counter(&tx, "next_continuation", c.next_continuation)?;
         put_meta_json(&tx, "prime_autonomy_config", &snapshot.prime_autonomy_config)?;
         put_meta_json(&tx, "prime_agent_policy", &snapshot.prime_agent_policy)?;
         put_meta_json(&tx, "orchestrations", &snapshot.orchestrations)?;
@@ -194,6 +198,11 @@ impl SqliteStore {
             &tx,
             "pending_clarifications",
             &snapshot.pending_clarifications,
+        )?;
+        put_meta_json(
+            &tx,
+            "prime_agent_continuations",
+            &snapshot.prime_agent_continuations,
         )?;
         put_meta_json(
             &tx,
@@ -272,6 +281,7 @@ impl SqliteStore {
                 "next_event" => counters.next_event = value,
                 "next_orchestration" => counters.next_orchestration = value,
                 "next_grant" => counters.next_grant = value,
+                "next_continuation" => counters.next_continuation = value,
                 _ => {}
             }
         }
