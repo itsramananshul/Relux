@@ -2856,3 +2856,45 @@ not-cancellable.
   `canCancelRun`, the Cancel-run button + inline honest result; bundle rebuilt.
 
 See `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §26 for the applied-change record and the remaining gaps.
+
+---
+
+## Reference read — Work hierarchy / progress v1 on the board (this slice)
+
+Before surfacing sub-work + progress on the Work board, read how the reference
+dashboards model and render a parent's child progress and dependency (blocked-by)
+edges, so Relux mirrors a proven shape rather than inventing one. This slice is a
+**read-only display** join over two existing reads (it changes no orchestration /
+execution / approval behavior), but task/workflow *display* is in scope for the
+reference-first rule, so the grounding is recorded.
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/plugins/kanban/dashboard/plugin_api.py` (the `/board`
+  endpoint, progress rollup at L386-398): for each parent it computes `{done, total}`
+  in ONE pass over `task_links` joined to each child's live status
+  (`SELECT l.parent_id, t.status FROM task_links l JOIN tasks t ON t.id = l.child_id`),
+  attaching `progress` + `link_counts` per card. **Pattern: a parent's progress is a
+  one-pass tally of its children's CURRENT status, not a stored summary field.**
+- Same file, `_links_for` (L322-338): parents/children resolved by two directional
+  queries over the join table; and the `update_task` "ready" guard (L709-722) — a
+  child cannot advance until **all parents are `done`**. **Pattern: blocked-by is a
+  status relationship over the dependency edges, surfaced on the row.**
+- `reference/hermes-agent-main/hermes_cli/kanban_db.py` `task_links(parent_id, child_id)`
+  — parent↔child lives in a join table, not a field on the task. (Relux's analogue is
+  the orchestration's `steps[].depends_on` index edges + `steps[].task_id`.)
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation |
+|---|---|
+| Hermes: **per-parent `{done,total}` from a one-pass join to each child's LIVE status** | `apps/dashboard/src/workhierarchy.ts` `buildWorkGroups` joins `reluxOrchestration.list()` `steps[].task_id` to the live `reluxWork.listTasks()`, bucketing each child by its current board status via the shared `oversight.ts::taskBucket` (so the strip and the columns agree); `groupProgress` tallies the four board buckets in one pass. A child off the board falls back to the durable `step.outcome`, said so honestly. |
+| Hermes: **blocked-by is a status relationship over the dependency edges, shown on the row** | `buildWorkGroups` resolves `step.depends_on` indices to sibling `task_id`s for **blocked-by**, and the reverse (siblings whose `depends_on` names this child) for **blocking**; rendered as chips on each numbered checklist row (`blockedByLabel` / `blockingLabel`). |
+| Hermes: **parent↔child in a join table, not a task field** | Relux has the inert `relux_core::Task.parent_task` field but the real edges are the orchestration's `steps[].depends_on` + `steps[].task_id`; the orchestration is treated as the parent. No ad-hoc task subtree is fabricated. |
+
+**What we deliberately do differently:** no backend route or authority was added —
+the board composes two reads it already makes (the orchestration list + the task
+list), so progress is live and honest with zero new state. Hermes nests arbitrary
+parent/child trees; Relux's orchestration is a single level today, so the plan
+numbers `1..N` and deeper `1.1` nesting is **not** fabricated. See
+`docs/relix-dashboard-design.md` §6.2 for the shipped surface + remaining gaps.

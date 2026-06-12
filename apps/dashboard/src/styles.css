@@ -375,6 +375,12 @@ a > .stat-card:hover { border-color: var(--text-faint); }
 .mandate-row:hover { border-color: var(--border); background: var(--bg-elev); }
 .progress-bar { height: 6px; border-radius: 999px; background: var(--bg-elev); overflow: hidden; }
 .progress-fill { height: 100%; background: var(--ok); border-radius: 999px; transition: width 0.2s; }
+/* Work hierarchy/progress v1 — a SEGMENTED progress strip on a parent group
+   (relix-dashboard-design §6): one slice per non-empty board bucket, widths
+   proportional, painted with each bucket's semantic CSS var (color is meaning-
+   only — design §12). Distinct from the single-fill `.progress-fill` above. */
+.seg-bar { display: flex; height: 6px; border-radius: 999px; background: var(--bg-elev); overflow: hidden; flex: 1; min-width: 100px; }
+.seg-bar > span { height: 100%; transition: width 0.2s; }
 /* A numbered step in the Mandate workflow (strategy → team → clearances → orchestrate). */
 .wf-step { padding: 10px 0; border-bottom: 1px solid var(--border-soft); }
 .wf-step:first-of-type { padding-top: 4px; }

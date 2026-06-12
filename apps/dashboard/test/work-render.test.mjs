@@ -91,6 +91,12 @@ test("Work RENDERS under a declarative router (no render-time throw)", () => {
   // the effect fetches, which never fires under renderToStaticMarkup).
   assert.match(html, /Oversight/);
   assert.match(html, /Blocked \/ Failed/);
+  // Work hierarchy/progress v1: the Work groups section renders on first paint.
+  // No effect fires under renderToStaticMarkup, so the orchestration read is still
+  // null with no error → the honest loading state (never a fabricated group). The
+  // populated parent+children render is asserted in work-hierarchy-render.test.mjs.
+  assert.match(html, /Work groups/);
+  assert.match(html, /Loading work groups/);
 });
 
 test("the committed dashboard bundle carries the Work copy (no stale dist)", () => {

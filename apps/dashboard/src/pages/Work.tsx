@@ -7,6 +7,20 @@ import {
   hasOversightAttention,
   continuationActionLabel,
 } from "../oversight";
+import {
+  buildWorkGroups,
+  nonEmptyGroups,
+  progressSegments,
+  groupProgressLabel,
+  blockedByLabel,
+  blockingLabel,
+  groupForTask,
+  bucketTone,
+  bucketColorVar,
+  type WorkGroup,
+  type GroupProgress,
+} from "../workhierarchy";
+import { orchestrationStatusTone } from "../orchestration";
 import { approvalInlineActions } from "../approvalactions";
 import {
   latestReluxEventId,
@@ -20,7 +34,7 @@ import {
   runLogSourceLabel,
   runLogTruncationNote,
 } from "../reluxrunlog";
-import { reluxWork, reluxAudit, reluxOversight, reluxPrime, reluxApprovals, type ReluxTask, type ReluxRun, type ReluxAgent, type ReluxTaskDetail, type ReluxRunDetail, type ReluxAuditEntry, type ReluxRunEvent, type ReluxRunLog, type ReluxOversight, type ReluxApproval } from "../api";
+import { reluxWork, reluxAudit, reluxOversight, reluxPrime, reluxApprovals, reluxOrchestration, type ReluxTask, type ReluxRun, type ReluxAgent, type ReluxTaskDetail, type ReluxRunDetail, type ReluxAuditEntry, type ReluxRunEvent, type ReluxRunLog, type ReluxOversight, type ReluxApproval, type ReluxOrchestration } from "../api";
 import { useAsync } from "../components/common";
 import {
   runStatusTone,
@@ -94,6 +108,16 @@ export function Work() {
     () => reluxOversight.get(),
     [],
   );
+  // The multi-agent orchestrations (the ONLY real parent→child grouping the kernel
+  // records today — see workhierarchy.ts). Joined to the live task list below to
+  // surface sub-work + progress on the board. A failure here must NOT blank the
+  // board, so its error is surfaced inline in the hierarchy card and excluded from
+  // the page-level error gate (an older kernel without the route just shows the
+  // honest empty/degraded state).
+  const { data: orchestrations, error: errorOrchestrations, reload: reloadOrchestrations } = useAsync<ReluxOrchestration[]>(
+    () => reluxOrchestration.list(),
+    [],
+  );
 
   const [newTaskTitle, setNewTaskTitle] = useState("");
   const [creating, setCreating] = useState(false);
@@ -146,6 +170,19 @@ export function Work() {
     return bucketTasks(list);
   }, [tasks, filterAgentId, filterStatus]);
 
+  // Real parent→child groups for the board: each orchestration goal joined to the
+  // live task list (workhierarchy.buildWorkGroups). Built from the UNFILTERED task
+  // list so a group's progress reflects the whole subtree even when the board is
+  // filtered. Only groups with committed steps are surfaced as parents.
+  const groups = useMemo(
+    () => nonEmptyGroups(buildWorkGroups(orchestrations ?? [], tasks ?? [])),
+    [orchestrations, tasks],
+  );
+  const selectedTaskGroup = useMemo(
+    () => (selectedTaskId ? groupForTask(groups, selectedTaskId) : null),
+    [groups, selectedTaskId],
+  );
+
   const error = errorTasks || errorRuns || errorAgents;
   const loading = (loadingTasks && !tasks) || (loadingRuns && !runs) || (loadingAgents && !agents);
 
@@ -154,6 +191,7 @@ export function Work() {
     reloadRuns();
     reloadAgents();
     reloadOversight();
+    reloadOrchestrations();
   };
 
   // focusDetail already clears the other panel, so each inspect is a single nav.
@@ -202,6 +240,14 @@ export function Work() {
               onReload={handleReload}
             />
 
+            <WorkHierarchy
+              groups={groups}
+              error={errorOrchestrations ? String(errorOrchestrations) : null}
+              loading={!orchestrations && !errorOrchestrations}
+              agents={agents || []}
+              onInspectTask={handleInspectTask}
+            />
+
             <div className="row wrap" style={{ gap: 16, alignItems: "flex-start" }}>
               <Column title="Open" tasks={columns.open} onAction={handleReload} onInspectTask={handleInspectTask} agents={agents || []} />
               <Column title="Running" tasks={columns.running} onAction={handleReload} onInspectTask={handleInspectTask} agents={agents || []} />
@@ -212,7 +258,13 @@ export function Work() {
             {(selectedTaskId || selectedRunId) && (
               <div className="card" style={{ marginTop: 24, padding: 16 }}>
                 {selectedTaskId && (
-                  <TaskDetailPanel taskId={selectedTaskId} onClose={() => setSelectedTaskId(null)} />
+                  <TaskDetailPanel
+                    taskId={selectedTaskId}
+                    group={selectedTaskGroup}
+                    agents={agents || []}
+                    onInspectTask={handleInspectTask}
+                    onClose={() => setSelectedTaskId(null)}
+                  />
                 )}
                 {selectedRunId && (
                   <RunDetailPanel
@@ -709,6 +761,189 @@ export function OversightApprovalRow({
   );
 }
 
+// Work hierarchy/progress v1 (docs/relix-dashboard-design.md §6 "A progress strip
+// on a parent" + §6.1 sub-issue nesting / workflow-checklist). Surfaces the REAL
+// parent→child grouping the kernel records — the multi-agent orchestration — right
+// on the board: each goal joined to the live task list (workhierarchy.buildWorkGroups),
+// with a compact segmented progress strip, the brief count, and an expandable
+// numbered workflow checklist (role + live status + blocked-by/blocking chips +
+// Inspect). NO fake hierarchy: a planned orchestration with no committed steps is
+// dropped (nonEmptyGroups upstream), tasks in no orchestration stay standalone flat
+// cards in the columns below, and a failed/empty read degrades to an honest state.
+export function WorkHierarchy({
+  groups,
+  error,
+  loading,
+  agents,
+  onInspectTask,
+}: {
+  groups: WorkGroup[];
+  error: string | null;
+  loading: boolean;
+  agents: ReluxAgent[];
+  onInspectTask: (taskId: string) => void;
+}) {
+  const agentName = (id: string | null) =>
+    id ? agents.find(a => a.id === id)?.name || id : "unassigned";
+
+  return (
+    <div className="card" style={{ marginBottom: 20, padding: 12 }}>
+      <div className="row" style={{ alignItems: "center", marginBottom: 10 }}>
+        <h4 style={{ margin: 0 }}>Work groups</h4>
+        <span className="muted" style={{ fontSize: 11, marginLeft: 8 }}>
+          multi-agent goals decomposed into sub-work — progress &amp; blockers from live task state
+        </span>
+      </div>
+      {error ? (
+        <div className="muted" style={{ fontSize: 11 }}>
+          Work groups unavailable ({error}). The board below still works.
+        </div>
+      ) : loading ? (
+        <div className="muted" style={{ fontSize: 12 }}>Loading work groups…</div>
+      ) : groups.length === 0 ? (
+        <div className="empty sm">
+          No sub-work yet — no multi-agent goal has been decomposed into a grouped plan.
+          Start one from Prime's orchestration view; its briefs appear here grouped with progress.
+        </div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {groups.map(g => (
+            <WorkGroupCard key={g.id} group={g} agentName={agentName} onInspectTask={onInspectTask} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// One parent group on the board: the goal + status, a compact segmented progress
+// strip and brief count, and an expandable numbered workflow checklist. When no
+// child is on the current board view, progress comes from the durable orchestration
+// record — said so honestly rather than implying live state.
+function WorkGroupCard({
+  group,
+  agentName,
+  onInspectTask,
+}: {
+  group: WorkGroup;
+  agentName: (id: string | null) => string;
+  onInspectTask: (taskId: string) => void;
+}) {
+  const g = group;
+  const plural = g.progress.total === 1 ? "" : "s";
+  return (
+    <div className="card sm" style={{ padding: 10, border: "1px solid var(--border)" }}>
+      <div className="row" style={{ alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
+        <span className={`badge ${orchestrationStatusTone(g.status)}`} style={{ fontSize: 9, fontWeight: 600 }}>
+          {g.status}
+        </span>
+        <span style={{ fontWeight: 600, fontSize: 13 }}>{g.goal}</span>
+        <span className="mono muted" style={{ fontSize: 10 }}>{g.id}</span>
+        <div className="spacer" style={{ flex: 1 }} />
+        <span className="muted" style={{ fontSize: 11 }}>{groupProgressLabel(g.progress)}</span>
+      </div>
+      <div className="row" style={{ alignItems: "center", gap: 8 }}>
+        <SegmentedBar progress={g.progress} />
+        <span className="muted" style={{ fontSize: 10, whiteSpace: "nowrap" }}>
+          {g.progress.total} brief{plural}
+        </span>
+      </div>
+      {!g.hasLiveChildren && (
+        <div className="muted" style={{ fontSize: 10, marginTop: 6, fontStyle: "italic" }}>
+          Progress is from the orchestration record — these briefs are not on the current board view.
+        </div>
+      )}
+      <details style={{ marginTop: 8 }}>
+        <summary style={{ cursor: "pointer", fontSize: 11 }}>Show the {g.progress.total}-brief plan</summary>
+        <div style={{ marginTop: 8 }}>
+          <WorkChecklist group={g} agentName={agentName} onInspectTask={onInspectTask} />
+        </div>
+      </details>
+    </div>
+  );
+}
+
+// The segmented progress strip (design §6): one slice per non-empty bucket, width
+// proportional to its share, painted with the bucket's semantic CSS var (color is
+// meaning-only — design §12). The full counts read in the title tooltip.
+function SegmentedBar({ progress }: { progress: GroupProgress }) {
+  const segs = progressSegments(progress);
+  return (
+    <div className="seg-bar" title={groupProgressLabel(progress)} aria-label={groupProgressLabel(progress)}>
+      {segs.map(s => (
+        <span key={s.bucket} style={{ width: `${s.pct}%`, background: bucketColorVar(s.bucket) }} />
+      ))}
+    </div>
+  );
+}
+
+// The dense, B&W, numbered workflow checklist for one group's children (design
+// §6/§6.1) — reused on the board card and in the task detail's parent context.
+// Each row: the 1-based step number, the title (→ Inspect), the specialist role,
+// the LIVE board status (or the durable outcome when the task is off-board), the
+// assignee, and the blocked-by / blocking dependency chips. `highlightTaskId`
+// marks the row for the currently-open task in the detail panel.
+function WorkChecklist({
+  group,
+  agentName,
+  onInspectTask,
+  highlightTaskId,
+}: {
+  group: WorkGroup;
+  agentName: (id: string | null) => string;
+  onInspectTask: (taskId: string) => void;
+  highlightTaskId?: string;
+}) {
+  return (
+    <div className="plan-list">
+      {group.children.map(c => {
+        const blockedBy = blockedByLabel(c);
+        const blocking = blockingLabel(c);
+        return (
+          <div key={c.taskId} className={`plan-row${highlightTaskId === c.taskId ? " selected" : ""}`}>
+            <div className="plan-num mono">{c.index + 1}</div>
+            <div className="plan-main">
+              <div className="plan-title-row">
+                <span className="plan-title" onClick={() => onInspectTask(c.taskId)}>{c.title}</span>
+                <span className="badge backlog" style={{ fontSize: 9 }} title="specialist role">{c.role}</span>
+                <span
+                  className={`badge ${bucketTone(c.bucket)}`}
+                  style={{ fontSize: 9 }}
+                  title={c.status ? "live board status" : "from the durable orchestration record (task not on the board)"}
+                >
+                  {c.status ?? `${c.bucket} (recorded)`}
+                </span>
+              </div>
+              <div className="row wrap" style={{ gap: 8, fontSize: 10, alignItems: "center" }}>
+                <span className="mono muted">{c.taskId}</span>
+                <span className="muted">· {agentName(c.assignedAgent)}</span>
+                {blockedBy && (
+                  <span className="badge blocked" style={{ fontSize: 9 }} title="this brief waits on an upstream brief">
+                    {blockedBy}
+                  </span>
+                )}
+                {blocking && (
+                  <span className="badge backlog" style={{ fontSize: 9 }} title="downstream briefs wait on this one">
+                    {blocking}
+                  </span>
+                )}
+                <div className="spacer" style={{ flex: 1 }} />
+                <button
+                  className="btn ghost sm"
+                  style={{ height: 20, padding: "0 8px" }}
+                  onClick={() => onInspectTask(c.taskId)}
+                >
+                  Inspect
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function Column({ title, tasks, onAction, onInspectTask, agents }: { title: string; tasks: ReluxTask[]; onAction: () => void; onInspectTask: (taskId: string) => void; agents: ReluxAgent[] }) {
   return (
     <div style={{ flex: 1, minWidth: 280 }}>
@@ -826,11 +1061,25 @@ function TaskCard({ task, onAction, onInspectTask, agents }: { task: ReluxTask; 
   );
 }
 
-function TaskDetailPanel({ taskId, onClose }: { taskId: string; onClose: () => void }) {
+function TaskDetailPanel({
+  taskId,
+  group,
+  agents,
+  onInspectTask,
+  onClose,
+}: {
+  taskId: string;
+  group: WorkGroup | null;
+  agents: ReluxAgent[];
+  onInspectTask: (taskId: string) => void;
+  onClose: () => void;
+}) {
   const { data: task, loading, error } = useAsync<ReluxTaskDetail>(
     () => reluxWork.getTask(taskId),
     [taskId],
   );
+  const agentName = (id: string | null) =>
+    id ? agents.find(a => a.id === id)?.name || id : "unassigned";
 
   return (
     <div style={{ paddingBottom: 16 }}>
@@ -839,6 +1088,35 @@ function TaskDetailPanel({ taskId, onClose }: { taskId: string; onClose: () => v
         <div className="spacer" style={{ flex: 1 }} />
         <button className="btn ghost sm" onClick={onClose}>Close</button>
       </div>
+      {/* Parent context (design §6.1): when this task is a brief inside a multi-agent
+          orchestration, show its goal, the group's segmented progress, and the full
+          numbered plan (siblings + blocked-by/blocking), with this task highlighted.
+          Absent when the task is standalone (in no group) — no fabricated parent. */}
+      {group && (
+        <div className="card sm" style={{ padding: 10, marginBottom: 12, border: "1px solid var(--border)" }}>
+          <div className="row" style={{ alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: 6 }}>
+            <span className="badge backlog" style={{ fontSize: 9 }}>part of</span>
+            <span style={{ fontWeight: 600, fontSize: 12 }}>{group.goal}</span>
+            <span className="mono muted" style={{ fontSize: 10 }}>{group.id}</span>
+            <div className="spacer" style={{ flex: 1 }} />
+            <span className="muted" style={{ fontSize: 11 }}>{groupProgressLabel(group.progress)}</span>
+          </div>
+          <SegmentedBar progress={group.progress} />
+          <details style={{ marginTop: 8 }}>
+            <summary style={{ cursor: "pointer", fontSize: 11 }}>
+              Show the {group.progress.total}-brief plan
+            </summary>
+            <div style={{ marginTop: 8 }}>
+              <WorkChecklist
+                group={group}
+                agentName={agentName}
+                onInspectTask={onInspectTask}
+                highlightTaskId={taskId}
+              />
+            </div>
+          </details>
+        </div>
+      )}
       {loading ? (
         <div className="loading">Loading task details...</div>
       ) : error ? (
