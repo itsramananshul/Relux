@@ -69,9 +69,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use relux_core::McpTool;
+use relux_core::{McpResource, McpResourceContent, McpTool};
 
-use crate::mcp::{parse_tools_list, shape_tool_call_result, McpClientError};
+use crate::mcp::{
+    parse_resources_list, parse_tools_list, shape_resource_read_result, shape_tool_call_result,
+    McpClientError,
+};
 
 /// The MCP protocol version Relux advertises in the `initialize` handshake (matches
 /// the loopback-HTTP client).
@@ -128,9 +131,52 @@ pub fn call_tool(
     })
 }
 
-/// Spawn the managed command, initialize it, run `op` (one `tools/list` or
-/// `tools/call`), then reap the child. On any failure the error is **enriched** with
-/// the child's bounded, secret-redacted stderr tail so the operator can see why.
+/// Spawn the managed command, run `initialize` → `resources/list`, reap the child, and
+/// return the discovered resources (bounded + sanitized) or an honest [`McpClientError`].
+///
+/// MCP **resources** are a READ-ONLY context surface (files/records/docs an agent can
+/// read) — distinct from tools (which act). This performs a bounded subprocess read and
+/// mutates nothing on the server. The result reuses the SAME bounding/sanitizing as the
+/// HTTP client ([`parse_resources_list`]); only the transport differs.
+pub fn list_resources(
+    command: &str,
+    args: &[String],
+    env: &[(String, String)],
+    cwd: Option<&Path>,
+    timeout_ms: u64,
+) -> Result<Vec<McpResource>, McpClientError> {
+    run_op(command, args, env, cwd, timeout_ms, |child, timeout| {
+        let result = child.request("resources/list", &serde_json::json!({}), timeout)?;
+        parse_resources_list(&result)
+    })
+}
+
+/// Spawn the managed command, run `initialize` → `resources/read` for `uri`, reap the
+/// child, and return a **shaped, sanitized, secret-redacted** [`McpResourceContent`]
+/// (never the raw JSON-RPC envelope, never raw binary bytes) or an honest
+/// [`McpClientError`]. A `resources/read` is inert — it performs no action and mutates
+/// nothing. `uri` is the caller's responsibility to validate
+/// ([`relux_core::is_valid_mcp_resource_uri`]); the result reuses the SAME shaping +
+/// redaction as the HTTP client ([`shape_resource_read_result`]).
+pub fn read_resource(
+    command: &str,
+    args: &[String],
+    env: &[(String, String)],
+    cwd: Option<&Path>,
+    uri: &str,
+    timeout_ms: u64,
+) -> Result<McpResourceContent, McpClientError> {
+    run_op(command, args, env, cwd, timeout_ms, |child, timeout| {
+        let params = serde_json::json!({ "uri": uri });
+        let result = child.request("resources/read", &params, timeout)?;
+        shape_resource_read_result(&result, uri)
+    })
+}
+
+/// Spawn the managed command, initialize it, run `op` (one `tools/list`, `tools/call`,
+/// `resources/list`, or `resources/read`), then reap the child. On any failure the
+/// error is **enriched** with the child's bounded, secret-redacted stderr tail so the
+/// operator can see why.
 fn run_op<T>(
     command: &str,
     args: &[String],
@@ -975,6 +1021,35 @@ impl ManagedPool {
         let params = serde_json::json!({ "name": tool_name, "arguments": arguments });
         let result = entry.request_reuse("tools/call", &params, timeout_ms)?;
         shape_tool_call_result(&result)
+    }
+
+    /// Reuse the running process to run `resources/list` (READ-ONLY context). Errors
+    /// with [`McpClientError::ProcessExited`] when no process is running (the caller then
+    /// decides whether to fall back to a spawn-per-operation listing).
+    pub fn list_resources(
+        &self,
+        id: &str,
+        timeout_ms: u64,
+    ) -> Result<Vec<McpResource>, McpClientError> {
+        let entry = self.lookup(id).ok_or(McpClientError::ProcessExited)?;
+        let result = entry.request_reuse("resources/list", &serde_json::json!({}), timeout_ms)?;
+        parse_resources_list(&result)
+    }
+
+    /// Reuse the running process to run `resources/read` for `uri`, returning the
+    /// SHAPED, sanitized, secret-redacted content (never the raw envelope, never raw
+    /// bytes). A `resources/read` is inert. Errors with
+    /// [`McpClientError::ProcessExited`] when no process is running.
+    pub fn read_resource(
+        &self,
+        id: &str,
+        uri: &str,
+        timeout_ms: u64,
+    ) -> Result<McpResourceContent, McpClientError> {
+        let entry = self.lookup(id).ok_or(McpClientError::ProcessExited)?;
+        let params = serde_json::json!({ "uri": uri });
+        let result = entry.request_reuse("resources/read", &params, timeout_ms)?;
+        shape_resource_read_result(&result, uri)
     }
 
     /// Stop and forget `id` entirely (used when its registration is removed).

@@ -465,7 +465,10 @@ pub(crate) fn parse_tools_list(result: &serde_json::Value) -> Result<Vec<McpTool
 /// [`relux_core::McpResource`]s. Mirrors Hermes' `_make_list_resources_handler`
 /// (`mcp_tool.py` L2448-2459): collect `{ uri, name, title?, mimeType?, description? }`,
 /// skipping any entry without a usable URI. Every string is sanitized + clamped.
-fn parse_resources_list(
+///
+/// `pub(crate)` so the managed-stdio client ([`crate::mcp_stdio`]) reuses the SAME
+/// bounding/sanitizing — only the transport differs.
+pub(crate) fn parse_resources_list(
     result: &serde_json::Value,
 ) -> Result<Vec<relux_core::McpResource>, McpClientError> {
     let resources = result
@@ -524,7 +527,11 @@ fn parse_resources_list(
 /// sanitized (control chars except newline/tab dropped), **secret-redacted**
 /// ([`relux_core::redact_secrets`] — a credential embedded in a resource never leaks
 /// verbatim), and clamped. Never returns the raw envelope or raw bytes.
-fn shape_resource_read_result(
+///
+/// `pub(crate)` so the managed-stdio client ([`crate::mcp_stdio`]) reuses the SAME
+/// security-sensitive shaping/redaction — the transport differs, the result handling
+/// does not.
+pub(crate) fn shape_resource_read_result(
     result: &serde_json::Value,
     uri: &str,
 ) -> Result<relux_core::McpResourceContent, McpClientError> {

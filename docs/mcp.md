@@ -119,12 +119,12 @@ and goes **stricter** than Hermes.
   auto-approve its tools**. The plan-proposal grounding (`discover_proposal_mcp_catalog`)
   dispatches on transport too, so an `mcp:<server>/<tool>` step grounds against a live
   stdio `tools/list` the same way it does an HTTP one.
-- **Minimal JSON-RPC subset (tools only).** The stdio bridge speaks **only**
-  `initialize`, `notifications/initialized`, `tools/list`, and `tools/call`. MCP
-  **resources** (`resources/list` / `resources/read`) are **not** supported over
-  managed stdio in this slice — a resource read against a stdio server is an honest
-  not-supported failure, never a fabricated body (resources stay an HTTP-only surface
-  for now; see "Remaining gaps" below).
+- **JSON-RPC subset (tools + read-only resources).** The stdio bridge speaks
+  `initialize`, `notifications/initialized`, `tools/list`, `tools/call`, and — as of
+  **managed stdio resources v1** — the two **read-only** MCP **resource** methods
+  `resources/list` and `resources/read` (see "Managed-stdio MCP resources (v1)" below).
+  It does **not** speak any mutating/streaming method (prompts, sampling, resource
+  subscriptions); those remain out of scope (see "Remaining gaps").
 
 ### Plugin MCP hint → managed-stdio prefill (advisory, never auto-run)
 
@@ -193,6 +193,56 @@ a single long-lived process and reuse it — the real lifecycle a serious produc
   lifecycle action against an HTTP-loopback server is a `400` (it has no process
   lifecycle — it is an endpoint the operator runs); an unknown server is `404`; a
   disabled server refused to start is `409`.
+
+### Managed-stdio MCP resources (v1) — `resources/list` + `resources/read`
+
+MCP **resources** are a **read-only context surface** (files, records, docs an agent can
+read) — distinct from tools (which act). They were originally an HTTP-only surface; a
+managed-stdio server is **stdio commands**, so to feel like a real MCP product surface
+the bridge now speaks `resources/list` and `resources/read` over stdio too. It stays
+**read-only by construction** — no `tools/call`, no mutation, no new authority.
+
+Reference (`docs/reference-driven-development.md`, BINDING):
+`reference/hermes-agent-main/tools/mcp_tool.py` — `_make_list_resources_handler`
+collects `{ uri, name, title?, mimeType?, description? }`; `_make_read_resource_handler`
+concatenates the `contents` text blocks and summarizes a binary (`blob`) block. Relux
+already ports that shaping for the HTTP client (`crate::mcp::parse_resources_list` /
+`shape_resource_read_result`); managed stdio reuses the **same** shapers, so the
+transport differs and the result handling does not.
+
+- **Two read-only methods, same two process modes.** The managed-stdio client
+  (`crates/relux-kernel/src/mcp_stdio.rs`) gains `list_resources` / `read_resource`
+  (spawn-per-operation: spawn → `initialize` → the request → reap) and the pool gains
+  `ManagedPool::list_resources` / `read_resource` (reuse the operator-started
+  `initialize`d process). The kernel dispatches on transport (`mcp_list_resources` /
+  `mcp_read_resource` in `state.rs`): a running managed process is **reused**; otherwise
+  it falls back to the safe spawn-per-operation read (resolving `env` secrets +
+  validating `cwd` first, exactly like the tools path) — so a stdio resource read never
+  silently fails just because nothing was started.
+- **Identical shaping, bounds, and redaction as HTTP.** `resources/list` reuses
+  `parse_resources_list` (bounded to `MAX_MCP_RESOURCES`, every string sanitized +
+  clamped, a URI-less entry skipped rather than fatal). `resources/read` reuses
+  `shape_resource_read_result`: text content blocks are concatenated, sanitized,
+  **secret-redacted** (`relux_core::redact_secrets` — a credential embedded in a
+  resource body never leaks verbatim), and clamped to `MAX_MCP_RESOURCE_TEXT_CHARS`; a
+  binary (`blob`) block is summarized with an honest `[binary content omitted: <mime>]`
+  marker and its bytes are **never decoded or returned**. The **raw JSON-RPC envelope is
+  never returned**. The URI is validated fail-closed (`is_valid_mcp_resource_uri`) before
+  any spawn, even over stdio.
+- **Same surfaces, no new route or authority.** The existing operator API
+  (`GET /v1/relux/mcp/servers/:id/resources` and
+  `…/resources/read?uri=…`) and the read-only Prime context tools
+  (`mcp_list_resources` / `mcp_read_resource`) now dispatch on transport, so they work
+  for a managed-stdio server with no new route. The dashboard's **Resources** action +
+  panel (previously hidden for a stdio server) is shown for both transports; it runs the
+  same read-only `resources/list` + inline `resources/read` preview. Honest by
+  construction: an unknown server → 404, a disabled one → 409, an invalid URI → 400, a
+  transport/protocol failure → 502 (never a fabricated list/body).
+- **Test fixture.** The pure-Rust MCP stdio fixture
+  (`crates/relux-kernel/src/bin/relux_mcp_test_server.rs`) now advertises a text resource
+  (`mem://notes`, embedding an obvious fake secret to prove redaction) and a binary one
+  (`mem://image`, a `blob`), exercised end to end (spawn-per-op, pool reuse, and through
+  the kernel registry) in `crates/relux-kernel/tests/mcp_stdio.rs`.
 
 ### Local secrets & environment (API keys for managed-stdio MCP servers)
 
@@ -364,8 +414,9 @@ The servers list shows each server's transport (`http` / `stdio`), its
 status, and **Discover** + **Remove** actions. For a managed-stdio server a **Process**
 control row also shows the live process **status** (state badge with pid, start time,
 tools-discovered count, redacted **last error** + **log tail**) and **Start** / **Stop**
-/ **Restart** buttons (`ManagedStdioControls`). The Resources action is hidden for a
-stdio server (resources are HTTP-only in this slice).
+/ **Restart** buttons (`ManagedStdioControls`). The **Resources** action is shown for
+**both** transports (managed stdio reads resources read-only too — see "Managed-stdio
+MCP resources (v1)" above).
 (`apps/dashboard/src/pages/Plugins.tsx`, `apps/dashboard/src/plugins.ts`,
 `managedStdioStatusBadge`.)
 
@@ -381,8 +432,11 @@ stdio server (resources are HTTP-only in this slice).
   environment" below. The config still stores **no plaintext** (only secret
   *references* + a path), the resolved values are never serialized/logged, and a `cwd`
   must canonicalize INSIDE the configured safe workspace root.
-- **Resources are HTTP-only.** `resources/list` / `resources/read` are not bridged over
-  managed stdio yet (tools only).
+- **Resources are now bridged (read-only).** `resources/list` / `resources/read` work
+  over managed stdio as of **resources v1** (see "Managed-stdio MCP resources (v1)"
+  above) — read-only context only. Still **not** bridged: MCP **prompts**, **sampling**,
+  and resource **subscriptions** (an MCP server that exposes those over stdio surfaces
+  only its tools + resources to Relux; the rest is out of scope by design).
 - **Status polling, not push.** The dashboard reads status on demand (no live stream);
   a crash between reads surfaces on the next status read / call, not instantly.
 

@@ -3,10 +3,11 @@
 //! `crates/relux-kernel/tests/mcp_stdio.rs`). It is NOT a product surface.
 //!
 //! It speaks the same JSON-RPC-over-stdio subset Relux's managed-stdio client uses —
-//! `initialize`, `notifications/initialized`, `tools/list`, `tools/call` — so the
-//! integration test exercises a genuine subprocess (real spawn → handshake → list →
-//! call → reap), not the kernel's built-in echo tool. Pure Rust + serde_json: no
-//! node/python/network dependency, so it runs identically on every platform/CI.
+//! `initialize`, `notifications/initialized`, `tools/list`, `tools/call`,
+//! `resources/list`, `resources/read` — so the integration test exercises a genuine
+//! subprocess (real spawn → handshake → list → call/read → reap), not the kernel's
+//! built-in echo tool. Pure Rust + serde_json: no node/python/network dependency, so it
+//! runs identically on every platform/CI.
 //!
 //! Tools it advertises:
 //! - `status.summary` — returns a small computed text result.
@@ -24,6 +25,12 @@
 //!   it is present plus a non-cryptographic FNV-1a hash of its value (never the raw
 //!   value), so a test can PROVE the managed-stdio child received a resolved secret in
 //!   its environment without that secret ever being printed/returned.
+//!
+//! Resources it advertises (READ-ONLY context — `resources/list` / `resources/read`):
+//! - `mem://notes` (text) — a small text body that also embeds an obvious fake secret,
+//!   so a test can PROVE the client redacts it on read.
+//! - `mem://image` (binary) — a `blob` content block, so a test can PROVE the client
+//!   summarizes binary honestly and never surfaces the raw bytes.
 
 use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -163,6 +170,42 @@ fn main() {
                     other => serde_json::json!({
                         "jsonrpc": "2.0", "id": id,
                         "error": { "code": -32601, "message": format!("no such tool: {other}") }
+                    }),
+                }
+            }
+            "resources/list" => serde_json::json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": { "resources": [
+                    { "uri": "mem://notes", "name": "notes",
+                      "mimeType": "text/plain", "description": "A small notes blob." },
+                    { "uri": "mem://image", "name": "image",
+                      "mimeType": "image/png", "description": "A tiny binary blob." }
+                ]}
+            }),
+            "resources/read" => {
+                let uri = req
+                    .get("params")
+                    .and_then(|p| p.get("uri"))
+                    .and_then(|u| u.as_str())
+                    .unwrap_or("");
+                match uri {
+                    "mem://notes" => serde_json::json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": { "contents": [ {
+                            "uri": uri, "mimeType": "text/plain",
+                            // Embeds an obvious fake secret so a test proves redaction.
+                            "text": "notes line one\napi_key=sk-fixturesupersecret1234567890"
+                        } ] }
+                    }),
+                    "mem://image" => serde_json::json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": { "contents": [ {
+                            "uri": uri, "mimeType": "image/png", "blob": "aGVsbG8td29ybGQ="
+                        } ] }
+                    }),
+                    other => serde_json::json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": { "code": -32602, "message": format!("no such resource: {other}") }
                     }),
                 }
             }

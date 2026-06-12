@@ -1870,6 +1870,27 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **Unreleased (on `main`, post-v0.1.29)** — **managed-stdio MCP resources v1.** MCP **resources**
+  (`resources/list` / `resources/read`), previously an HTTP-only surface, are now bridged over the
+  governed managed-stdio transport — **read-only context only**, no `tools/call`, no mutation, no new
+  authority (full mapping in `docs/mcp.md` "Managed-stdio MCP resources (v1)"; reference-first against
+  Hermes `tools/mcp_tool.py` `_make_list_resources_handler` / `_make_read_resource_handler`). The
+  managed-stdio client (`crates/relux-kernel/src/mcp_stdio.rs`) gains `list_resources` /
+  `read_resource` (spawn-per-operation) and the pool gains the matching reuse methods; the kernel
+  dispatches on transport (`mcp_list_resources` / `mcp_read_resource`), **reusing** a running managed
+  process and **falling back** to a spawn-per-operation read (env-secret-resolved, `cwd`-validated)
+  when none is started. Both transports reuse the SAME HTTP shapers (`parse_resources_list` /
+  `shape_resource_read_result`): bounded to `MAX_MCP_RESOURCES` / `MAX_MCP_RESOURCE_TEXT_CHARS`, text
+  sanitized + **secret-redacted**, binary (`blob`) summarized never decoded, the raw JSON-RPC envelope
+  never returned, and the URI validated fail-closed before any spawn. The existing operator routes
+  (`GET …/:id/resources`, `…/resources/read?uri=…`), the read-only Prime context tools
+  (`mcp_list_resources` / `mcp_read_resource`), and the dashboard **Resources** panel (no longer hidden
+  for a stdio server) all dispatch on transport with no new route. A real-subprocess fixture
+  (`relux_mcp_test_server.rs`) advertises a text + a binary resource, exercised end to end in
+  `tests/mcp_stdio.rs`. Still **out of scope** over stdio: MCP **prompts**, **sampling**, and resource
+  **subscriptions**. `cargo test` + `clippy --all-targets` clean on `relux-kernel`, dashboard
+  tests/typecheck/build green, the tracked `dashboard-dist` bundle rebuilt in sync. Every safety
+  property from v0.1.29 still holds.
 - **v0.1.29** (2026-06-12) — **recovery + Cross-Guild Inbox** rollup. The `relux-kernel` / `relux-core`
   crates move `0.1.28` → `0.1.29` in lockstep, packaging the whole post-v0.1.28 line per
   `docs/relix-dashboard-design.md` §6.6–§6.11 and `relix-execution-and-issue-design.md` §3.3b. (1) **Safe

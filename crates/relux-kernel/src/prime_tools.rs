@@ -909,9 +909,10 @@ fn list_mcp_servers_read(snapshot: &ContextSnapshot) -> ContextRead {
 }
 
 /// `mcp_list_resources` — live, READ-ONLY `resources/list` against one registered MCP server.
-/// Performs a bounded loopback network read (OUTSIDE the kernel lock) and mutates nothing. Honest
-/// by construction: a missing/unknown/disabled server, or a transport failure, is an `ok:false`
-/// read with the reason — never a fabricated list.
+/// Performs a bounded read (loopback HTTP or managed-stdio subprocess, dispatched on the server's
+/// transport) OUTSIDE the kernel lock and mutates nothing. Honest by construction: a
+/// missing/unknown/disabled server, or a transport failure, is an `ok:false` read with the
+/// reason — never a fabricated list.
 fn mcp_list_resources_read(
     snapshot: &ContextSnapshot,
     args: &serde_json::Map<String, serde_json::Value>,
@@ -943,7 +944,7 @@ fn mcp_list_resources_read(
             detail: format!("MCP server '{server_id}' is registered but disabled; an operator must enable it."),
         };
     }
-    match crate::mcp::list_resources(&server.endpoint, server.timeout_ms) {
+    match crate::state::mcp_view_list_resources(server) {
         Ok(resources) if resources.is_empty() => ContextRead {
             tool,
             ok: true,
@@ -972,7 +973,8 @@ fn mcp_list_resources_read(
 }
 
 /// `mcp_read_resource` — live, READ-ONLY `resources/read` of ONE resource by uri from a registered
-/// MCP server. Performs a bounded loopback read (OUTSIDE the lock) and mutates nothing. The
+/// MCP server. Performs a bounded read (loopback HTTP or managed-stdio subprocess, dispatched on
+/// the server's transport) OUTSIDE the lock and mutates nothing. The
 /// returned text is already sanitized, secret-redacted, and clamped by the client; the detail is
 /// further clamped for the brain prompt. Honest: a missing/invalid uri, an unknown/disabled
 /// server, or a transport failure is an `ok:false` read — never a fabricated body.
@@ -1013,7 +1015,7 @@ fn mcp_read_resource_read(
             detail: "Provide a non-empty, bounded resource uri (from mcp_list_resources).".to_string(),
         };
     };
-    match crate::mcp::read_resource(&server.endpoint, &uri, server.timeout_ms) {
+    match crate::state::mcp_view_read_resource(server, &uri) {
         Ok(content) => {
             let mime = content.mime_type.as_deref().unwrap_or("");
             let body = if content.text.is_empty() {

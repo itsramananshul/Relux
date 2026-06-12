@@ -421,6 +421,142 @@ fn managed_stdio_start_fails_cleanly_when_a_referenced_secret_is_missing() {
     pool().stop("env-missing");
 }
 
+// --- Managed-stdio MCP resources (resources/list + resources/read) ----------
+
+#[test]
+fn lists_resources_from_a_real_stdio_server() {
+    // Spawn-per-operation listing (no managed process running).
+    let resources =
+        mcp_stdio::list_resources(fixture(), &[], &[], None, 5_000).expect("list ok");
+    let uris: Vec<&str> = resources.iter().map(|r| r.uri.as_str()).collect();
+    assert!(uris.contains(&"mem://notes"), "uris: {uris:?}");
+    assert!(uris.contains(&"mem://image"), "uris: {uris:?}");
+    let notes = resources.iter().find(|r| r.uri == "mem://notes").unwrap();
+    assert_eq!(notes.mime_type.as_deref(), Some("text/plain"));
+    assert!(notes.description.contains("notes"), "desc: {}", notes.description);
+}
+
+#[test]
+fn reads_a_text_resource_and_redacts_secrets() {
+    let content = mcp_stdio::read_resource(fixture(), &[], &[], None, "mem://notes", 5_000)
+        .expect("read ok");
+    assert_eq!(content.uri, "mem://notes");
+    assert_eq!(content.mime_type.as_deref(), Some("text/plain"));
+    assert!(!content.binary, "a text resource is not binary");
+    // The legit prose survives; the embedded secret is redacted (never verbatim).
+    assert!(content.text.contains("notes line one"), "text: {}", content.text);
+    assert!(
+        !content.text.contains("sk-fixturesupersecret1234567890"),
+        "secret must be redacted: {}",
+        content.text
+    );
+}
+
+#[test]
+fn reads_a_binary_resource_without_surfacing_bytes() {
+    let content = mcp_stdio::read_resource(fixture(), &[], &[], None, "mem://image", 5_000)
+        .expect("read ok");
+    assert!(content.binary, "a blob resource sets the binary flag");
+    // The raw base64 bytes are NEVER surfaced; an honest marker is.
+    assert!(content.text.contains("[binary content omitted"), "text: {}", content.text);
+    assert!(!content.text.contains("aGVsbG8td29ybGQ="), "raw bytes leaked: {}", content.text);
+}
+
+#[test]
+fn an_unknown_resource_uri_fails_cleanly() {
+    let err = mcp_stdio::read_resource(fixture(), &[], &[], None, "mem://nope", 5_000)
+        .unwrap_err();
+    // A JSON-RPC error from the server, surfaced honestly (never a fabricated body).
+    assert!(matches!(err, McpClientError::ServerError { .. }), "got {err:?}");
+}
+
+#[test]
+fn pool_lists_and_reads_resources_reusing_one_process() {
+    let id = "pool-resources";
+    let start = pool().start(id, fixture(), &[], &[], None, 5_000);
+    assert_eq!(start.state, ManagedStdioState::Running, "start → running: {start:?}");
+
+    // resources/list reuses the running process.
+    let resources = pool().list_resources(id, 5_000).expect("list ok");
+    assert!(resources.iter().any(|r| r.uri == "mem://notes"), "resources: {resources:?}");
+
+    // resources/read reuses the SAME process and returns shaped, redacted content.
+    let content = pool().read_resource(id, "mem://notes", 5_000).expect("read ok");
+    assert!(content.text.contains("notes line one"), "text: {}", content.text);
+    assert!(
+        !content.text.contains("sk-fixturesupersecret1234567890"),
+        "secret must be redacted: {}",
+        content.text
+    );
+
+    pool().stop(id);
+}
+
+#[test]
+fn pool_resource_reuse_requires_an_explicit_start() {
+    let id = "pool-resources-not-started";
+    // No start → no running process → reuse fails cleanly (the caller then falls back
+    // to spawn-per-operation). Nothing is auto-started.
+    assert!(!pool().is_running(id));
+    let err = pool().list_resources(id, 2_000).unwrap_err();
+    assert!(matches!(err, McpClientError::ProcessExited), "got {err:?}");
+}
+
+#[test]
+fn kernel_lists_and_reads_resources_over_managed_stdio() {
+    let mut k = KernelState::new();
+    k.register_mcp_stdio_server(
+        "res-fs",
+        fixture(),
+        &[],
+        Default::default(),
+        None,
+        "resources stdio server",
+        true,
+        Some(5_000),
+    )
+    .expect("register ok");
+
+    // The kernel surface lists resources over the stdio transport (spawn-per-op here).
+    let resources = k.list_mcp_resources("res-fs").expect("list ok");
+    assert!(resources.iter().any(|r| r.uri == "mem://notes"), "resources: {resources:?}");
+
+    // And reads ONE, with the URI validated and the body shaped + redacted.
+    let content = k.read_mcp_resource("res-fs", "mem://notes").expect("read ok");
+    assert!(content.text.contains("notes line one"), "text: {}", content.text);
+    assert!(
+        !content.text.contains("sk-fixturesupersecret1234567890"),
+        "secret leaked: {}",
+        content.text
+    );
+
+    // An invalid URI is fail-closed (never dialed), even over stdio.
+    assert!(matches!(
+        k.read_mcp_resource("res-fs", "bad\r\nuri"),
+        Err(relux_kernel::KernelError::InvalidMcpResourceUri { .. })
+    ));
+}
+
+#[test]
+fn kernel_disabled_stdio_server_refuses_resource_list() {
+    let mut k = KernelState::new();
+    k.register_mcp_stdio_server(
+        "res-off",
+        fixture(),
+        &[],
+        Default::default(),
+        None,
+        "disabled",
+        false,
+        Some(5_000),
+    )
+    .expect("register ok");
+    assert!(matches!(
+        k.list_mcp_resources("res-off"),
+        Err(relux_kernel::KernelError::McpServerDisabled(_))
+    ));
+}
+
 #[test]
 fn kernel_remove_stops_the_managed_process() {
     let mut k = KernelState::new();

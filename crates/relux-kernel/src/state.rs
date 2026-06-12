@@ -1571,7 +1571,8 @@ impl KernelState {
     ///
     /// MCP **resources** are a read-only context surface (files, records, docs an
     /// agent can read) — distinct from tools (which act). Listing them performs a
-    /// bounded loopback read and mutates nothing. Honest by construction: an unknown
+    /// bounded read (loopback HTTP or managed-stdio subprocess, dispatched on the
+    /// server's transport) and mutates nothing. Honest by construction: an unknown
     /// server is [`KernelError::UnknownMcpServer`]; a disabled one is
     /// [`KernelError::McpServerDisabled`]; a transport/protocol failure is
     /// [`KernelError::McpResourceFetchFailed`] (never a fabricated empty list).
@@ -1584,21 +1585,12 @@ impl KernelState {
         if !server.enabled {
             return Err(KernelError::McpServerDisabled(id.to_string()));
         }
-        // The managed-stdio bridge speaks only initialize/tools/list/tools/call
-        // (`docs/mcp.md` "Managed stdio"). Resources over stdio are an honest
-        // not-supported failure here rather than a fabricated empty list.
-        if server.transport == relux_core::McpTransport::ManagedStdio {
-            return Err(KernelError::McpResourceFetchFailed {
-                id: id.to_string(),
-                message: "MCP resources are not supported over the managed-stdio transport yet"
-                    .to_string(),
-            });
-        }
-        crate::mcp::list_resources(&server.endpoint, server.timeout_ms).map_err(|e| {
-            KernelError::McpResourceFetchFailed {
-                id: id.to_string(),
-                message: e.to_string(),
-            }
+        // Both transports list resources: loopback HTTP dials the endpoint; managed
+        // stdio reuses a running process or spawns the command per-operation
+        // (`docs/mcp.md` "Managed stdio MCP resources"). The result shaping is shared.
+        mcp_list_resources(server).map_err(|e| KernelError::McpResourceFetchFailed {
+            id: id.to_string(),
+            message: e.to_string(),
         })
     }
 
@@ -1608,7 +1600,9 @@ impl KernelState {
     /// envelope).
     ///
     /// A `resources/read` is inert: it performs no action and mutates nothing, so
-    /// this is safe to expose as a read-only context source. Honest by construction:
+    /// this is safe to expose as a read-only context source (loopback HTTP or
+    /// managed-stdio subprocess, dispatched on the server's transport). Honest by
+    /// construction:
     /// an unknown server is [`KernelError::UnknownMcpServer`]; a disabled one is
     /// [`KernelError::McpServerDisabled`]; an invalid URI is
     /// [`KernelError::InvalidMcpResourceUri`] (fail closed, never dialed); a
@@ -1633,18 +1627,11 @@ impl KernelState {
                 uri: uri.chars().take(120).collect(),
             });
         }
-        if server.transport == relux_core::McpTransport::ManagedStdio {
-            return Err(KernelError::McpResourceFetchFailed {
-                id: id.to_string(),
-                message: "MCP resources are not supported over the managed-stdio transport yet"
-                    .to_string(),
-            });
-        }
-        crate::mcp::read_resource(&server.endpoint, uri, server.timeout_ms).map_err(|e| {
-            KernelError::McpResourceFetchFailed {
-                id: id.to_string(),
-                message: e.to_string(),
-            }
+        // Both transports read a resource (loopback HTTP or managed stdio); the URI is
+        // validated above and the result is shaped, redacted, and bounded identically.
+        mcp_read_resource(server, uri).map_err(|e| KernelError::McpResourceFetchFailed {
+            id: id.to_string(),
+            message: e.to_string(),
         })
     }
 
@@ -11805,6 +11792,134 @@ fn mcp_call_tool(
                 )
             }
         }
+    }
+}
+
+/// Run a `resources/list` against one MCP server, dispatching on its transport.
+/// Loopback HTTP dials the endpoint ([`crate::mcp`]); managed-stdio reuses the running
+/// process or spawns the command per-operation ([`crate::mcp_stdio`]). Resources are a
+/// READ-ONLY context surface — both transports perform a bounded read and mutate
+/// nothing. The result handling (bounding/sanitizing) is the SAME for both. Used by
+/// [`KernelState::list_mcp_resources`].
+fn mcp_list_resources(
+    server: &relux_core::McpServerConfig,
+) -> Result<Vec<relux_core::McpResource>, crate::mcp::McpClientError> {
+    match server.transport {
+        relux_core::McpTransport::HttpLoopback => {
+            crate::mcp::list_resources(&server.endpoint, server.timeout_ms)
+        }
+        relux_core::McpTransport::ManagedStdio => {
+            // Reuse the operator-started managed process when one is running; otherwise
+            // fall back to the safe spawn-per-operation listing (resolving env secrets +
+            // validating cwd first, exactly like the tools path).
+            if crate::mcp_stdio::pool().is_running(&server.id) {
+                crate::mcp_stdio::pool().list_resources(&server.id, server.timeout_ms)
+            } else {
+                let (env, cwd) = crate::secret_store::resolve_managed_env_and_cwd(
+                    &server.env,
+                    server.cwd.as_deref(),
+                )
+                .map_err(crate::mcp::McpClientError::Spawn)?;
+                let command = server.command.as_deref().unwrap_or("");
+                crate::mcp_stdio::list_resources(
+                    command,
+                    &server.args,
+                    &env,
+                    cwd.as_deref(),
+                    server.timeout_ms,
+                )
+            }
+        }
+    }
+}
+
+/// Run a `resources/read` for `uri` against one MCP server, dispatching on its
+/// transport. Returns the SHAPED, sanitized, secret-redacted content (never the raw
+/// envelope, never raw bytes) for both transports. A `resources/read` is inert. Used by
+/// [`KernelState::read_mcp_resource`] (the caller validates `uri` first).
+fn mcp_read_resource(
+    server: &relux_core::McpServerConfig,
+    uri: &str,
+) -> Result<relux_core::McpResourceContent, crate::mcp::McpClientError> {
+    match server.transport {
+        relux_core::McpTransport::HttpLoopback => {
+            crate::mcp::read_resource(&server.endpoint, uri, server.timeout_ms)
+        }
+        relux_core::McpTransport::ManagedStdio => {
+            if crate::mcp_stdio::pool().is_running(&server.id) {
+                crate::mcp_stdio::pool().read_resource(&server.id, uri, server.timeout_ms)
+            } else {
+                let (env, cwd) = crate::secret_store::resolve_managed_env_and_cwd(
+                    &server.env,
+                    server.cwd.as_deref(),
+                )
+                .map_err(crate::mcp::McpClientError::Spawn)?;
+                let command = server.command.as_deref().unwrap_or("");
+                crate::mcp_stdio::read_resource(
+                    command,
+                    &server.args,
+                    &env,
+                    cwd.as_deref(),
+                    uri,
+                    server.timeout_ms,
+                )
+            }
+        }
+    }
+}
+
+/// Live `resources/list` for an off-lock [`crate::prime_tools::McpServerView`],
+/// dispatching on its transport. Used by the read-only Prime context tool
+/// `mcp_list_resources` OUTSIDE the kernel lock.
+pub(crate) fn mcp_view_list_resources(
+    s: &crate::prime_tools::McpServerView,
+) -> Result<Vec<relux_core::McpResource>, crate::mcp::McpClientError> {
+    match s.transport {
+        relux_core::McpTransport::ManagedStdio => {
+            if crate::mcp_stdio::pool().is_running(&s.id) {
+                crate::mcp_stdio::pool().list_resources(&s.id, s.timeout_ms)
+            } else {
+                let (env, cwd) =
+                    crate::secret_store::resolve_managed_env_and_cwd(&s.env, s.cwd.as_deref())
+                        .map_err(crate::mcp::McpClientError::Spawn)?;
+                let command = s.command.as_deref().unwrap_or("");
+                crate::mcp_stdio::list_resources(command, &s.args, &env, cwd.as_deref(), s.timeout_ms)
+            }
+        }
+        // Default to HTTP for the loopback transport (and any older view that
+        // deserialized without an explicit transport).
+        _ => crate::mcp::list_resources(&s.endpoint, s.timeout_ms),
+    }
+}
+
+/// Live `resources/read` of ONE resource by `uri` for an off-lock
+/// [`crate::prime_tools::McpServerView`], dispatching on its transport. Used by the
+/// read-only Prime context tool `mcp_read_resource` OUTSIDE the kernel lock (the caller
+/// validates `uri` first).
+pub(crate) fn mcp_view_read_resource(
+    s: &crate::prime_tools::McpServerView,
+    uri: &str,
+) -> Result<relux_core::McpResourceContent, crate::mcp::McpClientError> {
+    match s.transport {
+        relux_core::McpTransport::ManagedStdio => {
+            if crate::mcp_stdio::pool().is_running(&s.id) {
+                crate::mcp_stdio::pool().read_resource(&s.id, uri, s.timeout_ms)
+            } else {
+                let (env, cwd) =
+                    crate::secret_store::resolve_managed_env_and_cwd(&s.env, s.cwd.as_deref())
+                        .map_err(crate::mcp::McpClientError::Spawn)?;
+                let command = s.command.as_deref().unwrap_or("");
+                crate::mcp_stdio::read_resource(
+                    command,
+                    &s.args,
+                    &env,
+                    cwd.as_deref(),
+                    uri,
+                    s.timeout_ms,
+                )
+            }
+        }
+        _ => crate::mcp::read_resource(&s.endpoint, uri, s.timeout_ms),
     }
 }
 

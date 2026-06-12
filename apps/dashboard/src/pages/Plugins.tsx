@@ -501,17 +501,19 @@ function McpServerRow({
           >
             {toolsOpen ? "Close" : "Discover"}
           </button>
-          {server.transport !== "managed_stdio" && (
-            <button
-              className="btn ghost sm"
-              style={{ marginLeft: 6 }}
-              onClick={() => setResourcesOpen((v) => !v)}
-              aria-expanded={resourcesOpen}
-              title="Run a live resources/list against this server (read-only context)"
-            >
-              {resourcesOpen ? "Close" : "Resources"}
-            </button>
-          )}
+          <button
+            className="btn ghost sm"
+            style={{ marginLeft: 6 }}
+            onClick={() => setResourcesOpen((v) => !v)}
+            aria-expanded={resourcesOpen}
+            title={
+              server.transport === "managed_stdio"
+                ? "Spawn the command (or reuse the running process) and run a live resources/list (read-only context)"
+                : "Run a live resources/list against this server (read-only context)"
+            }
+          >
+            {resourcesOpen ? "Close" : "Resources"}
+          </button>
           <button
             className="btn ghost sm"
             style={{ marginLeft: 6 }}
@@ -736,7 +738,8 @@ function McpDiscoverPanel({ server }: { server: ReluxMcpServer }) {
   );
 }
 
-// The live resources panel: runs `resources/list` against the loopback MCP server
+// The live resources panel: runs `resources/list` against the MCP server (loopback
+// HTTP or managed-stdio command, dispatched server-side on the registered transport)
 // and lists the read-only resources (files/records/docs) it advertises. Resources
 // are inert context — listing or reading one performs NO action and mutates nothing,
 // so there is no classification/approval gate here (unlike tools). Honest about every
@@ -760,8 +763,9 @@ function McpResourcesPanel({ server }: { server: ReluxMcpServer }) {
         )}
       </div>
       <p className="muted" style={{ marginTop: 0, marginBottom: 10, fontSize: 11 }}>
-        A real <span className="mono">resources/list</span> against the loopback
-        server. Resources are <strong>read-only context</strong> — reading one
+        A real <span className="mono">resources/list</span> against the{" "}
+        {server.transport === "managed_stdio" ? "managed-stdio command" : "loopback server"}.
+        Resources are <strong>read-only context</strong> — reading one
         performs no action. A preview runs <span className="mono">resources/read</span>;
         the body is sanitized, secret-redacted, and bounded server-side.
       </p>
