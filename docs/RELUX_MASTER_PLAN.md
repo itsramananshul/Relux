@@ -1859,6 +1859,18 @@ stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
   (`reluxMcp.list` + `reluxMcp.tools`, keyed `mcp:<server>`), gating via `toolReadiness`, surfacing a
   warning on failed discovery and an info note on a disabled server rather than silently dropping it; the
   Plugins MCP copy now reflects that a discovered tool is callable through the standard gates.
+  **Live MCP tools in Prime plan PROPOSALS:** Prime's inert multi-tool-plan preview
+  (`KernelState::build_tool_plan_proposal`) now grounds against a SHARED, read-only catalog
+  (`proposal_tool_catalog`) of installed plugin tools PLUS the live MCP-discovered tools of every
+  enabled server — so an `mcp:<server>/<tool>` step (recognized by `parse_tool_request`, mirroring
+  openclaw's `mcp:<serverId>:<toolName>` ref) resolves exactly like an installed tool and lands in the
+  SAME `mcp:<server>` task `tool_plan` execution path (no second tool system). The bounded `tools/list`
+  runs OFF-LOCK in the server (`discover_proposal_mcp_catalog`, injected via `set_proposal_mcp_catalog`)
+  so the kernel lock never spans a network read; the preview stays INERT (creates nothing, runs nothing)
+  and FAILS CLOSED — an unreachable / disabled / unregistered server grounds `unavailable`, an
+  un-advertised tool `unknown`, an unclassified MCP tool `needs_approval` — never a faked runnable step.
+  Normal chat / brainstorming / frustration still resolve to no tools and produce no plan. Raw reference
+  reading recorded in `docs/REFERENCE_CODE_MAP.md`.
   `cargo test` + `clippy` clean on `relux-core`/`relux-kernel`, dashboard tests + typecheck + build
   green, the tracked `dashboard-dist` bundle rebuilt and committed in sync. Every safety property from
   v0.1.24 still holds.

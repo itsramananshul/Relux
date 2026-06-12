@@ -858,6 +858,8 @@ const READINESS_TONE: Record<string, string> = {
   missing_permission: "backlog",
   not_runnable: "backlog",
   unknown: "err",
+  // A referenced MCP server/tool that was not reachable on the live `tools/list`.
+  unavailable: "err",
 };
 
 // A short label for a tool-plan step's readiness badge.
@@ -867,6 +869,7 @@ const READINESS_LABEL: Record<string, string> = {
   missing_permission: "needs permission",
   not_runnable: "not runnable",
   unknown: "unknown tool",
+  unavailable: "unavailable",
 };
 
 // Render a step's compact args preview without leaking a giant blob into the chat.
@@ -943,6 +946,11 @@ function ToolPlanCard({ proposal, busy }: { proposal: ReluxPrimeToolPlanProposal
         <ol style={{ margin: 0, paddingLeft: 0, listStyle: "none" }}>
           {proposal.steps.map((s) => {
             const args = compactArgs(s.args);
+            // An MCP-backed step is namespaced under a `mcp:<server>` synthetic plugin
+            // id; surface the source server explicitly so the operator sees it came from
+            // a live MCP server, not an installed plugin (docs/mcp.md "Run-driven
+            // multi-tool plan").
+            const mcpServer = s.plugin.startsWith("mcp:") ? s.plugin.slice("mcp:".length) : null;
             return (
               <li
                 key={s.index}
@@ -959,6 +967,15 @@ function ToolPlanCard({ proposal, busy }: { proposal: ReluxPrimeToolPlanProposal
                   {s.index}.
                 </span>
                 <span className="mono" style={{ flex: 1, minWidth: 160 }}>
+                  {mcpServer && (
+                    <span
+                      className="badge todo"
+                      style={{ fontSize: 8, marginRight: 6 }}
+                      title={`Live tool from MCP server "${mcpServer}"`}
+                    >
+                      MCP · {mcpServer}
+                    </span>
+                  )}
                   {s.tool ? `${s.plugin}/${s.tool}` : s.plugin}
                   {args && (
                     <span className="muted" style={{ marginLeft: 6, fontWeight: 400 }}>

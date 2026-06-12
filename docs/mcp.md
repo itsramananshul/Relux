@@ -352,16 +352,32 @@ preview.
   deterministic classifier already catches, gets there.
 - **Inert, grounded preview (`KernelState::build_tool_plan_proposal`).** The
   `ProposeToolPlan` action is READ-ONLY: the kernel splits the request into ordered
-  steps, resolves each against the **live tool registry** (`discover_tools`), surfaces
-  each step's honest `readiness` (`ready` / `needs_approval` / `missing_permission` /
-  `not_runnable` / `unknown`) and declared `risk`, and validates the whole bounded plan
-  with the **same `TaskToolPlan::validate`** the create route enforces — **creating no
-  task, running no tool, and mutating nothing**. An **unknown tool is never silently
-  accepted**: the step is flagged `unknown`, `ready_to_create` is `false`, and the reply
-  becomes a clarifying question; an **over-cap** plan (> 5 steps) is reported as too-long,
-  never truncated silently. The preview ships as `PrimeTurn.tool_plan_proposal`
+  steps and resolves each against the **shared proposal tool catalog**
+  (`KernelState::proposal_tool_catalog`) — **installed plugin tools (`discover_tools`)
+  PLUS the live MCP-discovered tools** from every enabled MCP server. It surfaces each
+  step's honest `readiness` (`ready` / `needs_approval` / `missing_permission` /
+  `not_runnable` / `unknown` / `unavailable`) and declared `risk`, and validates the
+  whole bounded plan with the **same `TaskToolPlan::validate`** the create route enforces
+  — **creating no task, running no tool, and mutating nothing**. An **unresolved step is
+  never silently accepted**: an installed tool that does not exist, or an MCP tool the
+  server does not advertise, is flagged `unknown`; a referenced MCP server that is
+  **unreachable / disabled / unregistered** is flagged `unavailable` (fail-closed, with
+  the reason). In every such case `ready_to_create` is `false` and the reply becomes a
+  clarifying question; an **over-cap** plan (> 5 steps) is reported as too-long, never
+  truncated silently. The preview ships as `PrimeTurn.tool_plan_proposal`
   (`relux_core::PrimeToolPlanProposal`: a human summary, the ordered steps, `ready_to_create`,
   and honest `issues`); it carries **no `PrimeAction`**.
+- **Live MCP tools, off-lock + fail-closed.** A step is referenced as
+  `mcp:<server>/<tool>` (the stable `mcp:<server>` synthetic plugin id, mirroring
+  openclaw's `mcp:<serverId>:<toolName>` ref in `src/tools/execution.ts`). The HTTP
+  server runs the bounded live `tools/list` **outside the kernel lock**
+  (`discover_proposal_mcp_catalog`, gated on the message carrying an `mcp:` reference and
+  ≥ 1 enabled server) and injects the result via `set_proposal_mcp_catalog` just before
+  the locked turn — so grounding never holds the kernel lock across a network read (the
+  same off-lock discipline as `context_snapshot`). A `tools/list` failure does **not**
+  fake the tool: the server is recorded unavailable and the step grounds `unavailable`.
+  An unclassified MCP tool reads `needs_approval` (fail-closed Medium + Required), exactly
+  as in the unified Tools picker.
 - **Explicit one-click commit, existing path + gates (UI).** The Prime chat renders the
   preview as a compact card (`apps/dashboard/src/pages/Prime.tsx` `ToolPlanCard`) under
   the assistant reply: ordered steps, tool names, readiness/risk badges, and a compact
@@ -372,11 +388,16 @@ preview.
   permission/approval/grant/audit gates** at run time; nothing runs until the operator
   starts the task in Work. The card is honest: nothing is created or run by showing it.
 
-**Scope (proposal layer).** The proposal is grounded against **installed plugin tools**
-(`discover_tools`); grounding a step against a **live MCP-discovered** `mcp:<server>` tool
-is not yet wired into the kernel preview (the operator's Plugins → Tools "Create a
-tool-run task" form already merges live MCP tools — use that for an MCP-step plan). The
-proposal chooses no tools on its own, runs nothing, and adds no new execution path.
+**Scope (proposal layer).** The proposal is grounded against the **shared catalog of
+installed plugin tools + live MCP-discovered tools** (`KernelState::proposal_tool_catalog`),
+so a `mcp:<server>/<tool>` step grounds against a real enabled MCP server exactly like an
+installed plugin tool and lands in the SAME `mcp:<server>` task `tool_plan` execution path
+(the operator's Plugins → Tools "Create a tool-run task" form uses the same merge). The
+proposal chooses no tools on its own, runs nothing, mutates nothing, and adds **no new
+execution path** — execution stays the single existing gated `tool_plan` task path. A
+referenced MCP server/tool that is not live is reported `unavailable` / `unknown`, never
+faked. Normal chat, brainstorming, and frustration still resolve to no tools and never
+produce a plan.
 
 ## What it does NOT do (honest limitations)
 

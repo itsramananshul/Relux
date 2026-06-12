@@ -1673,6 +1673,36 @@ pub(crate) fn parse_tool_request(message: &str) -> Option<(String, String, Strin
         }
     }
 
+    // 1b. Explicit MCP tool reference: "mcp:<server>/<tool>" — the stable ref form a
+    //     discovered MCP tool is listed under (the `mcp:<server>` synthetic plugin id
+    //     from `relux_core::mcp_synthetic_plugin_id` + the tool name). Scanned over the
+    //     ORIGINAL (case-preserving) message because an MCP tool name may be camelCase,
+    //     unlike the lowercase relux-tools convention, and the server id + tool name
+    //     must match the live `tools/list` exactly. Purely syntactic: the plan-grounding
+    //     path (`KernelState::build_tool_plan_proposal`) resolves the ref against the
+    //     off-lock MCP catalog and fails CLOSED (`unavailable` / `unknown`) when the
+    //     server or tool is not live, never silently accepting it (`docs/mcp.md`
+    //     "Run-driven multi-tool plan"; §10.5, §17.1).
+    if let Some(tok) = trimmed
+        .split(|c: char| c.is_whitespace())
+        .map(trim_token)
+        .find(|t| t.starts_with("mcp:") && t.contains('/'))
+    {
+        let mut parts = tok.splitn(2, '/');
+        if let (Some(plugin), Some(tool)) = (parts.next(), parts.next()) {
+            let plugin = plugin.trim();
+            let tool = tool.trim();
+            // Require a non-empty server id after the `mcp:` prefix and a non-empty tool.
+            if plugin.len() > "mcp:".len() && !tool.is_empty() {
+                return Some((
+                    plugin.to_string(),
+                    tool.to_string(),
+                    json.unwrap_or_else(|| "{}".to_string()),
+                ));
+            }
+        }
+    }
+
     // 2. The two built-in tools, by name or by plain-language reference.
     if lower.contains("echo.say") || lower.contains("echo") {
         let input = json.unwrap_or_else(|| echo_input_from(trimmed));
@@ -2770,6 +2800,50 @@ mod tests {
         assert_eq!(
             classify_intent("run the status tool"),
             PrimeIntent::ToolInvocation
+        );
+    }
+
+    #[test]
+    fn parses_explicit_mcp_tool_reference() {
+        // An `mcp:<server>/<tool>` token resolves to the `mcp:<server>` synthetic plugin
+        // id + the tool name, case-PRESERVED (MCP tool names may be camelCase), so the
+        // plan-grounding path can look it up in the live MCP catalog and the resolved
+        // step lands in the SAME `mcp:<server>` task tool_plan shape (`docs/mcp.md`).
+        assert_eq!(
+            parse_tool_request("mcp:fs/search"),
+            Some(("mcp:fs".to_string(), "search".to_string(), "{}".to_string()))
+        );
+        // Case preserved, trailing punctuation trimmed, inline JSON args lifted.
+        assert_eq!(
+            parse_tool_request("use mcp:notes/listNotes with {\"q\":\"x\"}"),
+            Some((
+                "mcp:notes".to_string(),
+                "listNotes".to_string(),
+                "{\"q\":\"x\"}".to_string()
+            ))
+        );
+        // A bare `mcp:` with no tool segment resolves nothing (never a half tool ref).
+        assert_eq!(parse_tool_request("mcp:fs"), None);
+        assert_eq!(parse_tool_request("mcp:/search"), None);
+    }
+
+    #[test]
+    fn classifies_explicit_mcp_multi_tool_plan() {
+        // Two MCP tool references in sequence are a multi-tool plan, exactly like two
+        // installed-tool references — the same `parse_tool_request` drives both.
+        assert_eq!(
+            classify_intent("use mcp:fs/search then mcp:fs/read"),
+            PrimeIntent::ToolPlanRequest
+        );
+        // A single MCP reference is one step, not a multi-tool plan.
+        assert_ne!(
+            classify_intent("run mcp:fs/search"),
+            PrimeIntent::ToolPlanRequest
+        );
+        // A casual MENTION of an mcp ref with no plan/sequence cue is never a plan.
+        assert_ne!(
+            classify_intent("what does mcp:fs/search even do"),
+            PrimeIntent::ToolPlanRequest
         );
     }
 

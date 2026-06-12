@@ -233,6 +233,17 @@ pub struct KernelState {
     /// server id. MCP v1: a discovery surface — the kernel lists these and runs a
     /// live `tools/list` against an enabled one. No secrets are stored.
     mcp_servers: HashMap<String, relux_core::McpServerConfig>,
+    /// TRANSIENT off-lock-discovered live MCP tool catalog for the CURRENT turn's
+    /// multi-tool-plan proposal grounding ([`ProposalMcpCatalog`]). The HTTP server runs
+    /// the bounded `tools/list` OUTSIDE the kernel lock and injects the result here via
+    /// [`Self::set_proposal_mcp_catalog`] just before `prime_turn_with_brain`, so
+    /// [`Self::build_tool_plan_proposal`] can ground an `mcp:<server>/<tool>` step against
+    /// LIVE tools without the lock ever spanning a network read. NOT persisted by the
+    /// store (it is not one of the saved collections); it defaults to empty on every
+    /// `store.load()`, so an empty catalog — what every test, the CLI, and any turn the
+    /// server did not pre-fetch for sees — grounds against installed plugin tools ONLY,
+    /// byte-for-byte the prior behavior.
+    proposal_mcp_catalog: ProposalMcpCatalog,
     namespaces: HashMap<NamespaceId, Namespace>,
     agents: HashMap<AgentId, Agent>,
     tasks: HashMap<TaskId, Task>,
@@ -1146,6 +1157,18 @@ impl KernelState {
         let mut out: Vec<&relux_core::McpServerConfig> = self.mcp_servers.values().collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
         out
+    }
+
+    /// Inject the off-lock-discovered live MCP tool catalog for the NEXT
+    /// proposal-grounding turn (see [`ProposalMcpCatalog`] and
+    /// [`discover_proposal_mcp_catalog`]). The HTTP server pre-fetches the bounded
+    /// `tools/list` OUTSIDE the lock and sets it here just before the locked turn, so
+    /// [`Self::build_tool_plan_proposal`] grounds an `mcp:<server>/<tool>` step against
+    /// LIVE tools without the lock ever spanning a network read. TRANSIENT: not
+    /// persisted, cleared to empty on every reload. With the default empty catalog,
+    /// proposal grounding sees installed plugin tools ONLY (the deterministic default).
+    pub fn set_proposal_mcp_catalog(&mut self, catalog: ProposalMcpCatalog) {
+        self.proposal_mcp_catalog = catalog;
     }
 
     /// Run a live `tools/list` discovery against an enabled MCP server and map the
@@ -3978,6 +4001,69 @@ impl KernelState {
         out
     }
 
+    /// The SHARED, read-only tool catalog used to ground a multi-tool-plan proposal:
+    /// every installed plugin tool ([`Self::discover_tools`]) PLUS the live
+    /// MCP-discovered tools the server pre-fetched off-lock for this turn
+    /// ([`Self::set_proposal_mcp_catalog`]). One catalog so a proposed `mcp:<server>/<tool>`
+    /// step resolves with the SAME `(plugin_id, tool_name)` lookup as an installed tool
+    /// and carries the SAME executable/risk semantics — there is no second tool system.
+    ///
+    /// Each MCP tool's executable state mirrors [`Self::discover_mcp_tools`] (the unified
+    /// Tools picker the operator already trusts): driven by the server's operator
+    /// classification through the SAME `approval_blocks_direct_invocation` predicate, so an
+    /// unclassified MCP tool reads as `needs_approval` (fail-closed Medium + Required),
+    /// never auto-runnable. PURE: reads only — no network I/O (the live `tools/list` already
+    /// ran off-lock), mutates nothing, fabricates nothing. An unreachable server contributes
+    /// NO tools here, so a step naming it cannot resolve and grounds as `unavailable`.
+    fn proposal_tool_catalog(
+        &self,
+        agent_for_permission: Option<&AgentId>,
+    ) -> Vec<ToolDescriptor> {
+        let mut catalog = self.discover_tools(agent_for_permission);
+        for server in &self.proposal_mcp_catalog.servers {
+            // Only a REACHABLE server (a successful live `tools/list`) contributes tools;
+            // an unreachable one is left out so a step that names it fails closed.
+            let Some(tools) = &server.tools else {
+                continue;
+            };
+            let plugin_id = relux_core::mcp_synthetic_plugin_id(&server.server_id);
+            let config = self.mcp_servers.get(&server.server_id);
+            for t in tools {
+                // Defense in depth: never list an MCP tool whose name is not a safe
+                // identifier (it would be refused at invoke anyway — fail closed here too).
+                if !relux_core::is_valid_mcp_tool_name(&t.name) {
+                    continue;
+                }
+                let classification = config
+                    .map(|c| c.tool_classification(&t.name))
+                    .unwrap_or_default();
+                // SAME gate as `discover_mcp_tools`: an unclassified / gated tool is
+                // `needs_approval`; a low-risk auto-approve one is `ready`.
+                let executable = if approval_blocks_direct_invocation(
+                    &classification.approval,
+                    &classification.risk,
+                ) {
+                    ToolExecutability::NeedsApproval
+                } else {
+                    ToolExecutability::Ready
+                };
+                catalog.push(ToolDescriptor {
+                    plugin_id: plugin_id.clone(),
+                    tool_name: t.name.clone(),
+                    description: t.description.clone(),
+                    permission: relux_core::mcp_tool_permission(&server.server_id, &t.name),
+                    risk: classification.risk,
+                    source_kind: "Mcp".to_string(),
+                    installed: true,
+                    enabled: true,
+                    protected: false,
+                    executable,
+                });
+            }
+        }
+        catalog
+    }
+
     /// Build the INERT, grounded multi-tool plan preview for a `ProposeToolPlan`
     /// action (`docs/mcp.md` "Run-driven multi-tool plan"; §10.5, §17.1). READ-ONLY:
     /// it splits the request into ordered segments
@@ -3994,7 +4080,13 @@ impl KernelState {
     ) -> relux_core::PrimeToolPlanProposal {
         use relux_core::task::{TaskToolCall, TaskToolPlan, MAX_TASK_TOOL_PLAN_STEPS};
 
-        let catalog = self.discover_tools(Some(&ctx.agent));
+        // The SHARED, read-only proposal tool catalog: installed plugin tools PLUS the
+        // live MCP-discovered tools the server pre-fetched off-lock for this turn. A
+        // single merged catalog grounds every step the same way, so an `mcp:<server>/<tool>`
+        // reference resolves exactly like an installed plugin tool and lands in the SAME
+        // `mcp:<server>` task tool_plan execution shape — never a second execution system
+        // (`docs/mcp.md` "Run-driven multi-tool plan"; §10.5, §17.1).
+        let catalog = self.proposal_tool_catalog(Some(&ctx.agent));
         let segments = crate::prime::split_tool_plan_segments(goal);
 
         let mut steps: Vec<relux_core::PrimeToolPlanStep> = Vec::new();
@@ -4035,19 +4127,55 @@ impl KernelState {
                         }
                         None => {
                             all_resolved = false;
-                            issues.push(format!(
-                                "step {index}: \"{plugin}/{tool}\" is not an installed tool"
-                            ));
+                            // FAIL CLOSED, with an HONEST reason. For an `mcp:<server>/<tool>`
+                            // reference we distinguish three unresolved cases so the card never
+                            // implies a missing MCP tool is merely "unknown" when the real cause
+                            // is an unreachable / unregistered server:
+                            //   - reachable server, no such tool  -> `unknown`
+                            //   - registered+enabled but `tools/list` failed -> `unavailable`
+                            //   - not registered / not enabled this turn -> `unavailable`
+                            let (readiness, issue, note) = match plugin.strip_prefix("mcp:") {
+                                Some(server_id) => match self.proposal_mcp_catalog.server(server_id) {
+                                    Some(s) if s.tools.is_some() => (
+                                        "unknown",
+                                        format!(
+                                            "step {index}: MCP server \"{server_id}\" has no tool \"{tool}\""
+                                        ),
+                                        "no such tool on this MCP server".to_string(),
+                                    ),
+                                    Some(s) => (
+                                        "unavailable",
+                                        format!(
+                                            "step {index}: MCP server \"{server_id}\" is unavailable ({})",
+                                            s.error.as_deref().unwrap_or("discovery failed")
+                                        ),
+                                        "MCP server is not reachable right now".to_string(),
+                                    ),
+                                    None => (
+                                        "unavailable",
+                                        format!(
+                                            "step {index}: MCP server \"{server_id}\" is not registered or not enabled"
+                                        ),
+                                        "MCP server is not registered or enabled".to_string(),
+                                    ),
+                                },
+                                None => (
+                                    "unknown",
+                                    format!(
+                                        "step {index}: \"{plugin}/{tool}\" is not an installed tool"
+                                    ),
+                                    "no installed tool matches this reference".to_string(),
+                                ),
+                            };
+                            issues.push(issue);
                             steps.push(relux_core::PrimeToolPlanStep {
                                 index,
                                 plugin,
                                 tool,
                                 args,
-                                readiness: "unknown".to_string(),
+                                readiness: readiness.to_string(),
                                 risk: None,
-                                note: Some(
-                                    "no installed tool matches this reference".to_string(),
-                                ),
+                                note: Some(note),
                             });
                         }
                     }
@@ -10361,6 +10489,110 @@ fn render_orchestration_plan(o: &Orchestration) -> String {
 /// `not implemented` tools that are installed but have no local runtime, and
 /// `needs permission` tools Prime would need a grant for. Disabled tools are
 /// marked so the list never implies a disabled tool is runnable.
+///
+/// One enabled MCP server's off-lock live `tools/list` outcome, captured by the HTTP
+/// server BEFORE the kernel lock is taken so multi-tool-plan proposal grounding never
+/// holds the lock across a network read — the same off-lock discipline
+/// [`KernelState::context_snapshot`] uses to pre-take board state for the read-only
+/// context loop.
+///
+/// Honest by construction: a server whose discovery FAILED (unreachable / disabled /
+/// protocol error) is carried with `tools: None` + a sanitized `error`, so a plan step
+/// that references it grounds as `unavailable` (fail-closed) instead of being silently
+/// accepted as a real, runnable tool.
+#[derive(Debug, Clone)]
+pub struct ProposalMcpServer {
+    pub server_id: String,
+    /// `Some(tools)` when the live `tools/list` succeeded (possibly an empty list);
+    /// `None` when the server was unreachable / disabled / the protocol failed.
+    pub tools: Option<Vec<ProposalMcpTool>>,
+    /// A sanitized one-line reason the server is unavailable, set when `tools` is `None`.
+    pub error: Option<String>,
+}
+
+/// One live MCP tool a `tools/list` advertised — just the name + bounded description,
+/// the raw inputs proposal grounding needs. Risk / approval / runnability are derived
+/// under the lock from the server's operator classification, never carried here.
+#[derive(Debug, Clone)]
+pub struct ProposalMcpTool {
+    pub name: String,
+    pub description: String,
+}
+
+/// The off-lock-discovered live MCP tool catalog for ONE proposal-grounding turn (all
+/// enabled MCP servers' `tools/list` outcomes). Injected into the kernel by the server
+/// via [`KernelState::set_proposal_mcp_catalog`] before the locked turn runs. Empty by
+/// default (the deterministic / test / CLI case).
+#[derive(Debug, Clone, Default)]
+pub struct ProposalMcpCatalog {
+    pub servers: Vec<ProposalMcpServer>,
+}
+
+impl ProposalMcpCatalog {
+    /// The discovery outcome for one server id, if it was pre-fetched this turn.
+    pub fn server(&self, server_id: &str) -> Option<&ProposalMcpServer> {
+        self.servers.iter().find(|s| s.server_id == server_id)
+    }
+}
+
+/// Off-lock: run a bounded live `tools/list` against each ENABLED MCP server in the
+/// snapshot and collect the result for multi-tool-plan proposal grounding. PURE network
+/// reads — it holds no kernel lock and mutates nothing, exactly like the read-only
+/// context loop's MCP reads. Called by the HTTP server between the board snapshot and
+/// the locked Prime turn.
+///
+/// Fail-closed by construction: a disabled server is skipped (it can never back a
+/// runnable step); an enabled server whose discovery FAILS is recorded with
+/// `tools: None` + the sanitized error (so a step naming it grounds as `unavailable`),
+/// never dropped or faked.
+pub fn discover_proposal_mcp_catalog(
+    servers: &[crate::prime_tools::McpServerView],
+) -> ProposalMcpCatalog {
+    let mut out: Vec<ProposalMcpServer> = Vec::new();
+    for s in servers {
+        // A disabled server cannot back a runnable plan step; skip it entirely so it is
+        // not even a candidate (a step naming it grounds as not-registered/enabled).
+        if !s.enabled {
+            continue;
+        }
+        let entry = match crate::mcp::discover_tools(&s.endpoint, s.timeout_ms) {
+            Ok(tools) => ProposalMcpServer {
+                server_id: s.id.clone(),
+                tools: Some(
+                    tools
+                        .into_iter()
+                        .map(|t| ProposalMcpTool {
+                            name: t.name,
+                            description: t.description,
+                        })
+                        .collect(),
+                ),
+                error: None,
+            },
+            Err(e) => ProposalMcpServer {
+                server_id: s.id.clone(),
+                tools: None,
+                error: Some(sanitize_proposal_error(&e.to_string())),
+            },
+        };
+        out.push(entry);
+    }
+    ProposalMcpCatalog { servers: out }
+}
+
+/// Clamp + de-control an MCP discovery error for the (operator-facing) proposal note.
+fn sanitize_proposal_error(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(200)
+        .collect()
+}
+
 /// Map a tool's live [`ToolExecutability`] to the honest `readiness` label and an
 /// optional note carried on a [`relux_core::PrimeToolPlanStep`]. The labels match
 /// the gated `call_tool` reality — a higher-risk or unpermitted tool is surfaced as
@@ -15857,6 +16089,250 @@ mod tests {
             "the issue names the uninstalled tool: {:?}",
             plan.issues
         );
+    }
+
+    /// The three response bodies for one successful `tools/list` discovery: the
+    /// initialize ack, the notifications/initialized ack, and the tool list.
+    fn mcp_tools_list_bodies(tools_json: &str) -> Vec<String> {
+        vec![
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{}}}"#.to_string(),
+            "{}".to_string(),
+            format!(r#"{{"jsonrpc":"2.0","id":2,"result":{{"tools":{tools_json}}}}}"#),
+        ]
+    }
+
+    /// Build + inject the off-lock proposal MCP catalog for `k`, exactly as the HTTP
+    /// server does between the board snapshot and the locked turn (runs the live
+    /// `tools/list` against every enabled registered server, off-lock).
+    fn inject_proposal_mcp_catalog(k: &mut KernelState, ctx: &PrimeContext) {
+        let servers = k.context_snapshot(ctx).mcp_servers;
+        let catalog = discover_proposal_mcp_catalog(&servers);
+        k.set_proposal_mcp_catalog(catalog);
+    }
+
+    #[test]
+    fn tool_plan_grounds_a_live_mcp_listed_tool() {
+        // The shared proposal catalog now includes LIVE MCP-discovered tools: a
+        // `mcp:<server>/<tool>` step grounds against the server's real `tools/list`
+        // and lands in the SAME `mcp:<server>` task tool_plan execution shape — never a
+        // second execution system (`docs/mcp.md` "Run-driven multi-tool plan"; §10.5).
+        let (mut k, ctx) = prime_chat_kernel();
+        let endpoint = mock_mcp(mcp_tools_list_bodies(
+            r#"[{"name":"search","description":"Find things."}]"#,
+        ));
+        k.register_mcp_server("fs", &endpoint, "fs server", true, Some(2000))
+            .unwrap();
+        inject_proposal_mcp_catalog(&mut k, &ctx);
+
+        let turn = k
+            .prime_turn(&ctx, "use mcp:fs/search then echo hi")
+            .unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::ToolPlanRequest);
+        // INERT: nothing created or run during the preview.
+        assert!(turn.created_task.is_none(), "a preview creates no task");
+        assert!(turn.started_run.is_none(), "a preview runs nothing");
+        assert!(turn.invoked_tool.is_none(), "a preview calls no tool");
+        let plan = turn.tool_plan_proposal.expect("a preview is attached");
+        assert_eq!(plan.steps.len(), 2, "two grounded steps: {plan:?}");
+        // The MCP step resolved against the LIVE catalog with the stable ref shape.
+        assert_eq!(plan.steps[0].plugin, "mcp:fs");
+        assert_eq!(plan.steps[0].tool, "search");
+        // An unclassified MCP tool is gated (Medium + Required) — never auto-runnable,
+        // surfaced honestly as needs_approval with its risk.
+        assert_eq!(plan.steps[0].readiness, "needs_approval");
+        assert_eq!(plan.steps[0].risk.as_deref(), Some("medium"));
+        assert_eq!(plan.steps[1].plugin, "relux-tools-echo");
+        assert!(plan.ready_to_create, "both steps resolved + validated: {plan:?}");
+
+        // Valid MCP proposal converts to the EXISTING task tool_plan shape verbatim.
+        let calls: Vec<relux_core::task::TaskToolCall> = plan
+            .steps
+            .iter()
+            .map(|s| relux_core::task::TaskToolCall {
+                plugin: s.plugin.clone(),
+                tool: s.tool.clone(),
+                args: s.args.clone(),
+            })
+            .collect();
+        let task_plan = relux_core::task::TaskToolPlan { steps: calls };
+        assert!(task_plan.validate().is_ok(), "the ready MCP preview validates");
+        let parsed = relux_core::task::parse_task_tool_plan(&task_plan.to_input())
+            .expect("the existing tool_plan path reads it back");
+        assert_eq!(parsed[0].plugin, "mcp:fs");
+        assert_eq!(parsed[0].tool, "search");
+    }
+
+    #[test]
+    fn tool_plan_classified_mcp_tool_is_ready() {
+        // Once the operator classifies an MCP tool Low + auto-approve it reads `ready`
+        // in the proposal, exactly like the unified Tools picker.
+        let (mut k, ctx) = prime_chat_kernel();
+        let endpoint = mock_mcp(mcp_tools_list_bodies(
+            r#"[{"name":"search","description":"Find things."}]"#,
+        ));
+        k.register_mcp_server("fs", &endpoint, "fs server", true, Some(2000))
+            .unwrap();
+        k.set_mcp_tool_classification(
+            "fs",
+            "search",
+            relux_core::RiskLevel::Low,
+            relux_core::ApprovalRequirement::Never,
+        )
+        .unwrap();
+        inject_proposal_mcp_catalog(&mut k, &ctx);
+
+        let turn = k
+            .prime_turn(&ctx, "use mcp:fs/search then echo hi")
+            .unwrap();
+        let plan = turn.tool_plan_proposal.expect("a preview is attached");
+        assert_eq!(plan.steps[0].plugin, "mcp:fs");
+        assert_eq!(plan.steps[0].readiness, "ready");
+        assert_eq!(plan.steps[0].risk.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn tool_plan_missing_mcp_tool_fails_closed() {
+        // A reference to a tool the live server does NOT advertise is flagged `unknown`
+        // and blocks creation — never silently accepted (fail closed).
+        let (mut k, ctx) = prime_chat_kernel();
+        let endpoint = mock_mcp(mcp_tools_list_bodies(
+            r#"[{"name":"search","description":"Find things."}]"#,
+        ));
+        k.register_mcp_server("fs", &endpoint, "fs server", true, Some(2000))
+            .unwrap();
+        inject_proposal_mcp_catalog(&mut k, &ctx);
+
+        let turn = k
+            .prime_turn(&ctx, "use mcp:fs/delete then echo hi")
+            .unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::ToolPlanRequest);
+        assert_eq!(turn.disposition, PrimeDisposition::NeedsClarification);
+        assert!(turn.created_task.is_none(), "an unresolved plan creates nothing");
+        let plan = turn.tool_plan_proposal.expect("a preview is attached");
+        assert!(!plan.ready_to_create, "the missing MCP tool blocks creation");
+        assert!(
+            plan.steps.iter().any(|s| s.plugin == "mcp:fs" && s.readiness == "unknown"),
+            "the missing MCP tool is flagged unknown: {:?}",
+            plan.steps
+        );
+        assert!(
+            plan.issues.iter().any(|i| i.contains("fs") && i.contains("delete")),
+            "the issue names the missing MCP tool: {:?}",
+            plan.issues
+        );
+    }
+
+    #[test]
+    fn tool_plan_unavailable_mcp_server_fails_closed() {
+        // An enabled MCP server whose live `tools/list` FAILS (here: nothing listening)
+        // contributes no tools; a step that names it grounds `unavailable` and blocks
+        // creation — never faked into a runnable step (fail closed).
+        let (mut k, ctx) = prime_chat_kernel();
+        // Bind then drop a listener to get a definitely-closed loopback port.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let endpoint = format!("http://127.0.0.1:{port}/mcp");
+        k.register_mcp_server("fs", &endpoint, "fs server", true, Some(500))
+            .unwrap();
+        inject_proposal_mcp_catalog(&mut k, &ctx);
+
+        let turn = k
+            .prime_turn(&ctx, "use mcp:fs/search then echo hi")
+            .unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::ToolPlanRequest);
+        assert_eq!(turn.disposition, PrimeDisposition::NeedsClarification);
+        assert!(turn.created_task.is_none());
+        let plan = turn.tool_plan_proposal.expect("a preview is attached");
+        assert!(!plan.ready_to_create, "an unreachable server blocks creation");
+        assert!(
+            plan.steps.iter().any(|s| s.plugin == "mcp:fs" && s.readiness == "unavailable"),
+            "the unreachable MCP server's step is unavailable: {:?}",
+            plan.steps
+        );
+        assert!(
+            plan.issues.iter().any(|i| i.contains("fs") && i.contains("unavailable")),
+            "the issue names the unavailable server: {:?}",
+            plan.issues
+        );
+    }
+
+    #[test]
+    fn tool_plan_unregistered_mcp_server_fails_closed() {
+        // A step naming an MCP server that was never discovered this turn (not
+        // registered / not enabled) grounds `unavailable`, never accepted.
+        let (mut k, ctx) = prime_chat_kernel();
+        // No MCP servers registered; the catalog is empty.
+        inject_proposal_mcp_catalog(&mut k, &ctx);
+        let turn = k
+            .prime_turn(&ctx, "use mcp:ghost/search then echo hi")
+            .unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::ToolPlanRequest);
+        let plan = turn.tool_plan_proposal.expect("a preview is attached");
+        assert!(!plan.ready_to_create);
+        assert!(
+            plan.steps.iter().any(|s| s.plugin == "mcp:ghost" && s.readiness == "unavailable"),
+            "the unknown MCP server's step is unavailable: {:?}",
+            plan.steps
+        );
+    }
+
+    #[test]
+    fn mcp_catalog_present_does_not_make_chat_a_tool_plan() {
+        // Requirement 8: an MCP catalog being available must NOT turn a greeting,
+        // frustration, or a vague idea into a tool plan — only an explicit ordered
+        // multi-tool command does (§10.5, §17.1).
+        let (mut k, ctx) = prime_chat_kernel();
+        let endpoint = mock_mcp(mcp_tools_list_bodies(
+            r#"[{"name":"search","description":"Find things."}]"#,
+        ));
+        k.register_mcp_server("fs", &endpoint, "fs server", true, Some(2000))
+            .unwrap();
+        inject_proposal_mcp_catalog(&mut k, &ctx);
+        for msg in [
+            "hey there",
+            "i'm so frustrated, nothing works then it breaks again",
+            "i was thinking maybe we could search files then summarize",
+        ] {
+            let turn = k.prime_turn(&ctx, msg).unwrap();
+            assert_ne!(
+                turn.intent,
+                relux_core::PrimeIntent::ToolPlanRequest,
+                "{msg:?} must not become a tool plan"
+            );
+            assert!(
+                turn.tool_plan_proposal.is_none(),
+                "{msg:?} must attach no tool-plan preview"
+            );
+        }
+    }
+
+    #[test]
+    fn discover_proposal_mcp_catalog_skips_disabled_and_records_failures() {
+        // The off-lock builder: a disabled server is skipped entirely; an enabled but
+        // unreachable one is recorded as unavailable (tools: None + error), never dropped.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let mut k = KernelState::new();
+        k.register_mcp_server("off", &format!("http://127.0.0.1:{port}/mcp"), "x", false, Some(500))
+            .unwrap();
+        k.register_mcp_server("down", &format!("http://127.0.0.1:{port}/mcp"), "x", true, Some(500))
+            .unwrap();
+        let ctx = PrimeContext {
+            namespace: NamespaceId::new("ns"),
+            agent: AgentId::new("a"),
+            actor: "founder".to_string(),
+        };
+        let servers = k.context_snapshot(&ctx).mcp_servers;
+        let catalog = discover_proposal_mcp_catalog(&servers);
+        // The disabled server is absent; the enabled-but-down one is recorded unavailable.
+        assert!(catalog.server("off").is_none(), "disabled server is skipped");
+        let down = catalog.server("down").expect("enabled server recorded");
+        assert!(down.tools.is_none(), "unreachable server has no tools");
+        assert!(down.error.is_some(), "unreachable server carries an error");
     }
 
     #[test]
