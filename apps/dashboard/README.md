@@ -108,6 +108,39 @@ The render path catches **source** regressions; the shipped-bundle path catches
 a **stale committed bundle** — complementary to the dist-parity gate below
 (which rebuilds and diffs the whole bundle).
 
+### Route render smoke (every Relux shell page)
+
+`test/routes-render.test.mjs` extends the same browser-free render harness to the
+three Relux shell routes that previously had **no** render test — **Home** (`/`),
+**Prime** (`/prime`), and **Approvals** (`/approvals`). Each is server-rendered
+through `StaticRouter` at its real path; because effects do not fire under
+`renderToStaticMarkup`, the assertion is on the **first synchronous paint** (the
+loading/empty state a user sees before any fetch returns) — which is exactly where
+a render-time throw produces a blank page. Combined with the existing
+`crew-render` / `work-render` / `health-render` / `plugins-render` harnesses, **all
+seven** Relux routes (`/`, `/prime`, `/work`, `/crew`, `/plugins`, `/approvals`,
+`/health`) now have a render smoke, so a data-router-only hook or a bad first-paint
+destructure fails a test instead of white-screening a route.
+
+This harness also pins a **design-system conformance fix**: `ReluxApprovals` was
+written entirely in Tailwind utility classes (`bg-gray-800` / `text-white` /
+`text-gray-*` / `rounded-lg`), which this project does **not** ship — so the
+Approvals page rendered unstyled and off the B&W aesthetic (no card chrome, action
+"buttons" that looked like plain same-colored text). It is now rebuilt on the
+shared `src/styles.css` system (`card` / `table` / `badge` / `btn` / `banner`),
+matching every other Relux page, with **identical behavior** (the same fetch/poll,
+decide, execute-once, allow-always, revoke, and grant routes). Its in-table agent
+link no longer points at the legacy `/agents/<id>` console (which would leave the
+Relux shell and dead-end) — it links to the in-shell **Crew** page where agent
+governance lives. The render test asserts the page uses `card` chrome and carries
+**no** stray Tailwind class.
+
+> **Runtime route/API smoke.** Beyond the render harness, `scripts/relux-e2e-smoke.ps1`
+> boots the real release binary against a throwaway DB and asserts `GET /dashboard`
+> serves 200 (from the committed `dashboard-dist/`) plus the live `/v1/relux/*`
+> control-plane routes — so the shell and its backing API are proven to serve, not
+> just to compile.
+
 **Why no live-browser click smoke.** The one link the render + bundle paths do
 not exercise is the actual browser binding from the **Continue** button's
 `onClick` to the resume request. Closing it honestly needs a real browser
