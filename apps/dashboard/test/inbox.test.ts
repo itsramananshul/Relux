@@ -17,6 +17,15 @@ import {
   inboxSeverityTone,
   inboxSeverityLabel,
   inboxInvestigationInput,
+  inboxAgeBucket,
+  inboxAgeBucketLabel,
+  inboxAgeTone,
+  inboxAgeDetail,
+  filterInbox,
+  inboxFilterCount,
+  inboxEmptyMessage,
+  INBOX_AGE_THRESHOLDS,
+  INBOX_FILTERS,
   type InboxActionMode,
 } from "../src/inbox.ts";
 import type { ReluxInboxItem, ReluxInboxActionKind } from "../src/api.ts";
@@ -145,4 +154,87 @@ test("inboxInvestigationInput is built only for investigable kinds", () => {
   // Approvals and continuations carry no failure to debug — no seed offered.
   assert.equal(inboxInvestigationInput(item({ kind: "pending_approval" })), null);
   assert.equal(inboxInvestigationInput(item({ kind: "paused_continuation" })), null);
+});
+
+test("inboxAgeBucket bands the LOGICAL-tick age at the configured thresholds", () => {
+  const { fresh, waiting, stale } = INBOX_AGE_THRESHOLDS;
+  // Boundaries are half-open: [0,fresh) fresh, [fresh,waiting) waiting, etc.
+  assert.equal(inboxAgeBucket(0), "fresh");
+  assert.equal(inboxAgeBucket(fresh - 1), "fresh");
+  assert.equal(inboxAgeBucket(fresh), "waiting");
+  assert.equal(inboxAgeBucket(waiting - 1), "waiting");
+  assert.equal(inboxAgeBucket(waiting), "stale");
+  assert.equal(inboxAgeBucket(stale - 1), "stale");
+  assert.equal(inboxAgeBucket(stale), "overdue");
+  assert.equal(inboxAgeBucket(stale + 10_000), "overdue");
+  // No anchor / nonsense age → unknown, never silently "fresh" (no fabricated age).
+  assert.equal(inboxAgeBucket(null), "unknown");
+  assert.equal(inboxAgeBucket(undefined), "unknown");
+  assert.equal(inboxAgeBucket(-5), "unknown");
+  assert.equal(inboxAgeBucket(Number.NaN), "unknown");
+});
+
+test("age bucket labels + tones are honest and restrained", () => {
+  assert.equal(inboxAgeBucketLabel("fresh"), "Fresh");
+  assert.equal(inboxAgeBucketLabel("waiting"), "Waiting");
+  assert.equal(inboxAgeBucketLabel("stale"), "Stale");
+  assert.equal(inboxAgeBucketLabel("overdue"), "Overdue");
+  assert.equal(inboxAgeBucketLabel("unknown"), "Age unavailable");
+  // Only the bands that need the operator sooner carry color; the rest stay faint.
+  assert.equal(inboxAgeTone("overdue"), "blocked");
+  assert.equal(inboxAgeTone("stale"), "in_progress");
+  assert.equal(inboxAgeTone("waiting"), "backlog");
+  assert.equal(inboxAgeTone("fresh"), "backlog");
+  assert.equal(inboxAgeTone("unknown"), "backlog");
+});
+
+test("inboxAgeDetail reports ticks (never wall-clock units), or null when unknown", () => {
+  assert.equal(inboxAgeDetail(1), "1 tick");
+  assert.equal(inboxAgeDetail(0), "0 ticks");
+  assert.equal(inboxAgeDetail(42), "42 ticks");
+  assert.equal(inboxAgeDetail(7.9), "7 ticks"); // floored, still honest
+  assert.equal(inboxAgeDetail(null), null);
+  assert.equal(inboxAgeDetail(undefined), null);
+  assert.equal(inboxAgeDetail(-1), null);
+});
+
+test("filterInbox keeps all / a kind / only overdue", () => {
+  const items: ReluxInboxItem[] = [
+    item({ id: "approval:1", kind: "pending_approval", age_ticks: 5 }),
+    item({ id: "run:1", kind: "failed_run", age_ticks: INBOX_AGE_THRESHOLDS.stale + 1 }),
+    item({ id: "task:1", kind: "blocked_task", age_ticks: 10 }),
+    item({ id: "task:2", kind: "blocked_task", age_ticks: INBOX_AGE_THRESHOLDS.stale + 9 }),
+  ];
+  assert.equal(filterInbox(items, "all").length, 4);
+  assert.deepEqual(
+    filterInbox(items, "blocked_task").map((i) => i.id),
+    ["task:1", "task:2"],
+  );
+  assert.deepEqual(
+    filterInbox(items, "pending_approval").map((i) => i.id),
+    ["approval:1"],
+  );
+  // Overdue is a band cut across kinds — only the items past the stale threshold.
+  assert.deepEqual(
+    filterInbox(items, "overdue").map((i) => i.id),
+    ["run:1", "task:2"],
+  );
+  // Counts mirror the filter.
+  assert.equal(inboxFilterCount(items, "all"), 4);
+  assert.equal(inboxFilterCount(items, "overdue"), 2);
+  assert.equal(inboxFilterCount(items, "paused_continuation"), 0);
+});
+
+test("INBOX_FILTERS covers all/kinds/overdue and inboxEmptyMessage reflects the active filter", () => {
+  assert.deepEqual(
+    INBOX_FILTERS.map((f) => f.key),
+    ["all", "pending_approval", "failed_run", "blocked_task", "paused_continuation", "overdue"],
+  );
+  // Each filter has an honest, filter-specific empty line (not the global one).
+  assert.match(inboxEmptyMessage("all"), /Nothing needs you/);
+  assert.match(inboxEmptyMessage("pending_approval"), /approvals/i);
+  assert.match(inboxEmptyMessage("failed_run"), /failed runs/i);
+  assert.match(inboxEmptyMessage("blocked_task"), /blocked/i);
+  assert.match(inboxEmptyMessage("paused_continuation"), /paused/i);
+  assert.match(inboxEmptyMessage("overdue"), /overdue/i);
 });

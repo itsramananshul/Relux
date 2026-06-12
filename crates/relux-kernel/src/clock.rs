@@ -42,10 +42,21 @@ impl Clock {
     pub fn tick(&mut self) -> String {
         let t = self.secs;
         self.secs += 1;
-        let secs = t % 60;
-        let mins = (t / 60) % 60;
-        let hours = (t / 3600) % 24;
-        format!("2026-06-08T{hours:02}:{mins:02}:{secs:02}Z")
+        Self::render(t)
+    }
+
+    /// Render a logical-second count as the deterministic ISO-shaped stamp — the
+    /// SAME shape [`Clock::tick`] returns — WITHOUT advancing the clock. Used to
+    /// stamp an "attention since" anchor from a stored logical-second count (e.g.
+    /// the Inbox ageing projection) so it matches the stamps already persisted on
+    /// runs/tasks/approvals. Seconds roll into minutes and minutes into hours
+    /// (`hours = (t / 3600) % 24`), so the rendered string is unambiguous within a
+    /// 24-logical-hour window.
+    pub fn render(secs: u64) -> String {
+        let s = secs % 60;
+        let mins = (secs / 60) % 60;
+        let hours = (secs / 3600) % 24;
+        format!("2026-06-08T{hours:02}:{mins:02}:{s:02}Z")
     }
 }
 

@@ -1953,6 +1953,21 @@ struct InboxItem {
     /// dashboard's investigate/diagnose framing). Absent for non-failure items.
     #[serde(skip_serializing_if = "Option::is_none")]
     failure_class: Option<String>,
+    /// The logical-clock stamp this item began needing attention (the per-kind
+    /// anchor: an approval's `created_at`, a run's `ended_at`/`started_at`, a blocked
+    /// task's `updated_at`, a continuation's `created_at`). It is a DETERMINISTIC
+    /// LOGICAL-CLOCK stamp, not a wall-clock instant (`crate::clock`). `None` when the
+    /// kind carries no usable stamp — the dashboard then says "age unavailable" rather
+    /// than inventing one. Presentation/provenance only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attention_since: Option<String>,
+    /// Logical-clock ticks elapsed since `attention_since`, measured against the
+    /// kernel's current clock — i.e. how many kernel events have passed while this item
+    /// waited. NOT wall-clock seconds. Drives the dashboard's ageing/SLA bucket
+    /// (fresh / waiting / stale / overdue) and the oldest-first ordering within a
+    /// severity. `None` when there is no anchor to measure from (age unavailable).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    age_ticks: Option<u64>,
     /// For a `pending_approval` item: the full approval record (the same
     /// [`ReluxApprovalRecord`] the Approvals page and the Work oversight strip
     /// consume), so the dashboard can offer the INLINE approve / allow-always / deny
@@ -2049,6 +2064,64 @@ fn inbox_run_silently_retrying(run: &relux_core::Run) -> bool {
             .is_some_and(|r| !r.exhausted)
 }
 
+/// Parse a logical-clock stamp (`2026-06-08THH:MM:SSZ`, the shape `Clock::tick`
+/// renders) back to its seconds-of-day (`0..86_400`). Returns `None` for any string
+/// not in that exact shape — the Inbox then reports the age as honestly unavailable
+/// rather than guessing. The clock rolls seconds→minutes→hours and wraps the day
+/// component, so this recovers the within-day position, which is all the age math needs.
+fn inbox_stamp_secs_of_day(stamp: &str) -> Option<u64> {
+    // ...THH:MM:SSZ  → take the time component after 'T', drop a trailing 'Z'.
+    let time = stamp.split('T').nth(1)?;
+    let time = time.strip_suffix('Z').unwrap_or(time);
+    let mut parts = time.split(':');
+    let h: u64 = parts.next()?.parse().ok()?;
+    let m: u64 = parts.next()?.parse().ok()?;
+    let s: u64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || h >= 24 || m >= 60 || s >= 60 {
+        return None;
+    }
+    Some(h * 3600 + m * 60 + s)
+}
+
+/// Logical ticks elapsed since `stamp_secs_of_day`, measured against the kernel's
+/// current logical clock (`now_secs`). The rendered stamp wraps every 24 logical hours,
+/// so this is the wrap-adjusted distance within that window — exact while the item is
+/// less than one logical day old (the realistic case for a local session). It is a
+/// real measure off the kernel's own clock, never fabricated.
+fn inbox_logical_age(now_secs: u64, stamp_secs_of_day: u64) -> u64 {
+    let now_of_day = now_secs % 86_400;
+    if now_of_day >= stamp_secs_of_day {
+        now_of_day - stamp_secs_of_day
+    } else {
+        now_of_day + 86_400 - stamp_secs_of_day
+    }
+}
+
+/// The age fields for an item anchored on a logical-clock STAMP STRING (approval /
+/// run / task). Returns `(attention_since, age_ticks)`: the raw stamp is always carried
+/// when present (provenance), and the age is filled only when the stamp parses — an
+/// unparseable stamp yields an honest `None` age, not a guess.
+fn inbox_age_from_stamp(now_secs: u64, stamp: Option<&str>) -> (Option<String>, Option<u64>) {
+    match stamp {
+        Some(s) if !s.trim().is_empty() => {
+            let age = inbox_stamp_secs_of_day(s).map(|secs| inbox_logical_age(now_secs, secs));
+            (Some(s.to_string()), age)
+        }
+        _ => (None, None),
+    }
+}
+
+/// The ordering key for ageing-aware sort: a KNOWN age (rank 1) always outranks an
+/// unknown one (rank 0); within a known age, a larger value is older. Combined with a
+/// descending sort, this surfaces the oldest items of a given severity first while
+/// pushing age-unknown items last (§6.11 ageing rule).
+fn inbox_age_order_key(item: &InboxItem) -> (u8, u64) {
+    match item.age_ticks {
+        Some(a) => (1, a),
+        None => (0, 0),
+    }
+}
+
 /// `GET /v1/relux/inbox` — the cross-Guild attention queue (`docs/relix-dashboard-design.md`
 /// §5; `docs/relix-execution-and-issue-design.md` §3.3b). Read-only: it composes live
 /// state into unified items, adds no authority, and mutates nothing.
@@ -2056,6 +2129,10 @@ async fn get_inbox(State(state): State<AppState>) -> Result<Json<InboxResponse>,
     let resp = locked_read(&state, |kernel| {
         let mut items: Vec<InboxItem> = Vec::new();
         let mut truncated = false;
+        // The current logical-clock position: every item's age is the number of ticks
+        // (kernel events) since its stamped "attention since" anchor, NOT wall-clock
+        // time (`crate::clock` is a deterministic logical clock).
+        let now_secs = kernel.clock_secs();
 
         // 1) Pending approvals — every one is something only the operator can clear.
         {
@@ -2066,6 +2143,9 @@ async fn get_inbox(State(state): State<AppState>) -> Result<Json<InboxResponse>,
                 .collect();
             pending.sort_by(|a, b| b.created_at.cmp(&a.created_at));
             for a in pending {
+                // An approval has waited since it was requested (`created_at`).
+                let (attention_since, age_ticks) =
+                    inbox_age_from_stamp(now_secs, Some(a.created_at.as_str()));
                 items.push(InboxItem {
                     id: format!("approval:{}", a.id),
                     kind: "pending_approval".to_string(),
@@ -2077,6 +2157,8 @@ async fn get_inbox(State(state): State<AppState>) -> Result<Json<InboxResponse>,
                     approval_id: Some(a.id.to_string()),
                     continuation_id: None,
                     failure_class: None,
+                    attention_since,
+                    age_ticks,
                     // Embed the full approval so the Inbox row can offer the same
                     // inline decisions the Work oversight strip does, with no second
                     // fetch. The decision still flows through the existing routes.
@@ -2147,6 +2229,12 @@ async fn get_inbox(State(state): State<AppState>) -> Result<Json<InboxResponse>,
                         }
                     }
                 };
+                // A failed/cancelled run has needed attention since it ended (or, if it
+                // somehow has no end stamp, since it started).
+                let (attention_since, age_ticks) = inbox_age_from_stamp(
+                    now_secs,
+                    r.ended_at.as_deref().or(r.started_at.as_deref()),
+                );
                 items.push(InboxItem {
                     id: format!("run:{}", r.id),
                     kind: "failed_run".to_string(),
@@ -2166,6 +2254,8 @@ async fn get_inbox(State(state): State<AppState>) -> Result<Json<InboxResponse>,
                     continuation_id: None,
                     failure_class: fc,
                     approval: None,
+                    attention_since,
+                    age_ticks,
                     actions,
                     link: "/work".to_string(),
                 });
@@ -2221,6 +2311,16 @@ async fn get_inbox(State(state): State<AppState>) -> Result<Json<InboxResponse>,
                     "On hold — reopen to put it back in the run lifecycle.".to_string()
                 };
 
+                // A blocked task has needed a decision since it last changed state
+                // (`updated_at` — set when it moved to Blocked); fall back to creation.
+                let (attention_since, age_ticks) = inbox_age_from_stamp(
+                    now_secs,
+                    Some(if t.updated_at.is_empty() {
+                        t.created_at.as_str()
+                    } else {
+                        t.updated_at.as_str()
+                    }),
+                );
                 items.push(InboxItem {
                     id: format!("task:{}", t.id),
                     kind: "blocked_task".to_string(),
@@ -2233,6 +2333,8 @@ async fn get_inbox(State(state): State<AppState>) -> Result<Json<InboxResponse>,
                     continuation_id: None,
                     failure_class: fc,
                     approval: None,
+                    attention_since,
+                    age_ticks,
                     actions,
                     link: "/work".to_string(),
                 });
@@ -2264,6 +2366,17 @@ async fn get_inbox(State(state): State<AppState>) -> Result<Json<InboxResponse>,
                     vec!["continue".to_string(), "inspect".to_string()],
                 )
             };
+            // The continuation carries an integer logical-clock anchor directly, so the
+            // age is the exact tick distance (no string parse / wrap needed). Render the
+            // same stamp shape for provenance.
+            let (attention_since, age_ticks) =
+                match kernel.current_prime_continuation_created_secs() {
+                    Some(created) => (
+                        Some(relux_kernel::Clock::render(created)),
+                        Some(now_secs.saturating_sub(created)),
+                    ),
+                    None => (None, None),
+                };
             items.push(InboxItem {
                 id: format!("continuation:{}", c.id),
                 kind: "paused_continuation".to_string(),
@@ -2276,15 +2389,23 @@ async fn get_inbox(State(state): State<AppState>) -> Result<Json<InboxResponse>,
                 continuation_id: Some(c.id.clone()),
                 failure_class: None,
                 approval: None,
+                attention_since,
+                age_ticks,
                 actions,
                 link: "/work".to_string(),
             });
         }
 
-        // Most-urgent first: severity, then by id-bearing recency (stable for equal sev).
+        // Most-urgent first: severity, then OLDEST-first within a severity so an aged
+        // item surfaces above a fresh one (the §6.11 ageing rule — older urgent items
+        // are obvious). A known age outranks an age-unknown item; ties break by id desc
+        // for a stable order. Because the ageing bucket (fresh/waiting/stale/overdue) is
+        // monotonic in age, ordering by age descending already places overdue before
+        // stale before waiting before fresh — no separate bucket key is needed.
         items.sort_by(|a, b| {
             inbox_severity_rank(&a.severity)
                 .cmp(&inbox_severity_rank(&b.severity))
+                .then_with(|| inbox_age_order_key(b).cmp(&inbox_age_order_key(a)))
                 .then_with(|| b.id.cmp(&a.id))
         });
 
@@ -11274,6 +11395,105 @@ mod tests {
             .map(|a| a.as_str().unwrap().to_string())
             .collect();
         assert!(actions.contains(&"open_approval".to_string()));
+    }
+
+    #[test]
+    fn inbox_stamp_parse_and_logical_age_are_honest() {
+        // A well-formed logical-clock stamp parses to its seconds-of-day.
+        assert_eq!(inbox_stamp_secs_of_day("2026-06-08T00:00:00Z"), Some(0));
+        assert_eq!(inbox_stamp_secs_of_day("2026-06-08T00:01:00Z"), Some(60));
+        assert_eq!(inbox_stamp_secs_of_day("2026-06-08T01:02:03Z"), Some(3723));
+        // Anything not in the exact shape yields None — the age is then "unavailable",
+        // never a guess.
+        assert_eq!(inbox_stamp_secs_of_day("not-a-stamp"), None);
+        assert_eq!(inbox_stamp_secs_of_day("2026-06-08T99:00:00Z"), None);
+        assert_eq!(inbox_stamp_secs_of_day("2026-06-08T00:00Z"), None);
+        assert_eq!(inbox_stamp_secs_of_day(""), None);
+
+        // The age is the wrap-adjusted tick distance from the stamp to `now`.
+        assert_eq!(inbox_logical_age(100, 40), 60); // forward within the day
+        assert_eq!(inbox_logical_age(40, 40), 0); // same instant
+        // `now` has wrapped past midnight relative to the stamp → +86_400 adjusted.
+        assert_eq!(inbox_logical_age(10, 86_390), 20);
+
+        // The end-to-end helper carries the raw stamp and fills the age only when it parses.
+        let (since, age) = inbox_age_from_stamp(100, Some("2026-06-08T00:00:40Z"));
+        assert_eq!(since.as_deref(), Some("2026-06-08T00:00:40Z"));
+        assert_eq!(age, Some(60));
+        // A present-but-unparseable stamp keeps provenance but reports no age.
+        let (since, age) = inbox_age_from_stamp(100, Some("garbage"));
+        assert_eq!(since.as_deref(), Some("garbage"));
+        assert_eq!(age, None);
+        // No stamp at all → nothing to show, nothing invented.
+        assert_eq!(inbox_age_from_stamp(100, None), (None, None));
+        assert_eq!(inbox_age_from_stamp(100, Some("   ")), (None, None));
+    }
+
+    #[tokio::test]
+    async fn inbox_items_carry_logical_age_and_sort_oldest_first() {
+        // Each attention item is stamped with its logical-clock "attention since"
+        // anchor and a logical-tick age; within a severity the OLDER item sorts first
+        // (the §6.11 ageing rule — older urgent items are obvious). Two blocked tasks
+        // (same `warn` severity) are blocked at different clock points, so the one
+        // blocked EARLIER has a larger age and must lead.
+        let (state, _dir) = auth_state(true);
+
+        // Block task A first, then task B — every kernel op advances the logical clock,
+        // so A's `updated_at` is at a lower tick than B's, giving A the larger age.
+        let mut ids: Vec<String> = Vec::new();
+        for title in ["older blocked", "newer blocked"] {
+            let (cs, _, cb) = call(
+                &state,
+                "POST",
+                "/v1/relux/tasks",
+                None,
+                Some(&format!(r#"{{"title":"{title}"}}"#)),
+            )
+            .await;
+            assert_eq!(cs, StatusCode::OK, "{cb}");
+            let created: serde_json::Value = serde_json::from_str(&cb).unwrap();
+            let id = created["id"].as_str().unwrap().to_string();
+            let (bs, _, bb) = call(
+                &state,
+                "POST",
+                &format!("/v1/relux/tasks/{id}/status"),
+                None,
+                Some(r#"{"status":"blocked"}"#),
+            )
+            .await;
+            assert_eq!(bs, StatusCode::OK, "{bb}");
+            ids.push(id);
+        }
+        let (older, newer) = (&ids[0], &ids[1]);
+
+        let (status, _, body) = call(&state, "GET", "/v1/relux/inbox", None, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let items = v["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2, "both blocked tasks are attention items");
+
+        // Both items carry a real logical-clock anchor + a numeric age (never fabricated).
+        for it in items {
+            assert!(
+                it["attention_since"].as_str().is_some(),
+                "every item carries its attention-since stamp: {it}"
+            );
+            assert!(
+                it["age_ticks"].as_u64().is_some(),
+                "every item carries a logical-tick age: {it}"
+            );
+        }
+
+        // Oldest-first within the (equal) severity: the earlier-blocked task leads and
+        // has the larger age.
+        assert_eq!(items[0]["task_id"].as_str().unwrap(), older, "oldest leads");
+        assert_eq!(items[1]["task_id"].as_str().unwrap(), newer);
+        let age_older = items[0]["age_ticks"].as_u64().unwrap();
+        let age_newer = items[1]["age_ticks"].as_u64().unwrap();
+        assert!(
+            age_older > age_newer,
+            "the earlier-blocked task is older ({age_older} > {age_newer})"
+        );
     }
 
     #[tokio::test]

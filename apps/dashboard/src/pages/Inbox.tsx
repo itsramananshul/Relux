@@ -15,6 +15,15 @@ import {
   inboxInvestigationInput,
   inboxSeverityLabel,
   inboxSeverityTone,
+  inboxAgeBucket,
+  inboxAgeBucketLabel,
+  inboxAgeTone,
+  inboxAgeDetail,
+  filterInbox,
+  inboxFilterCount,
+  inboxEmptyMessage,
+  INBOX_FILTERS,
+  type InboxFilter,
 } from "../inbox";
 import { buildInvestigationSeed, stashInvestigationSeed } from "../investigateseed";
 import { ApprovalInlineDecisions } from "../components/ApprovalInlineDecisions";
@@ -41,6 +50,35 @@ type DiagState =
   | { status: "loading" }
   | { status: "done"; result: ReluxDiagnostic }
   | { status: "error"; message: string };
+
+// The compact ageing / SLA badge on a row. The kernel uses a deterministic LOGICAL
+// clock (not wall-clock), so the age is a count of kernel events ("ticks") since the
+// item began needing attention — never a real-time duration or deadline. An item with
+// no anchor honestly reads "age unavailable" instead of inventing one (§6.11).
+function AgeBadge({ item }: { item: ReluxInboxItem }) {
+  const bucket = inboxAgeBucket(item.age_ticks);
+  const detail = inboxAgeDetail(item.age_ticks);
+  if (bucket === "unknown") {
+    return (
+      <span
+        className="mono muted"
+        style={{ fontSize: 9 }}
+        title="No timestamp anchor for this item — its age can't be measured, so none is shown (no fabricated deadline)."
+      >
+        age unavailable
+      </span>
+    );
+  }
+  const tip =
+    `${detail ?? ""} since it needed attention. The kernel uses a deterministic ` +
+    `logical clock, so this counts kernel events (ticks), not wall-clock time.`;
+  return (
+    <span className={"badge " + inboxAgeTone(bucket)} style={{ fontSize: 9 }} title={tip}>
+      {inboxAgeBucketLabel(bucket)}
+      {detail ? ` · ${detail}` : ""}
+    </span>
+  );
+}
 
 export function InboxRow({ item, onActed }: { item: ReluxInboxItem; onActed: () => void }) {
   const navigate = useNavigate();
@@ -137,6 +175,7 @@ export function InboxRow({ item, onActed }: { item: ReluxInboxItem; onActed: () 
         <span className={"badge " + inboxSeverityTone(item.severity)} style={{ fontSize: 9 }}>
           {inboxSeverityLabel(item.severity)}
         </span>
+        <AgeBadge item={item} />
         <span style={{ fontWeight: 600, fontSize: 13 }}>{item.title}</span>
         <div className="spacer" style={{ flex: 1 }} />
         <span className="mono muted" style={{ fontSize: 10 }}>{item.id}</span>
@@ -216,7 +255,13 @@ export function InboxRow({ item, onActed }: { item: ReluxInboxItem; onActed: () 
 
 export function Inbox() {
   const { data, loading, error, reload } = useAsync<ReluxInbox>(() => reluxInbox.get(), []);
-  const groups = data ? groupInbox(data.items) : [];
+  const [filter, setFilter] = useState<InboxFilter>("all");
+  const allItems = data?.items ?? [];
+  const visible = filterInbox(allItems, filter);
+  const groups = groupInbox(visible);
+  // The active filter narrowed a non-empty queue to nothing (vs. a globally empty
+  // Inbox) — the empty state reflects which.
+  const filteredToEmpty = allItems.length > 0 && visible.length === 0;
 
   return (
     <div className="grid" style={{ paddingBottom: 16 }}>
@@ -228,11 +273,33 @@ export function Inbox() {
         </button>
       </div>
       <p className="muted" style={{ fontSize: 12, marginTop: 0, lineHeight: 1.6 }}>
-        Everything across the Guild that needs you, most urgent first — pending approvals,
-        hard-failed runs, blocked work, and paused loops. Transient failures that retry on their
-        own never appear here, so this stays signal, not noise. Every action reuses an existing
-        control; nothing runs without your click.
+        Everything across the Guild that needs you, most urgent first, then oldest-first within a
+        severity — pending approvals, hard-failed runs, blocked work, and paused loops. Each row
+        carries an ageing band (fresh / waiting / stale / overdue) measured in the kernel's logical
+        clock ticks, not wall-clock time. Transient failures that retry on their own never appear
+        here, so this stays signal, not noise. Every action reuses an existing control; nothing
+        runs without your click.
       </p>
+
+      {/* Filter chips — a cheap cut by kind, plus an overdue-only band. The active
+          chip carries the live count; selecting one narrows the queue below. */}
+      <div className="row wrap" style={{ gap: 6, marginBottom: 4 }}>
+        {INBOX_FILTERS.map((f) => {
+          const active = filter === f.key;
+          const count = inboxFilterCount(allItems, f.key);
+          return (
+            <button
+              key={f.key}
+              className={"btn sm" + (active ? "" : " ghost")}
+              aria-pressed={active}
+              onClick={() => setFilter(f.key)}
+            >
+              {f.label}
+              <span className="mono muted" style={{ fontSize: 10, marginLeft: 6 }}>{count}</span>
+            </button>
+          );
+        })}
+      </div>
 
       {error && (
         <div className="banner err" style={{ fontSize: 12 }}>
@@ -240,7 +307,7 @@ export function Inbox() {
         </div>
       )}
 
-      {data && data.items.length === 0 && (
+      {data && allItems.length === 0 && (
         <div className="card">
           <div className="empty" style={{ padding: 24, textAlign: "center" }}>
             <div style={{ fontSize: 28, marginBottom: 8 }}>✓</div>
@@ -248,6 +315,17 @@ export function Inbox() {
             <div className="muted" style={{ fontSize: 12 }}>
               No pending approvals, no hard-failed runs, no blocked work, no paused loops. New
               escalations will appear here.
+            </div>
+          </div>
+        </div>
+      )}
+
+      {filteredToEmpty && (
+        <div className="card">
+          <div className="empty" style={{ padding: 24, textAlign: "center" }}>
+            <div style={{ fontWeight: 600, marginBottom: 4 }}>{inboxEmptyMessage(filter)}</div>
+            <div className="muted" style={{ fontSize: 12 }}>
+              Other attention items are still queued — clear the filter to see them.
             </div>
           </div>
         </div>

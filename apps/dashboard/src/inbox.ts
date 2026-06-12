@@ -186,6 +186,143 @@ export function inboxSeverityLabel(severity: ReluxInboxItem["severity"]): string
   }
 }
 
+// ---------------------------------------------------------------------------
+// Ageing / SLA (docs/relix-dashboard-design.md §6.11 "triage SLAs / ageing").
+//
+// IMPORTANT — the kernel uses a DETERMINISTIC LOGICAL CLOCK (crates/relux-kernel/
+// src/clock.rs), not wall-clock time. The backend's `age_ticks` is therefore the
+// number of kernel EVENTS (ticks) that have elapsed since an item began needing
+// attention — NOT a count of real seconds. So this surface never claims a wall-clock
+// duration or a real deadline; it buckets the honest logical age into urgency bands
+// and, when an item carries no anchor at all, says so ("age unavailable") rather than
+// inventing one (the §6.11 / mission "no fake deadlines" rule).
+// ---------------------------------------------------------------------------
+
+// The urgency band for an item's logical age. "unknown" = no anchor to measure from.
+export type InboxAgeBucket = "fresh" | "waiting" | "stale" | "overdue" | "unknown";
+
+// Static, configurable thresholds in LOGICAL-CLOCK TICKS (kernel events), not wall
+// seconds. An item younger than `fresh` ticks is fresh; `< waiting` is waiting; `<
+// stale` is stale; at/above `stale` it is overdue. Tunable in one place.
+export const INBOX_AGE_THRESHOLDS = {
+  fresh: 30,
+  waiting: 120,
+  stale: 600,
+} as const;
+
+// Bucket a logical-tick age. A missing / non-finite / negative age is honestly
+// "unknown" (the row shows "age unavailable"), never silently treated as fresh.
+export function inboxAgeBucket(ageTicks: number | null | undefined): InboxAgeBucket {
+  if (ageTicks == null || !Number.isFinite(ageTicks) || ageTicks < 0) return "unknown";
+  if (ageTicks < INBOX_AGE_THRESHOLDS.fresh) return "fresh";
+  if (ageTicks < INBOX_AGE_THRESHOLDS.waiting) return "waiting";
+  if (ageTicks < INBOX_AGE_THRESHOLDS.stale) return "stale";
+  return "overdue";
+}
+
+// The short human word for a bucket (the age badge's text).
+export function inboxAgeBucketLabel(bucket: InboxAgeBucket): string {
+  switch (bucket) {
+    case "fresh":
+      return "Fresh";
+    case "waiting":
+      return "Waiting";
+    case "stale":
+      return "Stale";
+    case "overdue":
+      return "Overdue";
+    default:
+      return "Age unavailable";
+  }
+}
+
+// The restrained B&W badge tone for an age bucket, onto the existing chip vocabulary
+// (styles.css): overdue reads as the error/blocked tone, stale as the warn
+// (in_progress) tone, and fresh/waiting/unknown stay faint (backlog) — color is
+// reserved for the bands that actually need the operator sooner.
+export function inboxAgeTone(
+  bucket: InboxAgeBucket,
+): "blocked" | "in_progress" | "backlog" {
+  switch (bucket) {
+    case "overdue":
+      return "blocked";
+    case "stale":
+      return "in_progress";
+    default:
+      return "backlog";
+  }
+}
+
+// The honest tick-count detail for a row (e.g. "12 ticks"), or null when no age is
+// available. Deliberately uses "ticks" (logical clock events), never "seconds" /
+// "min", so it can't be misread as wall-clock time.
+export function inboxAgeDetail(ageTicks: number | null | undefined): string | null {
+  if (ageTicks == null || !Number.isFinite(ageTicks) || ageTicks < 0) return null;
+  const n = Math.floor(ageTicks);
+  return `${n} tick${n === 1 ? "" : "s"}`;
+}
+
+// ---------------------------------------------------------------------------
+// Filtering (docs/relix-dashboard-design.md §6.11 "filtering of the queue").
+// ---------------------------------------------------------------------------
+
+// The Inbox filter: "all", one of the item kinds, or the cheap "overdue" band cut.
+export type InboxFilter = ReluxInboxKind | "all" | "overdue";
+
+export interface InboxFilterSpec {
+  key: InboxFilter;
+  label: string;
+}
+
+// The filter chips shown above the queue, in a stable order: All, then per-kind, then
+// the overdue-only band cut.
+export const INBOX_FILTERS: InboxFilterSpec[] = [
+  { key: "all", label: "All" },
+  { key: "pending_approval", label: "Approvals" },
+  { key: "failed_run", label: "Failed runs" },
+  { key: "blocked_task", label: "Blocked" },
+  { key: "paused_continuation", label: "Paused" },
+  { key: "overdue", label: "Overdue" },
+];
+
+// Apply a filter to the item list. "all" passes everything; "overdue" keeps only the
+// items whose logical age is in the overdue band; any kind keeps only that kind. Pure
+// and order-preserving (the backend already sorted by severity then oldest-first).
+export function filterInbox(
+  items: ReluxInboxItem[],
+  filter: InboxFilter,
+): ReluxInboxItem[] {
+  if (filter === "all") return items;
+  if (filter === "overdue") {
+    return items.filter((it) => inboxAgeBucket(it.age_ticks) === "overdue");
+  }
+  return items.filter((it) => it.kind === filter);
+}
+
+// How many items a filter would show — for the count on each filter chip.
+export function inboxFilterCount(items: ReluxInboxItem[], filter: InboxFilter): number {
+  return filterInbox(items, filter).length;
+}
+
+// The honest empty-state line for the ACTIVE filter, so an empty filtered view reads
+// correctly ("No overdue items", not the global "Nothing needs you").
+export function inboxEmptyMessage(filter: InboxFilter): string {
+  switch (filter) {
+    case "pending_approval":
+      return "No pending approvals need you right now.";
+    case "failed_run":
+      return "No hard-failed runs need attention.";
+    case "blocked_task":
+      return "No blocked work is waiting on a decision.";
+    case "paused_continuation":
+      return "No paused Prime loops are waiting.";
+    case "overdue":
+      return "Nothing is overdue.";
+    default:
+      return "Nothing needs you right now.";
+  }
+}
+
 // Build the safe, redacted Prime investigation seed input for an item (consumed by
 // investigateseed.buildInvestigationSeed in the page). It carries only the item's
 // identity + the deterministic summary the projection already redacted/bounded — no

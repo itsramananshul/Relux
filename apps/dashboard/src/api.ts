@@ -3536,6 +3536,17 @@ export interface ReluxInboxItem {
   approval_id?: string | null;
   continuation_id?: string | null;
   failure_class?: string | null;
+  // The logical-clock stamp this item began needing attention (the per-kind anchor:
+  // an approval's created_at, a run's ended/started, a blocked task's updated, a
+  // continuation's created). It is a DETERMINISTIC LOGICAL-CLOCK stamp, not a
+  // wall-clock instant. Absent when the kind carries no usable stamp — the row then
+  // says "age unavailable" instead of inventing one.
+  attention_since?: string | null;
+  // Logical-clock ticks elapsed since attention_since (how many kernel events passed
+  // while this item waited), NOT wall-clock seconds. Drives the ageing/SLA bucket
+  // (fresh / waiting / stale / overdue) and the oldest-first ordering. Absent → age
+  // unavailable.
+  age_ticks?: number | null;
   // For a pending_approval item: the full approval record (the same shape the
   // Approvals page + Work oversight strip consume), so the Inbox row can offer the
   // inline approve / allow-always / deny decisions without a second fetch. Present

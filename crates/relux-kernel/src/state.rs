@@ -8904,6 +8904,28 @@ impl KernelState {
             .map(|c| c.handle())
     }
 
+    /// The current logical-clock position (the monotonic second count the kernel has
+    /// advanced to). Read-only and side-effect free — it does NOT advance the clock.
+    /// Used by read-only projections (e.g. the Inbox ageing surface) to measure how
+    /// many logical ticks have elapsed since an item's stamped "attention since"
+    /// anchor. This is a logical/event count, never a wall-clock instant.
+    pub fn clock_secs(&self) -> u64 {
+        self.clock.secs()
+    }
+
+    /// The `created_at_secs` (logical-clock anchor) of the SAME live continuation
+    /// [`current_prime_continuation_handle`] would surface, so a caller can age the
+    /// paused-loop Inbox item honestly. `None` when there is no live continuation
+    /// (mirrors the handle's non-expired + most-recent selection exactly).
+    pub fn current_prime_continuation_created_secs(&self) -> Option<u64> {
+        let now = self.clock.secs();
+        self.prime_agent_continuations
+            .values()
+            .filter(|c| now < c.expires_at_secs)
+            .max_by_key(|c| c.created_at_secs)
+            .map(|c| c.created_at_secs)
+    }
+
     /// Read (clone, WITHOUT consuming) the continuation for this conversation IF the supplied token
     /// matches and it is not expired. `None` (fail closed) on an unknown / mismatched / expired
     /// token — a stale or wrong token can never resume a loop, and a mismatched token never disturbs
