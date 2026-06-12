@@ -89,6 +89,46 @@ presented as a capability).
   `apps/dashboard/src/api.ts`, `apps/dashboard/src/components/PrimeAgentPolicyPanel.tsx`,
   `apps/dashboard/src/toolruntask.ts`.
 
+### 4. Orchestration width + read-only context rounds → configurable policy (one autonomy dial)
+- **Was:** the two items below previously sat in **LATER** — orchestration fan-out width
+  (`MAX_ORCHESTRATION_STEPS`) and the read-only context-loop round budget (`MAX_TOOL_ROUNDS`)
+  were each a bare module constant. They were already *raised* (6→16 and 4→8) and honest, but
+  they could not be tuned per deployment, and the planner / brain-proposal paths read the
+  constant directly, so there was no single operator dial.
+- **Now:** both are folded into the existing operator-facing autonomy surface
+  (`relux_core::PrimeAgentPolicy`) alongside the agent-loop + tool-plan limits — the same
+  `iteration_budget.py` precedent (a tunable bound, not a tiny constant). Four new fields:
+  `max_orchestration_steps` (standard, default **16**) / `extended_max_orchestration_steps`
+  (default **64**), clamped to the shared `MAX_ORCHESTRATION_STEPS_CEIL` (**64**); and
+  `max_context_rounds` (standard, default **8**, aligned with `MAX_TOOL_ROUNDS`) /
+  `extended_max_context_rounds` (default **32**), clamped to `MAX_CONTEXT_ROUNDS_CEIL` (**64**).
+  - **Orchestration:** the planner now takes the configured width as an argument
+    (`relux_core::plan_orchestration_with_limit`; the bare `plan_orchestration` keeps the
+    default constant for callers without a policy). Both authoritative create-paths read the
+    SAME resolved width (`PrimeAgentPolicy::orchestration_steps`): `prime_orchestrate` (the
+    deterministic create) and `reconcile_orchestration_slots` (the brain-proposal path), so they
+    can never fan out to different widths. The preview route resolves the same width so the
+    previewed brief count matches what "Create" produces. Beyond the width the overflow note
+    **names the active limit and how to raise it** (autonomy limits / extended mode) — never a
+    silent drop.
+  - **Read-only context loop:** `ContextLoop` / the up-front `execute_requested_reads` executor
+    now take the resolved round budget (`PrimeAgentPolicy::context_rounds`), threaded from the
+    server preview block into the observe-then-act `DecisionLoop` and the sidecar `ContextLoop`.
+    The parse path bounds the request list at the absolute ceiling (so a list authored under a
+    raised/extended policy still reads back); the configured budget is applied at RESOLVE time.
+    The no-progress / repeat early-stop safety is preserved exactly.
+  - **Surface:** the four fields are on `/v1/relux/prime/agent-policy` (GET resolves them per
+    profile; PUT/PATCH clamps them) and the `prime agent-policy configure` CLI
+    (`--max-orchestration-steps` / `--ext-…`, `--max-context-rounds` / `--ext-…`), with compact
+    chips + controls in the dashboard Prime Autonomy Limits panel.
+- **Files:** `crates/relux-core/src/orchestration.rs`, `crates/relux-core/src/prime.rs`,
+  `crates/relux-core/src/lib.rs`, `crates/relux-kernel/src/prime_tools.rs`,
+  `crates/relux-kernel/src/prime_decision.rs`,
+  `crates/relux-kernel/src/prime_orchestration_slots.rs`, `crates/relux-kernel/src/state.rs`,
+  `crates/relux-kernel/src/server.rs`, `crates/relux-kernel/src/main.rs`,
+  `crates/relux-kernel/src/lib.rs`, `apps/dashboard/src/api.ts`,
+  `apps/dashboard/src/components/PrimeAgentPolicyPanel.tsx`.
+
 ---
 
 ## KEEP (with reason) — real guardrails, not toy caps
@@ -127,16 +167,6 @@ presented as a capability).
 
 ## LATER — real lifts, too large for this slice
 
-- **Orchestration step cap as an operator policy** (not just a raised constant): fold
-  `MAX_ORCHESTRATION_STEPS` into a configurable policy alongside `PrimeAgentPolicy` so an
-  operator can tune fan-out width per deployment. **Next step:** add an
-  `orchestration` section to the agent-policy surface (`/v1/relux/prime/agent-policy`) with a
-  clamped `max_steps`, thread it into `plan_orchestration` (which is pure today and would take
-  the limit as an argument), and add a dashboard control.
-- **`MAX_TOOL_ROUNDS` as a policy field**: same idea — the read-only context loop bound could
-  read from the operator's `PrimeAgentPolicy` (brain-rounds) rather than a module constant, so
-  there is one autonomy dial. **Next step:** thread the resolved `AgentLimits` into
-  `run_context_loop` / `execute_requested_reads` (both pure today) instead of the constant.
 - **`MAX_ACTIVE_JOBS = 4`** (`server.rs`, async run-job concurrency): a real concurrency
   guardrail, but `4` may be low for a busy operator. **Next step:** make it an operator
   setting with a sane clamp, surfaced in the dashboard, rather than a fixed constant.

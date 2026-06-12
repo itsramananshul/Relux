@@ -1939,6 +1939,13 @@ export interface ReluxPrimeAgentPolicy {
   // to an absolute ceiling on the server.
   max_tool_plan_steps: number;
   extended_max_tool_plan_steps: number;
+  // The configurable Prime orchestration fan-out width (how many briefs one goal decomposes
+  // into) and the read-only context-loop round budget, replacing the bare module constants.
+  // Standard + extended, both clamped to an absolute ceiling on the server.
+  max_orchestration_steps: number;
+  extended_max_orchestration_steps: number;
+  max_context_rounds: number;
+  extended_max_context_rounds: number;
 }
 
 // The resolved per-turn limits for one profile (clamped on the server).
@@ -1948,6 +1955,8 @@ export interface ReluxPrimeAgentLimits {
   max_brain_rounds: number;
   max_duration_secs: number;
   max_tool_plan_steps: number;
+  max_orchestration_steps: number;
+  max_context_rounds: number;
 }
 
 export interface ReluxPrimeAgentPolicyResponse {

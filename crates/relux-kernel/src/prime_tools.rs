@@ -95,7 +95,24 @@ pub fn turn_wants_context(turn: &PrimeTurn) -> bool {
 /// raised to a practical product default while staying finite (a brain that has not finished
 /// by then simply answers with what it has, and a repeated/no-progress read still stops the
 /// loop early). See `docs/ARTIFICIAL_CONSTRAINT_AUDIT.md`.
+///
+/// This is the STANDARD DEFAULT the bare read path still uses; the operator-configurable budget
+/// lives on [`relux_core::PrimeAgentPolicy::max_context_rounds`] (standard) /
+/// `extended_max_context_rounds`, resolved via
+/// [`relux_core::PrimeAgentPolicy::context_rounds`] and threaded into the loop
+/// ([`ContextLoop::with_rounds`]) / the up-front executor
+/// ([`execute_requested_reads_with_limit`]). The policy standard default equals this constant, so
+/// the default behavior is byte-for-byte unchanged.
 pub const MAX_TOOL_ROUNDS: usize = 8;
+
+/// The absolute hard ceiling on the read-only context-round budget — the runaway backstop every
+/// operator-configured round count is clamped to ([`ContextLoop::with_rounds`],
+/// [`execute_requested_reads_with_limit`]). Shared with the core policy
+/// ([`relux_core::PrimeAgentPolicy::MAX_CONTEXT_ROUNDS_CEIL`]) so the configured budget and the
+/// read-path bound can never drift. An operator can raise the budget up to here for a deep
+/// inspection but never set "unbounded".
+pub const MAX_TOOL_ROUNDS_CEIL: usize =
+    relux_core::PrimeAgentPolicy::MAX_CONTEXT_ROUNDS_CEIL as usize;
 
 /// Max characters kept from any single tool result the brain sees next round (Hermes's
 /// `_sanitize_tool_error` 2000-char clamp). Keeps a large board from blowing the context.
@@ -1082,25 +1099,39 @@ pub struct ContextLoop {
     reads: Vec<ContextRead>,
     feedback: Option<String>,
     round: usize,
+    /// The resolved, clamped round budget for THIS loop — the operator policy's
+    /// [`relux_core::PrimeAgentPolicy::context_rounds`] (or the default constant). Read by
+    /// [`Self::next_prompt`] so the bound is one operator dial, not a module constant.
+    max_rounds: usize,
 }
 
 impl ContextLoop {
-    /// Start a loop for one user message over a state snapshot. The snapshot is cloned in (it is
-    /// bounded) so the loop is self-contained and the executors stay pure over it.
+    /// Start a loop at the STANDARD DEFAULT round budget ([`MAX_TOOL_ROUNDS`]). Thin wrapper over
+    /// [`Self::with_rounds`] for callers/tests without a configured policy in hand.
     pub fn new(message: &str, snapshot: &ContextSnapshot) -> Self {
+        Self::with_rounds(message, snapshot, MAX_TOOL_ROUNDS)
+    }
+
+    /// Start a loop for one user message over a state snapshot, bounded by an explicit,
+    /// operator-configured `max_rounds` budget. The snapshot is cloned in (it is bounded) so the
+    /// loop is self-contained and the executors stay pure over it. `max_rounds` is clamped to
+    /// `1..=`[`MAX_TOOL_ROUNDS_CEIL`] so a configured value can never push the loop unbounded or
+    /// below one round (it always gets at least one chance to gather).
+    pub fn with_rounds(message: &str, snapshot: &ContextSnapshot, max_rounds: usize) -> Self {
         Self {
             message: message.to_string(),
             snapshot: snapshot.clone(),
             reads: Vec::new(),
             feedback: None,
             round: 0,
+            max_rounds: max_rounds.clamp(1, MAX_TOOL_ROUNDS_CEIL),
         }
     }
 
     /// The next prompt to send the brain, or `None` when the loop has hit its round cap (gather is
     /// over). Pure: does not advance the round (that happens in [`Self::observe`]).
     pub fn next_prompt(&self) -> Option<String> {
-        if self.round >= MAX_TOOL_ROUNDS {
+        if self.round >= self.max_rounds {
             return None;
         }
         Some(build_tools_prompt(
@@ -1162,9 +1193,21 @@ impl ContextLoop {
 pub fn run_context_loop<F: FnMut(&str) -> Option<String>>(
     message: &str,
     snapshot: &ContextSnapshot,
+    brain: F,
+) -> Vec<ContextRead> {
+    run_context_loop_with_rounds(message, snapshot, MAX_TOOL_ROUNDS, brain)
+}
+
+/// Drive the bounded read-only context loop at an explicit, operator-configured `max_rounds`
+/// budget (the policy-derived twin of [`run_context_loop`]). Identical control flow; only the
+/// round cap is threaded in (clamped by [`ContextLoop::with_rounds`]).
+pub fn run_context_loop_with_rounds<F: FnMut(&str) -> Option<String>>(
+    message: &str,
+    snapshot: &ContextSnapshot,
+    max_rounds: usize,
     mut brain: F,
 ) -> Vec<ContextRead> {
-    let mut lp = ContextLoop::new(message, snapshot);
+    let mut lp = ContextLoop::with_rounds(message, snapshot, max_rounds);
     while let Some(prompt) = lp.next_prompt() {
         let Some(raw) = brain(&prompt) else {
             break;
@@ -1189,8 +1232,24 @@ pub fn run_context_loop<F: FnMut(&str) -> Option<String>>(
 /// matching the round cap), and a repeated identical read (same tool + body) is skipped so a brain
 /// that lists the same tool twice does not double-count.
 pub fn execute_requested_reads(snapshot: &ContextSnapshot, calls: &[ToolCall]) -> Vec<ContextRead> {
+    execute_requested_reads_with_limit(snapshot, calls, MAX_TOOL_ROUNDS)
+}
+
+/// Execute a bounded, PRE-VALIDATED list of read-only tool requests against the snapshot at an
+/// explicit, operator-configured `max_reads` budget (the policy-derived twin of
+/// [`execute_requested_reads`]). Identical semantics — same read-only execution, same
+/// dedup-on-repeat — with the round budget threaded in from
+/// [`relux_core::PrimeAgentPolicy::context_rounds`]. `max_reads` is clamped to
+/// `1..=`[`MAX_TOOL_ROUNDS_CEIL`] so a configured value can never run unbounded reads or drop to
+/// zero (at least one requested read always runs).
+pub fn execute_requested_reads_with_limit(
+    snapshot: &ContextSnapshot,
+    calls: &[ToolCall],
+    max_reads: usize,
+) -> Vec<ContextRead> {
+    let max_reads = max_reads.clamp(1, MAX_TOOL_ROUNDS_CEIL);
     let mut reads: Vec<ContextRead> = Vec::new();
-    for call in calls.iter().take(MAX_TOOL_ROUNDS) {
+    for call in calls.iter().take(max_reads) {
         let read = execute_context_tool(snapshot, call);
         if reads.iter().any(|r| r.tool == read.tool && r.detail == read.detail) {
             continue;
@@ -1605,5 +1664,54 @@ mod tests {
         assert!(reads.len() <= MAX_TOOL_ROUNDS, "the request list is bounded by the round cap");
         // board_summary appears at most once despite three identical entries.
         assert_eq!(reads.iter().filter(|r| r.tool == "board_summary").count(), 1);
+    }
+
+    #[test]
+    fn loop_honors_a_configured_round_budget_and_clamps_it() {
+        let snap = snapshot();
+        let calls = [
+            r#"{"tool":"board_summary","args":{}}"#,
+            r#"{"tool":"list_tasks","args":{}}"#,
+            r#"{"tool":"list_agents","args":{}}"#,
+            r#"{"tool":"list_runs","args":{}}"#,
+            r#"{"tool":"list_plugins","args":{}}"#,
+        ];
+        // A small configured budget caps the gather below the default.
+        let mut i = 0usize;
+        let reads = run_context_loop_with_rounds("tell me everything", &snap, 2, |_| {
+            let c = calls[i % calls.len()].to_string();
+            i += 1;
+            Some(c)
+        });
+        assert_eq!(reads.len(), 2, "the configured round budget bounds the loop");
+
+        // A wild configured budget is clamped to the ceiling, never unbounded.
+        let mut j = 0usize;
+        let reads = run_context_loop_with_rounds("tell me everything", &snap, usize::MAX, |_| {
+            let c = calls[j % calls.len()].to_string();
+            j += 1;
+            Some(c)
+        });
+        assert!(reads.len() <= MAX_TOOL_ROUNDS_CEIL, "a wild budget is clamped to the ceiling");
+    }
+
+    #[test]
+    fn execute_requested_reads_honors_a_configured_limit_at_resolve_level() {
+        let snap = snapshot();
+        let calls: Vec<ToolCall> = vec![
+            ToolCall { tool: "board_summary".into(), args: Default::default() },
+            ToolCall { tool: "list_tasks".into(), args: Default::default() },
+            ToolCall { tool: "list_agents".into(), args: Default::default() },
+            ToolCall { tool: "list_runs".into(), args: Default::default() },
+        ];
+        // A small configured limit bounds the executed reads at resolve time.
+        let reads = execute_requested_reads_with_limit(&snap, &calls, 2);
+        assert_eq!(reads.len(), 2, "the configured limit bounds the reads");
+        // A higher (extended) limit lets more of the same list resolve.
+        let more = execute_requested_reads_with_limit(&snap, &calls, 4);
+        assert!(more.len() > reads.len(), "a higher limit resolves more reads");
+        // A wild limit is clamped to the ceiling.
+        let capped = execute_requested_reads_with_limit(&snap, &calls, usize::MAX);
+        assert!(capped.len() <= MAX_TOOL_ROUNDS_CEIL);
     }
 }

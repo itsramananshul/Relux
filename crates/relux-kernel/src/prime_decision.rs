@@ -608,8 +608,10 @@ pub fn parse_decision(raw: &str) -> Result<PrimeBrainDecision, String> {
     // Read-only context tool requests: a list of `{tool, args}` the brain wants run BEFORE it
     // answers. Each entry is validated against the READ-ONLY allowlist via
     // `prime_tools::validate_tool_request` — a mutating / unknown / made-up name is DROPPED here and
-    // can never execute — and the list is capped at the loop's round budget so it stays bounded.
-    // A non-array `tool_requests` yields no requests. `context_reads` is accepted as an alias.
+    // can never execute — and the list is capped at the absolute round CEILING (not the configured
+    // budget) so a request list authored under a raised/extended policy still parses back; the
+    // configured budget is applied later at RESOLVE time by the DecisionLoop. A non-array
+    // `tool_requests` yields no requests. `context_reads` is accepted as an alias.
     let context_requests = obj
         .get("tool_requests")
         .or_else(|| obj.get("context_reads"))
@@ -617,7 +619,7 @@ pub fn parse_decision(raw: &str) -> Result<PrimeBrainDecision, String> {
         .map(|arr| {
             arr.iter()
                 .filter_map(crate::prime_tools::validate_tool_request)
-                .take(crate::prime_tools::MAX_TOOL_ROUNDS)
+                .take(crate::prime_tools::MAX_TOOL_ROUNDS_CEIL)
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -785,19 +787,33 @@ pub struct DecisionLoop {
     decision: Option<PrimeBrainDecision>,
     round: usize,
     corrections: usize,
+    /// The resolved, clamped read-only context-read budget this loop executes per round — the
+    /// operator policy's [`relux_core::PrimeAgentPolicy::context_rounds`] (or the default
+    /// constant). Passed to [`crate::prime_tools::execute_requested_reads_with_limit`] so the
+    /// resolve-level bound is one operator dial, not a module constant.
+    max_reads: usize,
 }
 
 impl DecisionLoop {
+    /// Start a loop at the STANDARD DEFAULT context-read budget ([`crate::prime_tools::MAX_TOOL_ROUNDS`]).
+    /// Thin wrapper over [`Self::with_limit`] for callers/tests without a configured policy in hand.
+    pub fn new(snapshot: &crate::prime_tools::ContextSnapshot) -> Self {
+        Self::with_limit(snapshot, crate::prime_tools::MAX_TOOL_ROUNDS)
+    }
+
     /// Start a loop over an owned, bounded read-only state snapshot (cloned in, exactly like
     /// [`crate::prime_tools::ContextLoop::new`], so the executors stay pure over it and the
-    /// provider rounds run lock-free).
-    pub fn new(snapshot: &crate::prime_tools::ContextSnapshot) -> Self {
+    /// provider rounds run lock-free), bounding each round's executed reads by the explicit,
+    /// operator-configured `max_reads` budget (clamped by
+    /// [`crate::prime_tools::execute_requested_reads_with_limit`]).
+    pub fn with_limit(snapshot: &crate::prime_tools::ContextSnapshot, max_reads: usize) -> Self {
         Self {
             snapshot: snapshot.clone(),
             reads: Vec::new(),
             decision: None,
             round: 0,
             corrections: 0,
+            max_reads,
         }
     }
 
@@ -853,9 +869,11 @@ impl DecisionLoop {
             return DecisionStep::Stop;
         }
         let before = self.reads.len();
-        for read in
-            crate::prime_tools::execute_requested_reads(&self.snapshot, &d.context_requests)
-        {
+        for read in crate::prime_tools::execute_requested_reads_with_limit(
+            &self.snapshot,
+            &d.context_requests,
+            self.max_reads,
+        ) {
             if self
                 .reads
                 .iter()
@@ -1314,15 +1332,43 @@ instruction):\nUser: create a task to fix login\nPrime: Created it. [created tas
     }
 
     #[test]
-    fn tool_requests_are_bounded_by_the_round_cap() {
-        // A brain that lists more requests than the round budget is capped at parse time, so the
-        // deterministic execution can never exceed the loop's bound.
-        let many: Vec<String> = (0..crate::prime_tools::MAX_TOOL_ROUNDS + 6)
+    fn tool_requests_are_bounded_by_the_round_ceiling_at_parse_time() {
+        // The PARSE path bounds the request list at the absolute round CEILING (not the configured
+        // budget) so a list authored under a raised/extended policy still reads back; the configured
+        // budget is applied later at RESOLVE time by the DecisionLoop. A pathological list can never
+        // exceed the ceiling.
+        let many: Vec<String> = (0..crate::prime_tools::MAX_TOOL_ROUNDS_CEIL + 20)
             .map(|_| r#"{"tool":"board_summary"}"#.to_string())
             .collect();
         let raw = format!(r#"{{"tool_requests":[{}]}}"#, many.join(","));
         let d = parse_decision(&raw).unwrap();
-        assert!(d.context_requests.len() <= crate::prime_tools::MAX_TOOL_ROUNDS);
+        assert!(d.context_requests.len() <= crate::prime_tools::MAX_TOOL_ROUNDS_CEIL);
+    }
+
+    #[test]
+    fn decision_loop_resolve_budget_bounds_executed_reads() {
+        // The DecisionLoop applies the CONFIGURED context-read budget at resolve time: a small
+        // budget bounds how many distinct reads are executed in one round, even when the parsed
+        // request list (bounded only by the ceiling) is longer.
+        let snap = loop_snapshot();
+        let requests: Vec<String> = [
+            r#"{"tool":"board_summary"}"#,
+            r#"{"tool":"list_tasks"}"#,
+            r#"{"tool":"list_agents"}"#,
+            r#"{"tool":"list_runs"}"#,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let raw = format!(r#"{{"tool_requests":[{}]}}"#, requests.join(","));
+        let decision = parse_decision(&raw).unwrap();
+        assert!(decision.context_requests.len() >= 4);
+
+        let mut lp = DecisionLoop::with_limit(&snap, 2);
+        // One observe round executes at most the configured budget of distinct reads.
+        let _ = lp.step(Some(decision));
+        let (_d, reads) = lp.into_parts();
+        assert_eq!(reads.len(), 2, "the configured resolve budget bounds executed reads");
     }
 
     #[test]

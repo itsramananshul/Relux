@@ -209,11 +209,20 @@ security model: every execution still flows through `prime_invoke_tool`.
 >
 > **Other toy caps were swept too.** The same "tiny hard constant where a serious product needs a
 > bounded-but-practical limit" mistake was audited across the whole relux-\* layer and recorded in
-> `docs/ARTIFICIAL_CONSTRAINT_AUDIT.md`. Two more were fixed here: the orchestration step cap (`6` →
-> the named, shared `relux_core::MAX_ORCHESTRATION_STEPS = 16`) and Prime's **read-only** context loop
-> bound (`MAX_TOOL_ROUNDS` `4` → `8`). Both stay finite safety rails. Real guardrails (the clamped
-> autonomy ceilings, the loopback/size bounds, the echo fixture's demotion to dev/test-only) are
-> deliberately kept — they are guardrails, not toy caps.
+> `docs/ARTIFICIAL_CONSTRAINT_AUDIT.md`. The orchestration step cap (`6` → the named, shared
+> `relux_core::MAX_ORCHESTRATION_STEPS = 16`) and Prime's **read-only** context loop bound
+> (`MAX_TOOL_ROUNDS` `4` → `8`) were first raised to honest constants, then **folded into the same
+> `PrimeAgentPolicy` autonomy dial** so an operator can tune them per deployment: `max_orchestration_steps`
+> (standard **16**) / `extended_max_orchestration_steps` (**64**) and `max_context_rounds` (standard
+> **8**, aligned with `MAX_TOOL_ROUNDS`) / `extended_max_context_rounds` (**32**), each clamped to a
+> shared ceiling (**64**). The planner now takes the configured width as an argument
+> (`plan_orchestration_with_limit`) so the deterministic create-path (`prime_orchestrate`) and the
+> brain-proposal path (`reconcile_orchestration_slots`) read the SAME width and never drift; an
+> over-width goal's overflow note **names the active limit and how to raise it**, never a silent
+> drop. The read-only loop / up-front read executor take the resolved round budget
+> (`context_rounds`), preserving the no-progress / repeat early-stop. Both stay finite safety rails.
+> Real guardrails (the clamped autonomy ceilings, the loopback/size bounds, the echo fixture's
+> demotion to dev/test-only) are deliberately kept — they are guardrails, not toy caps.
 
 **When the loop engages (the safety wall).** Only when (a) a brain is configured (not Local) and
 (b) the deterministic classifier returns `ToolInvocation` for the message (the user explicitly asked
@@ -294,11 +303,26 @@ path (`parse_task_tool_plan`, run execution) bounds only at the absolute ceiling
 under a raised limit still reads back. (The static `MAX_TASK_TOOL_PLAN_STEPS` (16) is the
 conservative default `validate()` uses in tests/CLI where no policy is threaded.)
 
+**Orchestration width + context rounds (same policy).** The same `PrimeAgentPolicy` also carries the
+configurable **orchestration fan-out width** — `max_orchestration_steps` (standard, default **16**) /
+`extended_max_orchestration_steps` (**64**), clamped to the shared `MAX_ORCHESTRATION_STEPS_CEIL`
+(**64**) — and the **read-only context-loop round budget** — `max_context_rounds` (standard, default
+**8**, aligned with `MAX_TOOL_ROUNDS`) / `extended_max_context_rounds` (**32**), clamped to
+`MAX_CONTEXT_ROUNDS_CEIL` (**64**). The deterministic `prime_orchestrate`, the brain
+`reconcile_orchestration_slots`, and the preview route all pass the resolved
+`orchestration_steps(false)` width into `plan_orchestration_with_limit`, so they never drift; the
+read-only `ContextLoop` / `execute_requested_reads` take the resolved `context_rounds(false)` budget
+(threaded from the server preview block into the observe-then-act `DecisionLoop` and the sidecar
+loop). Both surface in the same places as the other policy fields.
+
 **Configuring + continuing.** The policy is served at `GET/PUT/PATCH /v1/relux/prime/agent-policy`
-(response carries the resolved standard/extended limits, including `max_tool_plan_steps`), set in the
-dashboard's **Prime Autonomy Limits** panel (Health → Prime Brain) — which now has a **Tool plan**
-row for the standard/extended step limits — or via `relux-kernel prime agent-policy
-<status|configure>` (flags `--max-tool-plan-steps N` / `--ext-max-tool-plan-steps N`). To run long
+(response carries the resolved standard/extended limits, including `max_tool_plan_steps`,
+`max_orchestration_steps`, and `max_context_rounds`), set in the dashboard's **Prime Autonomy
+Limits** panel (Health → Prime Brain) — which now has **Tool plan**, **Orchestration**, and **Context
+loop** rows for the standard/extended limits — or via `relux-kernel prime agent-policy
+<status|configure>` (flags `--max-tool-plan-steps N` / `--ext-max-tool-plan-steps N`,
+`--max-orchestration-steps N` / `--ext-max-orchestration-steps N`, `--max-context-rounds N` /
+`--ext-max-context-rounds N`). To run long
 work: tell Prime to "keep working" / "use extended mode" (raises this turn to the extended profile),
 or click the **Keep working (extended)** button Prime offers when a limit is hit (which resumes the
 paused loop — see below).

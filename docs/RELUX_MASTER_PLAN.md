@@ -1836,6 +1836,31 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **unreleased** — **Orchestration width + read-only context rounds folded into the autonomy policy
+  (one operator dial)**, the last two LATER items from `docs/ARTIFICIAL_CONSTRAINT_AUDIT.md` promoted
+  to FIXED, continuing the autonomy-policy line (§10.5/§17.1) and built reference-first against Hermes
+  `agent/iteration_budget.py` (a tunable bound, not a tiny constant) — `docs/reference-driven-development.md`
+  (BINDING). **What changes (safe, bounded):** four new `relux_core::PrimeAgentPolicy` fields —
+  `max_orchestration_steps` (standard **16**) / `extended_max_orchestration_steps` (**64**), clamped to
+  the shared `MAX_ORCHESTRATION_STEPS_CEIL` (**64**); and `max_context_rounds` (standard **8**, aligned
+  with `MAX_TOOL_ROUNDS`) / `extended_max_context_rounds` (**32**), clamped to `MAX_CONTEXT_ROUNDS_CEIL`
+  (**64**). The pure planner now takes the width as an argument (`plan_orchestration_with_limit`; bare
+  `plan_orchestration` keeps the default constant), and BOTH authoritative create-paths — the
+  deterministic `prime_orchestrate` and the brain `reconcile_orchestration_slots` — read the SAME
+  resolved `orchestration_steps(false)` width, so they can never drift; the preview route resolves the
+  same width; an over-width goal's overflow note **names the active limit and how to raise it**. The
+  read-only `ContextLoop` / up-front `execute_requested_reads` take the resolved `context_rounds(false)`
+  budget (threaded from the server preview block into the observe-then-act `DecisionLoop` and the
+  sidecar loop), preserving the no-progress / repeat early-stop; the parse path bounds the request list
+  at the ceiling so a raised/extended list still reads back. Surfaced on `/v1/relux/prime/agent-policy`
+  (GET resolves per profile; PUT/PATCH clamps), the `prime agent-policy configure` CLI
+  (`--max-orchestration-steps`/`--ext-…`, `--max-context-rounds`/`--ext-…`), and the dashboard Prime
+  Autonomy Limits panel (new **Orchestration** + **Context loop** rows and chips). No release cut; no
+  safety property weakened (every bound stays finite + clamped, just configurable). `cargo test` +
+  `clippy` clean on `relux-core`/`relux-kernel`; dashboard typecheck/build/tests green (tests pin:
+  standard default 16 / >6 works, smaller configured limit honored + named in the overflow note,
+  extended > standard, context loop honors a configured + higher extended budget at resolve-level,
+  route/CLI serialization clamps the fields, no regression to chat / tool gating / tool-plan policy).
 - **unreleased** — **Artificial-constraint audit + the next toy-cap fixes** continuing the autonomy-policy
   line (§10.5/§17.1), built reference-first against Hermes `agent/conversation_loop.py` /
   `agent/iteration_budget.py` (the "high configurable ceiling, not a tiny constant" precedent). After the

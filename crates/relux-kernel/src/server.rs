@@ -220,7 +220,7 @@ async fn serve() -> Result<(), KernelError> {
     println!("   POST   /v1/relux/prime                     {{ \"message\": \"...\" }}");
     println!("   POST   /v1/relux/prime/reset               (clear this conversation's bounded memory)");
     println!("   GET    /v1/relux/prime/agent-policy        (chat agent-loop autonomy limits + resolved profiles)");
-    println!("   PUT    /v1/relux/prime/agent-policy        {{ \"max_tool_calls\"?, \"max_brain_rounds\"?, \"max_duration_secs\"?, \"extended_*\"? }}");
+    println!("   PUT    /v1/relux/prime/agent-policy        {{ \"max_tool_calls\"?, \"max_brain_rounds\"?, \"max_duration_secs\"?, \"max_tool_plan_steps\"?, \"max_orchestration_steps\"?, \"max_context_rounds\"?, \"extended_*\"? }}");
     println!("   POST   /v1/relux/prime/agent/continue      {{ \"continuation_id\": \"cont_0001\", \"extended\"? }}  (resume a paused agent loop)");
     println!("   POST   /v1/relux/tasks                     {{ \"title\": \"...\" }}");
     println!("   POST   /v1/relux/tasks/:id/start");
@@ -2932,7 +2932,7 @@ async fn run_prime(
     // not the bare answer. The board summary grounds an assignment/update against real ids. The
     // kernel re-decides the continuation authoritatively under its own lock; this preview only
     // steers which message the (slow, off-lock) brain is asked about.
-    let (continuation, board_summary, context_snapshot, recent_history) = {
+    let (continuation, board_summary, context_snapshot, recent_history, context_rounds) = {
         let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut kernel = {
             let store = SqliteStore::open(&state.db_path)?;
@@ -2948,7 +2948,11 @@ async fn run_prime(
         // can interpret a follow-up in context. Advisory BACKGROUND only — it is injected into the
         // decision prompt and never reaches the deterministic classifier or any gate.
         let history = kernel.recent_conversation_context(&ctx);
-        (preview, summary, snapshot, history)
+        // The operator-configured STANDARD read-only context-round budget — the one autonomy dial
+        // the observe-then-act loop and the sidecar context loop both run under (replacing the bare
+        // `MAX_TOOL_ROUNDS` module constant). Read under this lock; the loops below run lock-free.
+        let rounds = kernel.prime_agent_policy.context_rounds(false);
+        (preview, summary, snapshot, history, rounds)
     };
     let is_continuation = continuation.is_some();
     // The message the brain reasons about: the COMBINED message on a continuation, else raw.
@@ -2979,6 +2983,7 @@ async fn run_prime(
         &decision_message,
         &board_summary,
         &recent_history,
+        context_rounds,
     )
     .await;
 
@@ -3316,6 +3321,7 @@ async fn run_prime(
                 cli_status.clone(),
                 &context_snapshot,
                 &message,
+                context_rounds,
             )
             .await;
         }
@@ -4156,6 +4162,10 @@ async fn decide_prime_via_cli(
 /// per-brain difference), so the loop's control flow — round cap, read-only execution,
 /// stop-on-progress — is pinned once and never drifts. `Local` (no brain) makes no decision and
 /// gathers nothing.
+// One cohesive call: the brain selector + its config/status, the read-only snapshot + message it
+// reasons over, the grounding (summary/history), and the operator-configured context-read budget.
+// Splitting these into a struct would add indirection without clarifying the call.
+#[allow(clippy::too_many_arguments)]
 async fn decide_prime_with_observation(
     brain: relux_kernel::PrimeBrain,
     ai_config: &relux_kernel::AiConfig,
@@ -4164,11 +4174,12 @@ async fn decide_prime_with_observation(
     message: &str,
     summary: &relux_core::StateSummary,
     history: &str,
+    max_context_reads: usize,
 ) -> (Option<relux_kernel::PrimeBrainDecision>, Vec<relux_kernel::ContextRead>) {
     if matches!(brain, relux_kernel::PrimeBrain::Local) {
         return (None, Vec::new());
     }
-    let mut lp = relux_kernel::DecisionLoop::new(snapshot);
+    let mut lp = relux_kernel::DecisionLoop::with_limit(snapshot, max_context_reads);
     let mut observations = String::new();
     let mut correction = String::new();
     loop {
@@ -4306,8 +4317,9 @@ async fn gather_read_only_context(
     cli_status: Option<relux_core::AdapterRuntimeStatus>,
     snapshot: &relux_kernel::ContextSnapshot,
     message: &str,
+    max_rounds: usize,
 ) -> Vec<relux_kernel::ContextRead> {
-    let mut lp = relux_kernel::ContextLoop::new(message, snapshot);
+    let mut lp = relux_kernel::ContextLoop::with_rounds(message, snapshot, max_rounds);
     while let Some(prompt) = lp.next_prompt() {
         let raw = match brain {
             relux_kernel::PrimeBrain::Openrouter => {
@@ -5330,6 +5342,10 @@ struct UpdateAgentPolicyReq {
     extended_max_duration_secs: Option<u64>,
     max_tool_plan_steps: Option<u32>,
     extended_max_tool_plan_steps: Option<u32>,
+    max_orchestration_steps: Option<u32>,
+    extended_max_orchestration_steps: Option<u32>,
+    max_context_rounds: Option<u32>,
+    extended_max_context_rounds: Option<u32>,
 }
 
 /// PUT/PATCH `/v1/relux/prime/agent-policy` — update one or more autonomy ceilings. Every field is
@@ -5365,6 +5381,18 @@ async fn update_agent_policy(
         if let Some(v) = req.extended_max_tool_plan_steps {
             config.extended_max_tool_plan_steps = v;
         }
+        if let Some(v) = req.max_orchestration_steps {
+            config.max_orchestration_steps = v;
+        }
+        if let Some(v) = req.extended_max_orchestration_steps {
+            config.extended_max_orchestration_steps = v;
+        }
+        if let Some(v) = req.max_context_rounds {
+            config.max_context_rounds = v;
+        }
+        if let Some(v) = req.extended_max_context_rounds {
+            config.extended_max_context_rounds = v;
+        }
         // Clamp into the safe ranges before it can reach the loop.
         config = config.clamped();
         kernel.prime_agent_policy = config.clone();
@@ -5391,7 +5419,14 @@ async fn preview_orchestration(
         return Err(ApiError::bad_request("goal is required"));
     }
     let plan = locked_read(&state, |kernel| {
-        Ok(relux_core::plan_orchestration(&goal, &kernel.inspect_state()))
+        // Preview at the operator-configured standard width, the SAME limit `prime_orchestrate`
+        // uses to commit, so the previewed brief count matches what "Create" would produce.
+        let width = kernel.prime_agent_policy.orchestration_steps(false);
+        Ok(relux_core::plan_orchestration_with_limit(
+            &goal,
+            &kernel.inspect_state(),
+            width,
+        ))
     })?;
     Ok(Json(plan))
 }
@@ -9762,6 +9797,23 @@ mod tests {
                 > v["standard"]["max_tool_plan_steps"].as_u64().unwrap(),
             "extended profile must allow more plan steps than standard"
         );
+        // Orchestration width + read-only context rounds are part of the surface too, resolved per
+        // profile with extended higher than standard.
+        assert!(
+            v["config"]["max_orchestration_steps"].as_u64().unwrap() >= 6,
+            "standard orchestration width is a serious default (>6)"
+        );
+        assert!(
+            v["extended"]["max_orchestration_steps"].as_u64().unwrap()
+                > v["standard"]["max_orchestration_steps"].as_u64().unwrap(),
+            "extended profile must allow a wider orchestration than standard"
+        );
+        assert!(v["config"]["max_context_rounds"].as_u64().unwrap() > 4, "standard context rounds beat the toy 4");
+        assert!(
+            v["extended"]["max_context_rounds"].as_u64().unwrap()
+                > v["standard"]["max_context_rounds"].as_u64().unwrap(),
+            "extended profile must allow more context rounds than standard"
+        );
     }
 
     #[tokio::test]
@@ -9784,6 +9836,25 @@ mod tests {
         let (_s, _, gb) = call(&state, "GET", "/v1/relux/prime/agent-policy", None, None).await;
         let g: serde_json::Value = serde_json::from_str(&gb).unwrap();
         assert_eq!(g["config"]["max_tool_calls"].as_u64().unwrap(), 40);
+
+        // The new orchestration-width + context-round fields are configurable AND clamped through
+        // the same route: a sane raise sticks, a wild value is clamped to its safe ceiling.
+        let body = r#"{"max_orchestration_steps":24,"extended_max_orchestration_steps":100000000,"max_context_rounds":16,"extended_max_context_rounds":100000000}"#;
+        let (status, _, rb) = call(&state, "PATCH", "/v1/relux/prime/agent-policy", None, Some(body)).await;
+        assert_eq!(status, StatusCode::OK, "{rb}");
+        let v: serde_json::Value = serde_json::from_str(&rb).unwrap();
+        assert_eq!(v["config"]["max_orchestration_steps"].as_u64().unwrap(), 24);
+        assert_eq!(
+            v["config"]["extended_max_orchestration_steps"].as_u64().unwrap(),
+            relux_core::PrimeAgentPolicy::MAX_ORCHESTRATION_STEPS_CEIL as u64,
+            "wild orchestration width clamped to the safe ceiling"
+        );
+        assert_eq!(v["config"]["max_context_rounds"].as_u64().unwrap(), 16);
+        assert_eq!(
+            v["config"]["extended_max_context_rounds"].as_u64().unwrap(),
+            relux_core::PrimeAgentPolicy::MAX_CONTEXT_ROUNDS_CEIL as u64,
+            "wild context-round budget clamped to the safe ceiling"
+        );
     }
 
     #[tokio::test]

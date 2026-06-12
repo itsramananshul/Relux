@@ -71,7 +71,7 @@
 //! the deterministic clarify in place — the planner's "must be multi-agent to fan out"
 //! safety constraint can never be bypassed.
 
-use relux_core::{plan_orchestration, OrchestrationPlan, StateSummary};
+use relux_core::{plan_orchestration_with_limit, OrchestrationPlan, StateSummary};
 
 use crate::prime_intent::extract_json_object;
 
@@ -84,11 +84,13 @@ const CONFIDENCE_FLOOR: f32 = 0.6;
 const MAX_GOAL_CHARS: usize = 400;
 /// Max characters kept for one proposed step before it is folded into the goal text.
 const MAX_STEP_CHARS: usize = 160;
-/// Max proposed steps kept. Bound DIRECTLY to the deterministic planner's own
-/// [`relux_core::MAX_ORCHESTRATION_STEPS`] cap (no duplicated literal) so a brain can
-/// never propose more briefs than the planner would itself plan, and the two stay in
-/// lock-step if the ceiling is ever retuned.
-const MAX_STEPS: usize = relux_core::MAX_ORCHESTRATION_STEPS;
+/// Max proposed step HINTS kept at PARSE time. Bound to the planner's absolute
+/// [`relux_core::MAX_ORCHESTRATION_STEPS_CEIL`] (not the configured width) so a hint list
+/// authored under a raised/extended width still parses back; the configured width is applied
+/// later at RESOLVE time when [`reconcile_orchestration_slots`] re-decomposes the composed goal
+/// through [`relux_core::plan_orchestration_with_limit`]. A brain can never end up with more
+/// briefs than the planner would itself plan at the active width.
+const MAX_STEPS: usize = relux_core::MAX_ORCHESTRATION_STEPS_CEIL;
 /// Max characters kept from the brain's free-text rationale (audit/provenance only).
 const MAX_RATIONALE_CHARS: usize = 240;
 
@@ -245,6 +247,7 @@ pub fn parse_orchestration_slots(raw: &str) -> Result<BrainOrchestrationSlots, S
 pub fn reconcile_orchestration_slots(
     proposal: &BrainOrchestrationSlots,
     summary: &StateSummary,
+    max_steps: usize,
 ) -> Option<ResolvedOrchestration> {
     if proposal.confidence < CONFIDENCE_FLOOR {
         return None;
@@ -257,9 +260,11 @@ pub fn reconcile_orchestration_slots(
     };
 
     // The deterministic planner is the final authority: it grounds roles against the live
-    // roster, caps the step count, and builds the DAG. A goal that does not genuinely split
-    // is not orchestratable — the deterministic clarify stands.
-    let plan = plan_orchestration(&goal, summary);
+    // roster, caps the step count at the operator-configured `max_steps` width (the SAME limit
+    // `prime_orchestrate` uses, so the brain path and the deterministic path never drift), and
+    // builds the DAG. A goal that does not genuinely split is not orchestratable — the
+    // deterministic clarify stands.
+    let plan = plan_orchestration_with_limit(&goal, summary, max_steps);
     if !plan.is_multi_agent() {
         return None;
     }
@@ -436,8 +441,9 @@ mod tests {
             confidence: 0.9,
             rationale: String::new(),
         };
-        let resolved = reconcile_orchestration_slots(&proposal, &summary)
-            .expect("a multi-step goal orchestrates");
+        let resolved =
+            reconcile_orchestration_slots(&proposal, &summary, relux_core::MAX_ORCHESTRATION_STEPS)
+                .expect("a multi-step goal orchestrates");
         assert!(resolved.plan.is_multi_agent());
         // The planner grounds roles against the live roster - the brain never named an agent.
         assert!(resolved
@@ -461,10 +467,32 @@ mod tests {
             rationale: String::new(),
         };
         let resolved =
-            reconcile_orchestration_slots(&proposal, &summary).expect("steps compose to a plan");
+            reconcile_orchestration_slots(&proposal, &summary, relux_core::MAX_ORCHESTRATION_STEPS)
+                .expect("steps compose to a plan");
         // The steps drove the decomposition (3 distinct briefs), but the planner owns the set.
         assert_eq!(resolved.plan.steps.len(), 3);
         assert!(resolved.goal.contains("research the market"));
+    }
+
+    #[test]
+    fn reconcile_caps_the_brain_plan_at_the_configured_width() {
+        // A small operator-configured width bounds the brain-composed plan exactly like the
+        // deterministic path — the brain can never fan out wider than the active policy width.
+        let summary = summary_with_agents(&["prime"]);
+        let proposal = BrainOrchestrationSlots {
+            goal: "ship it".to_string(),
+            steps: (0..8).map(|i| format!("research topic{i}")).collect(),
+            confidence: 0.9,
+            rationale: String::new(),
+        };
+        let resolved = reconcile_orchestration_slots(&proposal, &summary, 3)
+            .expect("a wide goal still orchestrates, capped");
+        assert_eq!(resolved.plan.steps.len(), 3, "the configured width caps the brain plan");
+        assert!(resolved
+            .plan
+            .notes
+            .iter()
+            .any(|n| n.contains("only the first")));
     }
 
     #[test]
@@ -478,7 +506,10 @@ mod tests {
             confidence: 0.9,
             rationale: String::new(),
         };
-        assert!(reconcile_orchestration_slots(&proposal, &summary).is_none());
+        assert!(
+            reconcile_orchestration_slots(&proposal, &summary, relux_core::MAX_ORCHESTRATION_STEPS)
+                .is_none()
+        );
     }
 
     #[test]
@@ -490,7 +521,10 @@ mod tests {
             confidence: 0.4,
             rationale: String::new(),
         };
-        assert!(reconcile_orchestration_slots(&proposal, &summary).is_none());
+        assert!(
+            reconcile_orchestration_slots(&proposal, &summary, relux_core::MAX_ORCHESTRATION_STEPS)
+                .is_none()
+        );
     }
 
     #[test]

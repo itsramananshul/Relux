@@ -23,6 +23,10 @@ type Draft = Pick<
   | "extended_max_duration_secs"
   | "max_tool_plan_steps"
   | "extended_max_tool_plan_steps"
+  | "max_orchestration_steps"
+  | "extended_max_orchestration_steps"
+  | "max_context_rounds"
+  | "extended_max_context_rounds"
 >;
 
 function toDraft(c: ReluxPrimeAgentPolicy): Draft {
@@ -35,6 +39,10 @@ function toDraft(c: ReluxPrimeAgentPolicy): Draft {
     extended_max_duration_secs: c.extended_max_duration_secs,
     max_tool_plan_steps: c.max_tool_plan_steps,
     extended_max_tool_plan_steps: c.extended_max_tool_plan_steps,
+    max_orchestration_steps: c.max_orchestration_steps,
+    extended_max_orchestration_steps: c.extended_max_orchestration_steps,
+    max_context_rounds: c.max_context_rounds,
+    extended_max_context_rounds: c.extended_max_context_rounds,
   };
 }
 
@@ -111,6 +119,20 @@ export function PrimeAgentPolicyPanel() {
         >
           plan {resp.standard.max_tool_plan_steps}/{resp.extended.max_tool_plan_steps} steps
         </span>
+        <span
+          className="badge todo"
+          style={{ fontSize: 9, marginLeft: 6 }}
+          title="Resolved orchestration fan-out width — briefs per goal (standard / extended)"
+        >
+          orch {resp.standard.max_orchestration_steps}/{resp.extended.max_orchestration_steps} briefs
+        </span>
+        <span
+          className="badge todo"
+          style={{ fontSize: 9, marginLeft: 6 }}
+          title="Resolved read-only context-loop rounds (standard / extended)"
+        >
+          ctx {resp.standard.max_context_rounds}/{resp.extended.max_context_rounds} rounds
+        </span>
       </div>
       <p className="muted" style={{ marginTop: -2, marginBottom: 10, fontSize: 12, lineHeight: 1.6 }}>
         How far Prime's chat <strong>agent loop</strong> may go in one turn before it stops and asks.
@@ -160,6 +182,45 @@ export function PrimeAgentPolicyPanel() {
           value={draft.extended_max_tool_plan_steps}
           disabled={busy}
           onChange={(v) => set("extended_max_tool_plan_steps", Math.max(0, parseInt(v, 10) || 0))}
+        />
+      </div>
+
+      {/* The configurable orchestration fan-out width (briefs a single goal decomposes into),
+          replacing the bare module constant. Standard bounds an ordinary orchestration; Extended a
+          long-work fan-out. Both clamped to a safe ceiling on the server; overflow is reported in an
+          honest note, never silently dropped. */}
+      <div className="row wrap" style={{ alignItems: "center", gap: 8, marginTop: 2, marginBottom: 4 }}>
+        <strong style={{ fontSize: 12, width: 72 }}>Orchestration</strong>
+        <Field
+          label="std briefs"
+          value={draft.max_orchestration_steps}
+          disabled={busy}
+          onChange={(v) => set("max_orchestration_steps", Math.max(0, parseInt(v, 10) || 0))}
+        />
+        <Field
+          label="ext briefs"
+          value={draft.extended_max_orchestration_steps}
+          disabled={busy}
+          onChange={(v) => set("extended_max_orchestration_steps", Math.max(0, parseInt(v, 10) || 0))}
+        />
+      </div>
+
+      {/* The configurable read-only context-loop round budget (how many times Prime may inspect
+          live state before answering), replacing the bare MAX_TOOL_ROUNDS constant. The loop changes
+          nothing; this only bounds brain-call count. Both clamped to a safe ceiling on the server. */}
+      <div className="row wrap" style={{ alignItems: "center", gap: 8, marginTop: 2, marginBottom: 4 }}>
+        <strong style={{ fontSize: 12, width: 72 }}>Context loop</strong>
+        <Field
+          label="std rounds"
+          value={draft.max_context_rounds}
+          disabled={busy}
+          onChange={(v) => set("max_context_rounds", Math.max(0, parseInt(v, 10) || 0))}
+        />
+        <Field
+          label="ext rounds"
+          value={draft.extended_max_context_rounds}
+          disabled={busy}
+          onChange={(v) => set("extended_max_context_rounds", Math.max(0, parseInt(v, 10) || 0))}
         />
       </div>
 

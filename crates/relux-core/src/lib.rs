@@ -55,9 +55,10 @@ pub use mcp::{
 };
 pub use namespace::{Namespace, NamespaceId};
 pub use orchestration::{
-    plan_orchestration, Orchestration, OrchestrationBatchResult, OrchestrationId,
-    OrchestrationPlan, OrchestrationRole, OrchestrationStatus, OrchestrationStep, PlannedStep,
-    StepOutcome, MAX_ORCHESTRATION_STEPS,
+    plan_orchestration, plan_orchestration_with_limit, Orchestration, OrchestrationBatchResult,
+    OrchestrationId, OrchestrationPlan, OrchestrationRole, OrchestrationStatus, OrchestrationStep,
+    PlannedStep, StepOutcome, EXTENDED_MAX_ORCHESTRATION_STEPS, MAX_ORCHESTRATION_STEPS,
+    MAX_ORCHESTRATION_STEPS_CEIL,
 };
 pub use permission::{ApprovalRequirement, Permission, PermissionError, RiskLevel, ToolDefinition};
 pub use persistent_grant::PersistentGrant;

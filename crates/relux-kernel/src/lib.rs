@@ -151,9 +151,10 @@ pub use prime_slots::{
 };
 pub use prime_tools::{
     build_tools_prompt, classify_tool, execute_context_tool, execute_requested_reads,
-    interpret_reply, read_only_tool_names, reads_to_wire, render_observations, run_context_loop,
-    turn_wants_context, validate_tool_request, BrainTurn, ContextLoop, ContextRead, ContextSnapshot,
-    ContextTool, ToolCall, ToolKind, MAX_TOOL_ROUNDS, READ_ONLY_TOOLS,
+    execute_requested_reads_with_limit, interpret_reply, read_only_tool_names, reads_to_wire,
+    render_observations, run_context_loop, run_context_loop_with_rounds, turn_wants_context,
+    validate_tool_request, BrainTurn, ContextLoop, ContextRead, ContextSnapshot, ContextTool,
+    ToolCall, ToolKind, MAX_TOOL_ROUNDS, MAX_TOOL_ROUNDS_CEIL, READ_ONLY_TOOLS,
 };
 pub use prime_update_slots::{
     build_update_slots_prompt, deterministic_update, parse_settable_status, parse_update_slots,

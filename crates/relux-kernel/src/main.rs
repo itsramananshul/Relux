@@ -258,7 +258,9 @@ fn run_prime_agent_policy(args: &[String]) -> Result<(), KernelError> {
             "usage: relux-kernel prime agent-policy <status|configure>\n  configure flags: \
              --max-tool-calls N --max-brain-rounds N --max-duration-secs N \
              --ext-max-tool-calls N --ext-max-brain-rounds N --ext-max-duration-secs N \
-             --max-tool-plan-steps N --ext-max-tool-plan-steps N"
+             --max-tool-plan-steps N --ext-max-tool-plan-steps N \
+             --max-orchestration-steps N --ext-max-orchestration-steps N \
+             --max-context-rounds N --ext-max-context-rounds N"
                 .to_string(),
         )),
     }
@@ -281,6 +283,14 @@ fn run_agent_policy_status() -> Result<(), KernelError> {
         output.push_str(&format!(
             "  Tool-plan steps: {} standard, {} extended (bounded by an absolute ceiling)\n",
             std.max_tool_plan_steps, ext.max_tool_plan_steps
+        ));
+        output.push_str(&format!(
+            "  Orchestration width: {} standard, {} extended briefs (bounded by an absolute ceiling)\n",
+            std.max_orchestration_steps, ext.max_orchestration_steps
+        ));
+        output.push_str(&format!(
+            "  Read-only context rounds: {} standard, {} extended\n",
+            std.max_context_rounds, ext.max_context_rounds
         ));
         output.push_str(
             "  (Extended is used when you explicitly ask Prime to keep working / use extended mode.\n\
@@ -310,6 +320,10 @@ fn run_agent_policy_configure(args: &[String]) -> Result<(), KernelError> {
     let mut ext_max_duration_secs: Option<u64> = None;
     let mut max_tool_plan_steps: Option<u32> = None;
     let mut ext_max_tool_plan_steps: Option<u32> = None;
+    let mut max_orchestration_steps: Option<u32> = None;
+    let mut ext_max_orchestration_steps: Option<u32> = None;
+    let mut max_context_rounds: Option<u32> = None;
+    let mut ext_max_context_rounds: Option<u32> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -322,6 +336,10 @@ fn run_agent_policy_configure(args: &[String]) -> Result<(), KernelError> {
             "--ext-max-duration-secs" => ext_max_duration_secs = Some(parse_u64(args, &mut i, "--ext-max-duration-secs")?),
             "--max-tool-plan-steps" => max_tool_plan_steps = Some(parse_u32(args, &mut i, "--max-tool-plan-steps")?),
             "--ext-max-tool-plan-steps" => ext_max_tool_plan_steps = Some(parse_u32(args, &mut i, "--ext-max-tool-plan-steps")?),
+            "--max-orchestration-steps" => max_orchestration_steps = Some(parse_u32(args, &mut i, "--max-orchestration-steps")?),
+            "--ext-max-orchestration-steps" => ext_max_orchestration_steps = Some(parse_u32(args, &mut i, "--ext-max-orchestration-steps")?),
+            "--max-context-rounds" => max_context_rounds = Some(parse_u32(args, &mut i, "--max-context-rounds")?),
+            "--ext-max-context-rounds" => ext_max_context_rounds = Some(parse_u32(args, &mut i, "--ext-max-context-rounds")?),
             other => return Err(KernelError::Storage(format!("Unknown argument: {other}"))),
         }
         i += 1;
@@ -338,6 +356,10 @@ fn run_agent_policy_configure(args: &[String]) -> Result<(), KernelError> {
         if let Some(v) = ext_max_duration_secs { p.extended_max_duration_secs = v; changed = true; }
         if let Some(v) = max_tool_plan_steps { p.max_tool_plan_steps = v; changed = true; }
         if let Some(v) = ext_max_tool_plan_steps { p.extended_max_tool_plan_steps = v; changed = true; }
+        if let Some(v) = max_orchestration_steps { p.max_orchestration_steps = v; changed = true; }
+        if let Some(v) = ext_max_orchestration_steps { p.extended_max_orchestration_steps = v; changed = true; }
+        if let Some(v) = max_context_rounds { p.max_context_rounds = v; changed = true; }
+        if let Some(v) = ext_max_context_rounds { p.extended_max_context_rounds = v; changed = true; }
         kernel.prime_agent_policy = p.clamped();
         if changed {
             Ok("Prime agent-loop policy updated (clamped to safe ranges).".to_string())

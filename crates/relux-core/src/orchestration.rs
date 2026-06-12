@@ -284,7 +284,9 @@ pub struct OrchestrationBatchResult {
     pub status: OrchestrationStatus,
 }
 
-/// The maximum number of briefs a single orchestration goal decomposes into.
+/// The STANDARD default number of briefs a single orchestration goal decomposes
+/// into — the per-deployment width an ordinary orchestration runs under, surfaced as
+/// the configurable [`crate::PrimeAgentPolicy::max_orchestration_steps`] field.
 ///
 /// This is a **real safety rail, not a toy/demo cap**: a pathological run-on
 /// sentence must not fan out into an unbounded storm of briefs and agents. But a
@@ -294,17 +296,54 @@ pub struct OrchestrationBatchResult {
 /// demo number. Beyond the cap the extra clauses are reported in an honest note —
 /// they are never silently dropped. (Superseded the original toy `MAX_STEPS = 6`;
 /// see `docs/ARTIFICIAL_CONSTRAINT_AUDIT.md`.)
+///
+/// An operator can raise the active width per deployment (standard / extended) via
+/// the Prime autonomy policy; the planner takes the resolved width as an argument
+/// ([`plan_orchestration_with_limit`]) so the deterministic planner and the
+/// brain-proposal path never drift. The bare [`plan_orchestration`] keeps this
+/// conservative default for tests / callers without a policy in hand.
 pub const MAX_ORCHESTRATION_STEPS: usize = 16;
 
-/// Decompose `goal` into a grounded multi-agent [`OrchestrationPlan`].
+/// The EXTENDED default orchestration width used for an explicit long-work
+/// orchestration — substantially higher than [`MAX_ORCHESTRATION_STEPS`] but still
+/// bounded, mirroring the agent-loop's extended profile. The configurable
+/// [`crate::PrimeAgentPolicy::extended_max_orchestration_steps`] field defaults here.
+pub const EXTENDED_MAX_ORCHESTRATION_STEPS: usize = 64;
+
+/// The absolute hard ceiling on orchestration width — the runaway backstop every
+/// configured width is clamped to ([`plan_orchestration_with_limit`] and
+/// [`crate::PrimeAgentPolicy::clamped`]). An operator can raise the width up to here
+/// for a serious deployment but never set "unbounded".
+pub const MAX_ORCHESTRATION_STEPS_CEIL: usize = 64;
+
+/// Decompose `goal` into a grounded multi-agent [`OrchestrationPlan`] at the
+/// STANDARD default width ([`MAX_ORCHESTRATION_STEPS`]). Thin wrapper over
+/// [`plan_orchestration_with_limit`] for callers/tests without a configured policy.
+pub fn plan_orchestration(goal: &str, summary: &StateSummary) -> OrchestrationPlan {
+    plan_orchestration_with_limit(goal, summary, MAX_ORCHESTRATION_STEPS)
+}
+
+/// Decompose `goal` into a grounded multi-agent [`OrchestrationPlan`] bounded by an
+/// explicit, operator-configured `max_steps` width.
 ///
 /// Deterministic and pure: it splits the goal into clauses on natural connectors,
 /// classifies each clause to a [`OrchestrationRole`], and resolves each role to an
 /// existing agent on the roster (`summary.all_agent_ids`). When no specialist
 /// exists for a role the step's `agent_id` is `None` (the kernel assigns Prime and
-/// records a hire suggestion). The number of steps is bounded by
-/// [`MAX_ORCHESTRATION_STEPS`] so a long sentence cannot fan out without bound.
-pub fn plan_orchestration(goal: &str, summary: &StateSummary) -> OrchestrationPlan {
+/// records a hire suggestion).
+///
+/// `max_steps` is the policy-derived width (see
+/// [`crate::PrimeAgentPolicy::orchestration_steps`]); it is itself clamped to
+/// `1..=`[`MAX_ORCHESTRATION_STEPS_CEIL`] so a configured value can never push the
+/// fan-out unbounded or below one brief. Beyond the width the extra clauses are
+/// reported in an honest note that NAMES the active limit and how to raise it — they
+/// are never silently dropped.
+pub fn plan_orchestration_with_limit(
+    goal: &str,
+    summary: &StateSummary,
+    max_steps: usize,
+) -> OrchestrationPlan {
+    let max_steps = max_steps.clamp(1, MAX_ORCHESTRATION_STEPS_CEIL);
     let goal = goal.trim().to_string();
     let clauses = split_into_clauses(&goal);
 
@@ -316,9 +355,11 @@ pub fn plan_orchestration(goal: &str, summary: &StateSummary) -> OrchestrationPl
     let mut steps: Vec<PlannedStep> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
     for clause in clauses {
-        if steps.len() >= MAX_ORCHESTRATION_STEPS {
+        if steps.len() >= max_steps {
             notes.push(format!(
-                "Goal had more than {MAX_ORCHESTRATION_STEPS} steps; only the first {MAX_ORCHESTRATION_STEPS} were planned."
+                "Goal had more than {max_steps} steps; only the first {max_steps} were planned. \
+                 Raise the orchestration width in Prime autonomy limits (or run it in extended \
+                 mode) to plan more."
             ));
             break;
         }
@@ -656,6 +697,62 @@ mod tests {
         let plan = plan_orchestration(&goal, &s);
         assert_eq!(plan.steps.len(), MAX_ORCHESTRATION_STEPS);
         assert!(plan.notes.iter().any(|n| n.contains("only the first")));
+    }
+
+    #[test]
+    fn configured_width_is_honored_and_named_in_the_overflow_note() {
+        // A smaller operator-configured width truncates to exactly that width and the
+        // honest note NAMES the active limit and how to raise it — never a silent drop.
+        let s = summary_with_agents(&["prime"]);
+        let goal = (0..8)
+            .map(|i| format!("research topic{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let plan = plan_orchestration_with_limit(&goal, &s, 3);
+        assert_eq!(plan.steps.len(), 3, "the configured width caps the fan-out");
+        let note = plan
+            .notes
+            .iter()
+            .find(|n| n.contains("only the first"))
+            .expect("an overflow note");
+        assert!(note.contains('3'), "the note names the active limit");
+        assert!(
+            note.contains("autonomy limits") || note.contains("extended"),
+            "the note says how to raise the limit"
+        );
+    }
+
+    #[test]
+    fn a_higher_configured_width_plans_more_than_the_standard_default() {
+        // With a goal of more clauses than the standard default, an extended/raised width
+        // plans more briefs than the standard default would (where the surface supports it).
+        let s = summary_with_agents(&["prime"]);
+        let goal = (0..MAX_ORCHESTRATION_STEPS + 8)
+            .map(|i| format!("research topic{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let standard = plan_orchestration_with_limit(&goal, &s, MAX_ORCHESTRATION_STEPS);
+        let extended = plan_orchestration_with_limit(&goal, &s, EXTENDED_MAX_ORCHESTRATION_STEPS);
+        assert_eq!(standard.steps.len(), MAX_ORCHESTRATION_STEPS);
+        assert!(
+            extended.steps.len() > standard.steps.len(),
+            "a higher width plans more briefs"
+        );
+        assert!(extended.steps.len() <= MAX_ORCHESTRATION_STEPS_CEIL);
+    }
+
+    #[test]
+    fn configured_width_is_clamped_to_the_ceiling_and_floor() {
+        // A wild configured width can never push the fan-out past the ceiling, nor below one.
+        let s = summary_with_agents(&["prime"]);
+        let goal = (0..MAX_ORCHESTRATION_STEPS_CEIL + 20)
+            .map(|i| format!("research topic{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let huge = plan_orchestration_with_limit(&goal, &s, usize::MAX);
+        assert_eq!(huge.steps.len(), MAX_ORCHESTRATION_STEPS_CEIL, "clamped to the ceiling");
+        let zero = plan_orchestration_with_limit(&goal, &s, 0);
+        assert_eq!(zero.steps.len(), 1, "clamped up to at least one brief");
     }
 
     #[test]

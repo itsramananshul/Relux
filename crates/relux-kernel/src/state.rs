@@ -24,7 +24,7 @@ use relux_core::agent::AgentStatus;
 use relux_core::namespace::NamespaceKind;
 use relux_core::plugin::PluginKind;
 use relux_core::{
-    approval_blocks_direct_invocation, clamp_runtime_timeout, plan_orchestration,
+    approval_blocks_direct_invocation, clamp_runtime_timeout, plan_orchestration_with_limit,
     validate_loopback_url, Agent, AgentId, Approval, ApprovalId, ApprovalStatus, AuditEvent,
     AuditResult, InstalledPlugin, Namespace, NamespaceId, Orchestration, OrchestrationBatchResult,
     OrchestrationId, OrchestrationStatus, OrchestrationStep, Permission, PersistentGrant, PluginId,
@@ -2957,7 +2957,11 @@ impl KernelState {
         goal: &str,
     ) -> Result<Orchestration, KernelError> {
         let summary = self.inspect_state();
-        let plan = plan_orchestration(goal, &summary);
+        // The operator-configured standard orchestration width — the SAME limit the brain-proposal
+        // reconcile reads (`prime_orchestration_slots`), so the deterministic planner and the brain
+        // path never fan out to different widths.
+        let max_steps = self.prime_agent_policy.orchestration_steps(false);
+        let plan = plan_orchestration_with_limit(goal, &summary, max_steps);
         if !plan.is_multi_agent() {
             return Err(KernelError::OrchestrationNotMultiAgent);
         }
@@ -6646,8 +6650,11 @@ impl KernelState {
         let plan = if intent == relux_core::PrimeIntent::Orchestration
             && !crate::prime::is_chat_guarded(message)
         {
+            let orch_width = self.prime_agent_policy.orchestration_steps(false);
             match slots.orchestration.and_then(|proposal| {
-                crate::prime_orchestration_slots::reconcile_orchestration_slots(proposal, &summary)
+                crate::prime_orchestration_slots::reconcile_orchestration_slots(
+                    proposal, &summary, orch_width,
+                )
             }) {
                 Some(resolved) => PrimePlan::Act {
                     action: PrimeAction::OrchestrateGoal {

@@ -90,6 +90,33 @@ pub struct PrimeAgentPolicy {
     /// Substantially higher than standard, clamped to the same absolute ceiling.
     #[serde(default = "default_extended_max_tool_plan_steps")]
     pub extended_max_tool_plan_steps: u32,
+    /// Standard profile: max briefs a single Prime orchestration goal fans out into
+    /// ([`crate::plan_orchestration_with_limit`]). The per-deployment width the planner
+    /// and the brain-proposal path both read, so they never drift — replacing the bare
+    /// module constant. A serious multi-part goal routinely has more than a handful of
+    /// clauses; beyond the width the overflow is reported in an honest note, never
+    /// silently dropped. Clamped to [`Self::MAX_ORCHESTRATION_STEPS_CEIL`].
+    ///
+    /// `#[serde(default)]` so a snapshot persisted before this field existed deserializes
+    /// with the serious default instead of failing the whole load.
+    #[serde(default = "default_max_orchestration_steps")]
+    pub max_orchestration_steps: u32,
+    /// Extended profile: max orchestration briefs for an explicit long-work fan-out.
+    /// Substantially higher than standard, clamped to the same absolute ceiling.
+    #[serde(default = "default_extended_max_orchestration_steps")]
+    pub extended_max_orchestration_steps: u32,
+    /// Standard profile: max rounds Prime's READ-ONLY context loop
+    /// (`crates/relux-kernel/src/prime_tools.rs`) runs before answering an inspection /
+    /// explanation question. The loop changes nothing; this bounds only the brain-call
+    /// count, and a repeated / no-progress read still stops it early. Replaces the bare
+    /// `MAX_TOOL_ROUNDS` module constant so there is one operator autonomy dial. Clamped
+    /// to [`Self::MAX_CONTEXT_ROUNDS_CEIL`].
+    #[serde(default = "default_max_context_rounds")]
+    pub max_context_rounds: u32,
+    /// Extended profile: max read-only context rounds for an explicit long-work inspection.
+    /// Higher than standard, clamped to the same absolute ceiling.
+    #[serde(default = "default_extended_max_context_rounds")]
+    pub extended_max_context_rounds: u32,
 }
 
 /// Serde default for [`PrimeAgentPolicy::max_tool_plan_steps`] (older snapshots) — the
@@ -102,6 +129,34 @@ fn default_max_tool_plan_steps() -> u32 {
 fn default_extended_max_tool_plan_steps() -> u32 {
     crate::task::MAX_TASK_TOOL_PLAN_STEPS_CEIL as u32
 }
+
+/// Serde default for [`PrimeAgentPolicy::max_orchestration_steps`] (older snapshots) — the
+/// serious standard fan-out width ([`crate::MAX_ORCHESTRATION_STEPS`]).
+fn default_max_orchestration_steps() -> u32 {
+    crate::orchestration::MAX_ORCHESTRATION_STEPS as u32
+}
+
+/// Serde default for [`PrimeAgentPolicy::extended_max_orchestration_steps`] (older snapshots).
+fn default_extended_max_orchestration_steps() -> u32 {
+    crate::orchestration::EXTENDED_MAX_ORCHESTRATION_STEPS as u32
+}
+
+/// Serde default for [`PrimeAgentPolicy::max_context_rounds`] (older snapshots) — the serious
+/// standard read-only context-round budget (aligned with the kernel's `MAX_TOOL_ROUNDS`).
+fn default_max_context_rounds() -> u32 {
+    DEFAULT_MAX_CONTEXT_ROUNDS
+}
+
+/// Serde default for [`PrimeAgentPolicy::extended_max_context_rounds`] (older snapshots).
+fn default_extended_max_context_rounds() -> u32 {
+    DEFAULT_EXTENDED_MAX_CONTEXT_ROUNDS
+}
+
+/// The STANDARD default read-only context-round budget. Kept aligned with the kernel's
+/// `relux_kernel::MAX_TOOL_ROUNDS` (the bare-constant default the read path still uses).
+const DEFAULT_MAX_CONTEXT_ROUNDS: u32 = 8;
+/// The EXTENDED default read-only context-round budget for an explicit long-work inspection.
+const DEFAULT_EXTENDED_MAX_CONTEXT_ROUNDS: u32 = 32;
 
 impl PrimeAgentPolicy {
     /// The smallest a tool-call / brain-round cap may be set to (a turn must allow at least one).
@@ -118,6 +173,14 @@ impl PrimeAgentPolicy {
     /// shared with the read path ([`crate::task::MAX_TASK_TOOL_PLAN_STEPS_CEIL`]). A single
     /// source of truth so a configured limit and the read-back bound can never drift.
     pub const MAX_TOOL_PLAN_STEPS_CEIL: u32 = crate::task::MAX_TASK_TOOL_PLAN_STEPS_CEIL as u32;
+    /// The largest an orchestration fan-out width may be set to — the absolute hard backstop
+    /// shared with the planner ([`crate::MAX_ORCHESTRATION_STEPS_CEIL`]). A single source of
+    /// truth so a configured width and the planner's own clamp can never drift.
+    pub const MAX_ORCHESTRATION_STEPS_CEIL: u32 = crate::orchestration::MAX_ORCHESTRATION_STEPS_CEIL as u32;
+    /// The largest a read-only context-round budget may be set to — a finite anti-spin backstop
+    /// on a loop that mutates nothing (it bounds only brain-call count). Operators cannot set
+    /// "infinite".
+    pub const MAX_CONTEXT_ROUNDS_CEIL: u32 = 64;
 
     /// Clamp every field into its safe operator range. Defensive — the route clamps too, but any
     /// path that mutates the policy can call this so an out-of-range value never reaches the loop.
@@ -137,6 +200,15 @@ impl PrimeAgentPolicy {
             self.max_tool_plan_steps.clamp(Self::MIN_STEPS, Self::MAX_TOOL_PLAN_STEPS_CEIL);
         self.extended_max_tool_plan_steps =
             self.extended_max_tool_plan_steps.clamp(Self::MIN_STEPS, Self::MAX_TOOL_PLAN_STEPS_CEIL);
+        self.max_orchestration_steps =
+            self.max_orchestration_steps.clamp(Self::MIN_STEPS, Self::MAX_ORCHESTRATION_STEPS_CEIL);
+        self.extended_max_orchestration_steps = self
+            .extended_max_orchestration_steps
+            .clamp(Self::MIN_STEPS, Self::MAX_ORCHESTRATION_STEPS_CEIL);
+        self.max_context_rounds =
+            self.max_context_rounds.clamp(Self::MIN_STEPS, Self::MAX_CONTEXT_ROUNDS_CEIL);
+        self.extended_max_context_rounds =
+            self.extended_max_context_rounds.clamp(Self::MIN_STEPS, Self::MAX_CONTEXT_ROUNDS_CEIL);
         self
     }
 
@@ -151,6 +223,8 @@ impl PrimeAgentPolicy {
                 max_brain_rounds: c.extended_max_brain_rounds,
                 max_duration_secs: c.extended_max_duration_secs,
                 max_tool_plan_steps: c.extended_max_tool_plan_steps,
+                max_orchestration_steps: c.extended_max_orchestration_steps,
+                max_context_rounds: c.extended_max_context_rounds,
             }
         } else {
             PrimeAgentLimits {
@@ -159,6 +233,8 @@ impl PrimeAgentPolicy {
                 max_brain_rounds: c.max_brain_rounds,
                 max_duration_secs: c.max_duration_secs,
                 max_tool_plan_steps: c.max_tool_plan_steps,
+                max_orchestration_steps: c.max_orchestration_steps,
+                max_context_rounds: c.max_context_rounds,
             }
         }
     }
@@ -169,6 +245,23 @@ impl PrimeAgentPolicy {
     /// selects the higher long-work profile.
     pub fn tool_plan_steps(&self, extended: bool) -> usize {
         self.limits(extended).max_tool_plan_steps as usize
+    }
+
+    /// The effective, clamped orchestration fan-out width for the requested mode — the single
+    /// accessor every orchestration-planning surface (`prime_orchestrate`, the brain
+    /// orchestration-slot reconcile, the preview route) passes into
+    /// [`crate::plan_orchestration_with_limit`], so the deterministic planner and the
+    /// brain-proposal path read the SAME limit and never drift. `extended` selects the higher
+    /// long-work profile.
+    pub fn orchestration_steps(&self, extended: bool) -> usize {
+        self.limits(extended).max_orchestration_steps as usize
+    }
+
+    /// The effective, clamped read-only context-round budget for the requested mode — the single
+    /// accessor the read-only context loop / requested-read executor read so the bound is one
+    /// operator dial rather than a module constant. `extended` selects the higher long-work profile.
+    pub fn context_rounds(&self, extended: bool) -> usize {
+        self.limits(extended).max_context_rounds as usize
     }
 }
 
@@ -189,6 +282,15 @@ impl Default for PrimeAgentPolicy {
             // multi-step plan, not the retired toy 5. Extended rises to the absolute ceiling.
             max_tool_plan_steps: crate::task::MAX_TASK_TOOL_PLAN_STEPS as u32,
             extended_max_tool_plan_steps: crate::task::MAX_TASK_TOOL_PLAN_STEPS_CEIL as u32,
+            // Standard orchestration width is the serious MAX_ORCHESTRATION_STEPS (16); extended
+            // rises to the higher long-work default, both clamped to the shared ceiling.
+            max_orchestration_steps: crate::orchestration::MAX_ORCHESTRATION_STEPS as u32,
+            extended_max_orchestration_steps: crate::orchestration::EXTENDED_MAX_ORCHESTRATION_STEPS
+                as u32,
+            // Standard read-only context rounds align with the kernel's MAX_TOOL_ROUNDS (8);
+            // extended allows a deeper inspection for explicit long work.
+            max_context_rounds: DEFAULT_MAX_CONTEXT_ROUNDS,
+            extended_max_context_rounds: DEFAULT_EXTENDED_MAX_CONTEXT_ROUNDS,
         }
     }
 }
@@ -208,6 +310,10 @@ pub struct PrimeAgentLimits {
     pub max_duration_secs: u64,
     /// Max steps in a multi-tool plan created/proposed under this profile.
     pub max_tool_plan_steps: u32,
+    /// Max briefs a Prime orchestration goal fans out into under this profile.
+    pub max_orchestration_steps: u32,
+    /// Max rounds the read-only context loop runs under this profile.
+    pub max_context_rounds: u32,
 }
 
 /// The result of a single Prime autonomy tick.
@@ -1419,6 +1525,15 @@ mod tests {
         assert!(p.max_tool_plan_steps > 5, "standard tool-plan steps must beat the toy 5");
         assert!(p.extended_max_tool_plan_steps > p.max_tool_plan_steps);
         assert!(p.extended_max_tool_plan_steps <= PrimeAgentPolicy::MAX_TOOL_PLAN_STEPS_CEIL);
+        // Orchestration width: standard is the serious default (and equals the planner constant),
+        // extended is higher, both within the absolute ceiling.
+        assert_eq!(p.max_orchestration_steps, crate::MAX_ORCHESTRATION_STEPS as u32);
+        assert!(p.extended_max_orchestration_steps > p.max_orchestration_steps);
+        assert!(p.extended_max_orchestration_steps <= PrimeAgentPolicy::MAX_ORCHESTRATION_STEPS_CEIL);
+        // Read-only context rounds: standard beats the retired toy 4, extended is higher still.
+        assert!(p.max_context_rounds > 4, "standard context rounds must beat the toy 4");
+        assert!(p.extended_max_context_rounds > p.max_context_rounds);
+        assert!(p.extended_max_context_rounds <= PrimeAgentPolicy::MAX_CONTEXT_ROUNDS_CEIL);
     }
 
     #[test]
@@ -1434,6 +1549,13 @@ mod tests {
         assert_eq!(std.max_tool_plan_steps, p.max_tool_plan_steps);
         assert_eq!(ext.max_tool_plan_steps, p.extended_max_tool_plan_steps);
         assert!(p.tool_plan_steps(true) > p.tool_plan_steps(false), "extended plan allows more steps");
+        // Orchestration width + context rounds resolve per mode, extended higher than standard.
+        assert_eq!(std.max_orchestration_steps, p.max_orchestration_steps);
+        assert_eq!(ext.max_orchestration_steps, p.extended_max_orchestration_steps);
+        assert!(p.orchestration_steps(true) > p.orchestration_steps(false), "extended orchestration is wider");
+        assert_eq!(std.max_context_rounds, p.max_context_rounds);
+        assert_eq!(ext.max_context_rounds, p.extended_max_context_rounds);
+        assert!(p.context_rounds(true) > p.context_rounds(false), "extended allows more context rounds");
         // An out-of-range policy is clamped to the safe ceilings (no "infinite").
         let wild = PrimeAgentPolicy {
             max_tool_calls: 0,
@@ -1444,6 +1566,10 @@ mod tests {
             extended_max_duration_secs: u64::MAX,
             max_tool_plan_steps: 0,
             extended_max_tool_plan_steps: u32::MAX,
+            max_orchestration_steps: 0,
+            extended_max_orchestration_steps: u32::MAX,
+            max_context_rounds: 0,
+            extended_max_context_rounds: u32::MAX,
         }
         .clamped();
         assert_eq!(wild.max_tool_calls, PrimeAgentPolicy::MIN_STEPS);
@@ -1453,6 +1579,10 @@ mod tests {
         assert_eq!(wild.extended_max_duration_secs, PrimeAgentPolicy::MAX_DURATION_CEIL);
         assert_eq!(wild.max_tool_plan_steps, PrimeAgentPolicy::MIN_STEPS);
         assert_eq!(wild.extended_max_tool_plan_steps, PrimeAgentPolicy::MAX_TOOL_PLAN_STEPS_CEIL);
+        assert_eq!(wild.max_orchestration_steps, PrimeAgentPolicy::MIN_STEPS);
+        assert_eq!(wild.extended_max_orchestration_steps, PrimeAgentPolicy::MAX_ORCHESTRATION_STEPS_CEIL);
+        assert_eq!(wild.max_context_rounds, PrimeAgentPolicy::MIN_STEPS);
+        assert_eq!(wild.extended_max_context_rounds, PrimeAgentPolicy::MAX_CONTEXT_ROUNDS_CEIL);
     }
 
     #[test]
