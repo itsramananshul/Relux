@@ -9,6 +9,49 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.22 (Windows bundle).** The `relux-kernel` /
+  `relux-core` crates move from `0.1.21` to `0.1.22`, bundling the post-v0.1.21
+  **run-log observability + safe mid-run cancellation** work into a fresh Windows
+  release. All three slices are driven by `docs/HERMES_OPENCLAW_DEEP_AUDIT.md`
+  (§24/§25/§26; §8/§10 P2) and were built reference-first against the vendored
+  Paperclip/openclaw process-execution paths per
+  `docs/reference-driven-development.md`. No master-plan safety property is
+  weakened: logs are bounded, redacted, and line-capped continuously; cancellation
+  is cooperative and fails closed. Headlines:
+  - **Bounded, redacted run-log / tail surface (`HERMES_OPENCLAW_DEEP_AUDIT.md`
+    §24).** A new `relux_core::RunLog` captures an adapter run's stdout/stderr as
+    classified, secret-redacted, per-line-clamped, line-count-capped lines
+    (oldest dropped + counted, with truncation markers). `GET
+    /v1/relux/runs/:id/logs?since=<seq>` returns the bounded tail (incremental
+    past a cursor, full when absent); a real run with no captured log returns an
+    **empty** `lines` array (never an error), only an unknown run id is a 400. The
+    dashboard Work Run Detail adds a **Logs / Tail** section (per-line table with
+    source badge, truncation note, Refresh + poll).
+  - **LIVE per-line run-log streaming during off-lock adapter execution
+    (`HERMES_OPENCLAW_DEEP_AUDIT.md` §25).** A new
+    `relux_core::StreamingRunLog` line-buffers streamed chunks and emits only
+    complete, re-redacted, clamped lines while the process runs, enforcing the
+    line cap continuously so a long live stream stays bounded; the finalized record
+    is byte-identical to the captured-then-built one. Wired through
+    `run_adapter_command_streaming` + a kernel `LiveRunLogs` buffer on the off-lock
+    (parallel orchestration) path, so lines appear before the run finalizes. The
+    synchronous lock-holding path remains finalize-captured; the tail is still
+    POLLED (no SSE/WebSocket push yet — stated honestly).
+  - **First safe mid-run cancellation for process-backed runs
+    (`HERMES_OPENCLAW_DEEP_AUDIT.md` §26).** An `AbortSignal`-style cooperative
+    cancel for a long adapter run: `POST /v1/relux/runs/:id/cancel` sets a flag the
+    off-lock streaming path observes, kills the child process, and records an honest
+    cancelled result inline. Cancellation fails closed (a non-cancellable / already-
+    finished run reports honestly rather than fabricating a kill).
+
+  Built reference-first per `docs/reference-driven-development.md`. `cargo test`
+  + `clippy` clean on `relux-core` / `relux-kernel`; dashboard tests + typecheck +
+  build green; the tracked `dashboard-dist` bundle rebuilt and committed in sync.
+  Build the bundle with `scripts\relux-package-local.ps1 -FullE2E`. This version
+  line is the `relux-kernel` crate version (separate from the legacy Relix
+  workspace versions in the dated sections below). See
+  `docs/RELUX_MASTER_PLAN.md` → *Release history*. Every safety property from
+  v0.1.21 still holds.
 - **Relux local release v0.1.21 (Windows bundle).** The `relux-kernel` /
   `relux-core` crates move from `0.1.20` to `0.1.21`, bundling the post-v0.1.20
   work into a fresh Windows release: the **first persistent allow-always grant**

@@ -1836,6 +1836,28 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.22** (2026-06-11) — **run-log observability + safe mid-run cancellation** on top of
+  v0.1.21, driven by `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` (§24/§25/§26; §8/§10 P2) and built
+  reference-first against the vendored Paperclip/openclaw process-execution paths per
+  `docs/reference-driven-development.md`. No master-plan safety property is weakened. **Bounded,
+  redacted run-log / tail (§24):** a new `relux_core::RunLog` captures an adapter run's stdout/stderr
+  as classified, secret-redacted, per-line-clamped, line-count-capped lines (oldest dropped + counted,
+  truncation markers). `GET /v1/relux/runs/:id/logs?since=<seq>` returns the bounded tail (incremental
+  past a cursor, full when absent); a run with no captured log returns an empty (not errored) `lines`
+  array, only an unknown run id is a 400. The dashboard Work Run Detail adds a Logs / Tail section
+  (per-line table, source badge, truncation note, Refresh + poll). **LIVE per-line streaming (§25):** a
+  new `relux_core::StreamingRunLog` line-buffers streamed chunks and emits only complete, re-redacted,
+  clamped lines while the process runs, enforcing the line cap continuously so a long live stream stays
+  bounded (the finalized record is byte-identical to the captured-then-built one); wired through
+  `run_adapter_command_streaming` + a kernel `LiveRunLogs` buffer on the off-lock parallel path, so
+  lines appear before the run finalizes. The synchronous lock-holding path stays finalize-captured and
+  the tail is still POLLED (no SSE/WebSocket push yet — stated honestly). **Safe mid-run cancellation
+  (§26):** an `AbortSignal`-style cooperative cancel — `POST /v1/relux/runs/:id/cancel` sets a flag the
+  off-lock streaming path observes, kills the child process, and records an honest cancelled result
+  inline; a non-cancellable / already-finished run reports honestly (fails closed) rather than
+  fabricating a kill. `cargo test` + `clippy` clean on `relux-core`/`relux-kernel`, dashboard tests +
+  typecheck + build green, the tracked `dashboard-dist` bundle rebuilt and committed in sync. Every
+  safety property from v0.1.21 still holds.
 - **v0.1.21** (2026-06-11) — the **first persistent allow-always grant** plus a **Hermes-first
   Prime** re-grounding on top of v0.1.20, driven by `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` (§23 / §5
   P2) and `docs/prime-processing-audit.md`. No master-plan safety property is weakened. **Persistent
