@@ -30,6 +30,9 @@ import {
   inboxItemMatchesQuery,
   searchInbox,
   inboxSearchEmptyMessage,
+  buildInboxGroups,
+  inboxGroupKey,
+  inboxKindLabel,
   INBOX_AGE_THRESHOLDS,
   INBOX_FILTERS,
   type InboxActionMode,
@@ -318,6 +321,115 @@ test("inboxSearchEmptyMessage names the query + filter, or falls back to the fil
   const msg = inboxSearchEmptyMessage("failed_run", "auth");
   assert.match(msg, /No items match 'auth'/);
   assert.match(msg, /Failed runs/);
+});
+
+// --- Cross-item grouping (§6.11) ------------------------------------------------
+
+test("inboxGroupKey: a parent_task edge keys the subtree; a parent-in-queue roots its own", () => {
+  const parents = new Set<string>(["tk-parent"]);
+  // A child with a parent_task → that subtree.
+  assert.equal(
+    inboxGroupKey(item({ id: "run:1", parent_task: "tk-parent" }), parents),
+    "subtree:tk-parent",
+  );
+  // A blocked task that IS some item's parent → roots its own subtree.
+  assert.equal(
+    inboxGroupKey(item({ id: "task:tk-parent", kind: "blocked_task", task_id: "tk-parent" }), parents),
+    "subtree:tk-parent",
+  );
+  // No edge and not a parent → standalone, keyed by its own id (never merges).
+  assert.equal(inboxGroupKey(item({ id: "approval:9", kind: "pending_approval" }), parents), "solo:approval:9");
+});
+
+test("buildInboxGroups collapses a real subtree and leaves unrelated items standalone", () => {
+  // A blocked parent task + a failed-run child + a blocked child, all under tk-root,
+  // plus an UNRELATED approval. The three subtree members collapse; the approval stays
+  // standalone (no fake grouping).
+  const items: ReluxInboxItem[] = [
+    item({ id: "task:tk-root", kind: "blocked_task", task_id: "tk-root", title: "Blocked: Ship the launch", severity: "warn", age_ticks: 50 }),
+    item({ id: "run:1", kind: "failed_run", task_id: "tk-child-a", parent_task: "tk-root", severity: "critical", age_ticks: 10 }),
+    item({ id: "task:tk-child-b", kind: "blocked_task", task_id: "tk-child-b", parent_task: "tk-root", severity: "warn", age_ticks: 200 }),
+    item({ id: "approval:1", kind: "pending_approval", severity: "info", age_ticks: 5 }),
+  ];
+  const cards = buildInboxGroups(items);
+  // Two cards: the collapsed subtree (root + 2 children) and the standalone approval.
+  assert.equal(cards.length, 2);
+  const subtree = cards.find((c) => c.key === "subtree:tk-root")!;
+  assert.ok(subtree, "the subtree card exists");
+  assert.equal(subtree.collapsible, true, "≥2 members → collapsible");
+  assert.equal(subtree.items.length, 3, "root + both children are members");
+  // Title is the root blocked task's own title, with the "Blocked: " prefix stripped.
+  assert.equal(subtree.title, "Ship the launch");
+  assert.equal(subtree.rootTaskId, "tk-root");
+  // Rollups: WORST severity (the critical child) and OLDEST age (the 200-tick child).
+  assert.equal(subtree.topSeverity, "critical");
+  assert.equal(subtree.topAgeTicks, 200);
+  // Per-kind counts: 2 blocked (root + child-b) and 1 failed.
+  const counts = Object.fromEntries(subtree.kindCounts.map((c) => [c.kind, c.count]));
+  assert.equal(counts["blocked_task"], 2);
+  assert.equal(counts["failed_run"], 1);
+
+  // The unrelated approval is its own non-collapsible solo card.
+  const solo = cards.find((c) => c.key === "solo:approval:1")!;
+  assert.ok(solo, "the approval is standalone");
+  assert.equal(solo.collapsible, false);
+  assert.equal(solo.items.length, 1);
+});
+
+test("buildInboxGroups: a single child whose parent is absent stays a standalone row", () => {
+  // Only ONE item carries parent_task tk-x and the parent itself is not in the queue —
+  // collapsing one item is pointless, so it is NOT collapsible (renders as a row).
+  const cards = buildInboxGroups([
+    item({ id: "run:1", kind: "failed_run", parent_task: "tk-x", parent_title: "Parent effort", age_ticks: 3 }),
+  ]);
+  assert.equal(cards.length, 1);
+  assert.equal(cards[0].collapsible, false, "a lone subtree member is not worth collapsing");
+  // A lone member's card title is the item's own title, not the subtree heading.
+  assert.equal(cards[0].title, "t");
+});
+
+test("buildInboxGroups titles a subtree from parent_title when the root isn't in the queue", () => {
+  // Two siblings under tk-y whose parent is NOT itself an attention item: the card is
+  // titled from the backend-resolved parent_title, never blank.
+  const cards = buildInboxGroups([
+    item({ id: "run:1", kind: "failed_run", parent_task: "tk-y", parent_title: "Migration effort", age_ticks: 4 }),
+    item({ id: "run:2", kind: "failed_run", parent_task: "tk-y", parent_title: "Migration effort", age_ticks: 9 }),
+  ]);
+  assert.equal(cards.length, 1);
+  assert.equal(cards[0].collapsible, true);
+  assert.equal(cards[0].title, "Migration effort");
+});
+
+test("buildInboxGroups preserves urgency order: a more-urgent group leads", () => {
+  // A standalone critical run appears before a warn subtree because its first member is
+  // more urgent (input is already backend-sorted; group order follows first appearance).
+  const items: ReluxInboxItem[] = [
+    item({ id: "run:hot", kind: "failed_run", severity: "critical", age_ticks: 1 }),
+    item({ id: "task:p", kind: "blocked_task", task_id: "p", severity: "warn", age_ticks: 100 }),
+    item({ id: "run:c", kind: "failed_run", parent_task: "p", severity: "warn", age_ticks: 80 }),
+  ];
+  const cards = buildInboxGroups(items);
+  assert.deepEqual(cards.map((c) => c.key), ["solo:run:hot", "subtree:p"]);
+});
+
+test("buildInboxGroups: search/filter run FIRST, so a group only holds matched items", () => {
+  const items: ReluxInboxItem[] = [
+    item({ id: "run:1", kind: "failed_run", parent_task: "tk-root", title: "auth broke", age_ticks: 5 }),
+    item({ id: "task:tk-child", kind: "blocked_task", task_id: "tk-child", parent_task: "tk-root", title: "Blocked: deploy", age_ticks: 6 }),
+  ];
+  // Mimic the page: search first, then group the visible subset. Only the matching
+  // member survives, so the subtree degrades to a single standalone row.
+  const cards = buildInboxGroups(searchInbox(items, "auth"));
+  assert.equal(cards.length, 1);
+  assert.equal(cards[0].items.length, 1);
+  assert.equal(cards[0].collapsible, false, "one matched member → not a collapsed group");
+});
+
+test("inboxKindLabel resolves a section heading per kind", () => {
+  assert.equal(inboxKindLabel("pending_approval"), "Approvals");
+  assert.equal(inboxKindLabel("failed_run"), "Failed runs");
+  assert.equal(inboxKindLabel("blocked_task"), "Blocked work");
+  assert.equal(inboxKindLabel("paused_continuation"), "Paused loops");
 });
 
 test("INBOX_FILTERS covers all/kinds/overdue and inboxEmptyMessage reflects the active filter", () => {

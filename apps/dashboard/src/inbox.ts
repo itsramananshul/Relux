@@ -395,6 +395,160 @@ export function inboxEmptyMessage(filter: InboxFilter): string {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Cross-item grouping (docs/relix-dashboard-design.md §6.11 "cross-item grouping —
+// collapsing a whole stalled subtree into one card").
+//
+// Grouping is built from the ONE real relationship the backend exposes: the ad-hoc
+// `parent_task` edge (`relux_core::Task`). Items whose underlying tasks share a
+// `parent_task` — OR whose task IS another in-queue item's parent — collapse into a
+// single stalled-subtree card. Items with no shared root stay standalone (NO fake
+// grouping). The page applies search + filter FIRST, then groups the visible result,
+// so a group only ever holds already-matched items and "a group matches if any member
+// matches" holds by construction.
+// ---------------------------------------------------------------------------
+
+// Severity rank for the worst-member rollup: critical (0) outranks warn (1) outranks
+// info (2). Mirrors the backend's `inbox_severity_rank`.
+function inboxSeverityRank(severity: ReluxInboxItem["severity"]): number {
+  switch (severity) {
+    case "critical":
+      return 0;
+    case "warn":
+      return 1;
+    default:
+      return 2;
+  }
+}
+
+// A short human heading per kind (reused from the section order) for the per-kind
+// count chips on a collapsed subtree card.
+export function inboxKindLabel(kind: ReluxInboxKind): string {
+  return GROUP_ORDER.find((g) => g.kind === kind)?.label ?? kind;
+}
+
+// One rendered group card: either a real multi-member subtree (collapsible) or a
+// single standalone item (collapsible === false). The rollups (worst severity, oldest
+// age, per-kind counts) summarize the members so a collapsed card is still honest.
+export interface InboxGroupCard {
+  // "subtree:<rootTaskId>" for a parent-edge group, "solo:<itemId>" for a standalone.
+  key: string;
+  // The subtree root task id (the parent everything hangs off), or null for a solo item.
+  rootTaskId: string | null;
+  // The card heading: the parent task's title for a subtree, else the lone item's title.
+  title: string;
+  // The members, in the backend's urgency order (severity, then oldest-first).
+  items: ReluxInboxItem[];
+  // True only for a real multi-member subtree (≥ 2 members) — the case worth collapsing.
+  collapsible: boolean;
+  // The WORST severity among members (drives the card's leading badge) — "highest
+  // severity" per the mission, computed across all members, not just the first.
+  topSeverity: ReluxInboxItem["severity"];
+  // The OLDEST known logical-tick age among members (the card's age badge), or null when
+  // no member has a usable age (honest "age unavailable", never invented).
+  topAgeTicks: number | null;
+  // Non-zero per-kind counts in section order, for the "2 failed · 1 blocked" summary.
+  kindCounts: { kind: ReluxInboxKind; label: string; count: number }[];
+}
+
+// The grouping key for one item. A `parent_task` edge puts the item in that parent's
+// subtree; a blocked task that is itself some other in-queue item's parent roots its
+// own subtree; anything else is standalone (keyed by its own id, so it never merges).
+export function inboxGroupKey(item: ReluxInboxItem, parentIds: Set<string>): string {
+  if (item.parent_task) return `subtree:${item.parent_task}`;
+  if (item.kind === "blocked_task" && item.task_id && parentIds.has(item.task_id)) {
+    return `subtree:${item.task_id}`;
+  }
+  return `solo:${item.id}`;
+}
+
+// Strip the "Blocked: " prefix the backend puts on a blocked_task title, so a subtree
+// card titled from its root task reads as the plain effort name.
+function stripBlockedPrefix(title: string): string {
+  return title.startsWith("Blocked: ") ? title.slice("Blocked: ".length) : title;
+}
+
+// The heading for a subtree card: the root blocked task's own title if it is in the
+// queue, else a member's backend-resolved `parent_title`, else a stable id fallback —
+// never blank.
+function inboxSubtreeTitle(rootTaskId: string, members: ReluxInboxItem[]): string {
+  const root = members.find((m) => m.kind === "blocked_task" && m.task_id === rootTaskId);
+  if (root) return stripBlockedPrefix(root.title);
+  const titled = members.find((m) => m.parent_title && m.parent_title.length > 0);
+  if (titled?.parent_title) return titled.parent_title;
+  return `Subtree ${rootTaskId}`;
+}
+
+// The worst (lowest-rank) severity among a group's members.
+function inboxWorstSeverity(members: ReluxInboxItem[]): ReluxInboxItem["severity"] {
+  return members.reduce<ReluxInboxItem["severity"]>(
+    (worst, m) => (inboxSeverityRank(m.severity) < inboxSeverityRank(worst) ? m.severity : worst),
+    "info",
+  );
+}
+
+// The oldest KNOWN logical-tick age among members, or null when none has a usable age.
+function inboxOldestAge(members: ReluxInboxItem[]): number | null {
+  let oldest: number | null = null;
+  for (const m of members) {
+    const a = m.age_ticks;
+    if (typeof a === "number" && Number.isFinite(a) && a >= 0) {
+      oldest = oldest == null ? a : Math.max(oldest, a);
+    }
+  }
+  return oldest;
+}
+
+// Non-zero per-kind counts in the fixed section order.
+function inboxKindCounts(
+  members: ReluxInboxItem[],
+): { kind: ReluxInboxKind; label: string; count: number }[] {
+  return GROUP_ORDER.map((g) => ({
+    kind: g.kind,
+    label: g.label,
+    count: members.filter((m) => m.kind === g.kind).length,
+  })).filter((c) => c.count > 0);
+}
+
+// Collapse the (already searched + filtered) item list into ordered group cards.
+// Order preserves the backend's urgency sort: each group appears at the position of
+// its most-urgent member (first appearance), so a more-urgent group leads. A group
+// with one member is rendered standalone; only a real ≥2-member subtree collapses.
+export function buildInboxGroups(items: ReluxInboxItem[]): InboxGroupCard[] {
+  const parentIds = new Set<string>(
+    items.map((i) => i.parent_task).filter((p): p is string => !!p),
+  );
+  const order: string[] = [];
+  const byKey = new Map<string, ReluxInboxItem[]>();
+  for (const it of items) {
+    const key = inboxGroupKey(it, parentIds);
+    if (!byKey.has(key)) {
+      byKey.set(key, []);
+      order.push(key);
+    }
+    byKey.get(key)!.push(it);
+  }
+  return order.map((key) => {
+    const members = byKey.get(key)!;
+    const isSubtree = key.startsWith("subtree:");
+    const rootTaskId = isSubtree ? key.slice("subtree:".length) : null;
+    const collapsible = isSubtree && members.length >= 2;
+    return {
+      key,
+      rootTaskId,
+      collapsible,
+      items: members,
+      title:
+        collapsible && rootTaskId
+          ? inboxSubtreeTitle(rootTaskId, members)
+          : members[0].title,
+      topSeverity: inboxWorstSeverity(members),
+      topAgeTicks: inboxOldestAge(members),
+      kindCounts: inboxKindCounts(members),
+    };
+  });
+}
+
 // Build the safe, redacted Prime investigation seed input for an item (consumed by
 // investigateseed.buildInvestigationSeed in the page). It carries only the item's
 // identity + the deterministic summary the projection already redacted/bounded — no

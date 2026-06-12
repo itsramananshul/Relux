@@ -1953,6 +1953,19 @@ struct InboxItem {
     /// dashboard's investigate/diagnose framing). Absent for non-failure items.
     #[serde(skip_serializing_if = "Option::is_none")]
     failure_class: Option<String>,
+    /// The id of the parent task this item's work belongs to, when the underlying task
+    /// carries a `parent_task` edge (the ad-hoc subtree link — `relux_core::Task`). This
+    /// is the ONE real relationship the dashboard groups on: items whose tasks share a
+    /// `parent_task` (or whose task IS another item's parent) collapse into one stalled-
+    /// subtree card (`docs/relix-dashboard-design.md` §6.11 "cross-item grouping"). `None`
+    /// for a top-level task and for the approval / continuation kinds (no task edge).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_task: Option<String>,
+    /// The parent task's title, resolved from the same snapshot, so the dashboard can
+    /// title a collapsed subtree card WITHOUT a second fetch even when the parent itself
+    /// is not in the queue. `None` when there is no parent or the parent can't be resolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_title: Option<String>,
     /// The logical-clock stamp this item began needing attention (the per-kind
     /// anchor: an approval's `created_at`, a run's `ended_at`/`started_at`, a blocked
     /// task's `updated_at`, a continuation's `created_at`). It is a DETERMINISTIC
@@ -2157,6 +2170,9 @@ async fn get_inbox(State(state): State<AppState>) -> Result<Json<InboxResponse>,
                     approval_id: Some(a.id.to_string()),
                     continuation_id: None,
                     failure_class: None,
+                    // An approval is a Guild-level gate, not subtree work — no task edge.
+                    parent_task: None,
+                    parent_title: None,
                     attention_since,
                     age_ticks,
                     // Embed the full approval so the Inbox row can offer the same
@@ -2171,11 +2187,33 @@ async fn get_inbox(State(state): State<AppState>) -> Result<Json<InboxResponse>,
 
         // Index runs once for retry-eligibility + latest-run-per-task lookups.
         let runs: Vec<&relux_core::Run> = kernel.runs();
+        // Index tasks by id once for the subtree grouping fields (`parent_task` /
+        // `parent_title`) — the ad-hoc `parent_task` edge is the ONE real relationship
+        // the dashboard collapses a stalled subtree on (§6.11). The title is resolved
+        // here, off the same snapshot, so the dashboard never needs a second fetch.
+        let tasks: Vec<&relux_core::Task> = kernel.tasks();
+        let task_by_id: std::collections::HashMap<String, &relux_core::Task> =
+            tasks.iter().map(|t| (t.id.to_string(), *t)).collect();
+        // Resolve the `(parent_task, parent_title)` pair for a task id, when that task
+        // carries a parent edge and the parent resolves. A missing task or top-level task
+        // yields `(None, None)` — no invented relationship.
+        let parent_fields = |task_id: &str| -> (Option<String>, Option<String>) {
+            let Some(t) = task_by_id.get(task_id) else {
+                return (None, None);
+            };
+            match t.parent_task.as_ref() {
+                Some(pid) => {
+                    let pid_s = pid.to_string();
+                    let title = task_by_id.get(&pid_s).map(|p| p.title.clone());
+                    (Some(pid_s), title)
+                }
+                None => (None, None),
+            }
+        };
         // The set of task ids that are currently blocked — a failed run on a blocked
         // task is represented by the (richer) blocked_task item, so we de-dupe it out
         // of the standalone failed-run list to keep the queue signal, not noise.
-        let blocked_task_ids: std::collections::HashSet<String> = kernel
-            .tasks()
+        let blocked_task_ids: std::collections::HashSet<String> = tasks
             .iter()
             .filter(|t| t.status == relux_core::TaskStatus::Blocked)
             .map(|t| t.id.to_string())
@@ -2235,6 +2273,9 @@ async fn get_inbox(State(state): State<AppState>) -> Result<Json<InboxResponse>,
                     now_secs,
                     r.ended_at.as_deref().or(r.started_at.as_deref()),
                 );
+                // The subtree edge: the run's own task's parent (if any), so a failed run
+                // collapses under the same stalled-subtree card as its siblings (§6.11).
+                let (parent_task, parent_title) = parent_fields(&r.task_id.to_string());
                 items.push(InboxItem {
                     id: format!("run:{}", r.id),
                     kind: "failed_run".to_string(),
@@ -2253,6 +2294,8 @@ async fn get_inbox(State(state): State<AppState>) -> Result<Json<InboxResponse>,
                     approval_id: None,
                     continuation_id: None,
                     failure_class: fc,
+                    parent_task,
+                    parent_title,
                     approval: None,
                     attention_since,
                     age_ticks,
@@ -2321,6 +2364,9 @@ async fn get_inbox(State(state): State<AppState>) -> Result<Json<InboxResponse>,
                         t.updated_at.as_str()
                     }),
                 );
+                // The subtree edge: this blocked task's own parent (if any), so a held
+                // child collapses under its parent's stalled-subtree card (§6.11).
+                let (parent_task, parent_title) = parent_fields(&t.id.to_string());
                 items.push(InboxItem {
                     id: format!("task:{}", t.id),
                     kind: "blocked_task".to_string(),
@@ -2332,6 +2378,8 @@ async fn get_inbox(State(state): State<AppState>) -> Result<Json<InboxResponse>,
                     approval_id: None,
                     continuation_id: None,
                     failure_class: fc,
+                    parent_task,
+                    parent_title,
                     approval: None,
                     attention_since,
                     age_ticks,
@@ -2388,6 +2436,9 @@ async fn get_inbox(State(state): State<AppState>) -> Result<Json<InboxResponse>,
                 approval_id: None,
                 continuation_id: Some(c.id.clone()),
                 failure_class: None,
+                // A paused loop is its own attention item, not subtree work — no task edge.
+                parent_task: None,
+                parent_title: None,
                 approval: None,
                 attention_since,
                 age_ticks,
@@ -11493,6 +11544,87 @@ mod tests {
         assert!(
             age_older > age_newer,
             "the earlier-blocked task is older ({age_older} > {age_newer})"
+        );
+    }
+
+    #[tokio::test]
+    async fn inbox_items_carry_parent_task_edge_for_subtree_grouping() {
+        // §6.11 cross-item grouping: an Inbox item whose underlying task carries a
+        // `parent_task` edge surfaces that edge (+ the resolved parent title) so the
+        // dashboard can collapse a stalled subtree into one card WITHOUT a second fetch.
+        // A top-level blocked task carries NO parent edge — no invented relationship.
+        let (state, _dir) = auth_state(true);
+
+        // Create a parent task and a child task, then reparent the child under the parent
+        // through the real board route (the same validated ad-hoc subtree edge).
+        let mut ids: Vec<String> = Vec::new();
+        for title in ["parent effort", "child step"] {
+            let (cs, _, cb) = call(
+                &state,
+                "POST",
+                "/v1/relux/tasks",
+                None,
+                Some(&format!(r#"{{"title":"{title}"}}"#)),
+            )
+            .await;
+            assert_eq!(cs, StatusCode::OK, "{cb}");
+            let created: serde_json::Value = serde_json::from_str(&cb).unwrap();
+            ids.push(created["id"].as_str().unwrap().to_string());
+        }
+        let (parent, child) = (ids[0].clone(), ids[1].clone());
+        let (rs, _, rb) = call(
+            &state,
+            "POST",
+            &format!("/v1/relux/tasks/{child}/parent"),
+            None,
+            Some(&format!(r#"{{"parent_task":"{parent}"}}"#)),
+        )
+        .await;
+        assert_eq!(rs, StatusCode::OK, "{rb}");
+
+        // Block BOTH so each becomes an attention item.
+        for id in [&parent, &child] {
+            let (bs, _, bb) = call(
+                &state,
+                "POST",
+                &format!("/v1/relux/tasks/{id}/status"),
+                None,
+                Some(r#"{"status":"blocked"}"#),
+            )
+            .await;
+            assert_eq!(bs, StatusCode::OK, "{bb}");
+        }
+
+        let (status, _, body) = call(&state, "GET", "/v1/relux/inbox", None, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let items = v["items"].as_array().unwrap();
+
+        let child_item = items
+            .iter()
+            .find(|i| i["task_id"].as_str() == Some(child.as_str()))
+            .expect("the blocked child is an attention item");
+        // The child carries its parent edge + the resolved parent title — the real
+        // relationship the dashboard groups on, with the title resolved server-side.
+        assert_eq!(
+            child_item["parent_task"].as_str(),
+            Some(parent.as_str()),
+            "child surfaces its parent_task edge: {child_item}"
+        );
+        assert_eq!(
+            child_item["parent_title"].as_str(),
+            Some("parent effort"),
+            "the parent title is resolved off the same snapshot: {child_item}"
+        );
+
+        // The top-level parent has NO parent edge — the field is omitted, never invented.
+        let parent_item = items
+            .iter()
+            .find(|i| i["task_id"].as_str() == Some(parent.as_str()))
+            .expect("the blocked parent is an attention item");
+        assert!(
+            parent_item.get("parent_task").is_none(),
+            "a top-level task carries no parent edge: {parent_item}"
         );
     }
 

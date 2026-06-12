@@ -23,8 +23,10 @@ import {
   inboxFilterCount,
   searchInbox,
   inboxSearchEmptyMessage,
+  buildInboxGroups,
   INBOX_FILTERS,
   type InboxFilter,
+  type InboxGroupCard,
 } from "../inbox";
 import { buildInvestigationSeed, stashInvestigationSeed } from "../investigateseed";
 import { ApprovalInlineDecisions } from "../components/ApprovalInlineDecisions";
@@ -56,9 +58,9 @@ type DiagState =
 // clock (not wall-clock), so the age is a count of kernel events ("ticks") since the
 // item began needing attention — never a real-time duration or deadline. An item with
 // no anchor honestly reads "age unavailable" instead of inventing one (§6.11).
-function AgeBadge({ item }: { item: ReluxInboxItem }) {
-  const bucket = inboxAgeBucket(item.age_ticks);
-  const detail = inboxAgeDetail(item.age_ticks);
+function AgeTicksBadge({ ageTicks }: { ageTicks: number | null | undefined }) {
+  const bucket = inboxAgeBucket(ageTicks);
+  const detail = inboxAgeDetail(ageTicks);
   if (bucket === "unknown") {
     return (
       <span
@@ -78,6 +80,74 @@ function AgeBadge({ item }: { item: ReluxInboxItem }) {
       {inboxAgeBucketLabel(bucket)}
       {detail ? ` · ${detail}` : ""}
     </span>
+  );
+}
+
+function AgeBadge({ item }: { item: ReluxInboxItem }) {
+  return <AgeTicksBadge ageTicks={item.age_ticks} />;
+}
+
+// A collapsed stalled-subtree card (§6.11 cross-item grouping). The header summarizes
+// the whole subtree — its root title, the WORST member severity, the OLDEST member age,
+// and the per-kind counts — and is expandable to the full member rows. Actions are
+// never hidden permanently: one click on the header reveals every member's controls.
+export function SubtreeGroupCard({
+  group,
+  onActed,
+  defaultOpen = false,
+}: {
+  group: InboxGroupCard;
+  onActed: () => void;
+  defaultOpen?: boolean;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  const memberCount = group.items.length;
+  return (
+    <div className="card" style={{ padding: 12 }}>
+      <button
+        className="row"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+        title={open ? "Collapse this subtree" : "Expand to act on each member"}
+        style={{
+          width: "100%",
+          alignItems: "baseline",
+          gap: 8,
+          flexWrap: "wrap",
+          background: "none",
+          border: "none",
+          padding: 0,
+          cursor: "pointer",
+          textAlign: "left",
+        }}
+      >
+        <span className="mono muted" style={{ fontSize: 11 }}>{open ? "▾" : "▸"}</span>
+        <span className={"badge " + inboxSeverityTone(group.topSeverity)} style={{ fontSize: 9 }}>
+          {inboxSeverityLabel(group.topSeverity)}
+        </span>
+        <AgeTicksBadge ageTicks={group.topAgeTicks} />
+        <span style={{ fontWeight: 600, fontSize: 13 }}>{group.title}</span>
+        <span className="mono muted" style={{ fontSize: 11 }}>
+          {memberCount} item{memberCount === 1 ? "" : "s"}
+        </span>
+        <div className="spacer" style={{ flex: 1 }} />
+        <span className="mono muted" style={{ fontSize: 10 }}>
+          {group.kindCounts.map((c) => `${c.count} ${c.label.toLowerCase()}`).join(" · ")}
+        </span>
+      </button>
+      {!open && (
+        <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>
+          A stalled subtree — expand to act on each member (every action is still here).
+        </div>
+      )}
+      {open && (
+        <div style={{ marginTop: 10 }}>
+          {group.items.map((it) => (
+            <InboxRow key={it.id} item={it} onActed={onActed} />
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -257,6 +327,11 @@ export function InboxRow({ item, onActed }: { item: ReluxInboxItem; onActed: () 
 export function Inbox() {
   const { data, loading, error, reload } = useAsync<ReluxInbox>(() => reluxInbox.get(), []);
   const [filter, setFilter] = useState<InboxFilter>("all");
+  // Cross-item grouping (§6.11): collapse a stalled subtree (items whose tasks share a
+  // parent_task edge) into one card. Default ON — the whole point of the queue is to
+  // turn a fanned-out failure into one thing to look at. The toggle drops to the flat
+  // per-kind sections for operators who want every row laid out.
+  const [grouped, setGrouped] = useState(true);
   // The free-text search lives in the URL (`/inbox?q=…`) so a narrowed view is
   // shareable and survives refresh/back-forward (mirrors the Briefs `?brief=` /
   // Agents `?agent=` pattern). It is a purely local cut over the loaded items.
@@ -280,7 +355,11 @@ export function Inbox() {
   // many of this kind match your search".
   const searched = searchInbox(allItems, query);
   const visible = filterInbox(searched, filter);
+  // Flat per-kind sections (toggle off) vs. collapsed subtree cards (toggle on). Both
+  // operate on the SAME already-searched + filtered `visible` set, so a group only ever
+  // holds matched items ("a group matches if any member matches" holds by construction).
   const groups = groupInbox(visible);
+  const groupCards = buildInboxGroups(visible);
   // A search and/or the kind filter narrowed a non-empty queue to nothing (vs. a
   // globally empty Inbox) — the empty state names the active query/filter.
   const filteredToEmpty = allItems.length > 0 && visible.length === 0;
@@ -325,8 +404,8 @@ export function Inbox() {
 
       {/* Filter chips — a cheap cut by kind, plus an overdue-only band. The active
           chip carries the live count (over the searched set); selecting one narrows
-          the queue below. */}
-      <div className="row wrap" style={{ gap: 6, marginBottom: 4 }}>
+          the queue below. The Group toggle collapses stalled subtrees into one card. */}
+      <div className="row wrap" style={{ gap: 6, marginBottom: 4, alignItems: "center" }}>
         {INBOX_FILTERS.map((f) => {
           const active = filter === f.key;
           const count = inboxFilterCount(searched, f.key);
@@ -342,6 +421,19 @@ export function Inbox() {
             </button>
           );
         })}
+        <div className="spacer" style={{ flex: 1 }} />
+        <button
+          className={"btn sm" + (grouped ? "" : " ghost")}
+          aria-pressed={grouped}
+          onClick={() => setGrouped((v) => !v)}
+          title={
+            grouped
+              ? "Grouping related items (a stalled subtree collapses into one card). Click for a flat list."
+              : "Showing every item flat, by kind. Click to collapse related subtrees into one card."
+          }
+        >
+          {grouped ? "Grouped" : "Group related"}
+        </button>
       </div>
 
       {error && (
@@ -377,17 +469,30 @@ export function Inbox() {
         </div>
       )}
 
-      {groups.map((g) => (
-        <div key={g.kind} className="card" style={{ padding: 12 }}>
-          <div className="row" style={{ alignItems: "baseline", marginBottom: 8 }}>
-            <h4 style={{ margin: 0 }}>{g.label}</h4>
-            <span className="badge backlog" style={{ fontSize: 9, marginLeft: 8 }}>{g.items.length}</span>
-          </div>
-          {g.items.map((it) => (
-            <InboxRow key={it.id} item={it} onActed={reload} />
+      {/* Grouped view (default): a collapsed card per stalled subtree, with standalone
+          items rendered as their own row — unrelated items are never falsely grouped.
+          The flat view (toggle off) keeps the per-kind sections. */}
+      {grouped
+        ? groupCards.map((g) =>
+            g.collapsible ? (
+              <SubtreeGroupCard key={g.key} group={g} onActed={reload} />
+            ) : (
+              <InboxRow key={g.key} item={g.items[0]} onActed={reload} />
+            ),
+          )
+        : groups.map((g) => (
+            <div key={g.kind} className="card" style={{ padding: 12 }}>
+              <div className="row" style={{ alignItems: "baseline", marginBottom: 8 }}>
+                <h4 style={{ margin: 0 }}>{g.label}</h4>
+                <span className="badge backlog" style={{ fontSize: 9, marginLeft: 8 }}>
+                  {g.items.length}
+                </span>
+              </div>
+              {g.items.map((it) => (
+                <InboxRow key={it.id} item={it} onActed={reload} />
+              ))}
+            </div>
           ))}
-        </div>
-      ))}
 
       {data?.truncated && (
         <div className="muted" style={{ fontSize: 11 }}>

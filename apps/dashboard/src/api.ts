@@ -3536,6 +3536,15 @@ export interface ReluxInboxItem {
   approval_id?: string | null;
   continuation_id?: string | null;
   failure_class?: string | null;
+  // The id of the parent task this item's work belongs to, when the underlying task
+  // carries a `parent_task` edge (the ad-hoc subtree link). The ONE real relationship
+  // the Inbox collapses a stalled subtree on (§6.11 cross-item grouping): items whose
+  // tasks share a parent_task (or whose task IS another item's parent) group together.
+  // Absent for a top-level task and for the approval / continuation kinds.
+  parent_task?: string | null;
+  // The parent task's title, resolved by the backend off the same snapshot, so a
+  // collapsed subtree card can be titled without a second fetch. Absent when no parent.
+  parent_title?: string | null;
   // The logical-clock stamp this item began needing attention (the per-kind anchor:
   // an approval's created_at, a run's ended/started, a blocked task's updated, a
   // continuation's created). It is a DETERMINISTIC LOGICAL-CLOCK stamp, not a
