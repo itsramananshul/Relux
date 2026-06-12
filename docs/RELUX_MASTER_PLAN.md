@@ -1870,6 +1870,18 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **Unreleased (on `main`, post-v0.1.28)** — **Cross-Guild Inbox v1.** A new read-only
+  `GET /v1/relux/inbox` projection (`relux-kernel` `server.rs::get_inbox`, sibling of
+  `get_oversight`) composes the whole Guild's attention items — pending approvals, hard-failed runs
+  (**excluding** the ones silently auto-retrying, per `relix-execution-and-issue-design.md` §3.3b),
+  blocked tasks, and a paused Prime continuation — into unified `InboxItem`s (stable id / kind /
+  severity / title / summary / related ids / recommended action kinds / link). A new top-level
+  **Inbox** dashboard page + sidebar badge (`apps/dashboard/src/pages/Inbox.tsx`, pure
+  `inbox.ts`) renders the prioritized, grouped queue; every action reuses an existing route
+  (open-approval / retry / reopen[-and-run] / diagnose / investigate / continue / inspect) — **no new
+  authority, no auto-run**. Honest empty state + bounded `truncated` flag. Delivers
+  `relix-dashboard-design.md` §5 / §6.11. `cargo test` + `clippy` clean on `relux-kernel`; dashboard
+  `tsc`/`npm test` green (527); `dashboard-dist` rebuilt. Not yet packaged into a release.
 - **v0.1.28** (2026-06-12) — **dashboard Work-board oversight** rollup. The `relux-kernel` / `relux-core`
   crates move `0.1.27` → `0.1.28` in lockstep, packaging the post-v0.1.27 oversight line per
   `docs/relix-dashboard-design.md` §6.x: (1) **Board Oversight v1** — a composed `GET /v1/relux/oversight`

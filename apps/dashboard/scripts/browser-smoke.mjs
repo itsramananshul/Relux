@@ -17,7 +17,7 @@
 // already-present engine, not commit a browser binary." This is exactly that.
 //
 // What it catches (each is a real user-visible regression a render test misses):
-//   - a blank main content area on any of the 7 Relux shell routes,
+//   - a blank main content area on any of the 8 Relux shell routes,
 //   - a sidebar nav link whose click does not actually route / renders nothing,
 //   - an uncaught render crash (the ErrorBoundary "This page hit an error" card),
 //   - a console error or thrown exception during a route's runtime data load,
@@ -382,10 +382,11 @@ async function main() {
     }
 
     // ---- 2) click through every sidebar nav destination -------------------
-    section("Sidebar navigation (all 7 routes)");
+    section("Sidebar navigation (all 8 routes)");
     const ROUTES = [
       { label: "Home", title: "Relux" },
       { label: "Prime", title: "Prime" },
+      { label: "Inbox", title: "Inbox" },
       { label: "Work", title: "Work" },
       { label: "Crew", title: "Crew" },
       { label: "Plugins", title: "Plugins" },
@@ -628,7 +629,7 @@ async function main() {
       {
         const captured = await evaluate(
           `(() => {
-             const sel = document.querySelector('.workspace select[aria-label="Move task status"]');
+             const sel = document.querySelector('.workspace select[aria-label^="Move task status"]');
              if (!sel) return null;
              const card = sel.closest('.card');
              const idEl = card ? card.querySelector('.mono.muted') : null;
@@ -642,7 +643,7 @@ async function main() {
           // assert the card with that id now shows a "blocked" status badge.
           await evaluate(
             `(() => {
-               const sel = document.querySelector('.workspace select[aria-label="Move task status"]');
+               const sel = document.querySelector('.workspace select[aria-label^="Move task status"]');
                if (!sel) return false;
                const set = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype,'value').set;
                set.call(sel, 'blocked');

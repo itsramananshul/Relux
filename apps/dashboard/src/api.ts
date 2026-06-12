@@ -3495,6 +3495,64 @@ export const reluxOversight = {
   get: () => api.get<ReluxOversight>("/v1/relux/oversight"),
 };
 
+// -- Cross-Guild Inbox (GET /v1/relux/inbox) --------------------------------
+// The unified attention queue (docs/relix-dashboard-design.md §5 "The Inbox";
+// docs/relix-execution-and-issue-design.md §3.3b). A read-only projection of live
+// state into one prioritized list: pending approvals, hard-failed runs (NOT the
+// ones silently auto-retrying), blocked tasks, and a paused Prime continuation.
+// Each item is self-describing — the recommended action KINDS each map to an
+// EXISTING route/surface (inbox.ts does the mapping); the projection adds no
+// authority and mutates nothing.
+
+// The stable category of an attention item.
+export type ReluxInboxKind =
+  | "pending_approval"
+  | "failed_run"
+  | "blocked_task"
+  | "paused_continuation";
+
+// The recommended action kinds the projection may attach to an item. Each is
+// mapped by inbox.ts to an existing route (a POST) or surface (a navigation).
+export type ReluxInboxActionKind =
+  | "open_approval"
+  | "retry"
+  | "reopen"
+  | "reopen_and_run"
+  | "diagnose"
+  | "investigate"
+  | "continue"
+  | "inspect";
+
+export interface ReluxInboxItem {
+  // Stable, category-prefixed id (e.g. "approval:<id>", "run:<id>", "task:<id>").
+  id: string;
+  kind: ReluxInboxKind;
+  // "critical" | "warn" | "info" — drives ordering + badge tone.
+  severity: "critical" | "warn" | "info";
+  title: string;
+  summary: string;
+  task_id?: string | null;
+  run_id?: string | null;
+  approval_id?: string | null;
+  continuation_id?: string | null;
+  failure_class?: string | null;
+  // Recommended action kinds in priority order (mapped to existing routes by inbox.ts).
+  actions: ReluxInboxActionKind[];
+  // The dashboard path that owns the richer controls for this item.
+  link: string;
+}
+
+export interface ReluxInbox {
+  items: ReluxInboxItem[];
+  // True when a per-category cap dropped items (the rest live on the Work board).
+  truncated: boolean;
+}
+
+export const reluxInbox = {
+  // The composed attention queue. Cheap, read-only, mutates nothing.
+  get: () => api.get<ReluxInbox>("/v1/relux/inbox"),
+};
+
 // -- Relux persistent allow-always grants -----------------------------------
 
 // A standing grant that lets a future matching tool invocation bypass the

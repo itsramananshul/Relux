@@ -522,6 +522,7 @@ fn protected_router() -> Router<AppState> {
             post(apply_proposed_change_set),
         )
         .route("/v1/relux/oversight", get(get_oversight))
+        .route("/v1/relux/inbox", get(get_inbox))
         .route("/v1/relux/audit", get(list_audit_events))
         .route("/v1/relux/tasks/:id/start", post(start_task))
         .route("/v1/relux/tasks/:id/execute-assigned", post(execute_assigned_task))
@@ -1898,6 +1899,381 @@ async fn get_oversight(State(state): State<AppState>) -> Result<Json<OversightRe
             pending_approvals,
             continuation,
         })
+    })?;
+    Ok(Json(resp))
+}
+
+// ---------------------------------------------------------------------------
+// Cross-Guild Inbox v1 (`docs/relix-dashboard-design.md` §5 "The Inbox (the
+// operator's home)"; `docs/relix-execution-and-issue-design.md` §3.3b "Only the
+// escalation kind reaches the Inbox — transient failures retry silently — so the
+// Inbox stays signal, not noise").
+//
+// The Inbox is a READ-ONLY projection of live kernel state into a single, unified
+// attention queue: pending approvals, hard-failed runs (NOT the ones silently
+// auto-retrying), blocked tasks needing a lifecycle decision, and a paused Prime
+// continuation. Each item carries a stable id, kind, severity, plain title/summary,
+// the related task/run/approval/continuation ids, the recommended action KINDS
+// (each backed by an EXISTING route — the projection invents no authority and
+// mutates nothing), and a dashboard link target. The deterministic per-kind rules
+// mirror the dashboard's recovery model (`apps/dashboard/src/recovery.ts`) so the
+// offered actions are honest — a retry only when the run is retry-eligible, a reopen
+// only when the blocked task is reopen-eligible.
+// ---------------------------------------------------------------------------
+
+/// Per-category caps so the projection stays bounded on a large store (the rest is
+/// reachable on the Work board). Surfaced honestly via `truncated` on the response.
+const INBOX_FAILED_RUN_LIMIT: usize = 24;
+const INBOX_BLOCKED_TASK_LIMIT: usize = 24;
+
+/// One unified attention item. `kind` is the stable category; `actions` are the
+/// recommended action KINDS the dashboard maps to an existing route/affordance.
+#[derive(Debug, Serialize)]
+struct InboxItem {
+    /// Stable, category-prefixed id (e.g. `approval:<id>`, `run:<id>`, `task:<id>`,
+    /// `continuation:<id>`) — unique within the queue and stable across refreshes.
+    id: String,
+    /// `pending_approval` | `failed_run` | `blocked_task` | `paused_continuation`.
+    kind: String,
+    /// `critical` | `warn` | `info` — drives ordering and the badge tone.
+    severity: String,
+    /// Short plain-language headline.
+    title: String,
+    /// One-line plain-language summary of what needs attention.
+    summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    continuation_id: Option<String>,
+    /// The structured run failure class when one underlies the item (drives the
+    /// dashboard's investigate/diagnose framing). Absent for non-failure items.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_class: Option<String>,
+    /// Recommended action KINDS in priority order. Each is mapped by the dashboard to
+    /// an EXISTING route or surface; the projection grants no new authority.
+    actions: Vec<String>,
+    /// The dashboard path that owns the richer controls for this item.
+    link: String,
+}
+
+/// The composed Inbox read.
+#[derive(Debug, Serialize)]
+struct InboxResponse {
+    /// The unified attention items, most-urgent first (severity, then recency).
+    items: Vec<InboxItem>,
+    /// Whether a per-category cap dropped some items (the rest live on the Work board).
+    truncated: bool,
+}
+
+/// Numeric rank for ordering: critical first, then warn, then info.
+fn inbox_severity_rank(sev: &str) -> u8 {
+    match sev {
+        "critical" => 0,
+        "warn" => 1,
+        _ => 2,
+    }
+}
+
+/// Clamp a plain-language field to a bounded length for the dense Inbox row.
+fn inbox_clamp(s: &str, max: usize) -> String {
+    let trimmed = s.trim();
+    if trimmed.chars().count() <= max {
+        return trimmed.to_string();
+    }
+    let mut out: String = trimmed.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// The severity for a pending approval, derived from its risk.
+fn inbox_approval_severity(risk: &relux_core::RiskLevel) -> &'static str {
+    match risk {
+        relux_core::RiskLevel::Critical => "critical",
+        relux_core::RiskLevel::High => "warn",
+        _ => "info",
+    }
+}
+
+/// The severity for a hard-failed run, derived from its failure class. The classes
+/// that need operator configuration are critical; the rest are warn; an intentional
+/// cancel is info.
+fn inbox_failed_run_severity(run: &relux_core::Run) -> &'static str {
+    if matches!(run.status, relux_core::RunStatus::Cancelled) {
+        return "info";
+    }
+    match run.failure_class {
+        Some(relux_core::RunFailureClass::AuthRequired)
+        | Some(relux_core::RunFailureClass::AdapterMissing)
+        | Some(relux_core::RunFailureClass::PermissionDenied) => "critical",
+        _ => "warn",
+    }
+}
+
+/// Whether a failed/cancelled run is retry-eligible from the Inbox: it is terminal
+/// (failed/cancelled) and no later run already retried from it (mirrors the kernel's
+/// retry guard and `apps/dashboard/src/runview.ts::canRetryRun`). The retry route
+/// re-validates; this only avoids offering a dead action.
+fn inbox_run_retryable(run: &relux_core::Run, all_runs: &[&relux_core::Run]) -> bool {
+    let terminal = matches!(
+        run.status,
+        relux_core::RunStatus::Failed | relux_core::RunStatus::Cancelled
+    );
+    if !terminal {
+        return false;
+    }
+    !all_runs
+        .iter()
+        .any(|r| r.retried_from.as_ref() == Some(&run.id))
+}
+
+/// Whether a failed run is silently auto-retrying (transient class with a bounded
+/// retry budget that is NOT yet exhausted). Per §3.3b these stay OUT of the Inbox —
+/// only hard blockers / exhausted retries escalate, so the Inbox stays signal.
+fn inbox_run_silently_retrying(run: &relux_core::Run) -> bool {
+    matches!(run.status, relux_core::RunStatus::Failed)
+        && run
+            .retry
+            .as_ref()
+            .is_some_and(|r| !r.exhausted)
+}
+
+/// `GET /v1/relux/inbox` — the cross-Guild attention queue (`docs/relix-dashboard-design.md`
+/// §5; `docs/relix-execution-and-issue-design.md` §3.3b). Read-only: it composes live
+/// state into unified items, adds no authority, and mutates nothing.
+async fn get_inbox(State(state): State<AppState>) -> Result<Json<InboxResponse>, ApiError> {
+    let resp = locked_read(&state, |kernel| {
+        let mut items: Vec<InboxItem> = Vec::new();
+        let mut truncated = false;
+
+        // 1) Pending approvals — every one is something only the operator can clear.
+        {
+            let mut pending: Vec<&relux_core::Approval> = kernel
+                .approvals
+                .values()
+                .filter(|a| a.status == relux_core::ApprovalStatus::Pending)
+                .collect();
+            pending.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            for a in pending {
+                items.push(InboxItem {
+                    id: format!("approval:{}", a.id),
+                    kind: "pending_approval".to_string(),
+                    severity: inbox_approval_severity(&a.risk).to_string(),
+                    title: inbox_clamp(&format!("Approval: {}", a.action), 120),
+                    summary: inbox_clamp(&a.reason, 200),
+                    task_id: None,
+                    run_id: None,
+                    approval_id: Some(a.id.to_string()),
+                    continuation_id: None,
+                    failure_class: None,
+                    actions: vec!["open_approval".to_string()],
+                    link: "/approvals".to_string(),
+                });
+            }
+        }
+
+        // Index runs once for retry-eligibility + latest-run-per-task lookups.
+        let runs: Vec<&relux_core::Run> = kernel.runs();
+        // The set of task ids that are currently blocked — a failed run on a blocked
+        // task is represented by the (richer) blocked_task item, so we de-dupe it out
+        // of the standalone failed-run list to keep the queue signal, not noise.
+        let blocked_task_ids: std::collections::HashSet<String> = kernel
+            .tasks()
+            .iter()
+            .filter(|t| t.status == relux_core::TaskStatus::Blocked)
+            .map(|t| t.id.to_string())
+            .collect();
+
+        // 2) Hard-failed / cancelled runs needing retry or diagnosis — EXCLUDING the
+        // ones silently auto-retrying (§3.3b) and the ones whose task is blocked
+        // (folded into the blocked_task item below).
+        {
+            let mut failed: Vec<&relux_core::Run> = runs
+                .iter()
+                .copied()
+                .filter(|r| {
+                    matches!(
+                        r.status,
+                        relux_core::RunStatus::Failed | relux_core::RunStatus::Cancelled
+                    )
+                })
+                .filter(|r| !inbox_run_silently_retrying(r))
+                .filter(|r| !blocked_task_ids.contains(&r.task_id.to_string()))
+                .collect();
+            // Most-recent first (ids are zero-padded so lexical == chronological).
+            failed.sort_by_key(|r| std::cmp::Reverse(r.id.to_string()));
+            if failed.len() > INBOX_FAILED_RUN_LIMIT {
+                truncated = true;
+                failed.truncate(INBOX_FAILED_RUN_LIMIT);
+            }
+            for r in failed {
+                let is_failed = matches!(r.status, relux_core::RunStatus::Failed);
+                let retryable = inbox_run_retryable(r, &runs);
+                let fc = r.failure_class.map(|c| wire_label(&c));
+                let mut actions: Vec<String> = Vec::new();
+                if retryable {
+                    actions.push("retry".to_string());
+                }
+                // Diagnose reads a real failure; an intentional cancel has nothing to read.
+                if is_failed {
+                    actions.push("diagnose".to_string());
+                }
+                actions.push("investigate".to_string());
+                actions.push("inspect".to_string());
+                let summary = match (&fc, r.error.as_deref()) {
+                    (Some(c), Some(e)) => format!("{c}: {e}"),
+                    (Some(c), None) => c.clone(),
+                    (None, Some(e)) => e.to_string(),
+                    (None, None) => {
+                        if is_failed {
+                            "Run failed without a recorded reason.".to_string()
+                        } else {
+                            "Run was cancelled.".to_string()
+                        }
+                    }
+                };
+                items.push(InboxItem {
+                    id: format!("run:{}", r.id),
+                    kind: "failed_run".to_string(),
+                    severity: inbox_failed_run_severity(r).to_string(),
+                    title: inbox_clamp(
+                        &format!(
+                            "{} run {}",
+                            if is_failed { "Failed" } else { "Cancelled" },
+                            r.id
+                        ),
+                        120,
+                    ),
+                    summary: inbox_clamp(&summary, 200),
+                    task_id: Some(r.task_id.to_string()),
+                    run_id: Some(r.id.to_string()),
+                    approval_id: None,
+                    continuation_id: None,
+                    failure_class: fc,
+                    actions,
+                    link: "/work".to_string(),
+                });
+            }
+        }
+
+        // 3) Blocked tasks needing a lifecycle decision — fold in the latest run's
+        // failure context when the last run failed (so diagnose/investigate are honest).
+        {
+            let mut blocked: Vec<&relux_core::Task> = kernel
+                .tasks()
+                .into_iter()
+                .filter(|t| t.status == relux_core::TaskStatus::Blocked)
+                .collect();
+            blocked.sort_by_key(|t| std::cmp::Reverse(t.id.to_string()));
+            if blocked.len() > INBOX_BLOCKED_TASK_LIMIT {
+                truncated = true;
+                blocked.truncate(INBOX_BLOCKED_TASK_LIMIT);
+            }
+            for t in blocked {
+                // The latest run for this task (highest id wins — ids are monotonic).
+                let latest: Option<&relux_core::Run> = runs
+                    .iter()
+                    .copied()
+                    .filter(|r| r.task_id == t.id)
+                    .max_by(|a, b| a.id.to_string().cmp(&b.id.to_string()));
+                let failed_run = latest.filter(|r| {
+                    matches!(r.status, relux_core::RunStatus::Failed) || r.failure_class.is_some()
+                });
+                let assigned = t
+                    .assigned_agent
+                    .as_ref()
+                    .is_some_and(|a| !a.to_string().is_empty());
+                let fc = failed_run.and_then(|r| r.failure_class.map(|c| wire_label(&c)));
+
+                let mut actions: Vec<String> = Vec::new();
+                if assigned {
+                    // Reopen is a run-lifecycle action (re-queue), never a status decree.
+                    actions.push("reopen_and_run".to_string());
+                    actions.push("reopen".to_string());
+                }
+                if failed_run.is_some() {
+                    actions.push("diagnose".to_string());
+                }
+                actions.push("investigate".to_string());
+                actions.push("inspect".to_string());
+
+                let summary = if let Some(c) = &fc {
+                    format!("On hold — last run failed ({c}).")
+                } else if !assigned {
+                    "On hold — assign an operative before it can be reopened.".to_string()
+                } else {
+                    "On hold — reopen to put it back in the run lifecycle.".to_string()
+                };
+
+                items.push(InboxItem {
+                    id: format!("task:{}", t.id),
+                    kind: "blocked_task".to_string(),
+                    severity: "warn".to_string(),
+                    title: inbox_clamp(&format!("Blocked: {}", t.title), 120),
+                    summary: inbox_clamp(&summary, 200),
+                    task_id: Some(t.id.to_string()),
+                    run_id: failed_run.map(|r| r.id.to_string()),
+                    approval_id: None,
+                    continuation_id: None,
+                    failure_class: fc,
+                    actions,
+                    link: "/work".to_string(),
+                });
+            }
+        }
+
+        // 4) A paused Prime continuation — a loop with work still to do, waiting for the
+        // operator to resume (or to clear the tool approval it is blocked on).
+        if let Some(c) = kernel.current_prime_continuation_handle() {
+            let (severity, summary, actions) = if c.awaiting_approval {
+                (
+                    "warn",
+                    format!(
+                        "Paused awaiting a tool approval — approve the pending tool first ({} observation{} gathered).",
+                        c.observation_count,
+                        if c.observation_count == 1 { "" } else { "s" }
+                    ),
+                    vec!["open_approval".to_string(), "inspect".to_string()],
+                )
+            } else {
+                (
+                    "info",
+                    format!(
+                        "Paused: {} — Continue resumes from where it stopped ({} observation{} gathered).",
+                        c.reason,
+                        c.observation_count,
+                        if c.observation_count == 1 { "" } else { "s" }
+                    ),
+                    vec!["continue".to_string(), "inspect".to_string()],
+                )
+            };
+            items.push(InboxItem {
+                id: format!("continuation:{}", c.id),
+                kind: "paused_continuation".to_string(),
+                severity: severity.to_string(),
+                title: "Prime loop paused".to_string(),
+                summary: inbox_clamp(&summary, 200),
+                task_id: None,
+                run_id: None,
+                approval_id: None,
+                continuation_id: Some(c.id.clone()),
+                failure_class: None,
+                actions,
+                link: "/work".to_string(),
+            });
+        }
+
+        // Most-urgent first: severity, then by id-bearing recency (stable for equal sev).
+        items.sort_by(|a, b| {
+            inbox_severity_rank(&a.severity)
+                .cmp(&inbox_severity_rank(&b.severity))
+                .then_with(|| b.id.cmp(&a.id))
+        });
+
+        Ok(InboxResponse { items, truncated })
     })?;
     Ok(Json(resp))
 }
@@ -10755,6 +11131,78 @@ mod tests {
             v2["counts"]["open_tasks"].as_u64().unwrap(),
             open_before + 1,
             "a newly created task is counted as open in the oversight summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn inbox_route_projects_only_attention_items_and_is_selective() {
+        // The cross-Guild Inbox (docs/relix-dashboard-design.md §5) is a READ-ONLY
+        // projection of live state into a unified attention queue. On a fresh store it
+        // is empty (well-formed envelope). A freshly CREATED task is NOT attention, so
+        // it must NOT appear — proving the projection is selective, not a task dump.
+        // Blocking that task DOES surface a blocked_task item with honest fields +
+        // actions backed by existing routes.
+        let (state, _dir) = auth_state(true);
+
+        let (status, _, body) = call(&state, "GET", "/v1/relux/inbox", None, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v["items"].is_array(), "items present");
+        assert_eq!(v["items"].as_array().unwrap().len(), 0, "fresh store: nothing to attend to");
+        assert_eq!(v["truncated"].as_bool().unwrap(), false, "nothing truncated");
+
+        // Create a task through the real route — a CREATED task is not an attention item.
+        let (cs, _, cb) =
+            call(&state, "POST", "/v1/relux/tasks", None, Some(r#"{"title":"inbox probe"}"#)).await;
+        assert_eq!(cs, StatusCode::OK, "{cb}");
+        let created: serde_json::Value = serde_json::from_str(&cb).unwrap();
+        let task_id = created["id"].as_str().unwrap().to_string();
+        let (_s, _, body2) = call(&state, "GET", "/v1/relux/inbox", None, None).await;
+        let v2: serde_json::Value = serde_json::from_str(&body2).unwrap();
+        assert_eq!(
+            v2["items"].as_array().unwrap().len(),
+            0,
+            "a freshly created task is not an attention item — the Inbox is signal, not a task list"
+        );
+
+        // Block the task via the real status MOVE route — now it IS attention.
+        let (bs, _, bb) = call(
+            &state,
+            "POST",
+            &format!("/v1/relux/tasks/{task_id}/status"),
+            None,
+            Some(r#"{"status":"blocked"}"#),
+        )
+        .await;
+        assert_eq!(bs, StatusCode::OK, "{bb}");
+        let (_s3, _, body3) = call(&state, "GET", "/v1/relux/inbox", None, None).await;
+        let v3: serde_json::Value = serde_json::from_str(&body3).unwrap();
+        let items = v3["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "the blocked task is the lone attention item");
+        let it = &items[0];
+        assert_eq!(it["kind"], "blocked_task");
+        assert_eq!(it["severity"], "warn");
+        assert_eq!(it["task_id"], task_id);
+        assert_eq!(it["id"], format!("task:{task_id}"));
+        assert_eq!(it["link"], "/work");
+        let actions: Vec<String> = it["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap().to_string())
+            .collect();
+        // The create route auto-assigns to Prime, so this blocked task IS reopen-eligible
+        // (the kernel reopen guard needs an assignee) — the reopen lifecycle actions are
+        // offered honestly, alongside the always-safe investigate/inspect paths. No
+        // diagnose: the task has no failed run for the model to read.
+        assert!(actions.contains(&"reopen_and_run".to_string()), "assigned → reopen offered");
+        assert!(actions.contains(&"reopen".to_string()));
+        assert!(!actions.contains(&"diagnose".to_string()), "no failed run → no diagnose");
+        assert!(actions.contains(&"investigate".to_string()));
+        assert!(actions.contains(&"inspect".to_string()));
+        assert!(
+            it["summary"].as_str().unwrap().contains("reopen"),
+            "the summary names the reopen path"
         );
     }
 

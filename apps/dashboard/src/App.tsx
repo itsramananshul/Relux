@@ -32,6 +32,7 @@ const Chat = lazy(() => import("./pages/Chat").then((m) => ({ default: m.Chat })
 const Scheduled = lazy(() => import("./pages/Scheduled").then((m) => ({ default: m.Scheduled })));
 const Plugins = lazy(() => import("./pages/Plugins").then((m) => ({ default: m.Plugins })));
 const Work = lazy(() => import("./pages/Work").then((m) => ({ default: m.Work })));
+const Inbox = lazy(() => import("./pages/Inbox").then((m) => ({ default: m.Inbox })));
 const Settings = lazy(() => import("./pages/Settings").then((m) => ({ default: m.Settings })));
 const Crew = lazy(() => import("./pages/Crew").then((m) => ({ default: m.Crew })));
 const ReluxApprovals = lazy(() => import("./pages/ReluxApprovals"));
@@ -111,6 +112,7 @@ export function App() {
           <Routes>
             <Route path="/" element={<ReluxHome />} />
             <Route path="/prime" element={<Prime />} />
+            <Route path="/inbox" element={<Inbox />} />
             <Route path="/work" element={<Work />} />
             <Route path="/plugins" element={<Plugins />} />
             <Route path="/crew" element={<Crew />} />

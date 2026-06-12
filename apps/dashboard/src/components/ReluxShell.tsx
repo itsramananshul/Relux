@@ -2,7 +2,8 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
 import { NavLink, useLocation } from "react-router-dom";
 import { useAuth } from "../auth";
 import { AccountPanel } from "./AccountPanel";
-import { session, type SessionMetaResponse } from "../api";
+import { session, reluxInbox, type SessionMetaResponse } from "../api";
+import { inboxBadgeCount } from "../inbox";
 import { sessionWarning, elapsedSince, type SessionWarning } from "../account";
 
 // The standalone Relux product shell (RELUX_MASTER_PLAN section 11 Dashboard,
@@ -27,6 +28,7 @@ interface NavEntry {
 const RELUX_NAV: NavEntry[] = [
   { to: "/", label: "Home", icon: "◈" },
   { to: "/prime", label: "Prime", icon: "✦" },
+  { to: "/inbox", label: "Inbox", icon: "▣" },
   { to: "/work", label: "Work", icon: "⚙" },
   { to: "/crew", label: "Crew", icon: "⨈" },
   { to: "/plugins", label: "Plugins", icon: "#" },
@@ -37,6 +39,7 @@ const RELUX_NAV: NavEntry[] = [
 const TITLES: Record<string, { title: string; sub: string }> = {
   "/": { title: "Relux", sub: "Local control plane - Prime, plugins, tasks, runs" },
   "/prime": { title: "Prime", sub: "Talk to your local operator" },
+  "/inbox": { title: "Inbox", sub: "Everything across the Guild that needs you" },
   "/work": { title: "Work", sub: "Manage tasks and view execution history" },
   "/crew": { title: "Crew", sub: "Manage your agent workforce" },
   "/plugins": { title: "Plugins", sub: "Capabilities installed in the control plane" },
@@ -74,22 +77,38 @@ export function SessionWarnChip({
   );
 }
 
-function Group({ label, items }: { label: string; items: NavEntry[] }) {
+function Group({
+  label,
+  items,
+  counts,
+}: {
+  label: string;
+  items: NavEntry[];
+  counts?: Record<string, number>;
+}) {
   return (
     <div className="nav-group">
       <div className="nav-label">{label}</div>
-      {items.map((it) => (
-        <NavLink
-          key={it.to}
-          to={it.to}
-          end={it.to === "/"}
-          title={it.label}
-          className={({ isActive }) => "nav-item" + (isActive ? " active" : "")}
-        >
-          <span className="ico">{it.icon}</span>
-          <span>{it.label}</span>
-        </NavLink>
-      ))}
+      {items.map((it) => {
+        const count = counts?.[it.to] ?? 0;
+        return (
+          <NavLink
+            key={it.to}
+            to={it.to}
+            end={it.to === "/"}
+            title={it.label}
+            className={({ isActive }) => "nav-item" + (isActive ? " active" : "")}
+          >
+            <span className="ico">{it.icon}</span>
+            <span>{it.label}</span>
+            {count > 0 && (
+              <span className="count" title={`${count} item${count === 1 ? "" : "s"} need attention`}>
+                {count}
+              </span>
+            )}
+          </NavLink>
+        );
+      })}
     </div>
   );
 }
@@ -100,6 +119,36 @@ export function ReluxShell({ children }: { children: ReactNode }) {
   const { status, logout } = useAuth();
   const who = status?.username ?? "admin";
   const [accountOpen, setAccountOpen] = useState(false);
+
+  // The Inbox sidebar badge (docs/relix-dashboard-design.md §5 "The sidebar Inbox
+  // badge is the sum of these"). A cheap, read-only count of the cross-Guild
+  // attention queue, refreshed on mount, when the tab regains focus, and on every
+  // navigation (so acting on an item and routing away updates the badge). A fetch
+  // failure just leaves the badge hidden — the shell stays fully usable.
+  const [inboxCount, setInboxCount] = useState(0);
+  useEffect(() => {
+    let live = true;
+    const load = () => {
+      reluxInbox
+        .get()
+        .then((i) => {
+          if (live) setInboxCount(inboxBadgeCount(i));
+        })
+        .catch(() => {
+          /* no badge — the nav stays usable without the count */
+        });
+    };
+    load();
+    const onVisible = () => {
+      if (document.visibilityState === "visible") load();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      live = false;
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [loc.pathname]);
+  const navCounts: Record<string, number> = { "/inbox": inboxCount };
 
   // Passive, low-noise session-expiry warning (RELUX_MASTER_PLAN "Local operator
   // login v1"). We read the safe, non-sliding /v1/auth/me metadata SPARSELY —
@@ -172,7 +221,7 @@ export function ReluxShell({ children }: { children: ReactNode }) {
           <div className="name">Relux</div>
           <div className="env">local</div>
         </div>
-        <Group label="Control plane" items={RELUX_NAV} />
+        <Group label="Control plane" items={RELUX_NAV} counts={navCounts} />
         <div className="sidebar-foot">
           <div className="muted" style={{ fontSize: 11, padding: "0 12px", lineHeight: 1.5 }}>
             Served by <span className="mono">relux-kernel</span>. Signed in as{" "}
