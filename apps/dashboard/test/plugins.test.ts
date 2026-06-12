@@ -21,6 +21,7 @@ import {
   mcpRegisterBody,
   parseEnvMappingLines,
   mcpEnvFromText,
+  normalizeGithubUrl,
 } from "../src/plugins.ts";
 
 // The Plugins page must read HONESTLY: a generated metadata-only wrapper is never
@@ -618,6 +619,49 @@ test("mcpRegisterBody includes env refs + cwd for a managed-stdio draft", () => 
   });
   assert.equal(bare.env, undefined);
   assert.equal(bare.cwd, undefined);
+});
+
+// The GitHub install field is forgiving: `owner/repo` shorthand expands to the
+// canonical https URL, while a full URL (or anything with a scheme) is passed
+// through untouched for the kernel's authoritative validator. The expansion is
+// conservative — it never injects credentials, never rewrites a scheme, and never
+// turns junk into an accepted URL.
+test("normalizeGithubUrl expands owner/repo shorthand to the canonical https URL", () => {
+  assert.equal(
+    normalizeGithubUrl("nousresearch/hermes-agent"),
+    "https://github.com/nousresearch/hermes-agent",
+  );
+  // Surrounding whitespace is trimmed; a trailing slash / `.git` is dropped.
+  assert.equal(normalizeGithubUrl("  owner/repo  "), "https://github.com/owner/repo");
+  assert.equal(normalizeGithubUrl("owner/repo.git"), "https://github.com/owner/repo");
+  assert.equal(normalizeGithubUrl("owner/repo/"), "https://github.com/owner/repo");
+});
+
+test("normalizeGithubUrl leaves a full URL (or any scheme) untouched", () => {
+  assert.equal(
+    normalizeGithubUrl("https://github.com/owner/repo"),
+    "https://github.com/owner/repo",
+  );
+  assert.equal(
+    normalizeGithubUrl("  https://github.com/owner/repo  "),
+    "https://github.com/owner/repo",
+  );
+  // A non-github scheme is NOT rewritten — the server validator rejects it.
+  assert.equal(normalizeGithubUrl("git://example.com/x"), "git://example.com/x");
+  assert.equal(
+    normalizeGithubUrl("ssh://git@github.com/owner/repo"),
+    "ssh://git@github.com/owner/repo",
+  );
+});
+
+test("normalizeGithubUrl never fabricates a URL from unsafe / non-shorthand input", () => {
+  // A bare word, too many segments, or embedded credentials are passed through
+  // unchanged so the kernel's validate_github_url stays the real gate.
+  assert.equal(normalizeGithubUrl("owner"), "owner");
+  assert.equal(normalizeGithubUrl("a/b/c"), "a/b/c");
+  assert.equal(normalizeGithubUrl("owner repo"), "owner repo");
+  assert.equal(normalizeGithubUrl("user:tok@owner/repo"), "user:tok@owner/repo");
+  assert.equal(normalizeGithubUrl(""), "");
 });
 
 test("parseEnvMappingLines + mcpEnvFromText parse VAR=secret lines (refs only)", () => {

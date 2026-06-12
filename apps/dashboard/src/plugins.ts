@@ -522,6 +522,30 @@ export function installResultSummary(p: ReluxPlugin): InstallSummary {
   };
 }
 
+// Make the GitHub install field forgiving: accept the `owner/repo` shorthand in
+// addition to a full `https://github.com/owner/repo` URL. PURE and conservative —
+// it expands ONLY the exact `owner/repo[.git]` shape into the canonical
+// `https://github.com/owner/repo`; anything else (a full URL, an ssh/git URL,
+// junk, or a credentialed URL) is passed through trimmed so the kernel's
+// authoritative `validate_github_url` stays the real gate. It never injects
+// credentials and never rewrites a scheme, so it cannot turn an unsafe input into
+// an accepted one — at worst the server still rejects it.
+export function normalizeGithubUrl(input: string): string {
+  const trimmed = input.trim();
+  if (!trimmed) return trimmed;
+  // Anything that already carries a scheme (https://, git://, ssh://, …) is left
+  // verbatim for the server validator — never rewritten.
+  if (trimmed.includes("://")) return trimmed;
+  // Exactly `owner/repo` (optionally a trailing `.git` and/or `/`): two segments
+  // of GitHub-legal name chars, no extra slashes, no spaces, no `@` credentials.
+  const m = /^([A-Za-z0-9][A-Za-z0-9._-]*)\/([A-Za-z0-9][A-Za-z0-9._-]*?)(?:\.git)?\/?$/.exec(
+    trimmed,
+  );
+  if (m) return `https://github.com/${m[1]}/${m[2]}`;
+  // Not a recognized shorthand — pass through unchanged; the server decides.
+  return trimmed;
+}
+
 // ── Tool readiness (the honest invocation surface) ────────────────────────────
 // ONE classifier from the kernel's `executable` state to what the operator sees
 // and may do — mirroring openclaw's approval-classifier

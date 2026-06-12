@@ -636,8 +636,27 @@ row: the install API returns a `generated: bool` flag (`relux_kernel::is_generat
 and `tool_count`, so the dashboard labels a generated import **"Imported as metadata-only —
 no Relux manifest needed"** and never as a failure or a "manifest required" error.
 
+**The install result card is itself actionable** (`apps/dashboard/src/pages/Plugins.tsx`
+`InstallResultCard`). It does not just point at the row's Configure affordance — it offers
+the LIVE next-action buttons inline, **reusing the same components a plugin row mounts** (no
+duplicated authority): for a metadata-only wrapper it **auto-opens** the in-card
+`ManifestPanel` (the read-only "Detected in source" hints, the **Register MCP server…**
+proposal flow, and **Add a tool** definition) so the next step is immediate; a real ToolSet
+with tools gets a **Runtime** button (the inline loopback `RuntimePanel`); an Adapter import
+gets **Configure on Crew** (a link to `/crew`); and every result offers **Copy install path**
+and **Install another / Done**. Nothing is auto-run and no new backend route is added — the
+card is a faster on-ramp to the existing, gated configure surfaces.
+
+The **GitHub URL** field is forgiving: it accepts the `owner/repo` shorthand as well as a
+full `https://github.com/owner/repo` URL. The pure, conservative `normalizeGithubUrl`
+(`apps/dashboard/src/plugins.ts`) expands **only** the exact `owner/repo[.git]` shape to the
+canonical https URL and passes anything else through untouched — it never injects credentials
+and never rewrites a scheme, so the kernel's authoritative `validate_github_url` stays the
+real gate.
+
 So "**Clone `nousresearch/hermes-agent` and import it as a plugin**" is a Plugins →
-**+ Install** → **GitHub URL** action — paste the repo URL and install. It is **not**
+**+ Install** → **GitHub URL** action — paste the repo URL (or just `owner/repo`) and
+install. It is **not**
 a Prime *task*: Prime's local adapter is deterministic and cannot clone/import (below).
 
 ### Local Prime cannot clone/import — it fails closed with guidance

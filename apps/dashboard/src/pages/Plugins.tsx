@@ -38,6 +38,7 @@ import {
   managedStdioStatusBadge,
   mcpDraftFromProposal,
   mcpServerStatusBadge,
+  normalizeGithubUrl,
   pluginCategory,
   pluginKindLabel,
   pluginNextStep,
@@ -3071,6 +3072,128 @@ function RuntimePanel({ plugin }: { plugin: ReluxPlugin }) {
   );
 }
 
+// The post-install result card (RELUX_MASTER_PLAN §11.6; docs/mcp.md "Plugin import").
+// After ANY install completes — especially a generated metadata-only wrapper — this
+// is the honest "what just happened + do the next thing right here" surface. It shows
+// the install summary and the meta line, then offers LIVE next-action buttons that
+// reuse the SAME components a plugin row exposes (no duplicated authority, nothing new
+// to maintain):
+//   - Configure & review hints → the inline ManifestPanel (detected hints, register an
+//     MCP server from a proposal, add a tool definition, advanced manifest). For a
+//     metadata-only wrapper (or any configurable plugin with no tools yet) it auto-opens
+//     so the hints start loading and the next step is immediate.
+//   - Runtime → the inline RuntimePanel, once tools exist.
+//   - Configure on Crew → the adapter path (a Link to /crew), for an Adapter import.
+//   - Copy install path → a safe clipboard copy of the on-host install dir.
+// Extracted as its own exported component so the render harness can mount it directly
+// and assert the next-action buttons render for a generated wrapper.
+export function InstallResultCard({
+  result,
+  onChanged,
+  onInstallAnother,
+  onClose,
+}: {
+  result: ReluxPlugin;
+  // Reload the parent plugin list (so the table tracks tools added in-card).
+  onChanged: () => void;
+  onInstallAnother: () => void;
+  onClose: () => void;
+}) {
+  const summary = installResultSummary(result);
+  const configurable = canConfigureTools(result);
+  const isAdapter = pluginCategory(result) === "adapter";
+  const hasTools = (result.tool_count ?? 0) > 0;
+  // Auto-open the configure+hints path for a metadata-only wrapper (or any
+  // configurable plugin that has no tools yet) so the next action is immediate.
+  const [configureOpen, setConfigureOpen] = useState(configurable && !hasTools);
+  const [runtimeOpen, setRuntimeOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  async function copyPath() {
+    try {
+      await navigator.clipboard.writeText(result.install_dir);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      setCopied(false);
+    }
+  }
+
+  return (
+    <div className="card" style={{ marginBottom: 12, padding: 12 }}>
+      <div className={"banner " + (summary.tone === "ok" ? "ok" : "info")} style={{ fontSize: 13 }}>
+        <strong>{summary.headline}</strong>
+        <div style={{ marginTop: 4, fontSize: 12 }}>{summary.detail}</div>
+      </div>
+      <div className="muted" style={{ fontSize: 11, marginBottom: 10 }}>
+        {pluginKindLabel(result)} · {result.id} · v{result.version} · source{" "}
+        {result.source_kind}
+        {result.generated
+          ? " · 0 tools discovered"
+          : ` · ${result.tool_count ?? 0} tool${(result.tool_count ?? 0) === 1 ? "" : "s"} discovered`}
+      </div>
+
+      <div className="row wrap" style={{ gap: 8 }}>
+        {isAdapter ? (
+          <Link
+            className="btn"
+            to="/crew"
+            title="Adapters are enabled from the Crew page (local CLI runtime), then selected as Prime's brain in Settings."
+          >
+            Configure on Crew
+          </Link>
+        ) : configurable ? (
+          <button
+            className="btn"
+            onClick={() => setConfigureOpen((v) => !v)}
+            aria-expanded={configureOpen}
+            title="Review detected hints, register an MCP server, or add a tool definition — right here."
+          >
+            {configureOpen ? "Hide setup" : "Configure & review hints"}
+          </button>
+        ) : null}
+        {!isAdapter && hasTools && (
+          <button
+            className="btn ghost"
+            onClick={() => setRuntimeOpen((v) => !v)}
+            aria-expanded={runtimeOpen}
+            title="Point Relux at a loopback HTTP server you run, so the tools can run."
+          >
+            {runtimeOpen ? "Hide runtime" : "Runtime"}
+          </button>
+        )}
+        <button
+          className="btn ghost"
+          onClick={() => void copyPath()}
+          title="Copy the on-host install directory for this plugin"
+        >
+          {copied ? "Copied path" : "Copy install path"}
+        </button>
+        <button className="btn ghost" onClick={onInstallAnother}>
+          Install another
+        </button>
+        <button className="btn ghost" onClick={onClose}>
+          Done
+        </button>
+      </div>
+
+      {/* The next-action panels reuse the SAME components a plugin row mounts, so
+          there is no duplicated configuration UI or authority — just opened inline
+          here for immediacy. */}
+      {configureOpen && configurable && (
+        <div style={{ marginTop: 4 }}>
+          <ManifestPanel plugin={result} onChanged={onChanged} />
+        </div>
+      )}
+      {runtimeOpen && !isAdapter && (
+        <div style={{ marginTop: 4 }}>
+          <RuntimePanel plugin={result} />
+        </div>
+      )}
+    </div>
+  );
+}
+
 function InstallPanel({
   onClose,
   onInstalled,
@@ -3095,7 +3218,9 @@ function InstallPanel({
       let installed: ReluxPlugin;
       if (source === "github") {
         if (!url.trim()) throw new Error("Enter a GitHub URL.");
-        installed = await reluxPlugins.installGithub(url.trim());
+        // Forgiving: accept `owner/repo` shorthand as well as a full URL. The
+        // server's validate_github_url remains the authoritative gate.
+        installed = await reluxPlugins.installGithub(normalizeGithubUrl(url));
       } else if (source === "zip") {
         if (!file) throw new Error("Choose a .zip file to upload.");
         installed = await reluxPlugins.installZip(file);
@@ -3113,38 +3238,19 @@ function InstallPanel({
   }
 
   if (result) {
-    const summary = installResultSummary(result);
     return (
-      <div className="card" style={{ marginBottom: 12, padding: 12 }}>
-        <div className={"banner " + (summary.tone === "ok" ? "ok" : "info")} style={{ fontSize: 13 }}>
-          <strong>{summary.headline}</strong>
-          <div style={{ marginTop: 4, fontSize: 12 }}>{summary.detail}</div>
-        </div>
-        <div className="muted" style={{ fontSize: 11, marginBottom: 10 }}>
-          {pluginKindLabel(result)} · {result.id} · v{result.version} · source{" "}
-          {result.source_kind}
-          {result.generated
-            ? " · 0 tools discovered"
-            : ` · ${result.tool_count ?? 0} tool${(result.tool_count ?? 0) === 1 ? "" : "s"} discovered`}
-        </div>
-        <div className="row wrap" style={{ gap: 8 }}>
-          <button
-            className="btn ghost"
-            onClick={() => {
-              setResult(null);
-              setBanner(null);
-              setUrl("");
-              setDir("");
-              setFile(null);
-            }}
-          >
-            Install another
-          </button>
-          <button className="btn" onClick={onClose}>
-            Done
-          </button>
-        </div>
-      </div>
+      <InstallResultCard
+        result={result}
+        onChanged={() => onInstalled(result)}
+        onInstallAnother={() => {
+          setResult(null);
+          setBanner(null);
+          setUrl("");
+          setDir("");
+          setFile(null);
+        }}
+        onClose={onClose}
+      />
     );
   }
 
@@ -3193,10 +3299,12 @@ function InstallPanel({
           <input
             className="input"
             value={url}
-            placeholder="https://github.com/owner/repo"
+            placeholder="owner/repo  or  https://github.com/owner/repo"
             onChange={(e) => setUrl(e.target.value)}
           />
           <p className="muted" style={{ fontSize: 11, marginTop: 6 }}>
+            Paste a full URL or the <span className="mono">owner/repo</span> shorthand
+            (e.g. <span className="mono">nousresearch/hermes-agent</span>) — both work.
             Cloned with <span className="mono">git clone --depth 1</span> on the Relux host.
             A <span className="mono">relux-plugin.json</span> manifest is <em>optional</em> —
             if the repo has one it is used directly; if not (the usual case), Relux imports a
