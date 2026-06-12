@@ -126,6 +126,10 @@ is brainstorming or direct_answer, NOT work.\n\
 \"orchestrate...\", \"fix the login bug\") is a work intent.\n\
 - A request to lay an idea out as a reviewable plan is plan_request (it only PREVIEWS; it \
 creates nothing).\n\
+- tool_plan_request ONLY when the user EXPLICITLY asks to run SEVERAL named tools in order \
+(\"run these tools in order: ...\", \"use the status tool then the echo tool\", \"chain these \
+tools\"); it previews an inert plan and runs nothing. A single tool is tool_invocation; vague \
+ideas, questions, or chat are NEVER a tool plan.\n\
 - If the instruction is genuinely ambiguous, prefer brainstorming so Prime can ask.\n\
 - greeting for hellos; status_question for \"what's running?\"; explanation_request for \
 \"why did it fail?\"; tool_discovery for \"what tools can you use?\".\n\n\
@@ -160,6 +164,7 @@ fn intent_labels() -> Vec<&'static str> {
         "plan_request",
         "tool_discovery",
         "tool_invocation",
+        "tool_plan_request",
         "small_talk",
         "emotional_support",
         "direct_answer",
@@ -275,6 +280,14 @@ fn is_sensitive_intent(intent: &PrimeIntent) -> bool {
             | PrimeIntent::Orchestration
             | PrimeIntent::OrchestrationRun
             | PrimeIntent::ToolInvocation
+            // A multi-tool plan PREVIEW creates nothing, but it is an explicit
+            // tool-action request — treat it as sensitive so the fail-closed rail
+            // forbids the brain from promoting guarded chat (a greeting, an insult,
+            // frustration, a vague musing/question) into a tool plan. Only an
+            // explicit ordered multi-tool command (which the deterministic classifier
+            // already catches) reaches it (`docs/mcp.md` "Run-driven multi-tool plan";
+            // §10.5, §17.1).
+            | PrimeIntent::ToolPlanRequest
     )
 }
 

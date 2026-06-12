@@ -375,6 +375,7 @@ mod tests {
             assign_slots: None,
             update: None,
             context_reads: vec![],
+            tool_plan_proposal: None,
         }
     }
 

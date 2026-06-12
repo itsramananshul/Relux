@@ -3,9 +3,11 @@ import { Link } from "react-router-dom";
 import {
   reluxAi,
   reluxPrime,
+  reluxWork,
   type ReluxAiStatus,
   type ReluxPrimeProposal,
   type ReluxPrimeSuggestion,
+  type ReluxPrimeToolPlanProposal,
   type ReluxPrimeTurn,
 } from "../api";
 import { afterActionLabel, boundedContextReads, brainSourceLabel, contextReadDetail, contextReadsHadMiss, contextReadsUsedLabel, decisionSourceLabel, hasSteps, intentProvenance, pendingClarificationLabel, polishProvenance, PRIME_GREETING, PRIME_HINT, PRIME_PLACEHOLDER, PRIME_SUGGESTIONS, proposalDisplaySummary, replyPolishLabel, requestedToolLabel, slotProvenance, stepDisplayTitle, updateProvenance } from "../prime";
@@ -443,6 +445,15 @@ function PrimeTurnCard({
           (from suggested_actions), so the card never acts on its own (§10.5, §17.1). */}
       {turn.proposal && <ProposalCard proposal={turn.proposal} />}
 
+      {/* The reviewable MULTI-TOOL plan proposal (docs/mcp.md "Run-driven multi-tool
+          plan"): a compact card showing the grounded tool steps, each step's
+          readiness/risk, and a compact args preview. It is INERT — showing it creates
+          and runs nothing. The explicit "Create tool-run task" button inside the card
+          is the ONLY commit path; it POSTs the validated steps to the existing
+          tool_plan task-create route, where the unchanged permission/approval/grant
+          gates still apply at run time (§10.5, §17.1). */}
+      {turn.tool_plan_proposal && <ToolPlanCard proposal={turn.tool_plan_proposal} busy={busy} />}
+
       {/* Brain-assisted task slots (RELUX_MASTER_PLAN §10.1 Intent Layer, §10.2
           Action Layer, §17.1). A compact, B&W card surfacing the normalized title,
           optional details, the honored assignee/priority, and a small provenance
@@ -834,6 +845,188 @@ function ProposalCard({ proposal }: { proposal: ReluxPrimeProposal }) {
           (or one-task) button below is the only path that materializes work. */}
       <div className="muted" style={{ fontSize: 10, marginTop: 8, fontStyle: "italic" }}>
         Nothing is created yet — use the button below to commit this plan.
+      </div>
+    </div>
+  );
+}
+
+// Tone for a tool-plan step's readiness badge — grounded in the kernel's honest
+// executability label (never optimistic).
+const READINESS_TONE: Record<string, string> = {
+  ready: "done",
+  needs_approval: "in_review",
+  missing_permission: "backlog",
+  not_runnable: "backlog",
+  unknown: "err",
+};
+
+// A short label for a tool-plan step's readiness badge.
+const READINESS_LABEL: Record<string, string> = {
+  ready: "ready",
+  needs_approval: "needs approval",
+  missing_permission: "needs permission",
+  not_runnable: "not runnable",
+  unknown: "unknown tool",
+};
+
+// Render a step's compact args preview without leaking a giant blob into the chat.
+function compactArgs(args: unknown): string {
+  if (args == null) return "";
+  let s: string;
+  try {
+    s = JSON.stringify(args);
+  } catch {
+    return "";
+  }
+  if (s === "{}" || s === "null") return "";
+  return s.length > 80 ? `${s.slice(0, 79)}…` : s;
+}
+
+// A compact, B&W MULTI-TOOL plan proposal card (docs/mcp.md "Run-driven multi-tool
+// plan"). It renders STRICTLY what Prime's grounded preview carried — a summary, the
+// ordered tool steps with their resolved plugin/tool, readiness/risk, and a compact
+// args preview — plus any issues that block creation. The card is INERT until the
+// operator clicks "Create tool-run task", which POSTs the validated steps to the
+// EXISTING tool_plan task-create route (reluxWork.createTask); the usual
+// permission/approval/grant gates still apply at run time. The card invents no step
+// (§10.5, §17.1).
+function ToolPlanCard({ proposal, busy }: { proposal: ReluxPrimeToolPlanProposal; busy: boolean }) {
+  const [creating, setCreating] = useState(false);
+  const [createdId, setCreatedId] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function createToolRunTask() {
+    if (creating || createdId) return;
+    setErr(null);
+    setCreating(true);
+    try {
+      const tool_plan = proposal.steps.map((s) => ({
+        plugin: s.plugin,
+        tool: s.tool,
+        args: s.args ?? {},
+      }));
+      const title = `Tool plan: ${proposal.goal}`.slice(0, 120);
+      const task = await reluxWork.createTask(title, { tool_plan });
+      setCreatedId(task.id);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Could not create the tool-run task");
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  return (
+    <div
+      style={{
+        marginTop: 10,
+        border: "1px solid var(--border)",
+        borderRadius: 6,
+        padding: "10px 12px",
+      }}
+    >
+      <div className="row wrap" style={{ gap: 6, alignItems: "center", marginBottom: 4 }}>
+        <span
+          className="badge todo"
+          style={{ fontSize: 9 }}
+          title="A reviewable multi-tool plan — nothing is created or run yet"
+        >
+          tool plan preview
+        </span>
+        <span className="mono" style={{ fontSize: 13, fontWeight: 600 }}>
+          {proposal.goal}
+        </span>
+      </div>
+      <div className="muted" style={{ fontSize: 11, marginBottom: proposal.steps.length > 0 ? 8 : 0 }}>
+        {proposal.summary}
+      </div>
+      {proposal.steps.length > 0 && (
+        <ol style={{ margin: 0, paddingLeft: 0, listStyle: "none" }}>
+          {proposal.steps.map((s) => {
+            const args = compactArgs(s.args);
+            return (
+              <li
+                key={s.index}
+                className="row wrap"
+                style={{
+                  gap: 8,
+                  alignItems: "baseline",
+                  padding: "4px 0",
+                  borderTop: "1px solid var(--border)",
+                  fontSize: 12,
+                }}
+              >
+                <span className="mono muted" style={{ fontSize: 11, minWidth: 16 }}>
+                  {s.index}.
+                </span>
+                <span className="mono" style={{ flex: 1, minWidth: 160 }}>
+                  {s.tool ? `${s.plugin}/${s.tool}` : s.plugin}
+                  {args && (
+                    <span className="muted" style={{ marginLeft: 6, fontWeight: 400 }}>
+                      {args}
+                    </span>
+                  )}
+                  {s.note && (
+                    <span className="muted" style={{ display: "block", fontSize: 10, fontWeight: 400 }}>
+                      {s.note}
+                    </span>
+                  )}
+                </span>
+                {s.risk && (
+                  <span className="badge backlog" style={{ fontSize: 9 }} title="Declared risk level of this tool">
+                    {s.risk}
+                  </span>
+                )}
+                <span
+                  className={`badge ${READINESS_TONE[s.readiness] ?? "backlog"}`}
+                  style={{ fontSize: 9 }}
+                  title="Grounded against the live tool registry — what the run would actually do"
+                >
+                  {READINESS_LABEL[s.readiness] ?? s.readiness}
+                </span>
+              </li>
+            );
+          })}
+        </ol>
+      )}
+      {/* Anything that blocks creation, surfaced honestly (an unknown tool, a
+          not-runnable step, too many steps). An unknown tool is never silently
+          accepted — the commit stays disabled until the plan is clean (§17.1). */}
+      {proposal.issues && proposal.issues.length > 0 && (
+        <PolishNotes label="Before this can be created" items={proposal.issues} />
+      )}
+      <div style={{ marginTop: 10 }}>
+        {createdId ? (
+          <div className="banner" style={{ fontSize: 11, margin: 0 }}>
+            Created tool-run task <span className="mono">{createdId}</span> —{" "}
+            <Link to={workTaskHref(createdId)}>open it in Work</Link> to start it. It runs each step
+            through the usual gates.
+          </div>
+        ) : (
+          <button
+            className="btn"
+            style={{ fontSize: 12, padding: "4px 12px" }}
+            disabled={busy || creating || !proposal.ready_to_create}
+            onClick={() => void createToolRunTask()}
+            title={
+              proposal.ready_to_create
+                ? "Create a tool-run task from these steps (nothing runs until you start it)"
+                : "Resolve the issues above before this plan can be created"
+            }
+          >
+            {creating ? "Creating…" : "Create tool-run task"}
+          </button>
+        )}
+        {err && (
+          <div className="banner err" style={{ fontSize: 11, marginTop: 8 }}>
+            {err}
+          </div>
+        )}
+      </div>
+      {/* The honest contract: showing this commits nothing. Only the explicit button
+          above materializes a task, and even then nothing RUNS until it is started —
+          the unchanged permission/approval/grant gates still apply at run time. */}
+      <div className="muted" style={{ fontSize: 10, marginTop: 8, fontStyle: "italic" }}>
+        Nothing is created or run yet — the button above creates a task you start when ready.
       </div>
     </div>
   );

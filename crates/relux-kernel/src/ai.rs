@@ -543,7 +543,13 @@ pub fn is_actionful(turn: &PrimeTurn) -> bool {
         || turn.invoked_tool.is_some()
         || turn.tool_output.is_some()
         || turn.tool_error.is_some()
-        || matches!(turn.intent, PrimeIntent::ToolDiscovery)
+        // A tool catalogue (ToolDiscovery) and a grounded multi-tool plan preview
+        // (ToolPlanRequest) are built from the live tool registry; the LLM must never
+        // re-narrate (and possibly overclaim) them, so keep their reply deterministic.
+        || matches!(
+            turn.intent,
+            PrimeIntent::ToolDiscovery | PrimeIntent::ToolPlanRequest
+        )
 }
 
 /// Decide the path for a turn given the config. Pure: no env, no network.
@@ -1428,6 +1434,7 @@ mod tests {
             assign_slots: None,
             update: None,
             context_reads: vec![],
+            tool_plan_proposal: None,
         }
     }
 

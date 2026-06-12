@@ -122,6 +122,20 @@ pub enum PrimeIntent {
     /// kernel's permission/audit path; an installed-but-unimplemented tool is
     /// reported honestly, never faked.
     ToolInvocation,
+    /// The user EXPLICITLY asked Prime to run several tools in order ("run these
+    /// tools in order: …", "use the status tool then the echo tool", "chain these
+    /// tools"). Distinct from [`ToolInvocation`](PrimeIntent::ToolInvocation) (one
+    /// tool) and from [`Orchestration`](PrimeIntent::Orchestration) (briefs across
+    /// agents): this previews a bounded, INERT multi-tool plan the operator commits
+    /// with one explicit click. The turn is action-free — it creates no task, runs
+    /// no tool, and mutates nothing; only the explicit "Create tool-run task" click
+    /// converts the validated steps into a task through the existing tool-run task
+    /// path, where the unchanged permission/approval/grant/audit gates still apply.
+    /// A vague idea, a question, or casual chat NEVER reaches here (the conversation
+    /// guards win first) — only an explicit ordered multi-tool command does
+    /// (`docs/prime-processing-audit.md` "Hermes-first general agent"; §10.5, §17.1;
+    /// `docs/mcp.md` "Run-driven multi-tool plan").
+    ToolPlanRequest,
     /// Throwaway, casual conversation with no work and no negative affect — a
     /// "lol" / "haha" / "nice" / "thanks" / "ok cool" / "makes sense". A deliberate
     /// non-action category (Hermes-first): such turns are represented as exactly
@@ -151,6 +165,18 @@ pub enum PrimeAction {
     /// List the installed plugin tools and their honest executable status
     /// (`ready` / `not_implemented` / `missing_permission`). Read-only.
     DiscoverTools,
+    /// Build a bounded, INERT multi-tool plan PREVIEW for an explicit ordered
+    /// multi-tool request, grounded in the live tool registry. The kernel fills the
+    /// preview ([`PrimeToolPlanProposal`]) the same way it fills [`DiscoverTools`]
+    /// from `discover_tools`: it resolves the referenced tools against the live
+    /// registry, validates the bounded plan (≤ `MAX_TASK_TOOL_PLAN_STEPS`, JSON args),
+    /// and surfaces gating — but it CREATES nothing and RUNS nothing. The operator's
+    /// explicit "Create tool-run task" click is the only path that materializes it,
+    /// through the existing tool-run task creation path and its unchanged gates
+    /// (`docs/mcp.md` "Run-driven multi-tool plan"; §10.5, §17.1). Read-only.
+    ProposeToolPlan {
+        goal: String,
+    },
     /// Invoke one tool through the kernel's permission/audit path. `input_json`
     /// is the JSON-encoded tool input (kept as text so the action stays `Eq`);
     /// it is parsed back to a value immediately before invocation.
@@ -446,6 +472,84 @@ pub struct PrimePolishedStep {
     pub index: u32,
     /// The refined, presentation-only title.
     pub title: String,
+}
+
+/// One concrete step of an INERT multi-tool plan preview Prime attaches to a
+/// [`PrimeIntent::ToolPlanRequest`] turn (`docs/mcp.md` "Run-driven multi-tool
+/// plan"; `docs/prime-processing-audit.md` "Hermes-first general agent"). It is a
+/// reviewable card row — a 1-based position, the resolved `plugin`/`tool`, the
+/// bounded JSON `args`, and the grounded `readiness`/`risk` — NOT a command. The
+/// kernel resolves and validates every field against the live tool registry
+/// (`discover_tools`) before attaching it; nothing here runs a tool.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrimeToolPlanStep {
+    /// The 1-based position shown in the card.
+    pub index: u32,
+    /// The resolved plugin id this step would call (a real installed plugin id), or
+    /// the raw reference when it could not be pinned to an installed plugin.
+    pub plugin: String,
+    /// The resolved tool name on that plugin. Empty when the reference could not be
+    /// pinned to a single installed tool (the step is then flagged unresolved).
+    pub tool: String,
+    /// The bounded, JSON-valid arguments the step would forward verbatim. `{}` when
+    /// the request carried none.
+    pub args: serde_json::Value,
+    /// The grounded executability of the resolved tool: `"ready"`,
+    /// `"needs_approval"`, `"missing_permission"`, `"not_runnable"`, or `"unknown"`
+    /// when the reference did not resolve to an installed tool. Honest, never
+    /// optimistic — it mirrors what the gated `call_tool` path would itself report.
+    pub readiness: String,
+    /// The declared risk level of the resolved tool (e.g. `"low"` / `"high"`), when
+    /// known. Absent for an unresolved step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<String>,
+    /// A short, honest note about THIS step (e.g. why it is not runnable, or that
+    /// the reference could not be pinned to an installed tool). Absent when clean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// A reviewable, ACTION-FREE multi-tool plan preview attached to a
+/// [`PrimeIntent::ToolPlanRequest`] turn so the dashboard can render the proposed
+/// tool sequence as a compact card and the operator can commit it with ONE explicit
+/// click — which creates a tool-run task through the EXISTING `tool_plan` task path
+/// and its unchanged permission/approval/grant/audit gates. Prime runs no tool to
+/// build this: the kernel grounds each step against the live tool registry and
+/// validates the whole plan ([`crate::task::TaskToolPlan::validate`]) WITHOUT
+/// touching state (`docs/mcp.md` "Run-driven multi-tool plan"; §10.5, §17.1).
+///
+/// ## The safety contract (binding)
+///
+/// - The preview CREATES nothing, RUNS nothing, and mutates no state. It carries no
+///   [`PrimeAction`]; the only path that materializes it is the explicit operator
+///   click that POSTs the steps to the existing tool-run task-create route.
+/// - Every step is grounded: an unknown tool is never silently accepted — it is
+///   flagged (`readiness: "unknown"`) and `ready_to_create` is `false`, and the
+///   reply asks the operator which tool they meant.
+/// - The plan is bounded: at most [`crate::task::MAX_TASK_TOOL_PLAN_STEPS`] steps,
+///   each with JSON-valid, size-bounded args, validated by the SAME logic the
+///   task-create route enforces.
+///
+/// Omitted from the wire on every non-tool-plan turn.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrimeToolPlanProposal {
+    /// The original request this plan was grounded from, echoed for provenance.
+    pub goal: String,
+    /// A short, human-readable one-line summary of the proposed plan.
+    pub summary: String,
+    /// The proposed steps in order. Bounded to [`crate::task::MAX_TASK_TOOL_PLAN_STEPS`];
+    /// may be empty when nothing resolved (the reply then asks a clarifying question).
+    pub steps: Vec<PrimeToolPlanStep>,
+    /// `true` ONLY when every step resolved to a known tool and the whole plan passed
+    /// the bounded `TaskToolPlan` validation, so the UI may offer the one-click
+    /// "Create tool-run task" commit. `false` keeps the card informational and the
+    /// commit disabled.
+    pub ready_to_create: bool,
+    /// Honest, bounded notes about anything that blocks creation (an unknown tool, a
+    /// not-runnable step, too many steps, oversized args). Empty when the plan is
+    /// clean and ready.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issues: Vec<String>,
 }
 
 /// The brain-assisted, VALIDATED task slots that produced a created task, attached
@@ -766,6 +870,14 @@ pub struct PrimeTurn {
     /// action.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context_reads: Vec<PrimeContextRead>,
+    /// A reviewable, ACTION-FREE multi-tool plan preview, present ONLY on a
+    /// `ToolPlanRequest` turn (see [`PrimeToolPlanProposal`]). The operator commits it
+    /// with one explicit click that creates a tool-run task through the existing
+    /// `tool_plan` path and its unchanged gates; this turn itself creates and runs
+    /// nothing. Omitted on every other turn, so existing clients see the same JSON
+    /// they did before (`docs/mcp.md` "Run-driven multi-tool plan"; §10.5, §17.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_plan_proposal: Option<PrimeToolPlanProposal>,
 }
 
 /// The scope a Prime turn runs in: which namespace work lands in, which agent
@@ -1005,6 +1117,7 @@ mod tests {
             PrimeIntent::OrchestrationRun,
             PrimeIntent::ToolDiscovery,
             PrimeIntent::ToolInvocation,
+            PrimeIntent::ToolPlanRequest,
             PrimeIntent::SmallTalk,
             PrimeIntent::EmotionalSupport,
             PrimeIntent::DirectAnswer,
@@ -1040,6 +1153,7 @@ mod tests {
             assign_slots: None,
             update: None,
             context_reads: vec![],
+            tool_plan_proposal: None,
         };
         let json = serde_json::to_string(&turn).unwrap();
         assert!(
@@ -1080,9 +1194,18 @@ mod tests {
         );
         // The plan preview is present ONLY on a PlanRequest turn: a normal turn must
         // not carry `proposal` on the wire, so existing clients are unaffected (§11.1).
+        // (This also covers the tool-plan preview, since `proposal` is a substring of
+        // `tool_plan_proposal` — the broader explicit check is below.)
         assert!(
             !json.contains("proposal"),
             "an action-free turn must omit the proposal field: {json}"
+        );
+        // The multi-tool plan preview is present ONLY on a ToolPlanRequest turn; a
+        // normal turn must omit it on the wire (`docs/mcp.md` "Run-driven multi-tool
+        // plan"; §10.5, §17.1).
+        assert!(
+            !json.contains("tool_plan_proposal"),
+            "a turn with no tool-plan preview must omit the field: {json}"
         );
 
         let s = PrimeSuggestion {
@@ -1186,6 +1309,73 @@ mod tests {
         assert_eq!(back.steps, proposal.steps);
         assert_eq!(back.agents, proposal.agents);
         assert_eq!(back.goal, proposal.goal);
+    }
+
+    #[test]
+    fn prime_tool_plan_proposal_round_trips_and_carries_only_descriptive_data() {
+        // A tool-plan preview is reviewable, INERT data: it round-trips and carries
+        // grounded step rows (plugin/tool/args/readiness) — never a PrimeAction. The
+        // commit is a separate explicit operator click against the existing tool-run
+        // task path (`docs/mcp.md` "Run-driven multi-tool plan"; §10.5, §17.1).
+        let proposal = PrimeToolPlanProposal {
+            goal: "run the status tool then echo the result".to_string(),
+            summary: "2 tool steps, all ready.".to_string(),
+            steps: vec![
+                PrimeToolPlanStep {
+                    index: 1,
+                    plugin: "relux-tools-status".to_string(),
+                    tool: "status.summary".to_string(),
+                    args: serde_json::json!({}),
+                    readiness: "ready".to_string(),
+                    risk: Some("low".to_string()),
+                    note: None,
+                },
+                PrimeToolPlanStep {
+                    index: 2,
+                    plugin: "relux-tools-echo".to_string(),
+                    tool: "echo.say".to_string(),
+                    args: serde_json::json!({ "message": "done" }),
+                    readiness: "ready".to_string(),
+                    risk: Some("low".to_string()),
+                    note: None,
+                },
+            ],
+            ready_to_create: true,
+            issues: vec![],
+        };
+        let json = serde_json::to_string(&proposal).unwrap();
+        // No action verbs leak into a preview — it is informational only.
+        assert!(
+            !json.contains("\"type\""),
+            "a tool-plan preview must not embed an action: {json}"
+        );
+        // A clean, ready plan omits the issues list on the wire.
+        assert!(!json.contains("issues"), "a clean plan omits issues: {json}");
+        let back: PrimeToolPlanProposal = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, proposal);
+
+        // An unresolved step is flagged honestly (readiness "unknown"), the plan is
+        // not creatable, and the issues are surfaced — never silently accepted.
+        let blocked = PrimeToolPlanProposal {
+            goal: "use the frobnicate tool".to_string(),
+            summary: "1 step could not be grounded.".to_string(),
+            steps: vec![PrimeToolPlanStep {
+                index: 1,
+                plugin: "frobnicate".to_string(),
+                tool: String::new(),
+                args: serde_json::json!({}),
+                readiness: "unknown".to_string(),
+                risk: None,
+                note: Some("no installed tool matches \"frobnicate\"".to_string()),
+            }],
+            ready_to_create: false,
+            issues: vec!["\"frobnicate\" is not an installed tool".to_string()],
+        };
+        let back: PrimeToolPlanProposal =
+            serde_json::from_str(&serde_json::to_string(&blocked).unwrap()).unwrap();
+        assert_eq!(back, blocked);
+        assert!(!back.ready_to_create);
+        assert!(back.steps[0].risk.is_none(), "an unresolved step carries no risk");
     }
 
     #[test]

@@ -91,6 +91,50 @@ pub fn classify_intent(message: &str) -> PrimeIntent {
     ]) {
         return PrimeIntent::ToolDiscovery;
     }
+    // Explicit multi-tool plan: the user asked Prime to run SEVERAL named tools in
+    // order ("run these tools in order: …", "use the status tool then the echo
+    // tool", "chain these tools"). Requires BOTH an explicit plan/sequence cue AND
+    // at least two segments that resolve to a real tool reference, so a single tool
+    // request ("echo hello") stays `ToolInvocation` and casual chat that merely says
+    // "then" never reaches here. Checked before single tool invocation so an ordered
+    // multi-tool command previews an INERT plan rather than running as one tool. The
+    // resulting turn is action-free: the kernel grounds + validates the plan and
+    // attaches a reviewable card; only an explicit operator click creates a tool-run
+    // task (`docs/mcp.md` "Run-driven multi-tool plan"; `docs/prime-processing-audit.md`
+    // "Hermes-first general agent"; §10.5, §17.1).
+    let plan_cue = has(&[
+        "these tools",
+        "the following tools",
+        "tool plan",
+        "tools in order",
+        "multi-tool",
+        "multi tool",
+        "chain these",
+        "chain the tools",
+        "sequence of tools",
+        "several tools",
+        "multiple tools",
+        "a few tools",
+    ]);
+    let seq_cue = has(&[
+        " then ",
+        " and then ",
+        ", then ",
+        " followed by ",
+        ", followed by ",
+        " after that ",
+        ", after that ",
+        " next, ",
+    ]);
+    if plan_cue || seq_cue {
+        let resolved = split_tool_plan_segments(message)
+            .iter()
+            .filter(|s| parse_tool_request(s).is_some())
+            .count();
+        if resolved >= 2 {
+            return PrimeIntent::ToolPlanRequest;
+        }
+    }
     // Tool invocation: the user wants Prime to RUN a specific tool. An explicit
     // `plugin/tool` reference, an echo/status request, or an "<verb> the X tool"
     // phrasing. Checked before task creation/run control so "echo hello" runs the
@@ -732,6 +776,20 @@ pub fn decide(message: &str, intent: &PrimeIntent, summary: &StateSummary) -> Pr
         PrimeIntent::ToolDiscovery => PrimePlan::Act {
             action: PrimeAction::DiscoverTools,
             text: "Here are the tools I can use right now.".to_string(),
+        },
+        // Explicit multi-tool plan request: build an INERT, grounded preview the
+        // operator commits with one explicit click. `decide` is pure and cannot reach
+        // the live tool registry, so it only carries the request forward as a
+        // `ProposeToolPlan` action; the kernel grounds + validates every step against
+        // `discover_tools` and attaches the reviewable card when it executes this
+        // READ-ONLY action. The turn creates nothing and runs nothing — execution
+        // happens only later, through the existing tool-run task path and its
+        // unchanged gates (`docs/mcp.md` "Run-driven multi-tool plan"; §10.5, §17.1).
+        PrimeIntent::ToolPlanRequest => PrimePlan::Act {
+            action: PrimeAction::ProposeToolPlan {
+                goal: message.trim().to_string(),
+            },
+            text: "Here's the tool plan I'd run — review the steps and create the tool-run task when you're ready.".to_string(),
         },
         // Running a tool is a safe, in-scope `Act`: the kernel executes only the
         // resolved built-in handler through the permission/audit path, and reports
@@ -1595,7 +1653,7 @@ pub fn brainstorm_offers_actionable_work(message: &str) -> bool {
 /// installed tool and reports it honestly (it will not be runnable here, which is
 /// the truthful answer). The input is the first JSON object found in the message,
 /// or - for an `echo <text>` request with no JSON - `{ "message": "<text>" }`.
-fn parse_tool_request(message: &str) -> Option<(String, String, String)> {
+pub(crate) fn parse_tool_request(message: &str) -> Option<(String, String, String)> {
     let trimmed = message.trim();
     let lower = trimmed.to_lowercase();
     let json = extract_json(trimmed);
@@ -1657,6 +1715,122 @@ fn parse_tool_request(message: &str) -> Option<(String, String, String)> {
     }
 
     None
+}
+
+/// Split an explicit multi-tool request into ordered raw segments, one per intended
+/// tool step, so each can be grounded against the live tool registry independently
+/// (`docs/mcp.md` "Run-driven multi-tool plan"). Strips a leading plan lead-in
+/// ("run these tools in order:", "chain these tools:", …) and splits the remainder
+/// on ordinary sequence connectors ("then", "and then", "followed by", "after that",
+/// "next,", ";", a newline) plus simple numbered / bulleted markers ("1.", "2)",
+/// "-"). Purely syntactic — it resolves nothing; the caller resolves each segment
+/// with [`parse_tool_request`] and validates the whole plan with the existing
+/// [`relux_core::task::TaskToolPlan`] gate. Matching is ASCII-case-insensitive over a
+/// 1:1 char buffer, so it never panics on a non-ASCII message.
+pub(crate) fn split_tool_plan_segments(message: &str) -> Vec<String> {
+    let body = strip_tool_plan_lead_in(message);
+    let chars: Vec<char> = body.chars().collect();
+    let lower: Vec<char> = chars.iter().map(|c| c.to_ascii_lowercase()).collect();
+    // Longest connectors first so a compound form wins over its shorter prefix.
+    const CONNECTORS: &[&str] = &[
+        " and then ",
+        ", then ",
+        ", followed by ",
+        ", after that ",
+        " followed by ",
+        " after that ",
+        " then ",
+        " next, ",
+        ";",
+        "\n",
+    ];
+    let mut segments: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut i = 0usize;
+    'scan: while i < chars.len() {
+        for conn in CONNECTORS {
+            let cc: Vec<char> = conn.chars().collect();
+            if i + cc.len() <= lower.len() && lower[i..i + cc.len()] == cc[..] {
+                segments.push(cur.trim().to_string());
+                cur = String::new();
+                i += cc.len();
+                continue 'scan;
+            }
+        }
+        cur.push(chars[i]);
+        i += 1;
+    }
+    segments.push(cur.trim().to_string());
+    segments
+        .into_iter()
+        .map(|seg| {
+            seg.trim()
+                .trim_start_matches(|c: char| {
+                    c.is_ascii_digit() || c == '.' || c == ')' || c == '-' || c == '*' || c == ' '
+                })
+                .trim()
+                .to_string()
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Strip a leading "run these tools in order:" / "chain these tools:" style plan
+/// lead-in (and any polite prefix) so what remains is the ordered tool steps. Only a
+/// known lead-in is removed, never the substance; applied repeatedly so a compound
+/// prefix ("prime, please run these tools:") is fully stripped.
+fn strip_tool_plan_lead_in(message: &str) -> String {
+    // Longest-first within a pass so a specific lead-in wins over a shorter prefix.
+    const LEAD_INS: &[&str] = &[
+        "run the following tools in order:",
+        "run these tools in order:",
+        "run the following tools in order",
+        "run these tools in order",
+        "run the following tools:",
+        "use the following tools:",
+        "run these tools:",
+        "use these tools:",
+        "chain these tools:",
+        "chain the tools:",
+        "run a tool plan:",
+        "here is the tool plan:",
+        "here's the tool plan:",
+        "run these tools",
+        "use these tools",
+        "chain these tools",
+        "chain the tools",
+        "run the tools:",
+        "tool plan:",
+        "in this order:",
+        "in order:",
+        "i want you to ",
+        "i'd like you to ",
+        "go ahead and ",
+        "can you ",
+        "could you ",
+        "would you ",
+        "please ",
+        "prime, ",
+        "prime ",
+    ];
+    let mut rest = message.trim().to_string();
+    loop {
+        let lower = rest.to_lowercase();
+        let mut stripped = false;
+        for lead in LEAD_INS {
+            if lower.starts_with(lead) {
+                // Lead-ins are ASCII, so the matched prefix is the same byte length
+                // in the original-cased string — a safe char boundary.
+                rest = rest[lead.len()..].trim_start().to_string();
+                stripped = true;
+                break;
+            }
+        }
+        if !stripped {
+            break;
+        }
+    }
+    rest
 }
 
 /// Trim a token down to a plugin/tool-id shape (ASCII alnum, `-`, `_`, `.`).
@@ -2572,6 +2746,74 @@ mod tests {
         assert_eq!(
             classify_intent("fix the login bug"),
             PrimeIntent::TaskCreation
+        );
+    }
+
+    #[test]
+    fn classifies_explicit_multi_tool_plan_requests() {
+        // An explicit ordered multi-tool command previews an INERT plan, distinct
+        // from a single tool invocation (`docs/mcp.md` "Run-driven multi-tool plan").
+        assert_eq!(
+            classify_intent("use the status tool then the echo tool"),
+            PrimeIntent::ToolPlanRequest
+        );
+        assert_eq!(
+            classify_intent("run these tools in order: status then echo hello"),
+            PrimeIntent::ToolPlanRequest
+        );
+        assert_eq!(
+            classify_intent("echo hi then echo bye"),
+            PrimeIntent::ToolPlanRequest
+        );
+        // A SINGLE tool stays ToolInvocation — one step is not a plan.
+        assert_eq!(classify_intent("echo hello"), PrimeIntent::ToolInvocation);
+        assert_eq!(
+            classify_intent("run the status tool"),
+            PrimeIntent::ToolInvocation
+        );
+    }
+
+    #[test]
+    fn casual_chat_with_a_connector_is_never_a_tool_plan() {
+        // A "then" in ordinary conversation, ideation, or a question must NOT be read
+        // as a tool plan: with no tool references the segments resolve to nothing
+        // (Hermes-first: §10.5, §17.1). These stay conversational / work as before.
+        for msg in [
+            "let me think then I'll decide",
+            "first we plan then we build",
+            "should we ship then iterate?",
+            "i'm so frustrated, nothing works then it breaks again",
+        ] {
+            assert_ne!(
+                classify_intent(msg),
+                PrimeIntent::ToolPlanRequest,
+                "{msg:?} must not be a tool plan"
+            );
+        }
+        // "run the build then run the tests" references no installed TOOL (build/tests
+        // are work, not tools), so it stays task creation, exactly as before.
+        assert_eq!(
+            classify_intent("run the build then run the tests"),
+            PrimeIntent::TaskCreation
+        );
+    }
+
+    #[test]
+    fn splits_multi_tool_segments_and_strips_lead_ins() {
+        // The lead-in is stripped and the connectors split the steps in order.
+        assert_eq!(
+            split_tool_plan_segments("run these tools in order: status then echo hello"),
+            vec!["status".to_string(), "echo hello".to_string()]
+        );
+        // Numbered markers and "and then" both split.
+        assert_eq!(
+            split_tool_plan_segments("1. run the status tool and then 2. echo done"),
+            vec!["run the status tool".to_string(), "echo done".to_string()]
+        );
+        // A non-ASCII message never panics and still splits on the ASCII connector.
+        assert_eq!(
+            split_tool_plan_segments("echo café then echo déjà"),
+            vec!["echo café".to_string(), "echo déjà".to_string()]
         );
     }
 

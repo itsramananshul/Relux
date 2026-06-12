@@ -1537,6 +1537,37 @@ export interface ReluxPrimeProposal {
   polish?: ReluxPrimeProposalPolish;
 }
 
+// One concrete step of an INERT multi-tool plan preview (docs/mcp.md "Run-driven
+// multi-tool plan"). A reviewable card row — the resolved plugin/tool, the bounded
+// JSON args, and the grounded readiness/risk — never a command. `readiness` is one
+// of "ready" / "needs_approval" / "missing_permission" / "not_runnable" / "unknown"
+// (the kernel grounded it against the live tool registry, never optimistically).
+export interface ReluxPrimeToolPlanStep {
+  index: number;
+  plugin: string;
+  tool: string;
+  args: unknown;
+  readiness: string;
+  risk?: string;
+  note?: string;
+}
+
+// A reviewable, ACTION-FREE multi-tool plan preview attached to a tool-plan turn so
+// the chat can render a compact card. The operator commits it with ONE explicit
+// click that creates a tool-run task through the EXISTING tool_plan task path and
+// its unchanged permission/approval/grant/audit gates; showing this turn creates and
+// runs nothing. `ready_to_create` is true ONLY when every step resolved to a known
+// tool and the bounded plan validated. `issues` surfaces anything that blocks
+// creation (an unknown tool, a not-runnable step, too many steps). Omitted on every
+// non-tool-plan turn.
+export interface ReluxPrimeToolPlanProposal {
+  goal: string;
+  summary: string;
+  steps: ReluxPrimeToolPlanStep[];
+  ready_to_create: boolean;
+  issues?: string[];
+}
+
 // Brain-assisted, VALIDATED task slots that shaped a created task, present ONLY on
 // a task-creation turn the brain genuinely sharpened. Provenance/presentation only
 // — the kernel validated every field (title sanitized/clamped, assignee checked
@@ -1662,6 +1693,11 @@ export interface ReluxPrimeTurn {
   // A reviewable, action-free plan preview, present ONLY on a plan-request turn
   // (§10 planning layer, §11.1). Omitted on every other turn.
   proposal?: ReluxPrimeProposal;
+  // A reviewable, action-free MULTI-TOOL plan preview, present ONLY on a tool-plan
+  // turn (docs/mcp.md "Run-driven multi-tool plan"). The operator commits it with one
+  // explicit click that creates a tool-run task through the existing tool_plan path;
+  // showing it creates and runs nothing. Omitted on every other turn.
+  tool_plan_proposal?: ReluxPrimeToolPlanProposal;
   // Brain-assisted, validated task slots, present ONLY on a create turn the brain
   // sharpened (§10.1, §10.2, §17.1). Omitted on every other turn.
   slots?: ReluxPrimeTaskSlots;

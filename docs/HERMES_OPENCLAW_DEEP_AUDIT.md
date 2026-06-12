@@ -574,6 +574,25 @@ safe (adds no authority), bounded, feasible in one commit, and reuses existing v
   bypass + audit + the distinct `mcp_tool_call*` transcript events — instead of echo, failing the
   run/task honestly on a gate refusal (never a fabricated success). The brain never picks the tool;
   a multi-step / brain-chosen MCP run stays out of scope. *(core, kernel, API, tests, docs.)*
+- **P2 — run-driven multi-tool plan (bounded, operator-authored sequence)** — ✅ DONE: a `Task` may
+  carry `{ "tool_plan": [ { plugin, tool, args }, … ] }` (`relux_core::TaskToolPlan`), strictly
+  validated at create time (non-empty, ≤ `MAX_TASK_TOOL_PLAN_STEPS` (5), non-empty plugin/tool,
+  args ≤ 256 KiB; `tool_plan`/`tool_call` mutually exclusive), executed step-by-step through the SAME
+  gated `call_tool` chokepoint and **stopping on the first failure/denial**. Plus a compact operator
+  UI (Plugins → Tools "Create a tool-run task", live-MCP-tool picker). The brain never chooses a step.
+  *(core, kernel, API, UI, tests, `docs/mcp.md` "Run-driven multi-tool plan".)*
+- **P2 — brain-assisted tool-plan PROPOSAL (Prime preview, inert)** — ✅ DONE: an EXPLICIT ordered
+  multi-tool command in Prime chat (`PrimeIntent::ToolPlanRequest`, deterministic classifier requiring
+  a plan/sequence cue + ≥2 resolved tool refs; the brain may also propose but it is **sensitive** in the
+  fail-closed reconcile gate) produces an INERT, grounded preview (`KernelState::build_tool_plan_proposal`
+  → `PrimeTurn.tool_plan_proposal`): each step resolved against the live `discover_tools` registry with
+  honest readiness/risk, the whole plan validated by the SAME `TaskToolPlan::validate`, an unknown tool
+  flagged (never silently accepted) and an over-cap plan reported (never truncated). It **creates
+  nothing and runs nothing**; the dashboard `ToolPlanCard` renders the steps and an explicit "Create
+  tool-run task" button that POSTs to the EXISTING `tool_plan` route, where the unchanged gates apply at
+  run time. **Prime stays a Hermes-first general agent** — greetings, insults, frustration, vague ideas,
+  Q&A, and brainstorming answer naturally and carry NO tool plan. *(core, kernel, UI, tests,
+  `docs/mcp.md` "Brain-assisted tool-plan PROPOSAL".)*
 - **P2 — install-time manifest validation surfaced in Doctor/UI** (Paperclip Zod safe-parse style).
 
 ---

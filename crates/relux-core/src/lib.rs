@@ -72,7 +72,8 @@ pub use prime::{
     PrimeAutonomyConfig, PrimeAutonomyTickResult, PrimeContext, PrimeContextRead, PrimeDisposition,
     PrimeIntent,
     PrimePlan, PrimePolishedStep, PrimeProposal, PrimeProposalPolish, PrimeProposalStep,
-    PrimeSuggestion, PrimeTaskChange, PrimeTaskSlots, PrimeTaskUpdate, PrimeTurn, StateSummary,
+    PrimeSuggestion, PrimeTaskChange, PrimeTaskSlots, PrimeTaskUpdate, PrimeToolPlanProposal,
+    PrimeToolPlanStep, PrimeTurn, StateSummary,
     TaskBrief,
 };
 pub use proposed_change::{

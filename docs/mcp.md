@@ -329,6 +329,55 @@ fixed at creation; a step cannot consume a prior step's output), and NOT cross-a
 Those remain out of scope until they route through allowlisted/validated write tools and
 the same approval gates.
 
+### Brain-assisted tool-plan PROPOSAL (Prime preview, inert)
+
+The operator can also reach the same bounded `tool_plan` task through **Prime chat**, as
+a **reviewable proposal** — never an auto-action. **Prime is a Hermes-like general agent
+first** (normal chat, Q&A, brainstorming, emotional support); the company/crew/tool
+powers are optional abilities, not the default personality. So a greeting, an insult,
+frustration, a vague idea, a question, or any casual turn **answers naturally and carries
+no tool plan**. Only an **explicit ordered multi-tool command** ("run these tools in
+order: …", "use the status tool then the echo tool", "chain these tools") produces a
+preview.
+
+- **Classification (safe classifier + validated LLM, fail closed).** The deterministic
+  `classify_intent` recognizes `PrimeIntent::ToolPlanRequest` ONLY when an explicit
+  plan/sequence cue is present AND **≥ 2 segments resolve to a real tool reference**
+  (`crates/relux-kernel/src/prime.rs` `split_tool_plan_segments` + `parse_tool_request`).
+  A single tool stays `ToolInvocation`; a "then" in ordinary chat resolves to no tools and
+  never reaches here. The optional LLM brain may also propose the intent, but it is
+  **sensitive** in the fail-closed reconcile gate (`prime_intent.rs`
+  `is_sensitive_intent`), so the brain can never promote guarded chat (a greeting, an
+  insult, a vague musing/question) into a tool plan — only an explicit command, which the
+  deterministic classifier already catches, gets there.
+- **Inert, grounded preview (`KernelState::build_tool_plan_proposal`).** The
+  `ProposeToolPlan` action is READ-ONLY: the kernel splits the request into ordered
+  steps, resolves each against the **live tool registry** (`discover_tools`), surfaces
+  each step's honest `readiness` (`ready` / `needs_approval` / `missing_permission` /
+  `not_runnable` / `unknown`) and declared `risk`, and validates the whole bounded plan
+  with the **same `TaskToolPlan::validate`** the create route enforces — **creating no
+  task, running no tool, and mutating nothing**. An **unknown tool is never silently
+  accepted**: the step is flagged `unknown`, `ready_to_create` is `false`, and the reply
+  becomes a clarifying question; an **over-cap** plan (> 5 steps) is reported as too-long,
+  never truncated silently. The preview ships as `PrimeTurn.tool_plan_proposal`
+  (`relux_core::PrimeToolPlanProposal`: a human summary, the ordered steps, `ready_to_create`,
+  and honest `issues`); it carries **no `PrimeAction`**.
+- **Explicit one-click commit, existing path + gates (UI).** The Prime chat renders the
+  preview as a compact card (`apps/dashboard/src/pages/Prime.tsx` `ToolPlanCard`) under
+  the assistant reply: ordered steps, tool names, readiness/risk badges, and a compact
+  args preview. A **"Create tool-run task"** button (enabled ONLY when `ready_to_create`)
+  POSTs the validated steps straight to the **existing** `POST /v1/relux/tasks` `tool_plan`
+  route (`reluxWork.createTask`) — **no new backend, no magic phrase**. Execution still
+  flows only through the existing tool-run task path and its **unchanged
+  permission/approval/grant/audit gates** at run time; nothing runs until the operator
+  starts the task in Work. The card is honest: nothing is created or run by showing it.
+
+**Scope (proposal layer).** The proposal is grounded against **installed plugin tools**
+(`discover_tools`); grounding a step against a **live MCP-discovered** `mcp:<server>` tool
+is not yet wired into the kernel preview (the operator's Plugins → Tools "Create a
+tool-run task" form already merges live MCP tools — use that for an MCP-step plan). The
+proposal chooses no tools on its own, runs nothing, and adds no new execution path.
+
 ## What it does NOT do (honest limitations)
 
 - **No stdio (command) MCP servers.** Relux never spawns arbitrary downloaded

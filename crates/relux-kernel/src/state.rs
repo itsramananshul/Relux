@@ -3978,6 +3978,151 @@ impl KernelState {
         out
     }
 
+    /// Build the INERT, grounded multi-tool plan preview for a `ProposeToolPlan`
+    /// action (`docs/mcp.md` "Run-driven multi-tool plan"; §10.5, §17.1). READ-ONLY:
+    /// it splits the request into ordered segments
+    /// ([`crate::prime::split_tool_plan_segments`]), resolves each against the LIVE
+    /// tool registry ([`Self::discover_tools`]), and validates the whole bounded plan
+    /// with the SAME [`relux_core::task::TaskToolPlan::validate`] the task-create
+    /// route enforces — creating nothing and running nothing. An unknown tool is
+    /// flagged (`readiness: "unknown"`), never silently accepted, so the resulting
+    /// card honestly drives the explicit one-click commit the operator makes.
+    fn build_tool_plan_proposal(
+        &self,
+        ctx: &PrimeContext,
+        goal: &str,
+    ) -> relux_core::PrimeToolPlanProposal {
+        use relux_core::task::{TaskToolCall, TaskToolPlan, MAX_TASK_TOOL_PLAN_STEPS};
+
+        let catalog = self.discover_tools(Some(&ctx.agent));
+        let segments = crate::prime::split_tool_plan_segments(goal);
+
+        let mut steps: Vec<relux_core::PrimeToolPlanStep> = Vec::new();
+        let mut resolved_calls: Vec<TaskToolCall> = Vec::new();
+        let mut issues: Vec<String> = Vec::new();
+        let mut all_resolved = true;
+        let mut over_cap = false;
+
+        for (i, segment) in segments.iter().enumerate() {
+            // Cap the previewed steps at the same bound the task-create route enforces;
+            // a longer request is reported as too-long rather than silently truncated.
+            if steps.len() >= MAX_TASK_TOOL_PLAN_STEPS {
+                over_cap = true;
+                break;
+            }
+            let index = (i + 1) as u32;
+            match crate::prime::parse_tool_request(segment) {
+                // A concrete plugin + tool reference: ground it against the registry.
+                Some((plugin, tool, input_json)) if !tool.is_empty() => {
+                    let args: serde_json::Value = serde_json::from_str(&input_json)
+                        .unwrap_or_else(|_| serde_json::json!({}));
+                    match catalog
+                        .iter()
+                        .find(|d| d.plugin_id == plugin && d.tool_name == tool)
+                    {
+                        Some(desc) => {
+                            let (readiness, note) = tool_plan_readiness(&desc.executable);
+                            steps.push(relux_core::PrimeToolPlanStep {
+                                index,
+                                plugin: plugin.clone(),
+                                tool: tool.clone(),
+                                args: args.clone(),
+                                readiness: readiness.to_string(),
+                                risk: Some(format!("{:?}", desc.risk).to_lowercase()),
+                                note,
+                            });
+                            resolved_calls.push(TaskToolCall { plugin, tool, args });
+                        }
+                        None => {
+                            all_resolved = false;
+                            issues.push(format!(
+                                "step {index}: \"{plugin}/{tool}\" is not an installed tool"
+                            ));
+                            steps.push(relux_core::PrimeToolPlanStep {
+                                index,
+                                plugin,
+                                tool,
+                                args,
+                                readiness: "unknown".to_string(),
+                                risk: None,
+                                note: Some(
+                                    "no installed tool matches this reference".to_string(),
+                                ),
+                            });
+                        }
+                    }
+                }
+                // Resolved a plugin but not a specific tool (a bare keyword like
+                // "github"): never guess which tool — ask.
+                Some((plugin, _tool, _)) => {
+                    all_resolved = false;
+                    issues.push(format!(
+                        "step {index}: name the specific tool on \"{plugin}\" (e.g. \"{plugin}/<tool>\")"
+                    ));
+                    steps.push(relux_core::PrimeToolPlanStep {
+                        index,
+                        plugin,
+                        tool: String::new(),
+                        args: serde_json::json!({}),
+                        readiness: "unknown".to_string(),
+                        risk: None,
+                        note: Some("which tool on this plugin?".to_string()),
+                    });
+                }
+                // The segment maps to no tool at all.
+                None => {
+                    all_resolved = false;
+                    let label = tool_plan_segment_label(segment);
+                    issues.push(format!("step {index}: couldn't map \"{label}\" to a tool"));
+                    steps.push(relux_core::PrimeToolPlanStep {
+                        index,
+                        plugin: label,
+                        tool: String::new(),
+                        args: serde_json::json!({}),
+                        readiness: "unknown".to_string(),
+                        risk: None,
+                        note: Some("couldn't map this to an installed tool".to_string()),
+                    });
+                }
+            }
+        }
+
+        if over_cap || segments.len() > MAX_TASK_TOOL_PLAN_STEPS {
+            all_resolved = false;
+            issues.push(format!(
+                "a tool plan can have at most {MAX_TASK_TOOL_PLAN_STEPS} steps; you listed {}",
+                segments.len()
+            ));
+        }
+
+        // Reuse the EXACT create-time validation so a preview can never advertise a
+        // plan the task-create route would reject (empty, over-long, oversized args).
+        let mut validates = !resolved_calls.is_empty();
+        if !resolved_calls.is_empty() {
+            if let Err(e) = (TaskToolPlan {
+                steps: resolved_calls.clone(),
+            })
+            .validate()
+            {
+                validates = false;
+                all_resolved = false;
+                issues.push(e.to_string());
+            }
+        }
+
+        let ready_to_create =
+            all_resolved && validates && !steps.is_empty() && resolved_calls.len() == steps.len();
+        let summary = tool_plan_summary(&steps, ready_to_create);
+
+        relux_core::PrimeToolPlanProposal {
+            goal: goal.trim().to_string(),
+            summary,
+            steps,
+            ready_to_create,
+            issues,
+        }
+    }
+
     /// Resolve `(agent namespace, required permission)` for a tool call, erroring
     /// on an unknown agent, unknown plugin, or unknown tool. Shared by
     /// [`call_tool`] and [`invoke_tool`] so both gate identically.
@@ -6352,6 +6497,7 @@ impl KernelState {
                 assign_slots: None,
                 update: None,
                 context_reads: vec![],
+                tool_plan_proposal: None,
             },
             PrimePlan::Clarify { text } => PrimeTurn {
                 intent,
@@ -6373,6 +6519,7 @@ impl KernelState {
                 assign_slots: None,
                 update: None,
                 context_reads: vec![],
+                tool_plan_proposal: None,
             },
             PrimePlan::Act { action, text } => {
                 // Brain-assisted slot sharpening (validated): a create action takes
@@ -6453,6 +6600,7 @@ impl KernelState {
                     assign_slots: None,
                     update: None,
                     context_reads: vec![],
+                    tool_plan_proposal: None,
                 }
             }
         };
@@ -6565,6 +6713,7 @@ impl KernelState {
             assign_slots: None,
             update: None,
             context_reads: vec![],
+            tool_plan_proposal: None,
         }
     }
 
@@ -6767,6 +6916,7 @@ impl KernelState {
             assign_slots: None,
             update: None,
             context_reads: vec![],
+            tool_plan_proposal: None,
         }
     }
 
@@ -6846,6 +6996,7 @@ impl KernelState {
                     assign_slots: None,
                     update: None,
                     context_reads: vec![],
+                    tool_plan_proposal: None,
                 })
             }
             PrimeAction::CreateAndRunTask { title } => {
@@ -6913,6 +7064,7 @@ impl KernelState {
                     assign_slots: None,
                     update: None,
                     context_reads: vec![],
+                    tool_plan_proposal: None,
                 })
             }
             PrimeAction::StartRun { task_id } => {
@@ -6942,6 +7094,7 @@ impl KernelState {
                     assign_slots: None,
                     update: None,
                     context_reads: vec![],
+                    tool_plan_proposal: None,
                 })
             }
             PrimeAction::CreateAgent {
@@ -7015,6 +7168,7 @@ impl KernelState {
                     assign_slots: None,
                     update: None,
                     context_reads: vec![],
+                    tool_plan_proposal: None,
                 })
             }
             PrimeAction::AssignTask { task_id, agent_id } => {
@@ -7042,6 +7196,7 @@ impl KernelState {
                     assign_slots: None,
                     update: None,
                     context_reads: vec![],
+                    tool_plan_proposal: None,
                 })
             }
             PrimeAction::UpdateTask { task_id, patch } => {
@@ -7185,6 +7340,7 @@ impl KernelState {
                         source: None,
                     }),
                     context_reads: vec![],
+                    tool_plan_proposal: None,
                 })
             }
             PrimeAction::DiscoverTools => {
@@ -7216,6 +7372,46 @@ impl KernelState {
                     assign_slots: None,
                     update: None,
                     context_reads: vec![],
+                    tool_plan_proposal: None,
+                })
+            }
+            PrimeAction::ProposeToolPlan { goal } => {
+                // INERT preview: ground + validate the bounded plan against the LIVE
+                // tool registry without creating a task, running a tool, or mutating
+                // any state. An unresolved/unknown step is flagged (never silently
+                // accepted) and turns the reply into a clarifying question; a clean,
+                // bounded, fully-grounded plan offers the operator the explicit
+                // one-click commit (which the dashboard sends straight to the existing
+                // tool-run task-create route and its unchanged gates). `docs/mcp.md`
+                // "Run-driven multi-tool plan"; §10.5, §17.1.
+                let proposal = self.build_tool_plan_proposal(ctx, goal);
+                let disposition = if proposal.ready_to_create {
+                    PrimeDisposition::Answered
+                } else {
+                    PrimeDisposition::NeedsClarification
+                };
+                let reply = render_tool_plan_reply(&text, &proposal);
+                Ok(PrimeTurn {
+                    intent,
+                    reply,
+                    disposition,
+                    action: Some(action),
+                    created_task: None,
+                    started_run: None,
+                    created_agent: None,
+                    approval: None,
+                    invoked_tool: None,
+                    tool_output: None,
+                    tool_error: None,
+                    suggested_actions: Vec::new(),
+                    proposal: None,
+                    slots: None,
+                    agent_slots: None,
+                    admin_slots: None,
+                    assign_slots: None,
+                    update: None,
+                    context_reads: vec![],
+                    tool_plan_proposal: Some(proposal),
                 })
             }
             PrimeAction::InvokeTool {
@@ -7249,6 +7445,7 @@ impl KernelState {
                         assign_slots: None,
                         update: None,
                         context_reads: vec![],
+                        tool_plan_proposal: None,
                     })
                 }
                 Err(KernelError::OrchestrationNotMultiAgent) => Ok(PrimeTurn {
@@ -7271,6 +7468,7 @@ impl KernelState {
                     assign_slots: None,
                     update: None,
                     context_reads: vec![],
+                    tool_plan_proposal: None,
                 }),
                 Err(e) => Err(e),
             },
@@ -7306,6 +7504,7 @@ impl KernelState {
                         assign_slots: None,
                         update: None,
                         context_reads: vec![],
+                        tool_plan_proposal: None,
                     });
                 }
                 match self.run_orchestration(&oid, 25, 2) {
@@ -7331,6 +7530,7 @@ impl KernelState {
                             assign_slots: None,
                             update: None,
                             context_reads: vec![],
+                            tool_plan_proposal: None,
                         })
                     }
                     Err(e) => Err(e),
@@ -7359,6 +7559,7 @@ impl KernelState {
                 assign_slots: None,
                 update: None,
                 context_reads: vec![],
+                tool_plan_proposal: None,
             }),
         }
     }
@@ -7424,6 +7625,7 @@ impl KernelState {
                 assign_slots: None,
                 update: None,
                 context_reads: vec![],
+                tool_plan_proposal: None,
             }
         };
 
@@ -10159,6 +10361,126 @@ fn render_orchestration_plan(o: &Orchestration) -> String {
 /// `not implemented` tools that are installed but have no local runtime, and
 /// `needs permission` tools Prime would need a grant for. Disabled tools are
 /// marked so the list never implies a disabled tool is runnable.
+/// Map a tool's live [`ToolExecutability`] to the honest `readiness` label and an
+/// optional note carried on a [`relux_core::PrimeToolPlanStep`]. The labels match
+/// the gated `call_tool` reality — a higher-risk or unpermitted tool is surfaced as
+/// such, never as "ready".
+fn tool_plan_readiness(executable: &ToolExecutability) -> (&'static str, Option<String>) {
+    match executable {
+        ToolExecutability::Ready => ("ready", None),
+        ToolExecutability::NeedsApproval => (
+            "needs_approval",
+            Some("higher-risk tool — the run is gated on approval".to_string()),
+        ),
+        ToolExecutability::MissingPermission => (
+            "missing_permission",
+            Some("the acting agent lacks this tool's permission".to_string()),
+        ),
+        ToolExecutability::RuntimeNotConfigured => (
+            "not_runnable",
+            Some("installed, but no runtime is configured yet".to_string()),
+        ),
+        ToolExecutability::RuntimeDisabled => (
+            "not_runnable",
+            Some("installed, but its runtime is disabled".to_string()),
+        ),
+        ToolExecutability::NotImplemented => (
+            "not_runnable",
+            Some("installed, but the runtime is not implemented yet".to_string()),
+        ),
+    }
+}
+
+/// A short, bounded label for a raw plan segment that mapped to no tool, used in the
+/// honest "couldn't map …" note/issue so the operator sees what they wrote without
+/// echoing an unbounded blob into the reply.
+fn tool_plan_segment_label(segment: &str) -> String {
+    const MAX: usize = 48;
+    let trimmed = segment.trim();
+    let label: String = trimmed.chars().take(MAX).collect();
+    if trimmed.chars().count() > MAX {
+        format!("{label}…")
+    } else {
+        label
+    }
+}
+
+/// One-line, human-readable summary of a grounded tool-plan preview.
+fn tool_plan_summary(steps: &[relux_core::PrimeToolPlanStep], ready: bool) -> String {
+    if steps.is_empty() {
+        return "I couldn't map this to any installed tools.".to_string();
+    }
+    let n = steps.len();
+    let noun = if n == 1 { "step" } else { "steps" };
+    if ready {
+        let all_ready = steps.iter().all(|s| s.readiness == "ready");
+        if all_ready {
+            format!("{n} tool {noun}, all ready to run.")
+        } else {
+            format!("{n} tool {noun}; some are gated (see each step).")
+        }
+    } else {
+        let unresolved = steps.iter().filter(|s| s.readiness == "unknown").count();
+        if unresolved > 0 {
+            format!("{n} tool {noun}, but {unresolved} couldn't be grounded — see below.")
+        } else {
+            format!("{n} tool {noun}; the plan needs a fix before it can be created.")
+        }
+    }
+}
+
+/// Render the deterministic, grounded reply for a tool-plan preview turn. Carries the
+/// summary + ordered step lines + any blocking issues, in plain prose (the structured
+/// card rides alongside as [`relux_core::PrimeToolPlanProposal`]). No raw JSON blob
+/// leaks: args are shown compactly. The reply NEVER claims anything was created or
+/// run — the operator commits the plan explicitly.
+fn render_tool_plan_reply(intro: &str, proposal: &relux_core::PrimeToolPlanProposal) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(intro.trim().to_string());
+    lines.push(proposal.summary.clone());
+    for s in &proposal.steps {
+        let target = if s.tool.is_empty() {
+            s.plugin.clone()
+        } else {
+            format!("{}/{}", s.plugin, s.tool)
+        };
+        let args = serde_json::to_string(&s.args).unwrap_or_else(|_| "{}".to_string());
+        let args = if args == "{}" {
+            String::new()
+        } else {
+            let compact: String = args.chars().take(80).collect();
+            format!(" {compact}")
+        };
+        let note = s
+            .note
+            .as_deref()
+            .map(|n| format!(" — {n}"))
+            .unwrap_or_default();
+        lines.push(format!(
+            "{}. {target} [{}]{args}{note}",
+            s.index, s.readiness
+        ));
+    }
+    if !proposal.issues.is_empty() {
+        lines.push("Before I can create it:".to_string());
+        for issue in &proposal.issues {
+            lines.push(format!("- {issue}"));
+        }
+    }
+    if proposal.ready_to_create {
+        lines.push(
+            "Nothing is created or run yet — use \"Create tool-run task\" to commit it; the usual permission/approval gates still apply at run time."
+                .to_string(),
+        );
+    } else {
+        lines.push(
+            "Nothing is created or run. Tell me which tools you mean and I'll re-draft the plan."
+                .to_string(),
+        );
+    }
+    lines.join("\n")
+}
+
 fn render_tool_catalog(intro: &str, tools: &[ToolDescriptor]) -> String {
     if tools.is_empty() {
         return "No tools are installed yet. Install a ToolSet plugin and I will list it here."
@@ -15460,6 +15782,132 @@ mod tests {
         assert!(turn.tool_output.is_none(), "no fabricated output on denial");
         let err = turn.tool_error.expect("an honest tool_error");
         assert!(err.contains("permission"), "got: {err}");
+    }
+
+    #[test]
+    fn tool_plan_request_previews_an_inert_grounded_plan() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let turn = k
+            .prime_turn(&ctx, "use the status tool then the echo tool")
+            .unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::ToolPlanRequest);
+        // The turn is INERT: it answers and creates / runs nothing.
+        assert_eq!(turn.disposition, PrimeDisposition::Answered);
+        assert!(turn.created_task.is_none(), "a preview creates no task");
+        assert!(turn.started_run.is_none(), "a preview runs nothing");
+        assert!(turn.invoked_tool.is_none(), "a preview calls no tool");
+        assert!(turn.tool_output.is_none());
+        let plan = turn
+            .tool_plan_proposal
+            .expect("a tool-plan preview is attached");
+        assert!(plan.ready_to_create, "both steps resolved + validated: {plan:?}");
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.steps[0].plugin, "relux-tools-status");
+        assert_eq!(plan.steps[0].tool, "status.summary");
+        assert_eq!(plan.steps[0].readiness, "ready");
+        assert_eq!(plan.steps[1].plugin, "relux-tools-echo");
+        assert_eq!(plan.steps[1].tool, "echo.say");
+        assert_eq!(plan.steps[1].readiness, "ready");
+        assert!(plan.issues.is_empty(), "a clean plan has no issues: {:?}", plan.issues);
+        // The reply never claims anything happened.
+        assert!(
+            turn.reply.contains("Nothing is created or run"),
+            "honest reply: {}",
+            turn.reply
+        );
+
+        // The preview's steps feed the EXISTING tool-plan task path unchanged: they
+        // validate under the same gate the task-create route enforces and round-trip.
+        let calls: Vec<relux_core::task::TaskToolCall> = plan
+            .steps
+            .iter()
+            .map(|s| relux_core::task::TaskToolCall {
+                plugin: s.plugin.clone(),
+                tool: s.tool.clone(),
+                args: s.args.clone(),
+            })
+            .collect();
+        let task_plan = relux_core::task::TaskToolPlan { steps: calls };
+        assert!(task_plan.validate().is_ok(), "the ready preview validates");
+        let parsed = relux_core::task::parse_task_tool_plan(&task_plan.to_input())
+            .expect("the existing path reads the plan back");
+        assert_eq!(parsed.len(), 2);
+    }
+
+    #[test]
+    fn tool_plan_with_an_uninstalled_tool_is_flagged_not_accepted() {
+        let (mut k, ctx) = prime_chat_kernel();
+        // echo IS installed; the explicit github tool reference is NOT installed here,
+        // so it must be flagged unknown — never silently accepted.
+        let turn = k
+            .prime_turn(&ctx, "echo hi then use relux-tools-github/github.create_pr")
+            .unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::ToolPlanRequest);
+        assert_eq!(turn.disposition, PrimeDisposition::NeedsClarification);
+        assert!(turn.created_task.is_none(), "an unresolved plan creates nothing");
+        let plan = turn.tool_plan_proposal.expect("a preview is attached");
+        assert!(!plan.ready_to_create, "an unknown tool blocks creation");
+        assert!(
+            plan.steps.iter().any(|s| s.readiness == "unknown"),
+            "the unknown step is flagged: {:?}",
+            plan.steps
+        );
+        assert!(
+            plan.issues.iter().any(|i| i.contains("relux-tools-github")),
+            "the issue names the uninstalled tool: {:?}",
+            plan.issues
+        );
+    }
+
+    #[test]
+    fn tool_plan_over_the_step_cap_is_bounded_not_silently_truncated() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let turn = k
+            .prime_turn(
+                &ctx,
+                "echo a then echo b then echo c then echo d then echo e then echo f",
+            )
+            .unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::ToolPlanRequest);
+        assert_eq!(turn.disposition, PrimeDisposition::NeedsClarification);
+        assert!(turn.created_task.is_none());
+        let plan = turn.tool_plan_proposal.expect("a preview is attached");
+        assert!(!plan.ready_to_create, "an over-long plan is not creatable");
+        assert!(
+            plan.steps.len() <= relux_core::task::MAX_TASK_TOOL_PLAN_STEPS,
+            "the preview is capped at the step bound: {}",
+            plan.steps.len()
+        );
+        assert!(
+            plan.issues.iter().any(|i| i.contains("at most")),
+            "the bound is surfaced honestly: {:?}",
+            plan.issues
+        );
+    }
+
+    #[test]
+    fn greeting_and_frustration_never_attach_a_tool_plan() {
+        // Hermes-first: casual / emotional / vague turns answer naturally and never
+        // carry a tool-plan preview (`docs/mcp.md` "Run-driven multi-tool plan"; §10.5).
+        let (mut k, ctx) = prime_chat_kernel();
+        for msg in [
+            "hey there",
+            "ugh this is so frustrating",
+            "fuck you",
+            "what do you think we should build?",
+        ] {
+            let turn = k.prime_turn(&ctx, msg).unwrap();
+            assert_ne!(
+                turn.intent,
+                relux_core::PrimeIntent::ToolPlanRequest,
+                "{msg:?} must not be a tool plan"
+            );
+            assert!(
+                turn.tool_plan_proposal.is_none(),
+                "{msg:?} must carry no tool-plan preview"
+            );
+            assert!(turn.created_task.is_none(), "{msg:?} creates nothing");
+        }
     }
 
     #[test]
