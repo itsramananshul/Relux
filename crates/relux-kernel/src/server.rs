@@ -248,6 +248,10 @@ async fn serve() -> Result<(), KernelError> {
     println!("   GET    /v1/relux/adapters/:id/runtime");
     println!("   PUT    /v1/relux/adapters/:id/runtime     {{ \"enabled\":true, \"command\"?, \"timeout_seconds\"?, \"max_output_bytes\"? }}");
     println!("   DELETE /v1/relux/adapters/:id/runtime     (clear adapter runtime config)");
+    println!("   GET    /v1/relux/mcp/servers               (registered MCP servers — loopback HTTP discovery)");
+    println!("   POST   /v1/relux/mcp/servers              {{ \"id\":\"...\", \"endpoint\":\"http://127.0.0.1:<port>/mcp\", \"description\"?, \"enabled\"?, \"timeout_ms\"? }}");
+    println!("   DELETE /v1/relux/mcp/servers/:id           (remove an MCP server)");
+    println!("   GET    /v1/relux/mcp/servers/:id/tools     (live tools/list discovery; MCP tools are not callable yet)");
 
     // Start background autonomy loop
     let background_state = state.clone();
@@ -526,6 +530,13 @@ fn protected_router() -> Router<AppState> {
                 .patch(set_adapter_runtime)
                 .delete(delete_adapter_runtime),
         )
+        // MCP servers (loopback HTTP discovery — MCP v1).
+        .route(
+            "/v1/relux/mcp/servers",
+            get(list_mcp_servers).post(register_mcp_server),
+        )
+        .route("/v1/relux/mcp/servers/:id", delete(delete_mcp_server))
+        .route("/v1/relux/mcp/servers/:id/tools", get(mcp_server_tools))
         // Relux Approvals and Permissions
         .route("/v1/relux/approvals", get(list_approvals))
         .route("/v1/relux/approvals/:id/decide", post(decide_approval))
@@ -5925,6 +5936,137 @@ async fn delete_adapter_runtime(
     Ok(Json(status))
 }
 
+// --- MCP servers (loopback HTTP discovery — MCP v1) ------------------------
+// `docs/mcp.md`, `docs/RELUX_MASTER_PLAN.md` §8.2/§18, `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §9.
+// Operator-curated, loopback-ONLY MCP server registry + live `tools/list`
+// discovery. No secrets are accepted or stored. MCP tool INVOCATION is not wired
+// into the agent tool-call path yet (discovered tools are `not_implemented`).
+
+/// One MCP server row for the list/register response. Mirrors the stored config
+/// (no secrets) plus an honest one-word `status`.
+#[derive(Debug, Serialize)]
+struct McpServerResponse {
+    id: String,
+    transport: String,
+    endpoint: String,
+    description: String,
+    enabled: bool,
+    timeout_ms: u64,
+    /// `configured` (enabled) or `disabled`. Reachability is dynamic — see the
+    /// per-server tools endpoint.
+    status: String,
+}
+
+impl McpServerResponse {
+    fn from_config(c: &relux_core::McpServerConfig) -> Self {
+        Self {
+            id: c.id.clone(),
+            transport: c.transport.as_str().to_string(),
+            endpoint: c.endpoint.clone(),
+            description: c.description.clone(),
+            enabled: c.enabled,
+            timeout_ms: c.timeout_ms,
+            status: c.status_str().to_string(),
+        }
+    }
+}
+
+/// GET `/v1/relux/mcp/servers` — every registered MCP server (no secrets).
+async fn list_mcp_servers(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<McpServerResponse>>, ApiError> {
+    let rows = locked_read(&state, |kernel| {
+        Ok(kernel
+            .mcp_servers()
+            .into_iter()
+            .map(McpServerResponse::from_config)
+            .collect::<Vec<_>>())
+    })?;
+    Ok(Json(rows))
+}
+
+#[derive(Debug, Deserialize)]
+struct McpServerReq {
+    /// Stable, unique id (`[A-Za-z0-9._-]`). Required.
+    id: String,
+    /// The loopback endpoint (validated loopback-only). Required.
+    endpoint: String,
+    description: Option<String>,
+    /// Defaults to enabled on first register; can be set false to disable.
+    enabled: Option<bool>,
+    timeout_ms: Option<u64>,
+}
+
+/// POST `/v1/relux/mcp/servers` — register or update (upsert by id) an MCP server.
+/// The endpoint is validated as loopback-only; no secrets are accepted or stored.
+async fn register_mcp_server(
+    State(state): State<AppState>,
+    Json(req): Json<McpServerReq>,
+) -> Result<Json<McpServerResponse>, ApiError> {
+    let id = req.id.trim().to_string();
+    if id.is_empty() {
+        return Err(ApiError::bad_request("MCP server id is required"));
+    }
+    let endpoint = req.endpoint.trim().to_string();
+    if endpoint.is_empty() {
+        return Err(ApiError::bad_request("MCP server endpoint is required"));
+    }
+    let description = req.description.unwrap_or_default();
+    let enabled = req.enabled.unwrap_or(true);
+    let resp = locked_save(&state, |kernel| {
+        let cfg =
+            kernel.register_mcp_server(&id, &endpoint, &description, enabled, req.timeout_ms)?;
+        Ok(McpServerResponse::from_config(&cfg))
+    })?;
+    Ok(Json(resp))
+}
+
+/// DELETE `/v1/relux/mcp/servers/:id` — remove an MCP server registration.
+async fn delete_mcp_server(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err(ApiError::bad_request("MCP server id is required"));
+    }
+    locked_save(&state, |kernel| kernel.remove_mcp_server(&id))?;
+    Ok(Json(serde_json::json!({ "removed": id })))
+}
+
+/// The live discovery response for one MCP server. Honest by construction: on a
+/// transport/protocol failure the route surfaces the error (HTTP 4xx/5xx via
+/// [`ApiError`]); a successful probe returns the discovered tools as
+/// [`relux_core::ToolDescriptor`]s (all `not_implemented` in v1).
+#[derive(Debug, Serialize)]
+struct McpToolsResponse {
+    server_id: String,
+    /// True when the live `tools/list` probe succeeded.
+    reachable: bool,
+    tools: Vec<relux_core::ToolDescriptor>,
+}
+
+/// GET `/v1/relux/mcp/servers/:id/tools` — run a live `tools/list` against the
+/// server and map the result into the Tools surface. Unknown id → 404; disabled →
+/// 409; a transport/protocol failure → 502 (never a fabricated empty list).
+async fn mcp_server_tools(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<McpToolsResponse>, ApiError> {
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err(ApiError::bad_request("MCP server id is required"));
+    }
+    // Discovery performs a bounded loopback network call; it mutates no state, so a
+    // read lock is enough.
+    let tools = locked_read(&state, |kernel| kernel.discover_mcp_tools(&id))?;
+    Ok(Json(McpToolsResponse {
+        server_id: id,
+        reachable: true,
+        tools,
+    }))
+}
+
 // --- Store access (serialized) ---------------------------------------------
 
 /// Lock, open the store, load + bootstrap, run `f`, then SAVE. For mutations.
@@ -6473,7 +6615,13 @@ fn status_for(err: &KernelError) -> StatusCode {
         // present, so a 404 (not a 400) is the honest shape.
         | KernelError::PermissionNotGranted(..)
         | KernelError::UnknownOrchestration(_)
+        | KernelError::UnknownMcpServer(_)
         | KernelError::UnknownPersistentGrant(_) => StatusCode::NOT_FOUND,
+        // A disabled MCP server is a resolvable conflict (enable it first); a live
+        // discovery failure against the operator's loopback server is an upstream
+        // (bad gateway) failure, surfaced honestly rather than as a fake empty list.
+        KernelError::McpServerDisabled(_) => StatusCode::CONFLICT,
+        KernelError::McpDiscoveryFailed { .. } => StatusCode::BAD_GATEWAY,
         // A configured tool that requires approval cannot be invoked directly yet:
         // a conflict the operator resolves by lowering risk / enabling auto-approve,
         // or by requesting a per-call approval.
@@ -8614,6 +8762,55 @@ mod tests {
             .next()
             .map(|s| s.trim().to_string())
             .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn mcp_server_routes_register_list_reject_and_delete() {
+        let (state, _dir) = auth_state(true); // auth disabled for the test
+
+        // Register a loopback MCP server.
+        let (status, _, body) = call(
+            &state,
+            "POST",
+            "/v1/relux/mcp/servers",
+            None,
+            Some(r#"{"id":"fs","endpoint":"http://127.0.0.1:8000/mcp","description":"local fs"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "register body: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["id"], "fs");
+        assert_eq!(v["transport"], "http_loopback");
+        assert_eq!(v["status"], "configured");
+
+        // It shows up in the list.
+        let (status, _, body) = call(&state, "GET", "/v1/relux/mcp/servers", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 1);
+
+        // A non-loopback endpoint is refused (400, loopback-only).
+        let (status, _, _) = call(
+            &state,
+            "POST",
+            "/v1/relux/mcp/servers",
+            None,
+            Some(r#"{"id":"remote","endpoint":"https://mcp.example.com"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Discovery against an unknown server is a 404; nothing is faked.
+        let (status, _, _) =
+            call(&state, "GET", "/v1/relux/mcp/servers/nope/tools", None, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Delete it.
+        let (status, _, _) = call(&state, "DELETE", "/v1/relux/mcp/servers/fs", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, _, body) = call(&state, "GET", "/v1/relux/mcp/servers", None, None).await;
+        let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 0);
     }
 
     /// Write a fake CLI that prints `output` and exits 0 (cross-platform), used to

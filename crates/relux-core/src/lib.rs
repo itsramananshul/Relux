@@ -11,6 +11,7 @@ pub mod artifact;
 pub mod approval;
 pub mod hierarchy;
 pub mod audit;
+pub mod mcp;
 pub mod namespace;
 pub mod orchestration;
 pub mod permission;
@@ -40,6 +41,13 @@ pub use approval::{Approval, ApprovalId, ApprovalStatus};
 pub use audit::{AuditEvent, AuditResult};
 pub use hierarchy::{
     chain_of_command, is_in_subtree, would_create_cycle, ReportsToMap, MAX_HIERARCHY_DEPTH,
+};
+pub use mcp::{
+    clamp_mcp_timeout, is_valid_mcp_id, mcp_synthetic_plugin_id, mcp_tool_permission,
+    sanitize_mcp_text, sanitize_mcp_tool_description, scan_mcp_tool_description,
+    validate_mcp_server_config, McpConfigError, McpServerConfig, McpTool, McpTransport,
+    DEFAULT_MCP_TIMEOUT_MS, MAX_MCP_DESCRIPTION_CHARS, MAX_MCP_ID_CHARS, MAX_MCP_TIMEOUT_MS,
+    MAX_MCP_TOOLS, MAX_MCP_TOOL_DESC_CHARS, MIN_MCP_TIMEOUT_MS,
 };
 pub use namespace::{Namespace, NamespaceId};
 pub use orchestration::{

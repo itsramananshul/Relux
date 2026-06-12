@@ -499,12 +499,29 @@ safe (adds no authority), bounded, feasible in one commit, and reuses existing v
   non-loopback / creds / traversal).
 - Honest discovery (installed-but-unimplemented → `NotImplemented`), bundled-protected, no remote code
   execution by design.
-- **Missing (deliberate/deferred)**: MCP server support, plugin activation triggers.
+- **MCP support — v1 SHIPPED (loopback discovery).** `crates/relux-core/src/mcp.rs`
+  (`McpServerConfig`/`McpTransport::HttpLoopback`, `validate_mcp_server_config` loopback-only,
+  `scan_mcp_tool_description` injection scan), `crates/relux-kernel/src/mcp.rs` (blocking loopback
+  JSON-RPC discovery client: `initialize` → `tools/list`, single-POST subset + SSE-frame parse,
+  bounded/timeout/honest-errors), `crates/relux-kernel/src/state.rs`
+  (`register_mcp_server`/`set_mcp_server_enabled`/`remove_mcp_server`/`mcp_servers`/`discover_mcp_tools`
+  → `ToolDescriptor`s with `plugin_id="mcp:<id>"`, `NotImplemented`), four `/v1/relux/mcp/servers*`
+  routes, snapshot persistence, and a Plugins-tab **MCP servers** section. Operator-curated,
+  loopback-ONLY, no secrets, no stdio subprocess, no remote host. Maps Hermes `tools/mcp_tool.py`
+  (wire shape + `_validate_remote_mcp_url` posture, stricter → loopback) + legacy
+  `relix-runtime/.../mcp_http.rs` (one-POST-per-RPC, error→honest) + openclaw `execution.ts`
+  (`mcp:<server>:<tool>` namespace). See `docs/mcp.md`.
+  - **Still deferred (honest):** MCP tool **invocation** is NOT wired into the agent tool-call path
+    (discovered tools are `not_implemented`); no stdio command servers; no remote/SSE-subscription;
+    no OAuth. Next slice routes `tools/call` through the existing approval/permission/grant/audit
+    gates (`docs/mcp.md` "Next MCP slice").
+- **Missing (deliberate/deferred)**: MCP tool **invocation** (v1 is discovery-only), plugin activation
+  triggers.
 
 ### Priority & slices
 
-- **P2 — MCP tool support** (Hermes `mcp_tool.py`): the standard external-tool protocol; large.
-  *(backend, tests, docs.)*
+- **P2 — MCP tool INVOCATION** (Hermes `mcp_tool.py` `call_tool`): route `tools/call` through the
+  existing tool-invocation gates; v1 discovery already shipped. *(backend, tests, docs.)*
 - **P2 — install-time manifest validation surfaced in Doctor/UI** (Paperclip Zod safe-parse style).
 
 ---

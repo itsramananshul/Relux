@@ -114,6 +114,7 @@ impl SqliteStore {
             adapter_runtime_configs: self
                 .load_meta_json("adapter_runtime_configs")?
                 .unwrap_or_default(),
+            mcp_servers: self.load_meta_json("mcp_servers")?.unwrap_or_default(),
             orchestrations: self.load_meta_json("orchestrations")?.unwrap_or_default(),
             pending_clarifications: self
                 .load_meta_json("pending_clarifications")?
@@ -213,6 +214,7 @@ impl SqliteStore {
             "adapter_runtime_configs",
             &snapshot.adapter_runtime_configs,
         )?;
+        put_meta_json(&tx, "mcp_servers", &snapshot.mcp_servers)?;
 
         tx.commit().map_err(storage_err)?;
         Ok(())

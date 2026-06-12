@@ -83,6 +83,10 @@ pub struct KernelSnapshot {
     /// plugin id. Defaulted so older snapshots load cleanly.
     #[serde(default)]
     pub adapter_runtime_configs: Vec<AdapterRuntimeConfig>,
+    /// Operator-curated MCP server registrations, sorted by server id. Defaulted so
+    /// older snapshots (which never wrote it) load cleanly.
+    #[serde(default)]
+    pub mcp_servers: Vec<relux_core::McpServerConfig>,
     pub namespaces: Vec<Namespace>,
     pub agents: Vec<Agent>,
     pub tasks: Vec<Task>,
@@ -225,6 +229,10 @@ pub struct KernelState {
     tool_runtime_configs: HashMap<PluginId, ToolRuntimeConfig>,
     /// Per-adapter CLI runtime configs, keyed by plugin id.
     adapter_runtime_configs: HashMap<PluginId, AdapterRuntimeConfig>,
+    /// Operator-curated MCP server registrations (loopback HTTP only), keyed by
+    /// server id. MCP v1: a discovery surface — the kernel lists these and runs a
+    /// live `tools/list` against an enabled one. No secrets are stored.
+    mcp_servers: HashMap<String, relux_core::McpServerConfig>,
     namespaces: HashMap<NamespaceId, Namespace>,
     agents: HashMap<AgentId, Agent>,
     tasks: HashMap<TaskId, Task>,
@@ -370,6 +378,7 @@ impl KernelState {
             adapter_runtime_configs: sorted(&self.adapter_runtime_configs, |c| {
                 c.plugin_id.as_str()
             }),
+            mcp_servers: sorted(&self.mcp_servers, |c| c.id.as_str()),
             namespaces: sorted(&self.namespaces, |n| n.id.as_str()),
             agents: sorted(&self.agents, |a| a.id.as_str()),
             tasks: sorted(&self.tasks, |t| t.id.as_str()),
@@ -458,6 +467,9 @@ impl KernelState {
             state
                 .adapter_runtime_configs
                 .insert(PluginId::new(cfg.plugin_id.clone()), cfg);
+        }
+        for cfg in snapshot.mcp_servers {
+            state.mcp_servers.insert(cfg.id.clone(), cfg);
         }
         for namespace in snapshot.namespaces {
             state.namespaces.insert(namespace.id.clone(), namespace);
@@ -1014,6 +1026,180 @@ impl KernelState {
         let mut out: Vec<&ToolRuntimeConfig> = self.tool_runtime_configs.values().collect();
         out.sort_by(|a, b| a.plugin_id.cmp(&b.plugin_id));
         out
+    }
+
+    // --- MCP servers (loopback HTTP discovery — MCP v1) --------------------
+    // `docs/RELUX_MASTER_PLAN.md` §8.2/§18, `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §9,
+    // `docs/mcp.md`. The kernel registers operator-curated, loopback-only MCP
+    // servers and runs a live `tools/list` against an enabled one. No secrets are
+    // stored; MCP tool INVOCATION is not wired into the agent tool-call path yet
+    // (discovered tools surface as `NotImplemented`, honestly "not callable yet").
+
+    /// Register (or replace) an MCP server. The id + loopback endpoint are validated
+    /// with the same loopback-only rule as the plugin runtime; the description is
+    /// sanitized and the timeout clamped. Upsert by id so re-registering updates the
+    /// endpoint/description/enabled flag in place. Stores no secrets.
+    pub fn register_mcp_server(
+        &mut self,
+        id: &str,
+        endpoint: &str,
+        description: &str,
+        enabled: bool,
+        timeout_ms: Option<u64>,
+    ) -> Result<relux_core::McpServerConfig, KernelError> {
+        let id = id.trim().to_string();
+        let config = relux_core::McpServerConfig {
+            id: id.clone(),
+            transport: relux_core::McpTransport::HttpLoopback,
+            endpoint: endpoint.trim().to_string(),
+            description: relux_core::sanitize_mcp_text(
+                description,
+                relux_core::MAX_MCP_DESCRIPTION_CHARS,
+            ),
+            enabled,
+            timeout_ms: relux_core::clamp_mcp_timeout(timeout_ms),
+        };
+        relux_core::validate_mcp_server_config(&config).map_err(|e| {
+            KernelError::InvalidMcpConfig {
+                id: id.clone(),
+                message: e.to_string(),
+            }
+        })?;
+        self.record_audit(
+            "kernel",
+            "kernel",
+            "mcp:server_register",
+            Some("mcp_server"),
+            Some(&config.id),
+            None,
+            AuditResult::Success,
+            serde_json::json!({
+                "transport": config.transport.as_str(),
+                "enabled": config.enabled,
+                "timeout_ms": config.timeout_ms,
+            }),
+        );
+        self.mcp_servers.insert(config.id.clone(), config.clone());
+        Ok(config)
+    }
+
+    /// Toggle an MCP server's enabled flag, keeping its endpoint. Errors if unknown.
+    pub fn set_mcp_server_enabled(
+        &mut self,
+        id: &str,
+        enabled: bool,
+    ) -> Result<relux_core::McpServerConfig, KernelError> {
+        let server = self
+            .mcp_servers
+            .get_mut(id)
+            .ok_or_else(|| KernelError::UnknownMcpServer(id.to_string()))?;
+        server.enabled = enabled;
+        let server = server.clone();
+        self.record_audit(
+            "kernel",
+            "kernel",
+            if enabled { "mcp:server_enable" } else { "mcp:server_disable" },
+            Some("mcp_server"),
+            Some(id),
+            None,
+            AuditResult::Success,
+            serde_json::Value::Null,
+        );
+        Ok(server)
+    }
+
+    /// Remove an MCP server registration entirely. Errors if unknown.
+    pub fn remove_mcp_server(&mut self, id: &str) -> Result<(), KernelError> {
+        self.mcp_servers
+            .remove(id)
+            .ok_or_else(|| KernelError::UnknownMcpServer(id.to_string()))?;
+        self.record_audit(
+            "kernel",
+            "kernel",
+            "mcp:server_remove",
+            Some("mcp_server"),
+            Some(id),
+            None,
+            AuditResult::Success,
+            serde_json::Value::Null,
+        );
+        Ok(())
+    }
+
+    /// One MCP server config by id.
+    pub fn mcp_server(&self, id: &str) -> Option<&relux_core::McpServerConfig> {
+        self.mcp_servers.get(id)
+    }
+
+    /// All MCP servers, sorted by id for deterministic listing.
+    pub fn mcp_servers(&self) -> Vec<&relux_core::McpServerConfig> {
+        let mut out: Vec<&relux_core::McpServerConfig> = self.mcp_servers.values().collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
+    }
+
+    /// Run a live `tools/list` discovery against an enabled MCP server and map the
+    /// result into [`ToolDescriptor`]s for the unified Tools surface.
+    ///
+    /// Honest by construction: an unknown server is [`KernelError::UnknownMcpServer`];
+    /// a disabled one is [`KernelError::McpServerDisabled`]; a transport/protocol
+    /// failure is [`KernelError::McpDiscoveryFailed`] (never a fabricated empty
+    /// list). Discovered tools are listed as
+    /// [`ToolExecutability::NotImplemented`] — MCP tool invocation is not wired into
+    /// the agent tool-call path yet (`docs/mcp.md`). Read-only: it performs a bounded
+    /// loopback network call but mutates no kernel state.
+    pub fn discover_mcp_tools(&self, id: &str) -> Result<Vec<ToolDescriptor>, KernelError> {
+        let server = self
+            .mcp_servers
+            .get(id)
+            .ok_or_else(|| KernelError::UnknownMcpServer(id.to_string()))?;
+        if !server.enabled {
+            return Err(KernelError::McpServerDisabled(id.to_string()));
+        }
+        let tools = crate::mcp::discover_tools(&server.endpoint, server.timeout_ms).map_err(|e| {
+            KernelError::McpDiscoveryFailed {
+                id: id.to_string(),
+                message: e.to_string(),
+            }
+        })?;
+        let plugin_id = relux_core::mcp_synthetic_plugin_id(id);
+        let mut out: Vec<ToolDescriptor> = tools
+            .into_iter()
+            .map(|tool| {
+                // Scan the (untrusted) tool description for prompt-injection
+                // patterns; log a warning but still list the tool (mirrors Hermes
+                // `_scan_mcp_description` — advisory, never a block).
+                let findings = relux_core::scan_mcp_tool_description(&tool.description);
+                if !findings.is_empty() {
+                    // Advisory, never a block (false positives would break
+                    // legitimate servers). Surfaced on stderr so an operator can see
+                    // a suspicious MCP tool description without a logging dependency.
+                    eprintln!(
+                        "[relux] WARN mcp server '{id}' tool '{}': suspicious description content — {}",
+                        tool.name,
+                        findings.join("; ")
+                    );
+                }
+                ToolDescriptor {
+                    permission: relux_core::mcp_tool_permission(id, &tool.name),
+                    plugin_id: plugin_id.clone(),
+                    tool_name: tool.name,
+                    description: tool.description,
+                    // Conservative default: an MCP tool's real risk is unknown, so it
+                    // is listed as Medium (and, once invocation lands, would gate
+                    // behind approval until the operator classifies it).
+                    risk: relux_core::RiskLevel::Medium,
+                    source_kind: "Mcp".to_string(),
+                    installed: true,
+                    enabled: server.enabled,
+                    protected: false,
+                    // Honest: discovery is live, but invocation is not wired yet.
+                    executable: ToolExecutability::NotImplemented,
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| a.tool_name.cmp(&b.tool_name));
+        Ok(out)
     }
 
     // --- Adapter runtime config (local CLI adapters) -----------------------
@@ -10990,6 +11176,155 @@ mod tests {
         let primed = k.discover_tools(Some(&prime));
         let echo = primed.iter().find(|t| t.tool_name == "echo.say").unwrap();
         assert_eq!(echo.executable, ToolExecutability::Ready);
+    }
+
+    #[test]
+    fn mcp_server_register_list_enable_remove() {
+        let mut k = KernelState::new();
+        // Register a loopback server.
+        let cfg = k
+            .register_mcp_server(
+                "fs-helper",
+                "http://127.0.0.1:8000/mcp",
+                "local fs",
+                true,
+                None,
+            )
+            .expect("register ok");
+        assert_eq!(cfg.id, "fs-helper");
+        assert_eq!(cfg.transport.as_str(), "http_loopback");
+        assert_eq!(cfg.timeout_ms, relux_core::DEFAULT_MCP_TIMEOUT_MS);
+        assert_eq!(k.mcp_servers().len(), 1);
+
+        // Disable, then re-enable.
+        let off = k.set_mcp_server_enabled("fs-helper", false).unwrap();
+        assert!(!off.enabled);
+        assert_eq!(off.status_str(), "disabled");
+        let on = k.set_mcp_server_enabled("fs-helper", true).unwrap();
+        assert!(on.enabled);
+
+        // Upsert by id (re-register updates the endpoint in place, not a 2nd row).
+        k.register_mcp_server("fs-helper", "http://127.0.0.1:9001/mcp", "moved", true, Some(2000))
+            .unwrap();
+        assert_eq!(k.mcp_servers().len(), 1);
+        let s = k.mcp_server("fs-helper").unwrap();
+        assert_eq!(s.endpoint, "http://127.0.0.1:9001/mcp");
+        assert_eq!(s.timeout_ms, 2000);
+
+        // Remove.
+        k.remove_mcp_server("fs-helper").unwrap();
+        assert!(k.mcp_server("fs-helper").is_none());
+        assert!(matches!(
+            k.remove_mcp_server("fs-helper"),
+            Err(KernelError::UnknownMcpServer(_))
+        ));
+        assert!(matches!(
+            k.set_mcp_server_enabled("nope", true),
+            Err(KernelError::UnknownMcpServer(_))
+        ));
+    }
+
+    #[test]
+    fn mcp_server_rejects_non_loopback_and_bad_id() {
+        let mut k = KernelState::new();
+        // A remote / https endpoint is refused (loopback-only).
+        assert!(matches!(
+            k.register_mcp_server("s", "https://mcp.example.com", "x", true, None),
+            Err(KernelError::InvalidMcpConfig { .. })
+        ));
+        assert!(matches!(
+            k.register_mcp_server("s", "http://10.0.0.5:8000", "x", true, None),
+            Err(KernelError::InvalidMcpConfig { .. })
+        ));
+        // A bad id is refused.
+        assert!(matches!(
+            k.register_mcp_server("has space", "http://127.0.0.1:8000", "x", true, None),
+            Err(KernelError::InvalidMcpConfig { .. })
+        ));
+        assert_eq!(k.mcp_servers().len(), 0);
+    }
+
+    #[test]
+    fn mcp_discovery_disabled_and_unknown_are_honest() {
+        let mut k = KernelState::new();
+        assert!(matches!(
+            k.discover_mcp_tools("nope"),
+            Err(KernelError::UnknownMcpServer(_))
+        ));
+        k.register_mcp_server("s", "http://127.0.0.1:8000/mcp", "x", false, None)
+            .unwrap();
+        assert!(matches!(
+            k.discover_mcp_tools("s"),
+            Err(KernelError::McpServerDisabled(_))
+        ));
+    }
+
+    #[test]
+    fn mcp_discovery_maps_tools_into_descriptors() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        // A loopback mock MCP server: initialize → notif → tools/list.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let endpoint = format!("http://127.0.0.1:{}/mcp", addr.port());
+        let responses = vec![
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{}}}"#,
+            "{}",
+            r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"search","description":"Find things."}]}}"#,
+        ];
+        thread::spawn(move || {
+            for body in responses {
+                let Ok((mut sock, _)) = listener.accept() else { break };
+                // Drain the request headers + body before responding.
+                let mut buf = [0u8; 4096];
+                let mut data = Vec::new();
+                let header_end = loop {
+                    if let Some(i) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break i + 4;
+                    }
+                    match sock.read(&mut buf) {
+                        Ok(0) => break data.len(),
+                        Ok(n) => data.extend_from_slice(&buf[..n]),
+                        Err(_) => break data.len(),
+                    }
+                };
+                let headers = String::from_utf8_lossy(&data[..header_end]).to_lowercase();
+                let clen = headers
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                while data.len() - header_end < clen {
+                    match sock.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => data.extend_from_slice(&buf[..n]),
+                        Err(_) => break,
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes());
+                let _: Result<(), _> = sock.flush();
+            }
+        });
+
+        let mut k = KernelState::new();
+        k.register_mcp_server("fs", &endpoint, "fs server", true, Some(2000))
+            .unwrap();
+        let tools = k.discover_mcp_tools("fs").expect("discovery ok");
+        assert_eq!(tools.len(), 1);
+        let t = &tools[0];
+        assert_eq!(t.tool_name, "search");
+        assert_eq!(t.plugin_id, "mcp:fs");
+        assert_eq!(t.permission, "tool:mcp-fs:search");
+        assert_eq!(t.source_kind, "Mcp");
+        // Honest: discovered, but invocation is not wired yet.
+        assert_eq!(t.executable, ToolExecutability::NotImplemented);
     }
 
     #[test]

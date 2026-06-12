@@ -161,7 +161,10 @@ pub fn invoke_http_loopback(
 
 /// Build the concrete loopback socket address. `localhost` resolves to IPv4
 /// loopback; `::1` to IPv6 loopback. The host is already validated as loopback.
-fn loopback_socket_addr(host: &str, port: u16) -> SocketAddr {
+///
+/// `pub(crate)` so the loopback MCP client ([`crate::mcp`]) reuses the exact same
+/// loopback-resolution rule instead of re-deriving it.
+pub(crate) fn loopback_socket_addr(host: &str, port: u16) -> SocketAddr {
     let ip: IpAddr = match host {
         "::1" => IpAddr::V6(Ipv6Addr::LOCALHOST),
         // "127.0.0.1" and "localhost" both map to IPv4 loopback.
@@ -170,14 +173,14 @@ fn loopback_socket_addr(host: &str, port: u16) -> SocketAddr {
     SocketAddr::new(ip, port)
 }
 
-fn write_all(stream: &mut TcpStream, bytes: &[u8]) -> Result<(), RuntimeClientError> {
+pub(crate) fn write_all(stream: &mut TcpStream, bytes: &[u8]) -> Result<(), RuntimeClientError> {
     stream.write_all(bytes).map_err(map_io)
 }
 
 /// Read the whole response (headers + body) up to [`MAX_RESPONSE_BYTES`]. With
 /// `Connection: close` the server closes after writing, so reading to EOF yields
 /// the full response; a timeout surfaces as [`RuntimeClientError::Timeout`].
-fn read_capped(stream: &mut TcpStream) -> Result<Vec<u8>, RuntimeClientError> {
+pub(crate) fn read_capped(stream: &mut TcpStream) -> Result<Vec<u8>, RuntimeClientError> {
     let mut out = Vec::with_capacity(1024);
     let mut buf = [0u8; 8192];
     loop {
@@ -199,7 +202,7 @@ fn read_capped(stream: &mut TcpStream) -> Result<Vec<u8>, RuntimeClientError> {
 ///
 /// We send `Connection: close`, so the body is simply everything after the blank
 /// line that ends the headers - no Content-Length or chunked parsing needed.
-fn parse_http_response(raw: &[u8]) -> Result<(u16, &[u8]), RuntimeClientError> {
+pub(crate) fn parse_http_response(raw: &[u8]) -> Result<(u16, &[u8]), RuntimeClientError> {
     let sep = find_subslice(raw, b"\r\n\r\n")
         .map(|i| (i, i + 4))
         .or_else(|| find_subslice(raw, b"\n\n").map(|i| (i, i + 2)));
@@ -227,7 +230,7 @@ fn parse_http_response(raw: &[u8]) -> Result<(u16, &[u8]), RuntimeClientError> {
 }
 
 /// Find the first index of `needle` in `haystack`.
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+pub(crate) fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
@@ -237,7 +240,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// Map a socket io error to a timeout vs. generic io error.
-fn map_io(e: std::io::Error) -> RuntimeClientError {
+pub(crate) fn map_io(e: std::io::Error) -> RuntimeClientError {
     use std::io::ErrorKind;
     match e.kind() {
         ErrorKind::WouldBlock | ErrorKind::TimedOut => RuntimeClientError::Timeout,

@@ -13,7 +13,12 @@
 // the guidance without a DOM. The page renders whatever this returns; it invents
 // nothing.
 
-import type { ReluxAdapterStatus, ReluxPlugin, ReluxToolDescriptor } from "./api";
+import type {
+  ReluxAdapterStatus,
+  ReluxMcpServer,
+  ReluxPlugin,
+  ReluxToolDescriptor,
+} from "./api";
 
 // What the plugin actually is, for an honest one-word category in the UI.
 //   "wrapper"  — generated metadata-only manifest (no tools, not runnable yet)
@@ -364,6 +369,27 @@ export function toolReadiness(t: ReluxToolDescriptor): ToolReadiness {
           "The kernel has no supported runtime for this tool. Listed honestly rather than pretending to run.",
       };
   }
+}
+
+// ── MCP servers (loopback HTTP discovery — MCP v1) ────────────────────────────
+// An MCP server row's badge reflects only its stored config: `configured`
+// (enabled) vs `disabled`. Reachability is dynamic (it needs a live `tools/list`
+// probe) and is reported separately by the discovery action — never faked as
+// "ready" here. This mirrors the adapter-row honesty rule.
+export function mcpServerStatusBadge(server: ReluxMcpServer): PluginStatus {
+  if (!server.enabled) {
+    return {
+      label: "disabled",
+      variant: "muted",
+      title: "This MCP server is registered but disabled; enable it to discover its tools.",
+    };
+  }
+  return {
+    label: "configured",
+    variant: "ok",
+    title:
+      "Registered and enabled. Use Discover to run a live tools/list against the loopback server.",
+  };
 }
 
 export interface VisibleTools {

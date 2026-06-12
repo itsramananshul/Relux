@@ -28,6 +28,7 @@ pub mod doctor;
 pub mod event;
 pub mod live_run_log;
 pub mod loader;
+pub mod mcp;
 pub mod plugin_install;
 pub mod plugin_tool_config;
 pub mod prime;
@@ -158,6 +159,7 @@ pub use prime_write_tools::{
     BrainRunOrchestration, BrainRunStart, ParsedWriteTool, WriteTool, WriteToolSlot, WRITE_TOOLS,
     WRITE_TOOL_CONFIDENCE,
 };
+pub use mcp::{discover_tools as discover_mcp_tools, McpClientError};
 pub use runtime::{invoke_http_loopback, RuntimeClientError};
 pub use state::{
     run_briefs_in_parallel, run_briefs_in_parallel_streaming, AppliedProposedChange,
@@ -320,4 +322,12 @@ pub enum KernelError {
     UnknownPersistentGrant(String),
     #[error("unsafe plugin path rejected: {0}")]
     UnsafePluginPath(String),
+    #[error("invalid MCP server config for '{id}': {message}")]
+    InvalidMcpConfig { id: String, message: String },
+    #[error("unknown MCP server: {0}")]
+    UnknownMcpServer(String),
+    #[error("MCP server '{0}' is disabled; enable it before discovering its tools")]
+    McpServerDisabled(String),
+    #[error("MCP discovery against server '{id}' failed: {message}")]
+    McpDiscoveryFailed { id: String, message: String },
 }

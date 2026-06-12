@@ -2831,6 +2831,60 @@ export const reluxTools = {
   }) => api.post<ReluxApproval>("/v1/relux/tools/request-approval", body),
 };
 
+// -- Relux MCP servers (loopback HTTP discovery — MCP v1) -------------------
+// Operator-curated Model Context Protocol servers, loopback-ONLY. Relux lists
+// registered servers and runs a live `tools/list` discovery against an enabled
+// one. The config carries NO secrets — only the id, the loopback endpoint, a
+// description, the enabled flag, and the per-call timeout. MCP tool INVOCATION is
+// not wired into the agent tool-call path yet: discovered tools are listed with an
+// honest `not_implemented` status ("discovered, not callable yet").
+
+export interface ReluxMcpServer {
+  id: string;
+  transport: string; // "http_loopback"
+  endpoint: string;
+  description: string;
+  enabled: boolean;
+  timeout_ms: number;
+  // "configured" (enabled) | "disabled". Reachability is dynamic — see `tools`.
+  status: string;
+}
+
+// The live discovery result for one server. `reachable` is true only when the
+// `tools/list` probe succeeded; the tools reuse the standard ToolDescriptor shape
+// (all `not_implemented` in v1).
+export interface ReluxMcpToolsResult {
+  server_id: string;
+  reachable: boolean;
+  tools: ReluxToolDescriptor[];
+}
+
+export const reluxMcp = {
+  // Registered MCP servers (no secrets). Throws an ApiError on failure.
+  list: () => api.get<ReluxMcpServer[]>("/v1/relux/mcp/servers"),
+  // Register or update (upsert by id) a server. The endpoint is validated as
+  // loopback-only server-side; a remote/https endpoint is refused (HTTP 400).
+  register: (body: {
+    id: string;
+    endpoint: string;
+    description?: string;
+    enabled?: boolean;
+    timeout_ms?: number;
+  }) => api.post<ReluxMcpServer>("/v1/relux/mcp/servers", body),
+  // Remove a server registration by id.
+  remove: (id: string) =>
+    api.del<{ removed: string }>(
+      `/v1/relux/mcp/servers/${encodeURIComponent(id)}`,
+    ),
+  // Run a live tools/list discovery. 404 unknown · 409 disabled · 502 unreachable
+  // (the operator's loopback server is down / not speaking MCP) — never a faked
+  // empty list.
+  tools: (id: string) =>
+    api.get<ReluxMcpToolsResult>(
+      `/v1/relux/mcp/servers/${encodeURIComponent(id)}/tools`,
+    ),
+};
+
 // -- Relux Approvals --------------------------------------------------------
 
 // The per-tool-call binding attached to a tool-invocation approval. Carries only

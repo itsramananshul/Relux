@@ -12,6 +12,7 @@ import {
   toolReadiness,
   adapterStatusBadge,
   ADAPTER_STATE_LABEL,
+  mcpServerStatusBadge,
 } from "../src/plugins.ts";
 
 // The Plugins page must read HONESTLY: a generated metadata-only wrapper is never
@@ -55,6 +56,28 @@ function tool(over = {}) {
     ...over,
   };
 }
+
+function mcpServer(over = {}) {
+  return {
+    id: "fs-helper",
+    transport: "http_loopback",
+    endpoint: "http://127.0.0.1:8000/mcp",
+    description: "local fs",
+    enabled: true,
+    timeout_ms: 10000,
+    status: "configured",
+    ...over,
+  };
+}
+
+test("an MCP server badge reflects only its config (configured vs disabled), never faked ready", () => {
+  const on = mcpServerStatusBadge(mcpServer({ enabled: true }));
+  assert.equal(on.label, "configured");
+  assert.equal(on.variant, "ok");
+  const off = mcpServerStatusBadge(mcpServer({ enabled: false }));
+  assert.equal(off.label, "disabled");
+  assert.equal(off.variant, "muted");
+});
 
 test("a generated wrapper is categorized as a wrapper regardless of kind", () => {
   assert.equal(pluginCategory(plugin({ generated: true })), "wrapper");

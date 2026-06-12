@@ -2,11 +2,14 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   reluxAdapters,
+  reluxMcp,
   reluxPluginRuntime,
   reluxPlugins,
   reluxTools,
   type ReluxAdapterStatus,
   type ReluxManifestTemplate,
+  type ReluxMcpServer,
+  type ReluxMcpToolsResult,
   type ReluxPlugin,
   type ReluxPluginRuntime,
   type ReluxToolConfigInput,
@@ -18,6 +21,7 @@ import {
   adapterStatusBadge,
   canConfigureTools,
   installResultSummary,
+  mcpServerStatusBadge,
   pluginCategory,
   pluginKindLabel,
   pluginNextStep,
@@ -149,6 +153,344 @@ export function Plugins() {
       </div>
 
       <ToolsSection />
+
+      <McpSection />
+    </div>
+  );
+}
+
+// MCP servers section (RELUX_MASTER_PLAN §8.2/§18; HERMES_OPENCLAW_DEEP_AUDIT §9;
+// docs/mcp.md). The first relux-layer Model Context Protocol surface: register
+// operator-run, loopback-ONLY MCP servers and run a live `tools/list` discovery
+// against them. Honest by construction — Relux dials no remote host and spawns no
+// command, and MCP tool INVOCATION is not wired into the agent tool-call path yet:
+// discovered tools list with a `not_implemented` status ("discovered, not callable
+// yet"). The next slice routes `tools/call` through the existing approval gates.
+function McpSection() {
+  const { data, loading, error, reload } = useAsync<ReluxMcpServer[]>(
+    () => reluxMcp.list(),
+    [],
+  );
+  const servers = data ?? [];
+  const [open, setOpen] = useState(false);
+
+  return (
+    <div className="card">
+      <div className="row" style={{ marginBottom: 8, alignItems: "center" }}>
+        <h3 style={{ margin: 0 }}>MCP servers</h3>
+        <div className="spacer" style={{ flex: 1 }} />
+        <button className="btn ghost sm" onClick={() => reload()} disabled={loading}>
+          {loading ? "Loading..." : "Refresh"}
+        </button>
+        <button
+          className="btn sm"
+          style={{ marginLeft: 8 }}
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+          title="Register an MCP server"
+        >
+          {open ? "Close" : "+ Add server"}
+        </button>
+      </div>
+      <p className="muted" style={{ marginTop: -2, marginBottom: 12, fontSize: 12 }}>
+        Model Context Protocol servers you run locally. Only loopback endpoints are
+        allowed (<span className="mono">http://127.0.0.1:&lt;port&gt;</span>,{" "}
+        <span className="mono">http://localhost:&lt;port&gt;</span>, or{" "}
+        <span className="mono">http://[::1]:&lt;port&gt;</span>) — Relux dials no
+        remote host and runs no downloaded code. <strong>Discovery is live</strong>{" "}
+        (a real <span className="mono">tools/list</span>), but MCP tool{" "}
+        <strong>invocation is not wired in yet</strong>: discovered tools list as
+        “runtime not implemented”.
+      </p>
+
+      {open && (
+        <AddMcpServerForm
+          onClose={() => setOpen(false)}
+          onAdded={() => reload()}
+        />
+      )}
+
+      {error ? (
+        <div className="banner err" style={{ fontSize: 12 }}>
+          Could not reach the Relux MCP API ({error}). Start it with{" "}
+          <span className="mono">cargo run -p relux-kernel -- serve</span>.
+        </div>
+      ) : loading && data == null ? (
+        <div className="loading">Loading MCP servers...</div>
+      ) : servers.length === 0 ? (
+        <div className="empty">
+          No MCP servers registered. Use “+ Add server” to register a loopback MCP
+          server you run locally.
+        </div>
+      ) : (
+        <div className="table-scroll">
+          <table className="table">
+            <thead>
+              <tr>
+                <th>Server</th>
+                <th>Endpoint</th>
+                <th>Status</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {servers.map((s) => (
+                <McpServerRow key={s.id} server={s} onChanged={reload} />
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function McpServerRow({
+  server,
+  onChanged,
+}: {
+  server: ReluxMcpServer;
+  onChanged: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [toolsOpen, setToolsOpen] = useState(false);
+  const status = mcpServerStatusBadge(server);
+
+  async function remove() {
+    setBusy(true);
+    setErr(null);
+    try {
+      await reluxMcp.remove(server.id);
+      onChanged();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Remove failed");
+      setBusy(false);
+    }
+  }
+
+  return (
+    <>
+      <tr>
+        <td>
+          <strong>{server.id}</strong>
+          {server.description && (
+            <div className="muted" style={{ fontSize: 12, marginTop: 2, maxWidth: 380 }}>
+              {server.description}
+            </div>
+          )}
+          {err && (
+            <div className="banner err" style={{ fontSize: 11, marginTop: 6, marginBottom: 0 }}>
+              {err}
+            </div>
+          )}
+        </td>
+        <td className="mono muted" style={{ fontSize: 11, wordBreak: "break-all", maxWidth: 240 }}>
+          {server.endpoint}
+        </td>
+        <td>
+          <span className={"badge " + BADGE_CLASS[status.variant]} title={status.title}>
+            {status.label}
+          </span>
+        </td>
+        <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
+          <button
+            className="btn ghost sm"
+            onClick={() => setToolsOpen((v) => !v)}
+            aria-expanded={toolsOpen}
+            title="Run a live tools/list discovery against this server"
+          >
+            {toolsOpen ? "Close" : "Discover"}
+          </button>
+          <button
+            className="btn ghost sm"
+            style={{ marginLeft: 6 }}
+            disabled={busy}
+            onClick={() => void remove()}
+          >
+            {busy ? "..." : "Remove"}
+          </button>
+        </td>
+      </tr>
+      {toolsOpen && (
+        <tr>
+          <td colSpan={4} style={{ background: "transparent" }}>
+            <McpDiscoverPanel server={server} />
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
+// The live discovery panel: runs `tools/list` against the loopback MCP server and
+// lists the discovered tools. Honest about every outcome — a disabled server, an
+// unreachable server, or a server that isn't speaking MCP each shows its real
+// reason, never a faked tool list. Discovered tools are explicitly labelled
+// "not callable yet" (the kernel reports them `not_implemented`).
+function McpDiscoverPanel({ server }: { server: ReluxMcpServer }) {
+  const { data, loading, error } = useAsync<ReluxMcpToolsResult>(
+    () => reluxMcp.tools(server.id),
+    [server.id, server.enabled],
+  );
+  const tools = data?.tools ?? [];
+
+  return (
+    <div className="card" style={{ margin: "6px 0", padding: 12 }}>
+      <div className="row" style={{ marginBottom: 8, alignItems: "center" }}>
+        <strong style={{ fontSize: 13 }}>Discovered tools (live)</strong>
+        <div className="spacer" style={{ flex: 1 }} />
+        {!loading && !error && (
+          <span className="badge done">{tools.length} discovered</span>
+        )}
+      </div>
+      <p className="muted" style={{ marginTop: 0, marginBottom: 10, fontSize: 11 }}>
+        Discovery runs a real <span className="mono">tools/list</span> against the
+        loopback server. These tools are <strong>not callable yet</strong> — Relux
+        lists them honestly; routing MCP calls through the approval/permission gates
+        lands in a later slice.
+      </p>
+      {error ? (
+        <div className="banner err" style={{ fontSize: 12 }}>
+          Discovery failed ({error}). The server may be down, disabled, or not
+          speaking MCP over this endpoint. Relux does not fake an empty list.
+        </div>
+      ) : loading ? (
+        <div className="loading">Running tools/list…</div>
+      ) : tools.length === 0 ? (
+        <div className="empty" style={{ fontSize: 12 }}>
+          The server returned no tools.
+        </div>
+      ) : (
+        <div className="table-scroll">
+          <table className="table">
+            <tbody>
+              {tools.map((t) => (
+                <tr key={t.tool_name}>
+                  <td>
+                    <strong>{t.tool_name}</strong>
+                    <div className="mono muted" style={{ fontSize: 11 }}>{t.permission}</div>
+                    {t.description && (
+                      <div className="muted" style={{ fontSize: 12, marginTop: 2, maxWidth: 420 }}>
+                        {t.description}
+                      </div>
+                    )}
+                  </td>
+                  <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
+                    <span className="badge backlog" title="MCP tool invocation is not wired into the agent tool-call path yet.">
+                      not callable yet
+                    </span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// The "Add an MCP server" form. Minimal, validated fields: id (required),
+// loopback endpoint (required, validated server-side as loopback-only), and an
+// optional description. No secrets are accepted.
+function AddMcpServerForm({
+  onClose,
+  onAdded,
+}: {
+  onClose: () => void;
+  onAdded: () => void;
+}) {
+  const [id, setId] = useState("");
+  const [endpoint, setEndpoint] = useState("");
+  const [description, setDescription] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [banner, setBanner] = useState<{ kind: string; msg: string } | null>(null);
+
+  async function submit() {
+    setBusy(true);
+    setBanner(null);
+    if (!id.trim()) {
+      setBanner({ kind: "err", msg: "Server id is required." });
+      setBusy(false);
+      return;
+    }
+    if (!endpoint.trim()) {
+      setBanner({ kind: "err", msg: "Loopback endpoint is required." });
+      setBusy(false);
+      return;
+    }
+    try {
+      await reluxMcp.register({
+        id: id.trim(),
+        endpoint: endpoint.trim(),
+        description: description.trim() || undefined,
+      });
+      setBanner({ kind: "ok", msg: "MCP server registered. Use Discover to list its tools." });
+      setId("");
+      setEndpoint("");
+      setDescription("");
+      onAdded();
+    } catch (e) {
+      setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Register failed" });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="card" style={{ marginBottom: 12, padding: 12 }}>
+      <div className="row" style={{ marginBottom: 8, alignItems: "center" }}>
+        <strong style={{ fontSize: 13 }}>Add an MCP server</strong>
+      </div>
+      {banner && (
+        <div className={"banner " + banner.kind} style={{ fontSize: 12 }}>{banner.msg}</div>
+      )}
+      <label className="field" style={{ margin: "8px 0 0" }}>
+        <span style={{ fontSize: 12 }}>Server id</span>
+        <input
+          className="input"
+          value={id}
+          placeholder="fs-helper"
+          onChange={(e) => setId(e.target.value)}
+        />
+        <span className="muted" style={{ fontSize: 11, marginTop: 4 }}>
+          Letters, digits, <span className="mono">.</span>, <span className="mono">-</span>,{" "}
+          <span className="mono">_</span> only. Used as the{" "}
+          <span className="mono">mcp:&lt;id&gt;</span> namespace for discovered tools.
+        </span>
+      </label>
+      <label className="field" style={{ margin: "8px 0 0" }}>
+        <span style={{ fontSize: 12 }}>Loopback endpoint</span>
+        <input
+          className="input"
+          value={endpoint}
+          placeholder="http://127.0.0.1:8000/mcp"
+          onChange={(e) => setEndpoint(e.target.value)}
+        />
+        <span className="muted" style={{ fontSize: 11, marginTop: 4 }}>
+          Loopback only. A remote or <span className="mono">https</span> endpoint is
+          refused. Relux POSTs JSON-RPC (<span className="mono">initialize</span>,{" "}
+          <span className="mono">tools/list</span>) here.
+        </span>
+      </label>
+      <label className="field" style={{ margin: "8px 0 0" }}>
+        <span style={{ fontSize: 12 }}>Description (optional)</span>
+        <input
+          className="input"
+          value={description}
+          placeholder="What this server provides."
+          onChange={(e) => setDescription(e.target.value)}
+        />
+      </label>
+      <div className="row wrap" style={{ gap: 8, marginTop: 12 }}>
+        <button className="btn" disabled={busy} onClick={() => void submit()}>
+          {busy ? "Registering..." : "Register server"}
+        </button>
+        <button className="btn ghost" disabled={busy} onClick={onClose}>
+          Cancel
+        </button>
+      </div>
     </div>
   );
 }
