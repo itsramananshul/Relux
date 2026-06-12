@@ -26,6 +26,7 @@ pub mod builtin;
 pub mod clock;
 pub mod doctor;
 pub mod event;
+pub mod introspect;
 pub mod live_run_log;
 pub mod loader;
 pub mod mcp;
@@ -89,6 +90,7 @@ pub use auth::{
 pub use builtin::{is_builtin_tool, is_internal_plugin, BUILTIN_TOOLS, INTERNAL_PLUGIN_IDS};
 pub use clock::Clock;
 pub use event::RunEvent;
+pub use introspect::{detect_hints, PluginHint};
 pub use loader::{load_plugin_manifests, MANIFEST_FILENAME};
 pub use plugin_install::{
     install_from_dir, install_from_github, install_from_zip, is_generated_manifest, list_installed,

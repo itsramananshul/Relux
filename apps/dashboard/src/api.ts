@@ -2824,6 +2824,14 @@ export const reluxPlugins = {
     api.get<ReluxManifestTemplate>(
       `/v1/relux/plugins/${encodeURIComponent(id)}/manifest-template`,
     ),
+  // Read-only, never-executed introspection of an imported plugin's source: a
+  // possible MCP server, an npm/python package, an entrypoint, scripts, a README.
+  // Surfaced so the operator who imported an arbitrary repo can see what to wire
+  // up next. Relux never turns a hint into a runnable tool and never runs the
+  // source. `scanned: false` means the source was outside the plugins root (a
+  // bundled fixture) so nothing was inspected.
+  hints: (id: string) =>
+    api.get<ReluxPluginHints>(`/v1/relux/plugins/${encodeURIComponent(id)}/hints`),
   // Add or replace ONE operator-configured tool on a user-installed ToolSet/
   // wrapper plugin. The kernel derives the permission (`tool:<id>:<verb>`) and the
   // approval requirement from the risk - the form never sends a raw permission.
@@ -2858,6 +2866,27 @@ export interface ReluxManifestTemplate {
   install_dir: string;
   generated: boolean;
   manifest_json: string;
+}
+
+// One read-only finding about an imported plugin source. Informational only —
+// Relux never turns a hint into a runnable tool and never executes the source.
+export interface ReluxPluginHint {
+  // Stable machine kind for grouping/badging: "mcp-server", "npm-package",
+  // "npm-bin", "python-package", "python-entrypoint", "mcp-config", "container",
+  // "rust-crate", "scripts", "readme", "relux-manifest".
+  kind: string;
+  label: string;
+  detail: string;
+}
+
+export interface ReluxPluginHints {
+  plugin_id: string;
+  install_dir: string;
+  // False when the install dir was gone or outside the plugins root (a bundled
+  // fixture), so nothing was inspected — the UI says so honestly.
+  scanned: boolean;
+  generated: boolean;
+  hints: ReluxPluginHint[];
 }
 
 // -- Relux plugin tool runtime (HTTP loopback) ------------------------------

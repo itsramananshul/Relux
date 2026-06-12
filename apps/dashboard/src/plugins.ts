@@ -17,6 +17,7 @@ import type {
   ReluxAdapterStatus,
   ReluxMcpServer,
   ReluxPlugin,
+  ReluxPluginHint,
   ReluxToolDescriptor,
 } from "./api";
 
@@ -86,6 +87,56 @@ export function canConfigureTools(p: ReluxPlugin): boolean {
   if (p.protected || p.bundled) return false;
   const category = pluginCategory(p);
   return category === "wrapper" || category === "toolset";
+}
+
+// A friendly group label for a read-only source hint kind (api.ts ReluxPluginHint).
+// These describe what Relux DETECTED in an imported source so the operator can
+// decide how to wire it up. They are advisory only: Relux never turns a hint into
+// a runnable tool and never executes the source.
+export function hintKindLabel(kind: string): string {
+  switch (kind) {
+    case "mcp-server":
+      return "Possible MCP server";
+    case "mcp-config":
+      return "MCP config file";
+    case "npm-package":
+      return "npm package";
+    case "npm-bin":
+      return "npm executable";
+    case "python-package":
+      return "Python package";
+    case "python-entrypoint":
+      return "Python entrypoint";
+    case "container":
+      return "Container image";
+    case "rust-crate":
+      return "Rust crate";
+    case "scripts":
+      return "Scripts";
+    case "readme":
+      return "Readme";
+    case "relux-manifest":
+      return "Relux manifest";
+    default:
+      return kind;
+  }
+}
+
+// An honest, advisory next-step line derived from detected hints, or null when no
+// hint suggests a specific path. The strongest signal (an MCP server/config) routes
+// the operator to the MCP page; otherwise we point at the in-UI tool-definition
+// path. Never claims anything is runnable — that always takes explicit operator
+// action and existing gates.
+export function hintsNextStep(hints: ReluxPluginHint[]): string | null {
+  if (!hints.length) return null;
+  const has = (kind: string) => hints.some((h) => h.kind === kind);
+  if (has("mcp-server") || has("mcp-config")) {
+    return "This source looks like an MCP server. Relux won’t run it automatically — register it on the MCP page (or point a loopback runtime at it once you run it locally) to expose its tools through the gate.";
+  }
+  if (has("npm-package") || has("python-package") || has("python-entrypoint")) {
+    return "This source is a package/entrypoint, not a Relux ToolSet. Run it yourself as a local loopback server, then add a tool definition below — Relux never runs downloaded code.";
+  }
+  return "Detected source signals only. Add a tool definition below (and a loopback runtime) to make anything runnable; Relux never infers tools or runs downloaded code.";
 }
 
 export type NextStepKind =

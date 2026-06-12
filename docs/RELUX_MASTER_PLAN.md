@@ -3384,6 +3384,56 @@ runnable and the UI never pretends a refused tool ran. Pinned by
 `apps/dashboard/test/plugins.test.ts` (`toolReadiness` per-state assertions) and
 the kernel tests above.
 
+#### Source introspection hints (what an imported repo contains)
+
+A metadata-only wrapper is honest that *nothing runs yet*, but the operator still
+needs to know *what the source is* to wire it up. `GET /v1/relux/plugins/:id/hints`
+(`crates/relux-kernel/src/introspect.rs` `detect_hints`) performs a **read-only,
+never-executed** scan of the installed directory and returns informational
+**hints** only. Safety bounds, all enforced by construction:
+
+- The directory is scanned **only when it lives inside the plugins root**, so an
+  arbitrary path can never be inspected through this route (a bundled fixture under
+  `examples/` reports `scanned: false`, no hints).
+- The scan reads only a fixed allow-list of top-level metadata files
+  (`package.json`, `pyproject.toml`/`setup.py`/`requirements.txt`, `mcp.json`,
+  `Dockerfile`, `Cargo.toml`, `Makefile`, README, top-level `*.py`/`*.sh`), each
+  capped at `MAX_FILE_BYTES`, with the hint list capped at `MAX_HINTS`. It **never
+  spawns a process, follows a command/entrypoint, recurses, or promotes a hint into
+  a tool**.
+- Signals detected: a **possible MCP server** (the `@modelcontextprotocol/sdk`
+  dependency in `package.json`, an `mcp`/`fastmcp` dependency in
+  `pyproject.toml`/`requirements.txt`, or a standalone `mcp.json`), an **npm/python
+  package**, declared **bin/entrypoints**, a **container/Rust crate**, **scripts**,
+  and a **README**.
+
+The Configure panel (`DetectedHints` in `Plugins.tsx`, labels/next-step in
+`plugins.ts` `hintKindLabel`/`hintsNextStep`) shows these under a **"hints only"**
+badge with an advisory next step — never a claim that anything is runnable.
+
+**Converting an imported repo into a real plugin / tool / MCP config.** The hints
+tell the operator which of the existing governed paths to take; Relux runs nothing
+on their behalf:
+
+1. **If the source is an MCP server** (an `mcp-server`/`mcp-config` hint): run it
+   yourself locally, then register it on the **MCP** page
+   (`POST /v1/relux/mcp/servers`, loopback-only). Its tools then flow through the
+   same discovery + per-call gate as any MCP tool. Relux never launches it for you.
+2. **If the source is a package/entrypoint** that exposes an HTTP surface: run it
+   yourself as a local **loopback** server, then on the Plugins page add a tool
+   definition (Plugin Tool Config v1) and point a loopback runtime at it
+   (`PUT /v1/relux/plugins/:id/runtime`). The tool becomes `ready` only after that
+   explicit operator action and the existing permission/approval gates.
+3. **If you have a real manifest**, author `relux-plugin.json` from the
+   manifest-template (`GET /v1/relux/plugins/:id/manifest-template`) and re-install
+   — the preferred path, used directly with no scaffolding.
+
+Pinned by `crates/relux-kernel/src/introspect.rs` unit tests (npm+MCP, python+MCP,
+mcp.json, container/rust/scripts/readme, oversized-file skip, hint-count bound),
+the server tests `hints_route_introspects_an_imported_repo_without_a_manifest` /
+`hints_route_does_not_scan_outside_the_plugins_root`, and the dashboard
+`hintKindLabel`/`hintsNextStep` assertions.
+
 #### Per-tool-call approval flow (gated tools)
 
 A `needs_approval` tool can be run for ONE specific invocation through a real

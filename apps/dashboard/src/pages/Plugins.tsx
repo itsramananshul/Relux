@@ -16,6 +16,7 @@ import {
   type ReluxMcpResourcesResult,
   type ReluxMcpResourceContent,
   type ReluxPlugin,
+  type ReluxPluginHints,
   type ReluxPluginRuntime,
   type ReluxToolConfigInput,
   type ReluxToolDescriptor,
@@ -25,6 +26,8 @@ import { useAsync } from "../components/common";
 import {
   adapterStatusBadge,
   canConfigureTools,
+  hintKindLabel,
+  hintsNextStep,
   installResultSummary,
   mcpServerStatusBadge,
   pluginCategory,
@@ -1708,6 +1711,8 @@ function ManifestPanel({
         requires approval and stays non-runnable until you lower its risk.
       </p>
 
+      <DetectedHints plugin={plugin} />
+
       <ConfiguredToolsList
         plugin={plugin}
         tools={myTools}
@@ -1944,6 +1949,90 @@ function AddToolForm({
           {busy ? "Adding..." : "Add tool"}
         </button>
       </div>
+    </div>
+  );
+}
+
+// Read-only "what's in this source" panel. When an arbitrary repo/zip is imported
+// without a relux-plugin.json, Relux scaffolds a metadata-only wrapper that runs
+// nothing — but the operator still needs to know what the source IS to wire it up.
+// This fetches safe, never-executed hints (a possible MCP server, an npm/python
+// package, an entrypoint, scripts) and an advisory next step. It explicitly states
+// these are hints only: Relux never turns one into a runnable tool and never runs
+// the source. (RELUX_MASTER_PLAN §7.4 Plugin Kernel Layer, §8.)
+function DetectedHints({ plugin }: { plugin: ReluxPlugin }) {
+  const { data, loading, error } = useAsync<ReluxPluginHints>(
+    () => reluxPlugins.hints(plugin.id),
+    [plugin.id],
+  );
+
+  if (loading && !data) {
+    return <div className="loading" style={{ fontSize: 12 }}>Inspecting source…</div>;
+  }
+  if (error) {
+    // Honest, non-blocking: hints are advisory, so a probe failure is informational.
+    return (
+      <div className="muted" style={{ fontSize: 11, marginBottom: 10 }}>
+        Could not inspect the source ({error}).
+      </div>
+    );
+  }
+  if (!data) return null;
+
+  const nextStep = hintsNextStep(data.hints);
+
+  return (
+    <div
+      className="card"
+      style={{ margin: "0 0 12px", padding: 10, background: "transparent" }}
+    >
+      <div className="row" style={{ alignItems: "center", marginBottom: 6 }}>
+        <strong style={{ fontSize: 12 }}>Detected in source</strong>
+        <div className="spacer" style={{ flex: 1 }} />
+        <span className="badge backlog" title="Read-only detection; nothing is executed">
+          hints only
+        </span>
+      </div>
+      {!data.scanned ? (
+        <p className="muted" style={{ margin: 0, fontSize: 11 }}>
+          Nothing to inspect — this plugin’s source is not in the local plugins
+          directory.
+        </p>
+      ) : data.hints.length === 0 ? (
+        <p className="muted" style={{ margin: 0, fontSize: 11 }}>
+          No runnable signals detected. Add a tool definition below to make anything
+          runnable — Relux never infers tools or runs downloaded code.
+        </p>
+      ) : (
+        <>
+          <p className="muted" style={{ marginTop: 0, marginBottom: 8, fontSize: 11 }}>
+            What Relux found in the imported source. These are read-only hints —
+            Relux never runs any of this and never turns a hint into a tool. Use
+            them to decide how to wire the plugin up.
+          </p>
+          <ul style={{ margin: "0 0 8px", paddingLeft: 0, listStyle: "none" }}>
+            {data.hints.map((h, i) => (
+              <li
+                key={`${h.kind}-${i}`}
+                className="row"
+                style={{ alignItems: "baseline", gap: 8, marginBottom: 4 }}
+              >
+                <span className="badge" style={{ flexShrink: 0 }}>
+                  {hintKindLabel(h.kind)}
+                </span>
+                <span className="mono muted" style={{ fontSize: 11, wordBreak: "break-all" }}>
+                  {h.detail}
+                </span>
+              </li>
+            ))}
+          </ul>
+          {nextStep && (
+            <p className="banner info" style={{ fontSize: 11, margin: 0 }}>
+              {nextStep}
+            </p>
+          )}
+        </>
+      )}
     </div>
   );
 }
@@ -2309,8 +2398,11 @@ function InstallPanel({
             onChange={(e) => setFile(e.target.files?.[0] ?? null)}
           />
           <p className="muted" style={{ fontSize: 11, marginTop: 6 }}>
-            The archive is uploaded, extracted, and validated on the Relux host.
-            Path-traversal entries are refused.
+            The archive is uploaded, extracted, and validated on the Relux host;
+            path-traversal entries are refused. If it has a{" "}
+            <span className="mono">relux-plugin.json</span> manifest it is used
+            directly; if not, Relux imports it as a safe <em>metadata-only</em>{" "}
+            wrapper (no runnable tools) you can configure afterward.
           </p>
         </label>
       )}
@@ -2326,8 +2418,11 @@ function InstallPanel({
           />
           <p className="muted" style={{ fontSize: 11, marginTop: 6 }}>
             Browser folder picking is not available yet; this path is read on the
-            Relux process host, not your machine. The folder (or its single plugin
-            subfolder) must contain a <span className="mono">relux-plugin.json</span>.
+            Relux process host, not your machine. If the folder (or its single
+            plugin subfolder) has a <span className="mono">relux-plugin.json</span>{" "}
+            manifest it is used directly; if not, Relux imports it as a safe{" "}
+            <em>metadata-only</em> wrapper (no runnable tools) you can configure
+            afterward.
           </p>
         </label>
       )}

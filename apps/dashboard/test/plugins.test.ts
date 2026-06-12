@@ -13,6 +13,8 @@ import {
   adapterStatusBadge,
   ADAPTER_STATE_LABEL,
   mcpServerStatusBadge,
+  hintKindLabel,
+  hintsNextStep,
 } from "../src/plugins.ts";
 
 // The Plugins page must read HONESTLY: a generated metadata-only wrapper is never
@@ -409,4 +411,38 @@ test("every adapter state has a shared label (single source of truth with Crew)"
   ]) {
     assert.ok(ADAPTER_STATE_LABEL[state], `missing label for ${state}`);
   }
+});
+
+// Source hints (read-only introspection of an imported repo) are advisory ONLY:
+// they describe what was detected so the operator can wire the plugin up. They
+// never claim anything is runnable — Relux never turns a hint into a tool and
+// never runs downloaded code. These pin the honest copy.
+
+test("hintKindLabel gives a friendly label and falls back to the raw kind", () => {
+  assert.equal(hintKindLabel("mcp-server"), "Possible MCP server");
+  assert.equal(hintKindLabel("npm-package"), "npm package");
+  assert.equal(hintKindLabel("python-entrypoint"), "Python entrypoint");
+  // An unknown kind is shown verbatim, never dropped or faked.
+  assert.equal(hintKindLabel("something-new"), "something-new");
+});
+
+test("hintsNextStep routes an MCP signal to the MCP page and never claims it runs", () => {
+  const step = hintsNextStep([
+    { kind: "mcp-server", label: "Possible MCP server", detail: "depends on sdk" },
+  ]);
+  assert.ok(step);
+  assert.match(step, /MCP/);
+  assert.match(step, /won’t run it automatically|never run/i);
+});
+
+test("hintsNextStep for a plain package points at the in-UI tool path, not auto-run", () => {
+  const step = hintsNextStep([
+    { kind: "npm-package", label: "npm package", detail: "left-pad" },
+  ]);
+  assert.ok(step);
+  assert.match(step, /never runs downloaded code/i);
+});
+
+test("hintsNextStep is null when there are no hints (nothing to suggest)", () => {
+  assert.equal(hintsNextStep([]), null);
 });

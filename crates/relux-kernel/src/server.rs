@@ -524,6 +524,10 @@ fn protected_router() -> Router<AppState> {
             "/v1/relux/plugins/:id/manifest-template",
             get(plugin_manifest_template),
         )
+        // Read-only, never-executed hints about what an imported source contains
+        // (MCP server, npm/python package, entrypoints, scripts). Informational
+        // only - the operator uses them to decide how to wire the plugin up.
+        .route("/v1/relux/plugins/:id/hints", get(plugin_hints))
         // Operator-configured tool definitions for a user-installed ToolSet/wrapper.
         .route("/v1/relux/plugins/:id/tools", post(configure_plugin_tool))
         .route(
@@ -6707,6 +6711,73 @@ async fn plugin_manifest_template(
     Ok(Json(resp))
 }
 
+/// Read-only, never-executed hints about what an installed plugin's source
+/// contains: a possible MCP server, an npm/python package, an entrypoint, build
+/// scripts, a README. Surfaced so an operator who imported an arbitrary repo can
+/// understand what to configure next. Relux never turns a hint into a runnable
+/// tool and never runs the source.
+#[derive(Debug, Serialize)]
+struct PluginHintsResponse {
+    plugin_id: String,
+    install_dir: String,
+    /// Whether the install directory was actually scanned. False when the dir is
+    /// gone or lives outside the plugins root (a bundled fixture), so the UI can
+    /// say "nothing to inspect" honestly instead of faking an empty result.
+    scanned: bool,
+    /// True when this plugin is a generated metadata-only wrapper (the case hints
+    /// matter most for).
+    generated: bool,
+    hints: Vec<relux_kernel::PluginHint>,
+}
+
+/// GET `/v1/relux/plugins/:id/hints` - safe, read-only introspection of an
+/// installed plugin's source directory (`docs/RELUX_MASTER_PLAN.md` section 7.4,
+/// section 8). The directory is only scanned when it lives inside the plugins
+/// root, so an arbitrary path can never be inspected through this route. Returns
+/// informational hints only; nothing is executed.
+async fn plugin_hints(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<PluginHintsResponse>, ApiError> {
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err(ApiError::bad_request("plugin id is required"));
+    }
+    let plugin_id = relux_core::PluginId::new(id.clone());
+    let plugins_root = state.plugins_root.clone();
+    let (install_dir, generated, within_root) = locked_read(&state, |kernel| {
+        let installed = kernel
+            .installed_plugin(&plugin_id)
+            .ok_or_else(|| KernelError::PluginNotInstalled(id.clone()))?;
+        let install_dir = installed.install_dir.clone();
+        let generated = kernel
+            .plugin(&plugin_id)
+            .map(relux_kernel::is_generated_manifest)
+            .unwrap_or(false);
+        // Only ever scan a directory that lives inside the plugins root. A bundled
+        // fixture (under examples/) or any stray path is reported, never scanned.
+        let within_root = std::path::Path::new(&install_dir).starts_with(&plugins_root);
+        Ok((install_dir, generated, within_root))
+    })?;
+
+    // The scan reads only the install directory's bounded metadata files; it runs
+    // off the lock since it touches the filesystem, never kernel state.
+    let dir = std::path::PathBuf::from(&install_dir);
+    let (scanned, hints) = if within_root && dir.is_dir() {
+        (true, relux_kernel::detect_hints(&dir))
+    } else {
+        (false, Vec::new())
+    };
+
+    Ok(Json(PluginHintsResponse {
+        plugin_id: id,
+        install_dir,
+        scanned,
+        generated,
+        hints,
+    }))
+}
+
 /// POST `/v1/relux/plugins/:id/tools` - add or replace ONE operator-configured
 /// tool on a user-installed ToolSet/wrapper plugin (`docs/RELUX_MASTER_PLAN.md`
 /// §7.4, §8.2). This is the in-UI alternative to hand-editing a `relux-plugin.json`
@@ -8044,6 +8115,80 @@ mod tests {
         let record = record_for(&kernel, &installed);
         assert!(!record.generated, "a real manifest is not generated");
         assert_eq!(record.tool_count, 1, "echo declares one tool");
+    }
+
+    /// Importing an arbitrary repo with NO `relux-plugin.json` installs a generated
+    /// wrapper, and the hints route then introspects its copied source read-only:
+    /// an npm package depending on the MCP SDK surfaces an `mcp-server` hint so the
+    /// operator knows what to wire up - without Relux ever running the source.
+    #[tokio::test]
+    async fn hints_route_introspects_an_imported_repo_without_a_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        // A repo-like source with no Relux manifest, but an MCP-server package.json.
+        let source = dir.path().join("cool-mcp-repo");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("package.json"),
+            r#"{"name":"cool-mcp","bin":{"cool":"./bin.js"},
+               "dependencies":{"@modelcontextprotocol/sdk":"^1.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(source.join("README.md"), "# Cool MCP\nDoes things.\n").unwrap();
+
+        let state = restarted_state_over(&dir);
+        let record = install_dir(
+            State(state.clone()),
+            Json(InstallDirReq {
+                path: source.display().to_string(),
+            }),
+        )
+        .await
+        .expect("install ok")
+        .0;
+        assert!(record.generated, "no manifest => generated wrapper");
+        assert_eq!(record.tool_count, 0, "a wrapper runs nothing yet");
+
+        let resp = plugin_hints(State(state.clone()), AxumPath(record.id.clone()))
+            .await
+            .expect("hints ok")
+            .0;
+        assert!(resp.scanned, "an in-root install dir is scanned");
+        assert!(resp.generated, "the hints response echoes the wrapper flag");
+        assert!(
+            resp.hints.iter().any(|h| h.kind == "mcp-server"),
+            "the MCP SDK dependency must surface an mcp-server hint: {:?}",
+            resp.hints
+        );
+        assert!(
+            resp.hints.iter().any(|h| h.kind == "npm-package"),
+            "the npm package itself is surfaced"
+        );
+        // No tool was ever created from a hint: discovery still shows nothing.
+        let tools = locked_read(&state, |k| {
+            Ok(k.discover_tools(None)
+                .into_iter()
+                .filter(|t| t.plugin_id == record.id)
+                .count())
+        })
+        .unwrap();
+        assert_eq!(tools, 0, "a hint never becomes a runnable tool");
+    }
+
+    /// The hints route never scans a directory outside the plugins root: a bundled
+    /// fixture (installed under `examples/`) reports `scanned: false` with no hints,
+    /// so an arbitrary path can never be inspected through this surface.
+    #[tokio::test]
+    async fn hints_route_does_not_scan_outside_the_plugins_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = restarted_state_over(&dir);
+        // A bundled plugin exists after bootstrap; its install dir is under examples/,
+        // outside the plugins root, so it must not be scanned.
+        let resp = plugin_hints(State(state.clone()), AxumPath("relux-tools-status".to_string()))
+            .await
+            .expect("hints ok")
+            .0;
+        assert!(!resp.scanned, "a dir outside the plugins root is not scanned");
+        assert!(resp.hints.is_empty(), "nothing scanned => no hints");
     }
 
     /// The honest dead-end: a generated wrapper has no tool definitions, so even an
