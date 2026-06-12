@@ -1887,6 +1887,46 @@ export const reluxPrimeAutonomy = {
   runTick: () => api.post<ReluxPrimeAutonomyTickResult>("/v1/relux/prime/autonomy/tick"),
 };
 
+// -- Relux Prime Agent-Loop autonomy policy --------------------------------
+//
+// The CONFIGURABLE limits that bound Prime's CHAT agent loop (the think → tool →
+// observe → respond loop). Replaces the old fixed v1 caps. Two profiles: a practical
+// standard default, and a higher "extended" profile used when the user explicitly asks
+// Prime to keep working. Even extended is bounded — there is no infinite setting.
+// (docs/mcp.md "Prime Agent Loop"; distinct from the background task-tick autonomy above.)
+export interface ReluxPrimeAgentPolicy {
+  max_tool_calls: number;
+  max_brain_rounds: number;
+  max_duration_secs: number;
+  extended_max_tool_calls: number;
+  extended_max_brain_rounds: number;
+  extended_max_duration_secs: number;
+}
+
+// The resolved per-turn limits for one profile (clamped on the server).
+export interface ReluxPrimeAgentLimits {
+  extended: boolean;
+  max_tool_calls: number;
+  max_brain_rounds: number;
+  max_duration_secs: number;
+}
+
+export interface ReluxPrimeAgentPolicyResponse {
+  config: ReluxPrimeAgentPolicy;
+  standard: ReluxPrimeAgentLimits;
+  extended: ReluxPrimeAgentLimits;
+}
+
+export type UpdateReluxPrimeAgentPolicyReq = Partial<ReluxPrimeAgentPolicy>;
+
+export const reluxPrimeAgentPolicy = {
+  // Get the configured policy + resolved standard/extended limits.
+  get: () => api.get<ReluxPrimeAgentPolicyResponse>("/v1/relux/prime/agent-policy"),
+  // Update one or more ceilings; the server clamps every field to its safe range.
+  update: (config: UpdateReluxPrimeAgentPolicyReq) =>
+    api.patch<ReluxPrimeAgentPolicyResponse>("/v1/relux/prime/agent-policy", config),
+};
+
 // -- Relux Orchestration (multi-agent autonomy) ----------------------------
 
 // The specialist role Prime assigns a brief to (mirrors relux_core OrchestrationRole).

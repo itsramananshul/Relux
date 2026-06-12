@@ -40,15 +40,30 @@ Read for: **loop continuation, the bounded tool-call iteration cap, the valid-to
   (allowlist gate), `unknown_tool_feedback` (self-correction). The unified-decision path
   (`prime_decision.rs`) collapses this to one envelope; the kernel still validates and
   executes deterministically.
-- **Relux mapping (Prime Agent Loop v1 — real tool execution):**
+- **Relux mapping (Prime Agent Loop — real tool execution):**
   `crates/relux-kernel/src/prime_agent_loop.rs` — `AgentLoop` (the bounded think→tool→observe→respond
-  driver, `MAX_AGENT_TOOL_CALLS` / `MAX_BRAIN_ROUNDS`), the live `AgentTool` catalog
+  driver; the per-turn ceiling lives in `AgentLimits`, resolved from the operator's
+  `relux_core::PrimeAgentPolicy` — see `agent/iteration_budget.py` below — NOT a fixed constant; a hit
+  ceiling is `AgentOutcome::LimitReached(LimitKind)`), the live `AgentTool` catalog
   (`valid_tool_names`), `interpret_agent_reply` (pick interpreter + off-catalog self-correction),
   `AgentObservation` (the redacted, bounded `role:"tool"` result fed back). The kernel executes each
   pick through the UNCHANGED single-invocation gate (`state.rs` `prime_agent_step` → `prime_invoke_tool`),
   pausing on a gated tool with the existing approval card; the off-lock-brain / short-locked-exec
   orchestration is `server.rs` `drive_prime_agent_loop`. Entry is gated on an explicit `ToolInvocation`
   turn (the safety wall). See `docs/mcp.md` "Prime Agent Loop v1".
+
+### `agent/iteration_budget.py` + `cli-config.yaml.example` — the configurable loop budget
+Read for: **why a real agent's per-turn loop bound is a CONFIGURABLE budget, not a tiny constant.**
+- `IterationBudget(max_total)` (L17) is a thread-safe consume counter; the parent agent's cap is
+  `max_iterations` (default **90**), each subagent's is `delegation.max_iterations` (default **50**,
+  set in `cli-config.yaml.example` L871-872). Operators tune these — the loop is bounded but the
+  ceiling is high and not hard-coded.
+- **Relux mapping:** `relux_core::PrimeAgentPolicy` (the operator-set standard + extended profiles,
+  clamped to safe ceilings — never "infinite") → `relux_kernel::AgentLimits` (per-turn, resolved by
+  `from_policy`). Replaces the retired toy `MAX_AGENT_TOOL_CALLS = 3` / `MAX_BRAIN_ROUNDS = 3`.
+  Served at `/v1/relux/prime/agent-policy`; persisted in the kernel snapshot; UI in the dashboard's
+  Prime Autonomy Limits panel. A hit ceiling surfaces as `AgentOutcome::LimitReached` + a one-click
+  "Keep working (extended)" continuation.
 
 ### `tools/mcp_tool.py` — the MCP client (list + call shaping)
 Read for: **MCP `tools/list` discovery, `tools/call` result shaping, description scanning.**

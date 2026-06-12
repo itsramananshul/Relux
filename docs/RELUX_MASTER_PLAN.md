@@ -1836,6 +1836,37 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **unreleased** — **Configurable Prime autonomy policy (replaces the toy v1 loop caps)** on top of the
+  Prime Agent Loop, continuing the §10.5/§17.1 line, built reference-first against Hermes'
+  `agent/iteration_budget.py` (`IterationBudget(max_total)` — a configurable per-agent budget, parent
+  `max_iterations` default **90**, `delegation.max_iterations` default **50**) and `cli-config.yaml.example`,
+  per `docs/reference-driven-development.md` (mapping in `docs/mcp.md`, "Prime Agent Loop"; `docs/REFERENCE_CODE_MAP.md`).
+  No release cut; no master-plan safety property is weakened. **What changes:** the agent loop's hard-coded
+  `MAX_AGENT_TOOL_CALLS = 3` / `MAX_BRAIN_ROUNDS = 3` made Prime feel artificially limited. They are replaced
+  by an operator-set `relux_core::PrimeAgentPolicy` with two profiles — a practical **standard** default
+  (12 tool calls / 18 brain rounds / 180s wall-clock) and a higher **extended** profile (64 / 96 / 1800s) for
+  user-initiated long work — resolved per turn into `relux_kernel::AgentLimits`. The loop reads these instead
+  of constants (`prime_agent_loop.rs`), enforces an optional wall-clock deadline (`mark_deadline_exceeded`,
+  the kernel owns the clock), and when a ceiling is reached returns `AgentOutcome::LimitReached(LimitKind)` so
+  the turn **names the exact limit, shows what it gathered, and offers a one-click "Keep working (extended)"
+  continuation** — never a fabricated "done". The extended profile is selected when the user explicitly asks
+  to keep working (`prime_wants_extended_work`, a fallback keyword rail that only raises the ceiling for an
+  already-`ToolInvocation` turn). **Why bounded, not infinite:** every policy field is clamped
+  (`PrimeAgentPolicy::clamped`: ≤512 calls / ≤1024 rounds / ≤24h) — an operator can scale up for serious work
+  but cannot set "infinite"; a literal unbounded loop is unsafe (runaway cost, never yields), so the model is
+  operator-controlled high limits + an explicit, auditable continue. Approvals still pause; high-risk tools
+  never auto-run; normal chat / frustration / vague ideas still never enter the loop. **Storage/serve:**
+  persisted in the kernel snapshot/store (clamped on load); served at `GET/PUT/PATCH /v1/relux/prime/agent-policy`
+  (response carries the resolved standard/extended limits); `relux-kernel prime agent-policy <status|configure>`
+  CLI. **UI:** a compact **Prime Autonomy Limits** panel (Health → Prime Brain) with std/ext chips + editable
+  rows; the "Keep working (extended)" affordance rides the existing `suggested_actions` chat buttons.
+  **Continuation model + gap (honest):** a continuation is a fresh, audited turn that re-runs the original
+  request under the extended profile; it does NOT yet resume mid-loop from the already-gathered observations
+  (incremental resume is the next step). `cargo test` + `clippy` clean on `relux-core`/`relux-kernel` (new
+  tests: default policy is not the toy 3, configured high tool limit runs >3, extended uses higher limits than
+  standard, brain-round + duration ceilings reported as limits, extended-work cue detection, policy persists +
+  clamps through the snapshot, the `/agent-policy` route serves + clamps). Dashboard typechecks, builds, its
+  358 tests pass, and the committed bundle was rebuilt.
 - **unreleased** — **Prime Agent Loop v1 (bounded think → tool → observe → respond, in chat)** on top of
   the chat-staged-approval slice, continuing the §9/§10.5/§17.1 line, built reference-first against Hermes'
   `agent/conversation_loop.py` (`run_conversation` bounded `while api_call_count < max_iterations` tool

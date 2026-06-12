@@ -219,6 +219,8 @@ async fn serve() -> Result<(), KernelError> {
     println!("   GET    /v1/relux/health");
     println!("   POST   /v1/relux/prime                     {{ \"message\": \"...\" }}");
     println!("   POST   /v1/relux/prime/reset               (clear this conversation's bounded memory)");
+    println!("   GET    /v1/relux/prime/agent-policy        (chat agent-loop autonomy limits + resolved profiles)");
+    println!("   PUT    /v1/relux/prime/agent-policy        {{ \"max_tool_calls\"?, \"max_brain_rounds\"?, \"max_duration_secs\"?, \"extended_*\"? }}");
     println!("   POST   /v1/relux/tasks                     {{ \"title\": \"...\" }}");
     println!("   POST   /v1/relux/tasks/:id/start");
     println!("   POST   /v1/relux/tasks/:id/execute-assigned");
@@ -445,6 +447,7 @@ fn protected_router() -> Router<AppState> {
         .route("/v1/relux/prime/reset", post(reset_prime_conversation))
         .route("/v1/relux/prime/autonomy", get(get_autonomy_config).put(update_autonomy_config).patch(update_autonomy_config))
         .route("/v1/relux/prime/autonomy/tick", post(run_autonomy_tick))
+        .route("/v1/relux/prime/agent-policy", get(get_agent_policy).put(update_agent_policy).patch(update_agent_policy))
         // Multi-agent orchestration (Prime as orchestrator).
         .route(
             "/v1/relux/prime/orchestrations",
@@ -3169,9 +3172,10 @@ async fn run_prime(
     // and never on a continuation. That gate is the safety wall: normal chat, a greeting,
     // frustration / profanity, a vague idea, a Q&A or a brainstorm classifies as some other intent
     // and NEVER enters the loop — it stays conversational. Inside the loop the brain may call an
-    // allowed tool, observe its real output, and continue (bounded to `MAX_AGENT_TOOL_CALLS` calls
-    // / `MAX_BRAIN_ROUNDS` rounds), pausing with the EXISTING per-call approval card on a gated
-    // tool with no standing grant. Every execution flows through the UNCHANGED
+    // allowed tool, observe its real output, and continue, bounded by the operator's CONFIGURABLE
+    // autonomy policy (`AgentLimits` — standard or, when the user explicitly asks to keep working,
+    // the higher extended profile; never an infinite loop), pausing with the EXISTING per-call
+    // approval card on a gated tool with no standing grant. Every execution flows through the UNCHANGED
     // `prime_invoke_tool` gate (`prime_agent_step`), so there is no second security model. When the
     // brain never picks a tool the loop returns `None` and the normal turn path below runs
     // unchanged (`docs/mcp.md` "Prime Agent Loop"; §10.5, §17.1).
@@ -3185,6 +3189,7 @@ async fn run_prime(
             &ai_config,
             cli_status.clone(),
             &message,
+            relux_kernel::prime_wants_extended_work(&message),
             &proposal_mcp_catalog,
         )
         .await?
@@ -4334,12 +4339,59 @@ async fn agent_brain_round(
 /// returned (the brain's final answer when it gave one, else a grounded fold of the observations).
 /// `invoked_tool` / `tool_output` carry the LAST observation so the turn reads as actionful and
 /// keeps its grounded reply (no brain re-narration); `tool_trace` carries the full compact trace.
+///
+/// When the loop stopped because a CONFIGURED autonomy limit was reached
+/// ([`relux_kernel::AgentOutcome::LimitReached`]), the reply names EXACTLY which limit was hit and
+/// the turn carries a one-click "keep working" continuation (a higher/extended-profile re-run of the
+/// SAME original request) — Prime never pretends it finished. `extended_used` says whether this turn
+/// already ran under the extended profile, so the offer is worded honestly.
+///
 /// Only called when `result.ran_any_tool()` is true, so `invoked_tool` is always set (honest).
-fn build_agent_loop_turn(result: &relux_kernel::AgentLoopResult) -> relux_core::PrimeTurn {
-    let reply = match &result.answer {
-        Some(a) => a.clone(),
-        None => {
-            let body = relux_kernel::prime_agent_loop::render_observations(&result.observations);
+fn build_agent_loop_turn(
+    result: &relux_kernel::AgentLoopResult,
+    message: &str,
+    extended_used: bool,
+) -> relux_core::PrimeTurn {
+    let body = relux_kernel::prime_agent_loop::render_observations(&result.observations);
+    let limit = result.limit_hit();
+    let mut suggested_actions: Vec<relux_core::PrimeSuggestion> = vec![];
+    let reply = match (&result.answer, limit) {
+        // The brain gave an explicit final answer — use it verbatim (it already folds in the tools).
+        (Some(a), _) => a.clone(),
+        // A configured ceiling stopped the loop with work still to do: report which limit, show what
+        // was gathered, and offer to continue with higher limits.
+        (None, Some(kind)) => {
+            let n = result.observations.len();
+            let more = if extended_used {
+                "This turn already used the extended (maximum) autonomy profile. I can keep going \
+                 if you ask me to continue."
+            } else {
+                "Tell me to keep working in extended mode and I'll continue with much higher limits."
+            };
+            // The continuation re-sends the ORIGINAL request under the extended profile (a fresh,
+            // audited turn). Prefixed with an explicit "Run … (keep working)" so it re-classifies as
+            // a tool invocation AND trips the extended profile. Bounded to keep the suggestion small.
+            let seed: String = message.chars().take(400).collect();
+            suggested_actions.push(relux_core::PrimeSuggestion {
+                label: "Keep working (extended)".to_string(),
+                message: format!("Run in extended mode (keep working): {seed}"),
+                send: true,
+            });
+            if body.is_empty() {
+                format!(
+                    "I reached the {} for this turn before I could finish. {more}",
+                    kind.label()
+                )
+            } else {
+                format!(
+                    "I ran {n} tool call(s) and reached the {} for this turn. Here's what I found \
+                     so far:\n\n{body}\n\n{more}",
+                    kind.label()
+                )
+            }
+        }
+        // The brain stopped on its own below every ceiling — fold the observations in plainly.
+        (None, None) => {
             if body.is_empty() {
                 "I could not complete the tool request.".to_string()
             } else {
@@ -4360,7 +4412,7 @@ fn build_agent_loop_turn(result: &relux_kernel::AgentLoopResult) -> relux_core::
         invoked_tool: last.map(|o| o.label.clone()),
         tool_output: last.map(|o| serde_json::Value::String(o.detail.clone())),
         tool_error: None,
-        suggested_actions: vec![],
+        suggested_actions,
         proposal: None,
         slots: None,
         agent_slots: None,
@@ -4392,6 +4444,7 @@ async fn drive_prime_agent_loop(
     ai_config: &relux_kernel::AiConfig,
     cli_status: Option<relux_core::AdapterRuntimeStatus>,
     message: &str,
+    extended: bool,
     proposal_mcp_catalog: &relux_kernel::ProposalMcpCatalog,
 ) -> Result<
     Option<(
@@ -4402,25 +4455,45 @@ async fn drive_prime_agent_loop(
     )>,
     ApiError,
 > {
-    // 1. Take the live, per-agent tool catalog under a short lock (MCP catalog injected so live
-    // MCP tools are included). Lock-free below.
-    let catalog = {
+    // 1. Take the live, per-agent tool catalog AND the configured autonomy policy under a short lock
+    // (MCP catalog injected so live MCP tools are included). Lock-free below.
+    let (catalog, policy) = {
         let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
         let store = SqliteStore::open(&state.db_path)?;
         let mut kernel = store.load()?;
         kernel.set_proposal_mcp_catalog(proposal_mcp_catalog.clone());
         let ctx = crate::ensure_bootstrapped(&mut kernel)?;
-        kernel.prime_agent_catalog(&ctx)
+        (kernel.prime_agent_catalog(&ctx), kernel.prime_agent_policy.clone())
     };
     // No runnable tools at all → nothing to drive; fall back to the normal turn path.
     if catalog.is_empty() {
         return Ok(None);
     }
 
-    // 2. Drive the bounded loop.
-    let mut lp = relux_kernel::AgentLoop::new(message, catalog);
+    // 2. Resolve the per-turn limits from the operator's policy (standard or extended profile) and
+    // an optional wall-clock deadline the orchestration enforces (the loop owns rounds/calls; the
+    // kernel owns the clock). Bounded by construction — even extended has a finite ceiling.
+    let limits = relux_kernel::AgentLimits::from_policy(&policy, extended);
+    let resolved = policy.limits(extended);
+    let deadline = if resolved.max_duration_secs > 0 {
+        std::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(resolved.max_duration_secs))
+    } else {
+        None
+    };
+
+    // 3. Drive the bounded loop.
+    let mut lp = relux_kernel::AgentLoop::new(message, catalog, limits);
     let mut terminal_turn: Option<relux_core::PrimeTurn> = None;
     while let Some(prompt) = lp.next_prompt() {
+        // Enforce the wall-clock deadline before spending another (possibly slow) brain round: if it
+        // elapsed, mark it so the loop reports a time limit and stop.
+        if let Some(d) = deadline {
+            if std::time::Instant::now() >= d {
+                lp.mark_deadline_exceeded();
+                break;
+            }
+        }
         let Some(raw) = agent_brain_round(brain, ai_config, cli_status.clone(), prompt).await else {
             break;
         };
@@ -4495,7 +4568,7 @@ async fn drive_prime_agent_loop(
             }
             t
         }
-        None => build_agent_loop_turn(&result),
+        None => build_agent_loop_turn(&result, message, extended),
     };
     Ok(Some((turn, summary, relux_kernel::IntentSource::Brain, pending_clarification)))
 }
@@ -4838,6 +4911,79 @@ async fn run_autonomy_tick(
         Ok(tick_result)
     })?;
     Ok(Json(result))
+}
+
+/// The chat AGENT-LOOP autonomy policy plus the resolved effective limits for each profile, so the
+/// dashboard can show the active ceilings at a glance without re-deriving the clamp.
+#[derive(Debug, Serialize)]
+struct PrimeAgentPolicyResponse {
+    config: relux_core::PrimeAgentPolicy,
+    /// The resolved standard-profile limits (clamped) the loop runs under for an ordinary turn.
+    standard: relux_core::PrimeAgentLimits,
+    /// The resolved extended-profile limits (clamped) used for an explicit "keep working" turn.
+    extended: relux_core::PrimeAgentLimits,
+}
+
+impl PrimeAgentPolicyResponse {
+    fn of(config: relux_core::PrimeAgentPolicy) -> Self {
+        let standard = config.limits(false);
+        let extended = config.limits(true);
+        Self { config, standard, extended }
+    }
+}
+
+/// GET `/v1/relux/prime/agent-policy` — the configured chat agent-loop autonomy policy + resolved
+/// limits. Distinct from `/prime/autonomy` (the background task-tick loop).
+async fn get_agent_policy(
+    State(state): State<AppState>,
+) -> Result<Json<PrimeAgentPolicyResponse>, ApiError> {
+    let config = locked_read(&state, |kernel| Ok(kernel.prime_agent_policy.clone()))?;
+    Ok(Json(PrimeAgentPolicyResponse::of(config)))
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateAgentPolicyReq {
+    max_tool_calls: Option<u32>,
+    max_brain_rounds: Option<u32>,
+    max_duration_secs: Option<u64>,
+    extended_max_tool_calls: Option<u32>,
+    extended_max_brain_rounds: Option<u32>,
+    extended_max_duration_secs: Option<u64>,
+}
+
+/// PUT/PATCH `/v1/relux/prime/agent-policy` — update one or more autonomy ceilings. Every field is
+/// clamped into its safe range ([`relux_core::PrimeAgentPolicy::clamped`]); an operator can raise
+/// the limits for serious long-running work but never set "infinite".
+async fn update_agent_policy(
+    State(state): State<AppState>,
+    Json(req): Json<UpdateAgentPolicyReq>,
+) -> Result<Json<PrimeAgentPolicyResponse>, ApiError> {
+    let config = locked_save(&state, |kernel| {
+        let mut config = kernel.prime_agent_policy.clone();
+        if let Some(v) = req.max_tool_calls {
+            config.max_tool_calls = v;
+        }
+        if let Some(v) = req.max_brain_rounds {
+            config.max_brain_rounds = v;
+        }
+        if let Some(v) = req.max_duration_secs {
+            config.max_duration_secs = v;
+        }
+        if let Some(v) = req.extended_max_tool_calls {
+            config.extended_max_tool_calls = v;
+        }
+        if let Some(v) = req.extended_max_brain_rounds {
+            config.extended_max_brain_rounds = v;
+        }
+        if let Some(v) = req.extended_max_duration_secs {
+            config.extended_max_duration_secs = v;
+        }
+        // Clamp into the safe ranges before it can reach the loop.
+        config = config.clamped();
+        kernel.prime_agent_policy = config.clone();
+        Ok(config)
+    })?;
+    Ok(Json(PrimeAgentPolicyResponse::of(config)))
 }
 
 // --- Orchestration (multi-agent autonomy) ----------------------------------
@@ -9203,6 +9349,46 @@ mod tests {
             .map(|s| s.to_string());
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         (status, set_cookie, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    #[tokio::test]
+    async fn agent_policy_route_serves_default_and_resolves_profiles() {
+        // GET returns the configured policy plus the resolved standard/extended limits, and the
+        // default must NOT be the retired toy v1 caps.
+        let (state, _dir) = auth_state(true);
+        let (status, _, body) = call(&state, "GET", "/v1/relux/prime/agent-policy", None, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v["config"]["max_tool_calls"].as_u64().unwrap() > 3, "default beats the toy cap");
+        assert!(!v["standard"]["extended"].as_bool().unwrap());
+        assert!(v["extended"]["extended"].as_bool().unwrap());
+        assert!(
+            v["extended"]["max_tool_calls"].as_u64().unwrap()
+                > v["standard"]["max_tool_calls"].as_u64().unwrap(),
+            "extended profile must allow more than standard"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_policy_route_updates_and_clamps() {
+        // PATCH raises the standard ceiling and supplies an out-of-range extended one; the response
+        // reflects the raised value and clamps the wild one — an operator can scale up but not to
+        // "infinite".
+        let (state, _dir) = auth_state(true);
+        let body = r#"{"max_tool_calls":40,"extended_max_tool_calls":100000000}"#;
+        let (status, _, rb) = call(&state, "PATCH", "/v1/relux/prime/agent-policy", None, Some(body)).await;
+        assert_eq!(status, StatusCode::OK, "{rb}");
+        let v: serde_json::Value = serde_json::from_str(&rb).unwrap();
+        assert_eq!(v["config"]["max_tool_calls"].as_u64().unwrap(), 40);
+        assert_eq!(
+            v["config"]["extended_max_tool_calls"].as_u64().unwrap(),
+            relux_core::PrimeAgentPolicy::MAX_TOOL_CALLS_CEIL as u64,
+            "wild value clamped to the safe ceiling"
+        );
+        // The change persists: a fresh GET shows the raised standard ceiling.
+        let (_s, _, gb) = call(&state, "GET", "/v1/relux/prime/agent-policy", None, None).await;
+        let g: serde_json::Value = serde_json::from_str(&gb).unwrap();
+        assert_eq!(g["config"]["max_tool_calls"].as_u64().unwrap(), 40);
     }
 
     #[tokio::test]

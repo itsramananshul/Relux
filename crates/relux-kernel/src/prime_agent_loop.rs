@@ -27,9 +27,11 @@
 //!   ends when the model stops requesting tools and returns a final answer. The chosen tool name is
 //!   validated against `agent.valid_tool_names` BEFORE execution (L389, L656) — an off-list name is
 //!   fed back as a self-correction message, NEVER executed. We mirror exactly this shape:
-//!   [`AgentLoop`] is the bounded driver ([`MAX_AGENT_TOOL_CALLS`] / [`MAX_BRAIN_ROUNDS`] are the
-//!   caps), [`interpret_agent_reply`] is the reply interpreter, the live catalog ([`AgentTool`]) is
-//!   `valid_tool_names`, and [`AgentReply::UnknownTool`] is the self-correction feedback.
+//!   [`AgentLoop`] is the bounded driver ([`AgentLimits`] carries the per-turn ceilings — the
+//!   CONFIGURABLE replacement for Hermes's `max_iterations`, resolved from the operator's
+//!   [`relux_core::PrimeAgentPolicy`]), [`interpret_agent_reply`] is the reply interpreter, the live
+//!   catalog ([`AgentTool`]) is `valid_tool_names`, and [`AgentReply::UnknownTool`] is the
+//!   self-correction feedback.
 //! - **Paperclip (openclaw)** `src/agents/tool-mutation.ts` `isMutatingToolCall(toolName, args)` —
 //!   the FAIL-CLOSED default where an UNKNOWN action is treated as mutating, and
 //!   `src/acp/approval-classifier.ts` — an unknown tool never auto-approves. We invert the polarity
@@ -55,9 +57,13 @@
 //!   existing per-call approval card. An allow-always grant turns that same tool into a direct
 //!   [`ToolStepOutcome::Ran`] (the kernel's `prime_agent_step` reuses `prime_invoke_tool`'s grant
 //!   check), so a granted tool participates in the loop like any low-risk one.
-//! - **Bounded.** At most [`MAX_AGENT_TOOL_CALLS`] tool executions and [`MAX_BRAIN_ROUNDS`] brain
-//!   rounds per turn (Hermes's `max_iterations`); a repeated identical call (no progress) stops the
-//!   loop; each observation is length-clamped ([`MAX_OBS_CHARS`]) and secret-redacted.
+//! - **Bounded, configurably.** At most [`AgentLimits::max_tool_calls`] tool executions and
+//!   [`AgentLimits::max_brain_rounds`] brain rounds per turn (the operator's policy, standard or
+//!   extended profile — never an "infinite" setting); an optional wall-clock deadline the kernel
+//!   trips via [`AgentLoop::mark_deadline_exceeded`]; a repeated identical call (no progress) stops
+//!   the loop; each observation is length-clamped ([`MAX_OBS_CHARS`]) and secret-redacted. When a
+//!   ceiling is reached the loop reports [`AgentOutcome::LimitReached`] with the exact
+//!   [`LimitKind`], so the kernel offers to continue rather than pretending it finished.
 //! - **Grounding, not new authority.** Every execution flows through the UNCHANGED
 //!   permission/approval/grant/audit gates (`invoke_tool`); the loop adds no mutation path of its
 //!   own. The gathered observations ground the final reply and are surfaced as a compact, redacted
@@ -68,16 +74,95 @@ use serde::{Deserialize, Serialize};
 use crate::prime_intent::extract_json_object;
 use relux_core::{PrimeToolTrace, ToolDescriptor, ToolExecutability};
 
-/// The hard cap on tool executions in one chat turn (v1). Small on purpose: a chat answer rarely
-/// needs more than a couple of real tool calls, and a tight bound keeps a misbehaving brain from
-/// spinning or running up cost. Mirrors Hermes's `max_iterations` discipline.
-pub const MAX_AGENT_TOOL_CALLS: usize = 3;
+/// The per-turn limits the agent loop runs under — the CONFIGURABLE replacement for the original
+/// v1 fixed caps (a hard-coded 3 tool calls / 3 brain rounds). The kernel builds these from the
+/// operator's [`relux_core::PrimeAgentPolicy`] (standard or extended profile); the loop logic reads
+/// these fields instead of constants, so the product is never artificially limited to a toy number.
+/// Still bounded by construction: every field is a finite ceiling (the policy clamps them), so even
+/// the extended profile stops — there is no "infinite" setting (`docs/mcp.md` "Prime Agent Loop").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentLimits {
+    /// Max tool executions this turn.
+    pub max_tool_calls: usize,
+    /// Max brain rounds this turn (a self-correction or a final-answer round counts).
+    pub max_brain_rounds: usize,
+    /// Whether these are the extended (long-work) limits — drives the "offer to continue" wording.
+    pub extended: bool,
+}
 
-/// The hard cap on brain rounds in one chat turn: one initial pick plus up to two
-/// post-observation iterations ("max 2 brain iterations after tool observations"). A round that
-/// names an off-catalog tool consumes a round (the self-correction is fed back), so the loop can
-/// never spin on retries.
-pub const MAX_BRAIN_ROUNDS: usize = 3;
+impl AgentLimits {
+    /// Resolve the loop's limits from the operator's policy for the requested mode. The policy
+    /// already clamps to safe ceilings; this only narrows `u32` to the `usize` the loop counts in.
+    pub fn from_policy(policy: &relux_core::PrimeAgentPolicy, extended: bool) -> Self {
+        let l = policy.limits(extended);
+        Self {
+            max_tool_calls: l.max_tool_calls as usize,
+            max_brain_rounds: l.max_brain_rounds as usize,
+            extended: l.extended,
+        }
+    }
+
+    /// The default STANDARD limits (the practical, non-toy default profile) — used by the
+    /// synchronous test driver and any caller without an explicit policy.
+    pub fn standard() -> Self {
+        Self::from_policy(&relux_core::PrimeAgentPolicy::default(), false)
+    }
+
+    /// The default EXTENDED limits (the long-work profile).
+    pub fn extended() -> Self {
+        Self::from_policy(&relux_core::PrimeAgentPolicy::default(), true)
+    }
+}
+
+/// Which configured ceiling stopped the loop, so the kernel can tell the operator EXACTLY what was
+/// hit and offer to continue with a higher/extended profile — never silently pretend it finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitKind {
+    /// The max-tool-calls ceiling was reached.
+    ToolCalls,
+    /// The max-brain-rounds ceiling was reached.
+    BrainRounds,
+    /// The wall-clock deadline elapsed (set by the kernel orchestration, which owns the clock).
+    Duration,
+}
+
+impl LimitKind {
+    /// A short human label for the limit, used in the continuation message.
+    pub fn label(self) -> &'static str {
+        match self {
+            LimitKind::ToolCalls => "tool-call limit",
+            LimitKind::BrainRounds => "reasoning-round limit",
+            LimitKind::Duration => "time limit",
+        }
+    }
+}
+
+/// Whether a message is an explicit request for EXTENDED (long-work) autonomy — "keep working",
+/// "extended mode", "don't stop", etc. Used to select the higher policy profile for a turn the user
+/// explicitly asked Prime to keep grinding on. Pure keyword rail (a fallback safety check, per
+/// `docs/reference-driven-development.md`): it only RAISES the ceiling for an already-`ToolInvocation`
+/// turn; it never creates a tool request or bypasses a gate. ASCII-lowercased substring match.
+pub fn prime_wants_extended_work(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    const CUES: &[&str] = &[
+        "extended mode",
+        "extended autonomy",
+        "extended work",
+        "keep working",
+        "keep going",
+        "don't stop",
+        "dont stop",
+        "as long as it takes",
+        "autonomous mode",
+        "work autonomously",
+        "higher limit",
+        "more tool calls",
+        "keep using the tools",
+        "long running",
+        "long-running",
+    ];
+    CUES.iter().any(|c| m.contains(c))
+}
 
 /// Max characters kept from any single tool observation the brain sees next round (and that is
 /// folded into the grounded reply). Keeps a large tool output from blowing the context. Mirrors
@@ -343,8 +428,13 @@ pub enum AgentOutcome {
     AwaitingApproval,
     /// A tool failed closed — the kernel surfaces the honest clarification.
     Refused(String),
-    /// The caps were hit with observations gathered but no explicit answer — the kernel folds the
-    /// observations into the grounded reply.
+    /// A CONFIGURED autonomy limit (tool calls / brain rounds / wall-clock) was reached while the
+    /// brain still had more to do. The kernel folds in what was gathered, states EXACTLY which
+    /// limit was hit, and offers to continue with a higher/extended profile — never "done".
+    LimitReached(LimitKind),
+    /// The brain stopped on its own (a `done`/no-tool reply, a repeat with no progress, or a
+    /// provider failure) with observations gathered but no explicit answer — the kernel folds the
+    /// observations into the grounded reply. NOT a limit hit.
     Exhausted,
 }
 
@@ -368,6 +458,15 @@ impl AgentLoopResult {
         !self.observations.is_empty()
     }
 
+    /// The configured limit that stopped the loop, if any — so the kernel knows to surface a
+    /// "hit the <limit>, continue?" turn instead of a plain answer.
+    pub fn limit_hit(&self) -> Option<LimitKind> {
+        match self.outcome {
+            AgentOutcome::LimitReached(kind) => Some(kind),
+            _ => None,
+        }
+    }
+
     /// The compact wire trace for the chat UI (one chip per executed tool).
     pub fn trace(&self) -> Vec<PrimeToolTrace> {
         self.observations.iter().map(AgentObservation::to_trace).collect()
@@ -381,6 +480,9 @@ impl AgentLoopResult {
 pub struct AgentLoop {
     message: String,
     catalog: Vec<AgentTool>,
+    /// The configured per-turn ceilings (tool calls / brain rounds + the extended flag). Replaces
+    /// the old fixed constants; the kernel resolves this from the operator's policy.
+    limits: AgentLimits,
     observations: Vec<AgentObservation>,
     feedback: Option<String>,
     /// Brain rounds consumed (every brain call, including a self-correction re-ask).
@@ -390,6 +492,9 @@ pub struct AgentLoop {
     terminal: Option<AgentOutcome>,
     answer: Option<String>,
     pending_pick: Option<AgentPick>,
+    /// A wall-clock deadline the kernel orchestration tripped (it owns the clock). When set, the
+    /// loop reports a [`LimitKind::Duration`] limit instead of a plain stop.
+    deadline_exceeded: bool,
     /// The args of the most recently executed pick, for repeat-detection (a brain that loops on the
     /// same tool+args makes no progress).
     last_pick_args: Option<serde_json::Value>,
@@ -407,11 +512,12 @@ pub enum AgentStep {
 }
 
 impl AgentLoop {
-    /// Start a loop for one user message over the live catalog.
-    pub fn new(message: &str, catalog: Vec<AgentTool>) -> Self {
+    /// Start a loop for one user message over the live catalog, under the given configured limits.
+    pub fn new(message: &str, catalog: Vec<AgentTool>, limits: AgentLimits) -> Self {
         Self {
             message: message.to_string(),
             catalog,
+            limits,
             observations: Vec::new(),
             feedback: None,
             rounds: 0,
@@ -419,23 +525,43 @@ impl AgentLoop {
             terminal: None,
             answer: None,
             pending_pick: None,
+            deadline_exceeded: false,
             last_pick_args: None,
         }
     }
 
-    /// The next prompt to send the brain, or `None` when the loop is over (terminal set, round cap
-    /// reached, or no tool budget left and nothing more to ask). Pure: does not advance state.
+    /// The configured limits this loop runs under.
+    pub fn limits(&self) -> AgentLimits {
+        self.limits
+    }
+
+    /// Trip the wall-clock deadline: the kernel orchestration (which owns the clock) calls this when
+    /// the configured `max_duration_secs` elapsed, so the loop stops on the NEXT `next_prompt` and
+    /// reports a [`LimitKind::Duration`] limit instead of a plain answer. No effect once the loop
+    /// already reached a terminal state.
+    pub fn mark_deadline_exceeded(&mut self) {
+        if self.terminal.is_none() {
+            self.deadline_exceeded = true;
+        }
+    }
+
+    /// The next prompt to send the brain, or `None` when the loop is over (terminal set, a deadline
+    /// tripped, the round ceiling reached, or no tool budget left and nothing more to ask). Pure:
+    /// does not advance state.
     pub fn next_prompt(&self) -> Option<String> {
         if self.terminal.is_some() {
             return None;
         }
-        if self.rounds >= MAX_BRAIN_ROUNDS {
+        if self.deadline_exceeded {
+            return None;
+        }
+        if self.rounds >= self.limits.max_brain_rounds {
             return None;
         }
         // Out of tool budget AND we already gathered something — there is nothing more to do but
-        // answer, which the caller does by folding observations (Exhausted). Asking again would
-        // only risk another (over-budget) pick.
-        if self.tool_calls >= MAX_AGENT_TOOL_CALLS {
+        // answer, which the caller does by folding observations. Asking again would only risk
+        // another (over-budget) pick.
+        if self.tool_calls >= self.limits.max_tool_calls {
             return None;
         }
         Some(build_agent_prompt(
@@ -512,15 +638,27 @@ impl AgentLoop {
         }
     }
 
-    /// Consume the loop into its result. If no terminal was reached (the brain stopped responding,
-    /// or the caps were hit mid-gather), classify by what was gathered.
+    /// Consume the loop into its result. If no explicit terminal was reached (a configured limit
+    /// was hit, the brain stopped responding, or a provider failure cut it short), classify by which
+    /// ceiling — if any — was reached, so the kernel can honestly say "I hit the <limit>, continue?"
+    /// rather than pretending the work is done.
     pub fn into_result(self) -> AgentLoopResult {
         let outcome = self.terminal.unwrap_or_else(|| {
             if self.answer.is_some() {
                 AgentOutcome::Answered
+            } else if self.deadline_exceeded {
+                // The wall-clock deadline tripped (the kernel owns the clock).
+                AgentOutcome::LimitReached(LimitKind::Duration)
+            } else if self.tool_calls >= self.limits.max_tool_calls {
+                // The configured tool-call ceiling stopped the loop while it had more to do.
+                AgentOutcome::LimitReached(LimitKind::ToolCalls)
+            } else if self.rounds >= self.limits.max_brain_rounds {
+                // The configured reasoning-round ceiling stopped the loop.
+                AgentOutcome::LimitReached(LimitKind::BrainRounds)
             } else if self.observations.is_empty() {
                 AgentOutcome::NoTool
             } else {
+                // The brain stopped on its own (or a provider failure) below every ceiling.
                 AgentOutcome::Exhausted
             }
         });
@@ -624,6 +762,7 @@ User request:\n{message}"
 pub fn run_agent_loop<B, E>(
     message: &str,
     catalog: Vec<AgentTool>,
+    limits: AgentLimits,
     mut brain: B,
     mut exec: E,
 ) -> AgentLoopResult
@@ -631,7 +770,7 @@ where
     B: FnMut(&str) -> Option<String>,
     E: FnMut(&AgentPick) -> ToolStepOutcome,
 {
-    let mut lp = AgentLoop::new(message, catalog);
+    let mut lp = AgentLoop::new(message, catalog, limits);
     while let Some(prompt) = lp.next_prompt() {
         let Some(raw) = brain(&prompt) else {
             break;
@@ -815,6 +954,7 @@ mod tests {
         let result = run_agent_loop(
             "hello",
             sample_catalog(),
+            AgentLimits::standard(),
             |_p| Some("{\"answer\":\"Hi! How can I help?\"}".to_string()),
             |_pick| {
                 execs += 1;
@@ -834,6 +974,7 @@ mod tests {
         let result = run_agent_loop(
             "this is garbage, ugh",
             sample_catalog(),
+            AgentLimits::standard(),
             |_p| Some("Ugh, I understand the frustration.".to_string()),
             |_pick| {
                 execs += 1;
@@ -851,6 +992,7 @@ mod tests {
         let result = run_agent_loop(
             "echo hello",
             sample_catalog(),
+            AgentLimits::standard(),
             |_p| {
                 round += 1;
                 if round == 1 {
@@ -882,6 +1024,7 @@ mod tests {
         let result = run_agent_loop(
             "delete the file",
             sample_catalog(),
+            AgentLimits::standard(),
             |_p| Some("{\"tool\":\"relux-tools-fs/delete\",\"args\":{\"path\":\"/x\"}}".to_string()),
             |_pick| {
                 execs += 1;
@@ -904,6 +1047,7 @@ mod tests {
         let result = run_agent_loop(
             "delete the file",
             sample_catalog(),
+            AgentLimits::standard(),
             |_p| {
                 round += 1;
                 if round == 1 {
@@ -932,6 +1076,7 @@ mod tests {
         let result = run_agent_loop(
             "use a tool",
             sample_catalog(),
+            AgentLimits::standard(),
             |prompt| {
                 round += 1;
                 match round {
@@ -956,21 +1101,17 @@ mod tests {
     }
 
     #[test]
-    fn tool_calls_are_bounded_by_the_cap() {
-        // A brain that always wants another tool must be bounded to MAX_AGENT_TOOL_CALLS.
+    fn repeat_call_with_no_progress_stops_below_the_cap() {
+        // A brain that loops on the SAME tool+args makes no progress — the loop stops at the second
+        // identical call regardless of how high the configured cap is (not a limit hit: Exhausted).
         let mut execs = 0;
         let result = run_agent_loop(
             "keep going",
             sample_catalog(),
-            |_p| {
-                // Always pick a DIFFERENT-arg call so repeat-detection does not stop it early —
-                // only the hard cap should.
-                Some("{\"tool\":\"relux-tools-echo/echo\",\"args\":{\"n\":1}}".to_string())
-            },
+            AgentLimits::standard(),
+            |_p| Some("{\"tool\":\"relux-tools-echo/echo\",\"args\":{\"n\":1}}".to_string()),
             |pick| {
                 execs += 1;
-                // Vary the observation so it is not deduped, then change args each call is not
-                // possible here (brain is fixed) — so use the arg-independent detail.
                 ToolStepOutcome::Ran(AgentObservation::ran(
                     &pick.label(),
                     "plugin",
@@ -978,27 +1119,23 @@ mod tests {
                 ))
             },
         );
-        // Repeat-detection actually stops it at the SECOND identical call; either way it is bounded
-        // well within the cap and never exceeds it.
-        assert!(execs <= MAX_AGENT_TOOL_CALLS, "executions {execs} exceeded cap");
+        assert!(execs <= 2, "repeat-detection stops a no-progress loop early: {execs}");
         assert_eq!(result.outcome, AgentOutcome::Exhausted);
     }
 
-    #[test]
-    fn distinct_tool_calls_are_bounded_to_three() {
-        // Three different picks in a row must all run, but a fourth must not.
-        let picks = ["relux-tools-echo/echo", "mcp:notes/listNotes", "relux-tools-echo/echo"];
+    /// A brain that always wants another DISTINCT tool call, to exercise the configured tool-call
+    /// ceiling. Picks a different-arg echo each round so repeat-detection never fires.
+    fn always_distinct_call(limits: AgentLimits) -> AgentLoopResult {
         let mut round = 0;
         let mut execs = 0;
-        let _ = run_agent_loop(
-            "chain tools",
+        run_agent_loop(
+            "keep working on this, extended mode",
             sample_catalog(),
+            limits,
             |_p| {
                 let i = round;
                 round += 1;
-                // Each pick has distinct args so repeat-detection does not fire.
-                let label = picks.get(i).copied().unwrap_or("relux-tools-echo/echo");
-                Some(format!("{{\"tool\":\"{label}\",\"args\":{{\"i\":{i}}}}}"))
+                Some(format!("{{\"tool\":\"relux-tools-echo/echo\",\"args\":{{\"i\":{i}}}}}"))
             },
             |pick| {
                 execs += 1;
@@ -1008,8 +1145,86 @@ mod tests {
                     &serde_json::json!({"i": execs}),
                 ))
             },
+        )
+    }
+
+    #[test]
+    fn configured_high_tool_limit_allows_more_than_the_old_toy_cap() {
+        // The whole point of the configurable policy: when the operator allows it and the brain
+        // keeps asking, Prime runs WELL beyond the old hard-coded 3. Here a 10-call ceiling runs 10.
+        let limits = AgentLimits { max_tool_calls: 10, max_brain_rounds: 30, extended: false };
+        let result = always_distinct_call(limits);
+        assert_eq!(result.observations.len(), 10, "the configured ceiling, not a toy 3, bounds it");
+        assert!(result.observations.len() > 3, "must beat the old v1 cap");
+        // It stopped because it HIT the configured tool-call limit — surfaced honestly, not "done".
+        assert_eq!(result.outcome, AgentOutcome::LimitReached(LimitKind::ToolCalls));
+        assert_eq!(result.limit_hit(), Some(LimitKind::ToolCalls));
+    }
+
+    #[test]
+    fn default_standard_limits_are_not_the_old_toy_three() {
+        // Regression guard: the default profile must allow more than the retired 3-call v1 cap.
+        let std = AgentLimits::standard();
+        assert!(std.max_tool_calls > 3, "standard tool calls regressed to a toy cap: {}", std.max_tool_calls);
+        assert!(std.max_brain_rounds > 3, "standard brain rounds regressed to a toy cap");
+        assert!(!std.extended);
+    }
+
+    #[test]
+    fn extended_profile_uses_higher_limits_than_standard() {
+        let std = AgentLimits::extended();
+        assert!(std.extended);
+        assert!(std.max_tool_calls > AgentLimits::standard().max_tool_calls);
+        // And the extended ceiling actually lets more calls run than the standard one would.
+        let ran_std = always_distinct_call(AgentLimits::standard()).observations.len();
+        let ran_ext = always_distinct_call(AgentLimits::extended()).observations.len();
+        assert!(ran_ext > ran_std, "extended ran {ran_ext}, standard ran {ran_std}");
+    }
+
+    #[test]
+    fn brain_round_ceiling_is_reported_as_a_limit() {
+        // A tiny brain-round ceiling (1) with a high tool ceiling: the loop stops on rounds, and
+        // reports the reasoning-round limit so the kernel can offer to continue.
+        let limits = AgentLimits { max_tool_calls: 50, max_brain_rounds: 1, extended: false };
+        let result = always_distinct_call(limits);
+        assert_eq!(result.observations.len(), 1, "one round ran exactly one tool");
+        assert_eq!(result.outcome, AgentOutcome::LimitReached(LimitKind::BrainRounds));
+    }
+
+    #[test]
+    fn deadline_trips_a_duration_limit() {
+        // The kernel orchestration owns the clock; here we simulate it tripping the deadline after
+        // one tool ran. The loop stops and reports the time limit (not a plain answer).
+        let limits = AgentLimits { max_tool_calls: 50, max_brain_rounds: 50, extended: false };
+        let mut lp = AgentLoop::new("keep working", sample_catalog(), limits);
+        // Round 1: brain picks a tool, it runs.
+        let prompt = lp.next_prompt().expect("first prompt");
+        assert!(prompt.contains("Runnable tools"));
+        let step = lp.classify("{\"tool\":\"relux-tools-echo/echo\",\"args\":{\"a\":1}}");
+        let pick = match step {
+            AgentStep::Execute(p) => p,
+            other => panic!("expected Execute, got {other:?}"),
+        };
+        lp.record_outcome(
+            &pick,
+            ToolStepOutcome::Ran(AgentObservation::ran(&pick.label(), "plugin", &serde_json::json!("ok"))),
         );
-        assert_eq!(execs, MAX_AGENT_TOOL_CALLS, "exactly the cap ran, no more");
+        // The kernel's wall-clock deadline elapses here.
+        lp.mark_deadline_exceeded();
+        assert!(lp.next_prompt().is_none(), "a tripped deadline stops the loop");
+        let result = lp.into_result();
+        assert_eq!(result.observations.len(), 1);
+        assert_eq!(result.outcome, AgentOutcome::LimitReached(LimitKind::Duration));
+    }
+
+    #[test]
+    fn extended_work_phrases_are_detected() {
+        assert!(prime_wants_extended_work("keep working on this until it's done"));
+        assert!(prime_wants_extended_work("Use extended mode and run all the tools"));
+        assert!(prime_wants_extended_work("don't stop, chain as many as you need"));
+        // Plain requests do NOT raise the ceiling.
+        assert!(!prime_wants_extended_work("echo hello"));
+        assert!(!prime_wants_extended_work("what tools can you use?"));
     }
 
     #[test]
@@ -1018,6 +1233,7 @@ mod tests {
         let result = run_agent_loop(
             "list my notes via mcp:notes/listNotes",
             sample_catalog(),
+            AgentLimits::standard(),
             |_p| {
                 round += 1;
                 if round == 1 {
@@ -1044,6 +1260,7 @@ mod tests {
         let result = run_agent_loop(
             "do it",
             sample_catalog(),
+            AgentLimits::standard(),
             |_p| Some("{\"tool\":\"relux-tools-echo/echo\",\"args\":{}}".to_string()),
             |_pick| ToolStepOutcome::Refused("the runtime is not configured".to_string()),
         );
@@ -1060,6 +1277,7 @@ mod tests {
         let result = run_agent_loop(
             "go",
             sample_catalog(),
+            AgentLimits::standard(),
             |_p| {
                 round += 1;
                 if round == 1 {

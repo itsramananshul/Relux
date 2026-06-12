@@ -65,6 +65,9 @@ fn main() -> ExitCode {
     let result = match args.split_first() {
         Some((cmd, rest)) if cmd == "prime" => match rest.split_first() {
             Some((prime_sub, prime_rest)) if prime_sub == "autonomy" => run_prime_autonomy(prime_rest),
+            Some((prime_sub, prime_rest)) if prime_sub == "agent-policy" => {
+                run_prime_agent_policy(prime_rest)
+            }
             Some((prime_sub, prime_rest)) if prime_sub == "orchestrate" => {
                 run_prime_orchestrate(prime_rest)
             }
@@ -240,6 +243,95 @@ fn run_autonomy_configure(args: &[String]) -> Result<(), KernelError> {
             Ok("Prime autonomy configuration updated.".to_string())
         } else {
             Ok("No changes applied to Prime autonomy configuration.".to_string())
+        }
+    })
+}
+
+/// Dispatches `relux-kernel prime agent-policy <subcommand> ...` — the CONFIGURABLE chat
+/// agent-loop autonomy ceilings (max tool calls / brain rounds / wall-clock, standard + extended
+/// profiles). Distinct from `prime autonomy` (the background task-tick loop).
+fn run_prime_agent_policy(args: &[String]) -> Result<(), KernelError> {
+    match args.split_first() {
+        Some((sub, _)) if sub == "status" => run_agent_policy_status(),
+        Some((sub, rest)) if sub == "configure" => run_agent_policy_configure(rest),
+        _ => Err(KernelError::Storage(
+            "usage: relux-kernel prime agent-policy <status|configure>\n  configure flags: \
+             --max-tool-calls N --max-brain-rounds N --max-duration-secs N \
+             --ext-max-tool-calls N --ext-max-brain-rounds N --ext-max-duration-secs N"
+                .to_string(),
+        )),
+    }
+}
+
+fn run_agent_policy_status() -> Result<(), KernelError> {
+    with_persistent_kernel(|kernel| {
+        let p = &kernel.prime_agent_policy;
+        let std = p.limits(false);
+        let ext = p.limits(true);
+        let mut output = "Prime Agent-Loop Autonomy Policy:\n".to_string();
+        output.push_str(&format!(
+            "  Standard: {} tool calls, {} brain rounds, {}s wall-clock\n",
+            std.max_tool_calls, std.max_brain_rounds, std.max_duration_secs
+        ));
+        output.push_str(&format!(
+            "  Extended: {} tool calls, {} brain rounds, {}s wall-clock\n",
+            ext.max_tool_calls, ext.max_brain_rounds, ext.max_duration_secs
+        ));
+        output.push_str(
+            "  (Extended is used when you explicitly ask Prime to keep working / use extended mode.\n\
+             \x20  Even extended is bounded — there is no infinite loop.)\n",
+        );
+        Ok(output)
+    })
+}
+
+fn run_agent_policy_configure(args: &[String]) -> Result<(), KernelError> {
+    let parse_u32 = |args: &[String], i: &mut usize, flag: &str| -> Result<u32, KernelError> {
+        *i += 1;
+        let val = args.get(*i).ok_or_else(|| KernelError::Storage(format!("Missing value for {flag}")))?;
+        val.parse().map_err(|_| KernelError::Storage(format!("Invalid {flag}: {val}")))
+    };
+    let parse_u64 = |args: &[String], i: &mut usize, flag: &str| -> Result<u64, KernelError> {
+        *i += 1;
+        let val = args.get(*i).ok_or_else(|| KernelError::Storage(format!("Missing value for {flag}")))?;
+        val.parse().map_err(|_| KernelError::Storage(format!("Invalid {flag}: {val}")))
+    };
+
+    let mut max_tool_calls: Option<u32> = None;
+    let mut max_brain_rounds: Option<u32> = None;
+    let mut max_duration_secs: Option<u64> = None;
+    let mut ext_max_tool_calls: Option<u32> = None;
+    let mut ext_max_brain_rounds: Option<u32> = None;
+    let mut ext_max_duration_secs: Option<u64> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--max-tool-calls" => max_tool_calls = Some(parse_u32(args, &mut i, "--max-tool-calls")?),
+            "--max-brain-rounds" => max_brain_rounds = Some(parse_u32(args, &mut i, "--max-brain-rounds")?),
+            "--max-duration-secs" => max_duration_secs = Some(parse_u64(args, &mut i, "--max-duration-secs")?),
+            "--ext-max-tool-calls" => ext_max_tool_calls = Some(parse_u32(args, &mut i, "--ext-max-tool-calls")?),
+            "--ext-max-brain-rounds" => ext_max_brain_rounds = Some(parse_u32(args, &mut i, "--ext-max-brain-rounds")?),
+            "--ext-max-duration-secs" => ext_max_duration_secs = Some(parse_u64(args, &mut i, "--ext-max-duration-secs")?),
+            other => return Err(KernelError::Storage(format!("Unknown argument: {other}"))),
+        }
+        i += 1;
+    }
+
+    with_persistent_kernel(|kernel| {
+        let mut p = kernel.prime_agent_policy.clone();
+        let mut changed = false;
+        if let Some(v) = max_tool_calls { p.max_tool_calls = v; changed = true; }
+        if let Some(v) = max_brain_rounds { p.max_brain_rounds = v; changed = true; }
+        if let Some(v) = max_duration_secs { p.max_duration_secs = v; changed = true; }
+        if let Some(v) = ext_max_tool_calls { p.extended_max_tool_calls = v; changed = true; }
+        if let Some(v) = ext_max_brain_rounds { p.extended_max_brain_rounds = v; changed = true; }
+        if let Some(v) = ext_max_duration_secs { p.extended_max_duration_secs = v; changed = true; }
+        kernel.prime_agent_policy = p.clamped();
+        if changed {
+            Ok("Prime agent-loop policy updated (clamped to safe ranges).".to_string())
+        } else {
+            Ok("No changes applied to Prime agent-loop policy.".to_string())
         }
     })
 }

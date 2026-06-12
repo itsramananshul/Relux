@@ -141,9 +141,9 @@ pub use prime_orchestration_slots::{
     BrainOrchestrationSlots, ResolvedOrchestration,
 };
 pub use prime_agent_loop::{
-    build_agent_catalog, build_agent_prompt, interpret_agent_reply, run_agent_loop, AgentExecStep,
-    AgentLoop, AgentLoopResult, AgentObservation, AgentOutcome, AgentPick, AgentReply, AgentStep,
-    AgentTool, ToolStepOutcome, MAX_AGENT_TOOL_CALLS, MAX_BRAIN_ROUNDS,
+    build_agent_catalog, build_agent_prompt, interpret_agent_reply, prime_wants_extended_work,
+    run_agent_loop, AgentExecStep, AgentLimits, AgentLoop, AgentLoopResult, AgentObservation,
+    AgentOutcome, AgentPick, AgentReply, AgentStep, AgentTool, LimitKind, ToolStepOutcome,
 };
 pub use prime_slots::{
     build_task_slots_prompt, parse_task_slots, reconcile_task_slots, BrainTaskSlots,

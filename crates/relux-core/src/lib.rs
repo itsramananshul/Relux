@@ -68,6 +68,7 @@ pub use plugin::{
 pub use prime::{
     ConversationSummary, ConversationTurn, PendingClarification, PrimeAction, PrimeAdminSlots,
     PrimeAgentSlots,
+    PrimeAgentLimits, PrimeAgentPolicy,
     PrimeAssignSlots,
     PrimeAutonomyConfig, PrimeAutonomyTickResult, PrimeContext, PrimeContextRead, PrimeDisposition,
     PrimeIntent,

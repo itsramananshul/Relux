@@ -37,6 +37,128 @@ impl Default for PrimeAutonomyConfig {
     }
 }
 
+/// The configurable autonomy policy that bounds Prime's **chat agent loop** — the bounded
+/// think → tool → observe → respond loop (`crates/relux-kernel/src/prime_agent_loop.rs`).
+///
+/// This REPLACES the original v1 fixed product caps (a hard-coded 3 tool calls / 3 brain
+/// rounds). Those tiny constants made Prime feel like a toy; a real Hermes/Codex-style agent
+/// keeps working when explicitly asked. The policy holds two profiles:
+///
+/// - **Standard** (`max_*`) — the practical default used for an ordinary explicit tool request.
+///   Higher than the old toy caps but conservative, so a normal turn finishes quickly and cheaply.
+/// - **Extended** (`extended_max_*`) — the much higher ceiling used for user-initiated long work
+///   ("keep working", "extended mode"). For long-running autonomy without an artificial wall.
+///
+/// ## Why there is no literal infinite loop (binding)
+///
+/// Even extended mode is BOUNDED. A truly unbounded loop is unsafe: a misbehaving brain or a
+/// runaway tool chain would spin forever, burn cost, and never yield to the operator. Instead the
+/// loop always stops at a configurable ceiling, reports EXACTLY which limit it hit, and offers to
+/// continue with a higher/extended profile — so "keep working" is operator-controlled high limits
+/// plus an explicit continue, not an ungoverned infinite loop. Approvals still pause the loop and a
+/// high-risk tool never auto-runs regardless of the limits (`docs/mcp.md` "Prime Agent Loop";
+/// `docs/RELUX_MASTER_PLAN.md` §10.5, §17.1). The limits are PER TURN; continuing is a fresh,
+/// audited turn the operator initiates (the continuation model — see `docs/mcp.md`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrimeAgentPolicy {
+    /// Standard profile: max tool executions in one chat turn.
+    pub max_tool_calls: u32,
+    /// Standard profile: max brain rounds (think iterations) in one chat turn.
+    pub max_brain_rounds: u32,
+    /// Standard profile: max wall-clock seconds for one chat turn's loop. `0` disables the
+    /// wall-clock cap (the tool-call / brain-round caps still bound the loop).
+    pub max_duration_secs: u64,
+    /// Extended profile: max tool executions in one chat turn (user-initiated long work).
+    pub extended_max_tool_calls: u32,
+    /// Extended profile: max brain rounds in one chat turn.
+    pub extended_max_brain_rounds: u32,
+    /// Extended profile: max wall-clock seconds for one chat turn's loop. `0` disables it.
+    pub extended_max_duration_secs: u64,
+}
+
+impl PrimeAgentPolicy {
+    /// The smallest a tool-call / brain-round cap may be set to (a turn must allow at least one).
+    pub const MIN_STEPS: u32 = 1;
+    /// The largest a tool-call cap may be set to — a hard runaway backstop well above any real
+    /// long-running turn. Operators cannot set "infinite".
+    pub const MAX_TOOL_CALLS_CEIL: u32 = 512;
+    /// The largest a brain-round cap may be set to (≥ the tool-call ceiling, since a round may be
+    /// spent on a self-correction or the final answer).
+    pub const MAX_BRAIN_ROUNDS_CEIL: u32 = 1024;
+    /// The largest wall-clock cap (24h); `0` (disabled) is also allowed.
+    pub const MAX_DURATION_CEIL: u64 = 86_400;
+
+    /// Clamp every field into its safe operator range. Defensive — the route clamps too, but any
+    /// path that mutates the policy can call this so an out-of-range value never reaches the loop.
+    pub fn clamped(mut self) -> Self {
+        self.max_tool_calls =
+            self.max_tool_calls.clamp(Self::MIN_STEPS, Self::MAX_TOOL_CALLS_CEIL);
+        self.max_brain_rounds =
+            self.max_brain_rounds.clamp(Self::MIN_STEPS, Self::MAX_BRAIN_ROUNDS_CEIL);
+        self.max_duration_secs = self.max_duration_secs.min(Self::MAX_DURATION_CEIL);
+        self.extended_max_tool_calls =
+            self.extended_max_tool_calls.clamp(Self::MIN_STEPS, Self::MAX_TOOL_CALLS_CEIL);
+        self.extended_max_brain_rounds =
+            self.extended_max_brain_rounds.clamp(Self::MIN_STEPS, Self::MAX_BRAIN_ROUNDS_CEIL);
+        self.extended_max_duration_secs =
+            self.extended_max_duration_secs.min(Self::MAX_DURATION_CEIL);
+        self
+    }
+
+    /// The effective per-turn limits for the requested mode, already clamped. `extended` selects the
+    /// higher profile (a user-initiated long-work turn).
+    pub fn limits(&self, extended: bool) -> PrimeAgentLimits {
+        let c = self.clone().clamped();
+        if extended {
+            PrimeAgentLimits {
+                extended: true,
+                max_tool_calls: c.extended_max_tool_calls,
+                max_brain_rounds: c.extended_max_brain_rounds,
+                max_duration_secs: c.extended_max_duration_secs,
+            }
+        } else {
+            PrimeAgentLimits {
+                extended: false,
+                max_tool_calls: c.max_tool_calls,
+                max_brain_rounds: c.max_brain_rounds,
+                max_duration_secs: c.max_duration_secs,
+            }
+        }
+    }
+}
+
+impl Default for PrimeAgentPolicy {
+    fn default() -> Self {
+        // Practical, safe defaults — deliberately HIGHER than the old toy v1 caps (3/3) so Prime
+        // can actually chain a useful amount of work, but conservative enough that a normal turn
+        // finishes quickly. Extended mirrors Hermes's real per-agent ceiling (its default
+        // `max_iterations` is 90), scaled for an interactive chat turn.
+        Self {
+            max_tool_calls: 12,
+            max_brain_rounds: 18,
+            max_duration_secs: 180,
+            extended_max_tool_calls: 64,
+            extended_max_brain_rounds: 96,
+            extended_max_duration_secs: 1_800,
+        }
+    }
+}
+
+/// The effective, already-clamped per-turn limits the chat agent loop runs under — the resolution
+/// of a [`PrimeAgentPolicy`] for one mode. Surfaced on the config route / CLI so an operator can
+/// see the active ceiling at a glance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrimeAgentLimits {
+    /// Whether these are the extended (long-work) limits.
+    pub extended: bool,
+    /// Max tool executions allowed this turn.
+    pub max_tool_calls: u32,
+    /// Max brain rounds allowed this turn.
+    pub max_brain_rounds: u32,
+    /// Max wall-clock seconds for the turn's loop; `0` means no wall-clock cap.
+    pub max_duration_secs: u64,
+}
+
 /// The result of a single Prime autonomy tick.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrimeAutonomyTickResult {
@@ -1109,6 +1231,45 @@ pub struct PendingClarification {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prime_agent_policy_default_is_not_the_toy_v1_caps() {
+        // The old v1 hard caps were 3 tool calls / 3 brain rounds. The configurable default must
+        // be meaningfully higher so Prime feels like a real agent, while still bounded.
+        let p = PrimeAgentPolicy::default();
+        assert!(p.max_tool_calls > 3, "default tool calls must beat the toy cap: {}", p.max_tool_calls);
+        assert!(p.max_brain_rounds > 3, "default brain rounds must beat the toy cap");
+        // Extended is a higher ceiling than standard, but never unbounded.
+        assert!(p.extended_max_tool_calls > p.max_tool_calls);
+        assert!(p.extended_max_brain_rounds > p.max_brain_rounds);
+        assert!(p.extended_max_tool_calls <= PrimeAgentPolicy::MAX_TOOL_CALLS_CEIL);
+    }
+
+    #[test]
+    fn prime_agent_policy_limits_resolve_per_mode_and_clamp() {
+        let p = PrimeAgentPolicy::default();
+        let std = p.limits(false);
+        let ext = p.limits(true);
+        assert!(!std.extended && ext.extended);
+        assert_eq!(std.max_tool_calls, p.max_tool_calls);
+        assert_eq!(ext.max_tool_calls, p.extended_max_tool_calls);
+        assert!(ext.max_tool_calls > std.max_tool_calls, "extended must allow more tool calls");
+        // An out-of-range policy is clamped to the safe ceilings (no "infinite").
+        let wild = PrimeAgentPolicy {
+            max_tool_calls: 0,
+            max_brain_rounds: 99_999,
+            max_duration_secs: 999_999_999,
+            extended_max_tool_calls: u32::MAX,
+            extended_max_brain_rounds: u32::MAX,
+            extended_max_duration_secs: u64::MAX,
+        }
+        .clamped();
+        assert_eq!(wild.max_tool_calls, PrimeAgentPolicy::MIN_STEPS);
+        assert_eq!(wild.max_brain_rounds, PrimeAgentPolicy::MAX_BRAIN_ROUNDS_CEIL);
+        assert_eq!(wild.max_duration_secs, PrimeAgentPolicy::MAX_DURATION_CEIL);
+        assert_eq!(wild.extended_max_tool_calls, PrimeAgentPolicy::MAX_TOOL_CALLS_CEIL);
+        assert_eq!(wild.extended_max_duration_secs, PrimeAgentPolicy::MAX_DURATION_CEIL);
+    }
 
     #[test]
     fn prime_intent_serializes_cleanly() {

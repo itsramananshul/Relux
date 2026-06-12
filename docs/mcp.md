@@ -190,14 +190,22 @@ returns an honest "no such tool", never a raw dump (`crate::prime::parse_tool_re
   `is_chat_guarded`) — so it never reaches the `NeedsApproval` arm and never stages an
   approval.
 
-## Prime Agent Loop v1 (bounded think → tool → observe → respond, in chat)
+## Prime Agent Loop (bounded think → tool → observe → respond, in chat)
 
 The single explicit invocation above runs ONE named tool and stops. The **Prime Agent Loop** turns
-that into a real, bounded agentic loop for chat: on an explicit tool-request turn the configured
-brain may **call an allowed tool, observe its real output, and continue** — chaining a small number
-of tool calls and folding what it learned into a useful final answer — all behind the SAME
-fail-closed gates (Hermes/Codex-style `run_conversation`, but local and tightly bounded). It invents
-no second security model: every execution still flows through `prime_invoke_tool`.
+that into a real, configurable agentic loop for chat: on an explicit tool-request turn the configured
+brain may **call an allowed tool, observe its real output, and continue** — chaining tool calls and
+folding what it learned into a useful final answer — all behind the SAME fail-closed gates
+(Hermes/Codex-style `run_conversation`, but local and operator-bounded). It invents no second
+security model: every execution still flows through `prime_invoke_tool`.
+
+> **Note on limits (supersedes the original "v1" fixed caps).** The first cut of this loop shipped
+> with tiny hard-coded caps (3 tool calls / 3 brain rounds). Those made Prime feel like a toy. They
+> are **replaced by a configurable autonomy policy** (`relux_core::PrimeAgentPolicy`): a practical
+> *standard* profile (default **12** tool calls, **18** brain rounds, **180s**) and a higher
+> *extended* profile (default **64** / **96** / **1800s**) the operator can tune, plus an explicit
+> "keep working / extended mode" the user can invoke for long-running work. There is **no infinite
+> loop** — see "Why bounded, not infinite" below.
 
 **When the loop engages (the safety wall).** Only when (a) a brain is configured (not Local) and
 (b) the deterministic classifier returns `ToolInvocation` for the message (the user explicitly asked
@@ -219,10 +227,22 @@ returns nothing and `run_prime` falls back to the normal turn path unchanged.
   call one tool, or `{"answer":"…"}` to finish. A valid pick is executed through the gate
   (`KernelState::prime_agent_step` → `prime_invoke_tool`); the **real, redacted, bounded**
   observation is fed back, and the brain calls another tool or answers.
-- **Caps (Hermes `max_iterations`):** at most `MAX_AGENT_TOOL_CALLS = 3` tool executions and
-  `MAX_BRAIN_ROUNDS = 3` brain rounds (one initial + up to two post-observation iterations) per
-  turn; a repeated identical call (no progress) stops the loop; each observation is secret-redacted
-  (`relux_core::redact_secrets`) and clamped (`MAX_OBS_CHARS`).
+- **Configurable limits (Hermes `max_iterations`, but operator-set).** The per-turn ceilings come
+  from the operator's `PrimeAgentPolicy`, resolved into `AgentLimits` (`max_tool_calls`,
+  `max_brain_rounds`) for the active profile. The kernel also enforces an optional wall-clock
+  deadline (`max_duration_secs`) via `AgentLoop::mark_deadline_exceeded` (the loop owns rounds/calls;
+  the kernel owns the clock). The **standard** profile is used by default; the **extended** profile
+  is selected when the user explicitly asks Prime to keep working (`prime_wants_extended_work` cue
+  detection — a fallback keyword rail that only RAISES the ceiling for an already-`ToolInvocation`
+  turn; it never creates a tool request). A repeated identical call (no progress) still stops the
+  loop early; each observation is secret-redacted (`relux_core::redact_secrets`) and clamped
+  (`MAX_OBS_CHARS`).
+- **Limit reached → say so + offer to continue, never "done".** When a configured ceiling is hit
+  with work still to do, the loop returns `AgentOutcome::LimitReached(LimitKind)` (tool-calls /
+  reasoning-rounds / time). The turn's reply names EXACTLY which limit was reached, shows what was
+  gathered so far, and carries a one-click **"Keep working (extended)"** suggestion that re-sends the
+  original request under the extended profile (a fresh, audited turn). Prime never fabricates a
+  finished answer it did not reach.
 - **Gated tool → pause, not auto-run.** A `NeedsApproval` tool with no standing grant returns the
   EXISTING staged approval card (see "Chat-staged approval" above) and the loop **stops** — nothing
   ran. An allow-always grant turns that same tool into a direct run (the grant fast-path in
@@ -242,12 +262,32 @@ final reply is the brain's answer grounded in the observations (kept determinist
 is set, so it is actionful and never re-narrated). No raw CLI JSON or transport envelope reaches the
 user.
 
-**v2 gaps (honest).** v1 does NOT: resume the brain's reasoning automatically AFTER an approval is
-granted (the operator approves + the bound call runs once via the existing routes; the brain does
-not then continue the loop in the same turn — it resumes on the next message, now grant-covered);
-stream tool output live; branch / run tools in parallel; or let the brain pick tools the user did
-not explicitly request (the `ToolInvocation` gate is the entry condition). These are deliberately
-out of scope to keep v1 local, bounded, and reuse-only.
+**Why bounded, not infinite (binding).** Even the extended profile has a finite ceiling, and the
+operator cannot set "infinite" — every policy field is clamped (`PrimeAgentPolicy::clamped`: tool
+calls ≤ 512, brain rounds ≤ 1024, duration ≤ 24h). A literal unbounded loop is unsafe: a misbehaving
+brain or a runaway tool chain would spin forever, run up cost, and never yield control. The product
+instead gives **operator-controlled high limits + an explicit continue**: when a ceiling is reached
+the loop stops, reports it, and offers to continue — so "keep working" is a governed, auditable
+continuation, not an ungoverned loop. Approvals still pause the loop and a high-risk tool never
+auto-runs, regardless of the limits.
+
+**Configuring + continuing.** The policy is served at `GET/PUT/PATCH /v1/relux/prime/agent-policy`
+(response carries the resolved standard/extended limits), set in the dashboard's **Prime Autonomy
+Limits** panel (Health → Prime Brain), or via `relux-kernel prime agent-policy <status|configure>`.
+To run long work: tell Prime to "keep working" / "use extended mode" (raises this turn to the
+extended profile), or click the **Keep working (extended)** button Prime offers when a limit is hit.
+
+**Continuation model + remaining gap (honest).** Each continuation is a **fresh, audited turn** that
+re-runs the original request under the higher profile — it does NOT yet resume mid-loop from the
+already-gathered observations (the agent-loop prompt is rebuilt from the message + live catalog, not
+the prior turn's partial trace). So continuing re-does the work with a bigger budget rather than
+picking up exactly where it paused. Full incremental resume (carry the prior observations/cursor into
+the next loop) is the next step. The loop also still does NOT: resume the brain's reasoning
+automatically AFTER an approval is granted (the operator approves + the bound call runs once via the
+existing routes; the brain resumes on the next message, now grant-covered); stream tool output live;
+branch / run tools in parallel; or let the brain pick tools the user did not explicitly request (the
+`ToolInvocation` gate is the entry condition). These stay out of scope to keep the loop local,
+bounded, and reuse-only.
 
 ## Session continuity (streamable-HTTP `Mcp-Session-Id`)
 
@@ -700,20 +740,31 @@ Files read before implementing the plan:
   plugin/tool + args bounds checked at create time), so an invalid plan is a `400` and
   never a partially-run task.
 
-**Prime Agent Loop v1 reference mapping (`docs/reference-driven-development.md`, BINDING).**
-Files read before implementing the loop:
+**Prime Agent Loop reference mapping (`docs/reference-driven-development.md`, BINDING).**
+Files read before implementing the loop and the configurable autonomy policy:
 - **Hermes** `reference/hermes-agent-main/agent/conversation_loop.py` `run_conversation(...)` —
   the per-turn agentic loop: `while (api_call_count < agent.max_iterations and
   agent.iteration_budget.remaining > 0)` (L598) bounds the rounds; the assistant reply is inspected
   for tool calls, each requested tool is executed and its result fed back as a `role:"tool"` message
   (L630-676), and the loop ends when the model stops requesting tools and answers. The chosen tool
   is validated against `agent.valid_tool_names` BEFORE execution (L389, L656) — an off-list name is
-  fed back as a self-correction message, never executed. We mirror this exactly:
-  `crates/relux-kernel/src/prime_agent_loop.rs` — `AgentLoop` (the bounded driver,
-  `MAX_AGENT_TOOL_CALLS` / `MAX_BRAIN_ROUNDS`), the live `AgentTool` catalog (`valid_tool_names`),
-  `interpret_agent_reply` (the pick interpreter + off-catalog `UnknownTool` self-correction), and a
-  reply with no tool/`{"answer":…}` ends the loop. We **diverge** by gating loop *entry* on an
-  explicit `ToolInvocation` turn (the safety wall) and by capping much tighter (3 calls / 3 rounds).
+  fed back as a self-correction message, never executed.
+- **Hermes** `reference/hermes-agent-main/agent/iteration_budget.py` `IterationBudget(max_total)` +
+  `cli-config.yaml.example` — the loop bound is a **configurable** per-agent budget (`max_iterations`
+  default **90** for the parent, `delegation.max_iterations` default **50** per subagent), a
+  thread-safe consume counter, NOT a tiny hard constant. This is the direct precedent for replacing
+  Relux's toy 3/3 caps with a configurable policy: a real agent's per-turn ceiling is set high and
+  operator-tunable. We mirror the *configurable-ceiling* shape (our `PrimeAgentPolicy` →
+  `AgentLimits`, standard default 12/18 and extended 64/96) while keeping our explicit-`ToolInvocation`
+  entry wall.
+- We mirror the loop shape exactly in `crates/relux-kernel/src/prime_agent_loop.rs` — `AgentLoop`
+  (the bounded driver; the per-turn ceiling now lives in `AgentLimits`, resolved from the operator's
+  `relux_core::PrimeAgentPolicy`, NOT a fixed constant), the live `AgentTool` catalog
+  (`valid_tool_names`), `interpret_agent_reply` (the pick interpreter + off-catalog `UnknownTool`
+  self-correction), and a reply with no tool/`{"answer":…}` ends the loop. We **diverge** by gating
+  loop *entry* on an explicit `ToolInvocation` turn (the safety wall) and by reporting a hit ceiling
+  as `AgentOutcome::LimitReached` so the turn offers an auditable continue rather than pretending it
+  finished.
 - **openclaw** `reference/openclaw-main/src/agents/tool-mutation.ts` `isMutatingToolCall` (the
   fail-closed default — an unknown action is mutating) and `src/acp/approval-classifier.ts` (an
   unknown tool never auto-approves). We invert the polarity for the same safety: `build_agent_catalog`

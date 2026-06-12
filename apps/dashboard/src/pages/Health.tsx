@@ -14,6 +14,7 @@ import {
   type ReluxPlugin,
 } from "../api";
 import { PrimeBrainPanel } from "../components/PrimeBrainPanel";
+import { PrimeAgentPolicyPanel } from "../components/PrimeAgentPolicyPanel";
 import { buildReadiness } from "../readiness";
 import { ReadinessGuide } from "../components/ReadinessGuide";
 import { DoctorPanel } from "../components/DoctorPanel";
@@ -301,6 +302,8 @@ export function Health() {
       </div>
 
       <PrimeBrainPanel />
+
+      <PrimeAgentPolicyPanel />
 
       <div className="card">
         <h3>AI Status</h3>

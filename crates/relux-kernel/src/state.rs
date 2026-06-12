@@ -109,6 +109,10 @@ pub struct KernelSnapshot {
     /// The append-only audit log, in emission order.
     pub audit_events: Vec<AuditEvent>,
     pub prime_autonomy_config: PrimeAutonomyConfig,
+    /// The configurable chat agent-loop autonomy policy. Defaulted so older snapshots (which never
+    /// wrote it) load with the practical default profile.
+    #[serde(default)]
+    pub prime_agent_policy: relux_core::PrimeAgentPolicy,
     /// Durable Prime orchestrations (goal -> briefs -> agents -> runs), sorted by
     /// id. Defaulted so older snapshots load cleanly.
     #[serde(default)]
@@ -274,6 +278,11 @@ pub struct KernelState {
     /// The append-only audit log, in emission order.
     audit_log: Vec<AuditEvent>,
     pub prime_autonomy_config: PrimeAutonomyConfig,
+    /// The configurable autonomy policy for Prime's CHAT agent loop (max tool calls / brain rounds /
+    /// wall-clock, standard + extended profiles). Replaces the old fixed v1 loop caps; resolved per
+    /// turn into [`crate::prime_agent_loop::AgentLimits`]. Distinct from
+    /// `prime_autonomy_config` (which governs the background task-tick loop).
+    pub prime_agent_policy: relux_core::PrimeAgentPolicy,
     /// Multi-turn clarification memory: the small, bounded pending-clarification
     /// record per conversation (keyed by namespace + actor), so a follow-up answer
     /// can resolve the clarifying question Prime asked last turn instead of being
@@ -403,6 +412,7 @@ impl KernelState {
             run_logs: sorted(&self.run_logs, |l| l.run_id.as_str()),
             audit_events: self.audit_log.clone(),
             prime_autonomy_config: self.prime_autonomy_config.clone(),
+            prime_agent_policy: self.prime_agent_policy.clone(),
             orchestrations: sorted(&self.orchestrations, |o| o.id.as_str()),
             pending_clarifications: {
                 let mut out: Vec<PendingClarificationEntry> = self
@@ -533,6 +543,7 @@ impl KernelState {
         state.next_orchestration = snapshot.counters.next_orchestration;
         state.next_grant = snapshot.counters.next_grant;
         state.prime_autonomy_config = snapshot.prime_autonomy_config;
+        state.prime_agent_policy = snapshot.prime_agent_policy.clamped();
         state
     }
 
@@ -15969,6 +15980,31 @@ mod tests {
         assert!(restored_config.auto_assign_unassigned);
         assert_eq!(restored_config.last_tick_at, Some(now));
         assert_eq!(restored_config.last_tick_summary, Some("Test summary".to_string()));
+    }
+
+    #[test]
+    fn prime_agent_policy_persists_and_clamps_through_snapshot() {
+        let (mut k, _ctx) = prime_chat_kernel();
+        // Default must already beat the old toy caps.
+        assert!(k.prime_agent_policy.max_tool_calls > 3);
+
+        // Operator raises the standard ceiling and an out-of-range extended one.
+        k.prime_agent_policy.max_tool_calls = 25;
+        k.prime_agent_policy.extended_max_tool_calls = u32::MAX; // must clamp on restore
+
+        let snapshot = k.snapshot();
+        let restored = KernelState::from_snapshot(snapshot);
+        assert_eq!(restored.prime_agent_policy.max_tool_calls, 25, "raised limit persisted");
+        assert_eq!(
+            restored.prime_agent_policy.extended_max_tool_calls,
+            relux_core::PrimeAgentPolicy::MAX_TOOL_CALLS_CEIL,
+            "an out-of-range limit is clamped on restore — never infinite"
+        );
+        // The resolved per-turn limits the loop runs under reflect the stored policy.
+        let std = crate::prime_agent_loop::AgentLimits::from_policy(&restored.prime_agent_policy, false);
+        let ext = crate::prime_agent_loop::AgentLimits::from_policy(&restored.prime_agent_policy, true);
+        assert_eq!(std.max_tool_calls, 25);
+        assert!(ext.max_tool_calls > std.max_tool_calls);
     }
 
     #[test]
