@@ -25,6 +25,12 @@ import {
   adhocSubtaskProgress,
   subtaskCounts,
 } from "../adhocsubtrees";
+import {
+  rollupRuns,
+  runRollupChips,
+  adhocSubtreeTaskIds,
+  type RollupChip,
+} from "../runrollup";
 import { operatorStatusMoves, canMoveStatus } from "../taskmove";
 import { orchestrationStatusTone } from "../orchestration";
 import { approvalInlineActions } from "../approvalactions";
@@ -252,6 +258,7 @@ export function Work() {
 
             <WorkHierarchy
               groups={groups}
+              runs={runs || []}
               error={errorOrchestrations ? String(errorOrchestrations) : null}
               loading={!orchestrations && !errorOrchestrations}
               agents={agents || []}
@@ -273,6 +280,7 @@ export function Work() {
                     group={selectedTaskGroup}
                     agents={agents || []}
                     tasks={tasks || []}
+                    runs={runs || []}
                     onInspectTask={handleInspectTask}
                     onChanged={handleReload}
                     onClose={() => setSelectedTaskId(null)}
@@ -784,12 +792,14 @@ export function OversightApprovalRow({
 // cards in the columns below, and a failed/empty read degrades to an honest state.
 export function WorkHierarchy({
   groups,
+  runs,
   error,
   loading,
   agents,
   onInspectTask,
 }: {
   groups: WorkGroup[];
+  runs: ReluxRun[];
   error: string | null;
   loading: boolean;
   agents: ReluxAgent[];
@@ -820,7 +830,7 @@ export function WorkHierarchy({
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           {groups.map(g => (
-            <WorkGroupCard key={g.id} group={g} agentName={agentName} onInspectTask={onInspectTask} />
+            <WorkGroupCard key={g.id} group={g} runs={runs} agentName={agentName} onInspectTask={onInspectTask} />
           ))}
         </div>
       )}
@@ -834,15 +844,19 @@ export function WorkHierarchy({
 // record — said so honestly rather than implying live state.
 function WorkGroupCard({
   group,
+  runs,
   agentName,
   onInspectTask,
 }: {
   group: WorkGroup;
+  runs: ReluxRun[];
   agentName: (id: string | null) => string;
   onInspectTask: (taskId: string) => void;
 }) {
   const g = group;
   const plural = g.progress.total === 1 ? "" : "s";
+  // The run/cost rollup for this group = the runs under its child tasks (design §6).
+  const groupTaskIds = useMemo(() => g.children.map(c => c.taskId), [g.children]);
   return (
     <div className="card sm" style={{ padding: 10, border: "1px solid var(--border)" }}>
       <div className="row" style={{ alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
@@ -865,6 +879,9 @@ function WorkGroupCard({
           Progress is from the orchestration record — these briefs are not on the current board view.
         </div>
       )}
+      <div style={{ marginTop: 8 }}>
+        <RunRollupChips runs={runs} taskIds={groupTaskIds} />
+      </div>
       <details style={{ marginTop: 8 }}>
         <summary style={{ cursor: "pointer", fontSize: 11 }}>Show the {g.progress.total}-brief plan</summary>
         <div style={{ marginTop: 8 }}>
@@ -884,6 +901,38 @@ function SegmentedBar({ progress }: { progress: GroupProgress }) {
     <div className="seg-bar" title={groupProgressLabel(progress)} aria-label={groupProgressLabel(progress)}>
       {segs.map(s => (
         <span key={s.bucket} style={{ width: `${s.pct}%`, background: bucketColorVar(s.bucket) }} />
+      ))}
+    </div>
+  );
+}
+
+// The per-subtree RUN / COST ROLLUP strip (design §6 "live cost (tokens + spend)
+// for the subtree"). A compact row of chips computed PURELY on the client by joining
+// the live run list (reluxWork.listRuns — each run carries task_id + the optional
+// measured cost/duration/usage) to the subtree's task ids (runrollup.ts). It is
+// scrupulously honest: cost/duration/tokens are summed ONLY over runs that reported
+// them, "cost unavailable" is shown when none did (never a fabricated $0.00), and the
+// chip tooltips disclose partial coverage. Run Detail remains the source of full logs;
+// each chip is a glance signal, not a drill-down. Renders nothing when there is no
+// rollup data to show (a subtree whose tasks have never run shows a single
+// "no runs yet" chip, so the strip is never silently blank where work exists).
+export function RunRollupChips({ runs, taskIds }: { runs: ReluxRun[]; taskIds: string[] }) {
+  const chips = useMemo<RollupChip[]>(
+    () => runRollupChips(rollupRuns(runs, taskIds)),
+    [runs, taskIds],
+  );
+  const toneClass = (tone: RollupChip["tone"]) =>
+    tone === "failed" ? "blocked" : tone === "active" ? "in_progress" : "backlog";
+  return (
+    <div className="rollup-strip" role="group" aria-label="Run and cost rollup">
+      {chips.map((c, i) => (
+        <span
+          key={`${c.label}-${i}`}
+          className={`badge ${toneClass(c.tone)} rollup-chip`}
+          title={c.title}
+        >
+          {c.label}
+        </span>
       ))}
     </div>
   );
@@ -1173,6 +1222,7 @@ function TaskDetailPanel({
   group,
   agents,
   tasks,
+  runs,
   onInspectTask,
   onChanged,
   onClose,
@@ -1181,6 +1231,7 @@ function TaskDetailPanel({
   group: WorkGroup | null;
   agents: ReluxAgent[];
   tasks: ReluxTask[];
+  runs: ReluxRun[];
   onInspectTask: (taskId: string) => void;
   onChanged: () => void;
   onClose: () => void;
@@ -1219,6 +1270,9 @@ function TaskDetailPanel({
             <span className="muted" style={{ fontSize: 11 }}>{groupProgressLabel(group.progress)}</span>
           </div>
           <SegmentedBar progress={group.progress} />
+          <div style={{ marginTop: 8 }}>
+            <RunRollupChips runs={runs} taskIds={group.children.map(c => c.taskId)} />
+          </div>
           <details style={{ marginTop: 8 }}>
             <summary style={{ cursor: "pointer", fontSize: 11 }}>
               Show the {group.progress.total}-brief plan
@@ -1272,6 +1326,7 @@ function TaskDetailPanel({
       <AdhocSubtaskSection
         taskId={taskId}
         tasks={tasks}
+        runs={runs}
         agentName={agentName}
         onInspectTask={onInspectTask}
         onChanged={onChanged}
@@ -1287,18 +1342,26 @@ function TaskDetailPanel({
 export function AdhocSubtaskSection({
   taskId,
   tasks,
+  runs,
   agentName,
   onInspectTask,
   onChanged,
 }: {
   taskId: string;
   tasks: ReluxTask[];
+  runs: ReluxRun[];
   agentName: (id: string | null) => string;
   onInspectTask: (taskId: string) => void;
   onChanged: () => void;
 }) {
   const children = useMemo(() => childrenOfTask(tasks, taskId), [tasks, taskId]);
   const progress = useMemo(() => adhocSubtaskProgress(children), [children]);
+  // The ad-hoc subtree's run/cost rollup spans the parent task itself plus its direct
+  // children (the parent is a real task that may have runs) — design §6.
+  const subtreeTaskIds = useMemo(
+    () => adhocSubtreeTaskIds(taskId, children.map(c => c.taskId)),
+    [taskId, children],
+  );
   const [title, setTitle] = useState("");
   const [adding, setAdding] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -1336,6 +1399,9 @@ export function AdhocSubtaskSection({
       {children.length > 0 ? (
         <>
           <SegmentedBar progress={progress} />
+          <div style={{ marginTop: 8 }}>
+            <RunRollupChips runs={runs} taskIds={subtreeTaskIds} />
+          </div>
           <div className="plan-list" style={{ marginTop: 8 }}>
             {children.map(c => (
               <div key={c.taskId} className="plan-row">

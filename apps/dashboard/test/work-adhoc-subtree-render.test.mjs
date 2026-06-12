@@ -37,10 +37,17 @@ const TASKS = [
 ];
 const agentName = (id) => (id === "a1" ? "Builder" : id === "a2" ? "Tester" : "unassigned");
 
-export function renderWithChildren() {
+// Runs under the parent + its children — one real cost/duration, so the ad-hoc
+// subtree's run/cost rollup (design §6) renders real figures.
+const RUNS = [
+  { id: "r1", task_id: "task_1", agent_id: "a1", adapter_plugin: "x", status: "running" },
+  { id: "r2", task_id: "task_2", agent_id: "a1", adapter_plugin: "x", status: "completed", cost: 0.02, duration_ms: 5000, usage: { input_tokens: 800, output_tokens: 200 } },
+];
+
+export function renderWithChildren(runs = RUNS) {
   return renderToStaticMarkup(
     <StaticRouter location="/work">
-      <AdhocSubtaskSection taskId={PARENT} tasks={TASKS} agentName={agentName} onInspectTask={() => {}} onChanged={() => {}} />
+      <AdhocSubtaskSection taskId={PARENT} tasks={TASKS} runs={runs} agentName={agentName} onInspectTask={() => {}} onChanged={() => {}} />
     </StaticRouter>
   );
 }
@@ -48,7 +55,7 @@ export function renderWithChildren() {
 export function renderEmpty() {
   return renderToStaticMarkup(
     <StaticRouter location="/work">
-      <AdhocSubtaskSection taskId={"task_5"} tasks={TASKS} agentName={agentName} onInspectTask={() => {}} onChanged={() => {}} />
+      <AdhocSubtaskSection taskId={"task_5"} tasks={TASKS} runs={[]} agentName={agentName} onInspectTask={() => {}} onChanged={() => {}} />
     </StaticRouter>
   );
 }
@@ -100,6 +107,16 @@ test("AdhocSubtaskSection renders the parent's children with a progress strip", 
   assert.match(html, /completed/);
   assert.match(html, /Builder/);
   assert.match(html, /Tester/);
+});
+
+test("AdhocSubtaskSection renders the subtree run/cost rollup (parent + children) from real run data", () => {
+  const html = mod.renderWithChildren();
+  // Two runs across the parent + children; a real reported cost; a token chip.
+  assert.match(html, /2 runs/);
+  assert.match(html, /\$0\.0200/);
+  assert.match(html, /tok/);
+  assert.match(html, /rollup-strip/);
+  assert.doesNotMatch(html, /cost unavailable/);
 });
 
 test("AdhocSubtaskSection always offers an Add-subtask form", () => {

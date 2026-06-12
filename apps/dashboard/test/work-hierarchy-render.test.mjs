@@ -60,11 +60,18 @@ const AGENTS = [
   { id: "a2", name: "Tester", description: "", adapter_plugin: "x", namespace: "default", status: "active", permissions_summary: "", permissions: [], created_at: "1" },
 ];
 
-export function renderWithGroups() {
+// Runs under the group's child tasks — one with a real cost/duration/usage, one
+// failed, so the per-subtree run/cost rollup (design §6) renders real figures.
+const RUNS = [
+  { id: "r1", task_id: "task_1", agent_id: "a1", adapter_plugin: "x", status: "completed", cost: 0.012, duration_ms: 8000, usage: { input_tokens: 1200, output_tokens: 340 } },
+  { id: "r2", task_id: "task_2", agent_id: "a1", adapter_plugin: "x", status: "failed", cost: 0.003, duration_ms: 1000 },
+];
+
+export function renderWithGroups(runs = RUNS) {
   const groups = nonEmptyGroups(buildWorkGroups([ORCH], TASKS));
   return renderToStaticMarkup(
     <StaticRouter location="/work">
-      <WorkHierarchy groups={groups} error={null} loading={false} agents={AGENTS} onInspectTask={() => {}} />
+      <WorkHierarchy groups={groups} runs={runs} error={null} loading={false} agents={AGENTS} onInspectTask={() => {}} />
     </StaticRouter>
   );
 }
@@ -72,7 +79,7 @@ export function renderWithGroups() {
 export function renderEmpty() {
   return renderToStaticMarkup(
     <StaticRouter location="/work">
-      <WorkHierarchy groups={[]} error={null} loading={false} agents={[]} onInspectTask={() => {}} />
+      <WorkHierarchy groups={[]} runs={[]} error={null} loading={false} agents={[]} onInspectTask={() => {}} />
     </StaticRouter>
   );
 }
@@ -80,7 +87,7 @@ export function renderEmpty() {
 export function renderError() {
   return renderToStaticMarkup(
     <StaticRouter location="/work">
-      <WorkHierarchy groups={[]} error={"boom"} loading={false} agents={[]} onInspectTask={() => {}} />
+      <WorkHierarchy groups={[]} runs={[]} error={"boom"} loading={false} agents={[]} onInspectTask={() => {}} />
     </StaticRouter>
   );
 }
@@ -147,6 +154,27 @@ test("WorkHierarchy renders the numbered workflow checklist with children + depe
   // Assignees resolve to crew names.
   assert.match(html, /Builder/);
   assert.match(html, /Tester/);
+});
+
+test("WorkHierarchy renders the per-subtree run/cost rollup chips from real run data", () => {
+  const html = mod.renderWithGroups();
+  // Two runs under the group's tasks; one failed; real summed cost; a token chip.
+  assert.match(html, /2 runs/);
+  assert.match(html, /1 failed/);
+  assert.match(html, /\$0\.0150/); // 0.012 + 0.003, real reported cost
+  assert.match(html, /tok/);
+  assert.match(html, /rollup-strip/);
+  assert.doesNotMatch(html, /cost unavailable/);
+});
+
+test("WorkHierarchy rollup says 'cost unavailable' (no fake $0) when no run reported a cost", () => {
+  // Same group, but the runs carry no cost/usage (the local-echo path) — the rollup
+  // must be honest, not print a fabricated zero.
+  const html = mod.renderWithGroups([
+    { id: "r1", task_id: "task_1", agent_id: "a1", adapter_plugin: "x", status: "completed" },
+  ]);
+  assert.match(html, /1 run/);
+  assert.match(html, /cost unavailable/);
 });
 
 test("WorkHierarchy shows the honest empty state when there are no groups", () => {

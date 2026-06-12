@@ -381,6 +381,14 @@ a > .stat-card:hover { border-color: var(--text-faint); }
    only — design §12). Distinct from the single-fill `.progress-fill` above. */
 .seg-bar { display: flex; height: 6px; border-radius: 999px; background: var(--bg-elev); overflow: hidden; flex: 1; min-width: 100px; }
 .seg-bar > span { height: 100%; transition: width 0.2s; }
+/* Per-subtree run/cost ROLLUP strip (relix-dashboard-design §6 "live cost
+   (tokens + spend) for the subtree"): a compact wrap of glance chips computed
+   purely client-side from the run list (runrollup.ts). Reuses the B&W `.badge`
+   vocabulary; `.rollup-chip` just tightens it for a dense metric row. Color is
+   semantic-only (design §12) — neutral metrics stay muted, only attention
+   (failed/active) tones carry meaning. */
+.rollup-strip { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.rollup-chip { font-size: 10px; font-weight: 500; cursor: default; }
 /* A numbered step in the Mandate workflow (strategy → team → clearances → orchestrate). */
 .wf-step { padding: 10px 0; border-bottom: 1px solid var(--border-soft); }
 .wf-step:first-of-type { padding-top: 4px; }
