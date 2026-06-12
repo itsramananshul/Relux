@@ -11336,7 +11336,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(v["items"].is_array(), "items present");
         assert_eq!(v["items"].as_array().unwrap().len(), 0, "fresh store: nothing to attend to");
-        assert_eq!(v["truncated"].as_bool().unwrap(), false, "nothing truncated");
+        assert!(!v["truncated"].as_bool().unwrap(), "nothing truncated");
 
         // Create a task through the real route — a CREATED task is not an attention item.
         let (cs, _, cb) =
@@ -13583,7 +13583,7 @@ mod tests {
         assert_eq!(resp["reopened"], true, "reopen stage succeeded: {b}");
         assert!(resp["run_id"].is_null(), "no run id on a refusal: {b}");
         assert!(
-            resp["run_refused"].as_str().unwrap_or_default().len() > 0,
+            !resp["run_refused"].as_str().unwrap_or_default().is_empty(),
             "an honest run-refusal message is surfaced: {b}"
         );
         // The reopen is PRESERVED: the task is no longer Blocked (it ran and failed).

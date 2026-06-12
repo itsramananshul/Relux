@@ -328,7 +328,7 @@ mod tests {
             Some("unknown"),
             None,
             Some(secret),
-            &[huge_line.clone()],
+            std::slice::from_ref(&huge_line),
         );
         // Failure text: secret redacted, length clamped.
         let ft = c.failure_text.expect("failure text");
