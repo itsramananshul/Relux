@@ -1836,6 +1836,35 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.24** (2026-06-12) — **MCP surface deepening** on top of v0.1.23, continuing the §9
+  ("P2 — MCP tool support") line from `docs/HERMES_OPENCLAW_DEEP_AUDIT.md`, built reference-first
+  against the vendored Hermes (`tools/mcp_tool.py`, `hermes_cli/mcp_config.py`) and the legacy
+  `relix-runtime` streamable-HTTP client per `docs/reference-driven-development.md` (full mapping in
+  `docs/mcp.md`). No master-plan safety property is weakened: MCP stays **loopback-only**, no
+  downloaded code is ever run, secrets are never persisted or returned, and every MCP tool call flows
+  through the SAME permission / approval / grant / audit gates a real plugin tool uses. **Session
+  continuity:** the kernel captures the `Mcp-Session-Id` header on `initialize`, validates it to the
+  visible-ASCII charset (header-injection guard), and echoes it on the operation's later requests; a
+  `404` mid-session triggers one bounded clear-and-re-initialize retry, then fails honestly; the
+  session id is in-memory per operation only (never persisted/logged/returned), with no long-lived
+  SSE channel and no cross-operation reuse. **Read-only resources:** `relux_core` `McpResource` /
+  `McpResourceContent` plus `list_resources` / `read_resource` clients add MCP resources as a
+  Prime/operator context source (binary blocks summarized not decoded; text sanitized,
+  secret-redacted, clamped), surfaced read-only at `GET /v1/relux/mcp/servers/:id/resources` and
+  `.../resources/read?uri=...`, on the Prime `READ_ONLY_TOOLS` allowlist (dialed outside the kernel
+  lock, no mutation), and in a dashboard Resources panel (maps Hermes
+  `_make_list_resources_handler` / `_make_read_resource_handler`, plus a Relux secret-redact of the
+  read body). **Run-transcript visibility:** a run-bound MCP tool call records distinct, bounded,
+  secret-redacted `mcp_tool_call` / `mcp_tool_call_denied` / `mcp_tool_call_failed` events
+  (`result_summary` redacted + clamped to 500 chars; raw args / `structuredContent` / JSON-RPC
+  envelope / session id never in the transcript); manual/approval/out-of-run grant bypasses stay
+  audit-only. **First production run path:** a `Task` may carry an operator-named
+  `{ tool_call: { plugin, tool, args } }` directive that the deterministic local run
+  (`execute_local_run`) routes through the gated `call_tool` chokepoint instead of echo (the brain
+  never picks the tool), failing the run/task honestly on a gate refusal; `POST /v1/relux/tasks`
+  accepts the optional directive. `cargo test` + `clippy` clean on `relux-core`/`relux-kernel`,
+  dashboard tests + typecheck + build green, the tracked `dashboard-dist` bundle rebuilt and
+  committed in sync. Every safety property from v0.1.23 still holds.
 - **v0.1.23** (2026-06-12) — the **first safe MCP (Model Context Protocol) surface** on top of
   v0.1.22, driven by `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` (§9, "P2 — MCP tool support") and
   `docs/RELUX_MASTER_PLAN.md` §8.2/§18, built reference-first against the vendored Hermes
