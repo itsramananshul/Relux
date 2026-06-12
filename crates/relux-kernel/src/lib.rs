@@ -334,4 +334,8 @@ pub enum KernelError {
     McpDiscoveryFailed { id: String, message: String },
     #[error("invalid MCP tool name '{tool}' for server '{server}' (must be [A-Za-z0-9._-], non-empty, bounded)")]
     InvalidMcpToolName { server: String, tool: String },
+    #[error("invalid MCP resource URI '{uri}' for server '{server}' (must be non-empty, bounded, control-char free)")]
+    InvalidMcpResourceUri { server: String, uri: String },
+    #[error("MCP resource fetch against server '{id}' failed: {message}")]
+    McpResourceFetchFailed { id: String, message: String },
 }

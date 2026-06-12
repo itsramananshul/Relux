@@ -1227,6 +1227,71 @@ impl KernelState {
         Ok(out)
     }
 
+    /// Run a live `resources/list` against an enabled MCP server, returning the
+    /// bounded, sanitized resources it advertises.
+    ///
+    /// MCP **resources** are a read-only context surface (files, records, docs an
+    /// agent can read) — distinct from tools (which act). Listing them performs a
+    /// bounded loopback read and mutates nothing. Honest by construction: an unknown
+    /// server is [`KernelError::UnknownMcpServer`]; a disabled one is
+    /// [`KernelError::McpServerDisabled`]; a transport/protocol failure is
+    /// [`KernelError::McpResourceFetchFailed`] (never a fabricated empty list).
+    /// Read-only (`&self`): no audit mutation, mirroring [`Self::discover_mcp_tools`].
+    pub fn list_mcp_resources(&self, id: &str) -> Result<Vec<relux_core::McpResource>, KernelError> {
+        let server = self
+            .mcp_servers
+            .get(id)
+            .ok_or_else(|| KernelError::UnknownMcpServer(id.to_string()))?;
+        if !server.enabled {
+            return Err(KernelError::McpServerDisabled(id.to_string()));
+        }
+        crate::mcp::list_resources(&server.endpoint, server.timeout_ms).map_err(|e| {
+            KernelError::McpResourceFetchFailed {
+                id: id.to_string(),
+                message: e.to_string(),
+            }
+        })
+    }
+
+    /// Read ONE MCP resource by URI from an enabled MCP server, returning the
+    /// shaped, sanitized, secret-redacted [`relux_core::McpResourceContent`] (text
+    /// content only; binary summarized honestly — never raw bytes, never the raw
+    /// envelope).
+    ///
+    /// A `resources/read` is inert: it performs no action and mutates nothing, so
+    /// this is safe to expose as a read-only context source. Honest by construction:
+    /// an unknown server is [`KernelError::UnknownMcpServer`]; a disabled one is
+    /// [`KernelError::McpServerDisabled`]; an invalid URI is
+    /// [`KernelError::InvalidMcpResourceUri`] (fail closed, never dialed); a
+    /// transport/protocol failure is [`KernelError::McpResourceFetchFailed`].
+    /// Read-only (`&self`): no audit mutation, mirroring [`Self::discover_mcp_tools`].
+    pub fn read_mcp_resource(
+        &self,
+        id: &str,
+        uri: &str,
+    ) -> Result<relux_core::McpResourceContent, KernelError> {
+        let server = self
+            .mcp_servers
+            .get(id)
+            .ok_or_else(|| KernelError::UnknownMcpServer(id.to_string()))?;
+        if !server.enabled {
+            return Err(KernelError::McpServerDisabled(id.to_string()));
+        }
+        let uri = uri.trim();
+        if !relux_core::is_valid_mcp_resource_uri(uri) {
+            return Err(KernelError::InvalidMcpResourceUri {
+                server: id.to_string(),
+                uri: uri.chars().take(120).collect(),
+            });
+        }
+        crate::mcp::read_resource(&server.endpoint, uri, server.timeout_ms).map_err(|e| {
+            KernelError::McpResourceFetchFailed {
+                id: id.to_string(),
+                message: e.to_string(),
+            }
+        })
+    }
+
     /// Set (or replace) the operator's risk + approval classification for ONE MCP
     /// tool, so a discovered tool can become directly runnable (Low + auto-approve)
     /// or stay gated. The server must exist and the tool name must be a safe
@@ -5816,6 +5881,22 @@ impl KernelState {
             })
             .collect();
 
+        // Registered loopback MCP servers (read-only context sources), sorted by id for a
+        // deterministic order. Carries the non-secret loopback endpoint + per-call timeout so the
+        // live MCP resource tools can dial OUTSIDE the lock; no secret is projected.
+        let mcp_servers: Vec<crate::prime_tools::McpServerView> = self
+            .mcp_servers()
+            .into_iter()
+            .take(MAX_SNAPSHOT_ITEMS)
+            .map(|s| crate::prime_tools::McpServerView {
+                id: s.id.clone(),
+                endpoint: s.endpoint.clone(),
+                description: s.description.clone(),
+                enabled: s.enabled,
+                timeout_ms: s.timeout_ms,
+            })
+            .collect();
+
         crate::prime_tools::ContextSnapshot {
             summary,
             tasks,
@@ -5823,6 +5904,7 @@ impl KernelState {
             runs,
             plugins,
             approvals,
+            mcp_servers,
         }
     }
 
@@ -11799,6 +11881,124 @@ mod tests {
             k.set_mcp_tool_classification("fs", "bad name", relux_core::RiskLevel::Low, relux_core::ApprovalRequirement::Never),
             Err(KernelError::InvalidMcpToolName { .. })
         ));
+    }
+
+    // --- MCP resources (resources/list + resources/read — read-only context) ----
+    // `docs/mcp.md` "MCP resources"; `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §9.
+
+    /// The three response bodies for one successful resources/list: initialize ack,
+    /// notifications/initialized ack, and a resources array.
+    fn mcp_resources_list_bodies() -> Vec<String> {
+        vec![
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{}}}"#.to_string(),
+            "{}".to_string(),
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resources":[{"uri":"file:///notes.md","name":"notes","mimeType":"text/markdown","description":"Notes."},{"uri":"mem://r/1","name":"r1"}]}}"#.to_string(),
+        ]
+    }
+
+    /// The three response bodies for one successful resources/read.
+    fn mcp_resource_read_bodies(text: &str) -> Vec<String> {
+        vec![
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{}}}"#.to_string(),
+            "{}".to_string(),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":2,"result":{{"contents":[{{"uri":"file:///c.txt","mimeType":"text/plain","text":"{text}"}}]}}}}"#
+            ),
+        ]
+    }
+
+    #[test]
+    fn mcp_list_resources_maps_and_is_honest() {
+        let mut k = KernelState::new();
+        let endpoint = mock_mcp(mcp_resources_list_bodies());
+        k.register_mcp_server("fs", &endpoint, "fs server", true, Some(2000))
+            .unwrap();
+        let resources = k.list_mcp_resources("fs").expect("list ok");
+        assert_eq!(resources.len(), 2);
+        assert_eq!(resources[0].uri, "file:///notes.md");
+        assert_eq!(resources[0].mime_type.as_deref(), Some("text/markdown"));
+        // Unknown / disabled servers are honest, not a fabricated empty list.
+        assert!(matches!(
+            k.list_mcp_resources("ghost"),
+            Err(KernelError::UnknownMcpServer(_))
+        ));
+        k.set_mcp_server_enabled("fs", false).unwrap();
+        assert!(matches!(
+            k.list_mcp_resources("fs"),
+            Err(KernelError::McpServerDisabled(_))
+        ));
+    }
+
+    #[test]
+    fn mcp_read_resource_shapes_redacts_and_rejects_bad_uri() {
+        let mut k = KernelState::new();
+        let endpoint =
+            mock_mcp(mcp_resource_read_bodies("hello token=sk-abcdefghijklmnop123456"));
+        k.register_mcp_server("fs", &endpoint, "fs server", true, Some(2000))
+            .unwrap();
+        let content = k.read_mcp_resource("fs", "file:///c.txt").expect("read ok");
+        assert!(content.text.contains("hello"), "text: {}", content.text);
+        // An embedded secret is redacted, never returned verbatim.
+        assert!(
+            !content.text.contains("sk-abcdefghijklmnop123456"),
+            "secret leaked: {}",
+            content.text
+        );
+        // An invalid (control-char) URI is refused before any dial.
+        assert!(matches!(
+            k.read_mcp_resource("fs", "file:///a\r\nb"),
+            Err(KernelError::InvalidMcpResourceUri { .. })
+        ));
+        // An empty URI is refused.
+        assert!(matches!(
+            k.read_mcp_resource("fs", "   "),
+            Err(KernelError::InvalidMcpResourceUri { .. })
+        ));
+    }
+
+    #[test]
+    fn prime_context_tool_reads_mcp_resource_via_snapshot() {
+        // End-to-end: the snapshot carries the registered server, and the read-only
+        // context tool `mcp_read_resource` dials it through the live loopback client,
+        // returning a bounded, honest read (provenance only — no action authority).
+        let (mut k, ctx) = prime_chat_kernel();
+        let endpoint = mock_mcp(mcp_resource_read_bodies("resource body text"));
+        k.register_mcp_server("fs", &endpoint, "fs server", true, Some(2000))
+            .unwrap();
+        let snap = k.context_snapshot(&ctx);
+        assert!(snap.mcp_servers.iter().any(|s| s.id == "fs"));
+
+        // list_mcp_servers is a PURE snapshot read.
+        let servers = crate::prime_tools::execute_context_tool(
+            &snap,
+            &crate::prime_tools::ToolCall {
+                tool: "list_mcp_servers".to_string(),
+                args: serde_json::Map::new(),
+            },
+        );
+        assert!(servers.ok);
+        assert!(servers.detail.contains("fs"));
+
+        // mcp_read_resource performs the live, read-only loopback read.
+        let mut args = serde_json::Map::new();
+        args.insert("server_id".to_string(), serde_json::json!("fs"));
+        args.insert("uri".to_string(), serde_json::json!("file:///c.txt"));
+        let read = crate::prime_tools::execute_context_tool(
+            &snap,
+            &crate::prime_tools::ToolCall { tool: "mcp_read_resource".to_string(), args },
+        );
+        assert!(read.ok, "read failed: {}", read.detail);
+        assert!(read.detail.contains("resource body text"), "detail: {}", read.detail);
+
+        // An unknown server is an honest ok:false read (no fabrication, no network).
+        let mut bad = serde_json::Map::new();
+        bad.insert("server_id".to_string(), serde_json::json!("ghost"));
+        bad.insert("uri".to_string(), serde_json::json!("file:///c.txt"));
+        let miss = crate::prime_tools::execute_context_tool(
+            &snap,
+            &crate::prime_tools::ToolCall { tool: "mcp_read_resource".to_string(), args: bad },
+        );
+        assert!(!miss.ok);
     }
 
     #[test]

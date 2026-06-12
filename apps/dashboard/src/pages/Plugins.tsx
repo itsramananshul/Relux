@@ -11,6 +11,9 @@ import {
   type McpToolClassification,
   type ReluxMcpServer,
   type ReluxMcpToolsResult,
+  type ReluxMcpResource,
+  type ReluxMcpResourcesResult,
+  type ReluxMcpResourceContent,
   type ReluxPlugin,
   type ReluxPluginRuntime,
   type ReluxToolConfigInput,
@@ -256,6 +259,7 @@ function McpServerRow({
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [toolsOpen, setToolsOpen] = useState(false);
+  const [resourcesOpen, setResourcesOpen] = useState(false);
   const status = mcpServerStatusBadge(server);
 
   async function remove() {
@@ -306,6 +310,15 @@ function McpServerRow({
           <button
             className="btn ghost sm"
             style={{ marginLeft: 6 }}
+            onClick={() => setResourcesOpen((v) => !v)}
+            aria-expanded={resourcesOpen}
+            title="Run a live resources/list against this server (read-only context)"
+          >
+            {resourcesOpen ? "Close" : "Resources"}
+          </button>
+          <button
+            className="btn ghost sm"
+            style={{ marginLeft: 6 }}
             disabled={busy}
             onClick={() => void remove()}
           >
@@ -317,6 +330,13 @@ function McpServerRow({
         <tr>
           <td colSpan={4} style={{ background: "transparent" }}>
             <McpDiscoverPanel server={server} />
+          </td>
+        </tr>
+      )}
+      {resourcesOpen && (
+        <tr>
+          <td colSpan={4} style={{ background: "transparent" }}>
+            <McpResourcesPanel server={server} />
           </td>
         </tr>
       )}
@@ -390,6 +410,161 @@ function McpDiscoverPanel({ server }: { server: ReluxMcpServer }) {
         </div>
       )}
     </div>
+  );
+}
+
+// The live resources panel: runs `resources/list` against the loopback MCP server
+// and lists the read-only resources (files/records/docs) it advertises. Resources
+// are inert context — listing or reading one performs NO action and mutates nothing,
+// so there is no classification/approval gate here (unlike tools). Honest about every
+// outcome — a disabled, unreachable, or non-MCP server shows its real reason, never a
+// faked empty list. Each resource can be previewed (a read-only `resources/read`)
+// inline; the returned text is sanitized + secret-redacted + bounded server-side.
+function McpResourcesPanel({ server }: { server: ReluxMcpServer }) {
+  const { data, loading, error } = useAsync<ReluxMcpResourcesResult>(
+    () => reluxMcp.resources(server.id),
+    [server.id, server.enabled],
+  );
+  const resources = data?.resources ?? [];
+
+  return (
+    <div className="card" style={{ margin: "6px 0", padding: 12 }}>
+      <div className="row" style={{ marginBottom: 8, alignItems: "center" }}>
+        <strong style={{ fontSize: 13 }}>Resources (read-only context)</strong>
+        <div className="spacer" style={{ flex: 1 }} />
+        {!loading && !error && (
+          <span className="badge done">{resources.length} listed</span>
+        )}
+      </div>
+      <p className="muted" style={{ marginTop: 0, marginBottom: 10, fontSize: 11 }}>
+        A real <span className="mono">resources/list</span> against the loopback
+        server. Resources are <strong>read-only context</strong> — reading one
+        performs no action. A preview runs <span className="mono">resources/read</span>;
+        the body is sanitized, secret-redacted, and bounded server-side.
+      </p>
+      {error ? (
+        <div className="banner err" style={{ fontSize: 12 }}>
+          Resource listing failed ({error}). The server may be down, disabled, or
+          not exposing resources over this endpoint. Relux does not fake a list.
+        </div>
+      ) : loading ? (
+        <div className="loading">Running resources/list…</div>
+      ) : resources.length === 0 ? (
+        <div className="empty" style={{ fontSize: 12 }}>
+          The server advertises no resources.
+        </div>
+      ) : (
+        <div className="table-scroll">
+          <table className="table">
+            <thead>
+              <tr>
+                <th>Resource</th>
+                <th>Type</th>
+                <th style={{ textAlign: "right" }}>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {resources.map((r) => (
+                <McpResourceRow key={r.uri} serverId={server.id} resource={r} />
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// One resource row: name/uri/description + a read-only Preview that fetches the
+// shaped, secret-redacted body inline. Never mutates; never shows raw bytes.
+function McpResourceRow({
+  serverId,
+  resource,
+}: {
+  serverId: string;
+  resource: ReluxMcpResource;
+}) {
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [content, setContent] = useState<ReluxMcpResourceContent | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function preview() {
+    if (open) {
+      setOpen(false);
+      return;
+    }
+    setOpen(true);
+    if (content) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      setContent(await reluxMcp.readResource(serverId, resource.uri));
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Read failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <>
+      <tr>
+        <td>
+          <strong style={{ fontSize: 12 }}>{resource.title || resource.name || resource.uri}</strong>
+          <div className="mono muted" style={{ fontSize: 11, wordBreak: "break-all", maxWidth: 360 }}>
+            {resource.uri}
+          </div>
+          {resource.description && (
+            <div className="muted" style={{ fontSize: 11, marginTop: 2, maxWidth: 360 }}>
+              {resource.description}
+            </div>
+          )}
+        </td>
+        <td className="mono muted" style={{ fontSize: 11 }}>
+          {resource.mime_type || "—"}
+        </td>
+        <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
+          <button className="btn ghost sm" onClick={() => void preview()} aria-expanded={open}>
+            {open ? "Hide" : "Preview"}
+          </button>
+        </td>
+      </tr>
+      {open && (
+        <tr>
+          <td colSpan={3} style={{ background: "transparent" }}>
+            {busy ? (
+              <div className="loading">Reading resource…</div>
+            ) : err ? (
+              <div className="banner err" style={{ fontSize: 12 }}>
+                Read failed ({err}). Relux does not fake a body.
+              </div>
+            ) : content ? (
+              <div className="card" style={{ padding: 10, margin: "4px 0" }}>
+                {content.binary && (
+                  <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>
+                    Includes binary content (summarized, not shown).
+                  </div>
+                )}
+                <pre
+                  className="mono"
+                  style={{
+                    fontSize: 11,
+                    whiteSpace: "pre-wrap",
+                    wordBreak: "break-word",
+                    maxHeight: 280,
+                    overflow: "auto",
+                    margin: 0,
+                  }}
+                >
+                  {content.text || "(empty)"}
+                </pre>
+              </div>
+            ) : null}
+          </td>
+        </tr>
+      )}
+    </>
   );
 }
 

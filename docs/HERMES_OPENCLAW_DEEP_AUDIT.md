@@ -499,7 +499,7 @@ safe (adds no authority), bounded, feasible in one commit, and reuses existing v
   non-loopback / creds / traversal).
 - Honest discovery (installed-but-unimplemented → `NotImplemented`), bundled-protected, no remote code
   execution by design.
-- **MCP support — SHIPPED (loopback discovery + gated invocation).** `crates/relux-core/src/mcp.rs`
+- **MCP support — SHIPPED (loopback discovery + gated invocation + read-only resources).** `crates/relux-core/src/mcp.rs`
   (`McpServerConfig`/`McpTransport::HttpLoopback`, `validate_mcp_server_config` loopback-only,
   `McpToolClassification` risk/approval, `is_valid_mcp_tool_name`, `scan_mcp_tool_description`),
   `crates/relux-kernel/src/mcp.rs` (blocking loopback JSON-RPC client: `initialize` →
@@ -528,17 +528,33 @@ safe (adds no authority), bounded, feasible in one commit, and reuses existing v
     in-memory per operation, never persisted/logged/returned (so it cannot reach the UI/API). Maps
     Hermes' SDK-managed `Mcp-Session-Id` / `_get_session_id` + reconnect (`tools/mcp_tool.py`
     L1454-1480), done by hand at the HTTP layer (no SDK, no long-lived connection).
+  - **MCP resources — SHIPPED (read-only context / Dossier source).** `resources/list` +
+    `resources/read` over the SAME loopback-only, bounded, session-continuous path:
+    `relux-core` adds `McpResource`/`McpResourceContent` + `is_valid_mcp_resource_uri` + bounds;
+    `relux-kernel::mcp` adds `list_resources`/`read_resource` (text-only shaping; a binary block is
+    summarized `[binary content omitted: <mime>]` — never decoded; the read body is sanitized,
+    **secret-redacted** via `redact_secrets`, and clamped); `KernelState::list_mcp_resources` /
+    `read_mcp_resource` are read-only (`&self`, honest errors: unknown/disabled/invalid-uri/fetch-
+    failed); routes `GET …/:id/resources` + `GET …/:id/resources/read?uri=…`; a Plugins-tab
+    **Resources** panel (list + inline read-only preview). Prime gains three read-only context tools
+    on the `READ_ONLY_TOOLS` allowlist — `list_mcp_servers` (pure), `mcp_list_resources`,
+    `mcp_read_resource` — so the brain can pull resource context inside the existing bounded loop
+    with no mutation / no action authority (provenance via `PrimeContextRead`). Maps Hermes
+    `_make_list_resources_handler` / `_make_read_resource_handler` (`tools/mcp_tool.py` L2434-2548).
   - **Still deferred (honest):** no stdio command servers; no remote/`https`; no long-lived
     SSE-subscription / server-push channel; no cross-operation session reuse; no OAuth; no MCP
-    resources/prompts/sampling; an MCP call is captured on the audit log but not (yet) on the run
-    transcript (`docs/mcp.md` "Next MCP slice").
+    prompts/sampling; no resource-change subscription; an MCP call is captured on the audit log but
+    not (yet) on the run transcript (`docs/mcp.md` "Next MCP slice").
 - **Missing (deliberate/deferred)**: MCP remote transport + OAuth, long-lived SSE subscription,
-  resources, run-transcript capture; plugin activation triggers.
+  prompts/sampling, run-transcript capture; plugin activation triggers.
 
 ### Priority & slices
 
 - **P2 — MCP tool INVOCATION** — ✅ DONE: `tools/call` routes through the existing tool-invocation
   gates with per-tool risk/approval classification; discovery already shipped. *(backend, tests, docs.)*
+- **P2 — MCP resources (read-only context)** — ✅ DONE: `resources/list` + `resources/read` over the
+  loopback path (text-only, binary summarized, secret-redacted, bounded), surfaced to operators
+  (Plugins Resources panel) and to Prime's read-only context loop. *(core, kernel, UI, tests, docs.)*
 - **P2 — install-time manifest validation surfaced in Doctor/UI** (Paperclip Zod safe-parse style).
 
 ---

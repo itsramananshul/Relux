@@ -168,6 +168,57 @@ pub fn call_tool(
     })
 }
 
+/// Run the MCP `initialize` handshake, then `resources/list`, against the loopback
+/// `endpoint`, returning the discovered resources (sanitized + bounded) or an honest
+/// [`McpClientError`].
+///
+/// `endpoint` must already be a validated loopback URL; it is re-validated here. The
+/// requests share a streamable-HTTP session (see [`Session`]); a stale-session `404`
+/// triggers one bounded re-initialize retry. Resources are READ-ONLY context — this
+/// performs a bounded loopback read and changes nothing on the server.
+pub fn list_resources(
+    endpoint: &str,
+    timeout_ms: u64,
+) -> Result<Vec<relux_core::McpResource>, McpClientError> {
+    // Re-validate the loopback endpoint on every call (defense in depth).
+    let _ =
+        parse_loopback_url(endpoint).map_err(|e| McpClientError::InvalidEndpoint(e.to_string()))?;
+
+    run_with_session(endpoint, timeout_ms, |session| {
+        let result = session.request("resources/list", &serde_json::json!({}))?;
+        parse_resources_list(&result)
+    })
+}
+
+/// Run the MCP `initialize` handshake, then `resources/read` for `uri`, against the
+/// loopback `endpoint`, returning a **shaped, sanitized, secret-redacted**
+/// [`relux_core::McpResourceContent`] (never the raw JSON-RPC envelope, never raw
+/// binary bytes) or an honest [`McpClientError`].
+///
+/// `endpoint` must already be a validated loopback URL; it is re-validated here.
+/// `uri` is the resource URI forwarded as the `resources/read` `{ uri }` param (the
+/// caller is responsible for validating it with
+/// [`relux_core::is_valid_mcp_resource_uri`]). Mirrors Hermes' `resources/read`
+/// shaping (`reference/hermes-agent-main/tools/mcp_tool.py` L2492-2548): text content
+/// blocks are concatenated; a binary (`blob`) block is summarized with an honest
+/// marker (its bytes are never decoded or returned). A `resources/read` is a pure
+/// read — it performs no action and mutates nothing.
+pub fn read_resource(
+    endpoint: &str,
+    uri: &str,
+    timeout_ms: u64,
+) -> Result<relux_core::McpResourceContent, McpClientError> {
+    // Re-validate the loopback endpoint on every call (defense in depth).
+    let _ =
+        parse_loopback_url(endpoint).map_err(|e| McpClientError::InvalidEndpoint(e.to_string()))?;
+
+    run_with_session(endpoint, timeout_ms, |session| {
+        let params = serde_json::json!({ "uri": uri });
+        let result = session.request("resources/read", &params)?;
+        shape_resource_read_result(&result, uri)
+    })
+}
+
 /// Open a streamable-HTTP [`Session`] against `endpoint` (run the `initialize`
 /// handshake), then run `op` (the `tools/list` or `tools/call` step) under it. If
 /// the server rejects an established session with HTTP `404` (the streamable-HTTP
@@ -392,6 +443,112 @@ fn parse_tools_list(result: &serde_json::Value) -> Result<Vec<McpTool>, McpClien
         });
     }
     Ok(out)
+}
+
+/// Parse a `resources/list` JSON-RPC result into bounded, sanitized
+/// [`relux_core::McpResource`]s. Mirrors Hermes' `_make_list_resources_handler`
+/// (`mcp_tool.py` L2448-2459): collect `{ uri, name, title?, mimeType?, description? }`,
+/// skipping any entry without a usable URI. Every string is sanitized + clamped.
+fn parse_resources_list(
+    result: &serde_json::Value,
+) -> Result<Vec<relux_core::McpResource>, McpClientError> {
+    let resources = result
+        .get("resources")
+        .and_then(|t| t.as_array())
+        .ok_or_else(|| {
+            McpClientError::BadResponse("result had no `resources` array".to_string())
+        })?;
+    let mut out = Vec::new();
+    for res in resources.iter().take(relux_core::MAX_MCP_RESOURCES) {
+        // A resource with no usable URI is unaddressable; skip it rather than fail
+        // the whole listing (one malformed entry shouldn't hide the rest).
+        let Some(uri) = res.get("uri").and_then(|u| u.as_str()) else {
+            continue;
+        };
+        let uri = uri.trim();
+        if uri.is_empty() {
+            continue;
+        }
+        let name = res
+            .get("name")
+            .and_then(|n| n.as_str())
+            .map(|s| relux_core::sanitize_mcp_text(s, relux_core::MAX_MCP_RESOURCE_NAME_CHARS))
+            .unwrap_or_default();
+        let title = res
+            .get("title")
+            .and_then(|t| t.as_str())
+            .map(|s| relux_core::sanitize_mcp_text(s, relux_core::MAX_MCP_RESOURCE_NAME_CHARS))
+            .filter(|s| !s.is_empty());
+        let mime_type = res
+            .get("mimeType")
+            .and_then(|m| m.as_str())
+            .map(|s| relux_core::sanitize_mcp_text(s, relux_core::MAX_MCP_RESOURCE_MIME_CHARS))
+            .filter(|s| !s.is_empty());
+        let description = res
+            .get("description")
+            .and_then(|d| d.as_str())
+            .map(relux_core::sanitize_mcp_resource_description)
+            .unwrap_or_default();
+        out.push(relux_core::McpResource {
+            uri: uri.chars().take(relux_core::MAX_MCP_RESOURCE_URI_CHARS).collect(),
+            name,
+            title,
+            mime_type,
+            description,
+        });
+    }
+    Ok(out)
+}
+
+/// Shape a raw `resources/read` JSON-RPC result into a bounded, sanitized,
+/// secret-redacted [`relux_core::McpResourceContent`]. Mirrors Hermes'
+/// `_make_read_resource_handler` (`mcp_tool.py` L2513-2520): concatenate the text of
+/// the `contents` blocks; a binary (`blob`) block is summarized with an honest
+/// `[binary content …]` marker (never decoded, never returned). The joined text is
+/// sanitized (control chars except newline/tab dropped), **secret-redacted**
+/// ([`relux_core::redact_secrets`] — a credential embedded in a resource never leaks
+/// verbatim), and clamped. Never returns the raw envelope or raw bytes.
+fn shape_resource_read_result(
+    result: &serde_json::Value,
+    uri: &str,
+) -> Result<relux_core::McpResourceContent, McpClientError> {
+    let contents = result.get("contents").and_then(|c| c.as_array());
+    let mut parts: Vec<String> = Vec::new();
+    let mut binary = false;
+    let mut mime_type: Option<String> = None;
+    if let Some(items) = contents {
+        for block in items {
+            if mime_type.is_none() {
+                if let Some(m) = block.get("mimeType").and_then(|m| m.as_str()) {
+                    let m = relux_core::sanitize_mcp_text(m, relux_core::MAX_MCP_RESOURCE_MIME_CHARS);
+                    if !m.is_empty() {
+                        mime_type = Some(m);
+                    }
+                }
+            }
+            if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                parts.push(t.to_string());
+            } else if block.get("blob").is_some() {
+                // Binary content — never decode or surface the bytes; summarize it.
+                binary = true;
+                let kind = block
+                    .get("mimeType")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("application/octet-stream");
+                parts.push(format!("[binary content omitted: {kind}]"));
+            }
+        }
+    }
+    let joined = parts.join("\n");
+    let sanitized = sanitize_result_text(&joined, relux_core::MAX_MCP_RESOURCE_TEXT_CHARS);
+    // Redact obvious secrets so a credential embedded in a resource body never leaks.
+    let text = relux_core::redact_secrets(&sanitized);
+    Ok(relux_core::McpResourceContent {
+        uri: uri.chars().take(relux_core::MAX_MCP_RESOURCE_URI_CHARS).collect(),
+        mime_type,
+        text,
+        binary,
+    })
 }
 
 /// POST one JSON-RPC request to the loopback endpoint and return `(result_value,
@@ -994,5 +1151,128 @@ mod tests {
         assert_eq!(validate_session_id("has space"), None);
         assert_eq!(validate_session_id("crlf\r\ninjected"), None);
         assert_eq!(validate_session_id(&"a".repeat(MAX_MCP_SESSION_ID_CHARS + 1)), None);
+    }
+
+    // --- MCP resources (resources/list + resources/read) -------------------
+
+    #[test]
+    fn lists_resources_after_initialize() {
+        let responses = vec![
+            http_json(init_ok()),
+            http_empty_ok(),
+            http_json(serde_json::json!({
+                "jsonrpc": "2.0", "id": 2,
+                "result": { "resources": [
+                    { "uri": "file:///notes.md", "name": "notes",
+                      "description": "Daily notes.", "mimeType": "text/markdown" },
+                    { "uri": "mem://record/7", "name": "record-7" },
+                    { "name": "no-uri-skipped" }
+                ]}
+            })),
+        ];
+        let (endpoint, rx) = mock_server(responses);
+        let resources = list_resources(&endpoint, 2_000).expect("list ok");
+        // The entry with no URI is skipped, not fatal.
+        assert_eq!(resources.len(), 2);
+        assert_eq!(resources[0].uri, "file:///notes.md");
+        assert_eq!(resources[0].name, "notes");
+        assert_eq!(resources[0].mime_type.as_deref(), Some("text/markdown"));
+        assert_eq!(resources[0].description, "Daily notes.");
+        let first = rx.recv().unwrap();
+        assert!(first.contains("initialize"), "first req: {first}");
+    }
+
+    #[test]
+    fn read_resource_shapes_text_and_redacts_secrets() {
+        let responses = vec![
+            http_json(init_ok()),
+            http_empty_ok(),
+            http_json(serde_json::json!({
+                "jsonrpc": "2.0", "id": 2,
+                "result": { "contents": [
+                    { "uri": "file:///c.txt", "mimeType": "text/plain",
+                      "text": "line one\napi_key=sk-supersecretvalue1234567890" }
+                ]}
+            })),
+        ];
+        let (endpoint, rx) = mock_server(responses);
+        let content = read_resource(&endpoint, "file:///c.txt", 2_000).expect("read ok");
+        assert_eq!(content.uri, "file:///c.txt");
+        assert_eq!(content.mime_type.as_deref(), Some("text/plain"));
+        assert!(!content.binary);
+        // The legit prose survives; the embedded secret is redacted (never verbatim).
+        assert!(content.text.contains("line one"), "text: {}", content.text);
+        assert!(
+            !content.text.contains("sk-supersecretvalue1234567890"),
+            "secret must be redacted: {}",
+            content.text
+        );
+        let _init = rx.recv().unwrap();
+        let _notif = rx.recv().unwrap();
+        let read = rx.recv().unwrap();
+        assert!(read.contains("resources/read"), "read req: {read}");
+        assert!(read.contains("file:///c.txt"), "read req carried uri: {read}");
+    }
+
+    #[test]
+    fn read_resource_summarizes_binary_content_honestly() {
+        let responses = vec![
+            http_json(init_ok()),
+            http_empty_ok(),
+            http_json(serde_json::json!({
+                "jsonrpc": "2.0", "id": 2,
+                "result": { "contents": [
+                    { "uri": "file:///img.png", "mimeType": "image/png", "blob": "aGVsbG8=" }
+                ]}
+            })),
+        ];
+        let (endpoint, _rx) = mock_server(responses);
+        let content = read_resource(&endpoint, "file:///img.png", 2_000).expect("read ok");
+        assert!(content.binary, "binary block must set the binary flag");
+        // The raw base64 bytes are NEVER surfaced; an honest marker is.
+        assert!(content.text.contains("[binary content omitted: image/png]"), "text: {}", content.text);
+        assert!(!content.text.contains("aGVsbG8="), "raw bytes leaked: {}", content.text);
+    }
+
+    #[test]
+    fn list_resources_carries_the_session_established_at_initialize() {
+        let responses = vec![
+            http_json_session(init_ok(), "rsess-1"),
+            http_empty_ok(),
+            http_json(serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "result": { "resources": [] }
+            })),
+        ];
+        let (endpoint, rx) = mock_server(responses);
+        let resources = list_resources(&endpoint, 2_000).expect("list ok");
+        assert!(resources.is_empty());
+        let _init = rx.recv().unwrap();
+        let _notif = rx.recv().unwrap();
+        let list = rx.recv().unwrap();
+        assert!(list.contains("resources/list"), "list: {list}");
+        assert!(list.contains("Mcp-Session-Id: rsess-1"), "list carried session: {list}");
+    }
+
+    #[test]
+    fn resource_calls_reject_non_loopback_before_dialing() {
+        let err = list_resources("https://evil.example.com/mcp", 500).unwrap_err();
+        assert!(matches!(err, McpClientError::InvalidEndpoint(_)));
+        let err = read_resource("https://evil.example.com/mcp", "file:///x", 500).unwrap_err();
+        assert!(matches!(err, McpClientError::InvalidEndpoint(_)));
+    }
+
+    #[test]
+    fn resources_list_jsonrpc_error_is_surfaced_honestly() {
+        let responses = vec![
+            http_json(init_ok()),
+            http_empty_ok(),
+            http_json(serde_json::json!({
+                "jsonrpc": "2.0", "id": 2,
+                "error": { "code": -32601, "message": "resources not supported" }
+            })),
+        ];
+        let (endpoint, _rx) = mock_server(responses);
+        let err = list_resources(&endpoint, 2_000).unwrap_err();
+        assert!(matches!(err, McpClientError::ServerError { code: -32601, .. }));
     }
 }

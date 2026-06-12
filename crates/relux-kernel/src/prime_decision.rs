@@ -1476,6 +1476,7 @@ instruction):\nUser: create a task to fix login\nPrime: Created it. [created tas
             runs: Vec::<RunView>::new(),
             plugins: Vec::new(),
             approvals: Vec::new(),
+            mcp_servers: Vec::new(),
         }
     }
 

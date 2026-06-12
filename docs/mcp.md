@@ -109,6 +109,51 @@ single logical operation:
   dashboard or the HTTP API. There is no cross-call session reuse: each discover /
   invoke opens, uses, and discards its own session.
 
+## MCP resources (read-only context / Dossier source)
+
+MCP **resources** are a second, read-only surface alongside tools: a server
+advertises addressable context (files, records, docs) via `resources/list`, and a
+client fetches one by URI via `resources/read`. Unlike a tool, a resource is
+**inert** — reading it performs no action and mutates nothing — which is exactly why
+it is safe to expose as a read-only context source to Prime and to operators.
+
+- **Client (`relux-kernel::mcp`).** `list_resources(endpoint, timeout)` runs
+  `initialize` → `resources/list`, and `read_resource(endpoint, uri, timeout)` runs
+  `initialize` → `resources/read { uri }`. Both flow through the SAME loopback-only,
+  bounded-timeout/size, session-continuous (`Mcp-Session-Id`) path as tool discovery —
+  the endpoint is re-validated on every call, a stale-session `404` triggers one
+  bounded re-initialize, and a transport/protocol failure or JSON-RPC `error` is an
+  honest [`McpClientError`], never a fabricated list/body.
+- **Validation + bounds.** A listed resource's `uri`/`name`/`title`/`mimeType`/
+  `description` are sanitized and clamped (`MAX_MCP_RESOURCE_*`); at most
+  `MAX_MCP_RESOURCES` (256) resources are returned. A `resources/read` URI must pass
+  `relux_core::is_valid_mcp_resource_uri` (non-empty, ≤2048 chars, control-char free)
+  or the read is refused before any dial (fail closed).
+- **Content shaping (text-only, honest binary, redacted).** A `resources/read`
+  result's `contents` text blocks are concatenated; a **binary (`blob`) block is
+  summarized** with an honest `[binary content omitted: <mime>]` marker (its bytes are
+  never decoded or returned) and the `binary` flag is set. The joined text is
+  sanitized, **secret-redacted** (`relux_core::redact_secrets` — a credential embedded
+  in a resource body never leaks verbatim), and clamped to
+  `MAX_MCP_RESOURCE_TEXT_CHARS` (20 000). The raw JSON-RPC envelope is never returned.
+- **Kernel state (read-only).** `KernelState::list_mcp_resources(id)` and
+  `read_mcp_resource(id, uri)` are `&self` (no audit mutation, mirroring
+  `discover_mcp_tools`): an unknown server → `UnknownMcpServer`; a disabled one →
+  `McpServerDisabled`; an invalid URI → `InvalidMcpResourceUri`; a transport failure →
+  `McpResourceFetchFailed`.
+- **Prime read-only context integration.** Three read-only context tools join the
+  governed [`READ_ONLY_TOOLS`] allowlist so a configured brain can request resource
+  context inside the SAME bounded observe-then-act loop / unified-decision read path:
+  `list_mcp_servers` (PURE — lists the registered loopback servers from the snapshot),
+  `mcp_list_resources` (live `resources/list` for a `server_id`), and
+  `mcp_read_resource` (live `resources/read` for a `server_id` + `uri`). The live two
+  dial the loopback endpoint carried in the snapshot **outside the kernel lock**
+  (exactly like the brain rounds), so the lock is never held across I/O. They are
+  read-only — no mutation, no action authority — and use the existing read-only
+  provenance ([`ContextRead`] → [`PrimeContextRead`]: tool + ok + bounded summary; the
+  full body and the endpoint stay server-side). An unknown/disabled server or a
+  transport failure is an honest `ok:false` read, never a fabricated body.
+
 ## What it does NOT do (honest limitations)
 
 - **No stdio (command) MCP servers.** Relux never spawns arbitrary downloaded
@@ -125,8 +170,10 @@ single logical operation:
   shared between calls).
 - **No OAuth / auth header.** No `Authorization` is sent. (Hermes' `mcp_oauth_manager`
   is deferred.)
-- **No MCP resources / prompts / sampling.** Only `tools/list` + `tools/call` are
-  spoken; `resources/*`, `prompts/*`, and server-initiated sampling are not.
+- **No MCP prompts / sampling.** `prompts/*` and server-initiated sampling are not
+  spoken. **MCP resources ARE now supported** as a read-only context source —
+  `resources/list` + `resources/read` (text content; binary summarized honestly). See
+  "MCP resources" below.
 
 Bounds (all reused from / mirrored on the loopback-tool runtime): per-call
 connect/read/write timeout (clamped `100..60_000 ms`, default `10_000`), request
@@ -144,9 +191,15 @@ GET    /v1/relux/mcp/servers                                       list register
 POST   /v1/relux/mcp/servers                                       { id, endpoint, description?, enabled?, timeout_ms? } (upsert by id)
 DELETE /v1/relux/mcp/servers/:id                                   remove a server (and its classifications)
 GET    /v1/relux/mcp/servers/:id/tools                             live tools/list discovery → ToolDescriptor[]
+GET    /v1/relux/mcp/servers/:id/resources                         live resources/list → McpResource[] (read-only context)
+GET    /v1/relux/mcp/servers/:id/resources/read?uri=…              read one resource → shaped, redacted McpResourceContent
 PUT    /v1/relux/mcp/servers/:id/tools/:tool/classification        { risk, approval } — set a tool's risk/approval
 DELETE /v1/relux/mcp/servers/:id/tools/:tool/classification        revert a tool to the gated default
 ```
+
+The resource routes are READ-ONLY (a read lock; no save). Honest status codes:
+unknown id → `404`; disabled server → `409`; an invalid/empty `uri` → `400`; a
+loopback transport/protocol failure → `502` (never an empty-list/empty-body lie).
 
 MCP tools are **invoked through the standard tool-invoke surface** with
 `plugin_id = "mcp:<server>"` — no separate MCP invoke route:
@@ -189,6 +242,16 @@ Files read before implementing:
   the `Mcp-Session-Id` response header on `initialize`, echo it on the operation's
   requests, and do one bounded re-`initialize` on a `404` session-expiry — without a
   long-lived connection or cross-call session reuse.
+- **Hermes** `reference/hermes-agent-main/tools/mcp_tool.py` `_make_list_resources_handler`
+  (L2434-2489) and `_make_read_resource_handler` (L2492-2548) — the resource wire shape
+  and shaping. `resources/list` → `{ resources: [{ uri, name, description?, mimeType? }] }`;
+  `resources/read { uri }` → `ReadResourceResult { contents: [block] }` where each block
+  carries `.text` (collected) or `.blob` (binary, summarized — Hermes emits
+  `[binary data, N bytes]`; we emit `[binary content omitted: <mime>]` and never decode).
+  Hermes registers these as per-server utility tools (`mcp_<server>_list_resources` /
+  `_read_resource`, L2842-2875) gated by the server's advertised `capabilities.resources`;
+  Relux exposes the same two operations as kernel methods + read-only Prime context tools,
+  and additionally **secret-redacts** the read body (Hermes does not).
 - **openclaw** `reference/openclaw-main/src/tools/execution.ts`
   (`formatToolExecutorRef`) — the `mcp:<serverId>:<toolName>` executor namespace.
   We adopt `mcp:<server>` as the synthetic plugin id so MCP tools map into the
@@ -196,27 +259,38 @@ Files read before implementing:
   without colliding with real plugin ids.
 
 Relux files: `crates/relux-core/src/mcp.rs` (config + validation + discovery types +
-`McpToolClassification` + `is_valid_mcp_tool_name` + injection scan),
-`crates/relux-kernel/src/mcp.rs` (loopback JSON-RPC discovery + `call_tool` client
-with result shaping, plus the in-memory streamable-HTTP `Session` —
-`Mcp-Session-Id` capture/echo/validate + one bounded re-initialize on `404`), `crates/relux-kernel/src/state.rs` (`register_mcp_server` /
+`McpToolClassification` + `is_valid_mcp_tool_name` + injection scan, **plus the
+resource types `McpResource`/`McpResourceContent` + `is_valid_mcp_resource_uri` +
+resource bounds**), `crates/relux-kernel/src/mcp.rs` (loopback JSON-RPC discovery +
+`call_tool` client with result shaping, **plus `list_resources` / `read_resource`
+with resource shaping + secret redaction**, plus the in-memory streamable-HTTP
+`Session` — `Mcp-Session-Id` capture/echo/validate + one bounded re-initialize on
+`404`), `crates/relux-kernel/src/state.rs` (`register_mcp_server` /
 `set_mcp_server_enabled` / `remove_mcp_server` / `mcp_servers` / `discover_mcp_tools` /
-`set_mcp_tool_classification` / `clear_mcp_tool_classification`, and the MCP branches
-in `resolve_tool_permission` / `tool_needs_approval` / `execute_tool_runtime` /
-`matching_persistent_grant_id` / `tool_risk_for`, + snapshot persistence),
-`crates/relux-kernel/src/server.rs` (the registry + classification routes; invocation
-reuses the generic tool-invoke routes), `crates/relux-kernel/src/store.rs`
-(`mcp_servers` persistence, now carrying classifications),
-`apps/dashboard/src/{api.ts,plugins.ts,pages/Plugins.tsx}` (the MCP servers UI:
-discover → classify → invoke / request-approval).
+`set_mcp_tool_classification` / `clear_mcp_tool_classification` / **`list_mcp_resources`
+/ `read_mcp_resource`**, the MCP branches in `resolve_tool_permission` /
+`tool_needs_approval` / `execute_tool_runtime` / `matching_persistent_grant_id` /
+`tool_risk_for`, + the **`McpServerView` projection in `context_snapshot`**, + snapshot
+persistence), `crates/relux-kernel/src/prime_tools.rs` (the read-only context tools —
+**`list_mcp_servers` / `mcp_list_resources` / `mcp_read_resource`** on the
+`READ_ONLY_TOOLS` allowlist + `ContextSnapshot.mcp_servers`),
+`crates/relux-kernel/src/server.rs` (the registry + classification routes + **the
+resource list/read routes**; invocation reuses the generic tool-invoke routes),
+`crates/relux-kernel/src/store.rs` (`mcp_servers` persistence, carrying
+classifications), `apps/dashboard/src/{api.ts,pages/Plugins.tsx}` (the MCP servers UI:
+discover → classify → invoke / request-approval, **plus the Resources panel:
+resources/list + inline read-only preview**).
 
 ## Next MCP slice
 
-Discovery + gated invocation + **per-operation session continuity** now work end to
-end. Candidate next slices, in rough order: (1) **remote transport + OAuth** (an
-allow-listed remote endpoint with `mcp_oauth_manager`-style auth), gated behind an
-explicit operator opt-in; (2) a **long-lived SSE / server-push subscription** (the
-streamable-HTTP variant Relux still does not speak — only single-POST request/reply
-today); (3) **MCP resources** (`resources/list` + `resources/read`) surfaced as a
-read-only Dossier source; (4) capturing an MCP call on the **run transcript** (not
-just the audit log) when invoked inside a run.
+Discovery + gated invocation + **per-operation session continuity** + **read-only MCP
+resources** (`resources/list` + `resources/read`, surfaced to operators and to Prime's
+read-only context loop) now work end to end. Candidate next slices, in rough order:
+(1) **remote transport + OAuth** (an allow-listed remote endpoint with
+`mcp_oauth_manager`-style auth), gated behind an explicit operator opt-in; (2) a
+**long-lived SSE / server-push subscription** (the streamable-HTTP variant Relux still
+does not speak — only single-POST request/reply today); (3) **MCP prompts**
+(`prompts/list` + `prompts/get`) as reusable prompt templates; (4) capturing an MCP
+call (tool or resource read) on the **run transcript** (not just the audit log) when
+invoked inside a run; (5) a **resource-change subscription**
+(`notifications/resources/list_changed`) once a server-push channel exists.

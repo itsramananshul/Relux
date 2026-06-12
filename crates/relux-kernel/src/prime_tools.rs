@@ -168,6 +168,24 @@ pub const READ_ONLY_TOOLS: &[ContextTool] = &[
         summary: "Pending and recent approvals: id, status, risk, requester, action. Optional status filter.",
         args_hint: "{\"status\":\"<optional: pending|approved|rejected>\"}",
     },
+    ContextTool {
+        name: "list_mcp_servers",
+        summary: "Registered loopback MCP servers (read-only context sources): id, endpoint, enabled, \
+                  description.",
+        args_hint: "{}",
+    },
+    ContextTool {
+        name: "mcp_list_resources",
+        summary: "List the read-only resources (files/records/docs) an MCP server advertises: uri, \
+                  name, mime. Performs a bounded loopback read; mutates nothing.",
+        args_hint: "{\"server_id\":\"<registered MCP server id>\"}",
+    },
+    ContextTool {
+        name: "mcp_read_resource",
+        summary: "Read ONE MCP resource by uri (text only; binary summarized; secrets redacted; \
+                  bounded). Read-only context — performs no action.",
+        args_hint: "{\"server_id\":\"<mcp server id>\",\"uri\":\"<resource uri from mcp_list_resources>\"}",
+    },
 ];
 
 /// The fail-closed read-only classification of a requested tool name. The first slice has only
@@ -273,9 +291,31 @@ pub struct ApprovalView {
     pub reason: String,
 }
 
+/// A compact, owned projection of one registered loopback MCP server for the read-only tools.
+/// Carries no secret — just the id, the validated loopback endpoint, the description, the
+/// enabled flag, and the per-call timeout. The endpoint + timeout let the live MCP resource
+/// tools ([`mcp_list_resources_read`] / [`mcp_read_resource_read`]) dial the operator's server
+/// OUTSIDE the kernel lock; the endpoint itself is never shipped to the client (only a summary
+/// is, via [`ContextRead::to_wire`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerView {
+    pub id: String,
+    pub endpoint: String,
+    pub description: String,
+    pub enabled: bool,
+    pub timeout_ms: u64,
+}
+
 /// An owned, bounded snapshot of the control-plane state the read-only tools read from. Taken
 /// once under the kernel lock (`KernelState::context_snapshot`) so the loop's brain calls run
 /// OUTSIDE the lock and the executors stay pure and unit-testable without a kernel.
+///
+/// NOTE on MCP resources: all fields below are pure projections of in-memory state, so the
+/// snapshot reads are pure. The two MCP *resource* tools (`mcp_list_resources` /
+/// `mcp_read_resource`) are the one exception — they perform a bounded, READ-ONLY loopback
+/// network read against the [`McpServerView::endpoint`] carried here. They are still read-only
+/// (no mutation, no action authority) and run OUTSIDE the kernel lock exactly like the brain
+/// rounds, so the lock is never held across I/O.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextSnapshot {
     /// The same board counts the decision prompt already uses (reused for `board_summary`).
@@ -285,6 +325,10 @@ pub struct ContextSnapshot {
     pub runs: Vec<RunView>,
     pub plugins: Vec<PluginView>,
     pub approvals: Vec<ApprovalView>,
+    /// Registered loopback MCP servers (for `list_mcp_servers` and to drive the live MCP
+    /// resource tools). Defaulted so an older serialized snapshot still deserializes.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerView>,
 }
 
 /// A validated, allowlisted read-only tool call the brain requested.
@@ -350,6 +394,22 @@ fn read_id_arg(args: &serde_json::Map<String, serde_json::Value>, key: &str) -> 
         None
     } else {
         Some(cleaned)
+    }
+}
+
+/// Read a required resource-URI argument: trim and validate against
+/// [`relux_core::is_valid_mcp_resource_uri`] (non-empty, bounded, control-char free). Returns
+/// `None` when missing or unsafe (the executor then reports an honest "not found" / refusal),
+/// never forwarding a malformed URI to the loopback server. Unlike [`read_id_arg`], it does NOT
+/// collapse whitespace or clamp to the short id length — a URI is longer and its inner structure
+/// must be preserved.
+fn read_uri_arg(args: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+    let raw = args.get(key)?.as_str()?;
+    let trimmed = raw.trim();
+    if relux_core::is_valid_mcp_resource_uri(trimmed) {
+        Some(trimmed.to_string())
+    } else {
+        None
     }
 }
 
@@ -448,6 +508,9 @@ pub fn execute_context_tool(snapshot: &ContextSnapshot, call: &ToolCall) -> Cont
         "get_run" => get_run_read(snapshot, &call.args),
         "list_plugins" => list_plugins_read(snapshot),
         "list_approvals" => list_approvals_read(snapshot, &call.args),
+        "list_mcp_servers" => list_mcp_servers_read(snapshot),
+        "mcp_list_resources" => mcp_list_resources_read(snapshot, &call.args),
+        "mcp_read_resource" => mcp_read_resource_read(snapshot, &call.args),
         other => ContextRead {
             tool: other.to_string(),
             ok: false,
@@ -764,6 +827,173 @@ fn list_approvals_read(
     }
 }
 
+/// `list_mcp_servers` — the registered loopback MCP servers (read-only context sources). PURE: a
+/// projection of the snapshot's server registry; performs NO network I/O. The endpoint is shown
+/// in the brain-facing detail (it is a non-secret loopback URL) but the wire provenance summary
+/// only carries counts.
+fn list_mcp_servers_read(snapshot: &ContextSnapshot) -> ContextRead {
+    let servers = &snapshot.mcp_servers;
+    if servers.is_empty() {
+        return ContextRead {
+            tool: "list_mcp_servers".to_string(),
+            ok: false,
+            summary: "no MCP servers registered".to_string(),
+            detail: "There are no MCP servers registered. An operator can register a loopback MCP \
+                     server in the Plugins / MCP surface."
+                .to_string(),
+        };
+    }
+    let enabled = servers.iter().filter(|s| s.enabled).count();
+    let detail = bounded_lines(servers, |s| {
+        format!(
+            "{} endpoint={} {} {}",
+            s.id,
+            s.endpoint,
+            if s.enabled { "enabled" } else { "disabled" },
+            sanitize_line(&s.description, 120),
+        )
+    });
+    ContextRead {
+        tool: "list_mcp_servers".to_string(),
+        ok: true,
+        summary: format!("{} MCP servers ({enabled} enabled)", servers.len()),
+        detail: clamp_detail(detail),
+    }
+}
+
+/// `mcp_list_resources` — live, READ-ONLY `resources/list` against one registered MCP server.
+/// Performs a bounded loopback network read (OUTSIDE the kernel lock) and mutates nothing. Honest
+/// by construction: a missing/unknown/disabled server, or a transport failure, is an `ok:false`
+/// read with the reason — never a fabricated list.
+fn mcp_list_resources_read(
+    snapshot: &ContextSnapshot,
+    args: &serde_json::Map<String, serde_json::Value>,
+) -> ContextRead {
+    let tool = "mcp_list_resources".to_string();
+    let Some(server_id) = read_id_arg(args, "server_id") else {
+        return ContextRead {
+            tool,
+            ok: false,
+            summary: "mcp_list_resources needs a server_id".to_string(),
+            detail: "Provide {\"server_id\":\"<registered MCP server id>\"}. Use list_mcp_servers \
+                     to see the available ids."
+                .to_string(),
+        };
+    };
+    let Some(server) = snapshot.mcp_servers.iter().find(|s| s.id == server_id) else {
+        return ContextRead {
+            tool,
+            ok: false,
+            summary: format!("no MCP server '{server_id}'"),
+            detail: format!("No MCP server '{server_id}' is registered. Use list_mcp_servers."),
+        };
+    };
+    if !server.enabled {
+        return ContextRead {
+            tool,
+            ok: false,
+            summary: format!("MCP server '{server_id}' is disabled"),
+            detail: format!("MCP server '{server_id}' is registered but disabled; an operator must enable it."),
+        };
+    }
+    match crate::mcp::list_resources(&server.endpoint, server.timeout_ms) {
+        Ok(resources) if resources.is_empty() => ContextRead {
+            tool,
+            ok: true,
+            summary: format!("MCP server '{server_id}' lists no resources"),
+            detail: "(no resources advertised)".to_string(),
+        },
+        Ok(resources) => {
+            let detail = bounded_lines(&resources, |r| {
+                let mime = r.mime_type.as_deref().unwrap_or("");
+                format!("{} name={} {}", r.uri, r.name, mime).trim().to_string()
+            });
+            ContextRead {
+                tool,
+                ok: true,
+                summary: format!("{} resources from '{server_id}'", resources.len()),
+                detail: clamp_detail(detail),
+            }
+        }
+        Err(e) => ContextRead {
+            tool,
+            ok: false,
+            summary: format!("MCP server '{server_id}' resource list failed"),
+            detail: sanitize_line(&e.to_string(), MAX_RESULT_CHARS),
+        },
+    }
+}
+
+/// `mcp_read_resource` — live, READ-ONLY `resources/read` of ONE resource by uri from a registered
+/// MCP server. Performs a bounded loopback read (OUTSIDE the lock) and mutates nothing. The
+/// returned text is already sanitized, secret-redacted, and clamped by the client; the detail is
+/// further clamped for the brain prompt. Honest: a missing/invalid uri, an unknown/disabled
+/// server, or a transport failure is an `ok:false` read — never a fabricated body.
+fn mcp_read_resource_read(
+    snapshot: &ContextSnapshot,
+    args: &serde_json::Map<String, serde_json::Value>,
+) -> ContextRead {
+    let tool = "mcp_read_resource".to_string();
+    let Some(server_id) = read_id_arg(args, "server_id") else {
+        return ContextRead {
+            tool,
+            ok: false,
+            summary: "mcp_read_resource needs a server_id".to_string(),
+            detail: "Provide {\"server_id\":\"<id>\",\"uri\":\"<resource uri>\"}.".to_string(),
+        };
+    };
+    let Some(server) = snapshot.mcp_servers.iter().find(|s| s.id == server_id) else {
+        return ContextRead {
+            tool,
+            ok: false,
+            summary: format!("no MCP server '{server_id}'"),
+            detail: format!("No MCP server '{server_id}' is registered. Use list_mcp_servers."),
+        };
+    };
+    if !server.enabled {
+        return ContextRead {
+            tool,
+            ok: false,
+            summary: format!("MCP server '{server_id}' is disabled"),
+            detail: format!("MCP server '{server_id}' is registered but disabled."),
+        };
+    }
+    let Some(uri) = read_uri_arg(args, "uri") else {
+        return ContextRead {
+            tool,
+            ok: false,
+            summary: "mcp_read_resource needs a valid uri".to_string(),
+            detail: "Provide a non-empty, bounded resource uri (from mcp_list_resources).".to_string(),
+        };
+    };
+    match crate::mcp::read_resource(&server.endpoint, &uri, server.timeout_ms) {
+        Ok(content) => {
+            let mime = content.mime_type.as_deref().unwrap_or("");
+            let body = if content.text.is_empty() {
+                "(empty)".to_string()
+            } else {
+                content.text.clone()
+            };
+            ContextRead {
+                tool,
+                ok: true,
+                summary: format!(
+                    "read {} from '{server_id}'{}",
+                    uri,
+                    if content.binary { " (includes binary)" } else { "" }
+                ),
+                detail: clamp_detail(format!("uri={uri} mime={mime}\n{body}")),
+            }
+        }
+        Err(e) => ContextRead {
+            tool,
+            ok: false,
+            summary: format!("read of {uri} from '{server_id}' failed"),
+            detail: sanitize_line(&e.to_string(), MAX_RESULT_CHARS),
+        },
+    }
+}
+
 /// The wire label for a task status (`snake_case`, matching the serialized form), for the tool
 /// output the brain reads. Pure.
 fn status_label(status: &TaskStatus) -> String {
@@ -892,16 +1122,18 @@ impl ContextLoop {
                 true
             }
             BrainTurn::Call(call) => {
-                // Stop on a repeated identical call: the brain is not making progress, so spending
-                // another round (and another provider call) on the same read is wasteful.
+                // Execute exactly ONCE (a live MCP resource tool dials the loopback server, so we
+                // must not run it twice just to dedup), then stop on a repeated identical read: the
+                // brain is not making progress, so spending another round on the same read is wasteful.
+                let read = execute_context_tool(&self.snapshot, &call);
                 if self
                     .reads
                     .iter()
-                    .any(|r| r.tool == call.tool && r.detail == execute_context_tool(&self.snapshot, &call).detail)
+                    .any(|r| r.tool == read.tool && r.detail == read.detail)
                 {
                     return false;
                 }
-                self.reads.push(execute_context_tool(&self.snapshot, &call));
+                self.reads.push(read);
                 true
             }
         }
@@ -1084,6 +1316,7 @@ mod tests {
                 action: "grant tool:relux-tools-github:create_pr to code-agent".to_string(),
                 reason: "Granting a permission widens what an actor can do.".to_string(),
             }],
+            mcp_servers: vec![],
         }
     }
 

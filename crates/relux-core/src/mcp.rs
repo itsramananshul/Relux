@@ -352,6 +352,100 @@ pub fn sanitize_mcp_tool_description(s: &str) -> String {
     sanitize_mcp_text(s, MAX_MCP_TOOL_DESC_CHARS)
 }
 
+// --- MCP resources (read-only context / Dossier source) -------------------
+//
+// MCP resources are a SECOND, read-only surface alongside tools: a server
+// advertises addressable read-only context (files, records, docs) via
+// `resources/list`, and a client fetches one by URI via `resources/read`. They
+// are inert by definition — reading a resource performs no action and mutates
+// nothing — which is exactly why they are safe to expose as a read-only context
+// source to Prime. See `docs/mcp.md` "MCP resources" and Hermes
+// `reference/hermes-agent-main/tools/mcp_tool.py` (`_make_list_resources_handler`
+// L2434-2489 → `{uri,name,description?,mimeType?}`; `_make_read_resource_handler`
+// L2492-2548 → `ReadResourceResult{contents:[{text|blob}]}` shaped to joined text
+// with binary summarized). We mirror that shaping; the actual JSON-RPC client is
+// `relux-kernel::mcp`.
+
+/// Hard cap on how many resources a single server may surface in one
+/// `resources/list`, so a misbehaving server cannot flood the context.
+pub const MAX_MCP_RESOURCES: usize = 256;
+/// Max characters kept for a resource URI. A URI is echoed verbatim into a
+/// `resources/read` request, so it is bounded; the charset is checked by
+/// [`is_valid_mcp_resource_uri`].
+pub const MAX_MCP_RESOURCE_URI_CHARS: usize = 2048;
+/// Max characters kept for a resource name / title.
+pub const MAX_MCP_RESOURCE_NAME_CHARS: usize = 256;
+/// Max characters kept for a resource mime type.
+pub const MAX_MCP_RESOURCE_MIME_CHARS: usize = 128;
+/// Max characters kept for a resource description.
+pub const MAX_MCP_RESOURCE_DESC_CHARS: usize = 600;
+/// Max characters of text kept from a `resources/read` result (the model/operator-
+/// facing body), so a large resource never floods the UI or a prompt.
+pub const MAX_MCP_RESOURCE_TEXT_CHARS: usize = 20_000;
+
+/// One resource discovered from an MCP server's live `resources/list` response.
+///
+/// Built by the kernel client; every string is already sanitized + clamped. Pure
+/// data — it carries no transport state and no resource body (only the addressable
+/// metadata). The body is fetched separately, on demand, via `resources/read`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpResource {
+    /// The resource URI as advertised by the server (e.g. `file:///notes.md`). This
+    /// is what a `resources/read` request echoes back.
+    pub uri: String,
+    /// The resource name as advertised by the server (may be empty).
+    pub name: String,
+    /// An optional human title, when the server supplies one distinct from `name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The resource mime type, when advertised (e.g. `text/markdown`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// The sanitized, bounded resource description (may be empty).
+    pub description: String,
+}
+
+/// The shaped, sanitized result of a `resources/read`: a bounded, secret-redacted
+/// text body, never the raw JSON-RPC envelope and never raw binary bytes.
+///
+/// Text content blocks are concatenated into [`McpResourceContent::text`]; a binary
+/// (`blob`) block is summarized with an honest `[binary content …]` marker (its
+/// bytes are never decoded or returned). [`McpResourceContent::binary`] records
+/// whether any binary block was present, so the caller can report the read honestly
+/// ("text + binary" / "binary only") instead of silently dropping content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpResourceContent {
+    /// The resource URI that was read (echoed back from the request).
+    pub uri: String,
+    /// The first content block's mime type, when advertised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// The concatenated text content: text blocks joined, binary blocks summarized,
+    /// then sanitized, secret-redacted, and clamped to [`MAX_MCP_RESOURCE_TEXT_CHARS`].
+    pub text: String,
+    /// True when the resource carried at least one binary (`blob`) content block.
+    pub binary: bool,
+}
+
+/// Whether `uri` is a safe MCP resource URI to read: non-empty, at most
+/// [`MAX_MCP_RESOURCE_URI_CHARS`] characters, and free of control characters
+/// (including `CR`/`LF`/`NUL`). A resource URI carries a scheme and arbitrary path,
+/// so — unlike a tool name — it is NOT restricted to an identifier charset; it is
+/// instead echoed inside a JSON-encoded `resources/read` request (which quotes it
+/// safely) and bounded here. A URI that fails this is refused on read (fail closed)
+/// rather than forwarded to the loopback server.
+pub fn is_valid_mcp_resource_uri(uri: &str) -> bool {
+    let uri = uri.trim();
+    !uri.is_empty()
+        && uri.chars().count() <= MAX_MCP_RESOURCE_URI_CHARS
+        && !uri.chars().any(|c| c.is_control())
+}
+
+/// Sanitize + clamp a discovered MCP resource description.
+pub fn sanitize_mcp_resource_description(s: &str) -> String {
+    sanitize_mcp_text(s, MAX_MCP_RESOURCE_DESC_CHARS)
+}
+
 /// Heuristic prompt-injection patterns for MCP tool descriptions. Lower-cased
 /// needles checked with `contains` — dependency-free (no `regex`), WARNING-level
 /// only. Mirrors Hermes `_MCP_INJECTION_PATTERNS` (`tools/mcp_tool.py` L340-365):
@@ -555,5 +649,33 @@ mod tests {
         );
         assert!(findings.contains(&"prompt override attempt"));
         assert!(findings.contains(&"network command in description"));
+    }
+
+    #[test]
+    fn valid_resource_uris_are_bounded_and_control_free() {
+        assert!(is_valid_mcp_resource_uri("file:///notes/today.md"));
+        assert!(is_valid_mcp_resource_uri("custom://server/resource?id=42"));
+        // Empty, control chars (CRLF/NUL), and over-long are refused.
+        assert!(!is_valid_mcp_resource_uri(""));
+        assert!(!is_valid_mcp_resource_uri("   "));
+        assert!(!is_valid_mcp_resource_uri("file:///a\r\nb"));
+        assert!(!is_valid_mcp_resource_uri("file:///a\u{0}b"));
+        assert!(!is_valid_mcp_resource_uri(&"x".repeat(MAX_MCP_RESOURCE_URI_CHARS + 1)));
+    }
+
+    #[test]
+    fn resource_serializes_only_present_optional_fields() {
+        let r = McpResource {
+            uri: "file:///a.md".to_string(),
+            name: "a".to_string(),
+            title: None,
+            mime_type: None,
+            description: String::new(),
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        // Absent optionals are omitted from the wire shape.
+        assert!(v.get("title").is_none());
+        assert!(v.get("mime_type").is_none());
+        assert_eq!(v["uri"], "file:///a.md");
     }
 }

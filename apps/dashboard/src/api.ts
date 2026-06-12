@@ -2873,6 +2873,35 @@ export interface ReluxMcpToolsResult {
   tools: ReluxToolDescriptor[];
 }
 
+// One read-only resource advertised by an MCP server (resources/list). Resources
+// are inert context (files/records/docs) — listing or reading one performs no
+// action and mutates nothing.
+export interface ReluxMcpResource {
+  uri: string;
+  name: string;
+  title?: string;
+  mime_type?: string;
+  description: string;
+}
+
+// The live resources/list result for one server. `reachable` is true only when
+// the probe succeeded — never a faked empty list.
+export interface ReluxMcpResourcesResult {
+  server_id: string;
+  reachable: boolean;
+  resources: ReluxMcpResource[];
+}
+
+// The shaped, sanitized, secret-redacted body of one resource (resources/read).
+// `text` is bounded; binary content is summarized (never raw bytes). `binary` is
+// true when the resource carried any binary block.
+export interface ReluxMcpResourceContent {
+  uri: string;
+  mime_type?: string;
+  text: string;
+  binary: boolean;
+}
+
 export const reluxMcp = {
   // Registered MCP servers (no secrets). Throws an ApiError on failure.
   list: () => api.get<ReluxMcpServer[]>("/v1/relux/mcp/servers"),
@@ -2914,6 +2943,19 @@ export const reluxMcp = {
   clearClassification: (id: string, tool: string) =>
     api.del<ReluxMcpServer>(
       `/v1/relux/mcp/servers/${encodeURIComponent(id)}/tools/${encodeURIComponent(tool)}/classification`,
+    ),
+  // Run a live resources/list (read-only context source). 404 unknown · 409
+  // disabled · 502 unreachable — never a faked empty list.
+  resources: (id: string) =>
+    api.get<ReluxMcpResourcesResult>(
+      `/v1/relux/mcp/servers/${encodeURIComponent(id)}/resources`,
+    ),
+  // Read one resource by URI, returning the shaped/redacted text (binary
+  // summarized). 404 unknown · 409 disabled · 400 invalid uri · 502 unreachable.
+  // Read-only: a resources/read performs no action.
+  readResource: (id: string, uri: string) =>
+    api.get<ReluxMcpResourceContent>(
+      `/v1/relux/mcp/servers/${encodeURIComponent(id)}/resources/read?uri=${encodeURIComponent(uri)}`,
     ),
 };
 

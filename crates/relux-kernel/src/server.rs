@@ -252,6 +252,8 @@ async fn serve() -> Result<(), KernelError> {
     println!("   POST   /v1/relux/mcp/servers              {{ \"id\":\"...\", \"endpoint\":\"http://127.0.0.1:<port>/mcp\", \"description\"?, \"enabled\"?, \"timeout_ms\"? }}");
     println!("   DELETE /v1/relux/mcp/servers/:id           (remove an MCP server)");
     println!("   GET    /v1/relux/mcp/servers/:id/tools     (live tools/list discovery → ToolDescriptor[])");
+    println!("   GET    /v1/relux/mcp/servers/:id/resources (live resources/list → McpResource[]; read-only context)");
+    println!("   GET    /v1/relux/mcp/servers/:id/resources/read?uri=…  (read one resource → shaped, redacted text)");
     println!("   PUT    /v1/relux/mcp/servers/:id/tools/:tool/classification  {{ \"risk\":\"low|medium|high|critical\", \"approval\":\"never|required\" }}");
     println!("   DELETE /v1/relux/mcp/servers/:id/tools/:tool/classification  (revert to the gated default)");
     println!("          (MCP tools invoke through /v1/relux/tools/invoke etc. with plugin_id \"mcp:<server>\")");
@@ -540,6 +542,12 @@ fn protected_router() -> Router<AppState> {
         )
         .route("/v1/relux/mcp/servers/:id", delete(delete_mcp_server))
         .route("/v1/relux/mcp/servers/:id/tools", get(mcp_server_tools))
+        // MCP resources — read-only context source (resources/list + resources/read).
+        .route("/v1/relux/mcp/servers/:id/resources", get(mcp_server_resources))
+        .route(
+            "/v1/relux/mcp/servers/:id/resources/read",
+            get(mcp_read_resource_route),
+        )
         .route(
             "/v1/relux/mcp/servers/:id/tools/:tool/classification",
             put(set_mcp_tool_classification)
@@ -6132,6 +6140,65 @@ async fn clear_mcp_tool_classification(
     Ok(Json(resp))
 }
 
+/// The live `resources/list` response for one MCP server. Honest by construction: on
+/// a transport/protocol failure the route surfaces the error (4xx/5xx via
+/// [`ApiError`]); a successful probe returns the advertised resources. Resources are
+/// READ-ONLY context — listing them performs no action and changes nothing.
+#[derive(Debug, Serialize)]
+struct McpResourcesResponse {
+    server_id: String,
+    /// True when the live `resources/list` probe succeeded.
+    reachable: bool,
+    resources: Vec<relux_core::McpResource>,
+}
+
+/// GET `/v1/relux/mcp/servers/:id/resources` — run a live `resources/list` against
+/// the server. Unknown id → 404; disabled → 409; a transport/protocol failure → 502
+/// (never a fabricated empty list). Read-only: a read lock is enough.
+async fn mcp_server_resources(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<McpResourcesResponse>, ApiError> {
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err(ApiError::bad_request("MCP server id is required"));
+    }
+    let resources = locked_read(&state, |kernel| kernel.list_mcp_resources(&id))?;
+    Ok(Json(McpResourcesResponse {
+        server_id: id,
+        reachable: true,
+        resources,
+    }))
+}
+
+/// Query params for `GET /v1/relux/mcp/servers/:id/resources/read`.
+#[derive(Debug, Deserialize)]
+struct McpResourceReadQuery {
+    /// The resource URI to read (validated non-empty, bounded, control-char free).
+    uri: String,
+}
+
+/// GET `/v1/relux/mcp/servers/:id/resources/read?uri=…` — read ONE resource by URI,
+/// returning the shaped, sanitized, secret-redacted content (text only; binary
+/// summarized honestly). Unknown id → 404; disabled → 409; an invalid/empty URI →
+/// 400; a transport/protocol failure → 502. Read-only: a `resources/read` is inert.
+async fn mcp_read_resource_route(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    query: axum::extract::Query<McpResourceReadQuery>,
+) -> Result<Json<relux_core::McpResourceContent>, ApiError> {
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err(ApiError::bad_request("MCP server id is required"));
+    }
+    let uri = query.uri.trim().to_string();
+    if uri.is_empty() {
+        return Err(ApiError::bad_request("a resource `uri` query param is required"));
+    }
+    let content = locked_read(&state, |kernel| kernel.read_mcp_resource(&id, &uri))?;
+    Ok(Json(content))
+}
+
 // --- Store access (serialized) ---------------------------------------------
 
 /// Lock, open the store, load + bootstrap, run `f`, then SAVE. For mutations.
@@ -6686,9 +6753,16 @@ fn status_for(err: &KernelError) -> StatusCode {
         // discovery failure against the operator's loopback server is an upstream
         // (bad gateway) failure, surfaced honestly rather than as a fake empty list.
         KernelError::McpServerDisabled(_) => StatusCode::CONFLICT,
-        KernelError::McpDiscoveryFailed { .. } => StatusCode::BAD_GATEWAY,
-        // An invalid MCP tool name (classification or invocation) is bad input.
-        KernelError::InvalidMcpToolName { .. } => StatusCode::BAD_REQUEST,
+        // A live resource list/read failure against the operator's loopback server is
+        // an upstream (bad gateway) failure, surfaced honestly (never a fake empty).
+        KernelError::McpDiscoveryFailed { .. } | KernelError::McpResourceFetchFailed { .. } => {
+            StatusCode::BAD_GATEWAY
+        }
+        // An invalid MCP tool name / resource URI (classification, invocation, read)
+        // is bad input.
+        KernelError::InvalidMcpToolName { .. } | KernelError::InvalidMcpResourceUri { .. } => {
+            StatusCode::BAD_REQUEST
+        }
         // A configured tool that requires approval cannot be invoked directly yet:
         // a conflict the operator resolves by lowering risk / enabling auto-approve,
         // or by requesting a per-call approval.
@@ -8931,6 +9005,43 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(v["tool_overrides"].as_object().map(|o| o.is_empty()).unwrap_or(true));
+    }
+
+    #[tokio::test]
+    async fn mcp_resource_routes_are_honest_on_bad_input() {
+        let (state, _dir) = auth_state(true);
+        // Resources on an unknown server → 404 (never a fabricated empty list).
+        let (status, _, _) =
+            call(&state, "GET", "/v1/relux/mcp/servers/nope/resources", None, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // Read with a missing uri query param → 400.
+        let (status, _, _) =
+            call(&state, "GET", "/v1/relux/mcp/servers/nope/resources/read", None, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Register, then disable, a server: resources on a disabled server → 409.
+        let (status, _, _) = call(
+            &state,
+            "POST",
+            "/v1/relux/mcp/servers",
+            None,
+            Some(r#"{"id":"fs","endpoint":"http://127.0.0.1:8000/mcp","enabled":false}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, _) =
+            call(&state, "GET", "/v1/relux/mcp/servers/fs/resources", None, None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        // Read with a uri but a disabled server → 409 (gate before dialing).
+        let (status, _, _) = call(
+            &state,
+            "GET",
+            "/v1/relux/mcp/servers/fs/resources/read?uri=file:///x.md",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
     }
 
     /// Write a fake CLI that prints `output` and exits 0 (cross-platform), used to
