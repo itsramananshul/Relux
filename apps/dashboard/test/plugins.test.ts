@@ -18,6 +18,9 @@ import {
   hintsNextStep,
   mcpDraftFromProposal,
   validateMcpRegisterDraft,
+  mcpRegisterBody,
+  parseEnvMappingLines,
+  mcpEnvFromText,
 } from "../src/plugins.ts";
 
 // The Plugins page must read HONESTLY: a generated metadata-only wrapper is never
@@ -486,6 +489,8 @@ test("mcpDraftFromProposal seeds the review form from an HTTP proposal", () => {
     endpoint: "http://127.0.0.1:8000/mcp",
     command: "",
     argsText: "",
+    envText: "",
+    cwd: "",
     description: "A cool MCP server.",
   });
 });
@@ -517,6 +522,8 @@ test("validateMcpRegisterDraft mirrors the kernel's fail-closed rules (HTTP)", (
       endpoint: "http://127.0.0.1:8000/mcp",
       command: "",
       argsText: "",
+      envText: "",
+      cwd: "",
       description: "",
       ...over,
     });
@@ -539,6 +546,8 @@ test("validateMcpRegisterDraft enforces the managed-stdio safety rules", () => {
       endpoint: "",
       command: "npx",
       argsText: "-y\nserver-github",
+      envText: "",
+      cwd: "",
       description: "",
       ...over,
     });
@@ -555,4 +564,61 @@ test("validateMcpRegisterDraft enforces the managed-stdio safety rules", () => {
   );
   // An arg with spaces (e.g. JSON) is fine — args are per-line, never shell-split.
   assert.equal(stdio({ argsText: '--config\n{"k": 1}' }), null);
+
+  // --- Env mappings (secret REFERENCES) + cwd ---
+  // A valid env line (ENV_VAR=secret_name) passes.
+  assert.equal(stdio({ envText: "OPENAI_API_KEY=my_openai_key" }), null);
+  // An invalid env-var name is rejected.
+  assert.match(stdio({ envText: "2bad=secret" }) ?? "", /env var name/i);
+  assert.match(stdio({ envText: "has-dash=secret" }) ?? "", /env var name/i);
+  // A missing / invalid secret reference is rejected (must be a NAME, not a value).
+  assert.match(stdio({ envText: "OK_VAR=" }) ?? "", /reference a secret/i);
+  assert.match(stdio({ envText: "OK_VAR=not a name" }) ?? "", /reference a secret/i);
+  // A `..` traversal cwd is rejected; a clean relative cwd passes.
+  assert.match(stdio({ cwd: "../escape" }) ?? "", /traversal/i);
+  assert.match(stdio({ cwd: "a\\..\\b" }) ?? "", /traversal/i);
+  assert.equal(stdio({ cwd: "workspace-a" }), null);
+});
+
+test("mcpRegisterBody includes env refs + cwd for a managed-stdio draft", () => {
+  const body = mcpRegisterBody({
+    id: "gh",
+    transport: "managed_stdio",
+    endpoint: "",
+    command: "npx",
+    argsText: "-y\nserver-github",
+    envText: "OPENAI_API_KEY=my_openai_key\nGH_TOKEN=gh_pat",
+    cwd: "workspace-a",
+    description: "",
+  });
+  assert.equal(body.transport, "managed_stdio");
+  assert.deepEqual(body.env, {
+    OPENAI_API_KEY: { secret: "my_openai_key" },
+    GH_TOKEN: { secret: "gh_pat" },
+  });
+  assert.equal(body.cwd, "workspace-a");
+
+  // No env / cwd → those fields are omitted (undefined), not empty objects.
+  const bare = mcpRegisterBody({
+    id: "gh",
+    transport: "managed_stdio",
+    endpoint: "",
+    command: "npx",
+    argsText: "",
+    envText: "",
+    cwd: "",
+    description: "",
+  });
+  assert.equal(bare.env, undefined);
+  assert.equal(bare.cwd, undefined);
+});
+
+test("parseEnvMappingLines + mcpEnvFromText parse VAR=secret lines (refs only)", () => {
+  assert.deepEqual(parseEnvMappingLines("A=one\n\n  B = two  "), [
+    ["A", "one"],
+    ["B", "two"],
+  ]);
+  assert.deepEqual(mcpEnvFromText("OPENAI_API_KEY=my_key"), {
+    OPENAI_API_KEY: { secret: "my_key" },
+  });
 });

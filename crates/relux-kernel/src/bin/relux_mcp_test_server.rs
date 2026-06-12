@@ -20,9 +20,25 @@
 //! - `crash` — makes the server process exit immediately without responding, so a
 //!   test can exercise the pool's process-death detection (the call sees EOF →
 //!   `ProcessExited`, and a later status reports `failed`).
+//! - `env_probe` — reads the env var named in `arguments.var` and reports ONLY whether
+//!   it is present plus a non-cryptographic FNV-1a hash of its value (never the raw
+//!   value), so a test can PROVE the managed-stdio child received a resolved secret in
+//!   its environment without that secret ever being printed/returned.
 
 use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// A tiny, dependency-free FNV-1a hash (hex), used by `env_probe` to attest the value
+/// of an injected env var WITHOUT revealing it — a test computes the same hash over the
+/// value it set and compares, proving exact delivery without printing the secret.
+fn fnv1a_hex(s: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in s.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
 
 /// Per-process invocation counter for `whoami`, proving process reuse across calls.
 static CALLS: AtomicU64 = AtomicU64::new(0);
@@ -64,7 +80,8 @@ fn main() {
                     { "name": "boom", "description": "Always returns an error result." },
                     { "name": "noisy", "description": "Writes to stderr, then returns ok." },
                     { "name": "whoami", "description": "Return this process pid + per-process call count." },
-                    { "name": "crash", "description": "Exit the process without responding (death test)." }
+                    { "name": "crash", "description": "Exit the process without responding (death test)." },
+                    { "name": "env_probe", "description": "Report presence + FNV hash of an env var (never its value)." }
                 ]}
             }),
             "tools/call" => {
@@ -116,6 +133,23 @@ fn main() {
                             "result": {
                                 "content": [ { "type": "text", "text": format!("pid={pid} calls={n}") } ],
                                 "structuredContent": { "pid": pid, "calls": n },
+                                "isError": false
+                            }
+                        })
+                    }
+                    "env_probe" => {
+                        let var = args.get("var").and_then(|v| v.as_str()).unwrap_or("");
+                        let value = std::env::var(var).ok();
+                        let present = value.is_some();
+                        // Attest the value via a hash ONLY — the raw value never leaves
+                        // this process, so a secret injected into the child env is never
+                        // printed or returned.
+                        let fnv1a = fnv1a_hex(value.as_deref().unwrap_or(""));
+                        serde_json::json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": {
+                                "content": [ { "type": "text", "text": format!("env {var} present={present}") } ],
+                                "structuredContent": { "present": present, "fnv1a": fnv1a },
                                 "isError": false
                             }
                         })

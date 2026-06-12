@@ -15,7 +15,7 @@ fn fixture() -> &'static str {
 
 #[test]
 fn discovers_tools_from_a_real_stdio_server() {
-    let tools = mcp_stdio::discover_tools(fixture(), &[], 5_000).expect("discovery ok");
+    let tools = mcp_stdio::discover_tools(fixture(), &[], &[], None, 5_000).expect("discovery ok");
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
     assert!(names.contains(&"status.summary"), "tools: {names:?}");
     assert!(names.contains(&"boom"), "tools: {names:?}");
@@ -30,6 +30,8 @@ fn calls_a_tool_and_gets_a_shaped_result() {
     let out = mcp_stdio::call_tool(
         fixture(),
         &[],
+        &[],
+        None,
         "status.summary",
         &serde_json::json!({ "q": "hi" }),
         5_000,
@@ -43,7 +45,7 @@ fn calls_a_tool_and_gets_a_shaped_result() {
 
 #[test]
 fn a_tool_iserror_is_an_honest_failure_not_a_fake_success() {
-    let err = mcp_stdio::call_tool(fixture(), &[], "boom", &serde_json::json!({}), 5_000)
+    let err = mcp_stdio::call_tool(fixture(), &[], &[], None, "boom", &serde_json::json!({}), 5_000)
         .unwrap_err();
     assert!(
         matches!(err, McpClientError::ToolCallError(ref m) if m.contains("intentional failure")),
@@ -55,14 +57,14 @@ fn a_tool_iserror_is_an_honest_failure_not_a_fake_success() {
 fn a_noisy_tool_still_returns_ok() {
     // The server writes to stderr then returns ok; the client drains stderr (bounded)
     // and still surfaces the shaped ok result.
-    let out = mcp_stdio::call_tool(fixture(), &[], "noisy", &serde_json::json!({}), 5_000)
+    let out = mcp_stdio::call_tool(fixture(), &[], &[], None, "noisy", &serde_json::json!({}), 5_000)
         .expect("call ok");
     assert_eq!(out["result"], "noisy ok");
 }
 
 #[test]
 fn an_unknown_tool_fails_cleanly() {
-    let err = mcp_stdio::call_tool(fixture(), &[], "does.not.exist", &serde_json::json!({}), 5_000)
+    let err = mcp_stdio::call_tool(fixture(), &[], &[], None, "does.not.exist", &serde_json::json!({}), 5_000)
         .unwrap_err();
     // A JSON-RPC error from the server, surfaced honestly (never a fabricated result).
     assert!(matches!(err, McpClientError::ServerError { .. }), "got {err:?}");
@@ -70,7 +72,8 @@ fn an_unknown_tool_fails_cleanly() {
 
 #[test]
 fn spawn_failure_is_honest() {
-    let err = mcp_stdio::discover_tools("relux-mcp-no-such-binary-xyzzy", &[], 1_000).unwrap_err();
+    let err = mcp_stdio::discover_tools("relux-mcp-no-such-binary-xyzzy", &[], &[], None, 1_000)
+        .unwrap_err();
     assert!(matches!(err, McpClientError::Spawn(_)), "got {err:?}");
 }
 
@@ -78,8 +81,17 @@ fn spawn_failure_is_honest() {
 fn kernel_discovers_a_managed_stdio_server_through_the_registry() {
     let mut k = KernelState::new();
     // Registration is explicit + validated; it does NOT spawn the command.
-    k.register_mcp_stdio_server("local-fs", fixture(), &[], "test stdio server", true, Some(5_000))
-        .expect("register ok");
+    k.register_mcp_stdio_server(
+        "local-fs",
+        fixture(),
+        &[],
+        Default::default(),
+        None,
+        "test stdio server",
+        true,
+        Some(5_000),
+    )
+    .expect("register ok");
 
     // Discover runs the live tools/list by SPAWNING the command (operator-controlled).
     let tools = k.discover_mcp_tools("local-fs").expect("discovery ok");
@@ -98,8 +110,17 @@ fn kernel_discovers_a_managed_stdio_server_through_the_registry() {
 #[test]
 fn kernel_disabled_stdio_server_refuses_discovery() {
     let mut k = KernelState::new();
-    k.register_mcp_stdio_server("off", fixture(), &[], "disabled", false, Some(5_000))
-        .expect("register ok");
+    k.register_mcp_stdio_server(
+        "off",
+        fixture(),
+        &[],
+        Default::default(),
+        None,
+        "disabled",
+        false,
+        Some(5_000),
+    )
+    .expect("register ok");
     assert!(k.discover_mcp_tools("off").is_err(), "a disabled server must refuse discovery");
 }
 
@@ -120,7 +141,7 @@ fn pid_from_whoami(out: &serde_json::Value) -> u64 {
 #[test]
 fn pool_start_status_list_call_stop_lifecycle() {
     let id = "pool-lifecycle";
-    let status = pool().start(id, fixture(), &[], 5_000);
+    let status = pool().start(id, fixture(), &[], &[], None, 5_000);
     assert_eq!(status.state, ManagedStdioState::Running, "start → running: {status:?}");
     assert!(status.pid.is_some(), "a running process has a pid");
     assert!(status.started_at_ms.is_some(), "a running process has a start time");
@@ -147,7 +168,7 @@ fn pool_start_status_list_call_stop_lifecycle() {
 #[test]
 fn pool_reuses_one_process_across_calls() {
     let id = "pool-reuse";
-    let start = pool().start(id, fixture(), &[], 5_000);
+    let start = pool().start(id, fixture(), &[], &[], None, 5_000);
     let started_pid = start.pid.expect("running pid");
 
     let first = pool().call_tool(id, "whoami", &serde_json::json!({}), 5_000).expect("ok");
@@ -175,13 +196,13 @@ fn pool_reuse_requires_an_explicit_start() {
 #[test]
 fn pool_restart_replaces_the_process() {
     let id = "pool-restart";
-    let first = pool().start(id, fixture(), &[], 5_000);
+    let first = pool().start(id, fixture(), &[], &[], None, 5_000);
     let pid1 = first.pid.expect("pid1");
     // whoami once on the first process.
     let a = pool().call_tool(id, "whoami", &serde_json::json!({}), 5_000).expect("ok");
     assert_eq!(calls_from_whoami(&a), 1);
 
-    let second = pool().restart(id, fixture(), &[], 5_000);
+    let second = pool().restart(id, fixture(), &[], &[], None, 5_000);
     let pid2 = second.pid.expect("pid2");
     assert_ne!(pid1, pid2, "restart spawns a NEW process (different pid)");
     // The fresh process's counter starts over at 1 (it is genuinely a new process).
@@ -194,7 +215,7 @@ fn pool_restart_replaces_the_process() {
 #[test]
 fn pool_process_crash_marks_failed_and_records_error() {
     let id = "pool-crash";
-    let start = pool().start(id, fixture(), &[], 5_000);
+    let start = pool().start(id, fixture(), &[], &[], None, 5_000);
     assert_eq!(start.state, ManagedStdioState::Running);
 
     // The `crash` tool exits the process without responding; the call sees EOF and
@@ -219,7 +240,7 @@ fn pool_start_failure_is_an_honest_failed_status() {
     let id = "pool-bad-binary";
     // Nothing by this name is on PATH; the start fails → a `failed` status with a
     // redacted reason (never a fabricated `running`).
-    let status = pool().start(id, "relux-mcp-no-such-binary-xyzzy", &[], 1_000);
+    let status = pool().start(id, "relux-mcp-no-such-binary-xyzzy", &[], &[], None, 1_000);
     assert_eq!(status.state, ManagedStdioState::Failed, "bad binary → failed: {status:?}");
     assert!(status.last_error.is_some(), "a failed start records why");
     assert!(status.pid.is_none());
@@ -228,8 +249,17 @@ fn pool_start_failure_is_an_honest_failed_status() {
 #[test]
 fn kernel_managed_stdio_lifecycle_through_the_registry() {
     let mut k = KernelState::new();
-    k.register_mcp_stdio_server("life-fs", fixture(), &[], "test stdio server", true, Some(5_000))
-        .expect("register ok");
+    k.register_mcp_stdio_server(
+        "life-fs",
+        fixture(),
+        &[],
+        Default::default(),
+        None,
+        "test stdio server",
+        true,
+        Some(5_000),
+    )
+    .expect("register ok");
 
     // Start through the kernel (audited); the process comes up.
     let status = k.start_mcp_stdio_server("life-fs").expect("start ok");
@@ -260,8 +290,17 @@ fn kernel_lifecycle_refuses_http_and_disabled_servers() {
     ));
 
     // A disabled managed-stdio server refuses to start (enable it first).
-    k.register_mcp_stdio_server("off-stdio", fixture(), &[], "disabled", false, Some(5_000))
-        .expect("register ok");
+    k.register_mcp_stdio_server(
+        "off-stdio",
+        fixture(),
+        &[],
+        Default::default(),
+        None,
+        "disabled",
+        false,
+        Some(5_000),
+    )
+    .expect("register ok");
     assert!(matches!(
         k.start_mcp_stdio_server("off-stdio"),
         Err(relux_kernel::KernelError::McpServerDisabled(_))
@@ -274,11 +313,128 @@ fn kernel_lifecycle_refuses_http_and_disabled_servers() {
     ));
 }
 
+// --- Local secrets → managed-stdio env injection (end to end) ---------------
+
+use relux_kernel::secret_store::secret_store;
+
+/// The same FNV-1a hash the fixture uses, so the test can attest the injected value
+/// matches WITHOUT the raw value ever appearing in the test or the transport.
+fn fnv1a_hex(s: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in s.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+#[test]
+fn managed_stdio_child_receives_a_resolved_env_secret_end_to_end() {
+    // A unique secret name so the process-global store does not collide with other
+    // tests in the same process.
+    let secret_name = "relux_e2e_managed_env_secret_777";
+    let secret_value = "tok-abcdef-0987654321-xyz";
+    secret_store().set(secret_name, secret_value).expect("set secret");
+
+    let mut k = KernelState::new();
+    let mut env = std::collections::BTreeMap::new();
+    env.insert(
+        "RELUX_FIXTURE_TOKEN".to_string(),
+        relux_core::McpEnvRef {
+            secret: secret_name.to_string(),
+        },
+    );
+    k.register_mcp_stdio_server(
+        "env-e2e",
+        fixture(),
+        &[],
+        env,
+        None,
+        "env injection test",
+        true,
+        Some(5_000),
+    )
+    .expect("register ok");
+
+    // Start RESOLVES the secret ref and injects the plaintext into the child env.
+    let status = k.start_mcp_stdio_server("env-e2e").expect("start ok");
+    assert_eq!(status.state, ManagedStdioState::Running, "start → running: {status:?}");
+    // The status surface carries NO secret value (defense in depth).
+    let status_json = serde_json::to_string(&status).unwrap();
+    assert!(!status_json.contains(secret_value), "secret leaked into status: {status_json}");
+
+    // The child reports the env var is PRESENT with a matching value hash — never the
+    // value itself.
+    let out = pool()
+        .call_tool(
+            "env-e2e",
+            "env_probe",
+            &serde_json::json!({ "var": "RELUX_FIXTURE_TOKEN" }),
+            5_000,
+        )
+        .expect("probe ok");
+    assert_eq!(out["structuredContent"]["present"], serde_json::json!(true));
+    assert_eq!(
+        out["structuredContent"]["fnv1a"],
+        serde_json::json!(fnv1a_hex(secret_value)),
+        "the child received a DIFFERENT value than the stored secret"
+    );
+    // The raw secret value never appears in the shaped result.
+    let out_json = serde_json::to_string(&out).unwrap();
+    assert!(!out_json.contains(secret_value), "secret value leaked in result: {out_json}");
+
+    k.stop_mcp_stdio_server("env-e2e").expect("stop ok");
+    secret_store().delete(secret_name);
+}
+
+#[test]
+fn managed_stdio_start_fails_cleanly_when_a_referenced_secret_is_missing() {
+    let mut k = KernelState::new();
+    let mut env = std::collections::BTreeMap::new();
+    env.insert(
+        "NEEDS_TOKEN".to_string(),
+        relux_core::McpEnvRef {
+            secret: "definitely_absent_secret_e2e_xyz".to_string(),
+        },
+    );
+    k.register_mcp_stdio_server(
+        "env-missing",
+        fixture(),
+        &[],
+        env,
+        None,
+        "missing secret",
+        true,
+        Some(5_000),
+    )
+    .expect("register ok");
+
+    // Start does NOT spawn — it fails cleanly, naming the missing secret KEY (never a
+    // value), as a `failed` status rather than a fabricated `running`.
+    let status = k.start_mcp_stdio_server("env-missing").expect("start returns a status");
+    assert_eq!(status.state, ManagedStdioState::Failed, "missing secret → failed: {status:?}");
+    let reason = status.last_error.clone().unwrap_or_default();
+    assert!(reason.contains("definitely_absent_secret_e2e_xyz"), "names the secret: {reason}");
+    assert!(reason.contains("NEEDS_TOKEN"), "names the env var: {reason}");
+    assert!(status.pid.is_none(), "a failed start has no pid");
+
+    pool().stop("env-missing");
+}
+
 #[test]
 fn kernel_remove_stops_the_managed_process() {
     let mut k = KernelState::new();
-    k.register_mcp_stdio_server("rm-fs", fixture(), &[], "to remove", true, Some(5_000))
-        .expect("register ok");
+    k.register_mcp_stdio_server(
+        "rm-fs",
+        fixture(),
+        &[],
+        Default::default(),
+        None,
+        "to remove",
+        true,
+        Some(5_000),
+    )
+    .expect("register ok");
     let status = k.start_mcp_stdio_server("rm-fs").expect("start ok");
     assert_eq!(status.state, ManagedStdioState::Running);
     // Removing the registration stops + reaps the process so no daemon lingers.

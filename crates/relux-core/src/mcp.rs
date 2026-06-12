@@ -89,6 +89,13 @@ pub const MAX_MCP_ARG_CHARS: usize = 4096;
 /// Hard cap on how many managed-stdio arguments a server may carry.
 pub const MAX_MCP_ARGS: usize = 64;
 
+/// Hard cap on how many env-var mappings a managed-stdio server may carry.
+pub const MAX_MCP_ENV_VARS: usize = 64;
+/// Max characters accepted for an env-var NAME (the variable the child receives).
+pub const MAX_MCP_ENV_NAME_CHARS: usize = 128;
+/// Max characters accepted for a managed-stdio `cwd` path string.
+pub const MAX_MCP_CWD_CHARS: usize = 1024;
+
 /// The transport used to reach an MCP server.
 ///
 /// Two safe transports are accepted:
@@ -124,6 +131,36 @@ impl McpTransport {
     }
 }
 
+/// The value of one managed-stdio env-var mapping: a **reference to a named secret**
+/// in the local secret store, never a literal value. The config carries only the
+/// secret NAME (`{ "secret": "<name>" }`); the kernel resolves it into the child env
+/// at spawn time and never serializes the resolved value into status / logs /
+/// snapshots / API responses (`docs/mcp.md` "Local secrets & environment").
+///
+/// The single-variant `{ secret }` envelope is deliberate: it keeps the config
+/// secret-free (a future non-secret value kind, if ever needed, can extend the shape
+/// without breaking the stable `secret` form mirrored from Hermes' `${ENV}` refs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpEnvRef {
+    /// The name of the stored secret whose plaintext becomes this env var at spawn.
+    pub secret: String,
+}
+
+/// Whether `name` is a safe POSIX-style env-var NAME (the variable the child
+/// receives): non-empty, `[A-Za-z_][A-Za-z0-9_]*`, bounded. Mirrors Hermes'
+/// `_ENV_VAR_NAME_RE` (`hermes_cli/mcp_config.py` L32). The name is handed to
+/// [`std::process::Command::env`] verbatim, so it must carry no `=`, whitespace, or
+/// control characters that could smuggle a second assignment.
+pub fn is_valid_env_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    name.chars().count() <= MAX_MCP_ENV_NAME_CHARS
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// A durable, operator-curated MCP server registration.
 ///
 /// Persisted locally alongside the rest of the control plane. Carries no secrets —
@@ -152,6 +189,21 @@ pub struct McpServerConfig {
     /// shape) for an HTTP server or a command with no args.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+    /// Environment-variable mappings for a [`McpTransport::ManagedStdio`] server,
+    /// keyed by the env-var NAME the child receives. Each value is a SECRET REFERENCE
+    /// ([`McpEnvRef`]) — the config stores only the secret NAME, never any plaintext
+    /// value. The kernel resolves the refs into the child env at spawn time and never
+    /// serializes the resolved values. Empty (and omitted from the wire shape) for an
+    /// HTTP server or a command needing no env.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, McpEnvRef>,
+    /// An optional working directory for a [`McpTransport::ManagedStdio`] server,
+    /// relative to (or contained within) the operator-configured safe MCP workspace
+    /// root. Validated against path traversal + the root at spawn time by the kernel;
+    /// `None` (and omitted from the wire shape) means the child inherits the parent's
+    /// working directory. Never used for an HTTP server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     /// A short human description of what this server provides.
     pub description: String,
     /// Whether the server is enabled. A disabled server is kept (so its endpoint
@@ -243,6 +295,16 @@ pub enum McpConfigError {
     InvalidArg(String),
     #[error("managed-stdio MCP server argument is a forbidden bypass/danger flag: {0}")]
     DangerousFlag(String),
+    #[error("managed-stdio MCP server has too many env vars (max {MAX_MCP_ENV_VARS})")]
+    TooManyEnvVars,
+    #[error("managed-stdio MCP server env var name is not valid: {0}")]
+    InvalidEnvName(String),
+    #[error("managed-stdio MCP server env var '{name}' references an invalid secret name: {secret}")]
+    InvalidEnvSecretName { name: String, secret: String },
+    #[error("managed-stdio MCP server cwd is too long (max {MAX_MCP_CWD_CHARS} chars)")]
+    CwdTooLong,
+    #[error("managed-stdio MCP server cwd is not safe: {0}")]
+    InvalidCwd(String),
 }
 
 /// Shell metacharacters refused in a managed-stdio `command` token. Relux spawns the
@@ -323,6 +385,63 @@ pub fn validate_stdio_command(command: &str, args: &[String]) -> Result<(), McpC
     Ok(())
 }
 
+/// Validate a managed-stdio server's `env` map (SHAPE only — secret existence is
+/// checked at spawn time, not here): the var **count** is bounded, every env-var
+/// NAME is a valid POSIX-style identifier ([`is_valid_env_var_name`]), and every
+/// referenced **secret name** is a valid secret name ([`crate::secret::is_valid_secret_name`]).
+/// A failure is fail-closed (the server is never spawned). The config carries no
+/// plaintext, so this never inspects a value.
+pub fn validate_stdio_env(env: &BTreeMap<String, McpEnvRef>) -> Result<(), McpConfigError> {
+    if env.len() > MAX_MCP_ENV_VARS {
+        return Err(McpConfigError::TooManyEnvVars);
+    }
+    for (name, value) in env {
+        if !is_valid_env_var_name(name) {
+            return Err(McpConfigError::InvalidEnvName(name.clone()));
+        }
+        if !crate::secret::is_valid_secret_name(&value.secret) {
+            return Err(McpConfigError::InvalidEnvSecretName {
+                name: name.clone(),
+                secret: value.secret.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validate a managed-stdio `cwd` string's SHAPE (bounds + no traversal/control
+/// chars). This is the dependency-free, pre-filesystem guard: the **deep** check
+/// (the path exists, is a directory, and canonicalizes INSIDE the configured safe
+/// root — blocking a symlink escape) lives in the kernel at spawn time
+/// (`relux-kernel::secret_store::validate_managed_cwd`), because it touches the
+/// filesystem. Here we only reject the obviously unsafe: empty, over-long, a control
+/// character, or a `..` parent-directory traversal component. Fail-closed.
+pub fn validate_stdio_cwd_shape(cwd: &str) -> Result<(), McpConfigError> {
+    let trimmed = cwd.trim();
+    if trimmed.is_empty() {
+        return Err(McpConfigError::InvalidCwd("the cwd must not be empty".to_string()));
+    }
+    if trimmed.chars().count() > MAX_MCP_CWD_CHARS {
+        return Err(McpConfigError::CwdTooLong);
+    }
+    if trimmed.chars().any(|c| c.is_control()) {
+        return Err(McpConfigError::InvalidCwd(
+            "the cwd must not contain control characters".to_string(),
+        ));
+    }
+    // Reject any `..` parent-directory component (the classic traversal). Split on
+    // both separators so a Windows or POSIX path is checked identically.
+    if trimmed
+        .split(['/', '\\'])
+        .any(|seg| seg == "..")
+    {
+        return Err(McpConfigError::InvalidCwd(
+            "the cwd must not contain a '..' parent-directory traversal".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Whether `id` is a safe MCP server id: non-empty, `[A-Za-z0-9._-]` only, and at
 /// most [`MAX_MCP_ID_CHARS`] characters. The id becomes part of a `mcp:<id>`
 /// plugin namespace and a `tool:mcp-<id>:<verb>` permission string, so it must
@@ -373,6 +492,10 @@ pub fn validate_mcp_server_config(config: &McpServerConfig) -> Result<(), McpCon
         McpTransport::ManagedStdio => {
             let command = config.command.as_deref().unwrap_or("");
             validate_stdio_command(command, &config.args)?;
+            validate_stdio_env(&config.env)?;
+            if let Some(cwd) = &config.cwd {
+                validate_stdio_cwd_shape(cwd)?;
+            }
         }
     }
     Ok(())
@@ -748,6 +871,8 @@ mod tests {
             endpoint: endpoint.to_string(),
             command: None,
             args: Vec::new(),
+            env: BTreeMap::new(),
+            cwd: None,
             description: "test server".to_string(),
             enabled: true,
             timeout_ms: DEFAULT_MCP_TIMEOUT_MS,
@@ -762,6 +887,8 @@ mod tests {
             endpoint: String::new(),
             command: Some(command.to_string()),
             args: args.iter().map(|a| a.to_string()).collect(),
+            env: BTreeMap::new(),
+            cwd: None,
             description: "test stdio server".to_string(),
             enabled: true,
             timeout_ms: DEFAULT_MCP_TIMEOUT_MS,
@@ -900,6 +1027,83 @@ mod tests {
         // Round-trips back to the same config.
         let back: McpServerConfig = serde_json::from_value(v).unwrap();
         assert_eq!(back, stdio_cfg("gh", "npx", &["-y", "srv"]));
+    }
+
+    #[test]
+    fn accepts_stdio_server_with_env_refs_and_cwd() {
+        let mut c = stdio_cfg("gh", "npx", &["-y", "srv"]);
+        c.env.insert(
+            "OPENAI_API_KEY".to_string(),
+            McpEnvRef { secret: "openrouter_api_key".to_string() },
+        );
+        c.cwd = Some("workspaces/gh".to_string());
+        assert!(validate_mcp_server_config(&c).is_ok());
+        // The config carries the secret NAME only — never a value.
+        let v = serde_json::to_value(&c).unwrap();
+        assert_eq!(v["env"]["OPENAI_API_KEY"]["secret"], "openrouter_api_key");
+        assert_eq!(v["cwd"], "workspaces/gh");
+        // Round-trips.
+        let back: McpServerConfig = serde_json::from_value(v).unwrap();
+        assert_eq!(back, c);
+    }
+
+    #[test]
+    fn rejects_unsafe_env_and_cwd() {
+        // A bad env-var name (would smuggle a second assignment).
+        let mut bad_name = stdio_cfg("s", "node", &[]);
+        bad_name
+            .env
+            .insert("BAD NAME".to_string(), McpEnvRef { secret: "k".to_string() });
+        assert!(matches!(
+            validate_mcp_server_config(&bad_name),
+            Err(McpConfigError::InvalidEnvName(_))
+        ));
+        // A bad secret name.
+        let mut bad_secret = stdio_cfg("s", "node", &[]);
+        bad_secret
+            .env
+            .insert("OK".to_string(), McpEnvRef { secret: "../escape".to_string() });
+        assert!(matches!(
+            validate_mcp_server_config(&bad_secret),
+            Err(McpConfigError::InvalidEnvSecretName { .. })
+        ));
+        // Too many env vars.
+        let mut too_many = stdio_cfg("s", "node", &[]);
+        for i in 0..(MAX_MCP_ENV_VARS + 1) {
+            too_many
+                .env
+                .insert(format!("V{i}"), McpEnvRef { secret: "k".to_string() });
+        }
+        assert_eq!(
+            validate_mcp_server_config(&too_many),
+            Err(McpConfigError::TooManyEnvVars)
+        );
+        // A `..` traversal cwd.
+        let mut bad_cwd = stdio_cfg("s", "node", &[]);
+        bad_cwd.cwd = Some("../../etc".to_string());
+        assert!(matches!(
+            validate_mcp_server_config(&bad_cwd),
+            Err(McpConfigError::InvalidCwd(_))
+        ));
+        // A backslash `..` traversal cwd (Windows form) is also rejected.
+        let mut bad_cwd_win = stdio_cfg("s", "node", &[]);
+        bad_cwd_win.cwd = Some("sub\\..\\..\\secrets".to_string());
+        assert!(matches!(
+            validate_mcp_server_config(&bad_cwd_win),
+            Err(McpConfigError::InvalidCwd(_))
+        ));
+    }
+
+    #[test]
+    fn env_var_names_follow_posix_rules() {
+        assert!(is_valid_env_var_name("OPENAI_API_KEY"));
+        assert!(is_valid_env_var_name("_private"));
+        assert!(is_valid_env_var_name("Path2"));
+        assert!(!is_valid_env_var_name(""));
+        assert!(!is_valid_env_var_name("2leading"));
+        assert!(!is_valid_env_var_name("has-dash"));
+        assert!(!is_valid_env_var_name("has=eq"));
+        assert!(!is_valid_env_var_name("has space"));
     }
 
     #[test]

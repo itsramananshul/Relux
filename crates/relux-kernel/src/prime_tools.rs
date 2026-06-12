@@ -335,6 +335,13 @@ pub struct McpServerView {
     /// The managed-stdio program's args; empty for an HTTP server.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+    /// The managed-stdio env mappings (secret REFERENCES only — no plaintext), so an
+    /// off-lock spawn-per-op discovery can resolve them. Empty for an HTTP server.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, relux_core::McpEnvRef>,
+    /// The managed-stdio working directory (a path string; no secret), when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     pub description: String,
     pub enabled: bool,
     pub timeout_ms: u64,

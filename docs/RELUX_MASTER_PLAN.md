@@ -1913,6 +1913,38 @@ stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
   lifecycle through the registry incl. HTTP/disabled/unknown refusals + remove-stops-the-process; the
   lifecycle routes incl. 400/404 mappings; `ManagedStdioStatus` serde shape); dashboard typecheck/build/tests
   green (369), committed bundle rebuilt.
+- **unreleased** — **Local secret/env/cwd foundation for managed-stdio MCP servers (closes the "no env / no
+  `cwd`" gap)** on top of the managed-stdio transport, same §8.2/§18 + §17.5, built reference-first against
+  Hermes `reference/hermes-agent-main/hermes_cli/mcp_config.py` (a stdio server is `{"command","args","env"}`;
+  the per-server key lives in a SEPARATE `~/.hermes/.env` and is REFERENCED via `${ENV}`; `cmd_mcp_test` masks
+  the value, never prints it) and `crates/relix-web-bridge/src/secrets.rs` + `os_secure.rs` (separate
+  permission-restricted file, atomic write, no-plaintext-return, tail-redacted preview) —
+  `docs/reference-driven-development.md` (BINDING); mapping in `docs/mcp.md` "Local secrets & environment".
+  **What closes:** the prior managed-stdio slices listed "no env / no `cwd`" as a gap, so a server needing a
+  token or a working directory could not run through the managed transport. **What ships:** (1) a local,
+  file-backed **secret store** (`relux-kernel::secret_store`, `secrets.json` hardened to owner-only — POSIX
+  `0600` / Windows `icacls`) that lives **outside** the kernel snapshot (like the managed pool), with
+  set/list/delete that **never return a plaintext value** (only a redacted `relux_core::SecretStatus` preview)
+  and a single internal `resolve` used solely at spawn; routes `GET /v1/relux/secrets`,
+  `PUT /v1/relux/secrets/:name { value }` (write-only), `DELETE …/:name`. (2) **Secret-referenced `env`** on a
+  managed-stdio `McpServerConfig` (`env: { "<ENV_VAR>": { "secret": "<name>" } }`, `relux_core::McpEnvRef`) —
+  the config stores only NAMES, never values; resolved into the child env at Start/Restart/spawn-per-op and
+  handed straight to `Command::env`, never serialized/logged/retained; a missing secret is a clean `failed`
+  status naming the KEY (never a value). (3) A confined optional **`cwd`** validated fail-closed
+  (`validate_managed_cwd`: no `..`, must exist + be a dir + canonicalize INSIDE the configured safe MCP
+  workspace root `RELUX_MCP_WORKSPACE_ROOT`, symlink-escape rejected). **Same safety contract** otherwise
+  (argv only — never a shell; no bypass/danger flag; protected/bundled plugins untouched; nothing auto-run on
+  registration). **UI:** Plugins page gains a **Secrets & environment** section (write-only value field,
+  redacted listing, delete) and the MCP form gains **Environment** (`ENV_VAR=secret_name`) + **Working
+  directory** fields, pre-checked with the kernel's rules. **Honest gaps:** local dev-safe (file-permission
+  hardened, not encrypted; no OS keychain/DPAPI yet); rotation is manual; env is per-process (Restart to pick
+  up a changed secret); adapters do not yet consume the store. No release cut; no safety property weakened (no
+  remote host dialed, no downloaded code run, **no plaintext secret stored in the config/snapshot/API**).
+  `cargo test` + `clippy` clean on `relux-core`/`relux-kernel` (new tests: secret set/list/delete never return
+  plaintext, redacted preview, hardened-file round-trip; spawn-Command env/cwd injection + a REAL-subprocess
+  `env_probe` proving the child receives the resolved secret via a value hash without printing it; missing
+  secret → clean failed status naming the key; cwd traversal/outside-root rejected, inside-root accepted);
+  dashboard typecheck/build/tests green (371), committed bundle rebuilt.
 - **unreleased** — **Background-job concurrency folded into the autonomy policy (retires the hidden
   `MAX_ACTIVE_JOBS = 4`)**, the FINAL LATER item from `docs/ARTIFICIAL_CONSTRAINT_AUDIT.md` promoted to
   FIXED, finishing the artificial-constraint pass and continuing the autonomy-policy line (§10.5/§17.1).

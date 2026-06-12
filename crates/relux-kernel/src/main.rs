@@ -857,6 +857,41 @@ fn uploads_root() -> PathBuf {
     }
 }
 
+/// The local secret store file: `secrets.json` next to the local dev database
+/// (`dev-data/relux/secrets.json` by default, already gitignored under `dev-data/`).
+/// `RELUX_SECRETS_FILE` overrides it. Holds operator-supplied secrets (API keys /
+/// tokens) in plaintext, hardened to owner-only permissions (POSIX 0600 / Windows
+/// icacls); the value is never returned by the API. See `secret_store.rs`.
+fn secrets_path() -> PathBuf {
+    match std::env::var("RELUX_SECRETS_FILE") {
+        Ok(p) if !p.trim().is_empty() => PathBuf::from(p),
+        _ => {
+            let db = db_path();
+            match db.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent.join("secrets.json"),
+                _ => PathBuf::from("dev-data/relux/secrets.json"),
+            }
+        }
+    }
+}
+
+/// The safe MCP workspace root: the ONLY directory tree a managed-stdio server's
+/// `cwd` may resolve inside (`dev-data/relux/mcp-workspaces` by default, gitignored).
+/// `RELUX_MCP_WORKSPACE_ROOT` overrides it. Created on startup so a relative `cwd`
+/// can be placed under it. See `secret_store.rs` `validate_managed_cwd`.
+fn mcp_workspace_root_path() -> PathBuf {
+    match std::env::var("RELUX_MCP_WORKSPACE_ROOT") {
+        Ok(p) if !p.trim().is_empty() => PathBuf::from(p),
+        _ => {
+            let db = db_path();
+            match db.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent.join("mcp-workspaces"),
+                _ => PathBuf::from("dev-data/relux/mcp-workspaces"),
+            }
+        }
+    }
+}
+
 /// Ensure the loaded `kernel` has the baseline control plane (plugins, the
 /// workspace namespace, and the Prime agent), and return the `PrimeContext` to
 /// act with.

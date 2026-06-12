@@ -52,6 +52,7 @@ pub mod prime_update_slots;
 pub mod prime_write_tools;
 pub mod run_cancel;
 pub mod runtime;
+pub mod secret_store;
 pub mod state;
 pub mod store;
 
@@ -175,6 +176,10 @@ pub use mcp::{
     call_tool as call_mcp_tool, discover_tools as discover_mcp_tools, McpClientError,
 };
 pub use runtime::{invoke_http_loopback, RuntimeClientError};
+pub use secret_store::{
+    init_mcp_workspace_root, init_secret_store, mcp_workspace_root, resolve_managed_env_and_cwd,
+    secret_store, validate_managed_cwd, SecretStore,
+};
 pub use state::{
     discover_proposal_mcp_catalog, run_briefs_in_parallel, run_briefs_in_parallel_streaming,
     AppliedProposedChange, AppliedProposedChangeSet, BrainSlotProposals, BundledRefresh,

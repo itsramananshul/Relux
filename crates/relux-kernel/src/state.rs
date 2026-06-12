@@ -1157,6 +1157,8 @@ impl KernelState {
             endpoint: endpoint.trim().to_string(),
             command: None,
             args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            cwd: None,
             description: relux_core::sanitize_mcp_text(
                 description,
                 relux_core::MAX_MCP_DESCRIPTION_CHARS,
@@ -1174,26 +1176,42 @@ impl KernelState {
     /// stdin/stdout. The command + args are validated with
     /// [`relux_core::validate_stdio_command`] (no shell metacharacters, bounded,
     /// no bypass/danger flag); the description is sanitized and the timeout clamped.
-    /// Upsert by id (preserving per-tool classifications). Stores **no env** (env
-    /// would carry secrets) and **no `cwd`** override. Registration is explicit and
-    /// operator-confirmed — it never spawns the command (that happens only on a later
-    /// operator-driven Discover / gated invocation). (`docs/mcp.md` "Managed stdio".)
+    /// Upsert by id (preserving per-tool classifications). `env` carries only SECRET
+    /// REFERENCES ([`relux_core::McpEnvRef`] — a secret NAME, never a plaintext value),
+    /// resolved into the child env at spawn from the local secret store; `cwd` is an
+    /// optional working directory validated against the safe MCP workspace root at
+    /// spawn. The config still stores **no plaintext secret**. Registration is explicit
+    /// and operator-confirmed — it never spawns the command (that happens only on a
+    /// later operator-driven Start / Discover / gated invocation), and it does NOT
+    /// require the referenced secrets to exist yet (that is checked, naming the missing
+    /// secret, at spawn). (`docs/mcp.md` "Local secrets & environment".)
+    // The arg list mirrors the on-the-wire managed-stdio fields (command/args/env/cwd/
+    // description/enabled/timeout); grouping them into a struct would only shift the
+    // shape, not reduce it, so the explicit args stay for call-site clarity.
+    #[allow(clippy::too_many_arguments)]
     pub fn register_mcp_stdio_server(
         &mut self,
         id: &str,
         command: &str,
         args: &[String],
+        env: std::collections::BTreeMap<String, relux_core::McpEnvRef>,
+        cwd: Option<String>,
         description: &str,
         enabled: bool,
         timeout_ms: Option<u64>,
     ) -> Result<relux_core::McpServerConfig, KernelError> {
         let id = id.trim().to_string();
+        let cwd = cwd
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty());
         let config = relux_core::McpServerConfig {
             id: id.clone(),
             transport: relux_core::McpTransport::ManagedStdio,
             endpoint: String::new(),
             command: Some(command.trim().to_string()),
             args: args.iter().map(|a| a.to_string()).collect(),
+            env,
+            cwd,
             description: relux_core::sanitize_mcp_text(
                 description,
                 relux_core::MAX_MCP_DESCRIPTION_CHARS,
@@ -1334,8 +1352,23 @@ impl KernelState {
             return Err(KernelError::McpServerDisabled(id.to_string()));
         }
         let command = server.command.clone().unwrap_or_default();
-        let status =
-            crate::mcp_stdio::pool().start(id, &command, &server.args, server.timeout_ms);
+        // Resolve env secrets + validate cwd BEFORE spawning. A missing secret / bad
+        // cwd is a clean `failed` status naming the missing KEY (never a value) — not a
+        // fabricated `running`, and not a hard error (the operator fixes it and retries).
+        let status = match crate::secret_store::resolve_managed_env_and_cwd(
+            &server.env,
+            server.cwd.as_deref(),
+        ) {
+            Ok((env, cwd)) => crate::mcp_stdio::pool().start(
+                id,
+                &command,
+                &server.args,
+                &env,
+                cwd.as_deref(),
+                server.timeout_ms,
+            ),
+            Err(reason) => crate::mcp_stdio::pool().fail(id, &reason),
+        };
         self.record_audit(
             "kernel",
             "kernel",
@@ -1381,8 +1414,20 @@ impl KernelState {
             return Err(KernelError::McpServerDisabled(id.to_string()));
         }
         let command = server.command.clone().unwrap_or_default();
-        let status =
-            crate::mcp_stdio::pool().restart(id, &command, &server.args, server.timeout_ms);
+        let status = match crate::secret_store::resolve_managed_env_and_cwd(
+            &server.env,
+            server.cwd.as_deref(),
+        ) {
+            Ok((env, cwd)) => crate::mcp_stdio::pool().restart(
+                id,
+                &command,
+                &server.args,
+                &env,
+                cwd.as_deref(),
+                server.timeout_ms,
+            ),
+            Err(reason) => crate::mcp_stdio::pool().fail(id, &reason),
+        };
         self.record_audit(
             "kernel",
             "kernel",
@@ -6541,6 +6586,10 @@ impl KernelState {
                 endpoint: s.endpoint.clone(),
                 command: s.command.clone(),
                 args: s.args.clone(),
+                // Secret REFERENCES only (no plaintext) + the cwd path, so off-lock
+                // discovery can resolve env via the global secret store.
+                env: s.env.clone(),
+                cwd: s.cwd.clone(),
                 description: s.description.clone(),
                 enabled: s.enabled,
                 timeout_ms: s.timeout_ms,
@@ -11363,8 +11412,23 @@ fn mcp_discover_tools(
             if crate::mcp_stdio::pool().is_running(&server.id) {
                 crate::mcp_stdio::pool().list_tools(&server.id, server.timeout_ms)
             } else {
+                // Spawn-per-op fallback: resolve env secrets + validate cwd first, so a
+                // stdio server needing a token/working-dir works without a managed
+                // process. A missing secret / bad cwd is an honest spawn error naming
+                // the KEY (never a value).
+                let (env, cwd) = crate::secret_store::resolve_managed_env_and_cwd(
+                    &server.env,
+                    server.cwd.as_deref(),
+                )
+                .map_err(crate::mcp::McpClientError::Spawn)?;
                 let command = server.command.as_deref().unwrap_or("");
-                crate::mcp_stdio::discover_tools(command, &server.args, server.timeout_ms)
+                crate::mcp_stdio::discover_tools(
+                    command,
+                    &server.args,
+                    &env,
+                    cwd.as_deref(),
+                    server.timeout_ms,
+                )
             }
         }
     }
@@ -11387,10 +11451,17 @@ fn mcp_call_tool(
             if crate::mcp_stdio::pool().is_running(&server.id) {
                 crate::mcp_stdio::pool().call_tool(&server.id, tool_name, input, server.timeout_ms)
             } else {
+                let (env, cwd) = crate::secret_store::resolve_managed_env_and_cwd(
+                    &server.env,
+                    server.cwd.as_deref(),
+                )
+                .map_err(crate::mcp::McpClientError::Spawn)?;
                 let command = server.command.as_deref().unwrap_or("");
                 crate::mcp_stdio::call_tool(
                     command,
                     &server.args,
+                    &env,
+                    cwd.as_deref(),
                     tool_name,
                     input,
                     server.timeout_ms,
@@ -11413,8 +11484,21 @@ fn mcp_view_discover_tools(
             if crate::mcp_stdio::pool().is_running(&s.id) {
                 crate::mcp_stdio::pool().list_tools(&s.id, s.timeout_ms)
             } else {
+                // Off-lock fallback discovery: resolve the view's env refs + cwd. The
+                // view carries only secret references (no plaintext); resolution dials
+                // the thread-safe global secret store. A missing secret / bad cwd is an
+                // honest spawn error (the step then grounds `unavailable`).
+                let (env, cwd) =
+                    crate::secret_store::resolve_managed_env_and_cwd(&s.env, s.cwd.as_deref())
+                        .map_err(crate::mcp::McpClientError::Spawn)?;
                 let command = s.command.as_deref().unwrap_or("");
-                crate::mcp_stdio::discover_tools(command, &s.args, s.timeout_ms)
+                crate::mcp_stdio::discover_tools(
+                    command,
+                    &s.args,
+                    &env,
+                    cwd.as_deref(),
+                    s.timeout_ms,
+                )
             }
         }
         // Default to HTTP for the loopback transport (and any older view that
@@ -13062,6 +13146,8 @@ mod tests {
                 "gh",
                 "npx",
                 &["-y".to_string(), "server-github".to_string()],
+                Default::default(),
+                None,
                 "github mcp",
                 true,
                 Some(2_000),
@@ -13081,7 +13167,16 @@ mod tests {
         )
         .unwrap();
         let re = k
-            .register_mcp_stdio_server("gh", "npx", &["-y".to_string(), "v2".to_string()], "moved", true, None)
+            .register_mcp_stdio_server(
+                "gh",
+                "npx",
+                &["-y".to_string(), "v2".to_string()],
+                Default::default(),
+                None,
+                "moved",
+                true,
+                None,
+            )
             .unwrap();
         assert_eq!(re.args, vec!["-y".to_string(), "v2".to_string()]);
         assert!(re.tool_overrides.contains_key("github.create_pr"));
@@ -13089,12 +13184,12 @@ mod tests {
 
         // An unsafe command (shell metacharacter) is refused fail-closed.
         assert!(matches!(
-            k.register_mcp_stdio_server("bad", "sh;rm", &[], "x", true, None),
+            k.register_mcp_stdio_server("bad", "sh;rm", &[], Default::default(), None, "x", true, None),
             Err(KernelError::InvalidMcpConfig { .. })
         ));
         // An empty command is refused.
         assert!(matches!(
-            k.register_mcp_stdio_server("bad", "   ", &[], "x", true, None),
+            k.register_mcp_stdio_server("bad", "   ", &[], Default::default(), None, "x", true, None),
             Err(KernelError::InvalidMcpConfig { .. })
         ));
         // A forbidden bypass flag in args is refused.
@@ -13103,6 +13198,8 @@ mod tests {
                 "bad",
                 "claude",
                 &["--dangerously-skip-permissions".to_string()],
+                Default::default(),
+                None,
                 "x",
                 true,
                 None

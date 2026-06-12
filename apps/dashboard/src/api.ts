@@ -3105,16 +3105,27 @@ export interface McpToolClassification {
   approval: "never" | "required" | { required_when_risk: string };
 }
 
+// One managed-stdio env mapping value: a reference to a stored secret by NAME
+// (never a literal value), so the config never carries plaintext.
+export interface McpEnvRef {
+  secret: string;
+}
+
 export interface ReluxMcpServer {
   id: string;
   transport: string; // "http_loopback" | "managed_stdio"
   // The loopback endpoint (HTTP transport); empty for a managed-stdio server.
   endpoint: string;
   // The managed-stdio program (stdio transport); absent for an HTTP server. No
-  // secret (env is not stored).
+  // secret (env carries secret NAMES only, never values).
   command?: string;
   // The managed-stdio program's args; absent/empty for an HTTP server.
   args?: string[];
+  // The managed-stdio env mappings, keyed by env-var NAME. Each value is a SECRET
+  // REFERENCE (the secret name) — never a plaintext value. Absent for an HTTP server.
+  env?: Record<string, McpEnvRef>;
+  // The managed-stdio working directory (a path string; no secret), when set.
+  cwd?: string;
   // A bounded one-line summary of how the server is reached (endpoint or `cmd args…`).
   transport_display?: string;
   description: string;
@@ -3199,6 +3210,11 @@ export const reluxMcp = {
     endpoint?: string;
     command?: string;
     args?: string[];
+    // Managed-stdio env mappings: { "<ENV_VAR>": { secret: "<secret-name>" } } —
+    // secret REFERENCES only, never plaintext values.
+    env?: Record<string, McpEnvRef>;
+    // Optional managed-stdio working directory (inside the safe workspace root).
+    cwd?: string;
     description?: string;
     enabled?: boolean;
     timeout_ms?: number;
@@ -3273,6 +3289,32 @@ export const reluxMcp = {
     api.post<ReluxManagedStdioStatus>(
       `/v1/relux/mcp/servers/${encodeURIComponent(id)}/restart`,
       {},
+    ),
+};
+
+// The redacted status of one stored secret. NEVER carries a plaintext value — only
+// the name, when it was set, and a tail preview (e.g. "…cdef").
+export interface ReluxSecretStatus {
+  name: string;
+  set_at: number;
+  // Ellipsis + last-4-chars preview, or absent for an empty value.
+  preview?: string;
+}
+
+export const reluxSecrets = {
+  // List every stored secret's redacted status (never a value).
+  list: () => api.get<ReluxSecretStatus[]>("/v1/relux/secrets"),
+  // Set (or replace) a named secret. The value is write-only — the response carries
+  // only the redacted status, never the value. 400 on a bad name/value.
+  set: (name: string, value: string) =>
+    api.put<ReluxSecretStatus>(
+      `/v1/relux/secrets/${encodeURIComponent(name)}`,
+      { value },
+    ),
+  // Delete a named secret. Idempotent; reports whether one existed.
+  remove: (name: string) =>
+    api.del<{ removed: boolean }>(
+      `/v1/relux/secrets/${encodeURIComponent(name)}`,
     ),
 };
 

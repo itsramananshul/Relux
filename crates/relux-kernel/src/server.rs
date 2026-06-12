@@ -145,6 +145,20 @@ async fn serve() -> Result<(), KernelError> {
         run_cancellations: relux_kernel::RunCancellations::new(),
     };
 
+    // Attach the local secret store (hardened owner-only file) and configure the safe
+    // MCP workspace root — both live OUTSIDE the kernel snapshot, like the managed pool.
+    // The secret file keeps plaintext credentials out of the control-plane DB; the
+    // workspace root bounds where a managed-stdio `cwd` may resolve.
+    relux_kernel::init_secret_store(crate::secrets_path());
+    let mcp_root = crate::mcp_workspace_root_path();
+    if let Err(e) = std::fs::create_dir_all(&mcp_root) {
+        eprintln!(
+            "relux-kernel serve: could not create MCP workspace root {} ({e})",
+            mcp_root.display()
+        );
+    }
+    relux_kernel::init_mcp_workspace_root(mcp_root);
+
     // Bootstrap + persist once so a fresh store already lists the bundled
     // example plugins before the first request arrives.
     locked_save(&state, |_kernel| Ok(()))
@@ -578,6 +592,14 @@ fn protected_router() -> Router<AppState> {
             put(set_mcp_tool_classification)
                 .patch(set_mcp_tool_classification)
                 .delete(clear_mcp_tool_classification),
+        )
+        // Local secret store (set / list / delete named secrets — never returns a
+        // plaintext value; only a redacted preview). Managed-stdio env refs resolve
+        // against these at spawn.
+        .route("/v1/relux/secrets", get(list_secrets))
+        .route(
+            "/v1/relux/secrets/:name",
+            put(set_secret).delete(delete_secret),
         )
         // Relux Approvals and Permissions
         .route("/v1/relux/approvals", get(list_approvals))
@@ -6987,6 +7009,13 @@ struct McpServerResponse {
     /// The managed-stdio program's args; empty for an HTTP server.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     args: Vec<String>,
+    /// The managed-stdio env mappings (secret REFERENCES only — the secret NAME, never
+    /// a value). Empty for an HTTP server or a command needing no env.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    env: std::collections::BTreeMap<String, relux_core::McpEnvRef>,
+    /// The managed-stdio working directory, when set (a path string; no secret).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<String>,
     /// A bounded one-line summary of how the server is reached (endpoint or
     /// `cmd args…`), for the listing.
     transport_display: String,
@@ -7010,6 +7039,8 @@ impl McpServerResponse {
             endpoint: c.endpoint.clone(),
             command: c.command.clone(),
             args: c.args.clone(),
+            env: c.env.clone(),
+            cwd: c.cwd.clone(),
             transport_display: c.transport_display(),
             description: c.description.clone(),
             enabled: c.enabled,
@@ -7051,6 +7082,16 @@ struct McpServerReq {
     /// The managed-stdio program's args (each a single argv element). Optional.
     #[serde(default)]
     args: Option<Vec<String>>,
+    /// Managed-stdio env mappings: `{ "<ENV_VAR>": { "secret": "<secret-name>" } }`.
+    /// Each value is a SECRET REFERENCE (the name of a stored secret) — never a literal
+    /// value, so this request body never carries plaintext. Resolved into the child env
+    /// at spawn from the local secret store. Optional.
+    #[serde(default)]
+    env: Option<std::collections::BTreeMap<String, relux_core::McpEnvRef>>,
+    /// An optional managed-stdio working directory (relative to / inside the safe MCP
+    /// workspace root). Validated at spawn time.
+    #[serde(default)]
+    cwd: Option<String>,
     description: Option<String>,
     /// Defaults to enabled on first register; can be set false to disable.
     enabled: Option<bool>,
@@ -7064,7 +7105,9 @@ struct McpServerReq {
 /// bypass/danger flag). Selecting stdio (transport `"managed_stdio"` or a present
 /// `command`) is an **explicit, operator-confirmed** registration — it never spawns
 /// the command (that happens only on a later operator-driven Discover / gated
-/// invocation). No secrets are accepted or stored (env is deliberately not stored).
+/// invocation). No plaintext secret is ever accepted or stored — a managed-stdio
+/// server's `env` carries only SECRET REFERENCES (the name of a stored secret),
+/// resolved into the child env at spawn from the local secret store.
 async fn register_mcp_server(
     State(state): State<AppState>,
     Json(req): Json<McpServerReq>,
@@ -7088,9 +7131,19 @@ async fn register_mcp_server(
             ));
         }
         let args = req.args.unwrap_or_default();
+        let env = req.env.unwrap_or_default();
+        let cwd = req.cwd.clone();
         locked_save(&state, |kernel| {
-            let cfg = kernel
-                .register_mcp_stdio_server(&id, &command, &args, &description, enabled, req.timeout_ms)?;
+            let cfg = kernel.register_mcp_stdio_server(
+                &id,
+                &command,
+                &args,
+                env.clone(),
+                cwd.clone(),
+                &description,
+                enabled,
+                req.timeout_ms,
+            )?;
             Ok(McpServerResponse::from_config(&cfg))
         })?
     } else {
@@ -7105,6 +7158,45 @@ async fn register_mcp_server(
         })?
     };
     Ok(Json(resp))
+}
+
+/// Body for `PUT /v1/relux/secrets/:name` — the plaintext value to store. Write-only:
+/// the value is never echoed back (the response is a redacted [`relux_core::SecretStatus`]).
+#[derive(Debug, Deserialize)]
+struct SetSecretReq {
+    value: String,
+}
+
+/// GET `/v1/relux/secrets` — every stored secret's REDACTED status (name + set time +
+/// last-4-chars preview). Never returns a plaintext value.
+async fn list_secrets(
+    State(_state): State<AppState>,
+) -> Result<Json<Vec<relux_core::SecretStatus>>, ApiError> {
+    Ok(Json(relux_kernel::secret_store().list()))
+}
+
+/// PUT `/v1/relux/secrets/:name` — set (or replace) a named secret. The value is
+/// supplied write-only; the response carries only the redacted status, never the value.
+/// A name/value that violates the store bounds is a `400`.
+async fn set_secret(
+    State(_state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Json(req): Json<SetSecretReq>,
+) -> Result<Json<relux_core::SecretStatus>, ApiError> {
+    let status = relux_kernel::secret_store()
+        .set(&name, &req.value)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok(Json(status))
+}
+
+/// DELETE `/v1/relux/secrets/:name` — remove a named secret. Idempotent; reports
+/// whether one existed.
+async fn delete_secret(
+    State(_state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+) -> Json<serde_json::Value> {
+    let removed = relux_kernel::secret_store().delete(&name);
+    Json(serde_json::json!({ "removed": removed }))
 }
 
 /// DELETE `/v1/relux/mcp/servers/:id` — remove an MCP server registration.

@@ -82,13 +82,16 @@ and goes **stricter** than Hermes.
   may otherwise contain anything (flags, `=`, JSON) because it is one `argv` element,
   never shell-expanded. The arg **count** is bounded. There is **no shell-injection
   surface**.
-- **No env, no `cwd`, no bypass flags.** The child inherits the parent environment
-  unchanged and runs in the parent's working directory: Relux passes **no env** (env
-  would carry secrets, which the config must never store) and **no `cwd` override**,
-  and it **never injects** a bypass/danger flag. A small denylist
+- **Governed env + `cwd`, no bypass flags.** The child inherits the parent environment
+  plus the operator-configured `env` — each value a **secret reference** resolved from
+  the local secret store at spawn (never a literal value in the config), see "Local
+  secrets & environment" below — and runs in the optional `cwd` (validated INSIDE the
+  safe workspace root). Relux **never injects** a bypass/danger flag: a small denylist
   (`--dangerously-skip-permissions`, `--dangerously-bypass-approvals-and-sandbox`,
-  `--yolo`) also **refuses** an operator-supplied bypass flag fail-closed — consistent
-  with the adapter governance (`crate::adapter` never passes one either).
+  `--yolo`) **refuses** an operator-supplied bypass flag fail-closed — consistent with
+  the adapter governance (`crate::adapter` never passes one either). A missing secret /
+  bad `cwd` is a clean **failed status naming the missing key** (never a value), not a
+  spawn.
 - **Two process modes: spawn-per-operation OR an operator-managed process.** The
   original transport **spawns its own child, runs one logical operation (`initialize`
   → `tools/list` / `tools/call`), and kills + reaps it** (`StdioChild::drop`) — exactly
@@ -182,18 +185,111 @@ a single long-lived process and reuse it — the real lifecycle a serious produc
   tail is bounded (`relux_core::MAX_MANAGED_STDIO_LOG_LINES`, redacted); status fields
   are cheap atomics read without blocking a live request (so `starting` is observable
   mid-spawn). Same safety contract as the per-operation transport: **argv only (never a
-  shell), no env stored, no `cwd` override, no bypass/danger flag.**
+  shell), no plaintext secret stored (only references), `cwd` confined to the safe
+  workspace root, no bypass/danger flag.** The resolved env values are handed straight
+  to the spawn and are **never** retained on the entry, the status, or the log tail.
 - **Routes.** `GET /v1/relux/mcp/servers/status` (all stdio servers),
   `GET …/:id/status`, `POST …/:id/start`, `POST …/:id/stop`, `POST …/:id/restart`. A
   lifecycle action against an HTTP-loopback server is a `400` (it has no process
   lifecycle — it is an endpoint the operator runs); an unknown server is `404`; a
   disabled server refused to start is `409`.
 
+### Local secrets & environment (API keys for managed-stdio MCP servers)
+
+Real MCP servers (and future adapters) need credentials — an `OPENAI_API_KEY`, a GitHub
+token, a service URL. Relux now offers a **safe, local secret store + secret-referenced
+`env` + a confined `cwd`** so an operator can supply those **without hard-coding them and
+without ever exposing them**. The config never stores a plaintext value; the dashboard
+never receives one back.
+
+Spec refs: `docs/RELUX_MASTER_PLAN.md` §17.5 (permissions/safety) + §8.2 (ToolSet/adapter
+plugins). Reference (`docs/reference-driven-development.md`, BINDING):
+`reference/hermes-agent-main/hermes_cli/mcp_config.py` — a stdio server is
+`{"command","args","env"}`; a per-server API key is stored in a **separate** `~/.hermes/.env`
+(`save_env_value`, keyed `MCP_<NAME>_API_KEY`) and **referenced** from the config via a
+`${ENV}` ref, and `cmd_mcp_test` only ever prints a **masked** value
+(`resolved[:4] + "***" + resolved[-4:]`, L553-560) — never the raw secret;
+`crates/relix-web-bridge/src/secrets.rs` + `os_secure.rs` — a separate
+permission-restricted file (mode `0600` / `icacls`), atomic write, no-plaintext-return,
+tail-redacted preview. Relux ports that posture to the relux layer.
+
+- **The secret store (`relux-kernel::secret_store`).** A local, file-backed store
+  (`secrets.json` next to the control-plane DB, `RELUX_SECRETS_FILE` to override),
+  **hardened to owner-only permissions** (POSIX `0600`; Windows `icacls` inheritance
+  stripped + current-user-only). It lives **outside** the kernel snapshot (like the
+  managed pool) so a plaintext credential never lands in the control-plane DB, the API,
+  or an export. An operator can:
+  - **Set** a named secret (`PUT /v1/relux/secrets/:name { "value": … }`) — the value is
+    **write-only**: the response carries only a **redacted** `SecretStatus`
+    (name + set time + a `…cdef` tail preview), never the value.
+  - **List** secrets (`GET /v1/relux/secrets`) — redacted statuses only.
+  - **Delete** a secret (`DELETE /v1/relux/secrets/:name`) — idempotent.
+  Names are bounded + charset-restricted (`is_valid_secret_name`), values are bounded
+  (`MAX_SECRET_VALUE_BYTES`, 16 KiB), and the store is count-capped (`MAX_SECRETS`, 256).
+  The **only** method that returns plaintext is `resolve(name)`, called solely at
+  managed-stdio spawn time to seed the child env — never logged, stored back, or returned
+  over HTTP.
+
+- **Secret-referenced `env` on a managed-stdio server.** `McpServerConfig.env` is a map
+  keyed by the **env-var NAME** the child receives, valued by a **secret reference**
+  `{ "secret": "<name>" }` (`relux_core::McpEnvRef`) — never a literal value, so the
+  config (and the snapshot, and every API response) **stores no plaintext**. Wire shape:
+  `"env": { "OPENAI_API_KEY": { "secret": "openrouter_api_key" } }`. Env-var names are
+  validated POSIX-style (`is_valid_env_var_name`, mirroring Hermes' `_ENV_VAR_NAME_RE`),
+  the referenced secret name is validated, and the count is bounded
+  (`MAX_MCP_ENV_VARS`, 64). The referenced secret **need not exist at registration** —
+  it is resolved (naming the missing key, never a value, on failure) at **spawn**.
+
+- **Resolution at spawn (off-snapshot, never serialized).** At a managed-stdio **Start**,
+  **Restart**, or spawn-per-operation **Discover/invoke**, the kernel resolves each
+  `env` ref to its plaintext via the secret store and hands a `(name, value)` list
+  **straight to `std::process::Command::env`** (`crate::mcp_stdio::build_command`). The
+  resolved values are **never** stored on the kernel, the managed-pool entry, the status,
+  or the redacted stderr/log tail. A **missing** secret produces a clean **`failed`
+  status** whose `last_error` names the missing **secret + env-var key** (never a value);
+  the spawn does **not** happen. (Process stderr is still secret-redacted via
+  `relux_core::redact_secrets` as defense in depth.)
+
+- **Confined optional `cwd`.** `McpServerConfig.cwd` (a path string; no secret) sets the
+  child's working directory. It is validated **fail-closed**
+  (`relux-kernel::validate_managed_cwd`): the shape must pass
+  `relux_core::validate_stdio_cwd_shape` (non-empty, bounded, no control char, **no `..`
+  traversal**); the path (relative → resolved against the safe root, absolute → as-is)
+  must **exist**, **canonicalize**, be a **directory**, and **canonicalize INSIDE** the
+  configured **safe MCP workspace root** (`dev-data/relux/mcp-workspaces` by default,
+  `RELUX_MCP_WORKSPACE_ROOT` to override) — `canonicalize` resolves symlinks before the
+  containment check, so a symlink that points outside the root is rejected. A `cwd` set
+  with no configured root is refused. This is the "explicitly safe configured workspace
+  root" model — a managed-stdio `cwd` can only ever resolve inside that one tree.
+
+- **Security model (binding).** The config layer carries **only secret references + a
+  path** — never a value. Plaintext lives **only** in the owner-only `secrets.json` and,
+  transiently, in the spawned child's environment. No surface returns a secret value: the
+  list/set/delete API, the server listing, the managed-process status, the run
+  transcript, and the audit log all carry redacted previews / names only. The same
+  argv-only, no-shell, no-bypass-flag guarantees of the managed transport are unchanged;
+  protected/bundled plugins are untouched; nothing auto-starts or auto-runs on
+  registration.
+
+- **Limitations (honest).** The store is **local-only** and **dev-safe**: plaintext at
+  rest is protected by file permissions (no OS keychain / DPAPI integration yet), so it
+  is hardened-but-not-encrypted. Secret **rotation** is manual (set the same name again).
+  `env` resolution is **per-process** — a running managed process keeps the env it was
+  started with; change a secret and **Restart** to pick it up. Adapters do not yet
+  consume the store (the foundation is shared, the wiring is a future slice).
+
 ### Operating it (dashboard)
 
-The Plugins page's **MCP servers** form has a **Transport** selector (loopback HTTP
-endpoint vs. managed stdio command); the stdio form takes a **command** and **args (one
-argv element per line)**, pre-checked with the same argv-only rules the kernel enforces.
+The Plugins page has a **Secrets & environment** section (`SecretsSection`) where the
+operator adds named secrets — the value field is **write-only** (a password input,
+cleared on submit) and the listing shows only the **redacted preview** (`…cdef`) + a
+Delete action. The **MCP servers** form has a **Transport** selector (loopback HTTP
+endpoint vs. managed stdio command); the stdio form takes a **command**, **args (one
+argv element per line)**, an **Environment** field (one `ENV_VAR=secret_name` per line —
+the right side is a **secret name**, a reference, never a value), and an optional
+**Working directory** (inside the safe workspace root), all pre-checked with the same
+fail-closed rules the kernel enforces (`apps/dashboard/src/plugins.ts`
+`validateMcpRegisterDraft` / `mcpRegisterBody` / `mcpEnvFromText`).
 The servers list shows each server's transport (`http` / `stdio`), its
 `transport_display` (endpoint or `cmd args…`), the honest `configured`/`disabled` config
 status, and **Discover** + **Remove** actions. For a managed-stdio server a **Process**
@@ -211,11 +307,11 @@ stdio server (resources are HTTP-only in this slice).
   desynced) and marks it `failed`; the operator (or the next fallback Discover/invoke)
   restarts it. This is deliberate — it avoids reusing a desynced pipe — but a single
   slow call can end a warm process.
-- **No env / no `cwd`.** Env is not stored (it would carry secrets) and `cwd` is not
-  overridden, so a stdio server that *requires* an env var (e.g. a token) or a specific
-  working directory is not yet supported through Relux's managed transport — run it as a
-  loopback HTTP server instead, or this stays a future slice once a safe, redacted
-  secret store backs it.
+- **Env + `cwd` are now supported (safely).** A managed-stdio server can reference
+  stored secrets in its `env` and set a plugin-relative `cwd` — see "Local secrets &
+  environment" below. The config still stores **no plaintext** (only secret
+  *references* + a path), the resolved values are never serialized/logged, and a `cwd`
+  must canonicalize INSIDE the configured safe workspace root.
 - **Resources are HTTP-only.** `resources/list` / `resources/read` are not bridged over
   managed stdio yet (tools only).
 - **Status polling, not push.** The dashboard reads status on demand (no live stream);
@@ -971,7 +1067,18 @@ GET    /v1/relux/mcp/servers/:id/resources                         live resource
 GET    /v1/relux/mcp/servers/:id/resources/read?uri=…              read one resource → shaped, redacted McpResourceContent
 PUT    /v1/relux/mcp/servers/:id/tools/:tool/classification        { risk, approval } — set a tool's risk/approval
 DELETE /v1/relux/mcp/servers/:id/tools/:tool/classification        revert a tool to the gated default
+
+GET    /v1/relux/secrets                                           list stored secrets (redacted status only — never a value)
+PUT    /v1/relux/secrets/:name                                     { value } — set a secret (write-only; returns redacted status)
+DELETE /v1/relux/secrets/:name                                     delete a secret ({ removed })
 ```
+
+A managed-stdio registration may carry `env` (secret references) + `cwd`:
+`POST /v1/relux/mcp/servers { "id", "transport":"managed_stdio", "command", "args"?,
+"env": { "<ENV_VAR>": { "secret": "<name>" } }, "cwd"?, … }`. The `env` map stores only
+secret **names**, never values; the value is supplied separately via the secrets routes
+above and resolved into the child env at spawn (`docs/mcp.md` "Local secrets &
+environment").
 
 The resource routes are READ-ONLY (a read lock; no save). Honest status codes:
 unknown id → `404`; disabled server → `409`; an invalid/empty `uri` → `400`; a

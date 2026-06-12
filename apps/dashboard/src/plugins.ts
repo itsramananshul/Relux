@@ -156,6 +156,11 @@ export interface McpRegisterDraft {
   command: string;
   // The managed-stdio args, one argv element per line (whitespace-trimmed, blanks dropped).
   argsText: string;
+  // The managed-stdio env mappings, one `ENV_VAR=secret_name` per line. The value is a
+  // SECRET REFERENCE (a stored secret's NAME) — never a plaintext value.
+  envText: string;
+  // The optional managed-stdio working directory (inside the safe workspace root).
+  cwd: string;
   description: string;
 }
 
@@ -166,6 +171,29 @@ export function parseStdioArgs(argsText: string): string[] {
     .split("\n")
     .map((a) => a.trim())
     .filter((a) => a.length > 0);
+}
+
+// Parse the env textarea into ordered [envVarName, secretName] pairs: one
+// `ENV_VAR=secret_name` per line, trimmed, blanks dropped. A line with no `=` yields
+// an empty secret name (caught by validation). The secret name is a REFERENCE — never
+// a value — so no plaintext is ever entered here.
+export function parseEnvMappingLines(envText: string): Array<[string, string]> {
+  return envText
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0)
+    .map((line) => {
+      const idx = line.indexOf("=");
+      if (idx < 0) return [line, ""] as [string, string];
+      return [line.slice(0, idx).trim(), line.slice(idx + 1).trim()] as [string, string];
+    });
+}
+
+// Build the env-ref map ({ ENV_VAR: { secret } }) from the env textarea.
+export function mcpEnvFromText(envText: string): Record<string, { secret: string }> {
+  const out: Record<string, { secret: string }> = {};
+  for (const [v, s] of parseEnvMappingLines(envText)) out[v] = { secret: s };
+  return out;
 }
 
 // Seed the review form from a server-built proposal. For a detected stdio command the
@@ -183,13 +211,24 @@ export function mcpDraftFromProposal(
     endpoint: p.suggested_endpoint ?? "",
     command: p.detected_command ?? "",
     argsText: (p.detected_args ?? []).join("\n"),
+    envText: "",
+    cwd: "",
     description: p.suggested_description ?? "",
   };
 }
 
 // A fresh, empty HTTP-loopback draft for the manual "Add MCP server" form.
 export function emptyMcpRegisterDraft(): McpRegisterDraft {
-  return { id: "", transport: "http_loopback", endpoint: "", command: "", argsText: "", description: "" };
+  return {
+    id: "",
+    transport: "http_loopback",
+    endpoint: "",
+    command: "",
+    argsText: "",
+    envText: "",
+    cwd: "",
+    description: "",
+  };
 }
 
 // Shell metacharacters the kernel refuses in a managed-stdio command (argv-only —
@@ -200,6 +239,9 @@ const DANGEROUS_STDIO_FLAGS = new Set([
   "--dangerously-bypass-approvals-and-sandbox",
   "--yolo",
 ]);
+// Mirrors relux_core::is_valid_env_var_name (POSIX-style) and is_valid_secret_name.
+const ENV_VAR_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const SECRET_NAME = /^[A-Za-z0-9._-]+$/;
 
 // Client-side pre-check for the review form, mirroring the kernel's fail-closed rules
 // so the form never sends a request the registry would reject. Returns an error
@@ -229,6 +271,25 @@ export function validateMcpRegisterDraft(d: McpRegisterDraft): string | null {
         return `Arg "${a}" is a forbidden bypass/danger flag and cannot be used.`;
       }
     }
+    // Env mappings: each is `ENV_VAR=secret_name` — a secret REFERENCE, never a value.
+    const envPairs = parseEnvMappingLines(d.envText);
+    if (envPairs.length > 64) return "Too many env vars (max 64).";
+    for (const [v, s] of envPairs) {
+      if (!ENV_VAR_NAME.test(v)) {
+        return `Env var name "${v || "(empty)"}" is invalid (letters/digits/_ only, not starting with a digit).`;
+      }
+      if (!SECRET_NAME.test(s)) {
+        return `Env var "${v}" must reference a secret by name (e.g. ${v}=my_api_key); enter a secret NAME, never a value.`;
+      }
+    }
+    // Working directory: optional, bounded, no `..` traversal.
+    const cwd = d.cwd.trim();
+    if (cwd) {
+      if (cwd.length > 1024) return "Working directory path is too long (max 1024 characters).";
+      if (cwd.split(/[\\/]/).includes("..")) {
+        return "Working directory must not contain '..' (no parent-directory traversal).";
+      }
+    }
     return null;
   }
 
@@ -246,14 +307,20 @@ export function mcpRegisterBody(d: McpRegisterDraft): {
   endpoint?: string;
   command?: string;
   args?: string[];
+  env?: Record<string, { secret: string }>;
+  cwd?: string;
   description?: string;
 } {
   if (d.transport === "managed_stdio") {
+    const env = mcpEnvFromText(d.envText);
+    const cwd = d.cwd.trim();
     return {
       id: d.id.trim(),
       transport: "managed_stdio",
       command: d.command.trim(),
       args: parseStdioArgs(d.argsText),
+      env: Object.keys(env).length > 0 ? env : undefined,
+      cwd: cwd || undefined,
       description: d.description.trim() || undefined,
     };
   }

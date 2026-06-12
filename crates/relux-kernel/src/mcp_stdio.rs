@@ -44,9 +44,14 @@
 //! - **No shell.** The command + args are passed as `argv` to [`std::process::Command`]
 //!   (re-validated by [`relux_core::validate_stdio_command`] on every spawn). No
 //!   string is ever handed to a shell, so there is no metacharacter-injection surface.
-//! - **No env injection / no `cwd` override.** The child inherits the parent
-//!   environment unchanged and runs in the parent's working directory; Relux passes
-//!   no extra env (storing env would store secrets) and no bypass/danger flag.
+//! - **Governed env + cwd (no danger flag).** The child inherits the parent
+//!   environment and adds ONLY the operator-configured `env` — already RESOLVED from
+//!   the local secret store by the kernel
+//!   ([`crate::secret_store::resolve_managed_env_and_cwd`]) into a plaintext
+//!   `(name, value)` list that this module hands straight to `Command::env` and never
+//!   stores, logs, or returns. An optional `cwd` (already validated INSIDE the safe
+//!   workspace root by the kernel) sets the child's working directory. No bypass/danger
+//!   flag is ever injected. A spawn with no env/cwd is exactly the prior behavior.
 //! - **Bounded.** A per-call timeout bounds every request (the child is killed on
 //!   expiry); each stdout line is size-capped ([`MAX_STDIO_LINE_BYTES`]); stderr is
 //!   drained into a bounded, secret-redacted tail surfaced only on failure.
@@ -56,6 +61,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufReader, Read, Write};
+use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -91,9 +97,11 @@ const MAX_STDERR_TAIL_CHARS: usize = 4_000;
 pub fn discover_tools(
     command: &str,
     args: &[String],
+    env: &[(String, String)],
+    cwd: Option<&Path>,
     timeout_ms: u64,
 ) -> Result<Vec<McpTool>, McpClientError> {
-    run_op(command, args, timeout_ms, |child, timeout| {
+    run_op(command, args, env, cwd, timeout_ms, |child, timeout| {
         let result = child.request("tools/list", &serde_json::json!({}), timeout)?;
         parse_tools_list(&result)
     })
@@ -107,11 +115,13 @@ pub fn discover_tools(
 pub fn call_tool(
     command: &str,
     args: &[String],
+    env: &[(String, String)],
+    cwd: Option<&Path>,
     tool_name: &str,
     arguments: &serde_json::Value,
     timeout_ms: u64,
 ) -> Result<serde_json::Value, McpClientError> {
-    run_op(command, args, timeout_ms, |child, timeout| {
+    run_op(command, args, env, cwd, timeout_ms, |child, timeout| {
         let params = serde_json::json!({ "name": tool_name, "arguments": arguments });
         let result = child.request("tools/call", &params, timeout)?;
         shape_tool_call_result(&result)
@@ -124,6 +134,8 @@ pub fn call_tool(
 fn run_op<T>(
     command: &str,
     args: &[String],
+    env: &[(String, String)],
+    cwd: Option<&Path>,
     timeout_ms: u64,
     op: impl FnOnce(&mut StdioChild, Duration) -> Result<T, McpClientError>,
 ) -> Result<T, McpClientError> {
@@ -132,7 +144,7 @@ fn run_op<T>(
     relux_core::validate_stdio_command(command, args)
         .map_err(|e| McpClientError::Spawn(e.to_string()))?;
     let timeout = Duration::from_millis(timeout_ms);
-    let mut child = StdioChild::spawn(command, args)?;
+    let mut child = StdioChild::spawn(command, args, env, cwd)?;
     let outcome = child
         .initialize(timeout)
         .and_then(|()| op(&mut child, timeout));
@@ -178,6 +190,30 @@ impl StderrTail {
     }
 }
 
+/// Build the `Command` for a managed-stdio spawn: argv only (never a shell), the
+/// child's stdio piped, the parent env inherited PLUS the resolved `env` entries, and
+/// the validated `cwd` when one is given. Factored out (and tested) so the exact env
+/// the OS will hand the child is observable without spawning a process.
+fn build_command(
+    command: &str,
+    args: &[String],
+    env: &[(String, String)],
+    cwd: Option<&Path>,
+) -> Command {
+    let mut cmd = Command::new(command);
+    cmd.args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    cmd
+}
+
 /// A live, spawned managed-stdio MCP child. Owns the child handle + stdin, a channel
 /// of stdout lines (filled by a reader thread), and the bounded stderr tail. The
 /// child is killed + reaped on [`Drop`], so a managed server never outlives its
@@ -194,14 +230,17 @@ struct StdioChild {
 impl StdioChild {
     /// Spawn `command` with `args` (argv only — never a shell), wire reader threads
     /// over its stdout (lines → channel) and stderr (→ bounded tail), and return the
-    /// live child. The child inherits the parent env + cwd unchanged; no extra env or
-    /// flag is injected.
-    fn spawn(command: &str, args: &[String]) -> Result<Self, McpClientError> {
-        let mut cmd = Command::new(command);
-        cmd.args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+    /// live child. The child inherits the parent env plus the resolved `env` entries
+    /// (already secret-resolved by the kernel — handed to `Command::env` and never
+    /// stored/logged here), and runs in `cwd` when one is given (already validated
+    /// inside the safe workspace root). No bypass/danger flag is injected.
+    fn spawn(
+        command: &str,
+        args: &[String],
+        env: &[(String, String)],
+        cwd: Option<&Path>,
+    ) -> Result<Self, McpClientError> {
+        let mut cmd = build_command(command, args, env, cwd);
         let mut child = cmd
             .spawn()
             .map_err(|e| McpClientError::Spawn(format!("{command}: {e}")))?;
@@ -625,7 +664,14 @@ impl ManagedEntry {
     /// replacing any existing process. Sets `Starting` for the spawn window, then
     /// `Running` (with pid + started-at) on success or `Failed` (with the redacted,
     /// stderr-enriched reason) on failure.
-    fn start(&self, command: &str, args: &[String], timeout_ms: u64) {
+    fn start(
+        &self,
+        command: &str,
+        args: &[String],
+        env: &[(String, String)],
+        cwd: Option<&Path>,
+        timeout_ms: u64,
+    ) {
         self.state.store(STATE_STARTING, Ordering::SeqCst);
         let timeout = Duration::from_millis(timeout_ms);
         let mut guard = self.child_guard();
@@ -633,7 +679,7 @@ impl ManagedEntry {
         *guard = None;
         self.pid.store(0, Ordering::SeqCst);
         self.started_at_ms.store(0, Ordering::SeqCst);
-        match StdioChild::spawn(command, args) {
+        match StdioChild::spawn(command, args, env, cwd) {
             Ok(mut child) => match child.initialize(timeout) {
                 Ok(()) => {
                     self.pid.store(child.pid(), Ordering::SeqCst);
@@ -839,10 +885,27 @@ impl ManagedPool {
         id: &str,
         command: &str,
         args: &[String],
+        env: &[(String, String)],
+        cwd: Option<&Path>,
         timeout_ms: u64,
     ) -> relux_core::ManagedStdioStatus {
         let entry = self.entry(id);
-        entry.start(command, args, timeout_ms);
+        entry.start(command, args, env, cwd, timeout_ms);
+        entry.status()
+    }
+
+    /// Record a `failed` status for `id` WITHOUT spawning — used when the kernel cannot
+    /// resolve a managed-stdio server's env secrets / cwd before a start, so the
+    /// operator sees an honest failure (naming the missing secret KEY, never a value)
+    /// instead of a fabricated `running`. Reaps any prior process first.
+    pub fn fail(&self, id: &str, reason: &str) -> relux_core::ManagedStdioStatus {
+        let entry = self.entry(id);
+        {
+            // Drop any running process before marking failed.
+            let mut guard = entry.child_guard();
+            *guard = None;
+        }
+        entry.fail(reason);
         entry.status()
     }
 
@@ -860,11 +923,13 @@ impl ManagedPool {
         id: &str,
         command: &str,
         args: &[String],
+        env: &[(String, String)],
+        cwd: Option<&Path>,
         timeout_ms: u64,
     ) -> relux_core::ManagedStdioStatus {
         let entry = self.entry(id);
         entry.stop();
-        entry.start(command, args, timeout_ms);
+        entry.start(command, args, env, cwd, timeout_ms);
         entry.status()
     }
 
@@ -972,14 +1037,81 @@ mod tests {
     #[test]
     fn spawn_failure_is_an_honest_error() {
         // Nothing by this name is on PATH; the spawn must fail clearly (no fake list).
-        let err = discover_tools("relux-mcp-no-such-binary-xyzzy", &[], 1_000).unwrap_err();
+        let err =
+            discover_tools("relux-mcp-no-such-binary-xyzzy", &[], &[], None, 1_000).unwrap_err();
         assert!(matches!(err, McpClientError::Spawn(_)), "got {err:?}");
     }
 
     #[test]
     fn an_unsafe_command_is_refused_before_spawning() {
         // A shell-metacharacter command never reaches `Command::spawn`.
-        let err = discover_tools("sh;rm -rf /", &[], 1_000).unwrap_err();
+        let err = discover_tools("sh;rm -rf /", &[], &[], None, 1_000).unwrap_err();
         assert!(matches!(err, McpClientError::Spawn(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn build_command_applies_resolved_env_and_cwd() {
+        // The exact env the OS will hand the child is observable on the built Command,
+        // without spawning. This proves the resolved secret value IS injected into the
+        // child environment (and only that env — `get_envs` returns only what we add).
+        let tmp = tempfile::tempdir().unwrap();
+        let env = vec![("MY_TOKEN".to_string(), "resolved-secret-1234".to_string())];
+        let cmd = build_command("node", &["-e".to_string()], &env, Some(tmp.path()));
+        let envs: Vec<(String, Option<String>)> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_string(),
+                    v.map(|v| v.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+        assert!(
+            envs.contains(&("MY_TOKEN".to_string(), Some("resolved-secret-1234".to_string()))),
+            "resolved secret not injected into child env: {envs:?}"
+        );
+        assert_eq!(cmd.get_current_dir(), Some(tmp.path()));
+    }
+
+    /// End-to-end proof the spawned process RECEIVES the injected env var — it exits 7
+    /// IFF the var is defined, and prints NOTHING (no value, no fixture output). Uses
+    /// the same `build_command` builder Relux spawns through. Platform-gated to a shell
+    /// that is always present (this is the TEST harness invoking it, not Relux running a
+    /// shell — Relux still spawns argv-only).
+    #[cfg(unix)]
+    #[test]
+    fn spawned_child_receives_injected_env_secret_unix() {
+        let env = vec![("RELUX_ENV_PROOF".to_string(), "must-not-print".to_string())];
+        let mut cmd = build_command(
+            "sh",
+            &[
+                "-c".to_string(),
+                "[ -n \"$RELUX_ENV_PROOF\" ] && exit 7 || exit 3".to_string(),
+            ],
+            &env,
+            None,
+        );
+        // Inherit stdio for this raw proof (no MCP handshake involved).
+        cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let status = cmd.status().expect("spawn sh");
+        assert_eq!(status.code(), Some(7), "child did not see the injected env var");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn spawned_child_receives_injected_env_secret_windows() {
+        let env = vec![("RELUX_ENV_PROOF".to_string(), "must-not-print".to_string())];
+        let mut cmd = build_command(
+            "cmd",
+            &[
+                "/c".to_string(),
+                "if defined RELUX_ENV_PROOF (exit 7) else (exit 3)".to_string(),
+            ],
+            &env,
+            None,
+        );
+        cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let status = cmd.status().expect("spawn cmd");
+        assert_eq!(status.code(), Some(7), "child did not see the injected env var");
     }
 }

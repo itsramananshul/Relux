@@ -5,10 +5,12 @@ import {
   reluxMcp,
   reluxPluginRuntime,
   reluxPlugins,
+  reluxSecrets,
   reluxTools,
   reluxWork,
   type ReluxAdapterStatus,
   type ReluxManagedStdioStatus,
+  type ReluxSecretStatus,
   type ReluxManifestTemplate,
   type McpToolClassification,
   type ReluxMcpServer,
@@ -177,7 +179,163 @@ export function Plugins() {
 
       <ToolsSection />
 
+      <SecretsSection />
+
       <McpSection />
+    </div>
+  );
+}
+
+// Secrets & environment (docs/mcp.md "Local secrets & environment"; RELUX_MASTER_PLAN
+// §17.5). A local, file-backed secret store: an operator adds named secrets (API keys /
+// tokens) here, and a managed-stdio MCP server's env maps an env-var to a secret by
+// NAME. The value is write-only — it is stored hardened to owner-only permissions and
+// NEVER returned by the API (the listing shows only a tail preview like "…cdef"). A
+// referenced secret is resolved into the child env at spawn; a missing one is an honest
+// failed status that names the secret, never a value.
+function SecretsSection() {
+  const { data, loading, error, reload } = useAsync<ReluxSecretStatus[]>(
+    () => reluxSecrets.list(),
+    [],
+  );
+  const secrets = data ?? [];
+  const [name, setName] = useState("");
+  const [value, setValue] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [banner, setBanner] = useState<{ kind: string; msg: string } | null>(null);
+
+  async function addSecret() {
+    const n = name.trim();
+    if (!n) {
+      setBanner({ kind: "err", msg: "Secret name is required." });
+      return;
+    }
+    if (!/^[A-Za-z0-9._-]+$/.test(n)) {
+      setBanner({
+        kind: "err",
+        msg: "Secret name may use only letters, digits, '.', '-' or '_'.",
+      });
+      return;
+    }
+    if (!value) {
+      setBanner({ kind: "err", msg: "Secret value is required." });
+      return;
+    }
+    setBusy(true);
+    setBanner(null);
+    try {
+      await reluxSecrets.set(n, value);
+      // Clear the value immediately — it is write-only and never shown again.
+      setValue("");
+      setName("");
+      setBanner({ kind: "ok", msg: `Secret "${n}" stored (value is write-only — never shown again).` });
+      reload();
+    } catch (e) {
+      setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Could not store secret" });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeSecret(n: string) {
+    setBusy(true);
+    setBanner(null);
+    try {
+      await reluxSecrets.remove(n);
+      reload();
+    } catch (e) {
+      setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Could not delete secret" });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="card">
+      <div className="row" style={{ marginBottom: 8, alignItems: "center" }}>
+        <h3 style={{ margin: 0 }}>Secrets &amp; environment</h3>
+        <div className="spacer" style={{ flex: 1 }} />
+        <button className="btn ghost sm" onClick={() => reload()} disabled={loading}>
+          {loading ? "Loading..." : "Refresh"}
+        </button>
+      </div>
+      <p className="muted" style={{ marginTop: -2, marginBottom: 12, fontSize: 12 }}>
+        Local API keys / tokens for managed-stdio MCP servers (and future adapters).
+        Values are <strong>write-only</strong> — stored locally, hardened to owner-only
+        file permissions, and <strong>never returned</strong> (only a redacted preview
+        is shown). Reference a secret from a server's <strong>Environment</strong> field
+        by NAME (e.g. <span className="mono">OPENAI_API_KEY=my_openai_key</span>).
+      </p>
+      {banner && (
+        <div className={"banner " + banner.kind} style={{ fontSize: 12, marginBottom: 8 }}>
+          {banner.msg}
+        </div>
+      )}
+      <div className="row wrap" style={{ gap: 8, alignItems: "flex-end", marginBottom: 12 }}>
+        <label className="field" style={{ margin: 0, minWidth: 180 }}>
+          <span style={{ fontSize: 12 }}>Name</span>
+          <input
+            className="input"
+            value={name}
+            placeholder="my_openai_key"
+            onChange={(e) => setName(e.target.value)}
+          />
+        </label>
+        <label className="field" style={{ margin: 0, minWidth: 220, flex: 1 }}>
+          <span style={{ fontSize: 12 }}>Value (write-only)</span>
+          <input
+            className="input"
+            type="password"
+            value={value}
+            placeholder="paste the secret value"
+            autoComplete="off"
+            onChange={(e) => setValue(e.target.value)}
+          />
+        </label>
+        <button className="btn sm" disabled={busy} onClick={() => void addSecret()}>
+          {busy ? "Saving..." : "Add secret"}
+        </button>
+      </div>
+      {error ? (
+        <div className="banner err" style={{ fontSize: 12 }}>
+          Could not load secrets ({error}).
+        </div>
+      ) : secrets.length === 0 ? (
+        <p className="muted" style={{ fontSize: 12 }}>
+          No secrets stored. Add one above, then reference it from a managed-stdio
+          server's Environment field.
+        </p>
+      ) : (
+        <div className="table-wrap">
+          <table className="table">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Value</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {secrets.map((s) => (
+                <tr key={s.name}>
+                  <td className="mono">{s.name}</td>
+                  <td className="mono muted">{s.preview ?? "—"}</td>
+                  <td style={{ textAlign: "right" }}>
+                    <button
+                      className="btn ghost sm"
+                      disabled={busy}
+                      onClick={() => void removeSecret(s.name)}
+                      title="Delete this secret"
+                    >
+                      Delete
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }
@@ -944,11 +1102,22 @@ function AddMcpServerForm({
   const [endpoint, setEndpoint] = useState(seed.endpoint);
   const [command, setCommand] = useState(seed.command);
   const [argsText, setArgsText] = useState(seed.argsText);
+  const [envText, setEnvText] = useState(seed.envText);
+  const [cwd, setCwd] = useState(seed.cwd);
   const [description, setDescription] = useState(seed.description);
   const [busy, setBusy] = useState(false);
   const [banner, setBanner] = useState<{ kind: string; msg: string } | null>(null);
 
-  const draft: McpRegisterDraft = { id, transport, endpoint, command, argsText, description };
+  const draft: McpRegisterDraft = {
+    id,
+    transport,
+    endpoint,
+    command,
+    argsText,
+    envText,
+    cwd,
+    description,
+  };
 
   async function submit() {
     setBusy(true);
@@ -972,6 +1141,8 @@ function AddMcpServerForm({
         setEndpoint("");
         setCommand("");
         setArgsText("");
+        setEnvText("");
+        setCwd("");
         setDescription("");
       }
       onAdded();
@@ -1061,7 +1232,36 @@ function AddMcpServerForm({
             />
             <span className="muted" style={{ fontSize: 11, marginTop: 4 }}>
               Each line is one argv element (never split) — an arg may contain spaces
-              or JSON. No env is stored; the child inherits the parent environment.
+              or JSON. The child inherits the parent environment plus the env below.
+            </span>
+          </label>
+          <label className="field" style={{ margin: "8px 0 0" }}>
+            <span style={{ fontSize: 12 }}>Environment (one ENV_VAR=secret_name per line)</span>
+            <textarea
+              className="input"
+              rows={2}
+              value={envText}
+              placeholder={"OPENAI_API_KEY=openrouter_api_key"}
+              onChange={(e) => setEnvText(e.target.value)}
+            />
+            <span className="muted" style={{ fontSize: 11, marginTop: 4 }}>
+              The right-hand side is a <strong>secret name</strong> — a reference to a
+              stored secret, <strong>never</strong> a value. Add secrets under{" "}
+              <strong>Secrets &amp; environment</strong> above; they resolve into the
+              child env at spawn and are never echoed back.
+            </span>
+          </label>
+          <label className="field" style={{ margin: "8px 0 0" }}>
+            <span style={{ fontSize: 12 }}>Working directory (optional)</span>
+            <input
+              className="input"
+              value={cwd}
+              placeholder="workspace-a"
+              onChange={(e) => setCwd(e.target.value)}
+            />
+            <span className="muted" style={{ fontSize: 11, marginTop: 4 }}>
+              Relative to (or inside) the safe MCP workspace root. No{" "}
+              <span className="mono">..</span> traversal; the path must exist at spawn.
             </span>
           </label>
         </>

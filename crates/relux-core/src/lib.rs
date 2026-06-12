@@ -25,6 +25,7 @@ pub mod run_failure;
 pub mod run_log;
 pub mod run_session;
 pub mod runtime;
+pub mod secret;
 pub mod task;
 pub mod tool;
 
@@ -43,18 +44,23 @@ pub use hierarchy::{
     chain_of_command, is_in_subtree, would_create_cycle, ReportsToMap, MAX_HIERARCHY_DEPTH,
 };
 pub use mcp::{
-    clamp_mcp_timeout, is_valid_mcp_id, is_valid_mcp_resource_uri, is_valid_mcp_tool_name,
-    mcp_synthetic_plugin_id, mcp_tool_permission, sanitize_mcp_resource_description,
-    sanitize_mcp_server_id, sanitize_mcp_text, sanitize_mcp_tool_description, scan_mcp_tool_description,
-    validate_mcp_server_config, validate_stdio_command, ManagedStdioState, ManagedStdioStatus,
-    McpConfigError, McpResource,
-    McpResourceContent, McpServerConfig,
+    clamp_mcp_timeout, is_valid_env_var_name, is_valid_mcp_id, is_valid_mcp_resource_uri,
+    is_valid_mcp_tool_name, mcp_synthetic_plugin_id, mcp_tool_permission,
+    sanitize_mcp_resource_description, sanitize_mcp_server_id, sanitize_mcp_text,
+    sanitize_mcp_tool_description, scan_mcp_tool_description, validate_mcp_server_config,
+    validate_stdio_command, validate_stdio_cwd_shape, validate_stdio_env, ManagedStdioState,
+    ManagedStdioStatus, McpConfigError, McpEnvRef, McpResource, McpResourceContent, McpServerConfig,
     McpTool, McpToolClassification, McpTransport, DEFAULT_MCP_TIMEOUT_MS,
     MAX_MANAGED_STDIO_LOG_LINES, MAX_MCP_ARGS, MAX_MCP_ARG_CHARS, MAX_MCP_COMMAND_CHARS,
-    MAX_MCP_DESCRIPTION_CHARS, MAX_MCP_ID_CHARS, MAX_MCP_RESOURCES, MAX_MCP_RESOURCE_DESC_CHARS,
+    MAX_MCP_CWD_CHARS, MAX_MCP_DESCRIPTION_CHARS, MAX_MCP_ENV_NAME_CHARS, MAX_MCP_ENV_VARS,
+    MAX_MCP_ID_CHARS, MAX_MCP_RESOURCES, MAX_MCP_RESOURCE_DESC_CHARS,
     MAX_MCP_RESOURCE_MIME_CHARS, MAX_MCP_RESOURCE_NAME_CHARS, MAX_MCP_RESOURCE_TEXT_CHARS,
     MAX_MCP_RESOURCE_URI_CHARS, MAX_MCP_TIMEOUT_MS, MAX_MCP_TOOLS, MAX_MCP_TOOL_DESC_CHARS,
     MAX_MCP_TOOL_NAME_CHARS, MIN_MCP_TIMEOUT_MS,
+};
+pub use secret::{
+    is_valid_secret_name, secret_preview, validate_secret, SecretError, SecretStatus,
+    MAX_SECRETS, MAX_SECRET_NAME_CHARS, MAX_SECRET_VALUE_BYTES,
 };
 pub use namespace::{Namespace, NamespaceId};
 pub use orchestration::{
