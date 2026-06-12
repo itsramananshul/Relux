@@ -141,19 +141,62 @@ governance lives. The render test asserts the page uses `card` chrome and carrie
 > control-plane routes — so the shell and its backing API are proven to serve, not
 > just to compile.
 
-**Why no live-browser click smoke.** The one link the render + bundle paths do
-not exercise is the actual browser binding from the **Continue** button's
-`onClick` to the resume request. Closing it honestly needs a real browser
-(Playwright/Puppeteer) — a 100s-of-MB engine download — or a `jsdom`-class DOM
-shim that still would not drive the real kernel over the network, only a
-half-measure that adds a dependency. Neither is worth it here: the resume API
-itself is already proven end-to-end against a live kernel by the unit test
-`a_second_job_resumes_only_pending_briefs_and_preserves_completed_runs` and the
-`scripts/smoke-orchestration-resume.ps1` / `-restart.ps1` smokes, and the button
-that triggers it is proven to render (and ship) by this harness. The remaining
-gap is a single one-line event binding, not worth a browser toolchain. If a
-live-DOM smoke is ever wanted, it should reuse an already-present engine, not
-commit a browser binary.
+### Live-browser click smoke (real `onClick` → network → re-render)
+
+The render + bundle paths above prove every route's **first paint**, but a
+`StaticRouter` render never fires an effect, never dispatches a click, and never
+sees a route's data load fail at runtime. So the regression a user actually hits
+— a page that goes **blank after clicking** a nav link / Inspect / Send, a raw
+JSON envelope leaking into the Prime chat, or a 5xx behind a button — is invisible
+to a first-paint test. `scripts/relux-browser-smoke.ps1` +
+`apps/dashboard/scripts/browser-smoke.mjs` close that gap.
+
+It is **opt-in and local**, not mandatory CI (it needs a real browser + a booted
+kernel, which is heavier than the framework-free tests). Run it with one command:
+
+```sh
+pwsh -File scripts/relux-browser-smoke.ps1     # add -Rebuild / -Headful / -KeepTemp
+```
+
+That wrapper boots the **real release kernel** (which serves `/dashboard` *and*
+the live `/v1/relux/*` control plane on one origin, exactly like production)
+against a **throwaway `RELUX_DB`**, does first-run operator setup, seeds one task,
+then drives the dashboard through the actual UI. It **never** touches the real dev
+store (`dev-data/relux/local.db`) or a running serve instance.
+
+**No new dependency, no committed browser binary** — the bar this README set for a
+live-DOM smoke ("reuse an already-present engine, not commit a browser binary").
+The driver (`browser-smoke.mjs`) launches the operator's already-installed
+Chrome/Edge and speaks the **Chrome DevTools Protocol** over Node's built-in
+global `fetch` + global `WebSocket` (Node ≥ 21). It adds **zero** npm packages and
+downloads **no** engine. To run the driver alone against an already-running kernel:
+`RELUX_SMOKE_BASE=http://127.0.0.1:19891 RELUX_SMOKE_USER=admin RELUX_SMOKE_PASS=… npm run smoke:browser`.
+
+What it actually clicks and asserts:
+
+- **Sign in** through the real Login form (controlled inputs + submit), reaching
+  the shell — never a blank page.
+- **All 7 sidebar routes** (`Home`, `Prime`, `Work`, `Crew`, `Plugins`,
+  `Approvals`, `Health`): clicks each `NavLink`, waits for the topbar title to
+  switch, and asserts the `.workspace` renders **real content** (not empty, not
+  the `ErrorBoundary` "This page hit an error" card).
+- **Prime greeting:** types a hello, clicks **Send**, and asserts the reply
+  renders, is the **shaped** turn (not a raw `{"disposition":…}` envelope leaking
+  into the chat), and **creates no task/run** from a mere greeting (§17.1).
+- **Work Inspect → task detail:** clicks the seeded task's **Inspect** button,
+  asserts the URL-driven detail panel opens, then **Close** restores the board
+  with no blank.
+- **Plugins / Approvals:** asserts the route renders and **stays rendered** after
+  expanding any disclosures, with no console error / page exception / 5xx.
+
+Throughout, it captures `Runtime.consoleAPICalled` (errors), `Runtime.
+exceptionThrown`, and `Network` 5xx / failed JS-CSS chunk loads, attributing each
+to the step that caused it and failing with useful output. The single binding it
+still does not drive is the **Continue** (resume) button, which needs a paused
+orchestration to exist first; that resume *API* is already proven end-to-end by
+the unit test `a_second_job_resumes_only_pending_briefs_and_preserves_completed_runs`
+and `scripts/smoke-orchestration-resume.ps1` / `-restart.ps1`, and the button is
+proven to render (and ship) by the harness above.
 
 ### Per-brief recorded duration
 
