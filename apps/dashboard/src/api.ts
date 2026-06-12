@@ -2740,6 +2740,16 @@ export const reluxWork = {
   assignTask: (taskId: string, agentId: string) =>
     api.post<ReluxTask>(`/v1/relux/tasks/${encodeURIComponent(taskId)}/assign`, { agent_id: agentId }),
 
+  // Move a task to an operator-settable status from the board (design §6). The
+  // backend reuses the SAME allowlist (`blocked` / `cancelled`) + terminal-state
+  // guard the chat update enforces: a machine-driven target (running/completed/
+  // failed) is an honest 400, a finished task a 409, an unknown task a 400. Throws an
+  // ApiError carrying the real reason on rejection. Returns the updated task. The UI
+  // only offers moves taskmove.ts::operatorStatusMoves allows, so a valid call never
+  // 4xxs in normal use; the throw is the honest fallback if state changed underneath.
+  setTaskStatus: (taskId: string, status: string) =>
+    api.post<ReluxTask>(`/v1/relux/tasks/${encodeURIComponent(taskId)}/status`, { status }),
+
   // Execute a running task locally as its assigned agent.
   executeAssignedTask: (id: string) =>
     api.post<{ run_id: string }>(`/v1/relux/tasks/${encodeURIComponent(id)}/execute-assigned`),

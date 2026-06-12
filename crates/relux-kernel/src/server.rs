@@ -524,6 +524,7 @@ fn protected_router() -> Router<AppState> {
         .route("/v1/relux/tasks/:id/start", post(start_task))
         .route("/v1/relux/tasks/:id/execute-assigned", post(execute_assigned_task))
         .route("/v1/relux/tasks/:id/assign", post(assign_task_to_agent))
+        .route("/v1/relux/tasks/:id/status", post(set_task_status_route))
         .route("/v1/relux/tools", get(list_tools))
         .route("/v1/relux/tools/invoke", post(invoke_tool))
         .route(
@@ -2720,6 +2721,40 @@ async fn assign_task_to_agent(
 
     let task = locked_save(&state, |kernel| {
         kernel.assign_task(&task_id, &agent_id)?;
+        Ok(kernel.task(&task_id).cloned().unwrap())
+    })?;
+    Ok(Json(task))
+}
+
+#[derive(Debug, Deserialize)]
+struct SetTaskStatusReq {
+    status: String,
+}
+
+/// POST `/v1/relux/tasks/:id/status` — the operator board status MOVE
+/// (`docs/relix-dashboard-design.md` §6 "Drag a card to a column → status mutation,
+/// with transition validation"). Moves an existing, non-terminal task to an
+/// operator-settable status (`blocked` / `cancelled`) through the SAME allowlist +
+/// terminal-state guard the conversational by-id update enforces
+/// (`crate::prime_update_slots`) — not a parallel, looser path.
+///
+/// The body `status` is parsed through `parse_settable_status` (an exact wire id or a
+/// forgiving phrase); a non-settable / unknown value is an honest 400 naming the
+/// allowed set, so the run lifecycle's machine-driven states
+/// (`running`/`completed`/`failed`) can never be decreed here. The kernel re-checks
+/// the allowlist (defense in depth), maps a terminal task to 409, and an unknown task
+/// to 400. Returns the updated task. Session-gated (the operator console is the human
+/// authority, like the assign/start routes).
+async fn set_task_status_route(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<SetTaskStatusReq>,
+) -> Result<Json<relux_core::Task>, ApiError> {
+    let task_id = relux_core::TaskId::new(id);
+    let target = relux_kernel::parse_settable_status(&req.status)
+        .ok_or_else(|| ApiError::bad_request("status must be one of: blocked, cancelled"))?;
+    let task = locked_save(&state, |kernel| {
+        kernel.set_task_status(&task_id, &target)?;
         Ok(kernel.task(&task_id).cloned().unwrap())
     })?;
     Ok(Json(task))
@@ -8150,6 +8185,10 @@ fn status_for(err: &KernelError) -> StatusCode {
         // (Re)assigning a task that has reached a terminal state is a resolvable
         // conflict — the operator/manager must target a live task.
         KernelError::TaskNotAssignable { .. } => StatusCode::CONFLICT,
+        // A board status MOVE onto a finished task is a resolvable conflict (409); an
+        // off-allowlist target is bad input (400 — the route also pre-validates it).
+        KernelError::TaskTerminalStatus { .. } => StatusCode::CONFLICT,
+        KernelError::TaskStatusNotSettable { .. } => StatusCode::BAD_REQUEST,
         // An honest "this run cannot be resumed" (no captured session, an adapter
         // without safe non-interactive resume, or a run still in flight): the
         // request is well-formed but the action does not apply — unprocessable.
@@ -11929,6 +11968,79 @@ mod tests {
         );
         assert!(audit.contains("task:assign"), "inner task:assign audit missing: {audit}");
         assert!(!audit.contains(&lead_tok), "raw token leaked into audit: {audit}");
+    }
+
+    /// End-to-end HTTP for the operator board status MOVE (`POST /v1/relux/tasks/:id/status`,
+    /// design §6). The route reuses the SAME settable-status allowlist + terminal guard the
+    /// chat update enforces: a non-terminal task moves to blocked/cancelled, a machine-driven
+    /// target is a 400, a finished task is a 409, an unknown task a 400.
+    #[tokio::test]
+    async fn set_task_status_route_moves_settable_and_rejects_the_rest() {
+        let (state, _dir) = auth_state(true);
+
+        // Create a task (auto-assigned to Prime → queued, non-terminal).
+        let (status, _, tb) =
+            call(&state, "POST", "/v1/relux/tasks", None, Some(r#"{"title":"ship it"}"#)).await;
+        assert_eq!(status, StatusCode::OK, "task create failed: {tb}");
+        let task: serde_json::Value = serde_json::from_str(&tb).unwrap();
+        let task_id = task["id"].as_str().unwrap().to_string();
+        let move_to = |s: &str| {
+            (
+                format!("/v1/relux/tasks/{task_id}/status"),
+                format!(r#"{{"status":"{s}"}}"#),
+            )
+        };
+
+        // A machine-driven target is bad input (400) — never decreed from the board.
+        let (path, body) = move_to("completed");
+        let (status, _, _) = call(&state, "POST", &path, None, Some(&body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "completed must be rejected");
+
+        // A settable target on a non-terminal task succeeds and flips the status.
+        let (path, body) = move_to("blocked");
+        let (status, _, b) = call(&state, "POST", &path, None, Some(&body)).await;
+        assert_eq!(status, StatusCode::OK, "block failed: {b}");
+        assert!(b.contains("\"status\":\"blocked\""), "task should be blocked: {b}");
+
+        // Cancel it (terminal), then a later move is a resolvable conflict (409).
+        let (path, body) = move_to("cancelled");
+        let (status, _, _) = call(&state, "POST", &path, None, Some(&body)).await;
+        assert_eq!(status, StatusCode::OK, "cancel failed");
+        let (path, body) = move_to("blocked");
+        let (status, _, _) = call(&state, "POST", &path, None, Some(&body)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "a finished task is a 409");
+
+        // An unknown task is a 400 (the kernel's UnknownTask mapping for task routes).
+        let (status, _, _) = call(
+            &state,
+            "POST",
+            "/v1/relux/tasks/task_does_not_exist/status",
+            None,
+            Some(r#"{"status":"blocked"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "unknown task is a 400");
+
+        // The move is audited as task:update (the same row the chat update writes).
+        let (status, _, audit) = call(&state, "GET", "/v1/relux/audit?limit=500", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(audit.contains("task:update"), "board move audit missing: {audit}");
+    }
+
+    /// The board status MOVE route is session-gated like every other protected route:
+    /// no cookie (auth enabled) is a 401, never an unauthenticated mutation.
+    #[tokio::test]
+    async fn set_task_status_route_requires_a_session() {
+        let (state, _dir) = auth_state(false);
+        let (status, _, _) = call(
+            &state,
+            "POST",
+            "/v1/relux/tasks/task_0001/status",
+            None,
+            Some(r#"{"status":"blocked"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "must not mutate without a session");
     }
 
     /// End-to-end HTTP for the per-agent-authenticated manager-subtree permission REVOKE

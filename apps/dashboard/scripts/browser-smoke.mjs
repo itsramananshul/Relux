@@ -617,6 +617,54 @@ async function main() {
           record("Work Inspect opens the task detail panel", false, e.message);
         }
       }
+      // ---- 4b) Work status MOVE: a real onClick → network → re-render ----------
+      // The seeded task is auto-assigned to Prime → "queued" (non-terminal), so its
+      // card carries the compact Block / Cancel move select. This is a SAFE, in-scope
+      // edit (relux-kernel set_task_status: the operator-settable allowlist, never a
+      // risk-gated/governed action) on a throwaway DB, so unlike the oversight
+      // approval controls it IS exercised: we pick "blocked" on the select and assert
+      // the card re-buckets to a blocked status — the full move → reload binding the
+      // static render test cannot see.
+      {
+        const captured = await evaluate(
+          `(() => {
+             const sel = document.querySelector('.workspace select[aria-label="Move task status"]');
+             if (!sel) return null;
+             const card = sel.closest('.card');
+             const idEl = card ? card.querySelector('.mono.muted') : null;
+             return idEl ? (idEl.textContent || '').trim() : '';
+           })()`,
+        );
+        if (captured == null || captured === "") {
+          record("Work status move control present on a card", false, captured == null ? "no move select found" : "card task id not read");
+        } else {
+          // Drive the controlled <select> the React way (native setter + change), then
+          // assert the card with that id now shows a "blocked" status badge.
+          await evaluate(
+            `(() => {
+               const sel = document.querySelector('.workspace select[aria-label="Move task status"]');
+               if (!sel) return false;
+               const set = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype,'value').set;
+               set.call(sel, 'blocked');
+               sel.dispatchEvent(new Event('change',{bubbles:true}));
+               return true;
+             })()`,
+          );
+          try {
+            await waitFor(
+              `(() => {
+                 const cards = Array.from(document.querySelectorAll('.workspace .card'));
+                 const card = cards.find(c => ((c.querySelector('.mono.muted')||{}).textContent||'').trim() === ${JSON.stringify(captured)});
+                 return !!card && /blocked/i.test((card.innerText||''));
+               })()`,
+              { timeout: 12000, desc: "card re-buckets to blocked" },
+            );
+            record("Work status move (Block) updates the card", true, `${captured} → blocked via onChange → network → re-render`);
+          } catch (e) {
+            record("Work status move (Block) updates the card", false, e.message);
+          }
+        }
+      }
       const probs = newProblems(before);
       record("Work clean (no console/page/5xx errors)", probs.length === 0, probs.slice(0, 3).join(" | "));
     }

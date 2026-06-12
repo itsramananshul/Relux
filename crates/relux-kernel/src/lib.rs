@@ -264,6 +264,10 @@ pub enum KernelError {
     TaskNotAssigned(String),
     #[error("task {task} is not assignable in status {status}; only a non-terminal task can be (re)assigned")]
     TaskNotAssignable { task: String, status: String },
+    #[error("status '{status}' is not operator-settable on task {task}; the board may set only blocked or cancelled (running/completed/failed are machine-driven through the run lifecycle)")]
+    TaskStatusNotSettable { task: String, status: String },
+    #[error("task {task} is already {status}; a finished task's status cannot be changed from the board")]
+    TaskTerminalStatus { task: String, status: String },
     #[error("parent task {parent} is in namespace {parent_ns}, not the child's namespace {child_ns}; an ad-hoc subtask lives in its parent's namespace")]
     TaskParentScope {
         parent: String,

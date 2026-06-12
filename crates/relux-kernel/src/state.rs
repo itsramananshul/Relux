@@ -2954,6 +2954,78 @@ impl KernelState {
         Ok(())
     }
 
+    /// Operator-driven board status MOVE: set an existing, non-terminal task to one
+    /// of the operator-settable statuses (`docs/relix-dashboard-design.md` §6 "Drag a
+    /// card to a column → status mutation, with transition validation").
+    ///
+    /// This reuses the EXACT validation the conversational by-id
+    /// [`relux_core::PrimeAction::UpdateTask`] path enforces — it is the SAME safe
+    /// mutation surfaced on the board, never a parallel/looser one:
+    ///
+    /// - the target must be operator-settable
+    ///   ([`crate::prime_update_slots::is_settable_status`] — `blocked` / `cancelled`);
+    ///   `running`/`completed`/`failed` are machine-driven by the run lifecycle and are
+    ///   refused here (`TaskStatusNotSettable`), never decreed from the board, so a
+    ///   running run is never falsely marked done.
+    /// - the task must EXIST (`UnknownTask`), and a TERMINAL task
+    ///   ([`crate::prime_update_slots::is_terminal_status`]) is never edited
+    ///   (`TaskTerminalStatus`).
+    ///
+    /// On success the task moves to `target`, `updated_at` advances, and the change is
+    /// audited (`task:update`, the same action the chat update writes). It does NOT
+    /// touch the assigned agent or any run, and it does NOT roll a child's status onto
+    /// a parent. Persistence is the caller's (the route's `locked_save`).
+    pub fn set_task_status(
+        &mut self,
+        task_id: &TaskId,
+        target: &TaskStatus,
+    ) -> Result<(), KernelError> {
+        // (1) Allowlist: only an operator-settable target (blocked / cancelled).
+        if !crate::prime_update_slots::is_settable_status(target) {
+            return Err(KernelError::TaskStatusNotSettable {
+                task: task_id.to_string(),
+                status: crate::prime_update_slots::status_label(target).to_string(),
+            });
+        }
+        // (2) The task must exist.
+        let current = self
+            .tasks
+            .get(task_id)
+            .map(|t| t.status.clone())
+            .ok_or_else(|| KernelError::UnknownTask(task_id.to_string()))?;
+        // (3) A finished (terminal) task is never edited.
+        if crate::prime_update_slots::is_terminal_status(&current) {
+            return Err(KernelError::TaskTerminalStatus {
+                task: task_id.to_string(),
+                status: crate::prime_update_slots::status_label(&current).to_string(),
+            });
+        }
+        let now = self.clock.tick();
+        let namespace = {
+            let task = self
+                .tasks
+                .get_mut(task_id)
+                .expect("task presence re-checked under the same &mut self");
+            task.status = target.clone();
+            task.updated_at = now;
+            task.namespace_id.clone()
+        };
+        self.record_audit(
+            "kernel",
+            "kernel",
+            "task:update",
+            Some("task"),
+            Some(task_id.as_str()),
+            Some(&namespace),
+            AuditResult::Success,
+            serde_json::json!({
+                "changes": { "status": crate::prime_update_slots::status_label(target) },
+                "source": "board",
+            }),
+        );
+        Ok(())
+    }
+
     pub fn task(&self, id: &TaskId) -> Option<&Task> {
         self.tasks.get(id)
     }
@@ -15318,6 +15390,53 @@ mod tests {
         assert!(t.reply.contains("finished task"), "got {:?}", t.reply);
         // Priority was NOT changed on the terminal task.
         assert_eq!(k.task(&id).unwrap().priority, 5);
+    }
+
+    #[test]
+    fn set_task_status_moves_to_settable_and_guards_the_rest() {
+        // The operator board status MOVE (design §6): the SAME allowlist + terminal
+        // guard the chat update enforces, exposed as a direct kernel call.
+        let (mut k, ctx) = prime_chat_kernel();
+        let id = make_task(&mut k, &ctx); // auto-assigned to Prime → Queued (non-terminal).
+
+        // A non-settable target (a machine-driven status) is refused — never decreed.
+        let err = k.set_task_status(&id, &TaskStatus::Completed).unwrap_err();
+        assert!(
+            matches!(err, KernelError::TaskStatusNotSettable { .. }),
+            "completed is machine-driven: {err:?}"
+        );
+        let err = k.set_task_status(&id, &TaskStatus::Running).unwrap_err();
+        assert!(matches!(err, KernelError::TaskStatusNotSettable { .. }), "running: {err:?}");
+        assert_eq!(k.task(&id).unwrap().status, TaskStatus::Queued, "nothing changed");
+
+        // A settable target on a non-terminal task succeeds and moves the card.
+        k.set_task_status(&id, &TaskStatus::Blocked).unwrap();
+        assert_eq!(k.task(&id).unwrap().status, TaskStatus::Blocked);
+
+        // The move survives a snapshot roundtrip (a dashboard refresh / restart).
+        let restored = KernelState::from_snapshot(k.snapshot());
+        assert_eq!(restored.task(&id).unwrap().status, TaskStatus::Blocked);
+
+        // Blocked is non-terminal → can still be cancelled (a terminal disposition).
+        k.set_task_status(&id, &TaskStatus::Cancelled).unwrap();
+        assert_eq!(k.task(&id).unwrap().status, TaskStatus::Cancelled);
+
+        // A finished (terminal) task is never edited — not even to another settable state.
+        let err = k.set_task_status(&id, &TaskStatus::Blocked).unwrap_err();
+        assert!(matches!(err, KernelError::TaskTerminalStatus { .. }), "terminal: {err:?}");
+        assert_eq!(k.task(&id).unwrap().status, TaskStatus::Cancelled, "unchanged");
+
+        // An unknown task fails closed.
+        let err = k
+            .set_task_status(&TaskId::new("task_9999"), &TaskStatus::Blocked)
+            .unwrap_err();
+        assert!(matches!(err, KernelError::UnknownTask(_)), "unknown task: {err:?}");
+
+        // The successful moves are audited as task:update (the same row chat writes).
+        assert!(
+            k.audit_log().iter().filter(|e| e.action == "task:update").count() >= 2,
+            "both moves audited as task:update"
+        );
     }
 
     #[test]

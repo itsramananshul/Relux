@@ -25,6 +25,7 @@ import {
   adhocSubtaskProgress,
   subtaskCounts,
 } from "../adhocsubtrees";
+import { operatorStatusMoves, canMoveStatus } from "../taskmove";
 import { orchestrationStatusTone } from "../orchestration";
 import { approvalInlineActions } from "../approvalactions";
 import {
@@ -971,6 +972,70 @@ function Column({ title, tasks, onAction, onInspectTask, agents, subtaskCounts }
   );
 }
 
+// Compact, design-system status MOVE control (design §6 "Drag a card to a column →
+// status mutation, with transition validation"). A small select offering ONLY the
+// operator-settable moves taskmove.ts allows for the task's live status (Block /
+// Cancel) — the SAME set the backend route accepts, so it never offers a rejected
+// move. Renders nothing for a terminal task (no move is possible). On a rejected move
+// (state changed underneath) it surfaces the honest backend reason inline, never a
+// silent no-op. Calls onMoved() after a successful move so the board refreshes (the
+// card re-buckets and any parent progress strip updates).
+export function StatusMoveControl({
+  taskId,
+  status,
+  onMoved,
+}: {
+  taskId: string;
+  status: string;
+  onMoved: () => void;
+}) {
+  const moves = useMemo(() => operatorStatusMoves(status), [status]);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  if (moves.length === 0) return null;
+
+  async function move(target: string) {
+    if (!target) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await reluxWork.setTaskStatus(taskId, target);
+      onMoved();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Move failed.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <span className="status-move" style={{ display: "inline-flex", flexDirection: "column", gap: 2 }}>
+      <select
+        className="input sm"
+        aria-label="Move task status"
+        title="Move this task to a new status"
+        value=""
+        disabled={busy}
+        style={{ fontSize: 10, padding: "4px 8px", minWidth: 92, height: 24 }}
+        onChange={(e) => void move(e.target.value)}
+      >
+        <option value="">{busy ? "Moving…" : "Move…"}</option>
+        {moves.map((m) => (
+          <option key={m.status} value={m.status}>
+            {m.label}
+          </option>
+        ))}
+      </select>
+      {err && (
+        <span className="badge failed" style={{ fontSize: 9, whiteSpace: "normal" }} title={err}>
+          {err}
+        </span>
+      )}
+    </span>
+  );
+}
+
 function TaskCard({ task, onAction, onInspectTask, agents, subtaskCount }: { task: ReluxTask; onAction: () => void; onInspectTask: (taskId: string) => void; agents: ReluxAgent[]; subtaskCount: number }) {
   const [busy, setBusy] = useState(false);
   const [selectedAgent, setSelectedAgent] = useState(task.assigned_agent || "");
@@ -1093,6 +1158,10 @@ function TaskCard({ task, onAction, onInspectTask, agents, subtaskCount }: { tas
             {busy ? "..." : "Run (Assigned)"}
           </button>
         )}
+        {/* Status MOVE (design §6): a compact Block / Cancel control, offered only for
+            a non-terminal task (taskmove.ts). On success the board reloads so the card
+            re-buckets into its new column. */}
+        <StatusMoveControl taskId={task.id} status={task.status} onMoved={onAction} />
         <button className="btn ghost sm" style={{ height: 24, padding: "0 8px" }} onClick={() => onInspectTask(task.id)}>Inspect</button>
       </div>
     </div>
@@ -1116,12 +1185,18 @@ function TaskDetailPanel({
   onChanged: () => void;
   onClose: () => void;
 }) {
-  const { data: task, loading, error } = useAsync<ReluxTaskDetail>(
+  const { data: task, loading, error, reload: reloadTask } = useAsync<ReluxTaskDetail>(
     () => reluxWork.getTask(taskId),
     [taskId],
   );
   const agentName = (id: string | null) =>
     id ? agents.find(a => a.id === id)?.name || id : "unassigned";
+  // A status move from the detail refreshes BOTH this panel (so the shown status is
+  // live) and the board (so the card re-buckets + any parent progress updates).
+  const onStatusMoved = () => {
+    reloadTask();
+    onChanged();
+  };
 
   return (
     <div style={{ paddingBottom: 16 }}>
@@ -1169,7 +1244,17 @@ function TaskDetailPanel({
         <div className="grid" style={{ gap: 8, fontSize: 12 }}>
           <div className="kv"><span>ID:</span><span className="mono">{task.id}</span></div>
           <div className="kv"><span>Title:</span><span>{task.title}</span></div>
-          <div className="kv"><span>Status:</span><span>{task.status}</span></div>
+          <div className="kv">
+            <span>Status:</span>
+            <span className="row" style={{ alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+              <span>{task.status}</span>
+              {/* Status MOVE (design §6): the same compact Block / Cancel control the
+                  board cards show, offered only for a non-terminal task. */}
+              {canMoveStatus(task.status) && (
+                <StatusMoveControl taskId={task.id} status={task.status} onMoved={onStatusMoved} />
+              )}
+            </span>
+          </div>
           <div className="kv"><span>Priority:</span><span>{task.priority}</span></div>
           <div className="kv"><span>Created By:</span><span>{task.created_by}</span></div>
           <div className="kv"><span>Assigned Agent:</span><span>{task.assignee_name || task.assigned_agent || "N/A"}</span></div>
