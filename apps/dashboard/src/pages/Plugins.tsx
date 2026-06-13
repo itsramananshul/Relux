@@ -1913,9 +1913,9 @@ function CreateToolRunTask({ tools }: { tools: ReluxToolDescriptor[] }) {
                 <span style={{ fontSize: 12 }}>Tool</span>
                 <select
                   className="input"
-                  value={step.plugin && step.tool ? `${step.plugin} ${step.tool}` : ""}
+                  value={step.plugin && step.tool ? `${step.plugin}::${step.tool}` : ""}
                   onChange={(e) => {
-                    const [plugin, tool] = e.target.value.split(" ");
+                    const [plugin, tool] = e.target.value.split("::");
                     setStep(i, { plugin: plugin ?? "", tool: tool ?? "" });
                   }}
                 >
