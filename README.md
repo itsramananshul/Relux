@@ -234,6 +234,33 @@ Turning a repo into a **runnable** tool (an MCP server or a governed command too
 remains an explicit, **approval-gated** step — read-only inspection is safe to
 expose by default; execution is not.
 
+##### Make an installed plugin a runnable Prime ability (operator recipe)
+
+For a source-only repo with no `relux-plugin.json`, the whole path lives on the
+**Plugins** page — nothing runs until you confirm, and the tool is always gated:
+
+1. **Install** — *Plugins → Install* from a **GitHub repo**, a **ZIP**, or a **local
+   folder**. A manifestless source lands as an honest metadata-only wrapper.
+2. **Configure an ability** — open the plugin's **Configure tools** panel. If the
+   read-only scan detected a CLI/script, click **Configure (command tool)…** on the
+   candidate (pre-filled argv). Otherwise use **Add a command tool…** to define one
+   from scratch (e.g. `program: git`, `args: ["--version"]`). It runs **argv-only**
+   (never a shell), confined to the install dir. Defining it runs nothing. The tool
+   appears as `needs_approval` — gated, never auto-approved.
+3. **Grant / approve** — either **Request approval** for one invocation, or create a
+   standing **allow-always grant** for the exact `(agent, plugin, tool)`. Both route
+   through the unchanged permission/approval/audit gate.
+4. **Ask Prime to use it** — in Prime chat, e.g. *"run the `repo.gitversion` tool"*.
+   Prime sees it in its catalogue (`GET /v1/relux/prime/tools`), invokes it through
+   the gate, and answers from the **bounded, secret-redacted** real output. The
+   end-to-end path (install → configure → discover → gate → run) is pinned on a real
+   `git --version` binary — not an echo fixture — by
+   `command_tool_runs_a_real_local_command_git_version_through_the_gate` and the
+   optional `scripts/smoke-plugin-install-to-prime-use.ps1`.
+
+You can **enable/disable** or **remove** the configured ability from the same panel.
+Relux never runs downloaded code on install and never injects a bypass/danger flag.
+
 #### Prime can use tools from chat
 
 You no longer need to leave Prime for the Tools panel for simple, safe tool use.

@@ -14730,6 +14730,83 @@ mod tests {
         ));
     }
 
+    /// End-to-end proof with a REAL local command — not the `echo`/`printf` fixture.
+    /// A manifestless wrapper (no `relux-plugin.json`, generated author) installs, the
+    /// operator configures a `git --version` command tool on it, Prime's catalogue lists
+    /// it as gated, a direct invoke is refused until a grant exists, and a granted invoke
+    /// actually spawns `git` argv-only and returns its real output. This pins the whole
+    /// install -> configure -> Prime-discovers -> gate -> run path on a genuine binary.
+    /// (Task E: "use a real harmless local command such as `git --version`; not echo.")
+    #[test]
+    fn command_tool_runs_a_real_local_command_git_version_through_the_gate() {
+        // Skip honestly on an exotic host with no `git` on PATH — never a false failure.
+        // The release gate and CI always have git, so the proof runs there.
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("skipping: `git --version` is not runnable on this host");
+            return;
+        }
+
+        let (mut k, prime, id, _dir) = primed_with_command_tool_dir();
+        // The wrapper is genuinely manifestless: a generated author, no declared tools.
+        assert_eq!(
+            k.plugin(&id).unwrap().author,
+            crate::plugin_install::GENERATED_MANIFEST_AUTHOR
+        );
+        assert!(k.plugin(&id).unwrap().capabilities.tools.is_empty());
+
+        // Configure a REAL command tool: `git --version`, argv-only.
+        let json = r#"{"name":"repo.gitversion","program":"git","args":["--version"]}"#;
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        let draft = crate::command_tool_config::parse_command_tool_input(&v).unwrap();
+        let def = k.configure_command_tool(&id, draft).expect("real command tool configured");
+        assert_eq!(def.permission.as_str(), "tool:relux-plugin-my-repo:gitversion");
+        // Command tools are always gated (never auto-approved).
+        assert_eq!(def.approval, ApprovalRequirement::Required);
+
+        // Prime's tool catalogue includes it, gated (NeedsApproval) — not a dead end.
+        k.grant_permission_to_agent(&prime, def.permission.clone()).unwrap();
+        let listed = k
+            .discover_tools(Some(&prime))
+            .into_iter()
+            .find(|t| t.tool_name == "repo.gitversion")
+            .expect("the configured real command tool is in Prime's catalogue");
+        assert_eq!(listed.executable, ToolExecutability::NeedsApproval);
+
+        // Denial path: a direct invoke is refused until a grant exists.
+        let err = k
+            .invoke_tool(&prime, &id, "repo.gitversion", serde_json::json!({}))
+            .unwrap_err();
+        assert!(matches!(err, KernelError::ToolRequiresApproval { .. }), "got {err:?}");
+
+        // With a standing grant the real `git` binary runs argv-only and returns its
+        // genuine version banner — proven on a real command, not an echo fixture.
+        k.grant_persistent_tool_invocation("operator", &prime, &id, "repo.gitversion")
+            .unwrap();
+        let result = k
+            .invoke_tool(&prime, &id, "repo.gitversion", serde_json::json!({}))
+            .expect("grant lets the real command run");
+        assert_eq!(result.output["success"], serde_json::json!(true));
+        assert_eq!(result.output["timed_out"], serde_json::json!(false));
+        let stdout = result.output["stdout"].as_str().unwrap_or("");
+        assert!(
+            stdout.to_ascii_lowercase().contains("git version"),
+            "expected the real git version banner, got {stdout:?}"
+        );
+
+        // Persistence: the real recipe survives a snapshot round-trip.
+        let snap = k.snapshot();
+        let k2 = KernelState::from_snapshot(snap);
+        let cfgs = k2.command_tool_configs_for(&id);
+        assert_eq!(cfgs.len(), 1);
+        assert_eq!(cfgs[0].program, "git");
+        assert_eq!(cfgs[0].args, vec!["--version".to_string()]);
+    }
+
     #[test]
     fn a_disabled_command_tool_is_refused_not_run() {
         let (mut k, prime, id, _dir) = primed_with_command_tool_dir();

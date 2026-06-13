@@ -43,26 +43,41 @@ function Assert($name, $cond, $note) { if ($cond) { Pass $name $note } else { Fa
 Write-Host '== Relux plugin install -> Prime use smoke ==' -ForegroundColor Cyan
 Write-Host '-- local fixture only: no clone, no remote code, no real brain --' -ForegroundColor Cyan
 
-# `node` makes the final governed run a REAL argv-only run with captured stdout; the
-# test asserts the install->configure->catalog->gate wiring regardless, and only the
-# real-run stdout/audit assertions need node. Surface its presence for transparency.
-$node = (& node --version 2>$null | Out-String).Trim()
-if ($node) {
-    Write-Host ("   node detected ({0}) -> the governed run is exercised for real" -f $node) -ForegroundColor DarkGray
+# The end-to-end real-command proof (command_tool_runs_a_real_local_command_git_version_
+# through_the_gate) spawns a genuine `git --version` argv-only through the gate — NOT an
+# echo fixture. git is effectively always present (this is a git repo), so the real run
+# is exercised here; the test itself skips honestly on the rare host with no git.
+$git = (& git --version 2>$null | Out-String).Trim()
+if ($git) {
+    Write-Host ("   git detected ({0}) -> the governed run is exercised for real (no echo)" -f $git) -ForegroundColor DarkGray
 } else {
-    Write-Host '   node not on PATH -> gate+grant path asserted, real-run stdout skipped (still honest)' -ForegroundColor Yellow
+    Write-Host '   git not on PATH -> the real-command test skips honestly; wiring tests still assert' -ForegroundColor Yellow
 }
 
-# Each test drives a real product-route sequence in the server test harness.
+# Warm up the test binaries once so the per-test runs below key cleanly off
+# "test result" + exit code and never race a fresh compile on the first iteration.
+Write-Host '   compiling kernel test binaries (warm-up)...' -ForegroundColor DarkGray
+& cargo test -p relux-kernel --no-run 2>$null | Out-Null
+
+# Each test drives a real product-route sequence in the kernel test harness. The target
+# is NOT pinned to --bin: the install/configure/catalog server tests live in the bin
+# target while the gate/persistence/real-command tests live in the lib (state::tests),
+# so an unpinned filter finds each test in whichever target actually defines it.
 $tests = @(
     'install_configure_then_prime_can_use_the_governed_command_tool',
     'prime_configure_candidate_activates_a_command_tool',
     'prime_configure_candidate_registers_an_mcp_server',
-    'command_tool_configures_gates_runs_persists_and_removes'
+    'command_tool_configures_gates_runs_persists_and_removes',
+    'prime_chat_invokes_a_configured_command_tool_through_the_governed_gate',
+    'command_tool_runs_a_real_local_command_git_version_through_the_gate'
 )
 foreach ($t in $tests) {
-    $out = & cargo test -p relux-kernel --bin relux-kernel $t 2>$null | Out-String
-    $ok = ($LASTEXITCODE -eq 0) -and ($out -match 'test result: ok')
+    $out = & cargo test -p relux-kernel $t 2>$null | Out-String
+    # Require a non-vacuous run: at least one target must report >=1 passed test.
+    # (Unmatched targets legitimately print "0 passed"; the filter is real only if
+    # some target ran the named test.)
+    $matched = $out -match 'result: ok\. [1-9]\d* passed'
+    $ok = ($LASTEXITCODE -eq 0) -and $matched
     Assert ("route test: $t") $ok 'install -> configure -> catalog -> gated invoke, audited'
 }
 

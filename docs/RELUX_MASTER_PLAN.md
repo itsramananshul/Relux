@@ -4400,7 +4400,16 @@ refusal, missing-input fail-closed, output redaction), `state.rs`
 `command_tool_configures_gates_runs_persists_and_removes` /
 `a_disabled_command_tool_is_refused_not_run` /
 `a_command_tool_on_an_uninstalled_plugin_is_refused`, and the server/dashboard tests
-above.
+above. The whole **install → configure → Prime-discovers → gate → run** path is
+additionally pinned on a **real local binary, not an echo fixture**, by `state.rs`
+`command_tool_runs_a_real_local_command_git_version_through_the_gate` — a manifestless
+wrapper (generated author, no declared tools) gets a `git --version` command tool, it
+appears in Prime's catalogue as `needs_approval`, a direct invoke is refused until a
+standing grant exists, and a granted invoke spawns the genuine `git` binary argv-only
+and returns its real `git version …` banner (the test skips honestly on the rare host
+with no `git`) — alongside `prime_chat_invokes_a_configured_command_tool_through_the_governed_gate`
+for the chat path. The optional `scripts/smoke-plugin-install-to-prime-use.ps1`
+exercises these same canonical tests (keyed off `git`, the real run, never echo).
 
 #### Per-tool-call approval flow (gated tools)
 
