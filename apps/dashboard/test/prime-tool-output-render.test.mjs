@@ -79,6 +79,27 @@ const PLAIN = {
   invoked_tool: "relux-tools-status/status.summary",
   tool_output: { result: "Nothing is running yet; the control plane is idle." },
 };
+// A tool result that (worst case) carries a credential in BOTH the human answer and the structured
+// detail — e.g. an unredacted MCP/tool body. The transcript must show NEITHER raw secret. The
+// secret is assembled at runtime so no literal token appears in this source.
+const SK = "sk-ant-" + "0123456789abcdef0123";
+const OPAQUE = "Zq" + "83hh21pPlainOpaqueToken";
+// The kernel already redacts the visible reply; the worst-case here is an UNREDACTED MCP/tool body
+// reaching the dashboard in tool_output — the dashboard's formatToolOutput/formatToolDetails must
+// scrub it, so the transcript shows neither raw secret.
+const SECRET = {
+  ...base,
+  reply: "logged in with token ***REDACTED*** successfully",
+  invoked_tool: "some-mcp/login",
+  tool_output: {
+    result: "logged in with token " + SK + " successfully",
+    structuredContent: { api_key: OPAQUE, note: "OPENAI_API_KEY=" + SK },
+  },
+};
+export function renderSecret() {
+  return at(<PrimeTurnCard turn={SECRET} busy={false} onSuggestion={noop} onContinue={noop} />);
+}
+export const SECRET_TOKENS = { SK, OPAQUE };
 export function renderShaped() {
   return at(<PrimeTurnCard turn={SHAPED} busy={false} onSuggestion={noop} onContinue={noop} />);
 }
@@ -150,4 +171,13 @@ test("a plain-string tool result renders no raw-details expander", () => {
   assert.match(html, /control plane is idle/);
   // Nothing structured to expand → no <details> / "raw details".
   assert.doesNotMatch(html, /raw details/i);
+});
+
+test("the transcript never includes a raw secret — neither the answer nor the raw-details body", () => {
+  const html = mod.renderSecret();
+  const { SK, OPAQUE } = mod.SECRET_TOKENS;
+  assert.ok(!html.includes(SK), "prefix secret leaked into the transcript");
+  assert.ok(!html.includes(OPAQUE), "opaque key-named secret leaked into the transcript");
+  // The redaction marker is what the operator sees instead.
+  assert.match(html, /REDACTED/);
 });

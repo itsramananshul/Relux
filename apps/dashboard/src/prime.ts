@@ -1,4 +1,5 @@
 import type { ReluxPendingClarification, ReluxPrimeAction, ReluxPrimeContextRead, ReluxPrimeProposal, ReluxPrimeProposalStep, ReluxPrimeSuggestion, ReluxPrimeTaskSlots, ReluxPrimeTaskUpdate, ReluxPrimeTurn, ReluxReplyPolish } from "./api";
+import { redactSecrets } from "./redact.ts";
 
 // A typed view of the GitHub plugin-import action Prime proposes for an
 // "install owner/repo as a plugin" / "import https://github.com/… as plugin" turn
@@ -511,6 +512,10 @@ export function formatToolOutput(output: unknown): string {
     text = String(output);
   }
   text = text.trimEnd();
+  // Redaction parity (docs/RELUX_MASTER_PLAN.md §11.1): scrub obvious secrets BEFORE clamping so a
+  // mask is never sliced mid-placeholder. Idempotent with the kernel's already-redacted reply, so
+  // the answer-first dedupe (replyCoversToolOutput) still matches.
+  text = redactSecrets(text);
   if (text.length > MAX_TOOL_OUTPUT_CHARS) {
     text = `${text.slice(0, MAX_TOOL_OUTPUT_CHARS - 1)}…`;
   }
@@ -556,6 +561,10 @@ export function formatToolDetails(output: unknown): string {
     return "";
   }
   text = text.trimEnd();
+  // Safety wins over fidelity: the audited "raw details" expander must not leak a credential a tool
+  // tucked into its structured body. Scrub the rendered JSON text (catches `"api_key": "…"` /
+  // `KEY=…` lines) before clamping. The expander label stays "raw details" — it is redacted detail.
+  text = redactSecrets(text);
   if (text.length > MAX_TOOL_OUTPUT_CHARS) {
     text = `${text.slice(0, MAX_TOOL_OUTPUT_CHARS - 1)}…`;
   }

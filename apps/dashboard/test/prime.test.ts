@@ -446,6 +446,34 @@ test("formatToolOutput clamps a pathologically large output so it never floods c
   assert.ok(huge.endsWith("…"));
 });
 
+// Redaction parity (RELUX_MASTER_PLAN §11.1): the chat bubble must never splash a credential, even
+// if an unredacted MCP/tool result reaches the dashboard. Build secrets at runtime so no literal
+// token appears in source.
+test("formatToolOutput redacts obvious secrets in the natural answer", () => {
+  const sk = `sk-ant-${"0123456789abcdef0123"}`;
+  const out = formatToolOutput({ result: `logged in with token ${sk} successfully` });
+  assert.ok(!out.includes(sk), `secret leaked into the chat bubble: ${out}`);
+  assert.ok(out.includes("***REDACTED***"));
+  // A plain-object output (pretty JSON body) is scrubbed too.
+  const opaque = `Zq${"83hh21pPlainOpaqueToken"}`;
+  const obj = formatToolOutput({ api_key: opaque, count: 2 });
+  assert.ok(!obj.includes(opaque), `secret leaked from JSON body: ${obj}`);
+});
+
+test("formatToolDetails redacts secrets in the raw-details expander body", () => {
+  const sk = `sk-ant-${"0123456789abcdef0123"}`;
+  const opaque = `Zq${"83hh21pPlainOpaqueToken"}`;
+  const details = formatToolDetails({
+    result: "read .env (42 bytes)",
+    structuredContent: { path: ".env", content: `OPENAI_API_KEY=${sk}`, api_key: opaque },
+  });
+  assert.ok(!details.includes(sk), `prefix secret leaked into raw details: ${details}`);
+  assert.ok(!details.includes(opaque), `opaque key-named secret leaked into raw details: ${details}`);
+  assert.ok(details.includes("***REDACTED***"));
+  // Non-secret structure stays useful.
+  assert.ok(details.includes("\".env\""));
+});
+
 // replyCoversToolOutput dedupes the answer-first path: when the chat reply already leads with
 // the tool's human answer, the result block must not repeat it.
 test("replyCoversToolOutput is true when the reply already shows the tool's human answer", () => {

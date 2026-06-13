@@ -11032,10 +11032,16 @@ fn natural_tool_reply(output: &serde_json::Value) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    if trimmed.chars().count() <= MAX_NATURAL_REPLY_CHARS {
-        return Some(trimmed.to_string());
+    // Redaction parity (`docs/RELUX_MASTER_PLAN.md` §11.1): this reply becomes the visible chat
+    // bubble for the deterministic single-invoke path. Plugin Lens already scrubs its shaped
+    // result, but an MCP / command-tool result reaches here unshaped, so scrub any obvious secret
+    // here too — Prime must never splash a credential into chat. Redact BEFORE clamping so a
+    // mask is never sliced mid-placeholder.
+    let redacted = relux_core::redact_secrets(trimmed);
+    if redacted.chars().count() <= MAX_NATURAL_REPLY_CHARS {
+        return Some(redacted);
     }
-    let mut out: String = trimmed.chars().take(MAX_NATURAL_REPLY_CHARS - 1).collect();
+    let mut out: String = redacted.chars().take(MAX_NATURAL_REPLY_CHARS - 1).collect();
     out.push('…');
     Some(out)
 }
@@ -16855,6 +16861,22 @@ mod tests {
         let out = natural_tool_reply(&serde_json::json!({ "result": big })).unwrap();
         assert_eq!(out.chars().count(), MAX_NATURAL_REPLY_CHARS);
         assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn natural_tool_reply_redacts_secrets_before_it_becomes_the_visible_reply() {
+        // An unshaped MCP/command-tool result reaches the deterministic reply path with a secret
+        // in its `result` text — it must be scrubbed before becoming the chat bubble.
+        let sk = format!("sk-ant-{}", "0123456789abcdef0123");
+        let out = natural_tool_reply(&serde_json::json!({
+            "result": format!("logged in with token {sk} successfully")
+        }))
+        .unwrap();
+        assert!(!out.contains(&sk), "secret leaked into reply: {out}");
+        assert!(out.contains(relux_core::redact::REDACTION_PLACEHOLDER), "{out}");
+        // A plain-string output is redacted too (no envelope, still a visible reply).
+        let out = natural_tool_reply(&serde_json::json!(format!("here is api_key={sk}"))).unwrap();
+        assert!(!out.contains(&sk), "secret leaked from plain string: {out}");
     }
 
     /// Install a manifest as a bundled, enabled plugin (test convenience).

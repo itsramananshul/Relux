@@ -116,10 +116,16 @@ fn redact_word(word: &str) -> String {
 /// `"auth_token":` or `password=`. The trailing separator is what distinguishes
 /// a key marker from a mere mention of the word in prose.
 fn is_secret_key_marker(word: &str) -> bool {
-    let key = match word.strip_suffix([':', '=']) {
-        Some(k) => k,
-        None => return false,
-    };
+    match word.strip_suffix([':', '=']) {
+        Some(key) => key_names_secret(key),
+        None => false,
+    }
+}
+
+/// True when a bare key name (no trailing separator, wrappers stripped) names a secret —
+/// the shared check behind both the text [`is_secret_key_marker`] and the JSON
+/// [`redact_json`] key-aware passes.
+fn key_names_secret(key: &str) -> bool {
     let (_, core, _) = strip_wrappers(key);
     let norm = core.to_lowercase();
     !norm.is_empty()
@@ -181,6 +187,50 @@ fn looks_like_secret_token(token: &str) -> bool {
         return false;
     }
     SECRET_PREFIXES.iter().any(|p| token.starts_with(p))
+}
+
+/// Recursively redact obvious secrets from every string inside a JSON value, returning a new
+/// value with the same shape. This is the structured counterpart to [`redact_secrets`]: when a
+/// tool result reaches a user-facing surface as JSON (the Plugin Lens `structuredContent`, an
+/// MCP result body), the key/value association a single-string scan relies on is split across
+/// JSON fields, so a key-aware pass is needed too.
+///
+/// Mirrors OpenClaw's `redactStringsDeep` / `sanitizeToolResult`
+/// (`reference/openclaw-main/src/agents/pi-embedded-subscribe.tools.ts`): every string is
+/// scrubbed with [`redact_secrets`], and an object entry whose KEY names a secret has a
+/// sufficiently long string value fully masked (the OpenClaw `redactSensitiveFieldValue` step).
+/// Object keys, numbers, booleans, and null pass through unchanged.
+pub fn redact_json(value: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::String(s) => Value::String(redact_secrets(s)),
+        Value::Array(items) => Value::Array(items.iter().map(redact_json).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), redact_object_field(k, v)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Redact one object field, using the KEY to decide. When the key names a secret and the value is
+/// a long-enough string, the whole value core is masked (key-aware redaction, since the prefix
+/// scan alone would miss an opaque token under e.g. `"api_key"`). Otherwise the value is recursed
+/// / scrubbed normally.
+fn redact_object_field(key: &str, value: &serde_json::Value) -> serde_json::Value {
+    if let serde_json::Value::String(s) = value {
+        if key_names_secret(key) {
+            let (lead, core, trail) = strip_wrappers(s);
+            if core.len() >= 6 {
+                return serde_json::Value::String(format!(
+                    "{lead}{REDACTION_PLACEHOLDER}{trail}"
+                ));
+            }
+        }
+        return serde_json::Value::String(redact_secrets(s));
+    }
+    redact_json(value)
 }
 
 /// Split a token into `(leading wrappers, core, trailing wrappers)` so the core
@@ -269,5 +319,39 @@ mod tests {
         assert!(out.contains("line one"));
         assert!(out.contains("line three"));
         assert!(!out.contains(&body));
+    }
+
+    #[test]
+    fn redact_json_masks_strings_by_prefix_and_key() {
+        let sk = token("sk-ant-", "0123456789abcdef0123");
+        let opaque = token("", "Zq83hh21pPlainOpaqueToken");
+        let value = serde_json::json!({
+            "note": format!("the token is {sk}"),
+            "api_key": opaque,
+            "count": 7,
+            "nested": { "password": opaque, "label": "fine" },
+            "lines": [ format!("export KEY={sk}"), "ordinary text" ],
+        });
+        let out = redact_json(&value);
+        let flat = out.to_string();
+        // No raw secret survives anywhere in the redacted tree.
+        assert!(!flat.contains(&sk), "prefix token leaked: {flat}");
+        assert!(!flat.contains(&opaque), "opaque key-named secret leaked: {flat}");
+        assert!(flat.contains(REDACTION_PLACEHOLDER));
+        // Non-secret structure is preserved: numbers and ordinary strings untouched, keys intact.
+        assert_eq!(out["count"], serde_json::json!(7));
+        assert_eq!(out["nested"]["label"], serde_json::json!("fine"));
+        assert_eq!(out["lines"][1], serde_json::json!("ordinary text"));
+    }
+
+    #[test]
+    fn redact_json_leaves_clean_value_unchanged() {
+        let value = serde_json::json!({
+            "match_count": 0,
+            "query": "todo",
+            "matches": [],
+            "files_scanned": 4,
+        });
+        assert_eq!(redact_json(&value), value);
     }
 }

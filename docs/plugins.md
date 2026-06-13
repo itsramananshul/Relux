@@ -563,14 +563,30 @@ envelope at a single chokepoint
   src/a.rs:12 — …"*, or *"Read README.md (24 bytes): …"*. This is what
   the chat bubble shows and what the brain reasons over next round
   (`prime_agent_loop::render_output` prefers `result`).
-- `structuredContent` is the **original structured value, verbatim** —
+- `structuredContent` is the **original structured value** —
   available for audit and rendered in a collapsible **"raw details"**
   expander beneath the answer (`formatToolDetails` +
   `Prime.tsx` `ToolOutputBlock`), never inlined into the bubble.
 
+**Redaction parity (no secret reaches the chat).** Both halves are
+secret-scrubbed before they leave the kernel: `shape_result` runs the
+human `result` through `relux_core::redact_secrets` and the
+`structuredContent` through `relux_core::redact_json` (a key-aware deep
+scrub). A source file body folded into a `plugin.read_file` summary, or a
+`plugin.search` hit, can carry a credential the user committed — so the
+natural answer **and** the "raw details" expander mask key-shaped tokens
+(`sk-…`, `ghp_…`) and secret-named `key=value` / `key: value` pairs. The
+dashboard re-scrubs at render time (`formatToolOutput` / `formatToolDetails`
+mirror the kernel scrub) as the last line of defence for any unredacted
+MCP/tool body. The structure is otherwise preserved — redaction only masks
+secrets — and the scrub is idempotent and bounded (the answer is clamped to
+4 000 chars). Modelled on Hermes `agent/redact.py` and OpenClaw
+`sanitizeToolResult` / `redactStringsDeep`
+(`reference/openclaw-main/src/agents/pi-embedded-subscribe.tools.ts`).
+
 The summary is *derived* from the structured value, never fabricated, and
-the structured value is preserved losslessly — so honesty is maintained
-while the visible answer stays prose. The same shaping applies to MCP and
+the structured value is preserved (modulo secret masking) — so honesty is
+maintained while the visible answer stays prose. The same shaping applies to MCP and
 other tool outputs that already return the `{ result, structuredContent }`
 shape; a plain tool with no human `result` still shows its structured
 output (there is simply nothing extra to expand).

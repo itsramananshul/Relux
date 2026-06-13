@@ -1109,6 +1109,22 @@ control-plane operator *second*:
   structured detail behind a collapsible **"raw details"** expander
   (`formatToolOutput` / `formatToolDetails` / `Prime.tsx` `ToolOutputBlock`). The
   structured body is preserved (audited, expandable), never dropped or fabricated.
+- **Redaction parity — no secret reaches the chat.** Every user-visible tool result
+  — the natural answer, the deterministic reply, AND the expandable "raw details"
+  — is secret-scrubbed and bounded before a human reads it. The kernel redacts both
+  halves of the shaped envelope (`shape_result` → `relux_core::redact_secrets` on
+  the `result` text + `relux_core::redact_json`, a key-aware deep scrub, on
+  `structuredContent`) and the deterministic single-invoke reply
+  (`natural_tool_reply` → `redact_secrets`, redact-then-clamp). The dashboard
+  re-scrubs as the last surface before display (`formatToolOutput` /
+  `formatToolDetails` → `redact` mirror of `relux_core::redact_secrets`), so even an
+  unredacted MCP/tool `structuredContent` cannot leak a committed credential into the
+  bubble or the "raw details" expander. The scrub masks key-shaped tokens (`sk-…`,
+  `ghp_…`, `AKIA…`) and secret-named `key=value` / `key: value` pairs; it is
+  idempotent (kernel-redacted text re-scrubs to itself, so the answer-first dedupe
+  still matches) and conservative, not a security boundary. Built reference-first
+  from Hermes `agent/redact.py` and OpenClaw `redactStringsDeep` / `sanitizeToolResult`
+  (`reference/openclaw-main/src/agents/pi-embedded-subscribe.tools.ts`).
 - **Answer-first even with no brain.** A deterministic (no-brain) single-invoke turn
   leads the chat reply with the tool's **natural answer**, not a canned
   `Running <tool>.` line: the kernel's two `Ready` execution arms route through

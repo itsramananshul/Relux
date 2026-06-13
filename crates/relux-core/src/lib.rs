@@ -111,7 +111,7 @@ pub use proposed_change::{
     capture_proposed_changes, sha256_hex, ProposedChange, ProposedChangeAction,
     ProposedChangeStatus, MAX_CONTENT_BYTES, MAX_PROPOSED_CHANGES,
 };
-pub use redact::redact_secrets;
+pub use redact::{redact_json, redact_secrets};
 pub use run::{Run, RunId, RunStatus};
 pub use run_log::{
     RunLog, RunLogBuilder, RunLogLine, RunLogSource, StreamingRunLog, MAX_LOG_LINES,

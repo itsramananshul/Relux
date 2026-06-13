@@ -589,11 +589,20 @@ fn clamp_chars(s: &str, max: usize) -> String {
 
 /// Wrap one source tool's structured output in the `{ result, structuredContent }` envelope.
 /// `result` is the human-readable summary from [`humanize`]; `structuredContent` is the original
-/// value unchanged. This is the single chokepoint the kernel uses for every Plugin Lens result,
-/// so the chat single-invoke path, the agent loop, and the dashboard all see clean prose.
+/// value. This is the single chokepoint the kernel uses for every Plugin Lens result, so the chat
+/// single-invoke path, the agent loop, and the dashboard all see clean prose.
+///
+/// SAFETY (redaction parity, `docs/RELUX_MASTER_PLAN.md` §11.1): both halves are secret-scrubbed
+/// before they leave the kernel. A source file body folded into a `plugin.read_file` summary, or
+/// a `plugin.search` hit, can carry a credential the user committed; Prime must never splash that
+/// into chat. The human `result` runs through [`relux_core::redact_secrets`] and the structured
+/// detail through [`relux_core::redact_json`] (key-aware deep scrub), so neither the natural answer
+/// nor the expandable "raw details" expander can leak an obvious secret. The structure is
+/// otherwise preserved verbatim — redaction only masks key-shaped tokens.
 pub fn shape_result(tool_name: &str, value: serde_json::Value) -> serde_json::Value {
-    let result = humanize(tool_name, &value);
-    serde_json::json!({ "result": result, "structuredContent": value })
+    let result = relux_core::redact_secrets(&humanize(tool_name, &value));
+    let structured = relux_core::redact_json(&value);
+    serde_json::json!({ "result": result, "structuredContent": structured })
 }
 
 /// Read a string field from a JSON object, defaulting to `""`.
@@ -873,6 +882,33 @@ mod tests {
         assert!(result.contains("No matches for \"todo\""), "{result}");
         // The full structured detail is preserved verbatim for audit / expansion.
         assert_eq!(shaped["structuredContent"], raw);
+    }
+
+    #[test]
+    fn shape_result_redacts_secrets_in_both_halves() {
+        // Build a key-shaped token at runtime so no literal secret appears in source.
+        let sk = format!("sk-ant-{}", "0123456789abcdef0123");
+        let opaque = format!("Zq{}", "83hh21pPlainOpaqueToken");
+        // A read_file whose human result folds in the body AND whose structured `content`
+        // carries the same secret — the worst case for leaking a committed credential.
+        let raw = serde_json::json!({
+            "path": ".env",
+            "total_bytes": 42,
+            "bytes_returned": 42,
+            "truncated": false,
+            "content": format!("OPENAI_API_KEY={sk}\napi_key={opaque}\n"),
+        });
+        let shaped = shape_result("plugin.read_file", raw);
+        let flat = shaped.to_string();
+        // Neither the visible `result` text nor the structured detail may carry the raw secret.
+        assert!(!flat.contains(&sk), "prefix secret leaked: {flat}");
+        assert!(!flat.contains(&opaque), "opaque key-named secret leaked: {flat}");
+        let result = shaped["result"].as_str().unwrap();
+        assert!(!result.contains(&sk), "result text leaked secret: {result}");
+        assert!(
+            flat.contains(relux_core::redact::REDACTION_PLACEHOLDER),
+            "expected a redaction marker: {flat}"
+        );
     }
 
     #[test]

@@ -3065,3 +3065,42 @@ grounded answer) wins; else the tool's human `result`/string answer leads; else 
 dashboard deduplicates with `replyCoversToolOutput(reply, output)` so the answer renders once
 (reply bubble) plus the audited "raw details" expander, never twice. Explicit task creation /
 run paths are untouched.
+
+### Follow-up — redaction parity for the natural reply AND the raw-details expander
+
+**Caveat closed (this slice).** The answer-first work made the deterministic reply and the
+"raw details" expander surface the tool's real body — but neither was secret-scrubbed. A
+`plugin.read_file` over a committed `.env`, a `plugin.search` hit on a key, or an unredacted
+MCP `structuredContent` could splash a credential into the chat bubble or the expander. The
+product bar is absolute: **Prime must never surface an obvious secret on a plugin/tool surface.**
+
+**Reference re-read:**
+
+- `reference/hermes-agent-main/agent/redact.py` — the canonical Hermes tool-output redactor:
+  `redact_sensitive_text` masks known vendor prefixes (`_PREFIX_RE`: `sk-…`, `ghp_…`, `AKIA…`),
+  `key=value` ENV assignments (`_ENV_ASSIGN_RE` keyed on `API_?KEY|TOKEN|SECRET|PASSWORD|AUTH|…`),
+  and JSON secret fields (`_JSON_FIELD_RE`) BEFORE the text reaches logs / verbose output. The
+  `force=True` path is a *safety boundary that must never return a raw secret regardless of
+  config.* **Pattern: scrub vendor-prefix tokens + secret-named key/value pairs on every
+  user-/log-facing string.** This is exactly the existing `relux_core::redact_secrets` shape.
+- `reference/openclaw-main/src/agents/pi-embedded-subscribe.tools.ts` `sanitizeToolResult` /
+  `redactStringsDeep` (L119-180): a tool result is sanitized **recursively** — every string is
+  passed through `redactToolPayloadText`, and an object entry is run through
+  `redactSensitiveFieldValue(key, child)` so a value under a secret-named KEY is masked even when
+  the prefix scan would miss an opaque token. **Pattern: deep, key-aware redaction of the whole
+  structured tool result before it is shown.** This is what `structuredContent` (which reaches the
+  "raw details" expander) needed and previously lacked.
+
+**How Relux maps it:**
+
+| Reference pattern | Relux adaptation (this slice) |
+|---|---|
+| Hermes `redact.py`: scrub prefix tokens + secret key/value pairs on every user-facing string | `plugin_source::shape_result` now runs the human `result` through `relux_core::redact_secrets`; the kernel's deterministic reply chokepoint `natural_tool_reply` redacts (redact-then-clamp) so the visible bubble for ANY tool (Plugin Lens, MCP, command tool) is scrubbed. |
+| OpenClaw `sanitizeToolResult` / `redactStringsDeep`: deep, key-aware redaction of the structured result | New `relux_core::redact_json(value)` recursively scrubs every string in a JSON value and masks a long string value under a secret-named key (`redact_object_field` + the shared `key_names_secret`). `shape_result` runs `structuredContent` through it, so the "raw details" expander cannot leak a secret either. |
+| Hermes `force=True`: a safety boundary returns no raw secret regardless of preference | The dashboard re-scrubs at render as the LAST surface before display: `apps/dashboard/src/redact.ts` mirrors `relux_core::redact_secrets` byte-for-byte, applied in `formatToolOutput` / `formatToolDetails`. Even an unredacted MCP/tool body reaching the UI is masked. Idempotent, so the kernel-redacted reply and the dashboard scrub agree (the answer-first dedupe still matches). |
+
+**What we deliberately keep:** redaction only masks key-shaped tokens and secret-named pairs —
+ordinary prose, paths, counts, and URLs pass through unchanged, so the answer stays readable and
+the details stay useful. The scrub is conservative (not a security boundary) and bounded (answer
+clamped to 4 000 chars). See `docs/plugins.md` "Plugin Lens → Redaction parity" and
+`RELUX_MASTER_PLAN.md` §11.1 for the product surface.
