@@ -1954,6 +1954,21 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.39** (2026-06-13) — **Prime brain/adapter setup** rollup. The `relux-kernel` /
+  `relux-core` crates move `0.1.38` → `0.1.39` in lockstep, packaging two post-v0.1.38 slices into a
+  fresh Windows bundle on top of all v0.1.38 work (RELUX_MASTER_PLAN §8.1 / §10.1; built
+  reference-first per `docs/reference-driven-development.md`). Headline: **setup guidance is
+  canonical and choosing a Prime brain model is a picker, not a typed slug.**
+  - **Canonical Prime brain/adapter setup guidance (§8.1 "Crew → Prime Brain").** Setup guidance
+    points consistently at `Crew → Prime Brain` and `Crew → Adapters` with hash deep-links; the stale
+    "Health → AI settings" wording is retired so the documented path matches the live dashboard.
+  - **OpenRouter model catalog + picker in Prime Brain setup (§10.1).** Prime Brain setup fetches the
+    live OpenRouter catalog (`GET https://openrouter.ai/api/v1/models`) through a bounded backend
+    route and renders a searchable dashboard picker, with a manual-slug fallback when the catalog is
+    unavailable.
+  - Dashboard typecheck / tests / build green. The full-e2e release gate
+    (`scripts\relux-package-local.ps1 -FullE2E`) is run at package time. All reads/writes hit real
+    kernel state; no new authority is added. Every safety property from v0.1.38 holds.
 - **v0.1.38** (2026-06-13) — **Prime plugin-use + Crew usability** rollup. The `relux-kernel` /
   `relux-core` crates move `0.1.37` → `0.1.38` in lockstep, packaging two post-v0.1.37 slices into a
   fresh Windows bundle on top of all v0.1.37 work (RELUX_MASTER_PLAN §8.1 / §10.1 / §11.6;

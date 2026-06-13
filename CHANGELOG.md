@@ -9,6 +9,26 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.39 (Windows bundle).** The `relux-kernel` and
+  `relux-core` crates move `0.1.38` → `0.1.39` in lockstep, packaging two
+  post-v0.1.38 **Prime brain/adapter setup** slices into a fresh Windows bundle on
+  top of everything in v0.1.38. Everything reads-from / writes-through real kernel
+  state and conforms to `docs/RELUX_MASTER_PLAN.md` §8.1 / §10.1; no master-plan
+  safety property is weakened. Headline:
+  - **Canonical Prime brain/adapter setup guidance (Crew → Prime Brain / Crew →
+    Adapters).** Setup guidance now points consistently at the live dashboard
+    surfaces — `Crew → Prime Brain` and `Crew → Adapters` with hash deep-links —
+    and the stale "Health → AI settings" wording is retired everywhere, so the
+    documented path matches the actual UI (RELUX_MASTER_PLAN §8.1 "Crew → Prime
+    Brain").
+  - **OpenRouter model catalog + picker in Prime Brain setup.** Prime Brain setup
+    fetches the live OpenRouter catalog (`GET https://openrouter.ai/api/v1/models`)
+    through a bounded backend route and renders a searchable dashboard picker, with
+    a manual-slug fallback when the catalog is unavailable, so choosing a brain
+    model no longer requires hand-typing an opaque slug (§10.1).
+  - Dashboard typecheck / tests / build green; the full-e2e release gate
+    (`scripts\relux-package-local.ps1 -FullE2E`) is run at package time. Every
+    safety property from v0.1.38 holds; no new authority is added.
 - **Relux local release v0.1.38 (Windows bundle).** The `relux-kernel` and
   `relux-core` crates move `0.1.37` → `0.1.38` in lockstep, packaging two
   post-v0.1.37 **Prime plugin-use + Crew usability** slices into a fresh Windows
