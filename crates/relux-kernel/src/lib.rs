@@ -72,6 +72,7 @@ pub use agent_config::{
 };
 pub use agent_presets::{find_agent_preset, AgentPreset, AGENT_PRESETS};
 pub use ai::{
+    available_cli_brains, resolve_brain, BrainResolution,
     classify_intent_via_openrouter, clear_stored_config, complete_tool_round, compose_chat_prompt,
     compose_polish_prompt, decide_prime_via_openrouter, grounded_facts_with_observations,
     extract_agent_slots_via_openrouter, extract_assign_slots_via_openrouter,

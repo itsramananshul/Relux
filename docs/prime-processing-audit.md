@@ -1952,3 +1952,68 @@ real CTAs (e.g. "Start the run").
 
 No frontend change: the contextual chips are backend-driven and render through the existing
 `suggested_actions` path; `dashboard-dist` was not rebuilt.
+
+## Applied change (auto-detected CLI brain — Prime is a real chat agent out of the box)
+
+The single biggest reason Prime still *felt* like a board/task manager instead of a
+Hermes/Codex-style general agent: with no brain configured it answered every message
+from the deterministic templates. Yet `docs/RELUX_MASTER_PLAN.md` §10.1 is explicit
+that the LLM brain is the **primary** surface and the deterministic classifier is a
+**fallback safety rail**, and §14 names the Claude / Codex CLI as the recommended
+first brain. The implementation defaulted to the *fallback* (`Local`) even when a
+perfectly good CLI brain was installed, enabled, and on PATH — exactly the disconnect
+this slice closes. Reference-grounded in the existing adapter-runtime detection
+(Hermes `system_prompt` provider selection; openclaw adapter-readiness gating) and the
+fail-closed brain seam already documented above.
+
+- **New pure resolver `relux-kernel/src/ai.rs`.** `available_cli_brains(statuses)`
+  lists the CLI brains whose adapter is `AdapterRuntimeState::Available` (enabled AND
+  binary on PATH), Claude-preferred. `resolve_brain(cfg, available_clis) ->
+  (PrimeBrain, BrainResolution)` is the doc-conformant ordering: (1) an EXPLICIT
+  operator choice always wins — including an explicit `Local`, so a deliberate
+  deterministic choice is never overridden; (2) no choice but a usable OpenRouter key
+  → OpenRouter (legacy auto); (3) no choice and no key → auto-adopt the first
+  available CLI brain; (4) nothing available → `Local`. Pure (no env / network /
+  clock), fully unit-tested.
+- **Auto-adoption only fires for an adapter the operator already ENABLED** (CLI
+  adapters are disabled by default), so Prime never spawns an external process the
+  operator did not opt into, and it changes **no durable-action path** — every state
+  change still flows through the deterministic `decide → prime_execute` / approval
+  path regardless of the brain. The reconcile/fail-closed gates are untouched.
+- **One resolution, three honest surfaces.** `run_prime` (`server.rs`) resolves the
+  brain once at the top from a single short adapter-status read and threads it through
+  every existing CLI-brain call site (intent, slots, reply, polish), so an
+  auto-detected Claude/Codex brain now drives the whole unified decision. `GET
+  /v1/relux/ai/status`, `/health`, and `/doctor` mirror the same resolution so they
+  report the auto-adopted brain instead of "Local".
+- **Honest provenance.** `AiStatus` gains `auto_detected`; `AiConfig::status_for(brain,
+  auto_detected)` stamps a clear "… brain auto-detected — its adapter is enabled and
+  the binary is on PATH … pick a brain explicitly to override" reason. The dashboard
+  Prime banner shows "Prime: Claude CLI · auto-detected" so the operator knows why
+  Prime is using it and how to change it.
+
+### Files changed
+
+- `crates/relux-kernel/src/ai.rs` — `BrainResolution`, `available_cli_brains`,
+  `resolve_brain`; `AiStatus.auto_detected`; `status()` refactored onto
+  `status_for(brain, auto_detected)` with an auto-detected reason; updated `PrimeBrain`
+  doc. Unit tests: `available_cli_brains_lists_only_available_in_preference_order`,
+  `resolve_brain_auto_adopts_an_available_cli_when_unset`,
+  `resolve_brain_honors_explicit_choice_and_openrouter_key_first`,
+  `status_for_marks_auto_detected_cli_brain`.
+- `crates/relux-kernel/src/lib.rs` — re-export the three new symbols.
+- `crates/relux-kernel/src/server.rs` — `run_prime` brain resolution (one adapter
+  read), `get_ai_status` / `get_health` / `get_doctor` mirror the resolution.
+- `crates/relux-kernel/src/doctor.rs` — test helper carries the new field.
+- `apps/dashboard/src/api.ts` — `ReluxAiStatus.auto_detected?`.
+- `apps/dashboard/src/pages/Prime.tsx` — "· auto-detected" banner hint;
+  `dashboard-dist` rebuilt and committed in sync.
+
+### Safety invariants (binding)
+
+Auto-adoption is brain *selection* only — it grants no authority, runs no action, and
+fires only for an operator-enabled, on-PATH adapter. An explicit `Local` is never
+overridden. Every safety property of the prior slices holds: the deterministic
+classifier remains the fail-closed rail, `reconcile_intent` and existence/approval
+checks run on the current message alone, and durable state still flows only through
+`decide → prime_execute` / human approval.

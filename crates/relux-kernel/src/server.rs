@@ -1136,7 +1136,20 @@ async fn get_state(State(state): State<AppState>) -> Result<Json<StateResponse>,
 }
 
 async fn get_ai_status(State(state): State<AppState>) -> Json<AiStatus> {
-    Json(resolve_ai(&state).status())
+    let cfg = resolve_ai(&state);
+    // Mirror the brain resolution `run_prime` does so the dashboard banner reflects
+    // an auto-adopted CLI brain (enabled + on PATH) instead of reporting "Local".
+    let adapter_statuses = {
+        let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
+        match SqliteStore::open(&state.db_path).and_then(|s| s.load()) {
+            Ok(kernel) => kernel.adapter_runtime_status(),
+            Err(_) => Vec::new(),
+        }
+    };
+    let available = relux_kernel::available_cli_brains(&adapter_statuses);
+    let (brain, resolution) = relux_kernel::resolve_brain(&cfg, &available);
+    let auto_detected = resolution == relux_kernel::BrainResolution::CliAutoDetected;
+    Json(cfg.status_for(brain, auto_detected))
 }
 
 /// Set or update Prime's AI provider configuration from the dashboard.
@@ -3928,29 +3941,34 @@ async fn run_prime(
     // Resolve the AI config (and therefore the selected brain) live, so a brain
     // chosen from the dashboard takes effect without a restart.
     let ai_config = resolve_ai(&state);
-    let brain = ai_config.effective_brain();
+
+    // 0. Snapshot every adapter runtime status under one short read-only lock, then
+    // resolve Prime's effective brain. An explicit operator choice / OpenRouter key
+    // wins; with neither, an enabled CLI adapter that is on PATH is auto-adopted so
+    // Prime is a real conversational agent out of the box instead of the
+    // deterministic fallback (`docs/RELUX_MASTER_PLAN.md` §10.1 — the LLM brain is
+    // primary, the deterministic classifier is the fallback rail; §14 — Claude /
+    // Codex CLI is the recommended first brain). Auto-adoption never changes a
+    // durable-action path and only fires for an adapter the operator already enabled.
+    let adapter_statuses = {
+        let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let store = SqliteStore::open(&state.db_path)?;
+        let kernel = store.load()?;
+        kernel.adapter_runtime_status()
+    };
+    let available_clis = relux_kernel::available_cli_brains(&adapter_statuses);
+    let (brain, _brain_resolution) = relux_kernel::resolve_brain(&ai_config, &available_clis);
     let cli_adapter_id = match brain {
         relux_kernel::PrimeBrain::ClaudeCli => Some(relux_core::CLAUDE_CLI_ADAPTER_ID),
         relux_kernel::PrimeBrain::CodexCli => Some(relux_core::CODEX_CLI_ADAPTER_ID),
         _ => None,
     };
-
-    // 0. Snapshot the brain's CLI adapter status (if any) under a short read-only
-    // lock. A CLI brain needs this BEFORE the turn so it can classify intent (and
-    // it is reused below for the reply/polish spawns), all OUTSIDE the main lock.
-    let cli_status = if cli_adapter_id.is_some() {
-        let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
-        let store = SqliteStore::open(&state.db_path)?;
-        let kernel = store.load()?;
-        cli_adapter_id.and_then(|id| {
-            kernel
-                .adapter_runtime_status()
-                .into_iter()
-                .find(|a| a.plugin_id == id)
-        })
-    } else {
-        None
-    };
+    // The resolved CLI brain's adapter status (reused for the reply/polish spawns,
+    // all OUTSIDE the main lock). Available-by-construction for an auto-detected
+    // brain; for an explicit CLI choice it carries the live readiness so the spawn
+    // path can fall back gracefully when it is not ready.
+    let cli_status = cli_adapter_id
+        .and_then(|id| adapter_statuses.into_iter().find(|a| a.plugin_id == id));
 
     // 0b. Continuation pre-flight + board snapshot (a short read under the lock). If this
     // message CONTINUES a pending clarification, the brain must reason about the COMBINED
@@ -8661,15 +8679,11 @@ async fn get_health(State(state): State<AppState>) -> Result<Json<HealthResponse
     let version = crate::get_kernel_version().to_string();
     let db_path = state.db_path.display().to_string();
     let dashboard_bundle_present = state.dashboard_dir.is_some();
-    let ai_status = resolve_ai(&state).status();
+    let cfg = resolve_ai(&state);
 
     if !dashboard_bundle_present {
         warnings.push("Dashboard bundle not found. Run `npm run build` in `apps/dashboard`".to_string());
         ok = false; // Missing dashboard bundle is a hard failure for readiness
-    }
-
-    if ai_status.mode == AiMode::Openrouter && !ai_status.configured {
-        warnings.push("AI mode: OpenRouter (not configured, set OPENROUTER_API_KEY)".to_string());
     }
 
     let (
@@ -8678,6 +8692,7 @@ async fn get_health(State(state): State<AppState>) -> Result<Json<HealthResponse
         agent_count,
         task_count,
         run_count,
+        adapter_statuses,
     ) = {
         let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
         match SqliteStore::open(&state.db_path) {
@@ -8688,20 +8703,34 @@ async fn get_health(State(state): State<AppState>) -> Result<Json<HealthResponse
                     kernel.agent_count(),
                     kernel.task_count(),
                     kernel.run_count(),
+                    kernel.adapter_runtime_status(),
                 ),
                 Err(e) => {
                     errors.push(format!("Failed to load kernel state from DB: {}", e));
                     ok = false;
-                    (false, 0, 0, 0, 0)
+                    (false, 0, 0, 0, 0, Vec::new())
                 }
             },
             Err(e) => {
                 errors.push(format!("Failed to open DB at {}: {}", state.db_path.display(), e));
                 ok = false;
-                (false, 0, 0, 0, 0)
+                (false, 0, 0, 0, 0, Vec::new())
             }
         }
     };
+
+    // Resolve the effective brain the same way `run_prime` does so health reports an
+    // auto-adopted CLI brain (enabled + on PATH) instead of "Local".
+    let available_clis = relux_kernel::available_cli_brains(&adapter_statuses);
+    let (brain, resolution) = relux_kernel::resolve_brain(&cfg, &available_clis);
+    let ai_status = cfg.status_for(
+        brain,
+        resolution == relux_kernel::BrainResolution::CliAutoDetected,
+    );
+
+    if ai_status.mode == AiMode::Openrouter && !ai_status.configured {
+        warnings.push("AI mode: OpenRouter (not configured, set OPENROUTER_API_KEY)".to_string());
+    }
 
     Ok(Json(HealthResponse {
         ok,
@@ -8729,7 +8758,7 @@ async fn get_doctor(
     State(state): State<AppState>,
 ) -> Result<Json<relux_kernel::doctor::DoctorReport>, ApiError> {
     let dashboard_bundle_present = state.dashboard_dir.is_some();
-    let ai = resolve_ai(&state).status();
+    let cfg = resolve_ai(&state);
 
     // One serialized read of the store; on any open/load failure we still produce
     // an honest report whose `kernel.store` row fails (rather than 500ing).
@@ -8755,6 +8784,15 @@ async fn get_doctor(
             Err(_) => (false, Vec::new(), Vec::new(), 0, 0, 0, 0),
         }
     };
+
+    // Resolve the effective brain the same way `run_prime` does so the doctor's brain
+    // row reflects an auto-adopted CLI brain (enabled + on PATH) instead of "Local".
+    let available_clis = relux_kernel::available_cli_brains(&adapters);
+    let (brain, resolution) = relux_kernel::resolve_brain(&cfg, &available_clis);
+    let ai = cfg.status_for(
+        brain,
+        resolution == relux_kernel::BrainResolution::CliAutoDetected,
+    );
 
     let generated_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)

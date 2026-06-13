@@ -2221,6 +2221,10 @@ export interface ReluxAiStatus {
   secret_missing: boolean;
   /// A human-readable, secret-free explanation of the current mode.
   reason: string;
+  /// True when this brain was NOT an explicit operator choice but was auto-adopted
+  /// because its CLI adapter is enabled and on PATH. The banner shows an
+  /// "auto-detected" hint so the operator knows why Prime is using it.
+  auto_detected?: boolean;
 }
 
 // The read-only operator Doctor report (relix-dashboard-design.md §15). Mirrors

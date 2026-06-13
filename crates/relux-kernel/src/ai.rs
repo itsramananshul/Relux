@@ -207,7 +207,17 @@ impl AiConfig {
     /// kernel layers in live adapter availability before this is returned (the
     /// status here only knows the selection, not whether the binary is on PATH).
     pub fn status(&self) -> AiStatus {
-        let brain = self.effective_brain();
+        self.status_for(self.effective_brain(), false)
+    }
+
+    /// Build the status surface for an explicitly-resolved brain.
+    ///
+    /// Unlike [`AiConfig::status`] (which reports `effective_brain`), this takes the
+    /// brain the kernel actually resolved for the turn — including a CLI brain that
+    /// was auto-adopted because its adapter is enabled and on PATH ([`resolve_brain`]).
+    /// `auto_detected` drives an honest "auto-detected" explanation and the matching
+    /// status flag so the dashboard never claims the operator selected it.
+    pub fn status_for(&self, brain: PrimeBrain, auto_detected: bool) -> AiStatus {
         let mode = match brain {
             PrimeBrain::Local => AiMode::Deterministic,
             PrimeBrain::Openrouter => {
@@ -257,6 +267,18 @@ impl AiConfig {
                 "Local brain: Prime runs fully deterministic and grounded in control-plane state.".to_string()
             }
         };
+        // When the brain was auto-adopted (no explicit choice, no OpenRouter key, but
+        // an enabled CLI adapter is on PATH), say so plainly instead of implying the
+        // operator picked it. Falls through to the selection reason for every other case.
+        let reason = if auto_detected {
+            match brain {
+                PrimeBrain::ClaudeCli => "Claude CLI brain auto-detected — its adapter is enabled and the `claude` binary is on PATH, so Prime answers through it. Pick a brain explicitly on Crew → Adapters to override. Actions stay deterministic and kernel-grounded.".to_string(),
+                PrimeBrain::CodexCli => "Codex CLI brain auto-detected — its adapter is enabled and the `codex` binary is on PATH, so Prime answers through it. Pick a brain explicitly on Crew → Adapters to override. Actions stay deterministic and kernel-grounded.".to_string(),
+                _ => reason,
+            }
+        } else {
+            reason
+        };
         AiStatus {
             mode,
             brain: brain.as_str().to_string(),
@@ -267,6 +289,7 @@ impl AiConfig {
             api_key_secret: self.api_key_secret.clone(),
             secret_missing: self.secret_missing,
             reason,
+            auto_detected,
         }
     }
 
@@ -509,12 +532,16 @@ pub enum AiMode {
 
 /// Which provider Prime uses for its *conversational* replies (its "brain").
 ///
-/// This is an explicit operator choice (`docs/RELUX_MASTER_PLAN.md` section 8.1 —
-/// adapter plugins are how Relux connects to a model/agent runtime). It never
-/// affects durable actions: every state change still comes from the deterministic
-/// kernel path regardless of the brain. `Local` is the always-available grounded
-/// stand-in; `Openrouter` uses the configured API key; `ClaudeCli`/`CodexCli`
-/// delegate to a local coding-agent CLI the operator has installed and enabled.
+/// The operator may select one explicitly (`docs/RELUX_MASTER_PLAN.md` section 8.1
+/// — adapter plugins are how Relux connects to a model/agent runtime). When no
+/// brain is selected, [`resolve_brain`] picks one: a configured OpenRouter key, or
+/// otherwise an enabled CLI adapter that is on PATH (auto-adoption, so Prime is a
+/// real conversational agent out of the box per §10.1/§14), falling back to `Local`.
+/// The brain never affects durable actions: every state change still comes from the
+/// deterministic kernel path regardless of the brain. `Local` is the
+/// always-available grounded stand-in; `Openrouter` uses the configured API key;
+/// `ClaudeCli`/`CodexCli` delegate to a local coding-agent CLI the operator has
+/// installed and enabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PrimeBrain {
@@ -551,6 +578,82 @@ impl PrimeBrain {
     }
 }
 
+/// How Prime's effective conversational brain was chosen for a turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrainResolution {
+    /// The operator explicitly selected this brain (`AiConfig.brain` is set) —
+    /// including an explicit `Local`.
+    Explicit,
+    /// No explicit choice; a usable OpenRouter key is configured, so OpenRouter is
+    /// used (the legacy auto choice).
+    OpenRouterAuto,
+    /// No explicit choice and no key; an enabled CLI adapter that is on PATH was
+    /// auto-adopted so Prime is a real conversational agent out of the box.
+    CliAutoDetected,
+    /// No brain available; the deterministic local fallback.
+    LocalFallback,
+}
+
+/// The CLI brains whose adapter is enabled AND whose binary resolved on PATH
+/// (`AdapterRuntimeState::Available`), in PREFERENCE order (Claude, then Codex).
+///
+/// Pure: it only reads the snapshot the kernel already builds
+/// (`KernelState::adapter_runtime_status`). The order is the auto-adoption
+/// preference consumed by [`resolve_brain`].
+pub fn available_cli_brains(statuses: &[relux_core::AdapterRuntimeStatus]) -> Vec<PrimeBrain> {
+    let mut out = Vec::new();
+    for (id, brain) in [
+        (relux_core::CLAUDE_CLI_ADAPTER_ID, PrimeBrain::ClaudeCli),
+        (relux_core::CODEX_CLI_ADAPTER_ID, PrimeBrain::CodexCli),
+    ] {
+        let available = statuses.iter().any(|s| {
+            s.plugin_id == id && s.state == relux_core::AdapterRuntimeState::Available
+        });
+        if available {
+            out.push(brain);
+        }
+    }
+    out
+}
+
+/// Resolve Prime's effective conversational brain for a turn.
+///
+/// This is the doc-conformant ordering from `docs/RELUX_MASTER_PLAN.md` §10.1 (the
+/// LLM brain is the PRIMARY surface; the deterministic classifier is a fallback
+/// rail) and §14 (Claude / Codex CLI is the recommended first brain):
+///
+/// 1. An explicit operator choice always wins — including an explicit `Local`, so
+///    an operator who deliberately wants the deterministic brain keeps it.
+/// 2. No explicit choice but a usable OpenRouter key → OpenRouter (legacy auto).
+/// 3. No explicit choice and no key → auto-adopt the first AVAILABLE CLI brain
+///    (`available_clis`, most-preferred first), so a user who installed and ENABLED
+///    a coding-agent CLI gets a real conversational Prime instead of templates.
+/// 4. Nothing available → the deterministic local fallback.
+///
+/// Auto-adoption only fires for an adapter the operator already ENABLED (CLI
+/// adapters are disabled by default), so it never spawns an external process the
+/// operator did not opt into, and it changes NO durable-action path — every state
+/// change still flows through the deterministic kernel path regardless of the brain.
+/// Pure: no env, no network, no clock.
+pub fn resolve_brain(
+    cfg: &AiConfig,
+    available_clis: &[PrimeBrain],
+) -> (PrimeBrain, BrainResolution) {
+    if let Some(b) = cfg.brain {
+        return (b, BrainResolution::Explicit);
+    }
+    if cfg.enabled() {
+        return (PrimeBrain::Openrouter, BrainResolution::OpenRouterAuto);
+    }
+    if let Some(&b) = available_clis
+        .iter()
+        .find(|b| matches!(b, PrimeBrain::ClaudeCli | PrimeBrain::CodexCli))
+    {
+        return (b, BrainResolution::CliAutoDetected);
+    }
+    (PrimeBrain::Local, BrainResolution::LocalFallback)
+}
+
 /// The safe, serializable AI status. Deliberately carries NO key material.
 #[derive(Debug, Clone, Serialize)]
 pub struct AiStatus {
@@ -574,6 +677,12 @@ pub struct AiStatus {
     pub secret_missing: bool,
     /// A human-readable, secret-free explanation of the current mode.
     pub reason: String,
+    /// `true` when this brain was NOT an explicit operator choice but was
+    /// auto-adopted because its CLI adapter is enabled and on PATH (see
+    /// [`resolve_brain`]). Presentation only — the dashboard shows an
+    /// "auto-detected" hint so the operator knows why Prime is using it.
+    #[serde(default)]
+    pub auto_detected: bool,
 }
 
 /// The result of (optionally) shaping a Prime reply.
@@ -1717,6 +1826,7 @@ mod tests {
         assert_eq!(
             keys,
             [
+                "auto_detected",
                 "brain",
                 "configured",
                 "disabled",
@@ -2031,6 +2141,99 @@ mod tests {
         write_stored_config(&path, None, None, None, None, None, Some("nope".into())).unwrap();
         let resolved = AiConfig::resolve(Some(&path));
         assert_eq!(resolved.brain, None);
+    }
+
+    /// Build an adapter runtime status row for the brain-resolution tests.
+    fn adapter_status(id: &str, state: relux_core::AdapterRuntimeState) -> relux_core::AdapterRuntimeStatus {
+        relux_core::AdapterRuntimeStatus {
+            plugin_id: id.to_string(),
+            adapter_name: id.to_string(),
+            kind: None,
+            configured: true,
+            enabled: state != relux_core::AdapterRuntimeState::Disabled
+                && state != relux_core::AdapterRuntimeState::NeedsConfiguration,
+            command: None,
+            available_on_path: state == relux_core::AdapterRuntimeState::Available,
+            resolved_path: None,
+            timeout_seconds: None,
+            max_output_bytes: None,
+            working_dir: None,
+            state,
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn available_cli_brains_lists_only_available_in_preference_order() {
+        use relux_core::AdapterRuntimeState::*;
+        // Both available -> Claude first (preference order), then Codex.
+        let both = vec![
+            adapter_status(relux_core::CODEX_CLI_ADAPTER_ID, Available),
+            adapter_status(relux_core::CLAUDE_CLI_ADAPTER_ID, Available),
+        ];
+        assert_eq!(
+            available_cli_brains(&both),
+            vec![PrimeBrain::ClaudeCli, PrimeBrain::CodexCli]
+        );
+        // Enabled-but-not-on-PATH / disabled / unconfigured never count.
+        let none_ready = vec![
+            adapter_status(relux_core::CLAUDE_CLI_ADAPTER_ID, MissingBinary),
+            adapter_status(relux_core::CODEX_CLI_ADAPTER_ID, Disabled),
+        ];
+        assert!(available_cli_brains(&none_ready).is_empty());
+        // Only Codex available -> only Codex.
+        let codex_only = vec![adapter_status(relux_core::CODEX_CLI_ADAPTER_ID, Available)];
+        assert_eq!(available_cli_brains(&codex_only), vec![PrimeBrain::CodexCli]);
+    }
+
+    #[test]
+    fn resolve_brain_auto_adopts_an_available_cli_when_unset() {
+        // No explicit brain, no key, Claude available -> auto-adopt Claude.
+        let cfg = AiConfig::from_parts(None, None, false, None);
+        let (brain, res) = resolve_brain(&cfg, &[PrimeBrain::ClaudeCli, PrimeBrain::CodexCli]);
+        assert_eq!(brain, PrimeBrain::ClaudeCli);
+        assert_eq!(res, BrainResolution::CliAutoDetected);
+
+        // Nothing available -> deterministic Local fallback.
+        let (brain, res) = resolve_brain(&cfg, &[]);
+        assert_eq!(brain, PrimeBrain::Local);
+        assert_eq!(res, BrainResolution::LocalFallback);
+    }
+
+    #[test]
+    fn resolve_brain_honors_explicit_choice_and_openrouter_key_first() {
+        // An OpenRouter key (no explicit brain) wins over an available CLI.
+        let keyed = AiConfig::from_parts(Some("k".into()), None, false, None);
+        let (brain, res) = resolve_brain(&keyed, &[PrimeBrain::ClaudeCli]);
+        assert_eq!(brain, PrimeBrain::Openrouter);
+        assert_eq!(res, BrainResolution::OpenRouterAuto);
+
+        // An EXPLICIT Local is never auto-overridden, even with a CLI available.
+        let forced_local =
+            AiConfig::from_parts(None, None, false, None).with_brain(Some(PrimeBrain::Local));
+        let (brain, res) = resolve_brain(&forced_local, &[PrimeBrain::ClaudeCli]);
+        assert_eq!(brain, PrimeBrain::Local);
+        assert_eq!(res, BrainResolution::Explicit);
+
+        // An explicit Codex choice is honored even if only Claude is "available".
+        let forced_codex =
+            AiConfig::from_parts(None, None, false, None).with_brain(Some(PrimeBrain::CodexCli));
+        let (brain, res) = resolve_brain(&forced_codex, &[PrimeBrain::ClaudeCli]);
+        assert_eq!(brain, PrimeBrain::CodexCli);
+        assert_eq!(res, BrainResolution::Explicit);
+    }
+
+    #[test]
+    fn status_for_marks_auto_detected_cli_brain() {
+        let cfg = AiConfig::from_parts(None, None, false, None);
+        let st = cfg.status_for(PrimeBrain::ClaudeCli, true);
+        assert_eq!(st.brain, "claude_cli");
+        assert_eq!(st.mode, AiMode::ClaudeCli);
+        assert!(st.auto_detected);
+        assert!(st.reason.contains("auto-detected"));
+        // The plain status (explicit) never claims auto-detection.
+        let plain = cfg.status_for(PrimeBrain::Local, false);
+        assert!(!plain.auto_detected);
     }
 
     #[test]

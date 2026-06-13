@@ -362,15 +362,16 @@ function AiStatusBanner({ status }: { status: ReluxAiStatus | null }) {
   const brain = status.brain ?? "local";
   let icon = "🤖";
   let label = "Prime: Local (deterministic)";
+  const auto = status.auto_detected ? " · auto-detected" : "";
   if (brain === "openrouter") {
     icon = "✨";
     label = status.configured ? `Prime: OpenRouter (${status.model})` : "Prime: OpenRouter (no key)";
   } else if (brain === "claude_cli") {
     icon = "✦";
-    label = "Prime: Claude CLI";
+    label = `Prime: Claude CLI${auto}`;
   } else if (brain === "codex_cli") {
     icon = "✦";
-    label = "Prime: Codex CLI";
+    label = `Prime: Codex CLI${auto}`;
   }
   return (
     <div className="row wrap muted" style={{ gap: 8, fontSize: 10, padding: "4px 8px", borderBottom: "1px solid var(--border)", marginBottom: 8, alignItems: "center" }} title={status.reason}>

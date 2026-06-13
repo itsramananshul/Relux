@@ -581,6 +581,7 @@ mod tests {
             api_key_secret: None,
             secret_missing: false,
             reason: String::new(),
+            auto_detected: false,
         }
     }
 
