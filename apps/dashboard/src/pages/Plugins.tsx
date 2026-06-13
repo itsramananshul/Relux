@@ -2352,7 +2352,7 @@ function PluginRow({
                 onClick={() => setManifestOpen((v) => !v)}
                 aria-expanded={manifestOpen}
               >
-                {manifestOpen ? "Hide setup" : "Configure"}
+                {manifestOpen ? "Hide setup" : "Add Prime ability"}
               </button>
             </div>
           )}
@@ -2440,9 +2440,9 @@ function PluginRow({
                   className="btn ghost sm"
                   onClick={() => setManifestOpen((v) => !v)}
                   aria-expanded={manifestOpen}
-                  title="Add or edit tool definitions for this plugin"
+                  title="Add or edit the abilities Prime can use from this plugin"
                 >
-                  {manifestOpen ? "Close" : "Configure"}
+                  {manifestOpen ? "Close" : hasTools ? "Manage Prime abilities" : "Add Prime ability"}
                 </button>
               )}
               {hasTools && (
@@ -2611,18 +2611,18 @@ function ManifestPanel({
   return (
     <div className="card" style={{ margin: "6px 0", padding: 12 }}>
       <div className="row" style={{ marginBottom: 8, alignItems: "center" }}>
-        <strong style={{ fontSize: 13 }}>Configure tools</strong>
+        <strong style={{ fontSize: 13 }}>Configure Prime abilities</strong>
         <div className="spacer" style={{ flex: 1 }} />
         <span className={"badge " + (myTools.length > 0 ? "done" : "in_progress")}>
           {myTools.length} tool{myTools.length === 1 ? "" : "s"}
         </span>
       </div>
       <p className="muted" style={{ marginTop: 0, marginBottom: 10, fontSize: 11 }}>
-        Add the tools this plugin exposes. Relux never infers tools from downloaded
-        code and never runs it — a tool runs only through an HTTP loopback server
-        you run locally (set that up with <strong>Runtime</strong> once a tool
-        exists). A low-risk tool can be auto-approved; a higher-risk tool always
-        requires approval and stays non-runnable until you lower its risk.
+        No <span className="mono">relux-plugin.json</span> is required. Relux generated
+        safe metadata for this source; this panel turns the installed plugin into
+        abilities Prime can actually see. Command abilities run argv-only from the
+        plugin directory and always pause for approval. HTTP tool abilities run only
+        through a loopback runtime you configure yourself.
       </p>
 
       <GuidedConfigChecklist
@@ -2812,11 +2812,11 @@ function AddToolForm({
 
   return (
     <div className="card" style={{ padding: 12, marginTop: 4 }}>
-      <strong style={{ fontSize: 12 }}>Add a tool</strong>
+      <strong style={{ fontSize: 12 }}>Add HTTP tool ability</strong>
       <p className="muted" style={{ margin: "4px 0 0", fontSize: 11 }}>
-        A tool definition is a name, description, risk and timeout — there is no
-        input-schema field. Your loopback server receives the JSON input you pass at
-        call time; the definition only governs the permission, approval and timeout.
+        Use this when the plugin has a local HTTP loopback server. For a normal
+        GitHub repo or ZIP, the command ability below is usually the faster path:
+        choose a program and args, then Prime can request approval and run it.
       </p>
       {banner && (
         <div className={"banner " + banner.kind} style={{ fontSize: 12, marginTop: 8 }}>
@@ -2884,7 +2884,7 @@ function AddToolForm({
       </label>
       <div className="row wrap" style={{ gap: 8, marginTop: 10 }}>
         <button className="btn" disabled={busy} onClick={() => void submit()}>
-          {busy ? "Adding..." : "Add tool"}
+          {busy ? "Adding..." : "Add HTTP tool ability"}
         </button>
       </div>
     </div>
@@ -2959,9 +2959,8 @@ export function DetectedCapabilities({
               one-click register.
             </li>
             <li>
-              Otherwise run it yourself as a loopback HTTP server, then{" "}
-              <strong>Add a tool definition</strong> below and point a{" "}
-              <strong>Runtime</strong> at it.
+              Otherwise use <strong>Add Prime command ability</strong> below to
+              review a program and args Prime may request approval to run.
             </li>
             <li>
               Or author a <span className="mono">relux-plugin.json</span> (Advanced
@@ -3196,9 +3195,9 @@ function CapabilityCard({
             ))}
           </ul>
           <p className="muted" style={{ margin: "6px 0 0", fontSize: 11 }}>
-            Use the <strong>Add a tool definition</strong> form below on{" "}
-            <strong>{plugin.name || plugin.id}</strong> once you have a loopback server
-            running.
+            Use <strong>Add Prime command ability</strong> below on{" "}
+            <strong>{plugin.name || plugin.id}</strong>, or wire a loopback HTTP
+            runtime if this source already exposes one.
           </p>
         </details>
       )}
@@ -3362,7 +3361,7 @@ function AddCommandToolSection({
   return (
     <div style={{ marginTop: 12 }}>
       <div className="row" style={{ alignItems: "center", marginBottom: 6 }}>
-        <strong style={{ fontSize: 12 }}>Add a command tool</strong>
+        <strong style={{ fontSize: 12 }}>Add Prime command ability</strong>
         <div className="spacer" style={{ flex: 1 }} />
         <span
           className="badge backlog"
@@ -3372,8 +3371,8 @@ function AddCommandToolSection({
         </span>
       </div>
       <p className="muted" style={{ margin: "0 0 8px", fontSize: 11 }}>
-        For a source-only repo with no manifest and no detected capability, define a
-        governed command tool yourself — e.g. a build/test/serve script. Relux runs it{" "}
+        For a source-only repo with no manifest, define the command Prime may ask to
+        run — e.g. a build/test/serve script. Relux runs it{" "}
         <strong>argv-only</strong> (never through a shell), confined to this plugin's
         install directory, only through approval. Defining it runs nothing.
       </p>
@@ -3384,9 +3383,9 @@ function AddCommandToolSection({
             <button
               className="btn ghost sm"
               onClick={() => setConfiguredTool(null)}
-              title="Define another command tool on this plugin"
+              title="Define another Prime command ability on this plugin"
             >
-              Add another command tool…
+              Add another Prime command ability...
             </button>
           </div>
         </>
@@ -3406,7 +3405,7 @@ function AddCommandToolSection({
           onClick={() => setOpen(true)}
           title="Open a blank, reviewable command-tool form; nothing is stored or run until you confirm, and the tool always requires approval to invoke"
         >
-          Add a command tool…
+          Add Prime command ability...
         </button>
       )}
     </div>
@@ -3471,8 +3470,9 @@ function DetectedHints({
         </p>
       ) : data.hints.length === 0 ? (
         <p className="muted" style={{ margin: 0, fontSize: 11 }}>
-          No runnable signals detected. Add a tool definition below to make anything
-          runnable — Relux never infers tools or runs downloaded code.
+          No runnable signals detected. Use Add Prime command ability below to make
+          a reviewed argv command available to Prime, or configure a loopback HTTP
+          tool if this source exposes one.
         </p>
       ) : (
         <>

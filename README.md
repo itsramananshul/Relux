@@ -241,18 +241,20 @@ For a source-only repo with no `relux-plugin.json`, the whole path lives on the
 
 1. **Install** — *Plugins → Install* from a **GitHub repo**, a **ZIP**, or a **local
    folder**. A manifestless source lands as an honest metadata-only wrapper.
-2. **Configure an ability** — open the plugin's **Configure tools** panel. If the
-   read-only scan detected a CLI/script, click **Configure (command tool)…** on the
-   candidate (pre-filled argv). Otherwise use **Add a command tool…** to define one
+2. **Configure an ability** — click **Add Prime ability** / **Manage Prime abilities**
+   on the plugin row. If the read-only scan detected a CLI/script, click **Configure
+   (command tool)…** on the candidate (pre-filled argv). Otherwise use **Add Prime
+   command ability...** to define one
    from scratch (e.g. `program: git`, `args: ["--version"]`). It runs **argv-only**
    (never a shell), confined to the install dir. Defining it runs nothing. The tool
    appears as `needs_approval` — gated, never auto-approved.
 3. **Grant / approve** — either **Request approval** for one invocation, or create a
    standing **allow-always grant** for the exact `(agent, plugin, tool)`. Both route
    through the unchanged permission/approval/audit gate.
-4. **Ask Prime to use it** — in Prime chat, e.g. *"run the `repo.gitversion` tool"*.
-   Prime sees it in its catalogue (`GET /v1/relux/prime/tools`), invokes it through
-   the gate, and answers from the **bounded, secret-redacted** real output. The
+4. **Ask Prime to use it** — open **Prime abilities** on the Prime page and click
+   **Ask Prime**, or type e.g. *"run the `repo.gitversion` tool"*. Prime sees it in
+   its catalogue (`GET /v1/relux/prime/tools`), invokes it through the gate, and
+   answers from the **bounded, secret-redacted** real output. The
    end-to-end path (install → configure → discover → gate → run) is pinned on a real
    `git --version` binary — not an echo fixture — by
    `command_tool_runs_a_real_local_command_git_version_through_the_gate` and the

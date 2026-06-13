@@ -2419,7 +2419,7 @@ stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
   (5) **Prime tool / plugin awareness** — the Prime Agent Loop entry is brain-driven (the UNCHANGED
   fail-closed `reconcile_intent`, keyword classifier demoted to fallback rail), the decision prompt
   is handed the runnable tool inventory (`render_tool_inventory`), and a new `GET /v1/relux/prime/tools`
-  + a "Tools Prime can use" panel surface the catalog, so an installed / configured tool is finally
+  + a **Prime abilities** panel surface the catalog, so an installed / configured tool is finally
   usable from natural-language chat — every execution still flowing through the single
   `prime_invoke_tool` → `invoke_tool` chokepoint (§10.1 / §10.5 / §17.1). (6) **Continuous tool use**
   — live MCP tool names land in Prime's *first* decision (`decision_time_mcp_catalog`, bounded /
@@ -4102,8 +4102,8 @@ tests `generated_wrapper_record_is_flagged_and_has_zero_tools`,
 ### Plugin Tool Config v1 (in-UI tool definitions for a wrapper)
 
 The first **safe in-UI path to make a metadata-only wrapper useful**: instead of
-hand-editing `relux-plugin.json` and re-installing, the operator opens **Configure**
-on a user-installed ToolSet/wrapper row and adds ONE tool at a time through a small,
+hand-editing `relux-plugin.json` and re-installing, the operator opens **Add Prime
+ability** / **Manage Prime abilities** on a user-installed ToolSet/wrapper row and adds ONE tool at a time through a small,
 validated form. See `docs/reference-driven-development.md` → *Reference read — safe
 in-UI tool configuration for a metadata-only wrapper* for the openclaw patterns this
 mirrors (`readPlanSteps` field-by-field + status-allowlist validation,
@@ -4181,8 +4181,8 @@ non-ready tool never opens a blank page):
    commands or runs downloaded plugin code in-process (§18).
 
 **Guided Setup checklist (the workflow, made visible).** The four steps above are
-not just prose — for a configurable metadata-only import the **Configure tools**
-panel now opens with a **Setup checklist** that PRESENTS that exact documented
+not just prose — for a configurable metadata-only import the **Add Prime ability** /
+**Manage Prime abilities** panel now opens with a **Setup checklist** that PRESENTS that exact documented
 order with each step's live status, so an operator never has to guess it (and never
 reaches for a runtime first, which on a wrapper surfaces nothing). The step statuses
 are derived purely from real state by `apps/dashboard/src/plugins.ts`

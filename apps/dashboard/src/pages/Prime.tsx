@@ -221,6 +221,18 @@ export function Prime() {
     });
   }
 
+  function stagePrompt(message: string) {
+    if (busy) return;
+    setText(message);
+    requestAnimationFrame(() => {
+      const el = inputRef.current;
+      if (!el) return;
+      el.focus();
+      const len = el.value.length;
+      el.setSelectionRange(len, len);
+    });
+  }
+
   return (
     <div className="chat" style={{ height: "calc(100vh - 96px)" }}>
       <AiStatusBanner status={aiStatus} />
@@ -300,9 +312,8 @@ export function Prime() {
 
       {/* The inventory of tools Prime can actually RUN from chat (installed plugins +
           governed command tools + live MCP), so "I installed a plugin — can Prime use
-          it?" has a visible, honest answer. Collapsed + lazy-loaded so it never blocks
-          the chat or pays the MCP discovery cost until opened (docs/prime-tool-use.md). */}
-      <PrimeToolInventoryPanel />
+          it?" has a visible, honest answer right on the chat page (docs/prime-tool-use.md). */}
+      <PrimeToolInventoryPanel onAsk={stagePrompt} />
 
       {/* Advanced controls: Prime Autonomy (the self-driving tick loop) and
           multi-agent Orchestration. Collapsed by default so they never block the
@@ -324,10 +335,10 @@ export function Prime() {
 // EXACT runnable catalog the agent loop offers Prime's brain, so a tool listed here is
 // one a user can ask Prime to use in chat ("use the readme summarizer on this repo").
 // Honest by construction: a tool Prime cannot run is never listed; a `gated` tool needs
-// an approval (or a standing allow-always grant) before it runs. Lazy-loaded on first
-// open so the chat is never blocked and the live MCP discovery cost is only paid on
-// demand (docs/prime-tool-use.md; RELUX_MASTER_PLAN §10.1/§10.5/§17.1).
-function PrimeToolInventoryPanel() {
+// an approval (or a standing allow-always grant) before it runs. Loaded once on mount
+// so the operator immediately sees what Prime can use (docs/prime-tool-use.md;
+// RELUX_MASTER_PLAN §10.1/§10.5/§17.1).
+function PrimeToolInventoryPanel({ onAsk }: { onAsk: (message: string) => void }) {
   const [tools, setTools] = useState<ReluxPrimeToolView[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -346,8 +357,17 @@ function PrimeToolInventoryPanel() {
     }
   }
 
+  useEffect(() => {
+    if (loadedRef.current) return;
+    loadedRef.current = true;
+    void load();
+    // Load once on mount so "Prime abilities" is visible without opening an advanced drawer.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   return (
     <details
+      open
       className="prime-advanced"
       onToggle={(e) => {
         if (e.currentTarget.open && !loadedRef.current) {
@@ -356,7 +376,7 @@ function PrimeToolInventoryPanel() {
         }
       }}
     >
-      <summary>🧰 Tools Prime can use</summary>
+      <summary>Prime abilities</summary>
       <div className="prime-advanced-body">
         <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
           <div className="muted" style={{ fontSize: 12 }}>
@@ -398,6 +418,13 @@ function PrimeToolInventoryPanel() {
                 <span className="mono">{t.label}</span>
                 <span className="muted">risk={t.risk}</span>
                 {t.description && <span className="muted">— {t.description}</span>}
+                <button
+                  className="btn ghost sm"
+                  onClick={() => onAsk(`use ${t.label}`)}
+                  title="Put this ability into the chat box; nothing runs until you send"
+                >
+                  Ask Prime
+                </button>
               </div>
             ))}
           </div>

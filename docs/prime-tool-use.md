@@ -52,7 +52,7 @@ Two surfaces expose this inventory:
   byte-for-byte the prior installed-tools-only form.
 - **In the dashboard / over HTTP.** `GET /v1/relux/prime/tools` returns the exact runnable
   catalog the agent loop offers (`KernelState::prime_agent_catalog`), including live MCP tools.
-  The Prime page renders it as the collapsible **"Tools Prime can use"** panel.
+  The Prime page renders it as the open-by-default **Prime abilities** panel.
 
 ## How a tool request flows
 
@@ -220,7 +220,7 @@ their own local CLI login, so Relux stores no key for them at all.
 - The live MCP `tools/list` discovery is no longer gated on the literal `"mcp:"` token in the
   message; it runs whenever the turn is a plausible tool turn and an MCP server is enabled, so a
   natural-language request can use an MCP tool.
-- New `GET /v1/relux/prime/tools` + the dashboard "Tools Prime can use" panel.
+- New `GET /v1/relux/prime/tools` + the dashboard **Prime abilities** panel.
 
 ### Later additions (continuous tool use)
 
@@ -421,8 +421,9 @@ command-tool path, with **no new authority** and **no manifest editing**.
 
 What works:
 
-- **On the Plugins page.** A non-bundled plugin's **Configure tools** panel now has an
-  **"Add a command tool"** section (`apps/dashboard/src/pages/Plugins.tsx`
+- **On the Plugins page.** A non-bundled plugin row now has **Add Prime ability** /
+  **Manage Prime abilities**. That panel has an **"Add Prime command ability"** section
+  (`apps/dashboard/src/pages/Plugins.tsx`
   `AddCommandToolSection`). The operator names a safe argv recipe — tool name, **program
   (argv[0])**, **args (one per line)**, an optional **working dir** inside the install dir,
   a timeout, and a risk band — and submits to the **unchanged**
