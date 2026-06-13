@@ -2021,6 +2021,35 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.44** (2026-06-13) — **Release-gate + operator-setup-guidance** rollup. The
+  `relux-kernel` / `relux-core` crates move `0.1.43` → `0.1.44` in lockstep, packaging the
+  post-v0.1.43 slice into a fresh Windows bundle on top of all v0.1.43 (and v0.1.42, v0.1.41)
+  work (RELUX_MASTER_PLAN §11.1; built reference-first per `docs/reference-driven-development.md`).
+  Headlines:
+  - **The FullE2E release gate now includes a manifestless plugin → Prime smoke.**
+    `scripts\smoke-manifestless-plugin-prime.ps1` runs inside `scripts\relux-package-local.ps1
+    -FullE2E` against the just-built release binary and dashboard bundle (HTTP/API only — no
+    browser, no network, no real Claude/Codex). It proves end to end that a manifestless source
+    plugin installs with nested-root inference, its four read-only Plugin Lens source tools
+    (`plugin.summary` / `inspect` / `search` / `read_file`) are visible to Prime, Prime chat
+    invokes summary / search / read and returns a **natural answer** while creating **no task**, a
+    planted **secret never leaks** into the reply or structured/raw tool detail (redaction parity),
+    and the dashboard SPA serves `/dashboard` and the client routes. A future release cannot
+    silently regress the "install a plugin → Prime can use it" promise.
+  - **Operator setup guidance now points to the canonical Crew surfaces.** The docs and the
+    `relux-kernel doctor` brain/adapter setup warning route Claude / Codex / OpenRouter setup to
+    **Crew → Prime Brain** and **Crew → Adapters**, so the CLI warning and the dashboard agree on
+    one canonical path.
+  - **Echo stays an internal fixture, hidden from the normal catalog.** The Echo adapter remains an
+    internal test fixture hidden from the normal Plugins / Tools / Prime catalog; **Claude and
+    Codex adapters are real, PATH-probed choices**, so operators never see Echo offered as a usable
+    adapter and the adapter probes reflect what is actually installed.
+  - Includes everything from v0.1.43 (manifestless ZIP / local-folder repo-root inference), v0.1.42
+    (redaction parity for visible tool/plugin replies and raw-details), and v0.1.41 (Plugin/tool
+    results render as natural assistant answers, not raw JSON). Dashboard typecheck / tests / build
+    green; the full-e2e release gate (`scripts\relux-package-local.ps1 -FullE2E`) is run at package
+    time. All reads/writes hit real kernel state; no new authority is added (read-only source
+    access, fail-closed). Every safety property from v0.1.43 holds.
 - **v0.1.43** (2026-06-13) — **Manifestless ZIP / local-folder repo-root inference** rollup. The
   `relux-kernel` / `relux-core` crates move `0.1.42` → `0.1.43` in lockstep, packaging the
   post-v0.1.42 slice into a fresh Windows bundle on top of all v0.1.42 (and v0.1.41) work
