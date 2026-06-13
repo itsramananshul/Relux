@@ -3138,3 +3138,56 @@ changes which directory's bytes seed the metadata and become the install dir. Th
 manifest is still metadata-only (`GENERATED_MANIFEST_AUTHOR`, no tools), and turning the repo into
 a runnable tool stays an explicit, approval-gated `capability_detect` / `mcp_register` /
 `ConfigureCommandTool` action. See `docs/plugins.md` "Manifestless ZIP root inference".
+
+## Reference read — tool-glue programs / the `execute_code` foundation (this slice)
+
+**Slice.** A safe, product-grade foundation toward the P1 `execute_code` gap
+(`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §2): a governed, non-toy way for the brain to
+author a structured multi-step **tool-glue program** that is grounded against the live
+tool catalog and previewed inertly, committing only through the existing `tool_plan`
+task path and its unchanged gates. No sandboxed script runtime, no shell runner, no
+arbitrary code execution — that larger subsystem stays future work.
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/tools/code_execution_tool.py` — the programmatic
+  tool-calling (PTC) tool. Read for its **load-bearing safety move**, not its transport:
+  - `SANDBOX_ALLOWED_TOOLS = frozenset([...])` (L60-68) — the allow-list. Only the
+    intersection of this set and the session's enabled tools is reachable from a script.
+  - `_rpc_server_loop` (L439-557) — "**Enforce the allow-list**" (L488-497): a tool name
+    not in `allowed_tools` is rejected before any dispatch; "**Enforce tool call limit**"
+    (L500-508) bounds the program; the call is dispatched through the SAME
+    `handle_function_call` as a single-tool call (L515-532).
+  - Output handling (L1343-1415): head+tail clamp of stdout (`MAX_STDOUT_BYTES`), ANSI
+    strip, and `redact_sensitive_text` before the result returns to the model.
+  - **Pattern learned:** the model proposes a program; a deterministic check validates
+    every tool name against an allow-list **before anything executes**; dispatch reuses
+    the one shared, gated tool path; output is bounded and secret-scrubbed at capture.
+
+### Paperclip (openclaw) — files read
+
+- `reference/openclaw-main/src/agents/tools/update-plan-tool.ts` — `readPlanSteps`:
+  per-entry validation of a model-authored plan with a status allow-list
+  (`PLAN_STEP_STATUSES`), rejecting unknown shapes rather than silently accepting or
+  truncating. **Pattern: validate each step compositionally, fail closed, never coerce.**
+- `reference/openclaw-main/src/tools/execution.ts` — `formatToolExecutorRef`
+  (`core:`/`plugin:`/`channel:`/`mcp:` namespaces): a tool reference is resolved against a
+  known registry, never invented. **Pattern: one namespaced registry is the source of
+  truth for what a step may name.**
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation (this slice) |
+|---|---|
+| Hermes `SANDBOX_ALLOWED_TOOLS` + allow-list enforcement before dispatch | `relux_core::ground_tool_glue_plan` resolves every brain-authored `ProposedGlueStep` against the live tool catalog (`KernelState::live_tool_catalog`: installed tools, Plugin Lens source tools, command tools, live MCP). A `(plugin, tool)` not in the catalog is flagged `readiness: "unknown"` and forces `ready_to_create: false` — never fabricated. The catalog IS the allow-list. |
+| Hermes "dispatch through the SAME tool handler" | The grounded program carries no new authority: it materializes ONLY through the existing one-click `tool_plan` task path (`TaskToolPlan`), so each step runs through the unchanged `prime_invoke_tool` / `call_tool` permission / approval / grant / audit gates. There is no second execution model. |
+| openclaw `readPlanSteps`: compositional per-entry validation, fail closed | Each step is grounded independently and carries its honest `ToolExecutability` (`tool_plan_readiness`, now shared in `relux_core::tool_glue` by both the keyword `build_tool_plan_proposal` and the glue path). Gated tools keep their gate; grounding never downgrades. The whole program is re-validated with the SAME `TaskToolPlan::validate_with_limit` the task-create route enforces. |
+| Hermes `DEFAULT_MAX_TOOL_CALLS` (a tunable budget, not a tiny constant) | The step bound is `PrimeAgentPolicy::tool_plan_steps(extended)` (standard 16 / extended 64, ceil 64), not a toy cap; an over-long program is reported honestly, never silently truncated. |
+| Hermes "only stdout returns; nothing runs without the gate" | `KernelState::preview_tool_glue_plan` takes `&self` — it creates no task, starts no run, mutates nothing. The surface is `POST /v1/relux/prime/glue/preview`; the returned `PrimeToolPlanProposal` is the same inert card the keyword path produces. |
+
+**What we deliberately do NOT do (this slice):** no sandboxed child process, no
+RPC-from-script, no shell runner, no execution of downloaded repo code, and no bypass of
+approvals/permissions. The brain authors a *structured program of named tool steps* that
+is validated and previewed; running it is the existing, gated, operator-committed
+`tool_plan` path. The sandboxed script runtime (Hermes' UDS/file RPC transport, child-env
+scrubbing, stdout bounding) remains the next slice. See `RELUX_MASTER_PLAN.md` §23.

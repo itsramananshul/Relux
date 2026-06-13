@@ -242,6 +242,7 @@ async fn serve() -> Result<(), KernelError> {
     println!("   POST   /v1/relux/prime/actions/install-plugin {{ \"repo_url\": \"https://github.com/owner/repo\", \"plugin_id\"?, \"approval_id\"? }}  (confirm+execute a Prime GitHub plugin-import; metadata only, no code run)");
     println!("   POST   /v1/relux/prime/actions/configure-command-tool {{ \"plugin_id\":\"...\", \"name\":\"repo.build\", \"program\":\"cargo\", \"args\":[\"build\"], \"cwd\"?, \"timeout_secs\"?, \"risk\"?, \"approval_id\"? }}  (configure a governed argv command tool on a source-only plugin; argv-only, gated, nothing runs)");
     println!("   GET    /v1/relux/prime/tools               (tools Prime can run from chat: installed + live MCP, with gated/ready status)");
+    println!("   POST   /v1/relux/prime/glue/preview        {{ \"goal\":\"...\", \"steps\":[{{\"plugin\":\"...\",\"tool\":\"...\",\"args\"?}}], \"extended\"? }}  (execute_code foundation: ground a brain-authored tool-glue program into an INERT, catalog-validated preview; unknown tools fail closed, nothing runs)");
     println!("   POST   /v1/relux/tasks                     {{ \"title\": \"...\" }}");
     println!("   POST   /v1/relux/tasks/:id/start");
     println!("   POST   /v1/relux/tasks/:id/execute-assigned");
@@ -554,6 +555,9 @@ fn protected_router() -> Router<AppState> {
             post(prime_configure_command_tool_action),
         )
         .route("/v1/relux/prime/tools", get(prime_tools))
+        // execute_code foundation: ground a brain-authored tool-glue program into an inert,
+        // catalog-validated preview (creates/runs nothing).
+        .route("/v1/relux/prime/glue/preview", post(preview_tool_glue))
         // Multi-agent orchestration (Prime as orchestrator).
         .route(
             "/v1/relux/prime/orchestrations",
@@ -4302,6 +4306,72 @@ async fn prime_tools(
         kernel.prime_agent_catalog(&ctx)
     };
     Ok(Json(catalog))
+}
+
+/// The body of `POST /v1/relux/prime/glue/preview`: the brain-authored tool-glue program
+/// (`goal` + ordered `steps`) plus the optional `extended` profile flag.
+#[derive(Debug, Deserialize)]
+struct GluePreviewReq {
+    /// The goal the program was authored for, echoed back on the preview for provenance.
+    goal: String,
+    /// The ordered `(plugin, tool, args)` steps the model wrote. Each is grounded against
+    /// the live catalog; an unknown tool fails closed.
+    #[serde(default)]
+    steps: Vec<relux_core::ProposedGlueStep>,
+    /// Use the extended tool-plan step limit instead of the standard one. Bounded by the
+    /// configured `PrimeAgentPolicy`, never an unbounded fan-out.
+    #[serde(default)]
+    extended: bool,
+}
+
+/// POST `/v1/relux/prime/glue/preview` — the `execute_code` FOUNDATION
+/// (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §2; `docs/RELUX_MASTER_PLAN.md` §23). Grounds a
+/// BRAIN-AUTHORED tool-glue program (an ordered list of `(plugin, tool, args)` steps the
+/// model wrote) against the live tool catalog and returns an INERT
+/// [`relux_core::PrimeToolPlanProposal`] preview — the same card the keyword
+/// `build_tool_plan_proposal` produces, so the dashboard renders it identically and the
+/// operator commits it through the EXISTING one-click `tool_plan` task path.
+///
+/// READ-ONLY and fail-closed: it creates nothing, runs nothing, and an unknown tool is
+/// flagged (`readiness: "unknown"`, `ready_to_create: false`), never fabricated. Gated
+/// tools keep their gate; the bound is the configured `PrimeAgentPolicy` step limit, not a
+/// toy cap. Live MCP `tools/list` discovery runs OFF-LOCK (exactly like `GET
+/// /v1/relux/prime/tools`) so an `mcp:<server>/<tool>` step grounds against reachable
+/// servers and fails closed against unreachable ones.
+async fn preview_tool_glue(
+    State(state): State<AppState>,
+    Json(req): Json<GluePreviewReq>,
+) -> Result<Json<relux_core::PrimeToolPlanProposal>, ApiError> {
+    let goal = req.goal.trim().to_string();
+    if goal.is_empty() {
+        return Err(ApiError::bad_request("goal is required"));
+    }
+    // 1. Snapshot the registered MCP servers under a short read lock.
+    let servers = {
+        let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let store = SqliteStore::open(&state.db_path)?;
+        let mut kernel = store.load()?;
+        let ctx = crate::ensure_bootstrapped(&mut kernel)?;
+        kernel.context_snapshot(&ctx).mcp_servers
+    };
+    // 2. Discover each enabled server's live tools OFF-LOCK (bounded `tools/list`).
+    let proposal_mcp_catalog = if servers.iter().any(|s| s.enabled) {
+        tokio::task::spawn_blocking(move || relux_kernel::discover_proposal_mcp_catalog(&servers))
+            .await
+            .unwrap_or_default()
+    } else {
+        relux_kernel::ProposalMcpCatalog::default()
+    };
+    // 3. Ground the program under a short lock with the discovered MCP tools injected.
+    let proposal = {
+        let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let store = SqliteStore::open(&state.db_path)?;
+        let mut kernel = store.load()?;
+        kernel.set_proposal_mcp_catalog(proposal_mcp_catalog);
+        let ctx = crate::ensure_bootstrapped(&mut kernel)?;
+        kernel.preview_tool_glue_plan(&ctx, &goal, &req.steps, req.extended)
+    };
+    Ok(Json(proposal))
 }
 
 /// Run exactly one durable Prime turn (`docs/RELUX_MASTER_PLAN.md` section 10) over
@@ -14996,6 +15066,51 @@ mod tests {
         assert_eq!(status_tool["source"], "plugin");
         assert_eq!(status_tool["gated"], false, "a low-risk built-in runs without approval");
         assert!(status_tool["label"].as_str().unwrap().contains("status.summary"));
+    }
+
+    #[tokio::test]
+    async fn glue_preview_route_grounds_known_tools_and_fails_closed_on_unknown() {
+        // The execute_code-foundation route grounds a brain-authored program against the
+        // SAME live catalog `GET /prime/tools` exposes: the built-in status tool grounds
+        // ready, an uninstalled tool fails closed, and nothing is created or run.
+        let (state, _dir) = auth_state(true);
+        let body = r#"{
+            "goal": "summarize then call a tool that does not exist",
+            "steps": [
+                { "plugin": "relux-tools-status", "tool": "status.summary", "args": {} },
+                { "plugin": "ghost-plugin", "tool": "ghost.act", "args": {} }
+            ]
+        }"#;
+        let (status, _, rb) =
+            call(&state, "POST", "/v1/relux/prime/glue/preview", None, Some(body)).await;
+        assert_eq!(status, StatusCode::OK, "{rb}");
+        let v: serde_json::Value = serde_json::from_str(&rb).unwrap();
+        let steps = v["steps"].as_array().expect("steps array");
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0]["readiness"], "ready", "the built-in tool grounds ready");
+        assert_eq!(steps[1]["readiness"], "unknown", "the uninstalled tool fails closed");
+        assert_eq!(v["ready_to_create"], false, "an unknown step blocks the commit");
+        assert!(
+            v["issues"].as_array().unwrap().iter().any(|i| i
+                .as_str()
+                .unwrap()
+                .contains("ghost-plugin/ghost.act")),
+            "the honest issue names the unknown tool: {rb}"
+        );
+    }
+
+    #[tokio::test]
+    async fn glue_preview_route_requires_a_goal() {
+        let (state, _dir) = auth_state(true);
+        let (status, _, _rb) = call(
+            &state,
+            "POST",
+            "/v1/relux/prime/glue/preview",
+            None,
+            Some(r#"{"goal":"   ","steps":[]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "empty goal rejected");
     }
 
     #[tokio::test]

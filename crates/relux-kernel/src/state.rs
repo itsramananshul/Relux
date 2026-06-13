@@ -5255,7 +5255,8 @@ impl KernelState {
                         .find(|d| d.plugin_id == plugin && d.tool_name == tool)
                     {
                         Some(desc) => {
-                            let (readiness, note) = tool_plan_readiness(&desc.executable);
+                            let (readiness, note) =
+                                relux_core::tool_plan_readiness(&desc.executable);
                             steps.push(relux_core::PrimeToolPlanStep {
                                 index,
                                 plugin: plugin.clone(),
@@ -5383,7 +5384,7 @@ impl KernelState {
 
         let ready_to_create =
             all_resolved && validates && !steps.is_empty() && resolved_calls.len() == steps.len();
-        let summary = tool_plan_summary(&steps, ready_to_create);
+        let summary = relux_core::tool_plan_summary(&steps, ready_to_create);
 
         relux_core::PrimeToolPlanProposal {
             goal: goal.trim().to_string(),
@@ -5392,6 +5393,34 @@ impl KernelState {
             ready_to_create,
             issues,
         }
+    }
+
+    /// Ground a BRAIN-AUTHORED tool-glue program into an INERT preview — the first safe
+    /// slice of the `execute_code` audit gap (`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §2;
+    /// `docs/RELUX_MASTER_PLAN.md` §23). READ-ONLY: it projects the SAME live tool catalog
+    /// the agent loop and the keyword [`Self::build_tool_plan_proposal`] use
+    /// ([`Self::live_tool_catalog`] — installed plugin tools, Plugin Lens source tools,
+    /// governed command tools, and live MCP tools) and hands it to the pure
+    /// [`relux_core::ground_tool_glue_plan`], which fail-closes on any tool not in that
+    /// catalog. It creates nothing, runs nothing, and mutates no state; the only path that
+    /// materializes the program is the EXISTING one-click `tool_plan` task commit with its
+    /// unchanged permission/approval/grant/audit gates.
+    ///
+    /// `extended` selects the standard vs. extended configured tool-plan step limit
+    /// ([`crate::prime::PrimeAgentPolicy::tool_plan_steps`]) — a configurable bound, never a
+    /// toy cap. For MCP-backed steps to ground, the caller must have populated the
+    /// proposal MCP catalog ([`Self::set_proposal_mcp_catalog`]) off-lock, exactly as the
+    /// `GET /v1/relux/prime/tools` route does.
+    pub fn preview_tool_glue_plan(
+        &self,
+        ctx: &PrimeContext,
+        goal: &str,
+        proposed: &[relux_core::ProposedGlueStep],
+        extended: bool,
+    ) -> relux_core::PrimeToolPlanProposal {
+        let max_steps = self.prime_agent_policy.tool_plan_steps(extended);
+        let catalog = self.live_tool_catalog(Some(&ctx.agent));
+        relux_core::ground_tool_glue_plan(goal, proposed, &catalog, max_steps)
     }
 
     /// Resolve `(agent namespace, required permission)` for a tool call, erroring
@@ -13269,35 +13298,9 @@ fn sanitize_proposal_error(s: &str) -> String {
         .collect()
 }
 
-/// Map a tool's live [`ToolExecutability`] to the honest `readiness` label and an
-/// optional note carried on a [`relux_core::PrimeToolPlanStep`]. The labels match
-/// the gated `call_tool` reality — a higher-risk or unpermitted tool is surfaced as
-/// such, never as "ready".
-fn tool_plan_readiness(executable: &ToolExecutability) -> (&'static str, Option<String>) {
-    match executable {
-        ToolExecutability::Ready => ("ready", None),
-        ToolExecutability::NeedsApproval => (
-            "needs_approval",
-            Some("higher-risk tool — the run is gated on approval".to_string()),
-        ),
-        ToolExecutability::MissingPermission => (
-            "missing_permission",
-            Some("the acting agent lacks this tool's permission".to_string()),
-        ),
-        ToolExecutability::RuntimeNotConfigured => (
-            "not_runnable",
-            Some("installed, but no runtime is configured yet".to_string()),
-        ),
-        ToolExecutability::RuntimeDisabled => (
-            "not_runnable",
-            Some("installed, but its runtime is disabled".to_string()),
-        ),
-        ToolExecutability::NotImplemented => (
-            "not_runnable",
-            Some("installed, but the runtime is not implemented yet".to_string()),
-        ),
-    }
-}
+// `tool_plan_readiness` and `tool_plan_summary` moved to `relux_core::tool_glue` so the
+// keyword `build_tool_plan_proposal` path and the brain-authored `ground_tool_glue_plan`
+// (execute_code foundation) share ONE source of truth for readiness labels + summaries.
 
 /// A short, bounded label for a raw plan segment that mapped to no tool, used in the
 /// honest "couldn't map …" note/issue so the operator sees what they wrote without
@@ -13313,29 +13316,6 @@ fn tool_plan_segment_label(segment: &str) -> String {
     }
 }
 
-/// One-line, human-readable summary of a grounded tool-plan preview.
-fn tool_plan_summary(steps: &[relux_core::PrimeToolPlanStep], ready: bool) -> String {
-    if steps.is_empty() {
-        return "I couldn't map this to any installed tools.".to_string();
-    }
-    let n = steps.len();
-    let noun = if n == 1 { "step" } else { "steps" };
-    if ready {
-        let all_ready = steps.iter().all(|s| s.readiness == "ready");
-        if all_ready {
-            format!("{n} tool {noun}, all ready to run.")
-        } else {
-            format!("{n} tool {noun}; some are gated (see each step).")
-        }
-    } else {
-        let unresolved = steps.iter().filter(|s| s.readiness == "unknown").count();
-        if unresolved > 0 {
-            format!("{n} tool {noun}, but {unresolved} couldn't be grounded — see below.")
-        } else {
-            format!("{n} tool {noun}; the plan needs a fix before it can be created.")
-        }
-    }
-}
 
 /// Render the deterministic, grounded reply for a tool-plan preview turn. Carries the
 /// summary + ordered step lines + any blocking issues, in plain prose (the structured
@@ -20309,6 +20289,76 @@ mod tests {
             "the issue names the uninstalled tool: {:?}",
             plan.issues
         );
+    }
+
+    #[test]
+    fn glue_plan_grounds_brain_authored_steps_against_the_live_catalog() {
+        // The execute_code FOUNDATION: a brain-authored tool-glue program is grounded
+        // against the REAL live catalog (built-in tools + a manifestless plugin's Plugin
+        // Lens source tools), fail-closed on anything not in it, and runs/creates nothing.
+        let (mut k, ctx) = prime_chat_kernel();
+        // A manifestless (generated-manifest) plugin: zero declared tools, but its four
+        // read-only Plugin Lens source tools become real, Ready capabilities.
+        let (_acme, _dir) = install_source_plugin(&mut k, &ctx.agent, "acme-repo", "Acme", false);
+
+        assert!(k.tasks().is_empty(), "preconditions: no tasks yet");
+        let runs_before = k.runs().len();
+
+        let proposed = vec![
+            // A Ready built-in tool.
+            relux_core::ProposedGlueStep {
+                plugin: "relux-tools-status".to_string(),
+                tool: "status.summary".to_string(),
+                args: serde_json::json!({}),
+            },
+            // A Plugin Lens source tool on the MANIFESTLESS plugin (read-only).
+            relux_core::ProposedGlueStep {
+                plugin: "acme-repo".to_string(),
+                tool: "plugin.summary".to_string(),
+                args: serde_json::json!({}),
+            },
+            // A tool that is NOT in the catalog — must fail closed, never be fabricated.
+            relux_core::ProposedGlueStep {
+                plugin: "relux-tools-github".to_string(),
+                tool: "github.create_pr".to_string(),
+                args: serde_json::json!({ "title": "x" }),
+            },
+        ];
+
+        let plan = k.preview_tool_glue_plan(&ctx, "inspect the repo then open a PR", &proposed, false);
+
+        assert_eq!(plan.steps.len(), 3);
+        assert_eq!(plan.steps[0].readiness, "ready", "built-in status tool grounds ready");
+        assert_eq!(
+            plan.steps[1].readiness, "ready",
+            "the manifestless plugin's source tool grounds as a read-only step"
+        );
+        assert_eq!(plan.steps[2].readiness, "unknown", "the uninstalled tool fails closed");
+        assert!(!plan.ready_to_create, "an unknown step blocks the one-click commit");
+        assert!(
+            plan.issues.iter().any(|i| i.contains("relux-tools-github/github.create_pr")),
+            "the honest issue names the unknown tool: {:?}",
+            plan.issues
+        );
+
+        // INERT: the preview created no task and started no run.
+        assert!(k.tasks().is_empty(), "a glue preview creates no task");
+        assert_eq!(k.runs().len(), runs_before, "a glue preview starts no run");
+
+        // The grounded steps feed the EXISTING tool_plan task path — no second execution
+        // model. (Only the first two resolved; the unknown is excluded from a committable
+        // plan, which is exactly why the whole program is not ready_to_create.)
+        let calls: Vec<relux_core::task::TaskToolCall> = plan
+            .steps
+            .iter()
+            .filter(|s| s.readiness != "unknown")
+            .map(|s| relux_core::task::TaskToolCall {
+                plugin: s.plugin.clone(),
+                tool: s.tool.clone(),
+                args: s.args.clone(),
+            })
+            .collect();
+        assert!(relux_core::task::TaskToolPlan { steps: calls }.validate().is_ok());
     }
 
     /// The three response bodies for one successful `tools/list` discovery: the

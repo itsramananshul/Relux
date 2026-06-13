@@ -5022,3 +5022,65 @@ remain, in rough priority for the next slices:
    and suggests a hire); and a background timer that drives orchestrations (running
    is operator-triggered from the UI/CLI/API; the background autonomy timer stays
    deterministic and never spawns a paid CLI).
+
+## 23. Tool-Glue Programs (the `execute_code` foundation)
+
+**Status: foundation shipped (grounding + inert preview); the sandboxed
+script runtime remains future work.**
+
+`docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §2 records `execute_code` (Hermes'
+`tools/code_execution_tool.py` "programmatic tool calling") as the P1 gap: the
+model writes one program that calls tools back through the SAME tool gate,
+collapsing a multi-step chain into a single inference turn. Hermes' load-bearing
+safety move is **allowlist-before-dispatch** — its RPC server validates every
+tool name against `SANDBOX_ALLOWED_TOOLS` before anything runs.
+
+### What is shipped
+
+The first safe slice is the **grounding half**, built reference-first and
+pinned to the existing multi-tool path — **not a second execution model**:
+
+- **A brain-authored tool-glue program** is an ordered list of `(plugin, tool,
+  args)` steps the model writes (`relux_core::ProposedGlueStep`). It is the
+  structured-program analogue of the keyword `build_tool_plan_proposal` path —
+  there the operator's prose is split by a fallback keyword rail; here the brain
+  authors the program directly, with the kernel as the deterministic validator
+  (the binding posture from `docs/reference-driven-development.md`: "validate the
+  model's choice against an allowlist/schema before acting").
+- **Grounding is pure and fail-closed** (`relux_core::ground_tool_glue_plan`).
+  Every step is resolved against the live tool catalog (the Relux analogue of
+  `SANDBOX_ALLOWED_TOOLS`): installed plugin tools, the manifestless plugins'
+  read-only **Plugin Lens** source tools (`plugin.summary` / `inspect` / `search`
+  / `read_file`), governed command tools, and live MCP tools. A step that names a
+  tool **not in the catalog** is flagged `readiness: "unknown"` and forces
+  `ready_to_create: false` — the model can never fabricate a capability it was not
+  shown. Gated tools keep their honest gate (`needs_approval` /
+  `missing_permission` / `not_runnable`); grounding never downgrades a gate.
+- **The preview is INERT.** `KernelState::preview_tool_glue_plan` takes `&self`,
+  creates no task, starts no run, and mutates no state. It returns the same
+  `PrimeToolPlanProposal` card the keyword path produces, so the dashboard renders
+  it identically and the operator commits it through the EXISTING one-click
+  `tool_plan` task path with its unchanged permission / approval / grant / audit
+  gates.
+- **Bounds are the configured policy, not a toy cap.** The step limit is
+  `PrimeAgentPolicy::tool_plan_steps(extended)` (standard 16 / extended 64, ceil
+  64), clamped to the hard backstop; an over-long program is reported honestly,
+  never silently truncated.
+- **Surface:** `POST /v1/relux/prime/glue/preview`
+  `{ "goal", "steps": [{ "plugin", "tool", "args"? }], "extended"? }`. Live MCP
+  `tools/list` discovery runs off-lock exactly like `GET /v1/relux/prime/tools`.
+
+### What remains (next slices)
+
+- **The sandboxed script runtime** itself (Hermes' RPC-from-script): a real
+  program with control flow whose tool calls travel a local loopback back through
+  `prime_invoke_tool`, with intermediate results kept out of the context window,
+  child-environment scrubbing, and stdout/stderr bounding. This is the larger
+  subsystem the audit flags as "high leverage but a real subsystem"; the grounding
+  + commit path shipped here is its safe foundation.
+- **Wiring the brain to author glue programs inside a chat turn** (today the
+  grounding surface is an explicit route; the chat-turn integration that has Prime
+  emit and commit a grounded program is a follow-up).
+- **A dashboard card** for the glue-preview surface (the backend + route + the
+  shared `PrimeToolPlanProposal` rendering exist; a dedicated UI entry point is a
+  later slice).

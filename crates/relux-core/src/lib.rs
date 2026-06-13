@@ -30,6 +30,7 @@ pub mod runtime;
 pub mod secret;
 pub mod task;
 pub mod tool;
+pub mod tool_glue;
 
 pub use adapter::{
     clamp_adapter_max_output, clamp_adapter_timeout, recognize_adapter_kind, AdapterKind,
@@ -141,4 +142,7 @@ pub use task::{
 };
 pub use tool::{
     approval_blocks_direct_invocation, ToolDescriptor, ToolExecutability, ToolInvocationResult,
+};
+pub use tool_glue::{
+    ground_tool_glue_plan, tool_plan_readiness, tool_plan_summary, ProposedGlueStep,
 };
