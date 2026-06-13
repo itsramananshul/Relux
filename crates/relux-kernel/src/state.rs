@@ -20310,6 +20310,80 @@ mod tests {
     }
 
     #[test]
+    fn prime_chat_invokes_a_configured_command_tool_through_the_governed_gate() {
+        // The product promise from chat (docs/prime-tool-use.md "How a tool request flows"
+        // + "The verified install -> use path"): a manifestless plugin whose runnable tool
+        // is a GOVERNED COMMAND TOOL (not the internal echo fixture) is usable directly from
+        // a Prime chat turn through the SAME `prime_invoke_tool` -> `invoke_tool` chokepoint —
+        // gated until authorized, then run for real with its captured output folded back. The
+        // existing end-to-end coverage drives the generic `/v1/relux/tools/invoke` route; this
+        // pins the CHAT path, with a non-echo tool, so "Prime can use an installed plugin" is
+        // proven where the user actually asks: in conversation.
+        let (mut k, ctx) = prime_chat_kernel();
+
+        // A manifestless wrapper plugin (LocalDir, no relux-plugin.json) hosting a configured
+        // command tool — a real argv recipe (cmd/printf), NOT the relux-tools-echo fixture.
+        let dir = tempfile::tempdir().unwrap();
+        let id = PluginId::new("relux-plugin-my-repo");
+        k.install_plugin(
+            wrapper_manifest("relux-plugin-my-repo"),
+            PluginSourceKind::LocalDir,
+            dir.path().display().to_string(),
+            dir.path().display().to_string(),
+            true,
+        );
+        let def = k
+            .configure_command_tool(&id, command_tool_draft_echo("repo.run", "relux-cmd-ok"))
+            .expect("command tool configured");
+        assert_eq!(def.permission.as_str(), "tool:relux-plugin-my-repo:run");
+        // Prime must hold the derived permission before it can be invoked or granted.
+        k.grant_permission_to_agent(&ctx.agent, def.permission.clone())
+            .unwrap();
+
+        // Turn A — no standing grant: an explicit chat request stages a pending per-call
+        // approval bound to the exact call. It is NEVER auto-run, NEVER a dead refusal, and
+        // NEVER demoted into a generic task — it flows through the same gate as any tool.
+        let turn = k
+            .prime_turn(&ctx, "use relux-plugin-my-repo/repo.run")
+            .unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::ToolInvocation);
+        assert_eq!(turn.disposition, PrimeDisposition::AwaitingApproval);
+        assert!(turn.invoked_tool.is_none(), "nothing ran before approval: {turn:?}");
+        assert!(turn.created_task.is_none(), "a tool request is never a generic task: {turn:?}");
+        assert!(turn.tool_error.is_none(), "a staged approval is not an error: {turn:?}");
+        let card = turn.pending_tool_approval.expect("a pending approval card");
+        assert_eq!(card.label, "relux-plugin-my-repo/repo.run");
+        assert_eq!(card.source, "plugin");
+        assert_eq!(card.permission, "tool:relux-plugin-my-repo:run");
+
+        // Authorize the exact (subject, plugin, tool) with a standing allow-always grant —
+        // the Governance affordance that lets a repeated call run without a per-call prompt.
+        k.grant_persistent_tool_invocation("operator", &ctx.agent, &id, "repo.run")
+            .unwrap();
+
+        // Turn B — with the grant the SAME chat request now runs for real through
+        // `prime_invoke_tool` -> `invoke_tool`, argv-only, and folds the captured output back.
+        let turn = k
+            .prime_turn(&ctx, "use relux-plugin-my-repo/repo.run")
+            .unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::ToolInvocation);
+        assert_eq!(turn.disposition, PrimeDisposition::Executed);
+        assert_eq!(
+            turn.invoked_tool.as_deref(),
+            Some("relux-plugin-my-repo/repo.run"),
+            "the configured command tool ran from chat: {turn:?}"
+        );
+        assert!(turn.tool_error.is_none(), "a granted run is not an error: {turn:?}");
+        let output = turn.tool_output.expect("the command tool returned output");
+        assert_eq!(output["success"], serde_json::json!(true), "output: {output}");
+        assert_eq!(output["timed_out"], serde_json::json!(false), "output: {output}");
+        assert!(
+            output["stdout"].as_str().unwrap_or_default().contains("relux-cmd-ok"),
+            "Prime must see the real captured tool output from chat: {output}"
+        );
+    }
+
+    #[test]
     fn chat_staged_approval_runs_once_through_the_existing_execute_route() {
         // The full lifecycle: chat stages the approval → operator approves it → the bound
         // one-shot executes EXACTLY once through the existing per-call execute path. The
