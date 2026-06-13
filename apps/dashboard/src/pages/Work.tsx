@@ -1495,13 +1495,12 @@ function TaskCard({ task, onAction, onInspectTask, agents, subtaskCount }: { tas
   async function executeAssignedRun() {
     setBusy(true);
     try {
-      if (task.status === "created" || task.status === "queued") {
-        // If task is created/queued, first start the run (moves it to Running status)
-        await reluxWork.startTask(task.id);
-      }
-      // Then execute the run, which will complete it
+      // The dispatcher starts the run if the task is still created/queued AND drives it
+      // to a terminal state in one governed call — it never leaves the run dangling in
+      // Running. (A separate pre-start would consume the run and make this fail with
+      // NoActiveRun.)
       await reluxWork.executeAssignedTask(task.id);
-      onAction(); // Reload tasks to reflect the completion
+      onAction(); // Reload tasks to reflect the terminal outcome
     } catch (e) {
       alert(e instanceof Error ? e.message : "Execution failed");
     } finally {
@@ -1522,7 +1521,11 @@ function TaskCard({ task, onAction, onInspectTask, agents, subtaskCount }: { tas
   }
 
   const isAssigned = !!task.assigned_agent;
-  const isRunnableByAssignedAgent = isAssigned && task.status === "queued";
+  // An assigned task is runnable while it is still created or queued — the dispatcher
+  // (`execute_assigned_run`) starts it if needed and drives it to a terminal state.
+  // Including `created` closes the gap where a freshly-created, auto-assigned task
+  // (the "New Task" form assigns to Prime) showed no run affordance at all.
+  const isRunnableByAssignedAgent = isAssigned && (task.status === "created" || task.status === "queued");
   // A card is draggable exactly when it has a settable move (a non-terminal task) —
   // a finished card offers no move, so it is not draggable (no dead drag affordance).
   // Drag is ADDITIVE over the StatusMoveControl select, which stays for keyboard use.

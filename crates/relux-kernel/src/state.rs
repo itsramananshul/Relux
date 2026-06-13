@@ -540,7 +540,7 @@ impl KernelState {
         // the deterministic local path. Scope the task borrow so the adapter-status
         // read below does not overlap it.
         let unfulfillable = match self.tasks.get(task_id) {
-            Some(t) => relux_core::is_unfulfillable_local_request(&t.input),
+            Some(t) => relux_core::local_prime_cannot_fulfill(&t.title, &t.input),
             None => {
                 return EffectiveRunAdapter {
                     adapter: base,
@@ -9587,9 +9587,9 @@ impl KernelState {
         let agent = self.agent(&assigned_agent_id).ok_or_else(|| KernelError::UnknownAgent(assigned_agent_id.to_string()))?;
         let agent_id_for_call = agent.id.clone();
 
-        let input = self.task(task_id)
-            .map(|t| t.input.clone())
-            .unwrap_or_else(|| serde_json::json!({})); // Fallback to empty JSON if no input
+        let (input, title) = self.task(task_id)
+            .map(|t| (t.input.clone(), t.title.clone()))
+            .unwrap_or_else(|| (serde_json::json!({}), String::new())); // Fallback if no task
 
         // A task may carry an explicit, operator-named tool-call directive in its
         // input (`{ "tool_call": { plugin, tool, args } }`). When present, the local
@@ -9668,11 +9668,14 @@ impl KernelState {
                     Err(e)
                 }
             }
-        } else if relux_core::is_unfulfillable_local_request(&input) {
-            // The task is a free-form natural-language goal Prime was handed, with no
-            // executable directive. The local Prime adapter is deterministic and has no
-            // real tools, so it CANNOT do this work (clone a repo, touch the
-            // filesystem/network, import a plugin). Refuse honestly with actionable
+        } else if relux_core::local_prime_cannot_fulfill(&title, &input) {
+            // The task is work the deterministic local Prime adapter cannot do: either a
+            // free-form natural-language goal Prime was handed (a `prime_request`) or a
+            // task whose human title obviously denotes external work (clone a repo,
+            // import/install a plugin, download from a URL — `title_requires_external_
+            // execution`). The local adapter has no real tools, so it CANNOT do this work
+            // (clone a repo, touch the filesystem/network, import a plugin). Refuse
+            // honestly with actionable
             // guidance and PARK the task as `Blocked` — never echo a no-op back as
             // "done", and never leave the run sitting in `Running` forever (the
             // "running but nothing happens" bug). The run reaches a terminal `Failed`
@@ -21881,6 +21884,39 @@ mod tests {
         let msg = run.error.clone().unwrap_or_default();
         assert!(msg.contains("Plugins"), "guidance points to the plugin import flow: {msg}");
         assert!(msg.contains("Claude or Codex"), "guidance offers a real adapter: {msg}");
+    }
+
+    #[test]
+    fn local_prime_refuses_an_external_work_title_with_empty_input() {
+        // The dashboard "New Task" form shape: a free-form goal entered as the TITLE with
+        // EMPTY input (no `prime_request` key, no directive). The local adapter still
+        // cannot clone a repo / import a plugin, so this must fail closed terminally with
+        // guidance — never echo a no-op back as "done", never hang in Running.
+        let mut k = KernelState::new();
+        k.register_plugin(echo_manifest());
+        k.register_plugin(adapter_manifest());
+        let ns = k.create_namespace("workspace", "Workspace", NamespaceKind::Personal);
+        let adapter = PluginId::new("relux-adapter-local-prime");
+        let prime = k
+            .create_agent("prime", "Prime", "The control-plane operator.", &adapter, &ns, None, vec![])
+            .unwrap();
+        let task = k.create_task(
+            "Clone nousresearch/hermes-agent and import it as a plugin",
+            serde_json::json!({}),
+            "founder",
+            &ns,
+            vec![],
+        );
+        k.assign_task(&task, &prime).unwrap();
+
+        let err = k.execute_assigned_run(&task).unwrap_err();
+        assert!(matches!(err, KernelError::LocalAdapterUnsupported(_)));
+        let run = k.runs().into_iter().find(|r| r.task_id == task).expect("a run exists");
+        assert_eq!(run.status, RunStatus::Failed, "the run must reach a terminal Failed, not echo or hang");
+        assert_eq!(run.failure_class, Some(RunFailureClass::AdapterMissing));
+        assert_eq!(k.task(&task).unwrap().status, TaskStatus::Blocked);
+        // It did NOT take the echo path (no fabricated success).
+        assert_ne!(k.task(&task).unwrap().status, TaskStatus::Completed);
     }
 
     #[test]

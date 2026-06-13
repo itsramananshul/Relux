@@ -3876,20 +3876,73 @@ async fn reopen_and_run_task(
 struct StartTaskResponse {
     task: relux_core::Task,
     run: relux_core::Run,
+    /// When the run was refused/failed-closed at start (e.g. the local Prime adapter
+    /// cannot do the requested external work and no real brain is configured), the
+    /// honest reason. `None` on a clean completion. The `run`/`task` already carry the
+    /// terminal state either way — the run is NEVER left dangling in `Running`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refused: Option<String>,
 }
 
+/// POST `/v1/relux/tasks/:id/start` — start a run AND drive it to a terminal state.
+///
+/// This routes through the same governed dispatcher the Work page's "Run (Assigned)"
+/// uses ([`execute_assigned_run`]), NOT a bare `start_run`. A bare start would move the
+/// run to `Running` with only a `run_started` event and no executor behind it — the
+/// reported "running, No activity forever" bug. By executing inline, the run always
+/// reaches a terminal outcome before this returns: it completes (echo / a gated
+/// directive), fails honestly (a CLI adapter that is disabled/missing), or — for work
+/// the deterministic local Prime adapter cannot do (clone a repo, import a plugin) with
+/// no real brain configured — fails closed with actionable guidance and parks the task
+/// `Blocked`. The fail-closed case returns 200 with `refused` set and the terminal
+/// run/task, so the dashboard shows the honest result instead of a hung card.
 async fn start_task(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<StartTaskResponse>, ApiError> {
     let task_id = relux_core::TaskId::new(id);
-    let (task, run) = locked_save(&state, |kernel| {
-        let run_id = kernel.start_run(&task_id)?;
-        let task = kernel.task(&task_id).cloned().unwrap();
-        let run = kernel.run(&run_id).cloned().unwrap();
-        Ok((task, run))
+    // `locked_save_persisting` saves even when the closure returns the staged refusal,
+    // so a failed-closed run + its transcript survive (and the task stays `Blocked`).
+    let resp = locked_save_persisting(&state, |kernel| {
+        let run_result = kernel.execute_assigned_run(&task_id);
+        match run_result {
+            Ok(run_id) => {
+                let task = kernel.task(&task_id).cloned().unwrap();
+                let run = kernel.run(&run_id).cloned().unwrap();
+                Ok(StartTaskResponse { task, run, refused: None })
+            }
+            // The honest fail-closed paths (local-prime cannot do external work, a CLI
+            // adapter is disabled/missing) already drove the run + task to a terminal
+            // state. Surface that terminal state with the reason rather than a raw error,
+            // mirroring `reopen-and-run`, so the card never looks blank/dead. A genuine
+            // error (unknown/unassigned task, permission denied) propagates as-is.
+            Err(e) => {
+                let staged_terminal = matches!(
+                    e,
+                    KernelError::LocalAdapterUnsupported(_)
+                        | KernelError::AdapterRuntimeDisabled { .. }
+                        | KernelError::AdapterRuntimeNotConfigured { .. }
+                        | KernelError::AdapterBinaryMissing { .. }
+                );
+                if !staged_terminal {
+                    return Err(e);
+                }
+                let msg = e.to_string();
+                let task = kernel.task(&task_id).cloned().unwrap();
+                // The most recent run for this task carries the terminal failure.
+                match kernel
+                    .runs()
+                    .into_iter()
+                    .filter(|r| r.task_id == task_id)
+                    .max_by(|a, b| a.id.as_str().cmp(b.id.as_str()))
+                {
+                    Some(run) => Ok(StartTaskResponse { task, run: run.clone(), refused: Some(msg) }),
+                    None => Err(e),
+                }
+            }
+        }
     })?;
-    Ok(Json(StartTaskResponse { task, run }))
+    Ok(Json(resp))
 }
 
 #[derive(Debug, Serialize)]
@@ -16670,6 +16723,52 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&rb).unwrap()["status"],
             "failed",
             "run still failed, unchanged: {rb}"
+        );
+    }
+
+    /// The reported bug, at the HTTP boundary: `POST /tasks/:id/start` on a local-prime
+    /// task whose title is obvious external work ("Clone … import it as a plugin") must
+    /// drive the run to a TERMINAL state with an honest refusal — never leave it dangling
+    /// in `Running` with only a start event ("No activity forever").
+    #[tokio::test]
+    async fn start_route_drives_an_external_work_task_to_a_terminal_refusal() {
+        let (state, _dir) = auth_state(true);
+        let (status, _, tb) = call(
+            &state,
+            "POST",
+            "/v1/relux/tasks",
+            None,
+            Some(r#"{"title":"Clone nousresearch/hermes-agent and import it as a plugin"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{tb}");
+        let task_id = serde_json::from_str::<serde_json::Value>(&tb).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let (status, _, sb) =
+            call(&state, "POST", &format!("/v1/relux/tasks/{task_id}/start"), None, None).await;
+        // 200 with the honest terminal state + a refusal message — NOT a hung 5xx/raw error.
+        assert_eq!(status, StatusCode::OK, "start should stage an honest refusal: {sb}");
+        let v: serde_json::Value = serde_json::from_str(&sb).unwrap();
+        assert_eq!(v["run"]["status"], "failed", "the run is terminal, not Running: {sb}");
+        assert_ne!(v["run"]["status"], "running", "the run must never dangle in Running");
+        assert_eq!(v["task"]["status"], "blocked", "the task is parked Blocked: {sb}");
+        assert!(
+            v["refused"].as_str().unwrap_or_default().contains("Plugins"),
+            "the refusal names an actionable remedy: {sb}"
+        );
+
+        // And the persisted run really is terminal (the dashboard card is not dead).
+        let run_id = v["run"]["id"].as_str().unwrap().to_string();
+        let (status, _, rb) =
+            call(&state, "GET", &format!("/v1/relux/runs/{run_id}"), None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&rb).unwrap()["status"],
+            "failed",
+            "{rb}"
         );
     }
 

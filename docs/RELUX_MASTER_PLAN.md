@@ -4301,11 +4301,21 @@ control-plane loop (the deterministic echo, plus any operator-authored
 chokepoint). A plain echo/test task keeps the echo behavior; a directive task runs
 its gated tools.
 
-But a task that carries a **free-form natural-language goal** Prime was handed (a
-non-empty `prime_request`) with **no executable directive** is something the
-deterministic adapter cannot turn into actions. Earlier such a run could be *started*
-and then sit in `Running` forever with nothing executing it (the "running but nothing
-happens" bug) — or fake-echo the input back as "done".
+But a task that the deterministic adapter cannot turn into actions — either a
+**free-form natural-language goal** Prime was handed (a non-empty `prime_request`) with
+**no executable directive**, OR a task whose **human title obviously denotes external
+work** (clone a repo, import/install a plugin, download from a URL — the dashboard
+"New Task" form shape, where the goal is the title and the input carries no
+`prime_request`) — is outside it. Earlier such a run could be *started* and then sit in
+`Running` forever with nothing executing it (the "running but nothing happens" bug) —
+or fake-echo the input back as "done". The structural discriminator is
+`relux_core::local_prime_cannot_fulfill(title, input)`, which combines
+`is_unfulfillable_local_request` (the `prime_request` shape) with a narrow, conservative
+title safety-rail `title_requires_external_execution` (per
+`docs/reference-driven-development.md`, a keyword rail is a fallback safety net, never
+the primary brain — it matches only unambiguous external-action phrasing so plain
+echo/control-plane tasks are never caught). An operator-authored `tool_call`/`tool_plan`
+directive always short-circuits to *fulfillable* (it runs through the gated tool path).
 
 The first remedy is the **brain-aware routing** above: when the operator has a real
 Prime brain configured (a Claude/Codex CLI adapter selected on Crew → Prime Brain),
@@ -4315,7 +4325,7 @@ fail-closed branch below is the honest floor for when **no real brain is configu
 action, never silently running on local-prime. When the resolved brain is `Local` or
 `Openrouter` (conversational only, no coding-agent run adapter), the run stays on
 local-prime and the **fail-closed branch** in `execute_local_run`
-(`relux_core::is_unfulfillable_local_request`) fires:
+(`relux_core::local_prime_cannot_fulfill`) fires:
 
 - the run reaches a terminal **`Failed`** state classified `adapter_missing` (never
   an infinite `Running`, never a fabricated success), and the task is parked
@@ -4328,9 +4338,16 @@ local-prime and the **fail-closed branch** in `execute_local_run`
   execute work runs.
 
 The two Prime-chat entry points that *create and run* / *start* a task
-(`PrimeAction::CreateAndRunTask`, `PrimeAction::StartRun`) now **drive the run to a
+(`PrimeAction::CreateAndRunTask`, `PrimeAction::StartRun`) **drive the run to a
 terminal state** through the same governed `execute_assigned_run` path the Work
-page's "Run (Assigned)" uses — a started run is never left dangling. The Work page's
+page's "Run (Assigned)" uses — a started run is never left dangling. The HTTP
+**`POST /v1/relux/tasks/:id/start`** route (behind the Work page's "Start" / "Run
+(Assigned)" controls) likewise routes through `execute_assigned_run`, NOT a bare
+`start_run`: a bare start would leave the run in `Running` with only a `run_started`
+event and no executor behind it (the exact "running, No activity forever" symptom). A
+fail-closed start returns **200** with the terminal run/task and a `refused` message
+(mirroring `reopen-and-run`), so the card shows the honest outcome instead of a hung
+card. The Work page's
 recovery card recognizes the local-Prime case (an `adapter_missing` failure whose run
 adapter is `relux-adapter-local-prime`) and offers **Set Prime's brain** (Crew →
 Prime Brain) as the primary remedy, plus **Open Plugins** + **Reassign**, rather than

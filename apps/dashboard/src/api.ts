@@ -3059,9 +3059,13 @@ export const reluxWork = {
       parent_task?: string;
     },
   ) => api.post<ReluxTask>("/v1/relux/tasks", { title, ...(extra ?? {}) }),
-  // Start an execution attempt for a task.
+  // Start a run AND drive it to a terminal state in one governed call (the backend
+  // routes through the same dispatcher "Run (Assigned)" uses, never a bare start that
+  // would leave the run dangling in Running). `refused` is set when the run failed
+  // closed at start (e.g. local Prime cannot do the requested external work) — the
+  // run/task already carry the honest terminal state.
   startTask: (id: string) =>
-    api.post<{ task: ReluxTask; run: ReluxRun }>(
+    api.post<{ task: ReluxTask; run: ReluxRun; refused?: string }>(
       `/v1/relux/tasks/${encodeURIComponent(id)}/start`,
     ),
   // Assign a task to an agent.

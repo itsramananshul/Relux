@@ -304,6 +304,70 @@ pub fn is_unfulfillable_local_request(input: &serde_json::Value) -> bool {
     has_request && parse_task_tool_call(input).is_none() && parse_task_tool_plan(input).is_none()
 }
 
+/// A conservative, deterministic SAFETY RAIL: true when a task's human `title`
+/// obviously denotes work that requires touching an external repo/filesystem/network
+/// (clone a repository, import/install a plugin or package, download/scrape from a URL,
+/// deploy/publish, raw git/GitHub actions). The local Prime adapter is deterministic
+/// and has no real tools, so it provably CANNOT do any of these — echoing the title back
+/// as "done" would be a fabricated success, and never executing it leaves the run hung.
+///
+/// This is intentionally a narrow keyword rail (per `docs/reference-driven-development.md`,
+/// keyword rules are fallback safety rails, never the primary brain): it matches only
+/// unambiguous external-action phrasing so plain control-plane / echo / test tasks
+/// ("check the echo tool responds", "ship it", "write the readme") are never caught.
+/// It complements [`is_unfulfillable_local_request`], which catches a free-form
+/// `prime_request` goal Prime was handed; this catches the same shape entered directly
+/// as a task title (the dashboard "New Task" form) where there is no `prime_request` key.
+pub fn title_requires_external_execution(title: &str) -> bool {
+    let t = title.to_lowercase();
+    // URLs and raw git/GitHub references are always external.
+    if t.contains("http://") || t.contains("https://") || t.contains("github.com") || t.contains("git clone") {
+        return true;
+    }
+    let words: std::collections::HashSet<&str> = t
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let has = |w: &str| words.contains(w);
+    // Unambiguous single-verb external actions.
+    if has("clone") || has("download") || has("scrape") || has("deploy") || has("publish") {
+        return true;
+    }
+    // Import / install only count as external when paired with an artifact noun, so a
+    // plain "import the data" intent inside the control plane is not over-caught.
+    let artifact = has("plugin")
+        || has("plugins")
+        || has("repo")
+        || has("repository")
+        || has("package")
+        || has("dependency")
+        || has("dependencies")
+        || has("npm")
+        || has("cargo")
+        || has("crate")
+        || has("pip");
+    if (has("import") || has("install") || has("fetch")) && artifact {
+        return true;
+    }
+    false
+}
+
+/// True when the local Prime (deterministic) adapter CANNOT fulfil a task — so a run on
+/// it must refuse honestly (route to a real brain when configured, else fail closed and
+/// park the task `Blocked`) instead of echoing a no-op as "done" or hanging in `Running`.
+///
+/// An operator-authored `tool_call`/`tool_plan` directive is always fulfilment-capable
+/// (it runs through the gated `call_tool` path), so it short-circuits to `false`.
+/// Otherwise it is unfulfillable when EITHER the input is a free-form `prime_request`
+/// goal ([`is_unfulfillable_local_request`]) OR the human title obviously denotes
+/// external work ([`title_requires_external_execution`]). Total and pure.
+pub fn local_prime_cannot_fulfill(title: &str, input: &serde_json::Value) -> bool {
+    if parse_task_tool_call(input).is_some() || parse_task_tool_plan(input).is_some() {
+        return false;
+    }
+    is_unfulfillable_local_request(input) || title_requires_external_execution(title)
+}
+
 /// A durable unit of work.
 ///
 /// Spec ref: `docs/RELUX_MASTER_PLAN.md` section 9.5 (Task).
@@ -471,6 +535,76 @@ mod task_subtree_tests {
             .collect();
         let m: TaskParentMap = edges.iter().map(|(c, p)| (id(c), id(p))).collect();
         assert_eq!(task_ancestors(&id("n0"), &m).len(), MAX_TASK_DEPTH);
+    }
+}
+
+#[cfg(test)]
+mod local_prime_capability_tests {
+    use super::*;
+
+    #[test]
+    fn external_work_titles_are_recognized() {
+        // The reported screenshot shape and other unambiguous external actions.
+        for title in [
+            "Clone nousresearch/hermes-agent and import it as a plugin",
+            "clone the repo and build it",
+            "import this repository as a plugin",
+            "install the playwright plugin",
+            "download the dataset",
+            "git clone git@example.com:me/x",
+            "fetch the package from npm",
+            "deploy the service",
+            "open https://example.com/repo and import it",
+        ] {
+            assert!(
+                title_requires_external_execution(title),
+                "should be external work: {title:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_control_plane_titles_are_not_flagged() {
+        // Echo/test/control-plane titles the deterministic local adapter genuinely
+        // handles must NOT be over-caught (no false fail-closed).
+        for title in [
+            "Check the echo tool responds",
+            "ship it",
+            "write the readme",
+            "create a task to triage the backlog",
+            "assign the readme task to researcher-bot",
+            "summarize the meeting notes",
+            "import the spreadsheet values", // "import" without an artifact noun
+        ] {
+            assert!(
+                !title_requires_external_execution(title),
+                "should NOT be external work: {title:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cannot_fulfill_combines_title_and_input_but_a_directive_wins() {
+        let empty = serde_json::json!({});
+        // External title with empty input (the dashboard "New Task" form shape).
+        assert!(local_prime_cannot_fulfill(
+            "Clone nousresearch/hermes-agent and import it as a plugin",
+            &empty
+        ));
+        // Free-form prime_request goal (the Prime-chat shape) with a benign title.
+        let goal = serde_json::json!({ "prime_request": "go do the thing" });
+        assert!(local_prime_cannot_fulfill("a handed goal", &goal));
+        // A plain echo/test task is fulfillable.
+        assert!(!local_prime_cannot_fulfill(
+            "Check the echo tool responds",
+            &serde_json::json!({ "message": "hi" })
+        ));
+        // An explicit tool-call directive is ALWAYS fulfillable, even with an external
+        // title — it runs through the gated tool path, not the echo/refuse branch.
+        let directive = serde_json::json!({
+            "tool_call": { "plugin": "relux-tools-echo", "tool": "echo.say", "args": {} }
+        });
+        assert!(!local_prime_cannot_fulfill("clone the repo", &directive));
     }
 }
 

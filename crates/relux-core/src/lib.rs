@@ -133,8 +133,8 @@ pub use runtime::{
     MIN_RUNTIME_TIMEOUT_MS,
 };
 pub use task::{
-    is_in_task_subtree, is_unfulfillable_local_request, parse_task_tool_call, parse_task_tool_plan,
-    task_ancestors,
+    is_in_task_subtree, is_unfulfillable_local_request, local_prime_cannot_fulfill,
+    parse_task_tool_call, parse_task_tool_plan, task_ancestors, title_requires_external_execution,
     would_create_task_cycle, Task, TaskId, TaskParentMap, TaskStatus, TaskToolCall, TaskToolPlan,
     TaskToolPlanError, MAX_TASK_DEPTH, MAX_TASK_TOOL_PLAN_ARGS_BYTES, MAX_TASK_TOOL_PLAN_STEPS,
     MAX_TASK_TOOL_PLAN_STEPS_CEIL,
