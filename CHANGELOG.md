@@ -9,6 +9,41 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.33 (Windows bundle).** The `relux-kernel` and
+  `relux-core` crates move `0.1.32` → `0.1.33` in lockstep, packaging the
+  post-v0.1.32 **brain-aware run routing + plugin activation honesty** fixes into
+  a fresh Windows bundle. Everything reads-from / writes-through real kernel state
+  and conforms to `docs/RELUX_MASTER_PLAN.md` §8.1 / §8.2 / §17.5 / §10.2 / §10.3,
+  `docs/prime-tool-use.md`, and `docs/mcp.md`; no master-plan safety property is
+  weakened. Headlines:
+  - **Brain-aware run routing — Prime work uses the real adapter or fails closed.**
+    A free-form Prime goal assigned to the local-prime default now routes to the
+    real adapter the operator's configured brain resolves to (Claude / Codex CLI)
+    instead of silently echoing on local-prime; when no real brain is configured
+    it fails closed with a "Set Prime's brain" setup action. Confined to the
+    operator-initiated `execute_assigned_run` chokepoint via `effective_run_adapter`
+    — `start_run` is unchanged, so the §17 autonomy tick keeps the deterministic
+    local path and never auto-spawns a paid CLI. The brain choice is a secret-free
+    `PrimeBrainPreference` snapshot re-synced from the on-disk `AiConfig` before
+    every run; the run record + transcript are stamped (`adapter_selected`) with
+    the adapter actually used.
+  - **Governed command-tool bridge for source-only plugins.** A source-only import
+    (no `relux-plugin.json`, no detected runnable candidate) is no longer a
+    dead-end: `POST /v1/relux/prime/actions/configure-command-tool` re-validates
+    an operator-supplied argv recipe through the unchanged `parse_command_tool_input`
+    + `configure_command_tool` (argv-only, no shell, no danger flag, confined cwd,
+    approval always Required) and returns a structured envelope. Prime chat stages a
+    High-risk, confirm-gated proposal with a reviewable card — never an unrelated
+    task and never a fabricated command. No command is inferred from repo content.
+  - **Guided secret/env setup for managed-stdio MCP activation.** A plugin/MCP
+    server that needs an `OPENAI_API_KEY` (or any env secret) is no longer raw:
+    `GET`/`POST /v1/relux/mcp/servers/:id/env-setup` stores an inline value
+    write-only or references an existing secret and maps `ENV_VAR → {secret}` onto
+    an existing managed-stdio server, re-validating names before any mutation and
+    optionally re-discovering. The `McpEnvSetupForm` wires this into the Prime chat
+    activation result and the Plugins capability card; values are never shown after
+    save (status/preview only), and the path runs no source code and never returns
+    a value. Rebuilt `dashboard-dist` committed.
 - **Relux local release v0.1.32 (Windows bundle).** The `relux-kernel` and
   `relux-core` crates move `0.1.31` → `0.1.32` in lockstep, packaging the
   post-v0.1.31 **Prime conversation-first + plugin-tool honesty** fixes into a

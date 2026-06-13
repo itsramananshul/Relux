@@ -1941,6 +1941,36 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.33** (2026-06-13) — **Brain-aware run routing + plugin activation honesty** rollup. The
+  `relux-kernel` / `relux-core` crates move `0.1.32` → `0.1.33` in lockstep, packaging the
+  post-v0.1.32 fixes into a fresh Windows bundle (`docs/prime-tool-use.md`, `docs/mcp.md`;
+  RELUX_MASTER_PLAN §8.1 / §8.2 / §17.5 / §10.2 / §10.3; built reference-first per
+  `docs/reference-driven-development.md`). Headlines: (1) **Brain-aware run routing — Prime work
+  uses the real adapter or fails closed** — a free-form Prime goal assigned to the local-prime
+  default now routes to the real adapter the operator's configured brain resolves to (Claude / Codex
+  CLI) instead of silently echoing on local-prime, and fails closed with a "Set Prime's brain" setup
+  action when no real brain is configured. Confined to the operator-initiated `execute_assigned_run`
+  chokepoint via `effective_run_adapter`; `start_run` is unchanged, so the §17 autonomy tick keeps
+  the deterministic local path and never auto-spawns a paid CLI. The brain choice is a secret-free
+  `PrimeBrainPreference` snapshot re-synced from the on-disk `AiConfig` before every run, and the run
+  record + transcript are stamped (`adapter_selected`) with the adapter actually used (§8.1). (2)
+  **Governed command-tool bridge for source-only plugins** — a source-only import (no
+  `relux-plugin.json`, no detected candidate) is usable without hand-editing JSON via
+  `POST /v1/relux/prime/actions/configure-command-tool`, which re-validates the operator's argv
+  recipe through the unchanged `parse_command_tool_input` + `configure_command_tool` (argv-only, no
+  shell, no danger flag, confined cwd, approval always Required) and stages a High-risk, confirm-gated
+  Prime proposal; no command is inferred from repo content (§8.2 / §10.2 / §10.3). (3) **Guided
+  secret/env setup for managed-stdio MCP activation** — `GET`/`POST /v1/relux/mcp/servers/:id/env-setup`
+  stores an inline value write-only or references an existing secret and maps `ENV_VAR → {secret}`
+  onto an existing managed-stdio server, re-validating names before any mutation and optionally
+  re-discovering; the `McpEnvSetupForm` wires it into the Prime chat activation result and the
+  Plugins card, values are never shown after save, and the path runs no source code and never returns
+  a value (§17.5 / §8.2). All reads/writes hit real kernel state; no new authority is added, imports
+  run no repo code, and nothing auto-runs without an explicit gate. Per-slice `cargo test` +
+  `clippy --all-targets -D warnings` clean on `relux-core` / `relux-kernel`; dashboard typecheck /
+  tests / build green. The full-e2e release gate (`scripts\relux-package-local.ps1 -FullE2E`) is run
+  at package time. Every safety property from v0.1.32 holds.
+
 - **v0.1.32** (2026-06-13) — **Prime conversation-first + plugin-tool honesty** rollup. The
   `relux-kernel` / `relux-core` crates move `0.1.31` → `0.1.32` in lockstep, packaging the
   post-v0.1.31 fixes into a fresh Windows bundle (`docs/prime-tool-use.md`; RELUX_MASTER_PLAN §8 /
