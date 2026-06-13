@@ -1941,12 +1941,16 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
-- **Unreleased (dashboard-only)** — **The orchestration result card becomes a real run control**
-  (§10.4 / §11.1 / §17.1; UI only, no kernel change, no crate-version bump). The v0.1.35 card
-  rendered the briefs but pushed the operator to a conversational chip or the Advanced panel to
-  actually run. The card now owns the run: an explicit **Run orchestration** button starts the
-  EXISTING non-blocking `run-async` job (the same route the standalone `OrchestrationPanel` uses),
-  a 1s poll renders the live phase / round / per-brief progress and the terminal
+- **v0.1.36** (2026-06-13) — **Orchestration result card becomes a run control + plugin-use proof**
+  rollup. The `relux-kernel` / `relux-core` crates move `0.1.35` → `0.1.36` in lockstep, packaging
+  two post-v0.1.35 Prime-usability slices into a fresh Windows bundle (`docs/prime-tool-use.md`;
+  RELUX_MASTER_PLAN §10.4 / §11.1 / §17.1; `docs/ARTIFICIAL_CONSTRAINT_AUDIT.md` §6; built
+  reference-first per `docs/reference-driven-development.md`). Headlines: (1) **The orchestration
+  result card becomes a real run control** (§10.4 / §11.1 / §17.1; UI only, no kernel change) — the
+  v0.1.35 card rendered the briefs but pushed the operator to a conversational chip or the Advanced
+  panel to actually run. The card now owns the run: an explicit **Run orchestration** button starts
+  the EXISTING non-blocking `run-async` job (the same route the standalone `OrchestrationPanel`
+  uses), a 1s poll renders the live phase / round / per-brief progress and the terminal
   completed/failed/canceled state, and a restart-honest **interrupted** callout appears when no
   live worker is driving the run (reusing the shared `orchestration.ts` job helpers). It reconnects
   to an already-active job instead of double-running (read-only mount reconnect + 409 → reconnect),
@@ -1956,7 +1960,16 @@ stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
   time). The redundant "Run this orchestration" suggestion chip is filtered from the generic row
   (`isRunOrchestrationSuggestion`) so there is one clear primary run path; the chip still works if
   typed. Focused render tests pin the button, the deep links, the no-fabricated-link rule, the chip
-  filtering, and a no-stale-`dashboard-dist` bundle check; rebuilt bundle committed.
+  filtering, and a no-stale-`dashboard-dist` bundle check; rebuilt bundle committed. (2) **Plugin
+  usability proof — a configured non-echo command tool is invokable from chat through the governed
+  gate** — the chat-path invocation of a configured (non-echo) command tool is now pinned through the
+  governed tool-approval gate by a test, closing the lone remaining gap in the install → configure →
+  Prime-use path so it is verified end-to-end rather than asserted by vibes (`docs/prime-tool-use.md`,
+  `docs/ARTIFICIAL_CONSTRAINT_AUDIT.md` §6). All reads/writes hit real kernel state; no new authority
+  is added, nothing auto-runs without an explicit gate. Per-slice `cargo test` +
+  `clippy --all-targets -D warnings` clean on `relux-core` / `relux-kernel`; dashboard typecheck /
+  tests / build green. The full-e2e release gate (`scripts\relux-package-local.ps1 -FullE2E`) is run
+  at package time. Every safety property from v0.1.35 holds.
 - **v0.1.35** (2026-06-13) — **Grounded orchestration result card** rollup. The `relux-kernel` /
   `relux-core` crates move `0.1.34` → `0.1.35` in lockstep, packaging the post-v0.1.34 fix into a
   fresh Windows bundle (`docs/prime-tool-use.md`; RELUX_MASTER_PLAN §10.4 / §11.1 / §17.1; built
