@@ -2021,6 +2021,21 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.46** (2026-06-13) — **Tool-glue / `execute_code` foundation** rollup. The
+  `relux-kernel` / `relux-core` crates move `0.1.45` → `0.1.46`, packaging the post-v0.1.45
+  `execute_code` foundation slice into a fresh Windows bundle (RELUX_MASTER_PLAN §23; built
+  reference-first per `docs/reference-driven-development.md`). Headlines:
+  - **Brain-authored tool-glue plan grounding.** The `execute_code` foundation lets the Prime
+    brain author a structured multi-step tool-glue *plan* that grounds on the runnable tool
+    inventory — the substrate the future sandboxed RPC-from-script runtime will execute against.
+  - **Operator-facing tool-glue plan preview UI.** Prime renders the brain-authored ability-plan
+    as an inert preview card so the operator can read the proposed glue before anything runs.
+  - **Brain-authored tool-glue plan from chat.** A natural chat turn can produce the same inert
+    plan preview, keeping the authoring path conversational.
+  - **No new execution authority.** The plan is preview-only: it executes nothing, grants nothing,
+    and bypasses no approval/permission gate. The sandboxed RPC-from-script runtime that would
+    actually run a plan remains future work; all existing argv-only / loopback / approval / audit
+    / bounded-redacted safety rails are unchanged.
 - **v0.1.45** (2026-06-13) — **Prime abilities UX** rollup. The `relux-kernel` /
   `relux-core` crates move `0.1.44` → `0.1.45`, packaging the post-v0.1.44 dashboard
   clarity slice into a fresh Windows bundle. Headlines:
