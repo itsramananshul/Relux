@@ -9,6 +9,30 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.40 (Windows bundle).** The `relux-kernel` and
+  `relux-core` crates move `0.1.39` → `0.1.40` in lockstep, packaging two
+  post-v0.1.39 **Plugin Lens** slices into a fresh Windows bundle on top of
+  everything in v0.1.39. Everything reads-from / writes-through real kernel state
+  and conforms to `docs/RELUX_MASTER_PLAN.md` §8.1 / §11.6; no master-plan safety
+  property is weakened. Headline — **installed plugins are now actually usable by
+  Prime**:
+  - **Plugin Lens — installed plugins are usable by Prime (read-only source
+    capabilities).** Every non-bundled installed plugin now exposes four runnable
+    read-only source tools — `plugin.summary`, `plugin.inspect`, `plugin.search`,
+    `plugin.read_file`. A manifestless GitHub / ZIP / local-folder install becomes
+    a safe **source plugin**: Prime can summarize it, inspect its layout, search it,
+    and read individual files with path-safe, read-only tools confined to the
+    plugin directory. **Runnable execution tools still require an explicit
+    configure/approval step — Relux does not execute downloaded code by default.**
+  - **Plugins page surfaces the new capabilities.** The dashboard Plugins page
+    shows a "Prime can use (read-only)" section per installed plugin and a
+    one-click **Summarize with Prime** action.
+  - **Hidden NUL separator bug fixed.** The Plugins tool selector no longer emits a
+    hidden `NUL` separator; the dashboard bundle was rebuilt.
+  - Dashboard typecheck / tests / build green; the full-e2e release gate
+    (`scripts\relux-package-local.ps1 -FullE2E`) is run at package time. Every
+    safety property from v0.1.39 holds; no new authority is added (read-only
+    source access only, fail-closed).
 - **Relux local release v0.1.39 (Windows bundle).** The `relux-kernel` and
   `relux-core` crates move `0.1.38` → `0.1.39` in lockstep, packaging two
   post-v0.1.38 **Prime brain/adapter setup** slices into a fresh Windows bundle on

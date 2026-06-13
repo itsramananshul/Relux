@@ -1954,6 +1954,26 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.40** (2026-06-13) — **Plugin Lens: installed plugins are usable by Prime** rollup. The
+  `relux-kernel` / `relux-core` crates move `0.1.39` → `0.1.40` in lockstep, packaging two
+  post-v0.1.39 slices into a fresh Windows bundle on top of all v0.1.39 work (RELUX_MASTER_PLAN §8.1 /
+  §11.6; built reference-first per `docs/reference-driven-development.md`). Headline: **an installed
+  plugin is no longer inert — Prime can actually read and reason over its source, read-only and
+  path-safe.**
+  - **Plugin Lens — installed plugins are usable by Prime (read-only source capabilities).** Every
+    non-bundled installed plugin (GitHub / ZIP / local-folder import, with or without a manifest) now
+    exposes four runnable read-only source tools — `plugin.summary`, `plugin.inspect`, `plugin.search`,
+    `plugin.read_file` — that Prime can use to summarize, inspect, search, and read files from the
+    plugin's own source. The tools are path-confined to the plugin directory and never execute the
+    downloaded code; runnable execution tools still require an explicit configure/approval step.
+  - **Plugins page surfaces "Prime can use (read-only)" + one-click "Summarize with Prime."** The
+    dashboard Plugins page shows the read-only source capabilities for each installed plugin and a
+    one-click Summarize-with-Prime action, and the hidden NUL separator bug in the Plugins tool
+    selector is fixed.
+  - Dashboard typecheck / tests / build green. The full-e2e release gate
+    (`scripts\relux-package-local.ps1 -FullE2E`) is run at package time. All reads/writes hit real
+    kernel state; no new authority is added (read-only source access, fail-closed). Every safety
+    property from v0.1.39 holds.
 - **v0.1.39** (2026-06-13) — **Prime brain/adapter setup** rollup. The `relux-kernel` /
   `relux-core` crates move `0.1.38` → `0.1.39` in lockstep, packaging two post-v0.1.38 slices into a
   fresh Windows bundle on top of all v0.1.38 work (RELUX_MASTER_PLAN §8.1 / §10.1; built
