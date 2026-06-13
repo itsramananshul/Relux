@@ -2021,6 +2021,23 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.45** (2026-06-13) — **Prime abilities UX** rollup. The `relux-kernel` /
+  `relux-core` crates move `0.1.44` → `0.1.45`, packaging the post-v0.1.44 dashboard
+  clarity slice into a fresh Windows bundle. Headlines:
+  - **Installed plugins now present the user-facing action as "Add Prime ability" / "Manage
+    Prime abilities."** The old generic "Configure" / "Configure tools" wording hid the real
+    product path. Manifestless GitHub / ZIP / folder imports still require no
+    `relux-plugin.json`; Relux generates safe metadata, then the operator explicitly configures a
+    governed command or loopback ability.
+  - **Prime exposes an open-by-default "Prime abilities" panel.** It loads the same
+    `GET /v1/relux/prime/tools` catalog the brain uses and shows per-tool **Ask Prime** buttons
+    that stage a natural prompt without running anything until the operator sends it.
+  - **The operator recipe now matches the UI.** README / `docs/prime-tool-use.md` / this plan
+    describe the exact path: Plugins → Add Prime ability → configure/grant → Prime abilities →
+    Ask Prime. The backend safety model is unchanged: argv-only command tools, loopback HTTP
+    tools, permission/approval gates, audit, bounded/redacted output.
+  - Dashboard typecheck / build and the targeted install-to-usable / Prime command-tool render
+    tests are green; the committed dashboard bundle is rebuilt.
 - **v0.1.44** (2026-06-13) — **Release-gate + operator-setup-guidance** rollup. The
   `relux-kernel` / `relux-core` crates move `0.1.43` → `0.1.44` in lockstep, packaging the
   post-v0.1.43 slice into a fresh Windows bundle on top of all v0.1.43 (and v0.1.42, v0.1.41)
