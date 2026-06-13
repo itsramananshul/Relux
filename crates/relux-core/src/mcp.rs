@@ -161,6 +161,159 @@ pub fn is_valid_env_var_name(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+// ===========================================================================
+// Guided secret/env setup for a managed-stdio MCP server.
+//
+// `docs/mcp.md` "Local secrets & environment" + "Guided env/secret setup";
+// `docs/RELUX_MASTER_PLAN.md` §17.5 (permissions/safety) + §8.2 (ToolSet/adapter
+// plugins needing credentials). A real MCP server (a GitHub token server, an
+// OpenAI-key tool) is useless until its env vars are mapped to stored secrets. The
+// raw `env` map ([`McpServerConfig::env`]) is the storage; these pure types are the
+// operator-facing *requirement view* the dashboard / Prime render so a user can see
+// "this needs OPENAI_API_KEY" and supply/map it WITHOUT ever editing config by hand.
+//
+// Hard invariant: this carries NAMES + mapping STATUS only — never a secret value.
+// ===========================================================================
+
+/// One environment-variable requirement of a managed-stdio MCP server's guided setup:
+/// the var NAME, whether it is required, a safe human description, and whether a stored
+/// secret is already mapped (and present). NEVER carries a secret value — only the
+/// referenced secret NAME (which is itself an operator-chosen identifier, never the
+/// plaintext). `docs/mcp.md` "Guided env/secret setup".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpEnvRequirement {
+    /// The POSIX-style env-var name the child process expects (e.g. `OPENAI_API_KEY`).
+    pub env_var: String,
+    /// Whether the server needs this var set to run. A source-declared placeholder and
+    /// an operator-mapped var are both required; advisory only — the spawn is the
+    /// authoritative gate (a missing required secret fails the spawn, naming the key).
+    pub required: bool,
+    /// A short, safe, value-free description of where the requirement came from.
+    pub description: String,
+    /// Whether the server config already maps this var to a stored secret.
+    pub secret_mapped: bool,
+    /// The mapped secret's NAME (the store key), when mapped — never the value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_name: Option<String>,
+    /// Whether the mapped secret actually exists in the local store right now. `false`
+    /// when unmapped, or mapped to a secret that has not been set / was deleted.
+    pub secret_present: bool,
+}
+
+/// The guided secret/env setup status of a managed-stdio MCP server: the per-var
+/// [`McpEnvRequirement`]s, whether every required var is satisfied (`ready`), and the
+/// names of the required vars that still need a secret (`missing`). Pure, value-free —
+/// the single structured contract the dashboard / Prime use to render a setup form and
+/// decide whether activation can proceed. `docs/mcp.md` "Guided env/secret setup".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerSetup {
+    /// The server this setup describes.
+    pub server_id: String,
+    /// One entry per env var the server expects or already maps.
+    pub requirements: Vec<McpEnvRequirement>,
+    /// True when every *required* var maps to a *present* secret (or there are no
+    /// requirements at all) — i.e. the server should have what it needs to spawn.
+    pub ready: bool,
+    /// The names of the required vars whose secret is unmapped or absent — exactly what
+    /// the setup form must collect. Empty iff `ready`.
+    pub missing: Vec<String>,
+}
+
+impl McpServerSetup {
+    /// Whether there is real setup work outstanding (at least one requirement, not
+    /// `ready`). Lets a UI decide between "show a setup form" and "nothing to do".
+    pub fn needs_setup(&self) -> bool {
+        !self.ready && !self.requirements.is_empty()
+    }
+}
+
+/// Build the value-free [`McpServerSetup`] requirement view for a managed-stdio server.
+///
+/// `expected_env` are the var names the source declared it needs (a candidate's
+/// `env_placeholders`); `config_env` is the server's current secret-ref map. The
+/// requirement set is the ordered union of the two (source-declared first). For each var
+/// the mapped secret name comes from `config_env`, and `secret_present` is decided by the
+/// injected `secret_present` closure (the kernel passes the secret store's `has`) — so
+/// this stays a PURE function with no store dependency and is unit-testable. Never reads
+/// or returns a secret value.
+pub fn build_mcp_server_setup(
+    server_id: &str,
+    expected_env: &[String],
+    config_env: &BTreeMap<String, McpEnvRef>,
+    secret_present: impl Fn(&str) -> bool,
+) -> McpServerSetup {
+    // Ordered, deduped union: source-declared vars first (the order the operator reads
+    // them), then any extra mapped vars not in the declared set.
+    let mut order: Vec<String> = Vec::new();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for v in expected_env {
+        let v = v.trim();
+        if !v.is_empty() && seen.insert(v.to_string()) {
+            order.push(v.to_string());
+        }
+    }
+    let declared: std::collections::BTreeSet<&str> =
+        expected_env.iter().map(|s| s.trim()).collect();
+    for k in config_env.keys() {
+        if seen.insert(k.clone()) {
+            order.push(k.clone());
+        }
+    }
+
+    let mut requirements = Vec::with_capacity(order.len());
+    let mut missing = Vec::new();
+    for env_var in order {
+        let mapped = config_env.get(&env_var);
+        let secret_name = mapped.map(|r| r.secret.clone());
+        let present = secret_name
+            .as_deref()
+            .map(&secret_present)
+            .unwrap_or(false);
+        let from_source = declared.contains(env_var.as_str());
+        // A declared placeholder is required; a var the operator has already mapped is
+        // also required (they would not have mapped it otherwise).
+        let required = from_source || mapped.is_some();
+        let description = if from_source {
+            "Expected by the imported MCP server — map it to a stored secret.".to_string()
+        } else {
+            "Mapped on this server's configuration.".to_string()
+        };
+        if required && !present {
+            missing.push(env_var.clone());
+        }
+        requirements.push(McpEnvRequirement {
+            env_var,
+            required,
+            description,
+            secret_mapped: mapped.is_some(),
+            secret_name,
+            secret_present: present,
+        });
+    }
+
+    McpServerSetup {
+        server_id: server_id.to_string(),
+        ready: missing.is_empty(),
+        missing,
+        requirements,
+    }
+}
+
+/// A safe default secret NAME for a server's env var, used when the operator supplies a
+/// value inline (rather than naming an existing secret): `mcp_<server>_<env_var>`,
+/// sanitized to the secret-name charset (`[A-Za-z0-9._-]`, other chars → `_`) and bounded
+/// to [`crate::MAX_SECRET_NAME_CHARS`]. Deterministic so re-running setup for the same var
+/// rewrites the same secret rather than spawning duplicates. Never contains a value.
+pub fn default_mcp_secret_name(server_id: &str, env_var: &str) -> String {
+    fn sanitize(s: &str) -> String {
+        s.chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+            .collect()
+    }
+    let raw = format!("mcp_{}_{}", sanitize(server_id), sanitize(env_var));
+    raw.chars().take(crate::MAX_SECRET_NAME_CHARS).collect()
+}
+
 /// The operator policy for **MCP sampling** (`sampling/createMessage`) on one server.
 ///
 /// MCP sampling **inverts the trust direction**: a managed MCP server can, mid-operation,
@@ -1078,6 +1231,117 @@ pub fn scan_mcp_tool_description(description: &str) -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{is_valid_secret_name, MAX_SECRET_NAME_CHARS};
+
+    fn env_map(pairs: &[(&str, &str)]) -> BTreeMap<String, McpEnvRef> {
+        pairs
+            .iter()
+            .map(|(var, secret)| {
+                ((*var).to_string(), McpEnvRef { secret: (*secret).to_string() })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn setup_requirement_for_an_unmapped_declared_env_var_is_missing() {
+        // The source declared OPENAI_API_KEY but nothing is mapped → required + missing.
+        let setup = build_mcp_server_setup(
+            "srv",
+            &["OPENAI_API_KEY".to_string()],
+            &BTreeMap::new(),
+            |_| false,
+        );
+        assert!(!setup.ready);
+        assert!(setup.needs_setup());
+        assert_eq!(setup.missing, vec!["OPENAI_API_KEY".to_string()]);
+        let req = &setup.requirements[0];
+        assert_eq!(req.env_var, "OPENAI_API_KEY");
+        assert!(req.required);
+        assert!(!req.secret_mapped);
+        assert_eq!(req.secret_name, None);
+        assert!(!req.secret_present);
+    }
+
+    #[test]
+    fn setup_is_ready_when_every_required_var_maps_to_a_present_secret() {
+        let env = env_map(&[("OPENAI_API_KEY", "openai_key")]);
+        let setup = build_mcp_server_setup(
+            "srv",
+            &["OPENAI_API_KEY".to_string()],
+            &env,
+            |name| name == "openai_key", // the mapped secret exists
+        );
+        assert!(setup.ready);
+        assert!(!setup.needs_setup());
+        assert!(setup.missing.is_empty());
+        let req = &setup.requirements[0];
+        assert!(req.secret_mapped);
+        assert_eq!(req.secret_name.as_deref(), Some("openai_key"));
+        assert!(req.secret_present);
+    }
+
+    #[test]
+    fn mapped_but_absent_secret_is_still_missing() {
+        // The config references a secret that has not been set / was deleted → not ready.
+        let env = env_map(&[("TOKEN", "ghost_secret")]);
+        let setup = build_mcp_server_setup("srv", &["TOKEN".to_string()], &env, |_| false);
+        assert!(!setup.ready);
+        assert_eq!(setup.missing, vec!["TOKEN".to_string()]);
+        let req = &setup.requirements[0];
+        assert!(req.secret_mapped, "the ref exists in config");
+        assert!(!req.secret_present, "but the secret itself is absent");
+    }
+
+    #[test]
+    fn config_only_vars_are_unioned_after_declared_ones() {
+        // A var mapped on the config but not declared by the source still surfaces.
+        let env = env_map(&[("EXTRA", "extra_secret")]);
+        let setup = build_mcp_server_setup(
+            "srv",
+            &["DECLARED".to_string()],
+            &env,
+            |name| name == "extra_secret",
+        );
+        let names: Vec<&str> = setup.requirements.iter().map(|r| r.env_var.as_str()).collect();
+        assert_eq!(names, vec!["DECLARED", "EXTRA"], "declared first, config-only after");
+        // EXTRA is required (operator mapped it) and present; DECLARED is missing.
+        assert_eq!(setup.missing, vec!["DECLARED".to_string()]);
+    }
+
+    #[test]
+    fn no_requirements_is_trivially_ready() {
+        let setup = build_mcp_server_setup("srv", &[], &BTreeMap::new(), |_| false);
+        assert!(setup.ready);
+        assert!(!setup.needs_setup(), "nothing to set up");
+        assert!(setup.requirements.is_empty());
+    }
+
+    #[test]
+    fn setup_view_never_carries_a_secret_value() {
+        // Whatever we build, serializing it must never contain a plaintext value — only
+        // names. (The store never hands a value to this builder, but pin the contract.)
+        let env = env_map(&[("OPENAI_API_KEY", "openai_key")]);
+        let setup = build_mcp_server_setup("srv", &["OPENAI_API_KEY".to_string()], &env, |_| true);
+        let json = serde_json::to_string(&setup).unwrap();
+        assert!(json.contains("openai_key"), "the secret NAME is fine to show");
+        assert!(json.contains("OPENAI_API_KEY"));
+        // A representative real key value must never appear (we never put one in).
+        assert!(!json.contains("sk-"), "no value-shaped string: {json}");
+    }
+
+    #[test]
+    fn default_secret_name_is_a_safe_deterministic_identifier() {
+        let n = default_mcp_secret_name("gh-mcp", "GITHUB_TOKEN");
+        assert_eq!(n, "mcp_gh-mcp_GITHUB_TOKEN");
+        assert!(is_valid_secret_name(&n));
+        // Injection-shaped chars in the inputs are sanitized to '_'.
+        let dirty = default_mcp_secret_name("a/b c", "X=Y");
+        assert!(is_valid_secret_name(&dirty), "sanitized: {dirty}");
+        assert!(!dirty.contains('/') && !dirty.contains(' ') && !dirty.contains('='));
+        // Bounded.
+        let long = default_mcp_secret_name(&"s".repeat(200), &"E".repeat(200));
+        assert!(long.chars().count() <= MAX_SECRET_NAME_CHARS);
+    }
 
     fn cfg(id: &str, endpoint: &str) -> McpServerConfig {
         McpServerConfig {

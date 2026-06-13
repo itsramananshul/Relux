@@ -1948,6 +1948,52 @@ export interface ReluxMcpPostActivationDiscovery {
   error?: string;
 }
 
+// One environment-variable requirement of a managed-stdio MCP server's guided setup
+// (the kernel's McpEnvRequirement). NAMES + mapping STATUS only — NEVER a secret value.
+export interface ReluxMcpEnvRequirement {
+  // The POSIX-style env var the child expects (e.g. OPENAI_API_KEY).
+  env_var: string;
+  // Whether the server needs this var set to run.
+  required: boolean;
+  // A short, safe, value-free description of where the requirement came from.
+  description: string;
+  // Whether the server config already maps this var to a stored secret.
+  secret_mapped: boolean;
+  // The mapped secret's NAME (the store key), when mapped — never the value.
+  secret_name?: string;
+  // Whether the mapped secret actually exists in the local store right now.
+  secret_present: boolean;
+}
+
+// The guided secret/env setup status of a managed-stdio MCP server (the kernel's
+// McpServerSetup): the per-var requirements, whether everything required is satisfied,
+// and the names still missing. Value-free — the contract a setup form renders from.
+export interface ReluxMcpServerSetup {
+  server_id: string;
+  requirements: ReluxMcpEnvRequirement[];
+  // True when every required var maps to a present secret (or there are none).
+  ready: boolean;
+  // Names of the required vars whose secret is unmapped or absent. Empty iff ready.
+  missing: string[];
+}
+
+// One env-var → secret mapping to apply in a guided setup. Supply EITHER an inline
+// `value` (stored write-only as a new/rewritten secret) OR the `secret_name` of an
+// existing stored secret to reference. The value, when given, never comes back.
+export interface ReluxMcpEnvSetupMapping {
+  env_var: string;
+  secret_name?: string;
+  value?: string;
+}
+
+// The value-free result of POST .../env-setup: the redacted server, the recomputed
+// requirement view, and (when rediscover was requested) the post-setup discovery.
+export interface ReluxMcpEnvSetupResult {
+  server: ReluxMcpServer;
+  setup: ReluxMcpServerSetup;
+  discovery?: ReluxMcpPostActivationDiscovery;
+}
+
 // The structured result of a confirmed capability activation (the kernel's
 // PrimeConfigureCandidateResponse). One auditable envelope: which plugin/candidate was
 // activated, through which governed path, the resulting server/tool status, the honest
@@ -1967,6 +2013,10 @@ export interface ReluxPrimeConfigureCandidateResult {
   // "couldn't reach it / what's missing" message. The guided discovery step that turns
   // "registered" into "here's what Prime can use" without a separate manual Discover.
   mcp_discovery?: ReluxMcpPostActivationDiscovery;
+  // Present for an mcp_register activation whose source declared env vars: the value-free
+  // guided secret/env setup requirement view (what is needed, what already maps to a present
+  // secret, what is still missing). Drives the setup form. Never carries a value.
+  setup?: ReluxMcpServerSetup;
   // Present for a command_tool activation: the updated plugin record (carries the new tool).
   plugin?: ReluxPlugin;
   // The new tool name (command tool) or registered MCP server id, for "ask me to use it".
@@ -3675,6 +3725,32 @@ export const reluxMcp = {
   tools: (id: string) =>
     api.get<ReluxMcpToolsResult>(
       `/v1/relux/mcp/servers/${encodeURIComponent(id)}/tools`,
+    ),
+  // The value-free guided secret/env requirement view for a managed-stdio server.
+  // `expected` are the source-declared env var names (a candidate's env_placeholders),
+  // so a declared-but-unmapped var surfaces even before it is on the config. Never a value.
+  envSetupStatus: (id: string, expected?: string[]) => {
+    const q = expected && expected.length > 0
+      ? `?expected=${encodeURIComponent(expected.join(","))}`
+      : "";
+    return api.get<ReluxMcpServerSetup>(
+      `/v1/relux/mcp/servers/${encodeURIComponent(id)}/env-setup${q}`,
+    );
+  },
+  // Store + map the secrets a managed-stdio server needs, then optionally re-discover.
+  // Each mapping supplies a write-only `value` OR an existing `secret_name`. No plaintext
+  // is ever returned. 400 invalid name / non-stdio · 404 unknown server.
+  envSetup: (
+    id: string,
+    body: {
+      mappings: ReluxMcpEnvSetupMapping[];
+      expected_env?: string[];
+      rediscover?: boolean;
+    },
+  ) =>
+    api.post<ReluxMcpEnvSetupResult>(
+      `/v1/relux/mcp/servers/${encodeURIComponent(id)}/env-setup`,
+      body,
     ),
   // Set the risk + approval classification for one discovered tool, so it can
   // become directly runnable (low + never) or stay gated. 404 unknown server ·

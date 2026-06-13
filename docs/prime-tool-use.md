@@ -358,6 +358,17 @@ The flow:
      server's secrets `ENV_VAR=secret_name`, then **Discover**, for a managed-stdio server
      with env placeholders; **Start it on the MCP page** otherwise) plus the sanitized,
      value-free `error` reason. **No fabricated tools.**
+   - **Guided secret/env setup (when the source declared env vars).** The same response
+     also carries a value-free `setup` requirement view (`relux_core::McpServerSetup`):
+     which env vars the server needs, which already map to a *present* stored secret, and
+     what is still `missing`. The chat renders an inline **"Set up the secrets this server
+     needs"** form (`McpEnvSetupForm`) so the user can supply a value (stored write-only) or
+     map an existing secret, then re-discover — **without** hand-editing config. The form
+     posts to the single governed `POST /v1/relux/mcp/servers/:id/env-setup` chokepoint,
+     which stores + maps the secrets through the existing write-only store + managed-stdio
+     `env` contract and returns the recomputed (still value-free) setup + a fresh discovery.
+     See `docs/mcp.md` "Guided env/secret setup". **No secret value ever crosses the wire;
+     setup runs no source code; the resulting tools stay gated.**
    This step is best-effort: the server is already registered, so a probe failure becomes
    guidance, **never a failed activation**. Discovery **lists** tools only — it never calls
    one, and never silently marks a discovered tool low-risk. This mirrors Hermes

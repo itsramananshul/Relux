@@ -30,6 +30,7 @@ import {
   type ReluxToolInvocationResult,
 } from "../api";
 import { useAsync } from "../components/common";
+import { McpEnvSetupSection } from "../components/McpEnvSetupForm";
 import {
   adapterStatusBadge,
   canConfigureTools,
@@ -2996,10 +2997,19 @@ function CapabilityCard({
 
       {oneClick && candidate.mcp_registration ? (
         registered ? (
-          <p className="banner ok" style={{ fontSize: 11, margin: "6px 0 0" }}>
-            MCP server registered. Open the <strong>MCP servers</strong> section above
-            and click <strong>Discover</strong> to list its tools through the gate.
-          </p>
+          candidate.env_placeholders && candidate.env_placeholders.length > 0 ? (
+            // The server needs secrets — guide the user to supply/map them and re-discover
+            // here, instead of pointing at a manual config edit on the MCP page.
+            <McpEnvSetupSection
+              serverId={candidate.mcp_registration.suggested_id}
+              expected={candidate.env_placeholders}
+            />
+          ) : (
+            <p className="banner ok" style={{ fontSize: 11, margin: "6px 0 0" }}>
+              MCP server registered. Open the <strong>MCP servers</strong> section above
+              and click <strong>Discover</strong> to list its tools through the gate.
+            </p>
+          )
         ) : open ? (
           <div style={{ marginTop: 8 }}>
             <AddMcpServerForm

@@ -278,6 +278,8 @@ async fn serve() -> Result<(), KernelError> {
     println!("   POST   /v1/relux/mcp/servers              {{ \"id\":\"...\", \"transport\":\"managed_stdio\", \"command\":\"npx\", \"args\":[\"-y\",\"server\"], … }}");
     println!("   DELETE /v1/relux/mcp/servers/:id           (remove an MCP server)");
     println!("   GET    /v1/relux/mcp/servers/:id/tools     (live tools/list discovery → ToolDescriptor[])");
+    println!("   GET    /v1/relux/mcp/servers/:id/env-setup?expected=A,B  (value-free guided secret/env requirement view)");
+    println!("   POST   /v1/relux/mcp/servers/:id/env-setup {{ \"mappings\":[{{\"env_var\":\"OPENAI_API_KEY\",\"value\":\"…\"}}|{{\"env_var\":…,\"secret_name\":…}}], \"expected_env\"?, \"rediscover\"? }}  (store+map secrets, then optionally re-discover; no plaintext returned)");
     println!("   GET    /v1/relux/mcp/servers/status        (managed-stdio process status for every stdio server)");
     println!("   GET    /v1/relux/mcp/servers/:id/status    (managed-stdio process status: state/pid/log tail)");
     println!("   POST   /v1/relux/mcp/servers/:id/start     (start the managed-stdio process — reused for list/call)");
@@ -662,6 +664,13 @@ fn protected_router() -> Router<AppState> {
         )
         .route("/v1/relux/mcp/servers/:id", delete(delete_mcp_server))
         .route("/v1/relux/mcp/servers/:id/tools", get(mcp_server_tools))
+        // Guided secret/env setup: GET the value-free requirement view, POST to store +
+        // map the required secret refs (then optionally re-discover). No plaintext is ever
+        // returned; setup runs no source code.
+        .route(
+            "/v1/relux/mcp/servers/:id/env-setup",
+            get(mcp_env_setup_status).post(mcp_env_setup),
+        )
         // Managed-stdio process lifecycle (start/stop/restart/status). HTTP-loopback
         // servers have no process lifecycle (they are an endpoint the operator runs).
         .route(
@@ -8165,6 +8174,13 @@ struct PrimeConfigureCandidateResponse {
     /// what Prime can now use" without the user driving a separate Discover.
     #[serde(skip_serializing_if = "Option::is_none")]
     mcp_discovery: Option<McpPostActivationDiscovery>,
+    /// Present for an `mcp_register` activation whose source declared env vars: the
+    /// value-free guided **secret/env setup** requirement view (which vars are needed,
+    /// which already map to a present secret, what is still `missing`). Lets the UI / Prime
+    /// render a setup form and supply/map the secrets without hand-editing config. `None`
+    /// when the candidate declared no env (nothing to set up). Never carries a value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    setup: Option<relux_core::McpServerSetup>,
     /// Present for a `command_tool` activation: the updated plugin record (carries the
     /// new tool in its count) so the page can refresh.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -8312,6 +8328,25 @@ fn build_post_activation_discovery(
                 next_step,
             )
         }
+    }
+}
+
+/// Build the value-free guided secret/env [`relux_core::McpServerSetup`] for a managed-stdio
+/// server from the server's current secret-ref `env`, the source-declared expected env var
+/// names, and the LIVE secret store (its `has` decides `secret_present`). Returns `None`
+/// when there are no requirements at all (nothing to set up). Never reads/returns a value.
+fn mcp_server_setup_for(
+    server_id: &str,
+    env: &std::collections::BTreeMap<String, relux_core::McpEnvRef>,
+    expected_env: &[String],
+) -> Option<relux_core::McpServerSetup> {
+    let store = relux_kernel::secret_store();
+    let setup =
+        relux_core::build_mcp_server_setup(server_id, expected_env, env, |name| store.has(name));
+    if setup.requirements.is_empty() {
+        None
+    } else {
+        Some(setup)
     }
 }
 
@@ -8463,7 +8498,7 @@ async fn prime_configure_candidate_action(
 
     // 4. Activate through the EXISTING governed path for this candidate's activation.
     let plugin_id = relux_core::PluginId::new(target.id.clone());
-    let (mcp_server, plugin_record, tool_name, next_step, mcp_discovery) = match candidate
+    let (mcp_server, plugin_record, tool_name, next_step, mcp_discovery, setup) = match candidate
         .activation
         .as_str()
     {
@@ -8511,6 +8546,11 @@ async fn prime_configure_candidate_action(
                 })?
             };
             let resp = McpServerResponse::from_config(&cfg);
+            // Guided secret/env setup: the value-free requirement view (which env vars the
+            // source declared, which already map to a present secret, what is still
+            // missing) so the UI / Prime can render a setup form instead of a config edit.
+            let setup =
+                mcp_server_setup_for(&server_id, &cfg.env, &candidate.env_placeholders);
             // Guided post-activation discovery: probe the freshly-registered server OFF the
             // kernel lock (best-effort — the server is already registered, so a probe
             // failure becomes actionable guidance, never a failed activation). This turns
@@ -8519,7 +8559,7 @@ async fn prime_configure_candidate_action(
             // one. Each discovered tool keeps its fail-closed classification.
             let (discovery, step) =
                 probe_registered_mcp_server(cfg, candidate.env_placeholders.clone()).await;
-            (Some(resp), None, server_id, step, Some(discovery))
+            (Some(resp), None, server_id, step, Some(discovery), setup)
         }
         "command_tool" => {
             let body = relux_kernel::command_tool_body(&candidate).ok_or_else(|| {
@@ -8540,7 +8580,7 @@ async fn prime_configure_candidate_action(
             let step = format!(
                 "Configured command tool \"{tool_name}\". It is gated (needs approval) — ask me to use {tool_name} and I'll stage the approval before it runs."
             );
-            (None, Some(record), tool_name, step, None)
+            (None, Some(record), tool_name, step, None, None)
         }
         other => {
             return Err(ApiError::bad_request(format!(
@@ -8574,6 +8614,7 @@ async fn prime_configure_candidate_action(
         activation: candidate.activation,
         mcp_server,
         mcp_discovery,
+        setup,
         plugin: plugin_record,
         tool_name,
         next_step,
@@ -9360,6 +9401,198 @@ async fn register_mcp_server(
         })?
     };
     Ok(Json(resp))
+}
+
+/// Query for `GET /v1/relux/mcp/servers/:id/env-setup` — an optional comma-separated list
+/// of the env-var names the source declared it needs (a candidate's `env_placeholders`),
+/// so the requirement view can surface a declared-but-unmapped var the live config alone
+/// would not show. Names only.
+#[derive(Debug, Deserialize)]
+struct McpEnvSetupQuery {
+    #[serde(default)]
+    expected: Option<String>,
+}
+
+/// GET `/v1/relux/mcp/servers/:id/env-setup` — the value-free guided secret/env setup
+/// **requirement view** for a managed-stdio server: which env vars it expects (the union
+/// of the source-declared `?expected=A,B` and the live config's mapped vars), which already
+/// map to a present stored secret, and which are still `missing`. Never returns a value.
+/// (`docs/mcp.md` "Guided env/secret setup".)
+async fn mcp_env_setup_status(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    query: axum::extract::Query<McpEnvSetupQuery>,
+) -> Result<Json<relux_core::McpServerSetup>, ApiError> {
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err(ApiError::bad_request("MCP server id is required"));
+    }
+    let expected = parse_expected_env(query.expected.as_deref());
+    let env = locked_read(&state, |kernel| {
+        let cfg = kernel
+            .mcp_server(&id)
+            .ok_or_else(|| KernelError::UnknownMcpServer(id.clone()))?;
+        Ok(cfg.env.clone())
+    })?;
+    let store = relux_kernel::secret_store();
+    let setup = relux_core::build_mcp_server_setup(&id, &expected, &env, |name| store.has(name));
+    Ok(Json(setup))
+}
+
+/// Split a comma/whitespace-separated `expected` query into bounded env-var name tokens.
+/// Invalid names are dropped (the requirement view is advisory; the mutation route is the
+/// authoritative validator). Names only — never a value.
+fn parse_expected_env(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or("")
+        .split([',', ' ', '\n', '\t'])
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && relux_core::is_valid_env_var_name(s))
+        .take(relux_core::MAX_MCP_ENV_VARS)
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// One env-var mapping in a guided setup request: the env-var NAME the child receives, and
+/// EITHER an inline `value` (stored write-only as a new/rewritten secret) OR the `secret_name`
+/// of an existing stored secret to reference. Exactly one of the two must be present. The
+/// `value`, when given, is the ONLY plaintext this struct ever carries and is never echoed
+/// back (the response is value-free).
+#[derive(Debug, Deserialize)]
+struct McpEnvSetupMapping {
+    env_var: String,
+    #[serde(default)]
+    secret_name: Option<String>,
+    #[serde(default)]
+    value: Option<String>,
+}
+
+/// Body for `POST /v1/relux/mcp/servers/:id/env-setup` — the guided secret/env setup
+/// mutation: a set of env-var → secret mappings to store + map onto the server, the
+/// source-declared `expected_env` (so the returned requirement view is complete), and
+/// whether to re-run discovery afterwards.
+#[derive(Debug, Deserialize)]
+struct McpEnvSetupReq {
+    #[serde(default)]
+    mappings: Vec<McpEnvSetupMapping>,
+    #[serde(default)]
+    expected_env: Vec<String>,
+    #[serde(default)]
+    rediscover: bool,
+}
+
+/// The value-free result of a guided secret/env setup: the redacted server record, the
+/// recomputed requirement view, and (when `rediscover` was requested) the post-setup
+/// `tools/list` discovery. Never carries a secret value.
+#[derive(Debug, Serialize)]
+struct McpEnvSetupResponse {
+    server: McpServerResponse,
+    setup: relux_core::McpServerSetup,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discovery: Option<McpPostActivationDiscovery>,
+}
+
+/// POST `/v1/relux/mcp/servers/:id/env-setup` — the single guided chokepoint that lets a
+/// user supply / map the secrets a managed-stdio MCP server needs and then re-discover its
+/// tools, WITHOUT hand-editing config. For each mapping it either stores an inline `value`
+/// as a write-only secret (default name `mcp_<server>_<ENV_VAR>`, or an explicit
+/// `secret_name`) or references an existing secret by name, then maps `ENV_VAR → {secret}`
+/// onto the server through the unchanged kernel path (which re-validates the env contract).
+/// No plaintext is ever returned; env-var + secret names are validated; the server id is
+/// validated; and setup runs NO source code (an optional re-discover only LISTS tools
+/// through the existing gated probe). (`docs/mcp.md` "Guided env/secret setup";
+/// `docs/RELUX_MASTER_PLAN.md` §17.5 / §8.2.)
+async fn mcp_env_setup(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<McpEnvSetupReq>,
+) -> Result<Json<McpEnvSetupResponse>, ApiError> {
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err(ApiError::bad_request("MCP server id is required"));
+    }
+
+    // 1. Validate every mapping and (for inline values) store the secret, building the
+    //    env-var → secret-ref additions. Fail closed on any bad name BEFORE mutating the
+    //    server, so a partial-but-invalid batch never half-applies the env map.
+    let store = relux_kernel::secret_store();
+    let mut additions: std::collections::BTreeMap<String, relux_core::McpEnvRef> =
+        std::collections::BTreeMap::new();
+    for m in &req.mappings {
+        let env_var = m.env_var.trim().to_string();
+        if !relux_core::is_valid_env_var_name(&env_var) {
+            return Err(ApiError::bad_request(format!(
+                "invalid env var name {env_var:?}"
+            )));
+        }
+        let inline = m.value.as_deref().map(str::trim).filter(|v| !v.is_empty());
+        let explicit = m
+            .secret_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let secret_name = match (inline, explicit) {
+            (Some(value), explicit_name) => {
+                // Store the inline value write-only under the explicit or default name.
+                let name = match explicit_name {
+                    Some(n) => n.to_string(),
+                    None => relux_core::default_mcp_secret_name(&id, &env_var),
+                };
+                store
+                    .set(&name, value)
+                    .map_err(|e| ApiError::bad_request(e.to_string()))?;
+                name
+            }
+            (None, Some(name)) => {
+                // Reference an existing secret by name (validated; presence is reported in
+                // the setup view, not required here — exactly like registration).
+                if !relux_core::is_valid_secret_name(name) {
+                    return Err(ApiError::bad_request(format!(
+                        "invalid secret name for env var {env_var:?}"
+                    )));
+                }
+                name.to_string()
+            }
+            (None, None) => {
+                return Err(ApiError::bad_request(format!(
+                    "mapping for env var {env_var:?} needs a value or a secret_name"
+                )));
+            }
+        };
+        additions.insert(env_var, relux_core::McpEnvRef { secret: secret_name });
+    }
+
+    // 2. Map the additions onto the server (skip the mutation when there are none — the
+    //    route then just recomputes the requirement view / re-discovers). The kernel path
+    //    re-validates the env contract and refuses a non-stdio server.
+    let cfg = if additions.is_empty() {
+        locked_read(&state, |kernel| {
+            kernel
+                .mcp_server(&id)
+                .cloned()
+                .ok_or_else(|| KernelError::UnknownMcpServer(id.clone()))
+        })?
+    } else {
+        locked_save(&state, |kernel| kernel.map_mcp_server_env(&id, additions.clone()))?
+    };
+
+    // 3. Recompute the value-free requirement view (declared ∪ live config).
+    let setup =
+        relux_core::build_mcp_server_setup(&id, &req.expected_env, &cfg.env, |name| store.has(name));
+
+    // 4. Optionally re-run the bounded, off-lock discovery so the user sees what the server
+    //    now advertises (or honest guidance) without driving a separate Discover.
+    let discovery = if req.rediscover {
+        let (d, _step) = probe_registered_mcp_server(cfg.clone(), setup.missing.clone()).await;
+        Some(d)
+    } else {
+        None
+    };
+
+    Ok(Json(McpEnvSetupResponse {
+        server: McpServerResponse::from_config(&cfg),
+        setup,
+        discovery,
+    }))
 }
 
 /// Body for `PUT /v1/relux/secrets/:name` — the plaintext value to store. Write-only:
@@ -12959,6 +13192,231 @@ mod tests {
         let (ls, _c, list) = call(&state, "GET", "/v1/relux/mcp/servers", None, None).await;
         assert_eq!(ls, StatusCode::OK);
         assert!(list.contains(v["tool_name"].as_str().unwrap()), "registered server missing: {list}");
+    }
+
+    #[tokio::test]
+    async fn configure_candidate_surfaces_then_env_setup_resolves_a_missing_secret() {
+        // The end-to-end guided secret/env path: a candidate that declares an env var lands
+        // as an honest "needs OPENAI_API_KEY" requirement, and the env-setup route stores +
+        // maps the secret and re-discovers — never echoing a value. (docs/mcp.md "Guided
+        // env/secret setup".)
+        let (state, _dir) = auth_state(true);
+        // A standalone MCP stdio config that declares an env var. The command is a
+        // guaranteed-absent binary so any tools/list probe fails fast + deterministically.
+        // The placeholder value in the config must never cross the wire (env is not
+        // pre-filled — secrets are mapped separately, by reference, not value).
+        let (_src, id) = install_source_plugin(
+            &state,
+            "mcp.json",
+            r#"{"mcpServers":{"gh":{"command":"relux-absent-mcp-binary-xyz","args":["--serve"],"env":{"OPENAI_API_KEY":"sk-PLACEHOLDER-MUST-NOT-LEAK"}}}}"#,
+        )
+        .await;
+        let req = serde_json::json!({ "plugin_id": id, "candidate_id": "mcp" }).to_string();
+        let (status, _c, body) = call(
+            &state,
+            "POST",
+            "/v1/relux/prime/actions/configure-candidate",
+            None,
+            Some(&req),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let server_id = v["mcp_server"]["id"].as_str().expect("server id").to_string();
+        // The guided setup surfaces the declared env var as a missing, unmapped requirement.
+        assert_eq!(v["setup"]["ready"], false, "body: {body}");
+        let missing = v["setup"]["missing"].as_array().unwrap();
+        assert!(
+            missing.iter().any(|m| m == "OPENAI_API_KEY"),
+            "OPENAI_API_KEY should be missing: {body}"
+        );
+        let reqmt = v["setup"]["requirements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["env_var"] == "OPENAI_API_KEY")
+            .expect("a requirement for the declared var");
+        assert_eq!(reqmt["required"], true, "body: {body}");
+        assert_eq!(reqmt["secret_mapped"], false, "env is not pre-filled: {body}");
+        assert_eq!(reqmt["secret_present"], false, "no secret stored yet: {body}");
+        // The config's placeholder value never crossed the wire.
+        assert!(!body.contains("PLACEHOLDER-MUST-NOT-LEAK"), "value leaked: {body}");
+
+        // Save + map the secret through the single guided route, then re-discover.
+        let secret_value = "sk-live-secret-value-9999-do-not-leak";
+        let setup_req = serde_json::json!({
+            "mappings": [{ "env_var": "OPENAI_API_KEY", "value": secret_value }],
+            "expected_env": ["OPENAI_API_KEY"],
+            "rediscover": true,
+        })
+        .to_string();
+        let (s2, _c, body2) = call(
+            &state,
+            "POST",
+            &format!("/v1/relux/mcp/servers/{server_id}/env-setup"),
+            None,
+            Some(&setup_req),
+        )
+        .await;
+        assert_eq!(s2, StatusCode::OK, "body: {body2}");
+        let v2: serde_json::Value = serde_json::from_str(&body2).unwrap();
+        // Setup is now ready: the var maps to a present secret.
+        assert_eq!(v2["setup"]["ready"], true, "body: {body2}");
+        assert!(v2["setup"]["missing"].as_array().unwrap().is_empty(), "body: {body2}");
+        let r2 = v2["setup"]["requirements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["env_var"] == "OPENAI_API_KEY")
+            .unwrap();
+        assert_eq!(r2["secret_mapped"], true, "body: {body2}");
+        assert_eq!(r2["secret_present"], true, "body: {body2}");
+        // The server now references the secret by NAME (a default derived name) — the value
+        // is nowhere in the config/response.
+        let mapped = r2["secret_name"].as_str().expect("a mapped secret name");
+        assert_eq!(v2["server"]["env"]["OPENAI_API_KEY"]["secret"], mapped, "body: {body2}");
+        // Re-discovery PROCEEDED (the bounded probe ran). Reachability is honest (the binary
+        // is absent), but the activation/discovery flow is unblocked — no fabricated tools.
+        assert!(v2["discovery"].is_object(), "discovery ran: {body2}");
+        assert_eq!(v2["discovery"]["tool_count"], 0, "no fake tools: {body2}");
+        // CRITICAL: the secret value never appears anywhere in the response.
+        assert!(!body2.contains(secret_value), "secret value leaked in env-setup response: {body2}");
+
+        // And it never appears in the secrets listing (redacted preview only).
+        let (s3, _c, list) = call(&state, "GET", "/v1/relux/secrets", None, None).await;
+        assert_eq!(s3, StatusCode::OK);
+        assert!(!list.contains(secret_value), "secret value leaked in secrets list: {list}");
+
+        // The GET requirement view agrees (declared ∪ live config), value-free.
+        let (s4, _c, statusbody) = call(
+            &state,
+            "GET",
+            &format!("/v1/relux/mcp/servers/{server_id}/env-setup?expected=OPENAI_API_KEY"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(s4, StatusCode::OK, "body: {statusbody}");
+        let v4: serde_json::Value = serde_json::from_str(&statusbody).unwrap();
+        assert_eq!(v4["ready"], true, "body: {statusbody}");
+        assert!(!statusbody.contains(secret_value), "value leaked in status: {statusbody}");
+    }
+
+    #[tokio::test]
+    async fn env_setup_maps_to_an_existing_secret_by_name() {
+        // The other supply mode: reference an already-stored secret by name (no inline
+        // value). Set the secret first, register a stdio server, then map it.
+        let (state, _dir) = auth_state(true);
+        let (sset, _c, _b) = call(
+            &state,
+            "PUT",
+            "/v1/relux/secrets/my_token",
+            None,
+            Some(r#"{"value":"tok-existing-secret-7777"}"#),
+        )
+        .await;
+        assert_eq!(sset, StatusCode::OK);
+        let reg = serde_json::json!({
+            "id": "srv-existing",
+            "transport": "managed_stdio",
+            "command": "relux-absent-mcp-binary-xyz",
+            "args": ["--serve"],
+        })
+        .to_string();
+        let (sreg, _c, _b) =
+            call(&state, "POST", "/v1/relux/mcp/servers", None, Some(&reg)).await;
+        assert_eq!(sreg, StatusCode::OK);
+        let setup_req = serde_json::json!({
+            "mappings": [{ "env_var": "API_TOKEN", "secret_name": "my_token" }],
+            "expected_env": ["API_TOKEN"],
+        })
+        .to_string();
+        let (s, _c, body) = call(
+            &state,
+            "POST",
+            "/v1/relux/mcp/servers/srv-existing/env-setup",
+            None,
+            Some(&setup_req),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "body: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["setup"]["ready"], true, "the existing secret is present: {body}");
+        assert_eq!(v["server"]["env"]["API_TOKEN"]["secret"], "my_token", "body: {body}");
+        assert!(!body.contains("tok-existing-secret-7777"), "value leaked: {body}");
+    }
+
+    #[tokio::test]
+    async fn env_setup_validates_input_and_rejects_non_stdio() {
+        let (state, _dir) = auth_state(true);
+        // Register a stdio server to map onto.
+        let reg = serde_json::json!({
+            "id": "srv-validate",
+            "transport": "managed_stdio",
+            "command": "relux-absent-mcp-binary-xyz",
+        })
+        .to_string();
+        let (sreg, _c, _b) =
+            call(&state, "POST", "/v1/relux/mcp/servers", None, Some(&reg)).await;
+        assert_eq!(sreg, StatusCode::OK);
+
+        // A bad env var name is rejected before any mutation.
+        let bad_name = serde_json::json!({ "mappings": [{ "env_var": "1BAD NAME", "value": "x" }] }).to_string();
+        let (s1, _c, b1) = call(
+            &state,
+            "POST",
+            "/v1/relux/mcp/servers/srv-validate/env-setup",
+            None,
+            Some(&bad_name),
+        )
+        .await;
+        assert_eq!(s1, StatusCode::BAD_REQUEST, "body: {b1}");
+        assert!(b1.contains("invalid env var name"), "body: {b1}");
+
+        // A mapping with neither a value nor a secret_name is rejected.
+        let neither = serde_json::json!({ "mappings": [{ "env_var": "TOKEN" }] }).to_string();
+        let (s2, _c, b2) = call(
+            &state,
+            "POST",
+            "/v1/relux/mcp/servers/srv-validate/env-setup",
+            None,
+            Some(&neither),
+        )
+        .await;
+        assert_eq!(s2, StatusCode::BAD_REQUEST, "body: {b2}");
+        assert!(b2.contains("needs a value or a secret_name"), "body: {b2}");
+
+        // An HTTP-loopback server has no spawned child, so env mapping is refused.
+        let reghttp = serde_json::json!({
+            "id": "srv-http",
+            "endpoint": "http://127.0.0.1:8765/mcp",
+        })
+        .to_string();
+        let (sh, _c, _b) =
+            call(&state, "POST", "/v1/relux/mcp/servers", None, Some(&reghttp)).await;
+        assert_eq!(sh, StatusCode::OK);
+        let map_http = serde_json::json!({ "mappings": [{ "env_var": "TOKEN", "value": "x" }] }).to_string();
+        let (s3, _c, b3) = call(
+            &state,
+            "POST",
+            "/v1/relux/mcp/servers/srv-http/env-setup",
+            None,
+            Some(&map_http),
+        )
+        .await;
+        assert_eq!(s3, StatusCode::BAD_REQUEST, "body: {b3}");
+        assert!(b3.contains("managed-stdio"), "body: {b3}");
+
+        // An unknown server is a 404.
+        let (s4, _c, _b4) = call(
+            &state,
+            "POST",
+            "/v1/relux/mcp/servers/nope/env-setup",
+            None,
+            Some(&map_http),
+        )
+        .await;
+        assert_eq!(s4, StatusCode::NOT_FOUND);
     }
 
     /// True when a real `node` is on PATH (argv-only `node --version`, no shell). The

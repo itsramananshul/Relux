@@ -51,12 +51,14 @@ pub use hierarchy::{
     chain_of_command, is_in_subtree, would_create_cycle, ReportsToMap, MAX_HIERARCHY_DEPTH,
 };
 pub use mcp::{
-    clamp_mcp_timeout, is_valid_env_var_name, is_valid_mcp_id, is_valid_mcp_prompt_name,
+    build_mcp_server_setup, clamp_mcp_timeout, default_mcp_secret_name, is_valid_env_var_name,
+    is_valid_mcp_id, is_valid_mcp_prompt_name,
     is_valid_mcp_resource_uri, is_valid_mcp_tool_name, mcp_synthetic_plugin_id, mcp_tool_permission,
     sanitize_mcp_prompt_description, sanitize_mcp_resource_description, sanitize_mcp_server_id,
     sanitize_mcp_text, sanitize_mcp_tool_description, scan_mcp_tool_description,
     validate_mcp_server_config, validate_stdio_command, validate_stdio_cwd_shape,
-    validate_stdio_env, ManagedStdioState, ManagedStdioStatus, McpConfigError, McpEnvRef, McpPrompt,
+    validate_stdio_env, ManagedStdioState, ManagedStdioStatus, McpConfigError, McpEnvRef,
+    McpEnvRequirement, McpServerSetup, McpPrompt,
     McpPromptArgument, McpPromptMessage, McpPromptResult, McpResource, McpResourceContent,
     McpSamplingAuditRecord, McpSamplingPolicy, McpServerConfig, McpTool, McpToolClassification,
     McpTransport, DEFAULT_MCP_TIMEOUT_MS,

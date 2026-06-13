@@ -580,6 +580,57 @@ form.
 (`apps/dashboard/src/pages/Plugins.tsx`, `apps/dashboard/src/plugins.ts`,
 `managedStdioStatusBadge`.)
 
+### Guided env/secret setup
+
+Spec refs: `docs/RELUX_MASTER_PLAN.md` §17.5 (permissions/safety) + §8.2 (ToolSet/adapter
+plugins needing credentials); `docs/prime-tool-use.md` "Configuring a detected capability".
+
+Mapping `ENV_VAR=secret_name` by hand in the registration form works, but it assumes the
+operator already knows *which* vars the server needs, *which* are still missing, and has
+already stored each secret elsewhere. A normal user importing a server that needs an
+`OPENAI_API_KEY` should instead be told *"this needs OPENAI_API_KEY"* and be able to supply
+it inline, then see the tools light up — without ever editing config or `relux-plugin.json`.
+That is the **guided env/secret setup** path. It adds **no new authority**: it stores
+secrets through the existing write-only store and maps them through the existing managed-stdio
+`env` contract; the only plaintext it ever touches is the value the user just typed.
+
+- **The value-free requirement view (`relux_core::McpServerSetup`).** Built purely by
+  `build_mcp_server_setup(server_id, expected_env, config_env, secret_present)` from the
+  union of the source-declared env var names (a candidate's `env_placeholders`) and the
+  server's current `env` map, with `secret_present` decided by the live store's `has`. Each
+  `McpEnvRequirement` carries the env-var **name**, whether it is `required`, a safe
+  description, whether a secret is `secret_mapped`, the mapped secret **name** (never the
+  value), and whether that secret is `secret_present`. `ready` is true iff every required
+  var maps to a present secret; `missing` is exactly what a form must collect. **No value
+  ever appears** — only names + status.
+- **The mutation chokepoint (`POST /v1/relux/mcp/servers/:id/env-setup`).** A
+  session-protected route that, for each mapping, either **stores an inline `value`** as a
+  write-only secret (under an explicit `secret_name` or the deterministic default
+  `mcp_<server>_<ENV_VAR>` from `default_mcp_secret_name`) **or references an existing
+  secret by name**, then maps `ENV_VAR → { secret }` onto the server through
+  `KernelState::map_mcp_server_env` (which re-validates the env contract and refuses a
+  non-stdio server). Env-var names (`is_valid_env_var_name`) and secret names
+  (`is_valid_secret_name`) are validated **before** any mutation, so a bad batch never
+  half-applies. With `rediscover: true` it then runs the same bounded, off-lock `tools/list`
+  probe the post-activation step uses, so the user sees the server's tools (or honest
+  guidance) in the same response. The reply is the **value-free** `McpServerSetup` + the
+  redacted server + the optional discovery — **never a secret value**. `GET …/env-setup`
+  (`?expected=A,B`) returns the requirement view alone.
+- **Where it surfaces.** Prime's `configure-candidate` result now carries the `setup`
+  requirement view for an `mcp_register` candidate that declared env vars, so the chat
+  renders an inline **"Set up the secrets this server needs"** form
+  (`McpEnvSetupForm`); the Plugins page shows the same form after a one-click register of a
+  candidate with `env_placeholders` (`McpEnvSetupSection`, which loads the view from
+  `GET …/env-setup`). Each row offers **enter a value** (a password input, never echoed) or
+  **use an existing secret** (a picker of stored secret names + redacted previews). After
+  save the form re-runs discovery and shows the (still-gated) tools or the honest "what's
+  still missing". This mirrors the OpenRouter brain-key picker (`PrimeAiSettings`) — same
+  pick-or-create-then-reference shape — and Hermes' `cmd_mcp_add` discovery-first flow.
+- **Safety (unchanged).** Setup runs **no source code**: it stores/maps metadata only; the
+  optional re-discover **lists** tools through the existing gated probe and never calls one.
+  Secrets stay write-only + redacted everywhere; the server config still carries only
+  references; resolution stays per-process (Restart to pick up a changed secret).
+
 ### Remaining gaps (honest)
 
 - **A fatal call tears the process down.** A `tools/call` / `tools/list` that **times

@@ -1483,6 +1483,40 @@ impl KernelState {
         Ok(server)
     }
 
+    /// Map (merge) secret-referenced `env` entries onto an existing **managed-stdio** MCP
+    /// server — the guided-setup mutation. Each addition keys an env-var NAME to a SECRET
+    /// REFERENCE ([`relux_core::McpEnvRef`] — a secret NAME, never a value); existing keys
+    /// are overwritten, others preserved. The merged config is re-validated through
+    /// [`relux_core::validate_mcp_server_config`] (so an over-cap / malformed env still
+    /// fails closed) and re-upserted (preserving tool classifications + sampling). Errors
+    /// if the server is unknown or is an HTTP-loopback server (env applies only to a
+    /// spawned child). Stores **no plaintext** — the refs resolve at spawn, exactly like
+    /// registration. (`docs/mcp.md` "Local secrets & environment" / "Guided env/secret
+    /// setup".)
+    pub fn map_mcp_server_env(
+        &mut self,
+        id: &str,
+        additions: std::collections::BTreeMap<String, relux_core::McpEnvRef>,
+    ) -> Result<relux_core::McpServerConfig, KernelError> {
+        let id = id.trim();
+        let existing = self
+            .mcp_servers
+            .get(id)
+            .ok_or_else(|| KernelError::UnknownMcpServer(id.to_string()))?;
+        if existing.transport != relux_core::McpTransport::ManagedStdio {
+            return Err(KernelError::InvalidMcpConfig {
+                id: id.to_string(),
+                message: "env mappings apply only to a managed-stdio MCP server".to_string(),
+            });
+        }
+        let mut config = existing.clone();
+        for (var, r) in additions {
+            config.env.insert(var, r);
+        }
+        // Re-upsert through the same validation + audit path as registration.
+        self.upsert_mcp_server(config)
+    }
+
     /// Remove an MCP server registration entirely. Errors if unknown. A managed-stdio
     /// server's running process (if any) is stopped + reaped so a removed server never
     /// leaves a daemon behind.
@@ -14678,6 +14712,48 @@ mod tests {
         ));
         // None of the rejected registrations were stored.
         assert!(k.mcp_server("bad").is_none());
+    }
+
+    #[test]
+    fn map_mcp_server_env_merges_refs_and_refuses_http() {
+        let mut k = KernelState::new();
+        // A managed-stdio server with no env.
+        k.register_mcp_stdio_server(
+            "srv",
+            "node",
+            &["server.js".to_string()],
+            Default::default(),
+            None,
+            "x",
+            true,
+            None,
+        )
+        .unwrap();
+        // Map two env refs (secret NAMES only — the secrets need not exist yet).
+        let mut add = std::collections::BTreeMap::new();
+        add.insert("OPENAI_API_KEY".to_string(), relux_core::McpEnvRef { secret: "openai".to_string() });
+        let cfg = k.map_mcp_server_env("srv", add).unwrap();
+        assert_eq!(cfg.env.get("OPENAI_API_KEY").unwrap().secret, "openai");
+        // A second mapping merges (does not clobber the first).
+        let mut add2 = std::collections::BTreeMap::new();
+        add2.insert("BASE_URL".to_string(), relux_core::McpEnvRef { secret: "url".to_string() });
+        let cfg = k.map_mcp_server_env("srv", add2).unwrap();
+        assert_eq!(cfg.env.len(), 2, "merged, not replaced");
+        assert!(cfg.env.contains_key("OPENAI_API_KEY") && cfg.env.contains_key("BASE_URL"));
+
+        // An HTTP-loopback server has no spawned child → env mapping is refused.
+        k.register_mcp_server("http", "http://127.0.0.1:8000/mcp", "x", true, None).unwrap();
+        let mut add3 = std::collections::BTreeMap::new();
+        add3.insert("X".to_string(), relux_core::McpEnvRef { secret: "y".to_string() });
+        assert!(matches!(
+            k.map_mcp_server_env("http", add3),
+            Err(KernelError::InvalidMcpConfig { .. })
+        ));
+        // An unknown server is honestly reported.
+        assert!(matches!(
+            k.map_mcp_server_env("nope", Default::default()),
+            Err(KernelError::UnknownMcpServer(_))
+        ));
     }
 
     #[test]

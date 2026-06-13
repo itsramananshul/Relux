@@ -23,6 +23,8 @@ import { workTaskHref, workRunHref } from "../routing";
 import { consumeInvestigationSeed } from "../investigateseed";
 import { PrimeAutonomyPanel } from "../components/PrimeAutonomyPanel";
 import { OrchestrationPanel } from "../components/OrchestrationPanel";
+import { McpEnvSetupForm } from "../components/McpEnvSetupForm";
+import { setupNeedsWork } from "../mcpEnvSetup";
 
 // Prime page (RELUX_MASTER_PLAN section 10 Prime Behavior, section 11.1 Prime Chat): the
 // conversational command surface for the local Relux control plane. It POSTs
@@ -1585,6 +1587,11 @@ export function CandidateActivationResult({ result }: { result: ReluxPrimeConfig
       </div>
       <div className="muted" style={{ marginBottom: 6 }}>{result.next_step}</div>
       {result.activation === "mcp_register" && <McpDiscoveryResult result={result} />}
+      {result.activation === "mcp_register" &&
+        result.setup &&
+        setupNeedsWork(result.setup) && (
+          <McpEnvSetupForm serverId={result.tool_name} setup={result.setup} />
+        )}
       <div className="row wrap" style={{ gap: 8 }}>
         <Link className="chip" style={{ fontSize: 11, padding: "3px 10px" }} to="/plugins">Open Plugins</Link>
       </div>
