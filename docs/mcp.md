@@ -705,8 +705,11 @@ auto-action, and never running the source.
 > capability flows through the identical loopback-only `POST /v1/relux/mcp/servers`
 > route + validation described below. An npm `@modelcontextprotocol/sdk` source with a
 > declared `bin` is enriched into a one-click `node <bin>` managed-stdio draft. A
-> detected non-MCP command-line tool is a `manual` candidate (an honest pending
-> capability with next steps), never auto-run. The MCP path below is unchanged.
+> detected non-MCP command-line tool (npm `bin` / Python script / Cargo `[[bin]]`) is a
+> **`command_tool`** candidate: its **Configure** opens the `ConfigureCommandToolForm`
+> which posts to `POST /v1/relux/plugins/:id/command-tools` (see "Governed command tools"
+> below) — a real activation path, never auto-run. Only a candidate with no inferable
+> command stays a `manual` next-steps record. The MCP path below is unchanged.
 
 - **Proposal (read-only, fail-closed).** The same `/v1/relux/plugins/:id/hints`
   scan additionally builds a `relux_kernel::McpRegistrationProposal`
@@ -745,6 +748,53 @@ auto-action, and never running the source.
   their honest readiness. No tool is auto-enabled: a discovered tool stays the fail-closed
   Medium + Required (`needs_approval`) until the operator classifies it — exactly the
   existing behavior. The hint never becomes a runnable tool on its own.
+
+## Governed command tools (an imported CLI/script/binary → a real, gated tool)
+
+MCP is the one-click path for a *protocol* source. **Governed command tools** are the
+parallel path for an ordinary repo that only ships a CLI / script / binary — they turn a
+detected `command_tool` candidate (or any operator-described local command) into a real,
+callable Relux tool **safely**, without hand-writing JSON. MCP vs command tool, in one
+line: an MCP server exposes a protocol surface (tools/resources/prompts) the kernel
+dials; a command tool runs **one local process** to completion. Both are argv-only,
+permission-gated, approval-gated, and audited; neither auto-runs on import.
+
+- **Configure (review form, not a runner).** A `command_tool` candidate's **Configure**
+  opens `ConfigureCommandToolForm` (`apps/dashboard/src/pages/Plugins.tsx`), pre-filled
+  from the candidate's `command_tool` argv draft (`commandToolDraftFromCandidate`). The
+  operator confirms/edits the `name`, `program` (argv[0]), `args` (one per line), an
+  optional `cwd` (relative to the install dir), a `timeout`, and the `risk`. Submit is
+  pre-checked with the SAME fail-closed rules the kernel enforces
+  (`validateCommandToolDraft` mirrors `validate_command_tool_config`: argv-only, no shell
+  metacharacters in the program, no `--yolo`/bypass danger flag, no `..` cwd), then POSTs
+  `POST /v1/relux/plugins/:id/command-tools`. **Nothing runs at configure time.**
+- **What the kernel stores.** `state.rs::configure_command_tool` validates the argv
+  safety contract, adds a manifest `ToolDefinition` (permission `tool:<plugin>:<verb>`,
+  derived — never operator-supplied; default risk **High**; approval **always Required**
+  — a command tool is never auto-approved), and stores a `relux_core::CommandToolConfig`
+  (`program` + fixed `args` + optional confined `cwd` + declared optional `input_args` +
+  clamped `timeout_ms` + `enabled`). There is **no shell-string field**. The tool then
+  appears in the Tools list as `needs_approval` — gated, not a dead end. Bundled and
+  non-ToolSet plugins are refused; `DELETE …/command-tools/:tool` drops both the manifest
+  tool and the recipe.
+- **How it runs (only on a gated invocation).** Invocation flows through the **existing**
+  governed path: `POST /v1/relux/tools/invoke` (gated → `request-approval` → `execute`,
+  or a standing allow-always grant). The executor (`crates/relux-kernel/src/command_exec.rs`)
+  re-validates the argv, builds the invocation argv (appending ONLY declared, validated
+  `input_args` — positional, never a smuggled flag), resolves the `cwd` to canonicalize
+  INSIDE the install dir (`secret_store::validate_managed_cwd` — a symlink escape is
+  refused), spawns **argv-only, never a shell**, enforces the timeout (killing the child
+  on expiry), and captures stdout/stderr bounded to 64 KiB each and **secret-redacted**
+  (`relux_core::redact_secrets`). The result is a shaped
+  `{ exit_code, success, timed_out, stdout, stderr, stdout_truncated, stderr_truncated,
+  duration_ms }`. A non-zero exit is an honest `success:false` run; a timeout is
+  `timed_out:true`; a missing required input / bad cwd / spawn failure is a clear,
+  value-free error — never a fabricated success.
+- **Persistence + reference grounding.** The recipe round-trips in the snapshot
+  (`command_tool_configs`) and survives restart. Built reference-first against
+  `reference/hermes-agent-main/tools/environments/local.py` (argv + validated cwd +
+  timeout + bounded capture) and `reference/openclaw-main/src/agents/bash-tools.exec-*`
+  / `infra/exec-approvals.ts` (argv binding, approval-before-execution, output bounding).
 
 ## Invocation (loopback `tools/call` through the gates)
 

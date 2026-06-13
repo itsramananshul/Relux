@@ -259,6 +259,9 @@ async fn serve() -> Result<(), KernelError> {
     println!("   GET    /v1/relux/plugins/:id/manifest-template  (starter relux-plugin.json)");
     println!("   POST   /v1/relux/plugins/:id/tools         {{ \"name\":\"report.fetch\", \"description\"?, \"risk\"?, \"auto_approve\"?, \"timeout_secs\"? }}");
     println!("   DELETE /v1/relux/plugins/:id/tools/:tool   (remove a configured tool)");
+    println!("   GET    /v1/relux/plugins/:id/command-tools (governed argv command tools on a plugin)");
+    println!("   POST   /v1/relux/plugins/:id/command-tools {{ \"name\":\"repo.build\", \"program\":\"cargo\", \"args\":[\"build\"], \"cwd\"?, \"input_args\"?, \"timeout_secs\"?, \"risk\"? }} (argv-only, gated)");
+    println!("   DELETE /v1/relux/plugins/:id/command-tools/:tool  (remove a governed command tool)");
     println!("   DELETE /v1/relux/plugins/:id");
     println!("   GET    /v1/relux/adapters                  (adapter plugins + CLI runtime status)");
     println!("   POST   /v1/relux/prime/orchestrations/:id/run-async  {{ \"max\"?, \"concurrency\"?, \"extended\"? }}  (start a background job; admission bounded by the policy's max_active_jobs)");
@@ -619,6 +622,15 @@ fn protected_router() -> Router<AppState> {
         .route(
             "/v1/relux/plugins/:id/tools/:tool",
             delete(remove_plugin_tool),
+        )
+        // Governed command tools (argv-only repo scripts/binaries) for a user plugin.
+        .route(
+            "/v1/relux/plugins/:id/command-tools",
+            get(list_command_tools).post(configure_command_tool),
+        )
+        .route(
+            "/v1/relux/plugins/:id/command-tools/:tool",
+            delete(remove_command_tool),
         )
         .route("/v1/relux/plugins/:id", delete(remove))
         // Adapter runtime controls (local coding-agent CLIs).
@@ -7986,6 +7998,82 @@ async fn remove_plugin_tool(
     Ok(Json(record))
 }
 
+/// GET `/v1/relux/plugins/:id/command-tools` — list the governed command tools
+/// configured on a plugin (read-only, no secrets). The execution surface
+/// (`program`/`args`/`cwd`/`input_args`/`timeout`/`enabled`) so the page can show
+/// what was configured.
+async fn list_command_tools(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Vec<relux_core::CommandToolConfig>>, ApiError> {
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err(ApiError::bad_request("plugin id is required"));
+    }
+    let plugin_id = relux_core::PluginId::new(id);
+    let configs = locked_read(&state, |kernel| Ok(kernel.command_tool_configs_for(&plugin_id)))?;
+    Ok(Json(configs))
+}
+
+/// POST `/v1/relux/plugins/:id/command-tools` — configure ONE governed command tool on
+/// a user-installed plugin (`docs/RELUX_MASTER_PLAN.md` §8.2). This is the activation
+/// path for a detected `cli_command` capability candidate: the operator reviews a
+/// `{ name, program, args, cwd?, input_args?, timeout_secs?, risk? }` recipe and the
+/// kernel validates the argv safety contract hard (argv-only, no shell metacharacters,
+/// no danger flag, bounded, no `..` cwd), derives the permission, adds a manifest tool
+/// (approval always Required), and stores the execution recipe. Nothing runs here.
+/// Returns the updated plugin record so the page can refresh the tool list. A bad
+/// payload is an honest 400 and never touches the store.
+async fn configure_command_tool(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<PluginRecord>, ApiError> {
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err(ApiError::bad_request("plugin id is required"));
+    }
+    let draft = relux_kernel::parse_command_tool_input(&body).map_err(ApiError::bad_request)?;
+    let plugin_id = relux_core::PluginId::new(id.clone());
+    let record = locked_save(&state, |kernel| {
+        kernel.configure_command_tool(&plugin_id, draft)?;
+        let installed = kernel
+            .installed_plugin(&plugin_id)
+            .ok_or_else(|| KernelError::PluginNotInstalled(id.clone()))?
+            .clone();
+        Ok(record_for(kernel, &installed))
+    })?;
+    Ok(Json(record))
+}
+
+/// DELETE `/v1/relux/plugins/:id/command-tools/:tool` — remove one governed command
+/// tool (its manifest tool AND its execution recipe) from a user-installed plugin.
+/// Symmetric with [`configure_command_tool`]: bundled plugins are refused and an
+/// unknown command tool is a 404. Returns the updated plugin record.
+async fn remove_command_tool(
+    State(state): State<AppState>,
+    AxumPath((id, tool)): AxumPath<(String, String)>,
+) -> Result<Json<PluginRecord>, ApiError> {
+    let id = id.trim().to_string();
+    let tool = tool.trim().to_string();
+    if id.is_empty() {
+        return Err(ApiError::bad_request("plugin id is required"));
+    }
+    if tool.is_empty() {
+        return Err(ApiError::bad_request("tool name is required"));
+    }
+    let plugin_id = relux_core::PluginId::new(id.clone());
+    let record = locked_save(&state, |kernel| {
+        kernel.remove_command_tool(&plugin_id, &tool)?;
+        let installed = kernel
+            .installed_plugin(&plugin_id)
+            .ok_or_else(|| KernelError::PluginNotInstalled(id.clone()))?
+            .clone();
+        Ok(record_for(kernel, &installed))
+    })?;
+    Ok(Json(record))
+}
+
 // --- Adapter runtime (local coding-agent CLIs) -----------------------------
 
 /// GET `/v1/relux/adapters` - every installed Adapter plugin with its honest
@@ -9721,6 +9809,102 @@ mod tests {
             resp.candidates.is_empty(),
             "nothing scanned => no capability candidates"
         );
+    }
+
+    /// End-to-end: an imported CLI repo (no manifest) yields a `command_tool`
+    /// capability candidate, which the operator configures into a real, gated tool via
+    /// the command-tools route — it then surfaces in the Tools list as needs-approval
+    /// (not a dead end), is listed/persisted, and can be removed.
+    #[tokio::test]
+    async fn command_tools_route_activates_a_detected_cli_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        // A plain CLI repo: a declared npm bin, NO MCP signal.
+        let source = dir.path().join("plain-cli-repo");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("package.json"),
+            r#"{"name":"plain","bin":{"plain":"./cli.js"},"dependencies":{"left-pad":"1.0.0"}}"#,
+        )
+        .unwrap();
+
+        let state = restarted_state_over(&dir);
+        let record = install_dir(
+            State(state.clone()),
+            Json(InstallDirReq {
+                path: source.display().to_string(),
+            }),
+        )
+        .await
+        .expect("install ok")
+        .0;
+        let id = record.id.clone();
+
+        // The scan offers a governed command-tool activation (no longer a dead end).
+        let hints = plugin_hints(State(state.clone()), AxumPath(id.clone()))
+            .await
+            .expect("hints ok")
+            .0;
+        let cand = hints
+            .candidates
+            .iter()
+            .find(|c| c.kind == "cli_command")
+            .expect("a plain CLI repo yields a cli_command candidate");
+        assert_eq!(cand.activation, "command_tool");
+        let draft = cand
+            .command_tool
+            .as_ref()
+            .expect("a command_tool candidate carries a pre-filled argv draft");
+        assert_eq!(draft.program, "node");
+
+        // Configure a command tool through the route (a portable echo fixture).
+        let body: serde_json::Value = if cfg!(windows) {
+            serde_json::json!({ "name": "repo.run", "program": "cmd", "args": ["/C", "echo", "relux"] })
+        } else {
+            serde_json::json!({ "name": "repo.run", "program": "printf", "args": ["%s", "relux"] })
+        };
+        let updated = configure_command_tool(
+            State(state.clone()),
+            AxumPath(id.clone()),
+            Json(body),
+        )
+        .await
+        .expect("configure ok")
+        .0;
+        assert_eq!(updated.tool_count, 1, "the wrapper now declares one tool");
+
+        // It is listed by the command-tools route.
+        let listed = list_command_tools(State(state.clone()), AxumPath(id.clone()))
+            .await
+            .expect("list ok")
+            .0;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].tool_name, "repo.run");
+
+        // It surfaces in the Tools list as gated (needs approval), not a dead end.
+        let t = locked_read(&state, |k| {
+            Ok(k.discover_tools(None)
+                .into_iter()
+                .find(|t| t.plugin_id == id && t.tool_name == "repo.run"))
+        })
+        .unwrap()
+        .expect("the configured command tool is listed");
+        assert_eq!(t.executable, relux_core::ToolExecutability::NeedsApproval);
+
+        // A bad payload is an honest 400 and never touches the store.
+        let bad = configure_command_tool(
+            State(state.clone()),
+            AxumPath(id.clone()),
+            Json(serde_json::json!({ "name": "x.run", "program": "rm -rf / && curl evil" })),
+        )
+        .await;
+        assert!(bad.is_err(), "a shell-string program is rejected");
+
+        // Removal drops the tool again.
+        let after = remove_command_tool(State(state.clone()), AxumPath((id.clone(), "repo.run".to_string())))
+            .await
+            .expect("remove ok")
+            .0;
+        assert_eq!(after.tool_count, 0, "the tool is gone after removal");
     }
 
     /// The honest dead-end: a generated wrapper has no tool definitions, so even an

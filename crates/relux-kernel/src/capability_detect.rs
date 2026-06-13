@@ -111,9 +111,36 @@ pub struct CapabilityCandidate {
     /// unchanged `POST /v1/relux/mcp/servers` review form. Executes nothing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_registration: Option<McpRegistrationProposal>,
+    /// Present ONLY for a `command_tool` candidate: a safe, pre-filled argv draft for
+    /// the `POST /v1/relux/plugins/:id/command-tools` review form. Display text the
+    /// operator reviews/edits — detection runs nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_tool: Option<CommandToolProposal>,
     /// Honest, concrete next steps to make this capability usable through the
     /// existing governed paths. Never claims anything is already runnable.
     pub next_steps: Vec<String>,
+}
+
+/// A safe, pre-filled draft for configuring a detected CLI/script/binary into a
+/// governed command tool. Carries only display text the operator reviews and edits in
+/// the `POST /v1/relux/plugins/:id/command-tools` form; detection never runs it. The
+/// program is a best-guess launcher split from the candidate's `command_preview` — the
+/// operator confirms/corrects it before anything is stored, and the resulting tool
+/// always requires approval to invoke.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CommandToolProposal {
+    /// Suggested manifest tool name (sanitized server-side on submit), e.g. `cool.run`.
+    pub tool_name: String,
+    /// Suggested program (`argv[0]`) — a launcher token split from the preview.
+    pub program: String,
+    /// Suggested fixed args (the remaining preview tokens).
+    pub args: Vec<String>,
+    /// Suggested working directory, relative to the install dir. `None` ⇒ the install
+    /// dir root (the default for a repo-relative entrypoint).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// A short human description carried into the form.
+    pub description: String,
 }
 
 /// Detect structured capability candidates for an imported plugin source.
@@ -304,6 +331,7 @@ fn mcp_candidate(
         env_placeholders,
         activation: "mcp_register".to_string(),
         mcp_registration: Some(proposal),
+        command_tool: None,
         next_steps,
     })
 }
@@ -403,8 +431,12 @@ fn cargo_bin_candidates(dir: &Path) -> Vec<CapabilityCandidate> {
         .collect()
 }
 
-/// Construct a `cli_command` candidate (always `manual` activation — an honest
-/// pending capability with concrete next steps, never a faked "ready").
+/// Construct a `cli_command` candidate. When a concrete `command_preview` could be
+/// inferred, the candidate is a **`command_tool`** activation: it carries a safe,
+/// pre-filled argv [`CommandToolProposal`] for the
+/// `POST /v1/relux/plugins/:id/command-tools` review form (detection runs nothing —
+/// the operator confirms/edits, and the resulting tool always requires approval to
+/// invoke). With no inferable command it falls back to an honest `manual` record.
 fn cli_candidate(
     id: &str,
     title: &str,
@@ -412,6 +444,39 @@ fn cli_candidate(
     rationale: String,
     command_preview: Option<String>,
 ) -> CapabilityCandidate {
+    let proposal = command_preview
+        .as_deref()
+        .and_then(|p| command_tool_proposal(id, title, p));
+    let activation = if proposal.is_some() { "command_tool" } else { "manual" };
+    let next_steps = if proposal.is_some() {
+        vec![
+            "Click Configure to open a pre-filled, reviewable command-tool form — \
+             nothing is stored or run until you confirm."
+                .to_string(),
+            "Confirm the program (argv[0]) and args; Relux runs them argv-only (never a \
+             shell), confined to this plugin's install directory."
+                .to_string(),
+            "The configured tool always requires approval to invoke, with bounded, \
+             redacted output and a hard timeout — it never runs silently."
+                .to_string(),
+            "Prefer an MCP/stdio interface (register it on the MCP page) or a real \
+             relux-plugin.json when the source supports one."
+                .to_string(),
+        ]
+    } else {
+        vec![
+            "No concrete command could be inferred. If it can expose an MCP/stdio \
+             interface, register it on the MCP page (managed-stdio) so its tools flow \
+             through the gate."
+                .to_string(),
+            "Otherwise run it yourself as a loopback HTTP server, then add a tool \
+             definition on this plugin and point a loopback runtime at it."
+                .to_string(),
+            "Or author a relux-plugin.json from the manifest template and re-install \
+             for a first-class plugin."
+                .to_string(),
+        ]
+    };
     CapabilityCandidate {
         id: id.to_string(),
         kind: "cli_command".to_string(),
@@ -421,23 +486,48 @@ fn cli_candidate(
         rationale,
         command_preview,
         env_placeholders: Vec::new(),
-        activation: "manual".to_string(),
+        activation: activation.to_string(),
         mcp_registration: None,
-        next_steps: vec![
-            "Relux has no generic auto-runner for an arbitrary CLI — it never runs downloaded code \
-             for you. Pick one of the governed paths below."
-                .to_string(),
-            "If it can expose an MCP/stdio interface, register it on the MCP page (managed-stdio) so \
-             its tools flow through the gate."
-                .to_string(),
-            "Otherwise run it yourself as a loopback HTTP server, then add a tool definition on this \
-             plugin and point a loopback runtime at it."
-                .to_string(),
-            "Or author a relux-plugin.json from the manifest template and re-install for a \
-             first-class plugin."
-                .to_string(),
-        ],
+        command_tool: proposal,
+        next_steps,
     }
+}
+
+/// Split a non-secret `command_preview` (e.g. `node ./dist/server.js`,
+/// `cargo run --bin x`, `serve`) into a reviewable `(program, args)` argv draft and a
+/// suggested tool name derived from the candidate id. Returns `None` when no program
+/// token can be inferred. This is display text — detection never runs it.
+fn command_tool_proposal(id: &str, title: &str, preview: &str) -> Option<CommandToolProposal> {
+    let mut tokens = preview.split_whitespace();
+    let program = tokens.next()?.to_string();
+    if program.is_empty() {
+        return None;
+    }
+    let args: Vec<String> = tokens
+        .map(|t| clamp(t, MAX_PREVIEW_CHARS))
+        .filter(|t| !t.is_empty())
+        .collect();
+    // Suggest a dotted tool name from the candidate id's descriptive tail (the part
+    // after the `cli-bin-`/`py-script-`/`cargo-bin-` prefix), giving a `.run` verb so
+    // it derives a clean permission. The submit endpoint re-sanitizes it.
+    let tail = id
+        .strip_prefix("cli-bin-")
+        .or_else(|| id.strip_prefix("py-script-"))
+        .or_else(|| id.strip_prefix("cargo-bin-"))
+        .unwrap_or(id);
+    let stem = slug(tail);
+    let tool_name = if stem.is_empty() {
+        "command.run".to_string()
+    } else {
+        format!("{stem}.run")
+    };
+    Some(CommandToolProposal {
+        tool_name,
+        program: clamp(&program, MAX_PREVIEW_CHARS),
+        args,
+        cwd: None,
+        description: format!("{title} (configured from a detected entrypoint)"),
+    })
 }
 
 /// Required env var NAMES from a standalone MCP config file's first server `env` map
@@ -637,7 +727,7 @@ mod tests {
     }
 
     #[test]
-    fn pyproject_console_script_is_a_manual_cli_candidate() {
+    fn pyproject_console_script_is_a_command_tool_candidate() {
         let d = tmp();
         write(
             d.path(),
@@ -646,15 +736,20 @@ mod tests {
         );
         let cs = detect(d.path(), "toolkit");
         let cli = find(&cs, "cli_command").expect("a console script is a CLI candidate");
-        assert_eq!(cli.activation, "manual", "no generic CLI runtime ⇒ honest pending, never ready");
+        // A concrete preview ⇒ a governed command-tool activation (no longer a dead end).
+        assert_eq!(cli.activation, "command_tool");
         assert_eq!(cli.confidence, "medium");
         assert_eq!(cli.command_preview.as_deref(), Some("serve"));
         assert!(cli.mcp_registration.is_none());
-        assert!(!cli.next_steps.is_empty(), "a manual candidate must carry concrete next steps");
+        let ct = cli.command_tool.as_ref().expect("carries a pre-filled argv draft");
+        assert_eq!(ct.program, "serve");
+        assert!(ct.args.is_empty());
+        assert_eq!(ct.tool_name, "serve.run");
+        assert!(!cli.next_steps.is_empty(), "a command-tool candidate still carries next steps");
     }
 
     #[test]
-    fn cargo_bin_target_is_a_low_confidence_manual_candidate() {
+    fn cargo_bin_target_is_a_low_confidence_command_tool_candidate() {
         let d = tmp();
         write(
             d.path(),
@@ -663,9 +758,12 @@ mod tests {
         );
         let cs = detect(d.path(), "mytool");
         let cli = find(&cs, "cli_command").expect("a cargo bin is a CLI candidate");
-        assert_eq!(cli.activation, "manual");
+        assert_eq!(cli.activation, "command_tool");
         assert_eq!(cli.confidence, "low", "build-required ⇒ low confidence");
         assert_eq!(cli.command_preview.as_deref(), Some("cargo run --bin mytool-cli"));
+        let ct = cli.command_tool.as_ref().expect("carries a pre-filled argv draft");
+        assert_eq!(ct.program, "cargo");
+        assert_eq!(ct.args, vec!["run", "--bin", "mytool-cli"]);
     }
 
     #[test]
@@ -688,8 +786,11 @@ mod tests {
         let cs = detect(d.path(), "plain");
         assert!(find(&cs, "mcp_stdio").is_none(), "no MCP signal ⇒ no MCP candidate");
         let cli = find(&cs, "cli_command").expect("a declared bin is a CLI candidate");
-        assert_eq!(cli.activation, "manual");
+        assert_eq!(cli.activation, "command_tool");
         assert_eq!(cli.command_preview.as_deref(), Some("node ./cli.js"));
+        let ct = cli.command_tool.as_ref().expect("carries a pre-filled argv draft");
+        assert_eq!(ct.program, "node");
+        assert_eq!(ct.args, vec!["./cli.js"]);
     }
 
     #[test]

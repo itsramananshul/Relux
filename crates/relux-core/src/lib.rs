@@ -9,6 +9,7 @@ pub mod adapter_result;
 pub mod agent;
 pub mod artifact;
 pub mod approval;
+pub mod command_tool;
 pub mod hierarchy;
 pub mod audit;
 pub mod mcp;
@@ -41,6 +42,11 @@ pub use agent::{Agent, AgentId};
 pub use artifact::{capture_run_artifacts, ArtifactKind, RunArtifact, MAX_ARTIFACTS};
 pub use approval::{Approval, ApprovalId, ApprovalStatus};
 pub use audit::{AuditEvent, AuditResult};
+pub use command_tool::{
+    build_command_argv, clamp_command_timeout, validate_command_tool_config, CommandInputArg,
+    CommandToolConfig, CommandToolError, DEFAULT_COMMAND_TIMEOUT_MS, MAX_COMMAND_INPUT_ARGS,
+    MAX_COMMAND_INPUT_VALUE_CHARS, MAX_COMMAND_TIMEOUT_MS, MIN_COMMAND_TIMEOUT_MS,
+};
 pub use hierarchy::{
     chain_of_command, is_in_subtree, would_create_cycle, ReportsToMap, MAX_HIERARCHY_DEPTH,
 };

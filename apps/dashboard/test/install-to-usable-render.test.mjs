@@ -5,7 +5,8 @@
 // A pure-function test pins the candidate helpers (plugins.test.ts), but only an
 // actual render proves the panel mounts the per-candidate Configure paths without a
 // render-time throw — that an MCP candidate offers a one-click register button, that a
-// command-line candidate shows its honest manual next steps (never a faked ready), and
+// command-line candidate offers a governed Configure (command tool) path, that a CLI
+// candidate with no inferable command stays an honest manual pending capability, and
 // that a scanned-but-empty source shows exact "what to add" guidance instead of a dead
 // end. Mirrors install-result-render.test.mjs: esbuild transpiles the REAL component
 // and react-dom/server + StaticRouter render it. useEffect does not fire under
@@ -77,6 +78,24 @@ const cliCandidate = {
   rationale: "package.json declares a bin entrypoint 'tool'",
   command_preview: "node ./cli.js",
   env_placeholders: [],
+  activation: "command_tool",
+  command_tool: {
+    tool_name: "tool.run",
+    program: "node",
+    args: ["./cli.js"],
+    description: "Command-line tool (npm bin)",
+  },
+  next_steps: ["Click Configure to open a pre-filled, reviewable command-tool form."],
+};
+
+const manualCandidate = {
+  id: "cli-unknown",
+  kind: "cli_command",
+  title: "Command-line tool (unknown)",
+  confidence: "low",
+  risk: "medium",
+  rationale: "an entrypoint was declared but no command could be inferred",
+  env_placeholders: [],
   activation: "manual",
   next_steps: ["Run it yourself as a loopback server, then add a tool definition."],
 };
@@ -92,7 +111,7 @@ function panel(hints) {
 export function renderWithCandidates() {
   return panel({
     plugin_id: plugin.id, install_dir: "/d", scanned: true, generated: true,
-    hints: [], candidates: [mcpCandidate, cliCandidate],
+    hints: [], candidates: [mcpCandidate, cliCandidate, manualCandidate],
   });
 }
 export function renderEmptyAfterScan() {
@@ -137,10 +156,11 @@ after(() => {
   if (tmp) rmSync(tmp, { recursive: true, force: true });
 });
 
-test("the panel headlines the detected capability count and a one-click badge", () => {
+test("the panel headlines the detected capability count, one-click + configurable badges", () => {
   const html = mod.renderWithCandidates();
-  assert.match(html, /Detected 2 possible capabilities/);
+  assert.match(html, /Detected 3 possible capabilities/);
   assert.match(html, /1 one-click/);
+  assert.match(html, /1 configurable/);
 });
 
 test("an MCP candidate offers a one-click Configure (register) path", () => {
@@ -153,13 +173,20 @@ test("an MCP candidate offers a one-click Configure (register) path", () => {
   assert.doesNotMatch(html, /ghp_/);
 });
 
-test("a command-line candidate is an HONEST PENDING capability, not a faked ready", () => {
+test("a command-line candidate offers a governed Configure (command tool) path", () => {
   const html = mod.renderWithCandidates();
-  assert.match(html, /Command-line tool/);
-  assert.match(html, /needs configuration/);
-  // Honest manual next steps are present (and it never offers the one-click register).
+  assert.match(html, /Command-line tool \(npm bin\)/);
+  assert.match(html, /configurable/);
+  assert.match(html, /Configure \(command tool\)/);
+  // It is honest that the command runs argv-only and only when invoked (gated).
+  assert.match(html, /Will run argv-only \(gated, never on import\)/);
+});
+
+test("a CLI candidate with NO inferable command stays an honest manual pending capability", () => {
+  const html = mod.renderWithCandidates();
+  assert.match(html, /Command-line tool \(unknown\)/);
+  // The manual fallback still shows next steps, never a faked ready / Configure button.
   assert.match(html, /How to make this usable/);
-  assert.match(html, /Detected command \(not run by Relux\)/);
 });
 
 test("a scanned source with NO candidates shows exact what-to-add guidance, not a dead end", () => {

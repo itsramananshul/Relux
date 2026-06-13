@@ -2941,6 +2941,25 @@ export const reluxPlugins = {
     api.del<ReluxPlugin>(
       `/v1/relux/plugins/${encodeURIComponent(id)}/tools/${encodeURIComponent(tool)}`,
     ),
+  // List the governed command tools configured on a plugin (read-only, no secrets).
+  commandTools: (id: string) =>
+    api.get<ReluxCommandToolConfig[]>(
+      `/v1/relux/plugins/${encodeURIComponent(id)}/command-tools`,
+    ),
+  // Configure ONE governed command tool (argv-only repo script/binary). The kernel
+  // validates the argv safety contract, derives the permission, adds a manifest tool
+  // (approval always required), and stores the execution recipe. Nothing runs here.
+  // Returns the updated plugin record so the table can refresh its tool count.
+  configureCommandTool: (id: string, body: ReluxCommandToolInput) =>
+    api.post<ReluxPlugin>(
+      `/v1/relux/plugins/${encodeURIComponent(id)}/command-tools`,
+      body,
+    ),
+  // Remove a governed command tool (its manifest tool AND its recipe) by name.
+  removeCommandTool: (id: string, tool: string) =>
+    api.del<ReluxPlugin>(
+      `/v1/relux/plugins/${encodeURIComponent(id)}/command-tools/${encodeURIComponent(tool)}`,
+    ),
 };
 
 // The operator-supplied fields for a configured tool. The permission and approval
@@ -3021,12 +3040,64 @@ export interface ReluxCapabilityCandidate {
   command_preview?: string;
   // Required env var NAMES the source expects (names only — never values/secrets).
   env_placeholders?: string[];
-  // "mcp_register" (one-click via the existing MCP registry) or "manual" (pending).
+  // "mcp_register" (one-click MCP), "command_tool" (configure a governed argv tool),
+  // or "manual" (an honest pending capability with next steps only).
   activation: string;
   // Present only for an mcp_register candidate: the pre-filled registration draft.
   mcp_registration?: ReluxMcpRegistrationProposal;
+  // Present only for a command_tool candidate: a pre-filled argv draft for the
+  // command-tools review form. Display text — never run by detection.
+  command_tool?: ReluxCommandToolProposal;
   // Concrete next steps through the existing governed paths. Never claims readiness.
   next_steps: string[];
+}
+
+// A safe, pre-filled draft for configuring a detected CLI/script/binary into a
+// governed command tool (the kernel's capability_detect::CommandToolProposal). The
+// program is a best-guess launcher split from the preview — the operator reviews/edits
+// it before anything is stored, and the resulting tool always requires approval.
+export interface ReluxCommandToolProposal {
+  // Suggested manifest tool name (re-sanitized on submit), e.g. "cool.run".
+  tool_name: string;
+  // Suggested program (argv[0]) — a launcher token.
+  program: string;
+  // Suggested fixed args (the remaining preview tokens).
+  args: string[];
+  // Suggested working directory, relative to the install dir. Absent ⇒ install root.
+  cwd?: string;
+  description: string;
+}
+
+// One declared, optional input arg of a governed command tool.
+export interface ReluxCommandInputArg {
+  name: string;
+  description?: string;
+  required?: boolean;
+}
+
+// A configured governed command tool (the kernel's CommandToolConfig). No secrets.
+export interface ReluxCommandToolConfig {
+  plugin_id: string;
+  tool_name: string;
+  program: string;
+  args?: string[];
+  cwd?: string;
+  input_args?: ReluxCommandInputArg[];
+  timeout_ms: number;
+  enabled: boolean;
+}
+
+// The payload to configure a governed command tool.
+export interface ReluxCommandToolInput {
+  name: string;
+  description?: string;
+  program: string;
+  args?: string[];
+  cwd?: string;
+  input_args?: ReluxCommandInputArg[];
+  timeout_secs?: number;
+  risk?: string;
+  enabled?: boolean;
 }
 
 export interface ReluxPluginHints {

@@ -87,6 +87,10 @@ pub struct KernelSnapshot {
     /// plugin id. Defaulted so older snapshots load cleanly.
     #[serde(default)]
     pub adapter_runtime_configs: Vec<AdapterRuntimeConfig>,
+    /// Operator-configured governed command tools (argv-only repo scripts/binaries),
+    /// sorted by `(plugin_id, tool_name)`. Defaulted so older snapshots load cleanly.
+    #[serde(default)]
+    pub command_tool_configs: Vec<relux_core::CommandToolConfig>,
     /// Operator-curated MCP server registrations, sorted by server id. Defaulted so
     /// older snapshots (which never wrote it) load cleanly.
     #[serde(default)]
@@ -287,6 +291,9 @@ pub struct KernelState {
     tool_runtime_configs: HashMap<PluginId, ToolRuntimeConfig>,
     /// Per-adapter CLI runtime configs, keyed by plugin id.
     adapter_runtime_configs: HashMap<PluginId, AdapterRuntimeConfig>,
+    /// Operator-configured governed command tools, keyed by `(plugin_id, tool_name)`.
+    /// Each backs a manifest tool of the same name with a safe argv execution recipe.
+    command_tool_configs: HashMap<(PluginId, String), relux_core::CommandToolConfig>,
     /// Operator-curated MCP server registrations (loopback HTTP only), keyed by
     /// server id. MCP v1: a discovery surface — the kernel lists these and runs a
     /// live `tools/list` against an enabled one. No secrets are stored.
@@ -468,6 +475,15 @@ impl KernelState {
             adapter_runtime_configs: sorted(&self.adapter_runtime_configs, |c| {
                 c.plugin_id.as_str()
             }),
+            command_tool_configs: {
+                let mut out: Vec<relux_core::CommandToolConfig> =
+                    self.command_tool_configs.values().cloned().collect();
+                out.sort_by(|a, b| {
+                    (a.plugin_id.as_str(), a.tool_name.as_str())
+                        .cmp(&(b.plugin_id.as_str(), b.tool_name.as_str()))
+                });
+                out
+            },
             mcp_servers: sorted(&self.mcp_servers, |c| c.id.as_str()),
             namespaces: sorted(&self.namespaces, |n| n.id.as_str()),
             agents: sorted(&self.agents, |a| a.id.as_str()),
@@ -572,6 +588,12 @@ impl KernelState {
             state
                 .adapter_runtime_configs
                 .insert(PluginId::new(cfg.plugin_id.clone()), cfg);
+        }
+        for cfg in snapshot.command_tool_configs {
+            state.command_tool_configs.insert(
+                (PluginId::new(cfg.plugin_id.clone()), cfg.tool_name.clone()),
+                cfg,
+            );
         }
         for cfg in snapshot.mcp_servers {
             state.mcp_servers.insert(cfg.id.clone(), cfg);
@@ -1008,6 +1030,10 @@ impl KernelState {
         })?;
 
         self.plugins.insert(plugin_id.clone(), updated);
+        // A command tool's manifest tool and its execution recipe travel together:
+        // dropping the tool drops any backing argv config so none is left orphaned.
+        self.command_tool_configs
+            .remove(&(plugin_id.clone(), tool_name.to_string()));
         self.record_audit(
             "kernel",
             "kernel",
@@ -1019,6 +1045,158 @@ impl KernelState {
             serde_json::json!({ "tool": tool_name }),
         );
         Ok(())
+    }
+
+    // --- Governed command tools (argv-only repo scripts/binaries) ----------
+
+    /// Configure (or replace) ONE governed command tool on a user-installed plugin
+    /// (`docs/RELUX_MASTER_PLAN.md` §8.2 — the activation path for a detected
+    /// `cli_command` capability candidate). This is the safe alternative to a generic
+    /// "run any CLI" runner: the operator reviews a `(program, args, cwd, input args)`
+    /// recipe and the kernel
+    ///
+    /// 1. validates the argv safety contract ([`relux_core::validate_command_tool_config`]
+    ///    — argv-only, no shell metacharacters, no danger flag, bounded, no `..` cwd),
+    /// 2. adds a manifest [`ToolDefinition`] (permission `tool:<plugin>:<verb>`, risk as
+    ///    chosen, approval ALWAYS `Required`) so it surfaces in the Tools list and gates
+    ///    like any other tool, and
+    /// 3. stores the [`relux_core::CommandToolConfig`] execution recipe keyed by
+    ///    `(plugin, tool)`.
+    ///
+    /// Nothing runs here. The command executes only later, through a gated invocation
+    /// (or a standing grant), via [`Self::execute_tool_runtime`]. Bundled/protected and
+    /// non-ToolSet plugins are refused. Returns the manifest tool that was added.
+    pub fn configure_command_tool(
+        &mut self,
+        plugin_id: &PluginId,
+        draft: crate::command_tool_config::CommandToolDraft,
+    ) -> Result<ToolDefinition, KernelError> {
+        let installed = self
+            .installed_plugins
+            .get(plugin_id)
+            .ok_or_else(|| KernelError::PluginNotInstalled(plugin_id.to_string()))?;
+        if installed.source_kind == PluginSourceKind::Bundled {
+            return Err(KernelError::BundledPluginProtected(plugin_id.to_string()));
+        }
+
+        // Build + validate the execution recipe BEFORE mutating the manifest, so a bad
+        // command never leaves a dangling tool definition.
+        let config = draft.into_command_config(plugin_id.as_str());
+        relux_core::validate_command_tool_config(&config).map_err(|message| {
+            KernelError::InvalidToolDefinition {
+                plugin: plugin_id.to_string(),
+                message: message.to_string(),
+            }
+        })?;
+        let tool = draft.into_tool_definition(plugin_id.as_str()).map_err(|message| {
+            KernelError::InvalidToolDefinition {
+                plugin: plugin_id.to_string(),
+                message,
+            }
+        })?;
+
+        // Apply on a clone so a validation failure never leaves the live manifest
+        // mutated. Only a ToolSet may carry tools.
+        let mut updated = self
+            .plugins
+            .get(plugin_id)
+            .cloned()
+            .ok_or_else(|| KernelError::PluginNotInstalled(plugin_id.to_string()))?;
+        if updated.kind != PluginKind::ToolSet {
+            return Err(KernelError::PluginNotToolConfigurable {
+                plugin: plugin_id.to_string(),
+                message: format!(
+                    "only ToolSet plugins can have command tools configured here; this plugin is a {:?}",
+                    updated.kind
+                ),
+            });
+        }
+
+        if let Some(existing) = updated
+            .capabilities
+            .tools
+            .iter_mut()
+            .find(|t| t.name == tool.name)
+        {
+            *existing = tool.clone();
+        } else {
+            updated.capabilities.tools.push(tool.clone());
+        }
+        if !updated
+            .capabilities
+            .permissions
+            .iter()
+            .any(|p| p.matches_exact(&tool.permission))
+        {
+            updated.capabilities.permissions.push(tool.permission.clone());
+        }
+
+        relux_core::plugin::validate_manifest(&updated).map_err(|source| {
+            KernelError::ManifestInvalid {
+                path: plugin_id.to_string(),
+                source,
+            }
+        })?;
+
+        self.plugins.insert(plugin_id.clone(), updated);
+        self.command_tool_configs
+            .insert((plugin_id.clone(), tool.name.clone()), config);
+        self.record_audit(
+            "kernel",
+            "kernel",
+            "plugin:command_tool_configure",
+            Some("plugin"),
+            Some(plugin_id.as_str()),
+            None,
+            AuditResult::Success,
+            serde_json::json!({
+                "tool": tool.name,
+                "permission": tool.permission.as_str(),
+                "risk": format!("{:?}", tool.risk),
+                "program": draft.program,
+            }),
+        );
+        Ok(tool)
+    }
+
+    /// Remove ONE governed command tool (its manifest tool AND its execution recipe)
+    /// from a user-installed plugin. Symmetric with [`Self::configure_command_tool`]:
+    /// bundled plugins are refused and an unknown command tool is a clear error. The
+    /// underlying manifest tool is removed via [`Self::remove_plugin_tool`] (which also
+    /// drops the recipe), so both halves disappear together.
+    pub fn remove_command_tool(
+        &mut self,
+        plugin_id: &PluginId,
+        tool_name: &str,
+    ) -> Result<(), KernelError> {
+        if !self
+            .command_tool_configs
+            .contains_key(&(plugin_id.clone(), tool_name.to_string()))
+        {
+            return Err(KernelError::PluginToolNotFound {
+                plugin: plugin_id.to_string(),
+                tool: tool_name.to_string(),
+            });
+        }
+        // remove_plugin_tool drops the manifest tool, its permission (if unused), AND
+        // the backing command config, and records the audit + re-validates the manifest.
+        self.remove_plugin_tool(plugin_id, tool_name)
+    }
+
+    /// The governed command tools configured on a plugin (read-only), sorted by tool
+    /// name, for the operator UI. No secrets are carried.
+    pub fn command_tool_configs_for(
+        &self,
+        plugin_id: &PluginId,
+    ) -> Vec<relux_core::CommandToolConfig> {
+        let mut out: Vec<relux_core::CommandToolConfig> = self
+            .command_tool_configs
+            .iter()
+            .filter(|((p, _), _)| p == plugin_id)
+            .map(|(_, c)| c.clone())
+            .collect();
+        out.sort_by(|a, b| a.tool_name.cmp(&b.tool_name));
+        out
     }
 
     // --- Tool runtime config (HTTP loopback) -------------------------------
@@ -4728,10 +4906,18 @@ impl KernelState {
             let runtime = self.tool_runtime_configs.get(&installed.id);
             for tool in &manifest.capabilities.tools {
                 let builtin = crate::builtin::is_builtin_tool(installed.id.as_str(), &tool.name);
-                // A tool is runnable when a built-in handler exists OR the plugin
-                // has an enabled HTTP loopback runtime configured. Otherwise the
-                // status is honest about WHY it cannot run.
-                let runnable = builtin || runtime.map(|c| c.enabled).unwrap_or(false);
+                // A governed command tool backs this tool with an argv execution
+                // recipe; an enabled one makes the tool runnable (still gated by its
+                // Required approval below), a disabled one is honestly RuntimeDisabled.
+                let command_cfg = self
+                    .command_tool_configs
+                    .get(&(installed.id.clone(), tool.name.clone()));
+                // A tool is runnable when a built-in handler exists, the plugin has an
+                // enabled HTTP loopback runtime, OR an enabled command tool backs it.
+                // Otherwise the status is honest about WHY it cannot run.
+                let runnable = builtin
+                    || runtime.map(|c| c.enabled).unwrap_or(false)
+                    || command_cfg.map(|c| c.enabled).unwrap_or(false);
                 let executable = if runnable {
                     // A tool whose declared approval blocks a direct invocation
                     // (any non-low-risk operator-configured tool) is NOT runnable
@@ -4749,8 +4935,8 @@ impl KernelState {
                             _ => ToolExecutability::Ready,
                         }
                     }
-                } else if runtime.is_some() {
-                    // Configured but disabled.
+                } else if runtime.is_some() || command_cfg.is_some() {
+                    // Configured but disabled (an HTTP runtime or a command tool).
                     ToolExecutability::RuntimeDisabled
                 } else {
                     // No built-in handler and no runtime yet: the operator can
@@ -5178,6 +5364,31 @@ impl KernelState {
         }
         if let Some(output) = self.builtin_tool_output(plugin_id.as_str(), tool_name, input) {
             return Ok(output);
+        }
+        // Governed command tool: run the operator-configured argv recipe, confined to
+        // the plugin's install dir, with a bounded timeout + redacted output. argv only,
+        // never a shell. A disabled config is honestly refused (not silently run).
+        if let Some(cfg) = self
+            .command_tool_configs
+            .get(&(plugin_id.clone(), tool_name.to_string()))
+        {
+            if !cfg.enabled {
+                return Err(KernelError::ToolRuntimeDisabled {
+                    plugin: plugin_id.to_string(),
+                });
+            }
+            let install_dir = self
+                .installed_plugins
+                .get(plugin_id)
+                .map(|p| p.install_dir.clone())
+                .ok_or_else(|| KernelError::PluginNotInstalled(plugin_id.to_string()))?;
+            return crate::command_exec::execute_command_tool(cfg, &install_dir, input).map_err(
+                |e| KernelError::ToolRuntimeInvocation {
+                    plugin: plugin_id.to_string(),
+                    tool: tool_name.to_string(),
+                    message: e.to_string(),
+                },
+            );
         }
         match self.tool_runtime_configs.get(plugin_id) {
             None => Err(KernelError::ToolRuntimeUnavailable {
@@ -13667,6 +13878,141 @@ mod tests {
         assert!(binding.args_preview.contains("prod"));
         // The stored snapshot keeps the real value so the approved call runs verbatim.
         assert_eq!(binding.input["token"], "s3cr3t");
+    }
+
+    // --- Governed command tools -----------------------------------------------
+
+    /// Install a user (non-bundled) wrapper plugin with a REAL on-disk install dir, so
+    /// a configured command tool can canonicalize/spawn inside it. Returns the tempdir
+    /// (keep it alive for the test's duration).
+    fn primed_with_command_tool_dir() -> (KernelState, AgentId, PluginId, tempfile::TempDir) {
+        let (mut k, prime, _task, _run, _echo) = primed_kernel();
+        let dir = tempfile::tempdir().unwrap();
+        let id = PluginId::new("relux-plugin-my-repo");
+        k.install_plugin(
+            wrapper_manifest("relux-plugin-my-repo"),
+            PluginSourceKind::LocalDir,
+            dir.path().display().to_string(),
+            dir.path().display().to_string(),
+            true,
+        );
+        (k, prime, id, dir)
+    }
+
+    /// A portable command-tool draft that echoes `text` and exits 0.
+    fn command_tool_draft_echo(name: &str, text: &str) -> crate::command_tool_config::CommandToolDraft {
+        let json = if cfg!(windows) {
+            format!(r#"{{"name":"{name}","program":"cmd","args":["/C","echo","{text}"]}}"#)
+        } else {
+            format!(r#"{{"name":"{name}","program":"printf","args":["%s","{text}"]}}"#)
+        };
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        crate::command_tool_config::parse_command_tool_input(&v).unwrap()
+    }
+
+    #[test]
+    fn command_tool_configures_gates_runs_persists_and_removes() {
+        let (mut k, prime, id, _dir) = primed_with_command_tool_dir();
+
+        // Configure: the permission is derived and approval is always Required.
+        let def = k
+            .configure_command_tool(&id, command_tool_draft_echo("repo.run", "relux-cmd-ok"))
+            .expect("command tool configured");
+        assert_eq!(def.permission.as_str(), "tool:relux-plugin-my-repo:run");
+        assert_eq!(def.approval, ApprovalRequirement::Required);
+        assert_eq!(def.risk, RiskLevel::High);
+
+        // It surfaces in the Tools list as gated (NeedsApproval) — not a dead end.
+        k.grant_permission_to_agent(&prime, def.permission.clone()).unwrap();
+        let t = k
+            .discover_tools(Some(&prime))
+            .into_iter()
+            .find(|t| t.tool_name == "repo.run")
+            .expect("listed");
+        assert_eq!(t.executable, ToolExecutability::NeedsApproval);
+
+        // A direct invoke is gated until a grant exists.
+        let err = k
+            .invoke_tool(&prime, &id, "repo.run", serde_json::json!({}))
+            .unwrap_err();
+        assert!(matches!(err, KernelError::ToolRequiresApproval { .. }), "got {err:?}");
+
+        // With a standing grant the command actually runs argv-only and returns a
+        // shaped, bounded result.
+        k.grant_persistent_tool_invocation("operator", &prime, &id, "repo.run")
+            .unwrap();
+        let result = k
+            .invoke_tool(&prime, &id, "repo.run", serde_json::json!({}))
+            .expect("grant lets the gated command run");
+        assert_eq!(result.output["success"], serde_json::json!(true));
+        assert_eq!(result.output["timed_out"], serde_json::json!(false));
+        assert!(result.output["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("relux-cmd-ok"));
+
+        // Persistence: the recipe survives a snapshot round-trip.
+        let snap = k.snapshot();
+        let k2 = KernelState::from_snapshot(snap);
+        assert_eq!(k2.command_tool_configs_for(&id).len(), 1);
+        assert_eq!(k2.command_tool_configs_for(&id)[0].program, if cfg!(windows) { "cmd" } else { "printf" });
+
+        // Removal drops BOTH the manifest tool and the execution recipe.
+        k.remove_command_tool(&id, "repo.run").expect("removed");
+        assert!(k.command_tool_configs_for(&id).is_empty());
+        assert!(k
+            .plugin(&id)
+            .unwrap()
+            .capabilities
+            .tools
+            .iter()
+            .all(|t| t.name != "repo.run"));
+        // Removing an unknown command tool is a clear error.
+        assert!(matches!(
+            k.remove_command_tool(&id, "nope.run").unwrap_err(),
+            KernelError::PluginToolNotFound { .. }
+        ));
+    }
+
+    #[test]
+    fn a_disabled_command_tool_is_refused_not_run() {
+        let (mut k, prime, id, _dir) = primed_with_command_tool_dir();
+        let json = if cfg!(windows) {
+            r#"{"name":"repo.run","program":"cmd","args":["/C","echo","x"],"enabled":false}"#
+        } else {
+            r#"{"name":"repo.run","program":"printf","args":["%s","x"],"enabled":false}"#
+        };
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        let draft = crate::command_tool_config::parse_command_tool_input(&v).unwrap();
+        let def = k.configure_command_tool(&id, draft).unwrap();
+        k.grant_permission_to_agent(&prime, def.permission.clone()).unwrap();
+
+        // Discovery is honest about why it cannot run.
+        let t = k
+            .discover_tools(Some(&prime))
+            .into_iter()
+            .find(|t| t.tool_name == "repo.run")
+            .unwrap();
+        assert_eq!(t.executable, ToolExecutability::RuntimeDisabled);
+
+        // Even past the approval gate (via a grant), a disabled recipe is refused —
+        // never silently run.
+        k.grant_persistent_tool_invocation("operator", &prime, &id, "repo.run")
+            .unwrap();
+        let err = k
+            .invoke_tool(&prime, &id, "repo.run", serde_json::json!({}))
+            .unwrap_err();
+        assert!(matches!(err, KernelError::ToolRuntimeDisabled { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn a_command_tool_on_an_uninstalled_plugin_is_refused() {
+        let (mut k, _prime, _task, _run, _echo) = primed_kernel();
+        let ghost = PluginId::new("relux-plugin-not-installed");
+        let err = k
+            .configure_command_tool(&ghost, command_tool_draft_echo("x.run", "no"))
+            .unwrap_err();
+        assert!(matches!(err, KernelError::PluginNotInstalled(_)), "got {err:?}");
     }
 
     // --- Persistent allow-always grants ----------------------------------------

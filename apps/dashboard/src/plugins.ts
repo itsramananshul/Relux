@@ -16,6 +16,7 @@
 import type {
   ReluxAdapterStatus,
   ReluxCapabilityCandidate,
+  ReluxCommandToolInput,
   ReluxManagedStdioStatus,
   ReluxMcpRegistrationProposal,
   ReluxMcpServer,
@@ -277,11 +278,20 @@ export function mcpDraftFromCandidate(c: ReluxCapabilityCandidate): McpRegisterD
   return emptyMcpRegisterDraft();
 }
 
+// True when a candidate is a governed command-tool activation: a detected CLI/script/
+// binary that carries a pre-filled argv draft. The UI renders a Configure form that
+// posts to POST /v1/relux/plugins/:id/command-tools (the tool is always gated).
+export function isCommandToolCandidate(c: ReluxCapabilityCandidate): boolean {
+  return c.activation === "command_tool" && !!c.command_tool;
+}
+
 export interface CapabilitySummary {
   total: number;
   // Candidates Relux can activate one-click through the MCP registry.
   oneClick: number;
-  // Honest pending candidates (a CLI tool / script) that need manual wiring.
+  // Candidates the operator can configure into a governed argv command tool.
+  commandTool: number;
+  // Honest pending candidates with next-steps only (nothing concrete inferred).
   manual: number;
   // True once the source was scanned but no runnable capability was detected, so the
   // UI shows exact "what to add" guidance instead of a dead end.
@@ -295,13 +305,108 @@ export function capabilitySummary(
 ): CapabilitySummary {
   const candidates = hints?.candidates ?? [];
   const oneClick = candidates.filter(isOneClickCandidate).length;
+  const commandTool = candidates.filter(isCommandToolCandidate).length;
   return {
     total: candidates.length,
     oneClick,
-    manual: candidates.length - oneClick,
+    commandTool,
+    manual: candidates.length - oneClick - commandTool,
     // Only call it "empty" once we KNOW the source was scanned and produced nothing.
     emptyAfterScan: hints?.scanned === true && candidates.length === 0,
   };
+}
+
+// The form model for configuring a governed command tool (argv-only). Args are
+// newline-separated so an arg may itself contain spaces (e.g. a path).
+export interface CommandToolDraft {
+  name: string;
+  description: string;
+  program: string;
+  argsText: string;
+  cwd: string;
+  timeoutSecs: string;
+  risk: string;
+}
+
+export function emptyCommandToolDraft(): CommandToolDraft {
+  return {
+    name: "",
+    description: "",
+    program: "",
+    argsText: "",
+    cwd: "",
+    timeoutSecs: "30",
+    risk: "high",
+  };
+}
+
+// Seed the command-tool review form from a candidate's pre-filled argv draft. The
+// program is a best-guess the operator confirms/edits before anything is stored.
+export function commandToolDraftFromCandidate(
+  c: ReluxCapabilityCandidate,
+): CommandToolDraft {
+  const p = c.command_tool;
+  if (!p) return emptyCommandToolDraft();
+  return {
+    name: p.tool_name ?? "",
+    description: p.description ?? "",
+    program: p.program ?? "",
+    argsText: (p.args ?? []).join("\n"),
+    cwd: p.cwd ?? "",
+    timeoutSecs: "30",
+    risk: "high",
+  };
+}
+
+// Split the newline-separated args textarea into trimmed, non-empty argv elements.
+export function parseCommandArgs(argsText: string): string[] {
+  return argsText
+    .split("\n")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
+// Build the POST payload for the command-tools route from the form model.
+export function commandToolInputFromDraft(d: CommandToolDraft): ReluxCommandToolInput {
+  const timeout = Number.parseInt(d.timeoutSecs.trim(), 10);
+  return {
+    name: d.name.trim(),
+    description: d.description.trim() || undefined,
+    program: d.program.trim(),
+    args: parseCommandArgs(d.argsText),
+    cwd: d.cwd.trim() || undefined,
+    timeout_secs: Number.isFinite(timeout) && timeout > 0 ? timeout : undefined,
+    risk: d.risk,
+  };
+}
+
+// Client-side pre-check for the command-tool form, mirroring the kernel's fail-closed
+// argv contract (relux_core::validate_command_tool_config) so the form never sends a
+// request the kernel would reject. Returns an error string, or null when submittable.
+// The server remains the authoritative validator.
+export function validateCommandToolDraft(d: CommandToolDraft): string | null {
+  if (!d.name.trim()) return "A tool name is required.";
+  const program = d.program.trim();
+  if (!program) return "A program (argv[0]) is required.";
+  if (/[\x00-\x1f]/.test(program)) {
+    return "The program must not contain control characters.";
+  }
+  if (STDIO_COMMAND_METACHARS.test(program)) {
+    return "The program must not contain shell metacharacters — Relux runs it argv-only, never through a shell.";
+  }
+  for (const arg of parseCommandArgs(d.argsText)) {
+    if (DANGEROUS_STDIO_FLAGS.has(arg.toLowerCase())) {
+      return `Argument "${arg}" is a forbidden bypass/danger flag.`;
+    }
+    if (/[\x00-\x1f]/.test(arg)) {
+      return "An argument must not contain control characters.";
+    }
+  }
+  const cwd = d.cwd.trim();
+  if (cwd && cwd.split(/[/\\]/).some((seg) => seg === "..")) {
+    return "The working directory must not contain a '..' parent-directory traversal.";
+  }
+  return null;
 }
 
 // A fresh, empty HTTP-loopback draft for the manual "Add MCP server" form.

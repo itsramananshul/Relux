@@ -118,6 +118,9 @@ impl SqliteStore {
             adapter_runtime_configs: self
                 .load_meta_json("adapter_runtime_configs")?
                 .unwrap_or_default(),
+            command_tool_configs: self
+                .load_meta_json("command_tool_configs")?
+                .unwrap_or_default(),
             mcp_servers: self.load_meta_json("mcp_servers")?.unwrap_or_default(),
             orchestrations: self.load_meta_json("orchestrations")?.unwrap_or_default(),
             pending_clarifications: self
@@ -228,6 +231,11 @@ impl SqliteStore {
             &tx,
             "adapter_runtime_configs",
             &snapshot.adapter_runtime_configs,
+        )?;
+        put_meta_json(
+            &tx,
+            "command_tool_configs",
+            &snapshot.command_tool_configs,
         )?;
         put_meta_json(&tx, "mcp_servers", &snapshot.mcp_servers)?;
 

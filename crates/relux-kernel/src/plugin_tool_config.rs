@@ -242,7 +242,7 @@ fn coerce_timeout(value: Option<&serde_json::Value>) -> Result<Option<u32>, Stri
 /// separators, trim leading/trailing separators, and clamp to `max` characters.
 /// The result can only ever contain characters that are safe in a permission
 /// string and a manifest, so a sanitized name can never carry an injection.
-fn sanitize_tool_name(s: &str, max: usize) -> String {
+pub(crate) fn sanitize_tool_name(s: &str, max: usize) -> String {
     let lowered = s.trim().to_ascii_lowercase();
     let mut out = String::with_capacity(lowered.len());
     let mut last_sep = false;
@@ -274,7 +274,7 @@ fn sanitize_tool_name(s: &str, max: usize) -> String {
 /// after the last `.`, reduced to `[a-z0-9_]` (hyphens become underscores so the
 /// verb is a clean identifier). Falls back to the whole flattened name when there
 /// is no dotted segment.
-fn derive_verb(name: &str) -> String {
+pub(crate) fn derive_verb(name: &str) -> String {
     let tail = name.rsplit('.').next().unwrap_or(name);
     let candidate = if tail.is_empty() { name } else { tail };
     let verb: String = candidate
@@ -287,7 +287,7 @@ fn derive_verb(name: &str) -> String {
 
 /// Sanitize a multi-line description: drop control chars except `\n`, collapse
 /// intra-line whitespace, drop blank lines, trim, and clamp to `max` characters.
-fn sanitize_block(s: &str, max: usize) -> String {
+pub(crate) fn sanitize_block(s: &str, max: usize) -> String {
     let lines: Vec<String> = s
         .lines()
         .map(|line| {

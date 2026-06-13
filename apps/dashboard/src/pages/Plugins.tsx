@@ -40,7 +40,11 @@ import {
   hintKindLabel,
   hintsNextStep,
   installResultSummary,
+  isCommandToolCandidate,
   isOneClickCandidate,
+  commandToolDraftFromCandidate,
+  commandToolInputFromDraft,
+  validateCommandToolDraft,
   mcpDraftFromCandidate,
   managedStdioStatusBadge,
   mcpDraftFromProposal,
@@ -60,6 +64,7 @@ import {
   type ConfigStepStatus,
   type StatusVariant,
   type ToolReadiness,
+  type CommandToolDraft,
 } from "../plugins";
 import {
   buildToolPickerOptions,
@@ -2863,6 +2868,11 @@ export function DetectedCapabilities({
             {summary.oneClick} one-click
           </span>
         )}
+        {summary.commandTool > 0 && (
+          <span className="badge in_progress" title="Can be configured into a governed argv command tool (gated)">
+            {summary.commandTool} configurable
+          </span>
+        )}
       </div>
 
       {summary.emptyAfterScan ? (
@@ -2919,7 +2929,9 @@ function CapabilityCard({
 }) {
   const [open, setOpen] = useState(false);
   const [registered, setRegistered] = useState(false);
+  const [configured, setConfigured] = useState(false);
   const oneClick = isOneClickCandidate(candidate);
+  const commandTool = isCommandToolCandidate(candidate);
   const confidence = candidateConfidenceBadge(candidate.confidence);
 
   return (
@@ -2941,6 +2953,10 @@ function CapabilityCard({
           <span className="badge done" title="Relux can register this through the existing MCP registry">
             one-click
           </span>
+        ) : commandTool ? (
+          <span className="badge in_progress" title="Configure this into a governed argv command tool — gated, argv-only, confined to the install dir">
+            configurable
+          </span>
         ) : (
           <span className="badge in_progress" title="An honest pending capability — needs manual wiring; Relux runs nothing for you">
             needs configuration
@@ -2954,7 +2970,12 @@ function CapabilityCard({
 
       {candidate.command_preview && (
         <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>
-          {oneClick ? "Will register as" : "Detected command (not run by Relux)"}:{" "}
+          {oneClick
+            ? "Will register as"
+            : commandTool
+              ? "Will run argv-only (gated, never on import)"
+              : "Detected command (not run by Relux)"}
+          :{" "}
           <span className="mono" style={{ wordBreak: "break-all" }}>
             {candidate.command_preview}
           </span>
@@ -3001,6 +3022,34 @@ function CapabilityCard({
             Configure (register MCP server)…
           </button>
         )
+      ) : commandTool && candidate.command_tool ? (
+        configured ? (
+          <p className="banner ok" style={{ fontSize: 11, margin: "6px 0 0" }}>
+            Command tool configured. Find it in the <strong>Tools</strong> list above —
+            it requires approval to invoke, runs argv-only with a timeout, and shows its
+            output.
+          </p>
+        ) : open ? (
+          <div style={{ marginTop: 8 }}>
+            <ConfigureCommandToolForm
+              plugin={plugin}
+              candidate={candidate}
+              onClose={() => setOpen(false)}
+              onConfigured={() => {
+                setOpen(false);
+                setConfigured(true);
+              }}
+            />
+          </div>
+        ) : (
+          <button
+            className="btn sm"
+            onClick={() => setOpen(true)}
+            title="Open a pre-filled, reviewable command-tool form; nothing is stored or run until you confirm, and the tool always requires approval to invoke"
+          >
+            Configure (command tool)…
+          </button>
+        )
       ) : (
         <details open={open} onToggle={(e) => setOpen((e.target as HTMLDetailsElement).open)}>
           <summary className="btn ghost sm" style={{ display: "inline-block" }}>
@@ -3020,6 +3069,131 @@ function CapabilityCard({
           </p>
         </details>
       )}
+    </div>
+  );
+}
+
+// A pre-filled, reviewable form that configures a detected CLI/script/binary candidate
+// into a governed command tool. Posts to POST /v1/relux/plugins/:id/command-tools; the
+// kernel validates the argv safety contract, derives the permission, and stores the
+// recipe. Nothing runs here, and the resulting tool always requires approval to invoke.
+function ConfigureCommandToolForm({
+  plugin,
+  candidate,
+  onClose,
+  onConfigured,
+}: {
+  plugin: ReluxPlugin;
+  candidate: ReluxCapabilityCandidate;
+  onClose: () => void;
+  onConfigured: () => void;
+}) {
+  const [draft, setDraft] = useState<CommandToolDraft>(() =>
+    commandToolDraftFromCandidate(candidate),
+  );
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const set = (patch: Partial<CommandToolDraft>) =>
+    setDraft((d) => ({ ...d, ...patch }));
+
+  async function submit() {
+    const problem = validateCommandToolDraft(draft);
+    if (problem) {
+      setErr(problem);
+      return;
+    }
+    setBusy(true);
+    setErr(null);
+    try {
+      await reluxPlugins.configureCommandTool(plugin.id, commandToolInputFromDraft(draft));
+      onConfigured();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Could not configure the command tool.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="card" style={{ margin: 0, padding: 10 }}>
+      <p className="muted" style={{ margin: "0 0 8px", fontSize: 11 }}>
+        Relux runs this <strong>argv-only</strong> (never through a shell), confined to
+        this plugin's install directory, with a timeout and bounded, redacted output.
+        The program is a best guess from the source — confirm it. The tool always
+        requires approval to invoke.
+      </p>
+      <label className="field" style={{ margin: "0 0 6px" }}>
+        <span style={{ fontSize: 12 }}>Tool name</span>
+        <input
+          className="input"
+          value={draft.name}
+          onChange={(e) => set({ name: e.target.value })}
+          placeholder="repo.build"
+        />
+      </label>
+      <label className="field" style={{ margin: "0 0 6px" }}>
+        <span style={{ fontSize: 12 }}>Program (argv[0])</span>
+        <input
+          className="input mono"
+          value={draft.program}
+          onChange={(e) => set({ program: e.target.value })}
+          placeholder="node"
+        />
+      </label>
+      <label className="field" style={{ margin: "0 0 6px" }}>
+        <span style={{ fontSize: 12 }}>Args (one per line)</span>
+        <textarea
+          className="input mono"
+          style={{ minHeight: 64, fontSize: 12 }}
+          value={draft.argsText}
+          onChange={(e) => set({ argsText: e.target.value })}
+          placeholder={"./dist/server.js"}
+        />
+      </label>
+      <div className="row wrap" style={{ gap: 8 }}>
+        <label className="field" style={{ margin: "0 0 6px", flex: 1 }}>
+          <span style={{ fontSize: 12 }}>Working dir (in install dir, optional)</span>
+          <input
+            className="input mono"
+            value={draft.cwd}
+            onChange={(e) => set({ cwd: e.target.value })}
+            placeholder="(install dir root)"
+          />
+        </label>
+        <label className="field" style={{ margin: "0 0 6px", width: 110 }}>
+          <span style={{ fontSize: 12 }}>Timeout (s)</span>
+          <input
+            className="input"
+            value={draft.timeoutSecs}
+            onChange={(e) => set({ timeoutSecs: e.target.value })}
+          />
+        </label>
+        <label className="field" style={{ margin: "0 0 6px", width: 120 }}>
+          <span style={{ fontSize: 12 }}>Risk</span>
+          <select
+            className="input"
+            value={draft.risk}
+            onChange={(e) => set({ risk: e.target.value })}
+          >
+            <option value="medium">medium</option>
+            <option value="high">high</option>
+            <option value="critical">critical</option>
+          </select>
+        </label>
+      </div>
+      {err && (
+        <div className="banner err" style={{ fontSize: 12, marginTop: 6 }}>
+          {err}
+        </div>
+      )}
+      <div className="row wrap" style={{ gap: 8, marginTop: 8 }}>
+        <button className="btn" disabled={busy} onClick={() => void submit()}>
+          {busy ? "Configuring…" : "Configure command tool"}
+        </button>
+        <button className="btn ghost" disabled={busy} onClick={onClose}>
+          Cancel
+        </button>
+      </div>
     </div>
   );
 }

@@ -26,7 +26,12 @@ import {
   candidateKindLabel,
   candidateConfidenceBadge,
   isOneClickCandidate,
+  isCommandToolCandidate,
   mcpDraftFromCandidate,
+  commandToolDraftFromCandidate,
+  commandToolInputFromDraft,
+  validateCommandToolDraft,
+  parseCommandArgs,
   capabilitySummary,
 } from "../src/plugins.ts";
 
@@ -864,4 +869,106 @@ test("capabilitySummary counts one-click vs manual and flags a true empty-after-
   // Not yet loaded (undefined) or not scanned → never claims "empty" (no false dead-end).
   assert.equal(capabilitySummary(undefined).emptyAfterScan, false);
   assert.equal(capabilitySummary(hints({ scanned: false, candidates: [] })).emptyAfterScan, false);
+});
+
+// A cli_command candidate that carries a pre-filled argv draft (the governed
+// command-tool activation path).
+function commandToolCandidate(over = {}) {
+  return {
+    id: "cli-bin-tool",
+    kind: "cli_command",
+    title: "Command-line tool (npm bin)",
+    confidence: "medium",
+    risk: "medium",
+    rationale: "package.json declares a bin entrypoint",
+    command_preview: "node ./cli.js",
+    env_placeholders: [],
+    activation: "command_tool",
+    command_tool: {
+      tool_name: "tool.run",
+      program: "node",
+      args: ["./cli.js"],
+      description: "Command-line tool (npm bin)",
+    },
+    next_steps: ["Click Configure to open the form."],
+    ...over,
+  };
+}
+
+test("isCommandToolCandidate: true only for a command_tool candidate that carries a draft", () => {
+  assert.equal(isCommandToolCandidate(commandToolCandidate()), true);
+  // A plain manual cli candidate (no draft) is NOT a command-tool activation.
+  assert.equal(isCommandToolCandidate(cliCandidate()), false);
+  assert.equal(isCommandToolCandidate(commandToolCandidate({ command_tool: undefined })), false);
+  assert.equal(isCommandToolCandidate(mcpCandidate()), false);
+});
+
+test("commandToolDraftFromCandidate seeds the form from the pre-filled argv draft", () => {
+  const d = commandToolDraftFromCandidate(commandToolCandidate());
+  assert.equal(d.name, "tool.run");
+  assert.equal(d.program, "node");
+  assert.equal(d.argsText, "./cli.js");
+  assert.equal(d.risk, "high");
+  // A malformed candidate falls back to a usable empty draft, never throws.
+  const empty = commandToolDraftFromCandidate(cliCandidate());
+  assert.equal(empty.program, "");
+});
+
+test("commandToolInputFromDraft builds the POST body (args split, optional fields omitted)", () => {
+  const body = commandToolInputFromDraft({
+    name: "repo.build",
+    description: "",
+    program: "cargo",
+    argsText: "build\n--release",
+    cwd: "",
+    timeoutSecs: "120",
+    risk: "high",
+  });
+  assert.equal(body.name, "repo.build");
+  assert.equal(body.program, "cargo");
+  assert.deepEqual(body.args, ["build", "--release"]);
+  assert.equal(body.cwd, undefined);
+  assert.equal(body.description, undefined);
+  assert.equal(body.timeout_secs, 120);
+  assert.equal(body.risk, "high");
+});
+
+test("parseCommandArgs splits lines, trims, drops blanks (an arg may keep internal spaces)", () => {
+  assert.deepEqual(parseCommandArgs("  a \n\n b c \n"), ["a", "b c"]);
+  assert.deepEqual(parseCommandArgs(""), []);
+});
+
+test("validateCommandToolDraft mirrors the kernel's fail-closed argv contract", () => {
+  const ok = {
+    name: "repo.run",
+    description: "",
+    program: "node",
+    argsText: "./cli.js",
+    cwd: "crates",
+    timeoutSecs: "30",
+    risk: "high",
+  };
+  assert.equal(validateCommandToolDraft(ok), null);
+  // A shell-string program is rejected (no shell — argv only).
+  assert.match(validateCommandToolDraft({ ...ok, program: "rm -rf / && curl" }) ?? "", /shell/i);
+  // A danger flag arg is rejected.
+  assert.match(
+    validateCommandToolDraft({ ...ok, argsText: "--dangerously-skip-permissions" }) ?? "",
+    /danger/i,
+  );
+  // A '..' traversal cwd is rejected.
+  assert.match(validateCommandToolDraft({ ...ok, cwd: "../etc" }) ?? "", /traversal/i);
+  // A missing program / name is rejected.
+  assert.match(validateCommandToolDraft({ ...ok, program: "" }) ?? "", /program/i);
+  assert.match(validateCommandToolDraft({ ...ok, name: "" }) ?? "", /name/i);
+});
+
+test("capabilitySummary counts command-tool candidates separately from manual/one-click", () => {
+  const s = capabilitySummary(
+    hints({ candidates: [mcpCandidate(), commandToolCandidate(), cliCandidate()] }),
+  );
+  assert.equal(s.total, 3);
+  assert.equal(s.oneClick, 1);
+  assert.equal(s.commandTool, 1);
+  assert.equal(s.manual, 1);
 });

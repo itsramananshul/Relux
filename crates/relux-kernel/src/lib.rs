@@ -25,6 +25,8 @@ pub mod auth;
 pub mod builtin;
 pub mod capability_detect;
 pub mod clock;
+pub mod command_exec;
+pub mod command_tool_config;
 pub mod doctor;
 pub mod event;
 pub mod introspect;
@@ -106,6 +108,7 @@ pub use plugin_install::{
     install_from_dir, install_from_github, install_from_zip, is_generated_manifest, list_installed,
     refresh_bundled_plugins, remove_plugin, GENERATED_MANIFEST_AUTHOR,
 };
+pub use command_tool_config::{parse_command_tool_input, CommandToolDraft};
 pub use plugin_tool_config::{parse_plugin_tool_input, PluginToolInput};
 pub use prime::{
     clarify_needs_label, classify_intent, decide, is_chat_guarded, is_standalone_request,

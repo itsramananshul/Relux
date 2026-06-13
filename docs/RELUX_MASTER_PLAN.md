@@ -1924,6 +1924,30 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **Unreleased (on `main`, post-v0.1.29)** — **Governed command tools (closes the "non-MCP
+  candidate is a dead end" gap).** A detected `cli_command` capability candidate (an npm `bin`, a
+  Python `[project.scripts]`, a Cargo `[[bin]]`) is no longer an honest-but-dead-end `manual`
+  record: it now carries a pre-filled `command_tool` argv draft and a one-click
+  **"Configure (command tool)…"** review form. The operator confirms a `(program, args, cwd?,
+  input_args?, timeout, risk)` recipe; the kernel validates the **argv safety contract**
+  (`relux_core::command_tool` — argv-only, no shell, no danger flag, bounded, no `..` cwd, reusing
+  the managed-stdio `validate_stdio_command`), adds a manifest tool (approval **always Required**),
+  and stores a `CommandToolConfig`. The tool surfaces in the Tools list as `needs_approval` and runs
+  ONLY through the existing gated invoke path — argv-only, confined to the plugin's install dir
+  (`secret_store::validate_managed_cwd`, symlink-escape refused), with a timeout, cancellation via
+  kill-on-timeout, and bounded (64 KiB/stream) secret-redacted output
+  (`crates/relux-kernel/src/command_exec.rs`). Nothing runs on import or at configure time; a non-zero
+  exit is an honest `success:false` run, a timeout is `timed_out:true`, and a bad cwd / missing input /
+  spawn failure is a clear value-free error — never a fabricated success. New endpoints
+  `GET`/`POST /v1/relux/plugins/:id/command-tools` + `DELETE …/:tool`; recipe round-trips in the
+  snapshot (`command_tool_configs`) and survives restart. Built reference-first against
+  `reference/hermes-agent-main/tools/environments/local.py` (argv + validated cwd + timeout + bounded
+  capture) and `reference/openclaw-main/src/agents/bash-tools.exec-*` / `infra/exec-approvals.ts`
+  (argv binding, approval-before-execution, output bounding). Pinned by `relux_core::command_tool`,
+  `command_exec.rs`, `state.rs`, the `command_tools_route_activates_a_detected_cli_candidate` server
+  test, and the dashboard `plugins.test.ts` + `install-to-usable-render.test.mjs` assertions. `cargo
+  test` + `clippy` clean on `relux-core`/`relux-kernel`; dashboard green; `dashboard-dist` rebuilt.
+  Every prior safety property holds — MCP activation is untouched and no path auto-runs downloaded code.
 - **Unreleased (on `main`, post-v0.1.29)** — **MCP sampling v1 (gated, default-deny).** MCP
   **sampling** (`sampling/createMessage`) **inverts the trust direction**: a managed-stdio server can,
   mid-operation, ask Relux to run its OWN configured LLM and return the completion. Relux ships a
@@ -3814,12 +3838,18 @@ on their behalf:
    (loopback-only) — no parallel registry, nothing auto-registered, nothing executed.
    After registering, **Discover** lists its tools through the same per-call gate as
    any MCP tool (an unclassified tool stays gated). Relux never launches it for you.
-2. **If the source is a package/entrypoint** that exposes an HTTP surface: run it
+2. **If the source is a CLI / script / binary** (a declared npm `bin`, a Python
+   `[project.scripts]`, a Cargo `[[bin]]`): the detected `command_tool` candidate now
+   offers a one-click **"Configure (command tool)…"** review form. Confirm the argv
+   recipe and submit to `POST /v1/relux/plugins/:id/command-tools`; the tool becomes
+   `needs_approval` (gated) and runs argv-only, confined to the install dir, only on a
+   gated invocation — see "Governed command tools" below. Relux never runs it on import.
+3. **If the source is a package/entrypoint** that exposes an HTTP surface: run it
    yourself as a local **loopback** server, then on the Plugins page add a tool
    definition (Plugin Tool Config v1) and point a loopback runtime at it
    (`PUT /v1/relux/plugins/:id/runtime`). The tool becomes `ready` only after that
    explicit operator action and the existing permission/approval gates.
-3. **If you have a real manifest**, author `relux-plugin.json` from the
+4. **If you have a real manifest**, author `relux-plugin.json` from the
    manifest-template (`GET /v1/relux/plugins/:id/manifest-template`) and re-install
    — the preferred path, used directly with no scaffolding.
 
@@ -3855,11 +3885,24 @@ required `env_placeholders` (names only — never values), and an `activation`:
   reviewable `node <bin>` managed-stdio draft — surfaced for review, never run by
   detection; managed-stdio re-validates + spawns it argv-only only after the operator
   registers and Discovers. MCP candidates lead the list.
-- **`manual` — an honest pending capability.** A detected CLI binary / Python or Cargo
-  script that Relux has **no generic auto-runner** for (it never runs downloaded code).
-  No fake "ready": the candidate carries concrete `next_steps` through the existing
-  governed paths (register an MCP/stdio interface, run it as a loopback server + add a
-  tool definition, or author a `relux-plugin.json`).
+- **`command_tool` — a governed argv activation.** A detected CLI binary / Python or
+  Cargo script for which a concrete command could be inferred. The candidate carries a
+  safe, pre-filled `command_tool` argv draft (`{ tool_name, program, args, cwd? }`,
+  split from the non-secret `command_preview` — display text, never run by detection)
+  for the `POST /v1/relux/plugins/:id/command-tools` review form. The operator
+  confirms/edits the recipe and submits; the kernel validates the **argv safety
+  contract** (`relux_core::validate_command_tool_config` — argv-only, no shell
+  metacharacters, no danger flag, bounded, no `..` cwd), derives the permission, adds a
+  manifest `ToolDefinition` (approval **always Required**), and stores a
+  `relux_core::CommandToolConfig`. Nothing runs at configure time. The command executes
+  only later, through a **gated invocation** (or a standing grant), argv-only, confined
+  to the plugin's install directory, with a timeout and bounded, secret-redacted output
+  (`crates/relux-kernel/src/command_exec.rs`). This is the activation path that turns an
+  ordinary repo script into a real, safe Relux tool — see "Governed command tools" below.
+- **`manual` — an honest pending capability.** A detected entrypoint for which **no**
+  concrete command could be inferred. No fake "ready": the candidate carries concrete
+  `next_steps` through the existing governed paths (register an MCP/stdio interface, run
+  it as a loopback server + add a tool definition, or author a `relux-plugin.json`).
 
 When the source was scanned but produced **no** candidate, the dashboard shows exact
 "what to add" guidance (an `mcp.json` / an MCP dependency / a loopback server + tool
@@ -3867,18 +3910,72 @@ definition / a manifest) — never a dead end. The Configure panel renders
 `DetectedCapabilities` → `CapabilityCard` (`apps/dashboard/src/pages/Plugins.tsx`),
 with presentation derived purely by `apps/dashboard/src/plugins.ts`
 (`candidateKindLabel`/`candidateConfidenceBadge`/`isOneClickCandidate`/
-`mcpDraftFromCandidate`/`capabilitySummary`). An `mcp_register` candidate's Configure
-opens the SAME pre-filled `AddMcpServerForm` the MCP-hint path uses, so a candidate
-registers through the identical loopback-only route + validation — no new backend, no
-parallel registry, nothing auto-registered or auto-run. Pinned by
-`crates/relux-kernel/src/capability_detect.rs` unit tests (npm-MCP+bin → one-click
-managed-stdio, env keys → placeholders not values, pyproject/cargo bin → manual CLI,
-README-only → no candidate, candidate-count bound, slug safety), the server test
-`hints_route_introspects_an_imported_repo_without_a_manifest` (now asserting the MCP
-stdio candidate) / `hints_route_does_not_scan_outside_the_plugins_root` (no candidates
-when nothing scanned), the dashboard `plugins.test.ts` candidate-helper assertions, and
-`apps/dashboard/test/install-to-usable-render.test.mjs` (one-click vs manual rendering,
-env name not value, empty-after-scan guidance).
+`isCommandToolCandidate`/`mcpDraftFromCandidate`/`commandToolDraftFromCandidate`/
+`capabilitySummary`). An `mcp_register` candidate's Configure opens the SAME pre-filled
+`AddMcpServerForm` the MCP-hint path uses; a `command_tool` candidate's Configure opens
+the `ConfigureCommandToolForm` posting to `POST /v1/relux/plugins/:id/command-tools` —
+both route through identical, unchanged validation; no parallel registry, nothing
+auto-registered or auto-run. Pinned by `crates/relux-kernel/src/capability_detect.rs`
+unit tests (npm-MCP+bin → one-click managed-stdio, env keys → placeholders not values,
+pyproject/cargo/npm bin → `command_tool` with a pre-filled argv draft, README-only → no
+candidate, candidate-count bound, slug safety), the server tests
+`hints_route_introspects_an_imported_repo_without_a_manifest` /
+`command_tools_route_activates_a_detected_cli_candidate` /
+`hints_route_does_not_scan_outside_the_plugins_root`, the dashboard `plugins.test.ts`
+candidate-helper assertions, and `apps/dashboard/test/install-to-usable-render.test.mjs`
+(one-click vs command-tool vs manual rendering, env name not value, empty-after-scan).
+
+##### Governed command tools (an imported CLI/script/binary → a real, gated tool)
+
+MCP is the one-click path; **governed command tools** close the other half — turning a
+detected `cli_command` candidate (or any operator-described repo script/binary) into a
+real, callable Relux tool **safely**, without hand-writing JSON. This is the smallest
+production-shaped path that fits the existing tool architecture (no parallel universe):
+
+- **Data model (`relux_core::command_tool`).** A `CommandToolConfig` stores the command
+  as an `argv` `program` + fixed `args` + an optional `cwd` (relative to and confined
+  within the plugin's install dir) + declared optional `input_args` + a clamped
+  `timeout_ms` + an `enabled` flag. **There is no shell-string field**, so there is no
+  metacharacter-injection surface. `validate_command_tool_config` reuses the SAME
+  `validate_stdio_command` the managed-stdio MCP transport uses (argv-only, no shell
+  metacharacters in the program token, bounded control-char-free args, no
+  `--yolo`/bypass danger flag); `build_command_argv` appends ONLY declared `input_args`
+  (each a bounded, control-char-free string, positional, never a flag the operator did
+  not declare) — a caller can never smuggle an extra argv element.
+- **Activation (`POST /v1/relux/plugins/:id/command-tools`,
+  `state.rs::configure_command_tool`).** Parsed by `command_tool_config.rs` (the same
+  field-allowlist / derived-permission / clamp posture as `plugin_tool_config.rs`), it
+  adds a manifest `ToolDefinition` (permission `tool:<plugin>:<verb>`, default risk
+  **High**, approval **always Required** — a command tool is never auto-approved) and
+  stores the `CommandToolConfig`. **Nothing runs at configure time.** The tool then
+  surfaces in the Tools list as `needs_approval` (gated, not a dead end). Bundled and
+  non-ToolSet plugins are refused; removal (`DELETE …/command-tools/:tool`) drops both
+  the manifest tool and the recipe together.
+- **Execution (`command_exec.rs`, only via `execute_tool_runtime`).** Invocation flows
+  through the **existing** governed path — `POST /v1/relux/tools/invoke` (gated →
+  `request-approval` → `execute`, or a standing allow-always grant). The executor
+  re-validates the argv, resolves the `cwd` to canonicalize INSIDE the install dir
+  (`secret_store::validate_managed_cwd` — a symlink escape is refused), spawns the
+  command **argv-only, never a shell**, enforces the timeout (killing the child on
+  expiry), captures stdout/stderr bounded to 64 KiB each and **secret-redacted**
+  (`relux_core::redact_secrets`), and returns a shaped
+  `{ exit_code, success, timed_out, stdout, stderr, …, duration_ms }`. A non-zero exit
+  is a successful *run* with `success:false` (honest), a timeout is `timed_out:true`,
+  and a missing required input / bad cwd / spawn failure is a clear, value-free error —
+  never a fabricated success. Persistence: the recipe round-trips in the snapshot
+  (`command_tool_configs`) and survives restart.
+
+This is **MCP vs governed command tools** in one line: MCP exposes a *protocol* surface
+(tools/resources/prompts) the kernel dials; a command tool runs *one local process* to
+completion. Both are argv-only, both are permission-gated, approval-gated, and audited,
+and neither is ever auto-run on import. Pinned by `relux_core::command_tool` unit tests
+(argv contract, danger flag, traversal cwd, input-arg build/validation, timeout clamp),
+`command_exec.rs` tests (live fixture run, non-zero exit, timeout kill, cwd-escape
+refusal, missing-input fail-closed, output redaction), `state.rs`
+`command_tool_configures_gates_runs_persists_and_removes` /
+`a_disabled_command_tool_is_refused_not_run` /
+`a_command_tool_on_an_uninstalled_plugin_is_refused`, and the server/dashboard tests
+above.
 
 #### Per-tool-call approval flow (gated tools)
 
