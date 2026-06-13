@@ -268,6 +268,39 @@ export function orchestrationNextAction(o: ReluxOrchestration): string {
   }
 }
 
+// True when a brief fell back to Prime because the planner found no specialist on
+// the roster for its role. Mirrors the kernel's grounded fallback (id "prime"); a
+// `general` brief needs no specialist and is never counted as a missing hire.
+export function stepIsPrimeFallback(step: ReluxOrchestrationStep): boolean {
+  return step.agent_id === "prime" && step.role !== "general";
+}
+
+// A grounded "who is doing what" summary for the Prime chat result card, derived
+// purely from the record. `assignedAgents` are the distinct real specialists work
+// landed on (Prime excluded); `unassignedRoles` are the roles whose brief fell back
+// to Prime because no specialist exists (the same gap the plan notes name and the
+// "Hire a … agent" suggestions cover). Both preserve first-seen order so the render
+// is deterministic. Invents nothing — it only classifies the committed steps.
+export interface OrchestrationAssignmentSummary {
+  assignedAgents: string[];
+  unassignedRoles: string[];
+}
+
+export function orchestrationAssignmentSummary(
+  o: ReluxOrchestration,
+): OrchestrationAssignmentSummary {
+  const assignedAgents: string[] = [];
+  const unassignedRoles: string[] = [];
+  for (const s of o.steps) {
+    if (stepIsPrimeFallback(s)) {
+      if (!unassignedRoles.includes(s.role)) unassignedRoles.push(s.role);
+    } else if (s.agent_id !== "prime" && !assignedAgents.includes(s.agent_id)) {
+      assignedAgents.push(s.agent_id);
+    }
+  }
+  return { assignedAgents, unassignedRoles };
+}
+
 // Group an orchestration's briefs by their assigned agent, for the per-agent
 // "who is doing what" view. Preserves first-seen agent order and per-agent brief
 // order so the render is deterministic.

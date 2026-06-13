@@ -328,9 +328,10 @@ pub fn plan_orchestration(goal: &str, summary: &StateSummary) -> OrchestrationPl
 ///
 /// Deterministic and pure: it splits the goal into clauses on natural connectors,
 /// classifies each clause to a [`OrchestrationRole`], and resolves each role to an
-/// existing agent on the roster (`summary.all_agent_ids`). When no specialist
-/// exists for a role the step's `agent_id` is `None` (the kernel assigns Prime and
-/// records a hire suggestion).
+/// existing agent on the roster — matched by the agent's id keyword OR its declared
+/// specialty skills (`summary.all_agent_ids` + `summary.agent_skills`). When no
+/// specialist exists for a role the step's `agent_id` is `None` (the kernel assigns
+/// Prime and records a hire suggestion).
 ///
 /// `max_steps` is the policy-derived width (see
 /// [`crate::PrimeAgentPolicy::orchestration_steps`]); it is itself clamped to
@@ -351,6 +352,14 @@ pub fn plan_orchestration_with_limit(
     // regardless of the StateSummary's (HashMap-derived) ordering.
     let mut roster: Vec<String> = summary.all_agent_ids.clone();
     roster.sort();
+    // The declared specialty skills per agent, so role->agent grounding can match an
+    // agent whose id is opaque (`agent_0007`) but who carries a fitting skill (the manual
+    // Crew-config path). Built once; lookups are by exact agent id.
+    let skills_by_agent: std::collections::HashMap<&str, &[String]> = summary
+        .agent_skills
+        .iter()
+        .map(|(id, skills)| (id.as_str(), skills.as_slice()))
+        .collect();
 
     let mut steps: Vec<PlannedStep> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
@@ -364,7 +373,7 @@ pub fn plan_orchestration_with_limit(
             break;
         }
         let role = classify_role(&clause);
-        let agent_id = match_agent_for_role(role, &roster);
+        let agent_id = match_agent_for_role(role, &roster, &skills_by_agent);
         if agent_id.is_none() && role != OrchestrationRole::General {
             let note = format!(
                 "No {} agent on the roster; assigning to Prime. Hire one (\"create a {} agent\") for a specialist.",
@@ -508,20 +517,46 @@ fn classify_role(clause: &str) -> OrchestrationRole {
     }
 }
 
-/// Find the first agent on the (sorted) roster whose id signals a fit for `role`.
-fn match_agent_for_role(role: OrchestrationRole, roster: &[String]) -> Option<String> {
+/// Find the first agent on the (sorted) roster who is a fit for `role`, grounded in real
+/// roster data — Prime never invents an assignee.
+///
+/// An agent matches when EITHER its id contains a role keyword (the conversational-hire
+/// path mints an id from the agent's name, so a "researcher" has a self-describing id) OR
+/// one of its declared specialty skills does (the manual Crew-config path, where an agent
+/// can carry a `research`/`qa`/`docs` skill behind an opaque id like `agent_0007`). The
+/// skill match accepts the role's own label or any of its keywords, so a `research` skill
+/// grounds a Research brief regardless of the agent's id.
+fn match_agent_for_role(
+    role: OrchestrationRole,
+    roster: &[String],
+    skills_by_agent: &std::collections::HashMap<&str, &[String]>,
+) -> Option<String> {
     let keywords = role.agent_keywords();
     if keywords.is_empty() {
         return None;
     }
+    let label = role.label();
     roster
         .iter()
         .find(|id| {
             // Prime is the general fallback, never a "specialist" match.
-            id.as_str() != "prime" && {
-                let lower = id.to_lowercase();
-                keywords.iter().any(|k| lower.contains(k))
+            if id.as_str() == "prime" {
+                return false;
             }
+            let lower = id.to_lowercase();
+            if keywords.iter().any(|k| lower.contains(k)) {
+                return true;
+            }
+            // Declared specialty skills also ground the match.
+            skills_by_agent
+                .get(id.as_str())
+                .map(|skills| {
+                    skills.iter().any(|s| {
+                        let sl = s.to_lowercase();
+                        sl.contains(label) || keywords.iter().any(|k| sl.contains(k))
+                    })
+                })
+                .unwrap_or(false)
         })
         .cloned()
 }
@@ -560,6 +595,55 @@ mod tests {
             queued: vec![],
             recent: vec![],
         }
+    }
+
+    /// A roster where some agents carry declared specialty skills behind opaque ids,
+    /// the way the manual Crew-config path mints them.
+    fn summary_with_skills(skills: &[(&str, &[&str])]) -> StateSummary {
+        let mut s = summary_with_agents(
+            &skills.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        );
+        s.agent_skills = skills
+            .iter()
+            .map(|(id, sk)| (id.to_string(), sk.iter().map(|x| x.to_string()).collect()))
+            .collect();
+        s
+    }
+
+    #[test]
+    fn grounds_a_role_on_a_declared_skill_behind_an_opaque_id() {
+        // An agent whose id is opaque (`agent_0007`) but who declares a `research`
+        // skill is still the right specialist for a research brief — the id-keyword
+        // match would miss it; the skill match grounds it. The "qa" skill grounds the
+        // testing brief; the implementation brief has no specialist and falls back to
+        // Prime with an honest note.
+        let s = summary_with_skills(&[
+            ("prime", &[]),
+            ("agent_0007", &["research"]),
+            ("agent_0008", &["qa", "quality"]),
+        ]);
+        let plan = plan_orchestration(
+            "research the options, implement a prototype, and test it",
+            &s,
+        );
+        assert!(plan.is_multi_agent());
+        assert_eq!(plan.steps[0].role, OrchestrationRole::Research);
+        assert_eq!(plan.steps[0].agent_id.as_deref(), Some("agent_0007"));
+        assert_eq!(plan.steps[1].role, OrchestrationRole::Implementation);
+        assert_eq!(plan.steps[1].agent_id, None, "no implementer skill -> Prime fallback");
+        assert_eq!(plan.steps[2].role, OrchestrationRole::Testing);
+        assert_eq!(plan.steps[2].agent_id.as_deref(), Some("agent_0008"));
+        assert!(plan.notes.iter().any(|n| n.contains("implementation")));
+    }
+
+    #[test]
+    fn id_keyword_still_wins_when_present() {
+        // The conversational-hire path mints a self-describing id; that still grounds
+        // the match with no skills declared (backward compatible).
+        let s = summary_with_agents(&["prime", "researcher", "coder"]);
+        let plan = plan_orchestration("research the options and implement it", &s);
+        assert_eq!(plan.steps[0].agent_id.as_deref(), Some("researcher"));
+        assert_eq!(plan.steps[1].agent_id.as_deref(), Some("coder"));
     }
 
     #[test]

@@ -7770,6 +7770,7 @@ impl KernelState {
                 tool_plan_proposal: None,
                 pending_tool_approval: None,
                 tool_trace: vec![],
+                orchestration: None,
             },
             PrimePlan::Clarify { text } => PrimeTurn {
                 intent,
@@ -7794,6 +7795,7 @@ impl KernelState {
                 tool_plan_proposal: None,
                 pending_tool_approval: None,
                 tool_trace: vec![],
+                orchestration: None,
             },
             PrimePlan::Act { action, text } => {
                 // Brain-assisted slot sharpening (validated): a create action takes
@@ -7877,6 +7879,7 @@ impl KernelState {
                     tool_plan_proposal: None,
                     pending_tool_approval: None,
                 tool_trace: vec![],
+                orchestration: None,
                 }
             }
         };
@@ -7993,6 +7996,7 @@ impl KernelState {
             tool_plan_proposal: None,
             pending_tool_approval: None,
                 tool_trace: vec![],
+                orchestration: None,
         }
     }
 
@@ -8199,6 +8203,7 @@ impl KernelState {
             tool_plan_proposal: None,
             pending_tool_approval: None,
                 tool_trace: vec![],
+                orchestration: None,
         }
     }
 
@@ -8281,6 +8286,7 @@ impl KernelState {
                     tool_plan_proposal: None,
                     pending_tool_approval: None,
                 tool_trace: vec![],
+                orchestration: None,
                 })
             }
             PrimeAction::CreateAndRunTask { title } => {
@@ -8365,6 +8371,7 @@ impl KernelState {
                     tool_plan_proposal: None,
                     pending_tool_approval: None,
                 tool_trace: vec![],
+                orchestration: None,
                 })
             }
             PrimeAction::StartRun { task_id } => {
@@ -8408,6 +8415,7 @@ impl KernelState {
                     tool_plan_proposal: None,
                     pending_tool_approval: None,
                 tool_trace: vec![],
+                orchestration: None,
                 })
             }
             PrimeAction::CreateAgent {
@@ -8484,6 +8492,7 @@ impl KernelState {
                     tool_plan_proposal: None,
                     pending_tool_approval: None,
                 tool_trace: vec![],
+                orchestration: None,
                 })
             }
             PrimeAction::AssignTask { task_id, agent_id } => {
@@ -8514,6 +8523,7 @@ impl KernelState {
                     tool_plan_proposal: None,
                     pending_tool_approval: None,
                 tool_trace: vec![],
+                orchestration: None,
                 })
             }
             PrimeAction::UpdateTask { task_id, patch } => {
@@ -8660,6 +8670,7 @@ impl KernelState {
                     tool_plan_proposal: None,
                     pending_tool_approval: None,
                 tool_trace: vec![],
+                orchestration: None,
                 })
             }
             PrimeAction::DiscoverTools => {
@@ -8695,6 +8706,7 @@ impl KernelState {
                     tool_plan_proposal: None,
                     pending_tool_approval: None,
                 tool_trace: vec![],
+                orchestration: None,
                 })
             }
             PrimeAction::ProposeToolPlan { goal } => {
@@ -8736,6 +8748,7 @@ impl KernelState {
                     tool_plan_proposal: Some(proposal),
                     pending_tool_approval: None,
                 tool_trace: vec![],
+                orchestration: None,
                 })
             }
             PrimeAction::InvokeTool {
@@ -8746,6 +8759,11 @@ impl KernelState {
             PrimeAction::OrchestrateGoal { goal } => match self.prime_orchestrate(ctx, goal) {
                 Ok(record) => {
                     let reply = format!("{text} {}", render_orchestration_plan(&record));
+                    // One-click next actions, each a pre-written user message routed through
+                    // the SAME grounded turn (§11.1): run the governed batch, and hire a
+                    // specialist for any role that fell back to Prime. Never a privileged
+                    // shortcut — a button can do nothing the user could not type.
+                    let suggested_actions = orchestration_suggested_actions(&record);
                     Ok(PrimeTurn {
                         intent,
                         reply,
@@ -8761,7 +8779,7 @@ impl KernelState {
                         invoked_tool: None,
                         tool_output: None,
                         tool_error: None,
-                        suggested_actions: Vec::new(),
+                        suggested_actions,
                         proposal: None,
                         slots: None,
                         agent_slots: None,
@@ -8772,6 +8790,10 @@ impl KernelState {
                         tool_plan_proposal: None,
                         pending_tool_approval: None,
                 tool_trace: vec![],
+                // The structured record so the chat renders a grounded result card
+                // (briefs, assignees, the honest no-specialist notes) instead of
+                // parsing the prose reply. Nothing runs by showing it (§10.4, §11.1).
+                orchestration: Some(record),
                     })
                 }
                 Err(KernelError::OrchestrationNotMultiAgent) => Ok(PrimeTurn {
@@ -8797,6 +8819,7 @@ impl KernelState {
                     tool_plan_proposal: None,
                     pending_tool_approval: None,
                 tool_trace: vec![],
+                orchestration: None,
                 }),
                 Err(e) => Err(e),
             },
@@ -8835,6 +8858,7 @@ impl KernelState {
                         tool_plan_proposal: None,
                         pending_tool_approval: None,
                 tool_trace: vec![],
+                orchestration: None,
                     });
                 }
                 match self.run_orchestration(&oid, 25, 2) {
@@ -8863,6 +8887,7 @@ impl KernelState {
                             tool_plan_proposal: None,
                             pending_tool_approval: None,
                 tool_trace: vec![],
+                orchestration: None,
                         })
                     }
                     Err(e) => Err(e),
@@ -8894,6 +8919,7 @@ impl KernelState {
                 tool_plan_proposal: None,
                 pending_tool_approval: None,
                 tool_trace: vec![],
+                orchestration: None,
             }),
         }
     }
@@ -8962,6 +8988,7 @@ impl KernelState {
                 tool_plan_proposal: None,
                 pending_tool_approval: None,
                 tool_trace: vec![],
+                orchestration: None,
             }
         };
 
@@ -12381,6 +12408,45 @@ fn describe_action(action: &PrimeAction) -> String {
         }
         other => format!("{other:?}"),
     }
+}
+
+/// One-click next actions for an orchestration Prime just created (§11.1). Each is a
+/// pre-written user message routed through the SAME grounded `prime_turn`, so a button
+/// can do nothing the user could not type by hand — never a privileged shortcut.
+///
+/// - **Run** the governed batch — the explicit, operator-triggered start (§10.4).
+///   Nothing ran on creation, so this is offered first; the run still gates every brief
+///   at run time through its assigned agent's adapter.
+/// - **Hire** a specialist for any role whose brief fell back to Prime because the
+///   planner found no specialist on the roster (the same gap the honest plan notes name).
+///   Pre-filled (`send: false`) so the operator confirms / names the adapter rather than
+///   spawning an agent on a click. Roles are de-duplicated, in first-seen order.
+fn orchestration_suggested_actions(o: &Orchestration) -> Vec<relux_core::PrimeSuggestion> {
+    use relux_core::{OrchestrationRole, PrimeSuggestion};
+    let mut out: Vec<PrimeSuggestion> = Vec::new();
+    out.push(PrimeSuggestion {
+        label: "Run this orchestration".to_string(),
+        message: format!("run orchestration {}", o.id),
+        send: true,
+    });
+    // Roles whose brief was assigned to the grounded Prime fallback (id "prime") because
+    // no specialist exists on the roster. A General brief needs no specialist and is never
+    // surfaced as a missing hire.
+    let mut seen: Vec<OrchestrationRole> = Vec::new();
+    for step in &o.steps {
+        if step.agent_id.as_str() == "prime"
+            && step.role != OrchestrationRole::General
+            && !seen.contains(&step.role)
+        {
+            seen.push(step.role);
+            out.push(PrimeSuggestion {
+                label: format!("Hire a {} agent", step.role.label()),
+                message: format!("create a {} agent", step.role.label()),
+                send: false,
+            });
+        }
+    }
+    out
 }
 
 /// Render a grounded, multi-line summary of an orchestration Prime just created:
@@ -24082,6 +24148,81 @@ mod tests {
             .any(|e| e.action == "orchestration:create" && e.result == AuditResult::Success));
         // Nothing ran yet.
         assert_eq!(k.run_count(), 0);
+    }
+
+    #[test]
+    fn orchestrate_chat_turn_returns_a_structured_result_card() {
+        // The full chat path (deterministic, no brain): an explicit coordination goal
+        // becomes an Executed Orchestration turn that carries the durable record as
+        // STRUCTURED data (so the dashboard renders a grounded result card, not prose)
+        // plus one-click next actions. Creating it runs nothing (§10.4, §11.1).
+        let (mut k, ctx) = orchestration_kernel();
+        let turn = k
+            .prime_turn(
+                &ctx,
+                "orchestrate research the options, implement the prototype, and document it",
+            )
+            .unwrap();
+
+        assert_eq!(turn.disposition, PrimeDisposition::Executed);
+        assert_eq!(turn.intent, relux_core::PrimeIntent::Orchestration);
+        let record = turn
+            .orchestration
+            .as_ref()
+            .expect("structured orchestration record on the turn");
+        assert_eq!(record.steps.len(), 3);
+        assert_eq!(record.status, OrchestrationStatus::Planned);
+        // Implementation routes to the code-agent specialist; research + documentation
+        // have no specialist and fall back to Prime (the honest "unassigned" steps).
+        assert_eq!(record.steps[0].agent_id.as_str(), "prime"); // research
+        assert_eq!(record.steps[1].agent_id.as_str(), "code-agent"); // implement
+        assert_eq!(record.steps[2].agent_id.as_str(), "prime"); // document
+        // created_task still points at the first brief for legacy navigation.
+        assert_eq!(turn.created_task.as_ref(), Some(&record.steps[0].task_id));
+        // Nothing ran by creating it.
+        assert_eq!(k.run_count(), 0);
+
+        // One-click next actions: run the batch, and hire the two missing specialists —
+        // never an implementation hire (that specialist exists). Each is a plain user
+        // message routed through the normal turn, never a privileged shortcut.
+        let run = turn
+            .suggested_actions
+            .iter()
+            .find(|s| s.label == "Run this orchestration")
+            .expect("a run action");
+        assert_eq!(run.message, format!("run orchestration {}", record.id));
+        assert!(run.send, "run is a deliberate one-click send");
+        let labels: Vec<&str> = turn
+            .suggested_actions
+            .iter()
+            .map(|s| s.label.as_str())
+            .collect();
+        assert!(labels.contains(&"Hire a research agent"));
+        assert!(labels.contains(&"Hire a documentation agent"));
+        assert!(
+            !labels.contains(&"Hire a implementation agent"),
+            "no hire offered for a role that already has a specialist"
+        );
+        // The hire actions PRE-FILL (do not auto-send) so the operator confirms the adapter.
+        assert!(turn
+            .suggested_actions
+            .iter()
+            .filter(|s| s.label.starts_with("Hire"))
+            .all(|s| !s.send));
+    }
+
+    #[test]
+    fn casual_ideation_never_returns_an_orchestration_result() {
+        // A guarded coordination QUESTION is conversation, not a command (§10.5, §17.1):
+        // the turn does not execute, carries no structured orchestration, and mints no
+        // durable record.
+        let (mut k, ctx) = orchestration_kernel();
+        let turn = k
+            .prime_turn(&ctx, "should we split this across a few agents?")
+            .unwrap();
+        assert_ne!(turn.disposition, PrimeDisposition::Executed);
+        assert!(turn.orchestration.is_none());
+        assert_eq!(k.orchestration_count(), 0);
     }
 
     #[test]

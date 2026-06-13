@@ -378,6 +378,7 @@ mod tests {
             tool_plan_proposal: None,
             pending_tool_approval: None,
             tool_trace: vec![],
+            orchestration: None,
         }
     }
 

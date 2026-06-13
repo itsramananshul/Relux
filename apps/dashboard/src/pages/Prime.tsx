@@ -16,9 +16,17 @@ import {
   type ReluxPrimeToolPlanProposal,
   type ReluxPrimeToolView,
   type ReluxPrimeTurn,
+  type ReluxOrchestration,
   type ReluxToolDescriptor,
   type ReluxToolInvocationResult,
 } from "../api";
+import {
+  orchestrationStatusTone,
+  orchestrationProgressLabel,
+  orchestrationAssignmentSummary,
+  stepIsPrimeFallback,
+  stepOutcomeTone,
+} from "../orchestration";
 import { afterActionLabel, agentCreatedView, boundedContextReads, brainSourceLabel, configureCommandToolAction, configurePluginCandidateAction, contextReadDetail, contextReadsHadMiss, contextReadsUsedLabel, decisionSourceLabel, formatToolOutput, githubPluginInstallAction, hasSteps, intentProvenance, isCapabilityGrantSuggestion, pendingClarificationLabel, polishProvenance, PRIME_GREETING, PRIME_HINT, PRIME_PLACEHOLDER, PRIME_SUGGESTIONS, proposalDisplaySummary, replyPolishLabel, requestedToolLabel, slotProvenance, stepDisplayTitle, updateProvenance, type AgentCreatedView, type ConfigureCommandToolAction, type ConfigurePluginCandidateAction } from "../prime";
 import { commandToolInputFromDraft, validateCommandToolDraft, type CommandToolDraft } from "../plugins";
 import { workTaskHref, workRunHref } from "../routing";
@@ -750,6 +758,13 @@ export function PrimeTurnCard({
           showing it. The explicit commit is the "Create these tasks" button below
           (from suggested_actions), so the card never acts on its own (§10.5, §17.1). */}
       {turn.proposal && <ProposalCard proposal={turn.proposal} />}
+
+      {/* The executed multi-agent ORCHESTRATION result card (RELUX_MASTER_PLAN §10.4
+          Delegation Rules, §11.1 Prime Chat): the briefs Prime just created across the
+          crew, each with its assignee + role + outcome, and the honest no-specialist
+          notes. The briefs were already created + assigned; NOTHING runs by showing it.
+          The Run/Hire next actions are the ordinary suggested_actions below. */}
+      {turn.orchestration && <OrchestrationResultCard orchestration={turn.orchestration} />}
 
       {/* The reviewable MULTI-TOOL plan proposal (docs/mcp.md "Run-driven multi-tool
           plan"): a compact card showing the grounded tool steps, each step's
@@ -2131,6 +2146,117 @@ function ProposalCard({ proposal }: { proposal: ReluxPrimeProposal }) {
           (or one-task) button below is the only path that materializes work. */}
       <div className="muted" style={{ fontSize: 10, marginTop: 8, fontStyle: "italic" }}>
         Nothing is created yet — use the button below to commit this plan.
+      </div>
+    </div>
+  );
+}
+
+// The executed multi-agent ORCHESTRATION result card (RELUX_MASTER_PLAN §10.4
+// Delegation Rules, §11.1 Prime Chat). It renders STRICTLY the durable record the turn
+// carried — the goal, the ordered briefs with their assigned agent + specialist role +
+// outcome, and the planner's honest notes (which name any role with no specialist on the
+// roster). A brief that fell back to Prime is marked as such so the "who is missing" gap
+// is legible, not hidden. The card commits nothing and runs nothing by showing it: the
+// briefs were already created + assigned, and the Run / Hire next actions are the ordinary
+// suggested_actions rendered below it (each a plain user message, never a privileged path).
+function OrchestrationResultCard({ orchestration }: { orchestration: ReluxOrchestration }) {
+  const o = orchestration;
+  const { assignedAgents, unassignedRoles } = orchestrationAssignmentSummary(o);
+  return (
+    <div
+      style={{
+        marginTop: 10,
+        border: "1px solid var(--border)",
+        borderRadius: 6,
+        padding: "10px 12px",
+      }}
+    >
+      <div className="row wrap" style={{ gap: 6, alignItems: "center", marginBottom: 4 }}>
+        <span className="badge todo" style={{ fontSize: 9 }} title="A multi-agent plan Prime created across the crew">
+          orchestration
+        </span>
+        <span className="mono" style={{ fontSize: 11 }} title="Orchestration id">
+          {o.id}
+        </span>
+        <span
+          className={"badge " + orchestrationStatusTone(o.status)}
+          style={{ fontSize: 9 }}
+          title="Overall lifecycle"
+        >
+          {o.status.replace(/_/g, " ")}
+        </span>
+        <span className="muted" style={{ fontSize: 10, marginLeft: "auto" }}>
+          {orchestrationProgressLabel(o)}
+        </span>
+      </div>
+      <div className="mono" style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>
+        {o.goal}
+      </div>
+      <div className="muted" style={{ fontSize: 11, marginBottom: 8 }}>
+        {o.steps.length} brief(s)
+        {assignedAgents.length > 0 && <> · {assignedAgents.length} specialist(s): {assignedAgents.join(", ")}</>}
+        {unassignedRoles.length > 0 && (
+          <> · {unassignedRoles.length} role(s) on Prime (no specialist yet): {unassignedRoles.join(", ")}</>
+        )}
+      </div>
+      <ol style={{ margin: 0, paddingLeft: 0, listStyle: "none" }}>
+        {o.steps.map((s, i) => {
+          const onPrime = stepIsPrimeFallback(s);
+          return (
+            <li
+              key={s.task_id}
+              className="row wrap"
+              style={{
+                gap: 8,
+                alignItems: "baseline",
+                padding: "4px 0",
+                borderTop: "1px solid var(--border)",
+                fontSize: 12,
+              }}
+            >
+              <span className="mono muted" style={{ fontSize: 11, minWidth: 16 }}>
+                {i + 1}.
+              </span>
+              <span style={{ flex: 1, minWidth: 160 }}>
+                <Link to={workTaskHref(s.task_id)} className="mono" title="Open this brief on the Work board">
+                  {s.task_id}
+                </Link>{" "}
+                {s.title}
+              </span>
+              <span className="badge backlog" style={{ fontSize: 9 }} title="Specialist role this brief needs">
+                {s.role}
+              </span>
+              <span
+                className={"mono " + (onPrime ? "muted" : "")}
+                style={{ fontSize: 10 }}
+                title={onPrime ? "No specialist on the roster — Prime is covering this brief; hire one to delegate it" : "Assigned specialist"}
+              >
+                → {s.agent_id}
+                {onPrime && " (no specialist yet)"}
+              </span>
+              <span className={"badge " + stepOutcomeTone(s.outcome)} style={{ fontSize: 9 }} title="Brief outcome">
+                {s.outcome}
+              </span>
+            </li>
+          );
+        })}
+      </ol>
+      {/* The planner's honest notes — e.g. "No documentation agent on the roster;
+          assigning to Prime. Hire one for a specialist." Never fabricated. */}
+      {o.notes.length > 0 && (
+        <ul className="muted" style={{ fontSize: 11, margin: "8px 0 0", paddingLeft: 16 }}>
+          {o.notes.map((n, i) => (
+            <li key={i}>{n}</li>
+          ))}
+        </ul>
+      )}
+      {/* The honest contract: creating the orchestration ran nothing. The Run /
+          Hire buttons below (suggested_actions) are the explicit, governed next
+          steps; the full controls (live progress, cancel, resume) live on the
+          Prime Orchestration panel and the Work board. */}
+      <div className="muted" style={{ fontSize: 10, marginTop: 8, fontStyle: "italic" }}>
+        Nothing is running yet — use the buttons below to run it or hire a missing
+        specialist, or open the <Link to="/work">Work board</Link> to track the briefs.
       </div>
     </div>
   );

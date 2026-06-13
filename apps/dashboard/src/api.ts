@@ -1763,6 +1763,14 @@ export interface ReluxPrimeTurn {
   // A reviewable, action-free plan preview, present ONLY on a plan-request turn
   // (§10 planning layer, §11.1). Omitted on every other turn.
   proposal?: ReluxPrimeProposal;
+  // The durable multi-agent orchestration Prime just created, present ONLY on a
+  // successful Orchestration turn (§10.4 Delegation Rules, §11.1 Prime Chat). Carries
+  // the full record — goal, ordered briefs with assigned agent/role/outcome, and the
+  // planner's honest notes (which name any role with no specialist) — so the chat renders
+  // a grounded result card instead of parsing the prose reply. The briefs were already
+  // created + assigned; NOTHING runs by showing it. The Run/Hire buttons are ordinary
+  // suggested_actions. Omitted on every other turn.
+  orchestration?: ReluxOrchestration;
   // A reviewable, action-free MULTI-TOOL plan preview, present ONLY on a tool-plan
   // turn (docs/mcp.md "Run-driven multi-tool plan"). The operator commits it with one
   // explicit click that creates a tool-run task through the existing tool_plan path;

@@ -5962,6 +5962,7 @@ fn build_agent_loop_turn(
         tool_plan_proposal: None,
         pending_tool_approval: None,
         tool_trace: result.trace(),
+        orchestration: None,
     }
 }
 
@@ -6220,6 +6221,7 @@ fn plain_prime_turn(
         tool_plan_proposal: None,
         pending_tool_approval: None,
         tool_trace: vec![],
+        orchestration: None,
     }
 }
 
@@ -11681,6 +11683,7 @@ mod tests {
             tool_plan_proposal: None,
             pending_tool_approval: None,
         tool_trace: vec![],
+        orchestration: None,
         }
     }
 
@@ -13147,6 +13150,7 @@ mod tests {
             tool_plan_proposal: None,
             pending_tool_approval: None,
         tool_trace: vec![],
+        orchestration: None,
         };
         let wire = serde_json::to_value(&turn).expect("PrimeTurn serializes");
         assert!(

@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent::AgentId;
 use crate::approval::ApprovalId;
 use crate::namespace::NamespaceId;
+use crate::orchestration::Orchestration;
 use crate::permission::RiskLevel;
 use crate::run::RunId;
 use crate::task::{TaskId, TaskStatus};
@@ -1460,6 +1461,18 @@ pub struct PrimeTurn {
     /// (`docs/mcp.md` "Prime Agent Loop"; `docs/RELUX_MASTER_PLAN.md` §10.5, §17.1).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_trace: Vec<PrimeToolTrace>,
+    /// The durable multi-agent orchestration this turn just created, present ONLY on a
+    /// successful `Orchestration` turn (Prime decomposed an explicit coordination goal
+    /// into briefs across the crew). Carries the full record — goal, the ordered briefs
+    /// with their assigned agent/role/outcome, and the planner's honest notes (which name
+    /// any role with no specialist on the roster) — so the chat can render a grounded
+    /// result card instead of parsing the prose reply. Omitted on every other turn, so
+    /// existing clients see the same JSON they did before. Presentation only: the briefs
+    /// were already created + assigned through the deterministic `prime_orchestrate` path,
+    /// and NOTHING runs by showing it — running stays the explicit, governed batch
+    /// (`docs/RELUX_MASTER_PLAN.md` §10.4 Delegation Rules, §11.1 Prime Chat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestration: Option<Orchestration>,
 }
 
 /// A pending per-call tool approval Prime created when an explicit chat tool
@@ -1869,6 +1882,7 @@ mod tests {
             tool_plan_proposal: None,
             pending_tool_approval: None,
             tool_trace: vec![],
+            orchestration: None,
         };
         let json = serde_json::to_string(&turn).unwrap();
         assert!(

@@ -495,6 +495,49 @@ action card. The operative then shows up on **Crew** (`CrewMemberCard`) with its
 brand, status, Lead/reporting line, skills/persona, and least-privilege permissions — and the
 card renders cleanly even when an optional field is missing.
 
+## Coordinating multi-agent work (from chat)
+
+> Spec refs: `docs/RELUX_MASTER_PLAN.md` §10.4 (Delegation Rules), §11.1 (Prime Chat),
+> §17.1 (Prime must be smart and grounded), and the "Orchestration (First Multi-Agent
+> Slice)" rollup. Code: `crates/relux-core/src/orchestration.rs` (the pure planner),
+> `crates/relux-kernel/src/state.rs` (`prime_orchestrate`, the `OrchestrateGoal` turn),
+> `apps/dashboard/src/orchestration.ts` + `pages/Prime.tsx` (`OrchestrationResultCard`).
+
+Prime can **turn one explicit goal into assigned work across the crew** from chat:
+*"orchestrate research the options, build a prototype, and write the docs"*, *"split this
+work across researcher and coder"*. Only **explicit coordination phrasing** classifies as
+an orchestration; a bare imperative still creates a single task, and **casual ideation
+stays conversation** (a guarded "should we split this across a few agents?" gets a
+clarifying question, not a fan-out — §10.5/§17.1). Nothing here bypasses the kernel.
+
+What happens, honestly:
+
+- **The deterministic planner owns the decomposition.** The goal is split into role-typed
+  briefs, each grounded to a real roster agent by **id keyword or declared specialty
+  skill** — so a conversational hire (`researcher`) and a manually-configured operative
+  with an opaque id but a `research` skill both match. A role with **no specialist** falls
+  back to Prime and is reported as a missing hire — access is never fabricated, and the
+  width is the operator-configured policy limit (no hidden cap).
+- **Creating the orchestration runs nothing.** One brief (task) per step is created and
+  assigned, recorded as a durable `Orchestration`. No run starts, and **no paid CLI is
+  spawned**, without an explicit start.
+- **The chat returns a STRUCTURED result card**, not a wall of prose. The turn carries the
+  record on `PrimeTurn.orchestration`, so the Prime chat renders the ordered briefs with
+  their **assignee + role + outcome**, the distinct specialists work landed on, the roles
+  still on Prime (with the planner's honest "hire one" notes), and a link to the **Work
+  board**. The card commits nothing.
+- **The next actions are one-click, governed, and explicit.** The turn attaches ordinary
+  `suggested_actions`: **Run this orchestration** (the explicit start of the same governed,
+  dependency-aware batch the panel/CLI drive — each brief still gates at run time through
+  its assigned agent's adapter) and **Hire a `<role>` agent** for each unstaffed role
+  (pre-filled, not auto-sent, so the operator confirms the adapter). Each button is just a
+  user message routed through the same grounded turn — never a privileged path.
+
+The full run controls (live progress, cancel, restart-honest resume) stay on the Prime
+**Orchestration panel**; the **Work board** groups the briefs by goal; **Crew** shows each
+operative's open/running brief counts. The chat card is the entry point that makes the
+fan-out legible the moment Prime creates it.
+
 ## The verified install → use path (end-to-end)
 
 This is the path a regression test pins end-to-end, route for route — the same sequence

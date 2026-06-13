@@ -16,6 +16,8 @@ import {
   orchestrationReadiness,
   orchestrationRounds,
   stepDurationLabel,
+  orchestrationAssignmentSummary,
+  stepIsPrimeFallback,
 } from "../src/orchestration.ts";
 import type { ReluxOrchestration, ReluxOrchestrationStep } from "../src/api.ts";
 
@@ -154,6 +156,35 @@ test("groupStepsByAgent preserves first-seen order and groups briefs", () => {
   );
   assert.equal(groups[0].steps.length, 2);
   assert.equal(groups[1].steps.length, 1);
+});
+
+test("orchestrationAssignmentSummary splits specialists from Prime fallbacks", () => {
+  // research + documentation fell back to Prime (no specialist); implementation
+  // landed on a real specialist. A general brief on Prime is NOT a missing hire.
+  const o = orch("orch_0001", "planned", [
+    step("t1", "prime", "pending", { role: "research" }),
+    step("t2", "code-agent", "pending", { role: "implementation" }),
+    step("t3", "prime", "pending", { role: "documentation" }),
+    step("t4", "prime", "pending", { role: "general" }),
+  ]);
+  const summary = orchestrationAssignmentSummary(o);
+  assert.deepEqual(summary.assignedAgents, ["code-agent"]);
+  assert.deepEqual(summary.unassignedRoles, ["research", "documentation"]);
+  // The per-step predicate matches: a Prime non-general brief is a fallback; a real
+  // specialist or a general brief is not.
+  assert.equal(stepIsPrimeFallback(o.steps[0]), true);
+  assert.equal(stepIsPrimeFallback(o.steps[1]), false);
+  assert.equal(stepIsPrimeFallback(o.steps[3]), false, "a general brief needs no specialist");
+});
+
+test("orchestrationAssignmentSummary de-dupes and is empty when fully staffed", () => {
+  const o = orch("orch_0002", "planned", [
+    step("t1", "research-agent", "pending", { role: "research" }),
+    step("t2", "research-agent", "pending", { role: "research" }),
+  ]);
+  const summary = orchestrationAssignmentSummary(o);
+  assert.deepEqual(summary.assignedAgents, ["research-agent"]);
+  assert.deepEqual(summary.unassignedRoles, []);
 });
 
 test("stepLifecycle derives ready vs waiting from dependencies", () => {

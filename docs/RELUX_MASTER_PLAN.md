@@ -3365,8 +3365,11 @@ How it works:
   splits a goal into clauses on natural connectors ("then", ",", "and"),
   classifies each clause to a role (`research`, `implementation`, `testing`,
   `review`, `documentation`, `operations`, `general`), and resolves each role to a
-  real agent on the live roster (by id keyword) or `None` (→ Prime fallback, with
-  an honest hire note). It is conservative: a goal that does not split into ≥2
+  real agent on the live roster — matched by the agent's **id keyword OR its declared
+  specialty skill** (`summary.all_agent_ids` + `summary.agent_skills`), so a
+  conversational hire (`researcher`) and a manually-configured operative with an opaque
+  id but a `research` skill both ground the same brief — or `None` (→ Prime fallback,
+  with an honest hire note). It is conservative: a goal that does not split into ≥2
   briefs is **not** treated as multi-agent, so a greeting or a single task never
   becomes a storm (section 10.5). Step count is capped.
 - **Prime classifies orchestration intent** only on explicit coordination phrasing
@@ -3377,6 +3380,17 @@ How it works:
   (`goal → steps[{task, agent, role, run, outcome}]`). It creates work but **does
   not run it** — nothing executes, and no paid CLI is spawned, without an explicit
   start.
+- **The chat turn returns the result as STRUCTURED data**, not a wall of prose:
+  the executed `Orchestration` turn carries the durable record on `PrimeTurn.orchestration`
+  so the Prime chat renders a grounded result card — the goal, the ordered briefs with
+  their assigned agent + role + outcome, and the planner's honest notes (which name any
+  role that fell back to Prime because no specialist exists). It also attaches one-click
+  `suggested_actions`: **Run this orchestration** (the explicit, governed start) and
+  **Hire a `<role>` agent** for each unstaffed role (pre-filled, not auto-sent). Each
+  button is an ordinary user message routed through the same grounded turn — never a
+  privileged path — and showing the card runs nothing. The Work board groups the briefs
+  by goal and the Crew page shows each operative's open/running brief counts, so the
+  fan-out is legible across surfaces.
 - **Planning infers simple dependencies.** When obvious roles co-occur in the goal
   the planner records a brief's prerequisites (`depends_on`, indices into the
   plan): **implementation waits on research**, and **testing/review/documentation
