@@ -115,6 +115,75 @@ fn kernel_discovers_a_managed_stdio_server_through_the_registry() {
 }
 
 #[test]
+fn off_lock_discover_and_classify_probes_a_real_stdio_server() {
+    // The post-activation discovery primitive: probe + classify straight from a config,
+    // off the kernel lock (this is what Prime's configure-candidate route runs after it
+    // registers a candidate). It spawns the command, lists tools, and classifies each —
+    // identical to `discover_mcp_tools`, but with no `&KernelState`.
+    let cfg = relux_core::McpServerConfig {
+        id: "fixture".to_string(),
+        transport: relux_core::McpTransport::ManagedStdio,
+        endpoint: String::new(),
+        command: Some(fixture().to_string()),
+        args: Vec::new(),
+        env: Default::default(),
+        cwd: None,
+        description: "post-activation probe".to_string(),
+        enabled: true,
+        timeout_ms: 5_000,
+        tool_overrides: Default::default(),
+        sampling: Default::default(),
+    };
+    let tools = relux_kernel::discover_and_classify_mcp_tools(&cfg).expect("probe ok");
+    assert!(!tools.is_empty(), "the fixture advertises tools");
+    let status = tools
+        .iter()
+        .find(|t| t.tool_name == "status.summary")
+        .expect("status.summary discovered");
+    assert_eq!(status.plugin_id, "mcp:fixture");
+    assert_eq!(status.source_kind, "Mcp");
+    // Every freshly-discovered, unclassified tool is gated — discovery NEVER silently
+    // marks a tool low-risk / directly runnable.
+    assert!(
+        tools.iter().all(|t| t.executable == relux_core::ToolExecutability::NeedsApproval),
+        "all discovered tools stay gated until classified"
+    );
+}
+
+#[test]
+fn off_lock_discover_and_classify_fails_cleanly_on_a_missing_secret() {
+    // A managed-stdio server whose env references an absent secret cannot be probed —
+    // the spawn-per-op resolver fails BEFORE spawning, naming the secret KEY + env var
+    // (never a value). The configure-candidate route turns this into "map its secrets,
+    // then Discover" guidance.
+    let mut env = std::collections::BTreeMap::new();
+    env.insert(
+        "NEEDS_TOKEN".to_string(),
+        relux_core::McpEnvRef {
+            secret: "definitely_absent_secret_probe_xyz".to_string(),
+        },
+    );
+    let cfg = relux_core::McpServerConfig {
+        id: "needs-secret".to_string(),
+        transport: relux_core::McpTransport::ManagedStdio,
+        endpoint: String::new(),
+        command: Some(fixture().to_string()),
+        args: Vec::new(),
+        env,
+        cwd: None,
+        description: "needs a secret".to_string(),
+        enabled: true,
+        timeout_ms: 5_000,
+        tool_overrides: Default::default(),
+        sampling: Default::default(),
+    };
+    let err = relux_kernel::discover_and_classify_mcp_tools(&cfg).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("definitely_absent_secret_probe_xyz"), "names the secret: {msg}");
+    assert!(msg.contains("NEEDS_TOKEN"), "names the env var: {msg}");
+}
+
+#[test]
 fn kernel_disabled_stdio_server_refuses_discovery() {
     let mut k = KernelState::new();
     k.register_mcp_stdio_server(

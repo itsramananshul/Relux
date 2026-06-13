@@ -1774,62 +1774,10 @@ impl KernelState {
         if !server.enabled {
             return Err(KernelError::McpServerDisabled(id.to_string()));
         }
-        let tools = mcp_discover_tools(server).map_err(|e| KernelError::McpDiscoveryFailed {
+        discover_and_classify_mcp_tools(server).map_err(|e| KernelError::McpDiscoveryFailed {
             id: id.to_string(),
             message: e.to_string(),
-        })?;
-        let plugin_id = relux_core::mcp_synthetic_plugin_id(id);
-        let mut out: Vec<ToolDescriptor> = tools
-            .into_iter()
-            .map(|tool| {
-                // Scan the (untrusted) tool description for prompt-injection
-                // patterns; log a warning but still list the tool (mirrors Hermes
-                // `_scan_mcp_description` — advisory, never a block).
-                let findings = relux_core::scan_mcp_tool_description(&tool.description);
-                if !findings.is_empty() {
-                    // Advisory, never a block (false positives would break
-                    // legitimate servers). Surfaced on stderr so an operator can see
-                    // a suspicious MCP tool description without a logging dependency.
-                    eprintln!(
-                        "[relux] WARN mcp server '{id}' tool '{}': suspicious description content — {}",
-                        tool.name,
-                        findings.join("; ")
-                    );
-                }
-                // The tool's risk + approval come from the operator's classification
-                // (or the fail-closed default: Medium + Required). The SAME
-                // `approval_blocks_direct_invocation` predicate that gates real
-                // plugin tools decides whether this MCP tool is directly runnable or
-                // gated behind approval — so an unclassified tool reads as
-                // `needs_approval`, never auto-runnable.
-                let classification = server.tool_classification(&tool.name);
-                let executable = if approval_blocks_direct_invocation(
-                    &classification.approval,
-                    &classification.risk,
-                ) {
-                    ToolExecutability::NeedsApproval
-                } else {
-                    // Low-risk + auto-approve: directly invocable. The MCP server
-                    // (enabled, loopback) IS the runtime; the invoke path still
-                    // permission-checks the calling agent.
-                    ToolExecutability::Ready
-                };
-                ToolDescriptor {
-                    permission: relux_core::mcp_tool_permission(id, &tool.name),
-                    plugin_id: plugin_id.clone(),
-                    tool_name: tool.name,
-                    description: tool.description,
-                    risk: classification.risk,
-                    source_kind: "Mcp".to_string(),
-                    installed: true,
-                    enabled: server.enabled,
-                    protected: false,
-                    executable,
-                }
-            })
-            .collect();
-        out.sort_by(|a, b| a.tool_name.cmp(&b.tool_name));
-        Ok(out)
+        })
     }
 
     /// Run a live `resources/list` against an enabled MCP server, returning the
@@ -12303,6 +12251,74 @@ pub fn discover_proposal_mcp_catalog(
         out.push(entry);
     }
     ProposalMcpCatalog { servers: out }
+}
+
+/// Discover + classify one MCP server's tools from its [`relux_core::McpServerConfig`]
+/// alone (no `&KernelState`), so the bounded `tools/list` probe — a loopback dial or a
+/// spawn-per-operation managed-stdio child — can run OFF the kernel lock.
+///
+/// The classification is IDENTICAL to [`KernelState::discover_mcp_tools`] (which now
+/// delegates here): each tool's risk + approval come from the server's
+/// [`relux_core::McpServerConfig::tool_classification`] (or the fail-closed default —
+/// Medium + Required), and the SAME [`approval_blocks_direct_invocation`] predicate
+/// decides gated (`needs_approval`) vs. directly runnable (`ready`). An unclassified
+/// tool always reads as gated — discovery never silently marks a tool low-risk.
+/// Untrusted descriptions are scanned advisory-only (mirrors Hermes `_scan_mcp_description`).
+///
+/// Used by [`KernelState::discover_mcp_tools`] and by the Prime post-activation
+/// discovery hook (`server.rs::prime_configure_candidate_action`), which probes a
+/// freshly-registered server off-lock so the user sees what Prime can now use — or a
+/// clear "why not / what's missing" message — without a separate manual Discover step.
+pub fn discover_and_classify_mcp_tools(
+    server: &relux_core::McpServerConfig,
+) -> Result<Vec<ToolDescriptor>, crate::mcp::McpClientError> {
+    let id = server.id.as_str();
+    let tools = mcp_discover_tools(server)?;
+    let plugin_id = relux_core::mcp_synthetic_plugin_id(id);
+    let mut out: Vec<ToolDescriptor> = tools
+        .into_iter()
+        .map(|tool| {
+            // Scan the (untrusted) tool description for prompt-injection patterns; log a
+            // warning but still list the tool (mirrors Hermes `_scan_mcp_description` —
+            // advisory, never a block).
+            let findings = relux_core::scan_mcp_tool_description(&tool.description);
+            if !findings.is_empty() {
+                eprintln!(
+                    "[relux] WARN mcp server '{id}' tool '{}': suspicious description content — {}",
+                    tool.name,
+                    findings.join("; ")
+                );
+            }
+            // The tool's risk + approval come from the operator's classification (or the
+            // fail-closed default: Medium + Required). The SAME
+            // `approval_blocks_direct_invocation` predicate that gates real plugin tools
+            // decides whether this MCP tool is directly runnable or gated — so an
+            // unclassified tool reads as `needs_approval`, never auto-runnable.
+            let classification = server.tool_classification(&tool.name);
+            let executable = if approval_blocks_direct_invocation(
+                &classification.approval,
+                &classification.risk,
+            ) {
+                ToolExecutability::NeedsApproval
+            } else {
+                ToolExecutability::Ready
+            };
+            ToolDescriptor {
+                permission: relux_core::mcp_tool_permission(id, &tool.name),
+                plugin_id: plugin_id.clone(),
+                tool_name: tool.name,
+                description: tool.description,
+                risk: classification.risk,
+                source_kind: "Mcp".to_string(),
+                installed: true,
+                enabled: server.enabled,
+                protected: false,
+                executable,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.tool_name.cmp(&b.tool_name));
+    Ok(out)
 }
 
 /// Run a live `tools/list` against one MCP server, dispatching on its transport:

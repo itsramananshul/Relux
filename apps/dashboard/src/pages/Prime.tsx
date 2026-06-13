@@ -15,6 +15,7 @@ import {
   type ReluxPrimeToolPlanProposal,
   type ReluxPrimeToolView,
   type ReluxPrimeTurn,
+  type ReluxToolDescriptor,
   type ReluxToolInvocationResult,
 } from "../api";
 import { afterActionLabel, boundedContextReads, brainSourceLabel, configurePluginCandidateAction, contextReadDetail, contextReadsHadMiss, contextReadsUsedLabel, decisionSourceLabel, formatToolOutput, githubPluginInstallAction, hasSteps, intentProvenance, pendingClarificationLabel, polishProvenance, PRIME_GREETING, PRIME_HINT, PRIME_PLACEHOLDER, PRIME_SUGGESTIONS, proposalDisplaySummary, replyPolishLabel, requestedToolLabel, slotProvenance, stepDisplayTitle, updateProvenance, type ConfigurePluginCandidateAction } from "../prime";
@@ -1503,6 +1504,94 @@ function CandidateRow({ pluginId, candidate }: { pluginId: string; candidate: Re
   );
 }
 
+// One discovered MCP tool row: its name + a gated/runnable chip. Discovery LISTS tools
+// only — nothing here invokes one. An unclassified tool reads as gated until classified.
+function DiscoveredMcpToolRow({ tool }: { tool: ReluxToolDescriptor }) {
+  const gated = tool.executable === "needs_approval";
+  return (
+    <li className="row wrap" style={{ gap: 6, alignItems: "baseline", marginBottom: 2 }}>
+      <span className="mono" style={{ fontWeight: 600 }}>{tool.tool_name}</span>
+      <span
+        className={`badge ${gated ? "blocked" : "done"}`}
+        style={{ fontSize: 8 }}
+        title={gated ? "Gated — needs approval before it runs (classify it to change this)" : "Classified runnable"}
+      >
+        {gated ? "gated" : "runnable"}
+      </span>
+      {tool.description && (
+        <span className="muted" style={{ fontSize: 10 }}>{tool.description.slice(0, 80)}</span>
+      )}
+    </li>
+  );
+}
+
+// The guided post-activation discovery panel for an mcp_register result: what the
+// freshly-registered server advertises (each tool still gated), or an honest "couldn't
+// reach it / what's missing" message with the registered-server status. Turns "registered"
+// into "here's what Prime can use" without the user driving a separate Discover.
+function McpDiscoveryResult({ result }: { result: ReluxPrimeConfigureCandidateResult }) {
+  const d = result.mcp_discovery;
+  if (!d) return null;
+  return (
+    <div style={{ marginTop: 6 }}>
+      <div className="row wrap" style={{ gap: 6, alignItems: "baseline", marginBottom: 2 }}>
+        <span
+          className={`badge ${d.reachable ? "done" : "blocked"}`}
+          style={{ fontSize: 8 }}
+          title={d.reachable ? "A tools/list probe reached the server" : "A tools/list probe could not reach the server yet"}
+        >
+          {d.reachable ? `${d.tool_count} tool${d.tool_count === 1 ? "" : "s"} found` : "not reachable yet"}
+        </span>
+        {d.reachable && d.gated_count > 0 && (
+          <span className="badge blocked" style={{ fontSize: 8 }} title="Gated tools need approval before they run">
+            {d.gated_count} gated
+          </span>
+        )}
+      </div>
+      {d.tools.length > 0 && (
+        <ul style={{ listStyle: "none", padding: 0, margin: "2px 0 4px" }}>
+          {d.tools.map((t) => (
+            <DiscoveredMcpToolRow key={`${t.plugin_id}/${t.tool_name}`} tool={t} />
+          ))}
+        </ul>
+      )}
+      {!d.reachable && d.error && (
+        <div className="muted mono" style={{ fontSize: 10, marginBottom: 4 }} title="The sanitized probe failure reason">
+          {d.error}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// The success view after a confirmed activation: the new tool / MCP server, the guided MCP
+// discovery (for an mcp_register result), the honest "ask me to use it" next step, and a
+// link. Exported so a render test can mount it directly with a fabricated result (the live
+// component sets `result` from the POST, which a static render does not run). Nothing here
+// invokes a tool — every discovered/configured tool stays gated until asked for.
+export function CandidateActivationResult({ result }: { result: ReluxPrimeConfigureCandidateResult }) {
+  return (
+    <div className="banner" style={{ fontSize: 11, marginTop: 4 }}>
+      <div style={{ marginBottom: 4 }}>
+        Configured <span className="mono" style={{ fontWeight: 600 }}>{result.tool_name}</span>{" "}
+        <span className="badge backlog" style={{ fontSize: 8 }}>
+          {result.activation === "mcp_register" ? "MCP server" : "command tool"}
+        </span>
+        {result.no_code_executed && (
+          <span className="badge backlog" style={{ fontSize: 8, marginLeft: 4 }} title="Activation registered metadata/recipe only — no source code ran">
+            no code run
+          </span>
+        )}
+      </div>
+      <div className="muted" style={{ marginBottom: 6 }}>{result.next_step}</div>
+      {result.activation === "mcp_register" && <McpDiscoveryResult result={result} />}
+      <div className="row wrap" style={{ gap: 8 }}>
+        <Link className="chip" style={{ fontSize: 11, padding: "3px 10px" }} to="/plugins">Open Plugins</Link>
+      </div>
+    </div>
+  );
+}
+
 // Activate ONE detected candidate through the SINGLE backend-governed route
 // (POST /v1/relux/prime/actions/configure-candidate), then show the result: the new
 // tool / MCP server, the honest "ask me to use it" next step, and links. Shared by the
@@ -1561,25 +1650,7 @@ function CandidateActivation({
   }
 
   if (result) {
-    return (
-      <div className="banner" style={{ fontSize: 11, marginTop: 4 }}>
-        <div style={{ marginBottom: 4 }}>
-          Configured <span className="mono" style={{ fontWeight: 600 }}>{result.tool_name}</span>{" "}
-          <span className="badge backlog" style={{ fontSize: 8 }}>
-            {result.activation === "mcp_register" ? "MCP server" : "command tool"}
-          </span>
-          {result.no_code_executed && (
-            <span className="badge backlog" style={{ fontSize: 8, marginLeft: 4 }} title="Activation registered metadata/recipe only — no source code ran">
-              no code run
-            </span>
-          )}
-        </div>
-        <div className="muted" style={{ marginBottom: 6 }}>{result.next_step}</div>
-        <div className="row wrap" style={{ gap: 8 }}>
-          <Link className="chip" style={{ fontSize: 11, padding: "3px 10px" }} to="/plugins">Open Plugins</Link>
-        </div>
-      </div>
-    );
+    return <CandidateActivationResult result={result} />;
   }
 
   if (denied) {

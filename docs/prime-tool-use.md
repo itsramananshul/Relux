@@ -343,8 +343,26 @@ The flow:
    activated candidate's `kind` + `activation`, the registered `mcp_server` **or** the
    updated `plugin` record, the new `tool_name`, the honest `next_step` (**"ask me to use
    it"** — the tool stays gated until invoked), and the `no_code_executed` guarantee. A
-   registered MCP server still needs a **Discover** + per-tool classification; a command
-   tool is invokable through the same gated chat path (`prime_invoke_tool`).
+   command tool is invokable through the same gated chat path (`prime_invoke_tool`).
+5. **Guided post-activation discovery (MCP only).** Immediately after it registers an
+   `mcp_register` candidate, the route runs ONE bounded `tools/list` probe against the
+   freshly-registered server — **off the kernel lock** (a loopback dial or a
+   spawn-per-operation managed-stdio child; `relux_kernel::discover_and_classify_mcp_tools`)
+   — so the user sees what Prime can now use without driving a separate manual Discover.
+   The result rides back on the response as `mcp_discovery`:
+   - **Reachable:** the discovered tools (each carrying its fail-closed classification —
+     unclassified ⇒ `needs_approval`), a `tool_count` / `gated_count` summary, and a
+     `guidance` line naming a few tools and the gated split. The chat card lists each tool
+     with a **gated / runnable** chip.
+   - **Unreachable / no tools:** `reachable: false` with **actionable** guidance (map the
+     server's secrets `ENV_VAR=secret_name`, then **Discover**, for a managed-stdio server
+     with env placeholders; **Start it on the MCP page** otherwise) plus the sanitized,
+     value-free `error` reason. **No fabricated tools.**
+   This step is best-effort: the server is already registered, so a probe failure becomes
+   guidance, **never a failed activation**. Discovery **lists** tools only — it never calls
+   one, and never silently marks a discovered tool low-risk. This mirrors Hermes
+   `cmd_mcp_add`'s discovery-first flow (`reference/hermes-agent-main/hermes_cli/mcp_config.py`):
+   connect, list tools, and on failure surface a clear "fix it, then test" path.
 
 **Safety:** activation registers metadata/recipe only — it runs no code from the source,
 grants no new authority, and the resulting MCP tool / command tool stays gated (needs

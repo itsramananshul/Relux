@@ -1928,6 +1928,26 @@ export const reluxPrime = {
     ),
 };
 
+// The result of the bounded `tools/list` probe Relux runs right after it registers an MCP
+// candidate from Prime chat — the guided discovery/classification step (the kernel's
+// McpPostActivationDiscovery). Honest by construction: a server that connects lists its
+// (still-gated) tools; one that does not is `reachable: false` with an actionable reason +
+// guidance (map secrets / Start / Discover). Listing only — it never calls a tool.
+export interface ReluxMcpPostActivationDiscovery {
+  // True only when the `tools/list` probe succeeded.
+  reachable: boolean;
+  // The discovered tools, each carrying its fail-closed classification (unclassified ⇒
+  // `needs_approval`). Empty when the server connected with no tools, or the probe failed.
+  tools: ReluxToolDescriptor[];
+  tool_count: number;
+  // How many of those are gated (need approval) — i.e. not directly runnable yet.
+  gated_count: number;
+  // Honest one-line guidance to show verbatim: what Prime can use now, or what to do next.
+  guidance: string;
+  // Present only when the probe failed: the sanitized, value-free failure reason.
+  error?: string;
+}
+
 // The structured result of a confirmed capability activation (the kernel's
 // PrimeConfigureCandidateResponse). One auditable envelope: which plugin/candidate was
 // activated, through which governed path, the resulting server/tool status, the honest
@@ -1942,6 +1962,11 @@ export interface ReluxPrimeConfigureCandidateResult {
   activation: string;
   // Present for an mcp_register activation: the registered server's redacted status.
   mcp_server?: ReluxMcpServer;
+  // Present for an mcp_register activation: the bounded post-activation `tools/list` probe
+  // — what tools the freshly-registered server advertises (each still gated), or an honest
+  // "couldn't reach it / what's missing" message. The guided discovery step that turns
+  // "registered" into "here's what Prime can use" without a separate manual Discover.
+  mcp_discovery?: ReluxMcpPostActivationDiscovery;
   // Present for a command_tool activation: the updated plugin record (carries the new tool).
   plugin?: ReluxPlugin;
   // The new tool name (command tool) or registered MCP server id, for "ask me to use it".

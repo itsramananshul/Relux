@@ -203,7 +203,8 @@ pub use secret_store::{
     secret_store, validate_managed_cwd, SecretStore,
 };
 pub use state::{
-    discover_proposal_mcp_catalog, run_briefs_in_parallel, run_briefs_in_parallel_streaming,
+    discover_and_classify_mcp_tools, discover_proposal_mcp_catalog, run_briefs_in_parallel,
+    run_briefs_in_parallel_streaming,
     AppliedProposedChange, AppliedProposedChangeSet, BrainSlotProposals, BundledRefresh,
     BundledRefreshSummary, ContinuationPause, FinishedBrief, KernelCounters, KernelSnapshot,
     KernelState, PendingClarificationEntry, PendingToolInvocation, PreparedBrief,

@@ -8150,6 +8150,13 @@ struct PrimeConfigureCandidateResponse {
     /// Present for an `mcp_register` activation: the registered server's redacted status.
     #[serde(skip_serializing_if = "Option::is_none")]
     mcp_server: Option<McpServerResponse>,
+    /// Present for an `mcp_register` activation: the result of the bounded, off-lock
+    /// post-activation `tools/list` probe — what tools the freshly-registered server
+    /// advertises (each still gated), or an honest "couldn't reach it / what's missing"
+    /// message. This is the guided discovery step that turns "registered" into "here is
+    /// what Prime can now use" without the user driving a separate Discover.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mcp_discovery: Option<McpPostActivationDiscovery>,
     /// Present for a `command_tool` activation: the updated plugin record (carries the
     /// new tool in its count) so the page can refresh.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -8165,6 +8172,178 @@ struct PrimeConfigureCandidateResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     approval_id: Option<String>,
     approval_closed: bool,
+}
+
+/// The result of the bounded, off-lock `tools/list` probe Relux runs immediately after
+/// it registers an MCP candidate from Prime chat — the guided discovery/classification
+/// step. Honest by construction: a server that connects lists its (still-gated) tools; a
+/// server that does not is reported `reachable: false` with an actionable reason +
+/// guidance (e.g. "map its secrets, then Discover" / "Start it on the MCP page"). Mirrors
+/// Hermes `cmd_mcp_add`'s discovery-first step (`reference/hermes-agent-main/hermes_cli/mcp_config.py`):
+/// connect, list tools, and on failure surface a clear "fix it, then test" path — never a
+/// fabricated tool. Discovery LISTS tools only; it never calls one.
+#[derive(Debug, Serialize)]
+struct McpPostActivationDiscovery {
+    /// True only when the `tools/list` probe succeeded (loopback dial / spawn-per-op).
+    reachable: bool,
+    /// The discovered tools, each carrying its fail-closed classification (unclassified ⇒
+    /// `needs_approval`). Empty when the server connected but advertised no tools, or when
+    /// the probe failed.
+    tools: Vec<relux_core::ToolDescriptor>,
+    /// How many tools were discovered.
+    tool_count: usize,
+    /// How many of those are gated (need approval) — i.e. not directly runnable yet.
+    gated_count: usize,
+    /// Honest one-line guidance the chat/UI can show verbatim: what Prime can use now, or
+    /// what to do next (map secrets / Start / Discover) when nothing came back.
+    guidance: String,
+    /// Present only when the probe failed: the sanitized, value-free failure reason (a
+    /// missing secret names the KEY, never a value).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// Build the structured post-activation discovery result + the honest `next_step` line
+/// from a registered server's identity and the outcome of the `tools/list` probe. Pure
+/// (no I/O) so the guidance/classification copy is unit-testable; the async wrapper
+/// [`probe_registered_mcp_server`] runs the bounded probe and calls this.
+///
+/// `probe` is `Ok(tools)` (already classified by `discover_and_classify_mcp_tools`, so
+/// each tool's `executable` reflects its fail-closed risk/approval), or `Err(reason)`
+/// (already sanitized). `is_stdio` / `env_placeholders` shape the failure guidance toward
+/// the right fix (a managed-stdio server that needs secrets vs. a server to Start/Discover).
+fn build_post_activation_discovery(
+    server_id: &str,
+    is_stdio: bool,
+    env_placeholders: &[String],
+    probe: Result<Vec<relux_core::ToolDescriptor>, String>,
+) -> (McpPostActivationDiscovery, String) {
+    match probe {
+        Ok(tools) => {
+            let tool_count = tools.len();
+            let gated_count = tools
+                .iter()
+                .filter(|t| matches!(t.executable, relux_core::ToolExecutability::NeedsApproval))
+                .count();
+            if tool_count == 0 {
+                let guidance = format!(
+                    "Registered MCP server \"{server_id}\" and it connected, but it advertises no tools yet."
+                );
+                let next_step = guidance.clone();
+                (
+                    McpPostActivationDiscovery {
+                        reachable: true,
+                        tools,
+                        tool_count,
+                        gated_count,
+                        guidance,
+                        error: None,
+                    },
+                    next_step,
+                )
+            } else {
+                // Name a few tools so the user sees what landed without dumping a long list.
+                let preview: Vec<&str> = tools.iter().take(3).map(|t| t.tool_name.as_str()).collect();
+                let more = tool_count.saturating_sub(preview.len());
+                let names = if more > 0 {
+                    format!("{} +{more} more", preview.join(", "))
+                } else {
+                    preview.join(", ")
+                };
+                let gated_note = if gated_count == tool_count {
+                    "Each stays gated until you classify it".to_string()
+                } else if gated_count == 0 {
+                    "All are classified runnable".to_string()
+                } else {
+                    format!("{gated_count} of {tool_count} stay gated until you classify them")
+                };
+                let guidance = format!(
+                    "Registered MCP server \"{server_id}\" and discovered {tool_count} tool(s): {names}. {gated_note} — ask me to use one and I'll stage the approval before it runs."
+                );
+                let next_step = guidance.clone();
+                (
+                    McpPostActivationDiscovery {
+                        reachable: true,
+                        tools,
+                        tool_count,
+                        gated_count,
+                        guidance,
+                        error: None,
+                    },
+                    next_step,
+                )
+            }
+        }
+        Err(reason) => {
+            // The server is registered; discovery just hasn't reached it yet. Point at the
+            // right fix instead of a bare failure.
+            let guidance = if is_stdio && !env_placeholders.is_empty() {
+                format!(
+                    "Registered MCP server \"{server_id}\", but a tools/list probe couldn't reach it yet — it expects secrets ({}). Map ENV_VAR=secret_name on the MCP page, then Discover to list its tools.",
+                    env_placeholders.join(", ")
+                )
+            } else if is_stdio {
+                format!(
+                    "Registered MCP server \"{server_id}\", but a tools/list probe couldn't start it yet ({reason}). Start it on the MCP page, then Discover to list its tools."
+                )
+            } else {
+                format!(
+                    "Registered MCP server \"{server_id}\", but a tools/list probe didn't reach it yet ({reason}). Make sure it's running, then Discover on the MCP page to list its tools."
+                )
+            };
+            let next_step = guidance.clone();
+            (
+                McpPostActivationDiscovery {
+                    reachable: false,
+                    tools: Vec::new(),
+                    tool_count: 0,
+                    gated_count: 0,
+                    guidance,
+                    error: Some(bounded_probe_error(&reason)),
+                },
+                next_step,
+            )
+        }
+    }
+}
+
+/// Bound a probe failure reason to a sane length for the wire (the underlying MCP client
+/// errors are already value-free — a missing secret names the KEY, not its value).
+fn bounded_probe_error(reason: &str) -> String {
+    const MAX: usize = 240;
+    let trimmed = reason.trim();
+    if trimmed.chars().count() <= MAX {
+        trimmed.to_string()
+    } else {
+        let mut s: String = trimmed.chars().take(MAX).collect();
+        s.push('…');
+        s
+    }
+}
+
+/// Run the bounded, off-lock `tools/list` probe against a freshly-registered MCP server
+/// and shape it into the guided discovery result. Best-effort: the server is ALREADY
+/// registered, so a probe failure never fails the activation — it becomes actionable
+/// guidance. Discovery LISTS tools only (never calls one); each discovered tool keeps its
+/// fail-closed classification. Reference: Hermes `cmd_mcp_add` connects + lists after add.
+async fn probe_registered_mcp_server(
+    cfg: relux_core::McpServerConfig,
+    env_placeholders: Vec<String>,
+) -> (McpPostActivationDiscovery, String) {
+    let server_id = cfg.id.clone();
+    let is_stdio = matches!(cfg.transport, relux_core::McpTransport::ManagedStdio);
+    // Discover off the kernel lock — a loopback dial or a spawn-per-op stdio child can
+    // take up to the server timeout; we never hold the lock across it.
+    let probe: Result<Vec<relux_core::ToolDescriptor>, String> =
+        match tokio::task::spawn_blocking(move || {
+            relux_kernel::discover_and_classify_mcp_tools(&cfg)
+        })
+        .await
+        {
+            Ok(result) => result.map_err(|e| e.to_string()),
+            Err(join_err) => Err(format!("discovery task did not complete: {join_err}")),
+        };
+    build_post_activation_discovery(&server_id, is_stdio, &env_placeholders, probe)
 }
 
 /// Read-only candidate scan for one installed plugin's directory (the SAME scan as GET
@@ -8276,7 +8455,10 @@ async fn prime_configure_candidate_action(
 
     // 4. Activate through the EXISTING governed path for this candidate's activation.
     let plugin_id = relux_core::PluginId::new(target.id.clone());
-    let (mcp_server, plugin_record, tool_name, next_step) = match candidate.activation.as_str() {
+    let (mcp_server, plugin_record, tool_name, next_step, mcp_discovery) = match candidate
+        .activation
+        .as_str()
+    {
         "mcp_register" => {
             let proposal = candidate.mcp_registration.as_ref().ok_or_else(|| {
                 ApiError::bad_request("MCP candidate is missing its registration draft")
@@ -8290,7 +8472,8 @@ async fn prime_configure_candidate_action(
             // Register through the unchanged registry (which re-validates the loopback/argv
             // contract). env is intentionally NOT pre-filled — a managed-stdio server's
             // secrets are mapped separately on the MCP page, never carried in this request.
-            let resp = if proposal.suggested_transport == "managed_stdio" {
+            let cfg: relux_core::McpServerConfig = if proposal.suggested_transport == "managed_stdio"
+            {
                 let command = proposal.detected_command.clone().ok_or_else(|| {
                     ApiError::bad_request(
                         "this MCP candidate has no command to register — open the MCP page to enter one",
@@ -8298,7 +8481,7 @@ async fn prime_configure_candidate_action(
                 })?;
                 let args = proposal.detected_args.clone();
                 locked_save(&state, |kernel| {
-                    let cfg = kernel.register_mcp_stdio_server(
+                    kernel.register_mcp_stdio_server(
                         &server_id,
                         &command,
                         &args,
@@ -8307,8 +8490,7 @@ async fn prime_configure_candidate_action(
                         &description,
                         true,
                         None,
-                    )?;
-                    Ok(McpServerResponse::from_config(&cfg))
+                    )
                 })?
             } else {
                 let endpoint = proposal.suggested_endpoint.clone().ok_or_else(|| {
@@ -8317,21 +8499,19 @@ async fn prime_configure_candidate_action(
                     )
                 })?;
                 locked_save(&state, |kernel| {
-                    let cfg =
-                        kernel.register_mcp_server(&server_id, &endpoint, &description, true, None)?;
-                    Ok(McpServerResponse::from_config(&cfg))
+                    kernel.register_mcp_server(&server_id, &endpoint, &description, true, None)
                 })?
             };
-            let mut step = format!(
-                "Registered MCP server \"{server_id}\". Run Discover on it to list its tools through the gate, then ask me to use one — each tool stays gated until you classify it."
-            );
-            if !candidate.env_placeholders.is_empty() {
-                step.push_str(&format!(
-                    " It expects secrets ({}); map ENV_VAR=secret_name on the MCP page before its tools will work.",
-                    candidate.env_placeholders.join(", ")
-                ));
-            }
-            (Some(resp), None, server_id, step)
+            let resp = McpServerResponse::from_config(&cfg);
+            // Guided post-activation discovery: probe the freshly-registered server OFF the
+            // kernel lock (best-effort — the server is already registered, so a probe
+            // failure becomes actionable guidance, never a failed activation). This turns
+            // "registered" into "here's what Prime can use" or "here's what's missing"
+            // without the user driving a separate Discover. Lists tools only; never calls
+            // one. Each discovered tool keeps its fail-closed classification.
+            let (discovery, step) =
+                probe_registered_mcp_server(cfg, candidate.env_placeholders.clone()).await;
+            (Some(resp), None, server_id, step, Some(discovery))
         }
         "command_tool" => {
             let body = relux_kernel::command_tool_body(&candidate).ok_or_else(|| {
@@ -8352,7 +8532,7 @@ async fn prime_configure_candidate_action(
             let step = format!(
                 "Configured command tool \"{tool_name}\". It is gated (needs approval) — ask me to use {tool_name} and I'll stage the approval before it runs."
             );
-            (None, Some(record), tool_name, step)
+            (None, Some(record), tool_name, step, None)
         }
         other => {
             return Err(ApiError::bad_request(format!(
@@ -8385,6 +8565,7 @@ async fn prime_configure_candidate_action(
         kind: candidate.kind,
         activation: candidate.activation,
         mcp_server,
+        mcp_discovery,
         plugin: plugin_record,
         tool_name,
         next_step,
@@ -12733,10 +12914,12 @@ mod tests {
         let (state, _dir) = auth_state(true);
         // A standalone MCP stdio config is an `mcp_register` candidate. Configuring it
         // registers a managed-stdio server through the UNCHANGED registry — never spawned.
+        // The command is a guaranteed-absent binary so the post-activation `tools/list`
+        // probe fails fast + deterministically (spawn error), with no network and no hang.
         let (_src, id) = install_source_plugin(
             &state,
             "mcp.json",
-            r#"{"mcpServers":{"gh":{"command":"npx","args":["-y","@x/server-github"]}}}"#,
+            r#"{"mcpServers":{"gh":{"command":"relux-absent-mcp-binary-xyz","args":["--serve"]}}}"#,
         )
         .await;
         let req = serde_json::json!({ "plugin_id": id, "candidate_id": "mcp" }).to_string();
@@ -12753,10 +12936,121 @@ mod tests {
         assert_eq!(v["activation"], "mcp_register", "body: {body}");
         assert_eq!(v["mcp_server"]["transport"], "managed_stdio", "body: {body}");
         assert_eq!(v["no_code_executed"], true, "registration never runs code");
+        // Guided post-activation discovery rode along: an unreachable server is reported
+        // honestly (reachable=false, no fabricated tools) with an actionable Start/Discover
+        // message + a sanitized error — never a silent "registered, you figure it out".
+        assert_eq!(v["mcp_discovery"]["reachable"], false, "body: {body}");
+        assert_eq!(v["mcp_discovery"]["tool_count"], 0, "no fake tools: {body}");
+        assert!(v["mcp_discovery"]["tools"].as_array().unwrap().is_empty(), "body: {body}");
+        let guidance = v["mcp_discovery"]["guidance"].as_str().unwrap();
+        assert!(guidance.contains("Discover"), "guidance should point at Discover: {guidance}");
+        assert!(v["mcp_discovery"]["error"].is_string(), "an unreachable probe carries a reason: {body}");
+        // The honest next_step reflects the probe outcome (not a blanket "run Discover").
+        assert!(v["next_step"].as_str().unwrap().contains("couldn't"), "body: {body}");
         // The server is now in the registry (a follow-up list shows it).
         let (ls, _c, list) = call(&state, "GET", "/v1/relux/mcp/servers", None, None).await;
         assert_eq!(ls, StatusCode::OK);
         assert!(list.contains(v["tool_name"].as_str().unwrap()), "registered server missing: {list}");
+    }
+
+    fn mcp_tool(name: &str, executable: relux_core::ToolExecutability) -> relux_core::ToolDescriptor {
+        relux_core::ToolDescriptor {
+            plugin_id: "mcp:srv".to_string(),
+            tool_name: name.to_string(),
+            description: String::new(),
+            permission: format!("tool:mcp-srv:{name}"),
+            risk: relux_core::RiskLevel::Medium,
+            source_kind: "Mcp".to_string(),
+            installed: true,
+            enabled: true,
+            protected: false,
+            executable,
+        }
+    }
+
+    #[test]
+    fn post_activation_discovery_reports_found_gated_tools() {
+        // The happy path: the probe came back with tools. The user should see what landed,
+        // how many stay gated, and an honest "ask me to use one" — not a protocol chore.
+        let tools = vec![
+            mcp_tool("alpha", relux_core::ToolExecutability::NeedsApproval),
+            mcp_tool("beta", relux_core::ToolExecutability::NeedsApproval),
+        ];
+        let (d, step) = build_post_activation_discovery("srv", true, &[], Ok(tools));
+        assert!(d.reachable);
+        assert_eq!(d.tool_count, 2);
+        assert_eq!(d.gated_count, 2);
+        assert!(d.error.is_none());
+        assert!(d.guidance.contains("alpha") && d.guidance.contains("beta"), "{}", d.guidance);
+        assert!(d.guidance.contains("gated"), "{}", d.guidance);
+        assert!(step.contains("ask me to use"), "{step}");
+    }
+
+    #[test]
+    fn post_activation_discovery_counts_only_gated_tools_as_gated() {
+        // A mix of classified-runnable + still-gated tools reports the honest split — it
+        // never silently calls a low-risk tool "gated" or vice-versa.
+        let tools = vec![
+            mcp_tool("ready", relux_core::ToolExecutability::Ready),
+            mcp_tool("gated", relux_core::ToolExecutability::NeedsApproval),
+        ];
+        let (d, _step) = build_post_activation_discovery("srv", false, &[], Ok(tools));
+        assert_eq!(d.tool_count, 2);
+        assert_eq!(d.gated_count, 1);
+        assert!(d.guidance.contains("1 of 2"), "{}", d.guidance);
+    }
+
+    #[test]
+    fn post_activation_discovery_handles_a_connected_but_toolless_server() {
+        let (d, step) = build_post_activation_discovery("srv", true, &[], Ok(Vec::new()));
+        assert!(d.reachable);
+        assert_eq!(d.tool_count, 0);
+        assert!(d.error.is_none());
+        assert!(d.guidance.contains("no tools"), "{}", d.guidance);
+        assert_eq!(d.guidance, step);
+    }
+
+    #[test]
+    fn post_activation_discovery_guides_a_stdio_server_that_needs_secrets() {
+        // An unreachable managed-stdio server with declared env placeholders points the
+        // user at mapping its secrets, then Discover — the right fix, not a bare error.
+        let (d, step) = build_post_activation_discovery(
+            "srv",
+            true,
+            &["GITHUB_TOKEN".to_string()],
+            Err("missing secret 'gh' for env var 'GITHUB_TOKEN'".to_string()),
+        );
+        assert!(!d.reachable);
+        assert_eq!(d.tool_count, 0);
+        assert!(d.tools.is_empty());
+        assert!(d.guidance.contains("GITHUB_TOKEN"), "{}", d.guidance);
+        assert!(d.guidance.contains("secret"), "{}", d.guidance);
+        assert!(d.guidance.contains("Discover"), "{}", d.guidance);
+        assert_eq!(d.error.as_deref(), Some("missing secret 'gh' for env var 'GITHUB_TOKEN'"));
+        assert_eq!(d.guidance, step);
+    }
+
+    #[test]
+    fn post_activation_discovery_guides_an_unreachable_http_server() {
+        let (d, _step) = build_post_activation_discovery(
+            "srv",
+            false,
+            &[],
+            Err("connect failed".to_string()),
+        );
+        assert!(!d.reachable);
+        assert!(d.guidance.contains("running"), "{}", d.guidance);
+        assert!(d.guidance.contains("Discover"), "{}", d.guidance);
+        assert_eq!(d.error.as_deref(), Some("connect failed"));
+    }
+
+    #[test]
+    fn post_activation_probe_error_is_bounded() {
+        let long = "x".repeat(1000);
+        let bounded = bounded_probe_error(&long);
+        assert!(bounded.chars().count() <= 241, "len {}", bounded.chars().count());
+        assert!(bounded.ends_with('…'));
+        assert_eq!(bounded_probe_error("  short  "), "short");
     }
 
     #[tokio::test]
