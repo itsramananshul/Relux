@@ -1,4 +1,27 @@
-import type { ReluxPendingClarification, ReluxPrimeContextRead, ReluxPrimeProposal, ReluxPrimeProposalStep, ReluxPrimeTaskSlots, ReluxPrimeTaskUpdate, ReluxReplyPolish } from "./api";
+import type { ReluxPendingClarification, ReluxPrimeAction, ReluxPrimeContextRead, ReluxPrimeProposal, ReluxPrimeProposalStep, ReluxPrimeTaskSlots, ReluxPrimeTaskUpdate, ReluxReplyPolish } from "./api";
+
+// A typed view of the GitHub plugin-import action Prime proposes for an
+// "install owner/repo as a plugin" / "import https://github.com/… as plugin" turn
+// (the kernel `PrimeAction::InstallPluginFromGithub`). `repo_url` is the canonical,
+// credential-free clone URL; `plugin_id` is the PROPOSED local id (finalized by the
+// installer). Pure + defensive so the chat card never trusts an unshaped action.
+export interface GithubPluginInstallAction {
+  repoUrl: string;
+  pluginId: string;
+}
+
+// Extract the GitHub plugin-import descriptor from a Prime action, or null when the
+// action is absent / a different type / missing its repo URL. The action shape is
+// `{ type, [k]: unknown }`, so every field is validated before use.
+export function githubPluginInstallAction(
+  action: ReluxPrimeAction | null | undefined,
+): GithubPluginInstallAction | null {
+  if (!action || action.type !== "install_plugin_from_github") return null;
+  const repoUrl = typeof action.repo_url === "string" ? action.repo_url.trim() : "";
+  const pluginId = typeof action.plugin_id === "string" ? action.plugin_id.trim() : "";
+  if (!repoUrl) return null;
+  return { repoUrl, pluginId };
+}
 
 // Prime's chat-surface copy (RELUX_MASTER_PLAN §11.1; `docs/prime-processing-audit.md`
 // "Hermes-first general agent"). Prime is presented as a GENERAL local AI agent —

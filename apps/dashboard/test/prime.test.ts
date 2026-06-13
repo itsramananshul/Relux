@@ -22,6 +22,7 @@ import {
   contextReadDetail,
   boundedContextReads,
   formatToolOutput,
+  githubPluginInstallAction,
   PRIME_GREETING,
   PRIME_HINT,
   PRIME_PLACEHOLDER,
@@ -403,4 +404,24 @@ test("formatToolOutput clamps a pathologically large output so it never floods c
   const huge = formatToolOutput({ result: "x".repeat(10000) });
   assert.ok(huge.length <= 4000);
   assert.ok(huge.endsWith("…"));
+});
+
+test("githubPluginInstallAction extracts the canonical repo + proposed id from the action", () => {
+  const got = githubPluginInstallAction({
+    type: "install_plugin_from_github",
+    repo_url: "https://github.com/nousresearch/hermes-agent",
+    plugin_id: "relux-plugin-hermes-agent",
+  });
+  assert.deepEqual(got, {
+    repoUrl: "https://github.com/nousresearch/hermes-agent",
+    pluginId: "relux-plugin-hermes-agent",
+  });
+});
+
+test("githubPluginInstallAction returns null for a non-import / absent / malformed action", () => {
+  assert.equal(githubPluginInstallAction(null), null);
+  assert.equal(githubPluginInstallAction(undefined), null);
+  assert.equal(githubPluginInstallAction({ type: "grant_permission" }), null);
+  // Right type but no repo URL → null (the card never trusts an unshaped action).
+  assert.equal(githubPluginInstallAction({ type: "install_plugin_from_github" }), null);
 });

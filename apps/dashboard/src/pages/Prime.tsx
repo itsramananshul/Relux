@@ -3,9 +3,12 @@ import { Link } from "react-router-dom";
 import {
   reluxAi,
   reluxApprovals,
+  reluxPlugins,
   reluxPrime,
   reluxWork,
   type ReluxAiStatus,
+  type ReluxPlugin,
+  type ReluxPluginHints,
   type ReluxPrimeProposal,
   type ReluxPrimeSuggestion,
   type ReluxPrimeToolApprovalRequest,
@@ -14,7 +17,7 @@ import {
   type ReluxPrimeTurn,
   type ReluxToolInvocationResult,
 } from "../api";
-import { afterActionLabel, boundedContextReads, brainSourceLabel, contextReadDetail, contextReadsHadMiss, contextReadsUsedLabel, decisionSourceLabel, formatToolOutput, hasSteps, intentProvenance, pendingClarificationLabel, polishProvenance, PRIME_GREETING, PRIME_HINT, PRIME_PLACEHOLDER, PRIME_SUGGESTIONS, proposalDisplaySummary, replyPolishLabel, requestedToolLabel, slotProvenance, stepDisplayTitle, updateProvenance } from "../prime";
+import { afterActionLabel, boundedContextReads, brainSourceLabel, contextReadDetail, contextReadsHadMiss, contextReadsUsedLabel, decisionSourceLabel, formatToolOutput, githubPluginInstallAction, hasSteps, intentProvenance, pendingClarificationLabel, polishProvenance, PRIME_GREETING, PRIME_HINT, PRIME_PLACEHOLDER, PRIME_SUGGESTIONS, proposalDisplaySummary, replyPolishLabel, requestedToolLabel, slotProvenance, stepDisplayTitle, updateProvenance } from "../prime";
 import { workTaskHref, workRunHref } from "../routing";
 import { consumeInvestigationSeed } from "../investigateseed";
 import { PrimeAutonomyPanel } from "../components/PrimeAutonomyPanel";
@@ -679,6 +682,21 @@ export function PrimeTurnCard({
         />
       )}
 
+      {/* A GitHub plugin-import Prime proposed this turn ("install owner/repo as a
+          plugin"). The card shows the canonical source, the destination, and the
+          no-code-run guarantee, then confirms before doing anything. Confirm runs the
+          EXISTING gated install-github route + the read-only /hints candidate scan — no
+          new authority — and renders the installed plugin + detected candidates with
+          Configure / Open Plugins links. Deny just rejects the logged approval. Nothing
+          installs by showing it (RELUX_MASTER_PLAN §8/§10.2/§10.3; docs/plugins.md). */}
+      {githubPluginInstallAction(turn.action) && turn.disposition === "awaiting_approval" && (
+        <PluginInstallCard
+          install={githubPluginInstallAction(turn.action)!}
+          approvalId={turn.approval}
+          busy={busy}
+        />
+      )}
+
       {/* The reviewable plan proposal (RELUX_MASTER_PLAN §10 planning layer, §11.1):
           a compact card showing the proposed shape — goal, steps, roles, and the
           agents work would land on. It is informational only; nothing runs from
@@ -1226,6 +1244,185 @@ function ApprovalCard({
       <div className="muted" style={{ fontSize: 10, marginTop: 8, fontStyle: "italic" }}>
         Nothing ran yet — your decision runs through the same permission/approval/grant/audit gates.
       </div>
+    </div>
+  );
+}
+
+// A GitHub plugin-import confirmation card (RELUX_MASTER_PLAN §8 Plugin Model,
+// §10.2 Action Layer, §10.3 Approval Rules; docs/plugins.md). Prime PROPOSED the
+// import behind a human approval; this card surfaces the canonical source, the
+// destination, and the explicit no-code-run guarantee so the operator confirms with
+// full context (mirroring Hermes's clone-then-confirm and openclaw's confirmation
+// gate). Confirm runs the EXISTING gated routes only — `install-github` (the same
+// manifestless clone the Plugins page uses) then the read-only `/hints` candidate
+// scan — and shows the installed plugin id/status, the detected candidate count, and
+// Configure / Open Plugins links. It grants no new authority and runs no plugin code.
+function PluginInstallCard({
+  install,
+  approvalId,
+  busy,
+}: {
+  install: { repoUrl: string; pluginId: string };
+  approvalId: string | null;
+  busy: boolean;
+}) {
+  const [working, setWorking] = useState<null | "confirm" | "deny">(null);
+  const [outcome, setOutcome] = useState<
+    null | { kind: "installed"; plugin: ReluxPlugin; hints: ReluxPluginHints | null } | { kind: "denied" }
+  >(null);
+  const [err, setErr] = useState<string | null>(null);
+  const locked = busy || working !== null || outcome !== null;
+
+  async function confirm() {
+    if (locked) return;
+    setErr(null);
+    setWorking("confirm");
+    try {
+      // Close the logged governance approval first (best-effort: the import is itself
+      // an operator-gated route, so a missing/!decidable approval never blocks it).
+      if (approvalId) {
+        try {
+          await reluxApprovals.decide(approvalId, "approved");
+        } catch {
+          /* the install route below stays the authoritative gate */
+        }
+      }
+      // The exact path the Plugins page uses: install via the manifestless GitHub
+      // installer, then read-only scan for capability candidates. No code is run.
+      const plugin = await reluxPlugins.installGithub(install.repoUrl);
+      let hints: ReluxPluginHints | null = null;
+      try {
+        hints = await reluxPlugins.hints(plugin.id);
+      } catch {
+        /* candidate scan is advisory — a failure must not hide a successful install */
+      }
+      setOutcome({ kind: "installed", plugin, hints });
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Could not import the plugin from GitHub");
+    } finally {
+      setWorking(null);
+    }
+  }
+
+  async function deny() {
+    if (locked) return;
+    setErr(null);
+    setWorking("deny");
+    try {
+      if (approvalId) await reluxApprovals.decide(approvalId, "rejected");
+      setOutcome({ kind: "denied" });
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Could not cancel the import");
+    } finally {
+      setWorking(null);
+    }
+  }
+
+  const candidateCount = outcome?.kind === "installed" ? (outcome.hints?.candidates?.length ?? 0) : 0;
+
+  return (
+    <div
+      style={{
+        marginTop: 10,
+        border: "1px solid var(--border)",
+        borderRadius: 6,
+        padding: "10px 12px",
+      }}
+    >
+      <div className="row wrap" style={{ gap: 6, alignItems: "center", marginBottom: 4 }}>
+        <span
+          className="badge in_review"
+          style={{ fontSize: 9 }}
+          title="A GitHub plugin import awaiting your confirmation — nothing has been cloned yet"
+        >
+          import needed
+        </span>
+        <span className="badge backlog" style={{ fontSize: 8 }} title="Imported from a GitHub repository">
+          GitHub
+        </span>
+        <span className="mono" style={{ fontSize: 13, fontWeight: 600 }}>{install.repoUrl}</span>
+      </div>
+
+      {/* Source / destination / guarantee — the full context the operator confirms. */}
+      <div className="row wrap" style={{ gap: 6, fontSize: 10, marginBottom: 6 }}>
+        <span className="mono muted" title="Proposed local plugin id (finalized by the installer)">
+          → {install.pluginId}
+        </span>
+      </div>
+      <ul className="muted" style={{ fontSize: 11, margin: "0 0 8px 16px", padding: 0 }}>
+        <li>Clones the repository's metadata into your local managed plugins.</li>
+        <li>
+          <strong>No code from the repository runs on import.</strong> Its tools stay
+          disabled until you configure them.
+        </li>
+        <li>Next: review the detected capability candidates, then configure a tool / runtime.</li>
+      </ul>
+
+      {!outcome && (
+        <div className="row wrap" style={{ gap: 8 }}>
+          <button
+            className="btn"
+            style={{ fontSize: 12, padding: "4px 12px" }}
+            disabled={locked}
+            onClick={confirm}
+            title="Import this repository as a plugin (metadata only, no code run)"
+          >
+            {working === "confirm" ? "Importing…" : "Confirm import"}
+          </button>
+          <button
+            className="chip"
+            style={{ fontSize: 11, padding: "3px 10px" }}
+            disabled={locked}
+            onClick={deny}
+            title="Cancel — reject the logged approval and import nothing"
+          >
+            Cancel
+          </button>
+        </div>
+      )}
+
+      {outcome?.kind === "installed" && (
+        <div className="banner" style={{ fontSize: 11, marginTop: 4 }}>
+          <div style={{ marginBottom: 4 }}>
+            Imported <span className="mono" style={{ fontWeight: 600 }}>{outcome.plugin.id}</span>{" "}
+            <span className="badge backlog" style={{ fontSize: 8 }}>
+              {outcome.plugin.enabled ? "enabled" : "metadata only"}
+            </span>
+            {outcome.plugin.generated && (
+              <span className="badge todo" style={{ fontSize: 8, marginLeft: 4 }} title="Relux scaffolded a metadata-only manifest because the repo had no relux-plugin.json">
+                scaffolded
+              </span>
+            )}
+          </div>
+          <div className="muted" style={{ marginBottom: 6 }}>
+            {candidateCount > 0
+              ? `${candidateCount} capability candidate${candidateCount === 1 ? "" : "s"} detected — configure one to make it runnable.`
+              : "No runnable capability detected yet — open Plugins to add a tool definition or runtime."}
+          </div>
+          <div className="row wrap" style={{ gap: 8 }}>
+            <Link className="btn" style={{ fontSize: 12, padding: "4px 12px" }} to="/plugins">
+              Configure on Plugins
+            </Link>
+            <Link className="chip" style={{ fontSize: 11, padding: "3px 10px" }} to="/plugins">
+              Open Plugins
+            </Link>
+          </div>
+        </div>
+      )}
+
+      {outcome?.kind === "denied" && (
+        <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>
+          Import cancelled — nothing was cloned.
+        </div>
+      )}
+
+      {err && <div className="banner err" style={{ fontSize: 11, marginTop: 8 }}>{err}</div>}
+
+      {!outcome && (
+        <div className="muted" style={{ fontSize: 10, marginTop: 8, fontStyle: "italic" }}>
+          Nothing has been cloned yet — confirming runs the same gated import the Plugins page uses.
+        </div>
+      )}
     </div>
   );
 }

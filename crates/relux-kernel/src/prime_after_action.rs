@@ -243,7 +243,9 @@ pub fn after_action_kind(turn: &PrimeTurn) -> Option<ActionResultKind> {
 fn is_high_risk_action(action: Option<&PrimeAction>) -> bool {
     matches!(
         action,
-        Some(PrimeAction::InstallPlugin { .. }) | Some(PrimeAction::GrantPermission { .. })
+        Some(PrimeAction::InstallPlugin { .. })
+            | Some(PrimeAction::InstallPluginFromGithub { .. })
+            | Some(PrimeAction::GrantPermission { .. })
     )
 }
 
@@ -281,6 +283,7 @@ pub fn build_action_envelope(turn: &PrimeTurn, kind: ActionResultKind) -> Action
         }
         Some(PrimeAction::StartRun { task_id }) => push(task_id),
         Some(PrimeAction::InstallPlugin { plugin_id }) => push(plugin_id),
+        Some(PrimeAction::InstallPluginFromGithub { plugin_id, .. }) => push(plugin_id),
         Some(PrimeAction::GrantPermission { subject_id, .. }) => push(subject_id),
         _ => {}
     }
@@ -327,6 +330,13 @@ fn action_label(turn: &PrimeTurn, kind: ActionResultKind) -> String {
                 "proposed installing a plugin (awaiting your approval)".to_string()
             }
             _ => "installed a plugin".to_string(),
+        },
+        Some(PrimeAction::InstallPluginFromGithub { .. }) => match kind {
+            ActionResultKind::Proposed => {
+                "proposed importing a plugin from GitHub (awaiting your approval; metadata only, no code run)"
+                    .to_string()
+            }
+            _ => "imported a plugin from GitHub".to_string(),
         },
         Some(PrimeAction::GrantPermission { .. }) => match kind {
             ActionResultKind::Proposed => {

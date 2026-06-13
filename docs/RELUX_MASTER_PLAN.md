@@ -974,6 +974,7 @@ prime.start_run
 prime.retry_run
 prime.create_agent
 prime.install_plugin
+prime.install_plugin_from_github   # import a GitHub repo as a plugin (confirm-gated; metadata only, no code run)
 prime.configure_plugin
 prime.grant_permission
 prime.request_approval

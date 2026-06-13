@@ -572,6 +572,22 @@ pub enum PrimeAction {
     InstallPlugin {
         plugin_id: String,
     },
+    /// Import a GitHub repository as a plugin: clone the repo's metadata into the
+    /// local managed plugins directory through the EXISTING manifestless installer
+    /// (`relux-kernel`'s `install_from_github` → `/v1/relux/plugins/install-github`).
+    /// `repo_url` is the canonical, credential-free `https://github.com/<owner>/<repo>`
+    /// the parser produced; `plugin_id` is the PROPOSED local id (finalized by the
+    /// installer from the repo's manifest, or scaffolded as `relux-plugin-<repo>` when
+    /// the source has none). This is always proposed behind a human approval — the
+    /// import clones METADATA only, runs no code from the repository, and leaves every
+    /// tool disabled until the operator configures it. Spec ref:
+    /// `docs/RELUX_MASTER_PLAN.md` §8 (Plugin Model), §10.2 (Action Layer), §10.3
+    /// (Approval Rules); `docs/plugins.md` (GitHub import); reference: Hermes
+    /// `hermes_cli/plugins_cmd.py` (`_resolve_git_url` + clone-then-confirm-enable).
+    InstallPluginFromGithub {
+        repo_url: String,
+        plugin_id: String,
+    },
     ConfigurePlugin {
         plugin_id: String,
     },

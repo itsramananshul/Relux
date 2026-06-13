@@ -12138,6 +12138,9 @@ fn describe_action(action: &PrimeAction) -> String {
             permission,
         } => format!("grant {permission} to {subject_id}"),
         PrimeAction::InstallPlugin { plugin_id } => format!("install plugin {plugin_id}"),
+        PrimeAction::InstallPluginFromGithub { repo_url, .. } => {
+            format!("import GitHub repo {repo_url} as a plugin (metadata only, no code run)")
+        }
         PrimeAction::ConfigurePlugin { plugin_id } => format!("configure plugin {plugin_id}"),
         PrimeAction::CreateAgent {
             name,
@@ -18048,6 +18051,91 @@ mod tests {
         assert_eq!(admin.plugin_id.as_deref(), Some("relux-tools-github"));
         // SAFETY: nothing was installed — only an approval was logged.
         assert_eq!(k.plugin_count(), plugins_before, "a brain slot must never install");
+    }
+
+    #[test]
+    fn explicit_github_import_proposes_install_from_github_and_installs_nothing() {
+        // "install owner/repo as a plugin" is a GitHub plugin-import: Prime proposes the
+        // safe manifestless import behind a human approval, with a canonical credential-
+        // free URL — and installs NOTHING by proposing it. (§8 Plugin Model, §10.2/§10.3;
+        // reference: Hermes `_resolve_git_url` + clone-then-confirm.)
+        let (mut k, ctx) = prime_chat_kernel();
+        let plugins_before = k.plugin_count();
+
+        let turn = k
+            .prime_turn(&ctx, "install nousresearch/hermes-agent as a plugin")
+            .unwrap();
+
+        assert_eq!(turn.intent, relux_core::PrimeIntent::PluginInstallation);
+        assert_eq!(turn.disposition, PrimeDisposition::AwaitingApproval);
+        assert!(turn.approval.is_some(), "a GitHub import is approval-gated");
+        match turn.action.as_ref().unwrap() {
+            PrimeAction::InstallPluginFromGithub { repo_url, plugin_id } => {
+                assert_eq!(repo_url, "https://github.com/nousresearch/hermes-agent");
+                assert_eq!(plugin_id, "relux-plugin-hermes-agent");
+                assert!(!repo_url.contains('@'), "URL is credential-free");
+            }
+            other => panic!("expected InstallPluginFromGithub, got {other:?}"),
+        }
+        // The reply makes the no-code-run guarantee explicit.
+        assert!(
+            turn.reply.contains("no code from the repository runs on import"),
+            "reply must state the no-code-run guarantee: {}",
+            turn.reply
+        );
+        // SAFETY: proposing an import installs nothing — only an approval was logged.
+        assert_eq!(
+            k.plugin_count(),
+            plugins_before,
+            "proposing a GitHub import must never install"
+        );
+    }
+
+    #[test]
+    fn import_url_phrasing_routes_to_github_import() {
+        // "import https://github.com/owner/repo as plugin" carries no "install" verb but
+        // is still a plugin-import intent and routes to the GitHub import action.
+        let (mut k, ctx) = prime_chat_kernel();
+        let turn = k
+            .prime_turn(&ctx, "import https://github.com/owner/repo as plugin")
+            .unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::PluginInstallation);
+        match turn.action.as_ref().unwrap() {
+            PrimeAction::InstallPluginFromGithub { repo_url, .. } => {
+                assert_eq!(repo_url, "https://github.com/owner/repo");
+            }
+            other => panic!("expected InstallPluginFromGithub, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn casual_plugin_musing_does_not_install() {
+        // A QUESTION about plugins is deliberation, not a command: it stays a
+        // conversation and proposes no install (§10.5, §17.1).
+        let (mut k, ctx) = prime_chat_kernel();
+        let turn = k.prime_turn(&ctx, "what if I made a plugin system?").unwrap();
+        assert_ne!(turn.intent, relux_core::PrimeIntent::PluginInstallation);
+        assert!(turn.approval.is_none(), "casual musing must not stage an approval");
+        assert!(
+            !matches!(turn.action, Some(PrimeAction::InstallPluginFromGithub { .. })),
+            "casual musing must not propose a GitHub import"
+        );
+    }
+
+    #[test]
+    fn github_import_without_a_repo_asks_to_clarify() {
+        // A GitHub-import command that named no parseable repo is answered with a
+        // clarifying question (the honest "which repo?"), not an install of an
+        // unspecified subject. The "import" cue marks it as a repo-import request.
+        let (mut k, ctx) = prime_chat_kernel();
+        let turn = k.prime_turn(&ctx, "import a plugin from github for me").unwrap();
+        assert_eq!(turn.disposition, PrimeDisposition::NeedsClarification);
+        assert!(turn.approval.is_none());
+        assert!(
+            turn.reply.to_lowercase().contains("which github repo"),
+            "should ask which GitHub repo: {}",
+            turn.reply
+        );
     }
 
     #[test]

@@ -50,6 +50,7 @@ pub mod prime_decision;
 pub mod prime_history;
 pub mod prime_intent;
 pub mod prime_orchestration_slots;
+pub mod prime_plugin_install;
 pub mod prime_slots;
 pub mod prime_tools;
 pub mod prime_update_slots;

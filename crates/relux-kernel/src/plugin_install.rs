@@ -408,7 +408,7 @@ fn seed_from_path(path: &Path) -> String {
 
 /// Derive a plugin-id seed from a GitHub URL: the trailing repo name without a
 /// `.git` suffix.
-fn github_repo_seed(url: &str) -> String {
+pub(crate) fn github_repo_seed(url: &str) -> String {
     let trimmed = url.trim().trim_end_matches('/');
     let last = trimmed.rsplit('/').next().unwrap_or("plugin");
     last.strip_suffix(".git").unwrap_or(last).to_string()
@@ -419,7 +419,7 @@ fn github_repo_seed(url: &str) -> String {
 /// trimmed. The result never contains `..`, a path separator, or a `.`, so
 /// `relux-plugin-<seed>` always passes [`safe_plugin_id`]. An empty result
 /// degrades to `"plugin"`.
-fn sanitize_seed(seed: &str) -> String {
+pub(crate) fn sanitize_seed(seed: &str) -> String {
     let mut out = String::new();
     let mut prev_dash = false;
     for c in seed.trim().chars() {

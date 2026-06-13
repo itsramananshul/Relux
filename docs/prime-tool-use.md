@@ -220,5 +220,53 @@ their own local CLI login, so Relux stores no key for them at all.
   auto-resumes the paused loop so Prime continues with the real result without a second typed
   prompt (see *Continuous approval* above). The chat never dead-ends on an approval.
 
+## Importing a plugin from GitHub (from chat)
+
+Prime recognizes a GitHub plugin-import request and stages the **safe manifestless
+import behind a human confirmation** — it never turns it into a generic work task and
+never runs the repo's code.
+
+What works from chat:
+
+- `install nousresearch/hermes-agent as a plugin`
+- `import https://github.com/owner/repo as plugin`
+- `clone owner/repo and import it as a plugin`
+
+The flow:
+
+1. **Parse.** `crate::prime_plugin_install::parse_github_plugin_install` turns the
+   message into a **canonical, credential-free** `https://github.com/<owner>/<repo>`
+   (anything before `github.com/`, including `user:token@`, is dropped; a non-GitHub
+   host yields no match). The owner/repo shorthand mirrors the dashboard's
+   `normalizeGithubUrl`, so chat and the Plugins page agree on what `owner/repo` means.
+2. **Propose (confirmation-gated).** The turn classifies as `PluginInstallation`, routes
+   to `PrimeAction::InstallPluginFromGithub { repo_url, plugin_id }`, and comes back as a
+   `RiskLevel::High` **proposal awaiting approval** — exactly like every other risky
+   Prime action. A logged approval is the governance/audit record. A GitHub-import
+   request with **no parseable repo** ("import a plugin from github") asks *which repo*
+   instead of proposing an unspecified install.
+3. **Confirm.** The chat renders a `PluginInstallCard` showing the source, the proposed
+   local id, the destination, and the explicit **"no code from the repository runs on
+   import"** guarantee. Confirm runs the **existing gated routes only** —
+   `POST /v1/relux/plugins/install-github` (the same manifestless clone the Plugins page
+   uses) then the read-only `GET /v1/relux/plugins/:id/hints` candidate scan.
+4. **Result.** The card shows the installed plugin id + status, the detected capability
+   candidate count, and **Configure / Open Plugins** links. A repo with no
+   `relux-plugin.json` lands as a metadata-only (scaffolded, disabled) wrapper that runs
+   nothing until the operator configures a tool/runtime.
+
+**Safety:** the import clones metadata, runs no repo code, and grants no new authority;
+tools stay disabled until configured through the unchanged plugin/tool paths. Casual
+musing ("what if I made a plugin system?") stays a conversation — the conversation guard
+routes a question to Brainstorming before the install check.
+
+**Reference-driven** (`docs/reference-driven-development.md`): this mirrors Hermes
+`reference/hermes-agent-main/hermes_cli/plugins_cmd.py` — `_resolve_git_url`
+(owner/repo shorthand or full URL → cloneable URL, GitHub default) and `cmd_install`
+(clone `--depth 1`, validate, then a separate **confirm/enable** step: install ≠
+auto-enable) — and openclaw's single-classifier confirmation discipline
+(`reference/openclaw-main/src/acp/approval-classifier.ts`): one deterministic function
+decides, and the stateful path is always confirmation-gated, never auto-run.
+
 See `docs/ARTIFICIAL_CONSTRAINT_AUDIT.md` for the lifted constraints and `docs/mcp.md` for the
 agent loop and MCP transports.

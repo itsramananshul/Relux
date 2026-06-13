@@ -382,7 +382,16 @@ pub fn classify_intent(message: &str) -> PrimeIntent {
         "add plugin",
         "enable plugin",
         "install the plugin",
-    ]) {
+    ])
+        // "import https://github.com/… as a plugin" / "clone owner/repo and import it
+        // as a plugin": an import/clone request that names a plugin is a plugin-install
+        // intent even without the word "install". Anchored on the word "plugin" so a
+        // generic "import the CSV" or "clone the repo" never reaches here. The
+        // conversation guard above already routed a QUESTION ("what if I made a plugin
+        // system?") to Brainstorming, so this only fires on a command.
+        || ((has(&["import ", "clone "]) || has(&["as a plugin", "as plugin"]))
+            && m.contains("plugin"))
+    {
         return PrimeIntent::PluginInstallation;
     }
     if has(&[
@@ -594,7 +603,48 @@ pub fn decide(message: &str, intent: &PrimeIntent, summary: &StateSummary) -> Pr
             }
         }
         PrimeIntent::PluginInstallation => {
+            // A GitHub repo reference ("install owner/repo as a plugin", "import
+            // https://github.com/owner/repo as plugin", "clone owner/repo and import
+            // it") routes to the SAFE manifestless GitHub import — proposed behind a
+            // human approval, cloning METADATA only and running no code from the repo.
+            // The deterministic parser produces a canonical, credential-free URL
+            // (`crate::prime_plugin_install`). Reference: Hermes
+            // `hermes_cli/plugins_cmd.py` (`_resolve_git_url` + clone-then-confirm).
+            if let Some(parsed) = crate::prime_plugin_install::parse_github_plugin_install(message) {
+                return PrimePlan::Propose {
+                    action: PrimeAction::InstallPluginFromGithub {
+                        repo_url: parsed.repo_url.clone(),
+                        plugin_id: parsed.proposed_plugin_id.clone(),
+                    },
+                    reason: "Importing a plugin from GitHub clones the repository's metadata into your local managed plugins and adds a new third-party capability to the control plane."
+                        .to_string(),
+                    risk: RiskLevel::High,
+                    text: format!(
+                        "I can import {} from GitHub as a plugin. This clones the repository's metadata into your local managed plugins — no code from the repository runs on import, and its tools stay disabled until you configure them. After it lands I'll show what was detected.",
+                        parsed.repo_url
+                    ),
+                };
+            }
+            // A GitHub-IMPORT request that named no parseable repo (e.g. "import a
+            // plugin from github", "clone the repo as a plugin") asks which repo — the
+            // honest "missing/invalid repo" clarify. The signal is a repo/URL/import
+            // cue, NOT the bare word "github" (so "install the github plugin", which
+            // means the plugin NAMED github and which the brain may sharpen, keeps the
+            // legacy local-install path below).
             let plugin = derive_plugin_id(message);
+            if plugin == "(unspecified-plugin)" {
+                let m = message.to_lowercase();
+                let import_flavored = m.contains("import ")
+                    || m.contains("clone ")
+                    || m.contains("http")
+                    || m.contains("github.com")
+                    || m.contains(".git");
+                if import_flavored {
+                    return PrimePlan::Clarify {
+                        text: "Which GitHub repo should I import as a plugin? Tell me the owner/repo (e.g. nousresearch/hermes-agent) or paste the https://github.com/… URL.".to_string(),
+                    };
+                }
+            }
             PrimePlan::Propose {
                 action: PrimeAction::InstallPlugin {
                     plugin_id: plugin.clone(),
