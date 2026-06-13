@@ -1968,6 +1968,33 @@ stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
   unknown-brain 400, openrouter-no-key missing_key, no-body probes the resolved brain). Dashboard
   typechecks, builds, and all tests pass incl. a new `prime-brain-setup-render.test.mjs`; the
   committed bundle was rebuilt.
+- **first-run guided launchpad** (2026-06-13) — a **dashboard-side** slice that turns Home's
+  first-run checklist (§22) into a coherent guided path to a useful Prime, answering the lingering
+  "what do I do?" after a real brain, plugin install-to-usable, tool use, and recovery all shipped.
+  No new product surface, no new endpoint, no master-plan safety property weakened — it extends the
+  pure `apps/dashboard` `buildReadiness()` (`readiness.ts`) with the three stages the journey was
+  missing and renders them through the existing `ReadinessGuide`. **New stages:** (1) **try Prime —
+  the first useful turn** (`tryPrimeItem`): once the brain that would answer is connected, Home
+  invites "Ask Prime what it can do" and reads *done* once any task or run exists (the first turn is
+  inferred honestly from real `state` counts, never a flag we can't stand behind); it never appears
+  before the brain is connected, where the brain item is already the action. (2) **resume paused
+  work** (`continuationItem`): a paused Prime agent-loop continuation (from the composed
+  `/v1/relux/oversight` read — the one signal `state` lacks) surfaces as attention routed to Work,
+  with "approve first" copy when it is waiting on a gated tool. (3) **inspect stuck work**
+  (`attentionWorkItem`): blocked tasks / failed runs surface as attention routed to the Inbox. The
+  first-action priority now fixes a broken brain first, then a pending decision, then paused work,
+  then stuck work, then in-flight work, then the first turn — and `deriveFirstAction`'s new
+  `ai`/`adapters`/`continuation` arguments are optional so every existing one-argument caller keeps
+  its exact prior behaviour. The fallback Local brain is still labelled honestly and never sold as
+  the main path; the new attention stages are *warn*, never blockers, so they never fake "setup
+  needed" on a working instance. `ReluxHome.tsx` adds one supplementary `reluxOversight.get()` read
+  (a failed oversight read just means "no paused work surfaced", never a degraded report). Tests:
+  `apps/dashboard/test/readiness.test.ts` pins the new derivations + the legacy `deriveFirstAction`
+  contract; `apps/dashboard/test/home-states-render.test.mjs` drives the **real** `buildReadiness`
+  → `ReadinessGuide` pipeline for the five states a new operator lands in (fallback brain/no tools,
+  real brain ready, pending approval, paused continuation, blocked/failed work). Rebuilt dashboard
+  bundle committed to `crates/relix-web-bridge/dashboard-dist`.
+
 - **v0.1.30** (2026-06-13) — **agentic tool-use + MCP-surface completion** rollup. The
   `relux-kernel` / `relux-core` crates move `0.1.29` → `0.1.30` in lockstep, packaging the whole
   post-v0.1.29 line into a fresh Windows bundle (`docs/prime-tool-use.md`, `docs/mcp.md`;
@@ -4332,8 +4359,13 @@ remain, in rough priority for the next slices:
    usable, and gives the exact next step — always routed to Health → *Prime Brain /
    AI Runtime*, never the legacy Crew path. The pure derivation lives in
    `apps/dashboard/src/onboarding.ts` with unit coverage in
-   `apps/dashboard/test/onboarding.test.ts`. A fuller modal walkthrough (a single
-   guided flow that ends on a first chat/task) is still optional polish.
+   `apps/dashboard/test/onboarding.test.ts`. *(Extended by the "first-run guided
+   launchpad" slice — see the changelog entry above §22.)* Home's checklist now
+   carries the **full guided journey** end-to-end: brain → adapter → crew →
+   plugins/tools → **try Prime (the first useful turn)** → **resume paused work** →
+   **inspect stuck work**, each a pure `readiness.ts` derivation with a single
+   honest first action. A fuller modal walkthrough (a separate guided overlay) is
+   still optional polish, but the in-page launchpad now guides every step.
 2. **Plugin install UX.** *(Addressed post-v0.1.1.)* See "Plugin Install UX v1"
    below. A generated metadata-only wrapper is now badged **Needs configuration**
    (never "enabled"/"ready"); its honest next step is **add tool definitions** (a

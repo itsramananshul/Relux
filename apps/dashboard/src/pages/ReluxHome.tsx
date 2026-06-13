@@ -5,12 +5,14 @@ import {
   reluxAdapters,
   reluxTools,
   reluxOrchestration,
+  reluxOversight,
   type ReluxPlugin,
   type ReluxState,
   type ReluxAiStatus,
   type ReluxAdapterStatus,
   type ReluxToolDescriptor,
   type ReluxOrchestration,
+  type ReluxOversight,
 } from "../api";
 import { useAsync } from "../components/common";
 import { buildReadiness } from "../readiness";
@@ -38,6 +40,10 @@ export function ReluxHome() {
   const adapters = useAsync<ReluxAdapterStatus[]>(() => reluxAdapters.list(), []);
   const tools = useAsync<ReluxToolDescriptor[]>(() => reluxTools.list(), []);
   const orchestrations = useAsync<ReluxOrchestration[]>(() => reluxOrchestration.list(), []);
+  // Composed oversight gives the one signal `state` cannot: a PAUSED Prime
+  // agent-loop continuation. It is supplementary — a failed read just means "no
+  // paused work surfaced", never a degraded report.
+  const oversight = useAsync<ReluxOversight>(() => reluxOversight.get(), []);
 
   // The whole readiness report is derived (pure) from the live control-plane
   // reads — the brain, the real-work adapter, crew, plugins/tools and any
@@ -54,6 +60,7 @@ export function ReluxHome() {
         adapters: adapters.error ? null : adapters.data,
         plugins: plugins.error ? null : plugins.data,
         tools: tools.error ? null : tools.data,
+        continuation: oversight.error ? null : (oversight.data?.continuation ?? null),
         failed: {
           ai: !!ai.error,
           adapters: !!adapters.error,
@@ -69,6 +76,7 @@ export function ReluxHome() {
     ai.reload();
     adapters.reload();
     tools.reload();
+    oversight.reload();
   };
 
   return (

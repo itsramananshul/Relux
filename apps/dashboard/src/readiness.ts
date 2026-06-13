@@ -27,6 +27,7 @@ import type {
   ReluxPlugin,
   ReluxToolDescriptor,
   ReluxPrimeBrain,
+  ReluxPrimeContinuation,
 } from "./api";
 import {
   primeBrainStep,
@@ -100,6 +101,11 @@ export interface ReadinessInputs {
   // null when the tools probe failed/has not resolved (we then stay honest
   // rather than claim "no tools configured").
   tools: ReluxToolDescriptor[] | null;
+  // A paused Prime agent-loop continuation, when one exists (from the composed
+  // oversight read). Supplementary, not a primary readiness signal: absent (or a
+  // failed oversight read) simply means "no paused work surfaced here" — it never
+  // degrades the report or blocks setup.
+  continuation?: ReluxPrimeContinuation | null;
   // Which of the above are null because the read FAILED (not still loading).
   // Omitted/empty means "treat every null as still-loading" — the prior contract.
   failed?: ReadinessFailed;
@@ -346,6 +352,105 @@ export function pluginToolItem(
   };
 }
 
+// Whether Prime's SELECTED brain is currently unusable — the one true blocker
+// (an OpenRouter brain with no key, a CLI brain whose binary is gone). A local
+// brain is never blocked. Used so the guided "try Prime" step is not offered
+// before the brain that would answer it is connected, and so the first action
+// routes to fixing the brain first.
+export function brainIsBlocked(
+  ai: ReluxAiStatus | null,
+  adapters: ReluxAdapterStatus[] | null,
+): boolean {
+  if (!ai) return false; // unknown — don't assert a block we can't stand behind
+  return primeBrainStep(ai, adapters).status === "todo";
+}
+
+// "Try Prime" item — the guided first useful turn, the answer to "what do I do?".
+// It only appears once the brain that would answer is connected (else the brain
+// item IS the action). Whether the operator has actually used Prime is inferred
+// honestly from real state: any task created or any run recorded means the first
+// turn happened (done); otherwise it is the recommended next step (a link, never
+// a blocker — nothing is broken, there is simply nothing to show yet).
+export function tryPrimeItem(
+  state: ReluxState | null,
+  ai: ReluxAiStatus | null,
+  adapters: ReluxAdapterStatus[] | null,
+): ReadinessItem | null {
+  // Don't invite a first prompt before the brain is connected — the brain item
+  // already carries that action, and a dead "Ask Prime" here would just fail.
+  if (brainIsBlocked(ai, adapters)) return null;
+
+  const base = { id: "try-prime", linkTo: "/prime" } as const;
+  const tasks = state ? state.tasks : 0;
+  const runs = state ? state.runs : 0;
+
+  if (tasks > 0 || runs > 0) {
+    return {
+      ...base,
+      label: "Used Prime",
+      status: "done",
+      description:
+        "You've put Prime to work — ask it “what tools do you have?” any time, or give it a new goal to plan and run.",
+      cta: "Open Prime",
+    };
+  }
+
+  return {
+    ...base,
+    label: "Ask Prime what it can do",
+    status: "link",
+    description:
+      "Your brain is connected but Prime hasn't done anything yet. Open Prime and ask “what tools do you have?”, or give it a goal — it can inspect state, create tasks, and start runs.",
+    cta: "Ask Prime",
+  };
+}
+
+// "Resume paused work" item — a Prime agent-loop that paused with work still to
+// do (an autonomy ceiling reached, or a gated tool waiting on approval). Surfaced
+// as attention because it needs the operator to act, never a blocker. The resume
+// (and any pending approval) lives on the Work board's oversight strip.
+export function continuationItem(
+  continuation: ReluxPrimeContinuation | null | undefined,
+): ReadinessItem | null {
+  if (!continuation) return null;
+  const reason = continuation.reason ? ` (${continuation.reason})` : "";
+  const description = continuation.awaiting_approval
+    ? `Prime paused a tool call that is waiting on your approval${reason}. Approve it, then resume the loop from where it left off — no work is re-run.`
+    : `Prime paused with work still to do${reason}. Resume the loop to continue from the ${continuation.observation_count} step${continuation.observation_count === 1 ? "" : "s"} it already gathered.`;
+  return {
+    id: "paused-continuation",
+    label: continuation.awaiting_approval
+      ? "Approve, then resume paused work"
+      : "Resume paused work",
+    status: "warn",
+    description,
+    linkTo: "/work",
+    cta: "Open Work",
+  };
+}
+
+// "Work needs attention" item — blocked or failed work that is sitting waiting
+// for a human (a blocked task, a failed run the watchdog surfaced). Attention,
+// not a blocker: the rest of Relux still works. Routes to the unified Inbox,
+// which is purpose-built for this queue.
+export function attentionWorkItem(state: ReluxState | null): ReadinessItem | null {
+  if (!state) return null;
+  const blocked = state.blocked ?? 0;
+  const failed = state.failed ?? 0;
+  if (blocked <= 0 && failed <= 0) return null;
+  const parts: string[] = [];
+  if (blocked > 0) parts.push(`${blocked} blocked task${blocked === 1 ? "" : "s"}`);
+  if (failed > 0) parts.push(`${failed} failed run${failed === 1 ? "" : "s"}`);
+  return {
+    id: "work-attention",
+    label: "Work needs attention",
+    status: "warn",
+    description: `${parts.join(" and ")} ${blocked + failed === 1 ? "is" : "are"} waiting for you. Open the Inbox to inspect the cause and recover, retry, or reopen.`,
+    linkTo: "/inbox",
+    cta: "Open Inbox",
+  };
+}
+
 // "State unavailable" item — the primary control-plane read (counts, tasks,
 // approvals) failed, so crew/approvals/first-action are all guesses. Surface it
 // honestly and retryably at the top instead of leaving the guide stuck on
@@ -379,14 +484,37 @@ function approvalsItem(state: ReluxState | null): ReadinessItem | null {
   };
 }
 
-// The single clearest next action, in priority order: a pending decision first,
-// then in-flight work, then starting the first work. Always lands on a real
-// page (Prime is always available, so the fresh state still has an action).
-export function deriveFirstAction(state: ReluxState | null): FirstAction {
+// The single clearest next action, in priority order: fix a broken brain first
+// (nothing works without it), then a pending decision, then paused/stuck work,
+// then in-flight work, then starting the first work. Always lands on a real page
+// (Prime is always available, so the fresh state still has an action).
+//
+// `ai`/`adapters`/`continuation` are optional so existing one-argument callers
+// keep their exact behaviour: with them omitted the brain-blocker and paused-work
+// branches simply do not fire (we don't assert a state we weren't given).
+export function deriveFirstAction(
+  state: ReluxState | null,
+  ai: ReluxAiStatus | null = null,
+  adapters: ReluxAdapterStatus[] | null = null,
+  continuation: ReluxPrimeContinuation | null | undefined = null,
+): FirstAction {
+  // A selected-but-unusable brain blocks everything Prime does — fix it first.
+  if (brainIsBlocked(ai, adapters)) {
+    return { label: "Set up Prime's brain", linkTo: "/health" };
+  }
   if (!state) return { label: "Talk to Prime", linkTo: "/prime" };
   if (state.pending_approvals > 0) {
     const n = state.pending_approvals;
     return { label: `Review ${n} pending approval${n === 1 ? "" : "s"}`, linkTo: "/approvals" };
+  }
+  if (continuation) {
+    return {
+      label: continuation.awaiting_approval ? "Approve & resume paused work" : "Resume paused work",
+      linkTo: "/work",
+    };
+  }
+  if ((state.blocked ?? 0) > 0 || (state.failed ?? 0) > 0) {
+    return { label: "Inspect work that needs attention", linkTo: "/inbox" };
   }
   if (state.active_runs > 0) {
     const n = state.active_runs;
@@ -415,11 +543,12 @@ function operationalSummary(inputs: ReadinessInputs): string {
 }
 
 // Compose the full readiness report from the live control-plane reads. Order is
-// the natural setup order: brain → real-work adapter → crew → plugins/tools →
-// (approvals when pending). When `state` is null the control plane was not
-// reachable; the caller renders its own honest error and a loading report here.
+// the natural guided journey: brain → real-work adapter → crew → plugins/tools →
+// try Prime (the first useful turn) → (approvals / paused work / stuck work when
+// present). When `state` is null the control plane was not reachable; the caller
+// renders its own honest error and a loading report here.
 export function buildReadiness(inputs: ReadinessInputs): ReadinessReport {
-  const { state, ai, adapters, plugins, tools, failed = {} } = inputs;
+  const { state, ai, adapters, plugins, tools, continuation = null, failed = {} } = inputs;
 
   const items: ReadinessItem[] = [];
 
@@ -434,8 +563,16 @@ export function buildReadiness(inputs: ReadinessInputs): ReadinessReport {
     crewItem(state),
     pluginToolItem(plugins, tools, { plugins: failed.plugins, tools: failed.tools }),
   );
+  // The guided first turn — only once the brain that would answer it is connected.
+  const tryPrime = tryPrimeItem(state, ai, adapters);
+  if (tryPrime) items.push(tryPrime);
+  // Things that need the operator to act, in escalating order of urgency.
   const approvals = approvalsItem(state);
   if (approvals) items.push(approvals);
+  const paused = continuationItem(continuation);
+  if (paused) items.push(paused);
+  const stuck = attentionWorkItem(state);
+  if (stuck) items.push(stuck);
 
   const blockers = items.filter((i) => i.status === "todo");
   const attention = items.filter((i) => i.status === "warn");
@@ -454,7 +591,7 @@ export function buildReadiness(inputs: ReadinessInputs): ReadinessReport {
     attention,
     ready: blockers.length === 0 && !degraded,
     degraded,
-    firstAction: deriveFirstAction(state),
+    firstAction: deriveFirstAction(state, ai, adapters, continuation),
     summary: operationalSummary(inputs),
   };
 }

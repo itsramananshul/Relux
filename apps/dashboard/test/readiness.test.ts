@@ -8,6 +8,10 @@ import {
   stateUnavailableItem,
   deriveFirstAction,
   brainLabel,
+  brainIsBlocked,
+  tryPrimeItem,
+  continuationItem,
+  attentionWorkItem,
 } from "../src/readiness.ts";
 import { CLAUDE_ADAPTER_ID, CODEX_ADAPTER_ID } from "../src/onboarding.ts";
 
@@ -353,4 +357,166 @@ test("brainLabel renders each brain honestly", () => {
   assert.equal(brainLabel(ai({ brain: "local" })), "Local (deterministic)");
   assert.equal(brainLabel(ai({ brain: "claude_cli" })), "Claude CLI");
   assert.equal(brainLabel(ai({ brain: "openrouter" })), "OpenRouter");
+});
+
+// ── Guided "try Prime" step (the first useful turn) ──────────────────────────
+//
+// The answer to "what do I do?". It only appears once the brain is connected,
+// reads "done" once any real work exists, and is a recommendation (link), never a
+// blocker, when the brain is ready but nothing has happened yet.
+
+function continuation(over = {}) {
+  return {
+    id: "cont_0001",
+    reason: "autonomy ceiling reached",
+    observation_count: 3,
+    extended_used: false,
+    awaiting_approval: false,
+    ...over,
+  };
+}
+
+test("brainIsBlocked is true only for a selected-but-unusable brain", () => {
+  assert.equal(brainIsBlocked(ai({ brain: "local" }), []), false);
+  assert.equal(brainIsBlocked(ai({ brain: "openrouter", configured: false }), []), true);
+  // Unknown ai (still loading / failed) is never asserted as blocked.
+  assert.equal(brainIsBlocked(null, []), false);
+});
+
+test("try-Prime is hidden until the brain is connected", () => {
+  const item = tryPrimeItem(
+    state(),
+    ai({ brain: "openrouter", configured: false }),
+    [],
+  );
+  assert.equal(item, null);
+});
+
+test("try-Prime is the recommended next step when ready with no work yet", () => {
+  const item = tryPrimeItem(state({ tasks: 0, runs: 0 }), ai({ brain: "local" }), []);
+  assert.ok(item);
+  assert.equal(item.status, "link");
+  assert.equal(item.linkTo, "/prime");
+  assert.match(item.label, /Ask Prime/i);
+  assert.match(item.description, /what tools do you have/i);
+});
+
+test("try-Prime reads done once any task or run exists", () => {
+  const fromTask = tryPrimeItem(state({ tasks: 1 }), ai({ brain: "local" }), []);
+  const fromRun = tryPrimeItem(state({ runs: 1 }), ai({ brain: "local" }), []);
+  assert.equal(fromTask.status, "done");
+  assert.equal(fromRun.status, "done");
+});
+
+// ── Paused continuation (resume a paused Prime tool loop) ────────────────────
+
+test("continuationItem is null when nothing is paused", () => {
+  assert.equal(continuationItem(null), null);
+  assert.equal(continuationItem(undefined), null);
+});
+
+test("a paused continuation is attention routed to Work", () => {
+  const item = continuationItem(continuation());
+  assert.ok(item);
+  assert.equal(item.status, "warn");
+  assert.equal(item.linkTo, "/work");
+  assert.match(item.label, /Resume paused work/i);
+  assert.match(item.description, /no work is re-run|already gathered/i);
+});
+
+test("a continuation awaiting approval says to approve first", () => {
+  const item = continuationItem(continuation({ awaiting_approval: true }));
+  assert.match(item.label, /Approve, then resume/i);
+  assert.match(item.description, /waiting on your approval/i);
+});
+
+// ── Blocked / failed work needs attention ────────────────────────────────────
+
+test("attentionWorkItem is null when no work is stuck", () => {
+  assert.equal(attentionWorkItem(state()), null);
+  assert.equal(attentionWorkItem(null), null);
+});
+
+test("blocked or failed work is attention routed to the Inbox", () => {
+  const item = attentionWorkItem(state({ blocked: 2, failed: 1 }));
+  assert.ok(item);
+  assert.equal(item.status, "warn");
+  assert.equal(item.linkTo, "/inbox");
+  assert.match(item.description, /2 blocked tasks/);
+  assert.match(item.description, /1 failed run/);
+});
+
+// ── First-action priority with the new stages ────────────────────────────────
+
+test("first action fixes a broken brain before anything else", () => {
+  const fa = deriveFirstAction(
+    state({ pending_approvals: 3 }),
+    ai({ brain: "openrouter", configured: false }),
+    [],
+  );
+  assert.equal(fa.linkTo, "/health");
+  assert.match(fa.label, /brain/i);
+});
+
+test("first action surfaces a paused continuation and stuck work in order", () => {
+  // Paused work outranks active runs.
+  const paused = deriveFirstAction(state({ active_runs: 2 }), ai({ brain: "local" }), [], continuation());
+  assert.equal(paused.linkTo, "/work");
+  assert.match(paused.label, /paused/i);
+  // Stuck work routes to the Inbox.
+  const stuck = deriveFirstAction(state({ blocked: 1 }), ai({ brain: "local" }), [], null);
+  assert.equal(stuck.linkTo, "/inbox");
+});
+
+test("the legacy one-argument deriveFirstAction is unchanged", () => {
+  // Existing callers pass only state — the brain/continuation branches must stay
+  // dormant so behaviour is byte-for-byte the prior contract.
+  assert.equal(deriveFirstAction(state({ pending_approvals: 2 })).linkTo, "/approvals");
+  assert.equal(deriveFirstAction(state({ active_runs: 1 })).linkTo, "/work");
+  assert.equal(deriveFirstAction(state({ tasks: 5, open_tasks: 2 })).linkTo, "/work");
+  assert.equal(deriveFirstAction(state({ tasks: 0 })).linkTo, "/prime");
+  assert.equal(deriveFirstAction(null).linkTo, "/prime");
+});
+
+// ── Integration: the new stages surface as attention but never block ─────────
+
+test("a paused continuation surfaces as attention without blocking a ready instance", () => {
+  const r = buildReadiness({
+    state: state({ tasks: 2 }),
+    ai: ai({ brain: "local" }),
+    adapters: [],
+    plugins: [],
+    tools: [],
+    continuation: continuation(),
+  });
+  assert.equal(r.ready, true); // warn ≠ blocker
+  assert.equal(r.blockers.length, 0);
+  assert.ok(r.attention.find((i) => i.id === "paused-continuation"));
+  assert.equal(r.firstAction.linkTo, "/work");
+});
+
+test("blocked work surfaces as attention and drives the first action to the Inbox", () => {
+  const r = buildReadiness({
+    state: state({ tasks: 3, blocked: 1 }),
+    ai: ai({ brain: "local" }),
+    adapters: [],
+    plugins: [],
+    tools: [],
+  });
+  assert.equal(r.ready, true);
+  assert.ok(r.attention.find((i) => i.id === "work-attention"));
+  assert.equal(r.firstAction.linkTo, "/inbox");
+});
+
+test("the guided try-Prime step appears once the brain is connected", () => {
+  const r = buildReadiness({
+    state: state(),
+    ai: ai({ brain: "local" }),
+    adapters: [],
+    plugins: [],
+    tools: [],
+  });
+  const tp = r.items.find((i) => i.id === "try-prime");
+  assert.ok(tp, "try-Prime is part of the guided journey");
+  assert.equal(tp.status, "link");
 });
