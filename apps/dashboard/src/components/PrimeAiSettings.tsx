@@ -1,5 +1,18 @@
-import { useEffect, useState } from "react";
-import { reluxAi, reluxSecrets, type ReluxAiStatus, type ReluxSecretStatus } from "../api";
+import { useCallback, useEffect, useState } from "react";
+import {
+  reluxAi,
+  reluxSecrets,
+  type ReluxAiStatus,
+  type ReluxModelCatalog,
+  type ReluxOpenRouterModel,
+  type ReluxSecretStatus,
+} from "../api";
+import {
+  filterModels,
+  modelDisplayName,
+  modelMetaLine,
+  orderModels,
+} from "../modelcatalog";
 
 // Prime AI settings (RELUX_MASTER_PLAN "Optional LLM-backed Prime"): configure
 // Prime's LLM provider/key from the dashboard, with NO environment variables and
@@ -25,6 +38,38 @@ export function PrimeAiSettings() {
   const [newValue, setNewValue] = useState("");
   const [busy, setBusy] = useState(false);
   const [banner, setBanner] = useState<{ kind: string; msg: string } | null>(null);
+  // The OpenRouter model catalog for the picker (loaded independently of status so
+  // an offline catalog never blocks configuring the key). `null` until first load.
+  const [catalog, setCatalog] = useState<ReluxModelCatalog | null>(null);
+  const [catalogLoading, setCatalogLoading] = useState(false);
+  // The model-picker search box query.
+  const [search, setSearch] = useState("");
+
+  // Load the model catalog. Bounded + key-free server-side; on failure the body
+  // carries ok:false + a reason, which we keep so the UI shows an honest fallback
+  // (manual slug field + retry) rather than going blank.
+  const loadCatalog = useCallback(async () => {
+    setCatalogLoading(true);
+    try {
+      const c = await reluxAi.models();
+      setCatalog(c);
+    } catch (e) {
+      // A transport/HTTP error (the route itself failed) — synthesize the same
+      // honest fallback shape so the picker degrades the same way.
+      setCatalog({
+        ok: false,
+        source: "openrouter",
+        models: [],
+        error: e instanceof Error ? e.message : "could not load model list",
+      });
+    } finally {
+      setCatalogLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadCatalog();
+  }, [loadCatalog]);
 
   async function refresh() {
     try {
@@ -204,15 +249,15 @@ export function PrimeAiSettings() {
             </div>
           )}
 
-          <label className="field" style={{ margin: "8px 0 0" }}>
-            <span style={{ fontSize: 12 }}>Model (optional)</span>
-            <input
-              className="input"
-              value={model}
-              placeholder="openai/gpt-4o-mini"
-              onChange={(e) => setModel(e.target.value)}
-            />
-          </label>
+          <ModelPicker
+            catalog={catalog}
+            loading={catalogLoading}
+            model={model}
+            search={search}
+            onSearch={setSearch}
+            onPick={setModel}
+            onRetry={() => void loadCatalog()}
+          />
 
           <div className="row wrap" style={{ gap: 8, marginTop: 12 }}>
             <button className="btn" disabled={busy} onClick={() => void save()}>
@@ -226,6 +271,134 @@ export function PrimeAiSettings() {
           </div>
         </>
       )}
+    </div>
+  );
+}
+
+// The OpenRouter model picker (RELUX_MASTER_PLAN "Optional LLM-backed Prime":
+// pick a model by real name/price, not an opaque slug). It shows a searchable,
+// selectable list of live models from the public catalog and writes the chosen
+// slug into the same `model` field the existing save path persists. Manual slug
+// entry remains as the advanced/fallback path and is the ONLY path when the
+// catalog can't load — so the UI is never blank and always offers a retry.
+function ModelPicker({
+  catalog,
+  loading,
+  model,
+  search,
+  onSearch,
+  onPick,
+  onRetry,
+}: {
+  catalog: ReluxModelCatalog | null;
+  loading: boolean;
+  model: string;
+  search: string;
+  onSearch: (q: string) => void;
+  onPick: (id: string) => void;
+  onRetry: () => void;
+}) {
+  const current = model.trim();
+  const ok = catalog?.ok ?? false;
+  const all = catalog?.models ?? [];
+  // Current model first, then OpenRouter's server order; then the search filter.
+  const visible: ReluxOpenRouterModel[] = filterModels(orderModels(all, current), search);
+  const selectedInList = current ? all.some((m) => m.id === current) : false;
+
+  return (
+    <div style={{ marginTop: 12 }}>
+      <div className="row" style={{ alignItems: "center", gap: 8 }}>
+        <span style={{ fontSize: 12, fontWeight: 600 }}>Model</span>
+        <div className="spacer" style={{ flex: 1 }} />
+        {ok && all.length > 0 && (
+          <span className="muted" style={{ fontSize: 11 }}>{all.length} available</span>
+        )}
+        <button
+          className="btn ghost sm"
+          disabled={loading}
+          onClick={onRetry}
+          title="Reload the OpenRouter model catalog"
+        >
+          {loading ? "Loading…" : "Refresh list"}
+        </button>
+      </div>
+      <p className="muted" style={{ fontSize: 11, margin: "4px 0 6px", lineHeight: 1.6 }}>
+        Pick a model from the live OpenRouter catalog — no need to know the slug.
+        Prices are shown per million tokens (in = prompt, out = completion). You can
+        still type a slug manually below.
+      </p>
+
+      {loading && all.length === 0 && (
+        <div className="muted" style={{ fontSize: 12 }}>Loading the model list…</div>
+      )}
+
+      {/* Honest fallback: the catalog could not load. Keep the manual field (below)
+          and explain why + offer a retry, rather than leaving the picker blank. */}
+      {!loading && catalog && !ok && (
+        <div className="banner info" style={{ fontSize: 11 }}>
+          Couldn't load the model list{catalog.error ? ` (${catalog.error})` : ""}. You can
+          still enter a model slug manually below, or{" "}
+          <button
+            className="btn ghost sm"
+            style={{ padding: "0 6px" }}
+            onClick={onRetry}
+          >
+            retry
+          </button>
+          .
+        </div>
+      )}
+
+      {ok && all.length > 0 && (
+        <>
+          <input
+            className="input"
+            value={search}
+            placeholder="Search models (e.g. gpt-4o, claude, llama)…"
+            onChange={(e) => onSearch(e.target.value)}
+            style={{ marginBottom: 6 }}
+          />
+          {visible.length === 0 ? (
+            <div className="muted" style={{ fontSize: 12 }}>
+              No models match "{search}".
+            </div>
+          ) : (
+            <select
+              className="input"
+              size={8}
+              value={selectedInList ? current : ""}
+              onChange={(e) => onPick(e.target.value)}
+              style={{ width: "100%", fontFamily: "inherit" }}
+            >
+              {visible.map((m) => {
+                const meta = modelMetaLine(m);
+                const name = modelDisplayName(m);
+                const label = meta ? `${name} — ${meta}` : name;
+                return (
+                  <option key={m.id} value={m.id} title={m.description ?? m.id}>
+                    {label}
+                  </option>
+                );
+              })}
+            </select>
+          )}
+        </>
+      )}
+
+      {/* Manual slug entry — the advanced path, and the fallback when the catalog
+          is offline. Always reflects/sets the same `model` value the save path uses. */}
+      <label className="field" style={{ margin: "8px 0 0" }}>
+        <span style={{ fontSize: 11 }}>Model ID (advanced / manual)</span>
+        <input
+          className="input"
+          value={model}
+          placeholder="openai/gpt-4o-mini"
+          onChange={(e) => onPick(e.target.value)}
+        />
+      </label>
+      <p className="muted" style={{ fontSize: 11, marginTop: 4 }}>
+        Leave blank to use the server default.
+      </p>
     </div>
   );
 }

@@ -170,6 +170,16 @@ refusal) deep-links to the canonical Crew → Prime Brain anchor. The panel is p
   The result is a clear status — `ready` / `disabled` / `missing_binary` / `not_configured` /
   `missing_key` / `failed` — each with a secret-free `detail` and the next step. The probe never
   runs an agent turn and never crosses a permission boundary.
+- **Pick an OpenRouter model by name, not by slug.** OpenRouter model IDs are unintuitive and
+  change, so the OpenRouter setup shows a **searchable, selectable model list** (name, context
+  window, prompt/completion price per million tokens) fetched live from OpenRouter's **public**
+  catalog endpoint `GET https://openrouter.ai/api/v1/models`
+  (<https://openrouter.ai/docs/api/api-reference/models/get-models>), surfaced to the dashboard as
+  `GET /v1/relux/ai/models`. The fetch is server-side, bounded, and needs **no API key** (no secret
+  exposed). The route always returns 200 with `{ ok, source, models, error? }`, so an offline
+  catalog degrades to an **honest fallback** — the manual slug field stays and a *Retry* button
+  reloads — never a blank picker. The chosen model saves through the **same** write-only
+  secret-reference config path (`PUT /v1/relux/ai/config`); the picker never sees or stores the key.
 - **Prove a real chat turn — the live probe.** The quick probe proves *availability*; it cannot
   prove Prime can complete a chat turn (for CLI brains, sign-in is only confirmed on the first real
   turn, and OpenRouter is never contacted). The **Test live chat** button → `POST

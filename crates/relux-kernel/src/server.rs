@@ -218,6 +218,7 @@ async fn serve() -> Result<(), KernelError> {
     println!("   PUT    /v1/relux/watchdog                  {{ \"enabled\": bool, \"stale_after_secs\": u64 }}  (clamped; recovers hung runs)");
     println!("   GET    /v1/relux/doctor                     (read-only structured diagnostics report)");
     println!("   GET    /v1/relux/ai/status");
+    println!("   GET    /v1/relux/ai/models                  (OpenRouter model catalog for the picker; public, key-free)");
     println!("   PUT    /v1/relux/ai/config                 {{ \"provider\":\"openrouter\", \"api_key\":\"...\", \"model\"?, \"disabled\"? }}");
     println!("   DELETE /v1/relux/ai/config                 (clear the stored AI key/config)");
     println!("   GET    /v1/relux/tasks");
@@ -521,6 +522,7 @@ fn protected_router() -> Router<AppState> {
         )
         .route("/v1/relux/doctor", get(get_doctor))
         .route("/v1/relux/ai/status", get(get_ai_status))
+        .route("/v1/relux/ai/models", get(get_ai_models))
         .route("/v1/relux/ai/probe", post(probe_ai_brain))
         .route("/v1/relux/ai/probe/live", post(probe_ai_brain_live))
         .route(
@@ -1265,6 +1267,21 @@ async fn get_ai_status(State(state): State<AppState>) -> Json<AiStatus> {
     let (brain, resolution) = relux_kernel::resolve_brain(&cfg, &available);
     let auto_detected = resolution == relux_kernel::BrainResolution::CliAutoDetected;
     Json(cfg.status_for(brain, auto_detected))
+}
+
+/// List the OpenRouter model catalog for the Prime Brain model picker.
+///
+/// (`docs/RELUX_MASTER_PLAN.md` "Optional LLM-backed Prime": OpenRouter model IDs
+/// are unintuitive and change, so operators pick a model by name/price instead of
+/// typing a slug.) Reads the PUBLIC
+/// `GET https://openrouter.ai/api/v1/models` endpoint
+/// (https://openrouter.ai/docs/api/api-reference/models/get-models): bounded
+/// timeout, bounded response, **no API key required or sent**, no secret exposure.
+/// Always returns 200 with an `ok` flag so an offline catalog degrades to an honest
+/// fallback in the UI (keep the manual model field + retry) rather than a hard
+/// error. It does not touch or block `GET /v1/relux/ai/status` or the config path.
+async fn get_ai_models() -> Json<relux_kernel::ModelCatalog> {
+    Json(relux_kernel::openrouter_model_catalog().await)
 }
 
 /// Set or update Prime's AI provider configuration from the dashboard.

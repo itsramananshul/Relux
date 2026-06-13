@@ -2555,9 +2555,46 @@ export interface ReluxLiveBrainProbe {
   checked: "local_fallback" | "openrouter_chat" | "cli_chat";
 }
 
+// One model from the OpenRouter catalog (GET /v1/relux/ai/models), reduced to the
+// fields the model picker needs. Secret-free: the catalog endpoint is public and
+// takes no API key. Prices are the raw USD per-token strings OpenRouter returns
+// (e.g. "0.0000025"); the dashboard formats them (see modelcatalog.ts).
+export interface ReluxOpenRouterModel {
+  // The slug to save as the configured model (e.g. "openai/gpt-4o-mini").
+  id: string;
+  // The human-readable name (e.g. "OpenAI: GPT-4o mini"), when advertised.
+  name?: string | null;
+  // The context-window length in tokens, when advertised.
+  context_length?: number | null;
+  // Prompt price in USD per token (raw string), or absent when not advertised.
+  prompt_price?: string | null;
+  // Completion price in USD per token (raw string), or absent.
+  completion_price?: string | null;
+  // A short, truncated description, when advertised.
+  description?: string | null;
+  // The model's modality (e.g. "text->text"), when advertised.
+  modality?: string | null;
+}
+
+// The model-catalog result (GET /v1/relux/ai/models). The route always returns
+// 200 with this shape so an offline catalog degrades to an honest fallback: `ok`
+// false + `error` set + empty `models`, so the UI keeps the manual model field and
+// offers a retry instead of going blank.
+export interface ReluxModelCatalog {
+  ok: boolean;
+  source: string;
+  models: ReluxOpenRouterModel[];
+  error?: string | null;
+}
+
 export const reluxAi = {
   // Current AI configuration/status (key-free; never returns the API key).
   status: () => api.get<ReluxAiStatus>("/v1/relux/ai/status"),
+  // The OpenRouter model catalog for the Prime Brain model picker. Reads the
+  // PUBLIC OpenRouter /api/v1/models endpoint server-side (bounded, no API key),
+  // so the operator can pick a model by name/price instead of typing a slug. On
+  // failure the body carries ok:false + a reason so the UI shows a fallback.
+  models: () => api.get<ReluxModelCatalog>("/v1/relux/ai/models"),
   // Safely test whether a brain is usable and return a clear status. Pass a
   // `brain` to test a specific one; omit it to probe Prime's current brain. CLI
   // brains run `<bin> --version` (read-only, no bypass flag); OpenRouter checks

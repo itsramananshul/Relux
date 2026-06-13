@@ -65,6 +65,29 @@ const MAX_TOKENS: u32 = 500;
 /// the API payload regardless of what the provider returns.
 const MAX_REPLY_CHARS: usize = 4_000;
 
+// --- OpenRouter model catalog ----------------------------------------------
+//
+// The roadmap calls out that OpenRouter model IDs are unintuitive and change, so
+// operators should pick a model from a real, live list of names/prices rather
+// than typing a slug (`docs/RELUX_MASTER_PLAN.md` "Optional LLM-backed Prime").
+// OpenRouter exposes the catalog at the PUBLIC `GET /api/v1/models` endpoint
+// (https://openrouter.ai/docs/api/api-reference/models/get-models), which needs
+// no API key — so the fetch below carries none and exposes no secret.
+
+/// OpenRouter's public model-catalog endpoint (no API key required).
+const OPENROUTER_MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
+/// Bounded timeout for the catalog fetch, independent of the chat timeout so a
+/// slow catalog can never hang the setup page.
+const MODELS_FETCH_TIMEOUT_MS: u64 = 10_000;
+/// Hard cap on models returned to the dashboard, so an unexpectedly large catalog
+/// can't bloat the response.
+const MAX_MODELS_RETURNED: usize = 400;
+/// Max characters kept from a model description.
+const MAX_MODEL_DESCRIPTION_CHARS: usize = 280;
+/// Hard cap on the catalog response body we will read, so a runaway/garbage
+/// response can't exhaust memory regardless of what the endpoint returns.
+const MAX_CATALOG_BODY_BYTES: usize = 4 * 1024 * 1024;
+
 // Bounds on a proposal-polish overlay. Presentation strings only, so these are
 // generous-but-finite: a runaway model reply can never balloon the card.
 /// Max characters kept for a polished one-line summary.
@@ -2245,6 +2268,216 @@ struct ChatMessage {
     content: String,
 }
 
+// --- OpenRouter model catalog (public, key-free) ---------------------------
+
+/// One model from the OpenRouter catalog (`GET /api/v1/models`), reduced to the
+/// fields the dashboard model picker needs.
+///
+/// Secret-free by construction: the catalog endpoint is public and takes no API
+/// key, so nothing here is sensitive. Prices are passed through as the raw USD
+/// per-token strings OpenRouter returns (e.g. `"0.0000025"`); the dashboard
+/// formats them for display so we don't bake a presentation choice into the wire.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct OpenRouterModel {
+    /// The model slug to save as the configured model (e.g. `openai/gpt-4o-mini`).
+    pub id: String,
+    /// The human-readable name (e.g. `OpenAI: GPT-4o mini`), when advertised.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The context-window length in tokens, when advertised.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u64>,
+    /// Prompt price in USD per token, as the raw string OpenRouter returns; `None`
+    /// when not advertised. The dashboard formats it (e.g. to per-million).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_price: Option<String>,
+    /// Completion price in USD per token, raw string; `None` when not advertised.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_price: Option<String>,
+    /// A short description, truncated to [`MAX_MODEL_DESCRIPTION_CHARS`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The model's modality (e.g. `text->text`), from `architecture.modality`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modality: Option<String>,
+}
+
+/// The result of a model-catalog fetch for `GET /v1/relux/ai/models`.
+///
+/// The route ALWAYS returns HTTP 200 with this body so the dashboard can render an
+/// honest fallback (keep the manual model field + offer retry) without treating an
+/// offline catalog as a hard error. `ok` distinguishes a live catalog (`models`
+/// populated) from a fallback (`error` set, `models` empty).
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelCatalog {
+    /// `true` when the catalog was fetched and parsed; `false` for a fallback.
+    pub ok: bool,
+    /// Where the catalog came from (always `"openrouter"` today).
+    pub source: &'static str,
+    /// The models, in OpenRouter's server order. The dashboard floats the
+    /// currently-configured model to the top; we keep server order on the wire.
+    pub models: Vec<OpenRouterModel>,
+    /// A short, secret-free reason when `ok` is `false`, so the UI can explain why
+    /// the catalog could not load and offer a retry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawModelsResponse {
+    #[serde(default)]
+    data: Vec<RawModel>,
+}
+
+#[derive(Deserialize)]
+struct RawModel {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    context_length: Option<u64>,
+    #[serde(default)]
+    architecture: Option<RawArchitecture>,
+    #[serde(default)]
+    pricing: Option<RawPricing>,
+}
+
+#[derive(Deserialize)]
+struct RawArchitecture {
+    #[serde(default)]
+    modality: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawPricing {
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    completion: Option<String>,
+}
+
+/// Normalize an optional raw price string: trim and drop empties. Kept as a string
+/// (no float parse) so we pass through exactly what OpenRouter advertised.
+fn clean_price(p: Option<&str>) -> Option<String> {
+    let p = p?.trim();
+    if p.is_empty() {
+        None
+    } else {
+        Some(p.to_string())
+    }
+}
+
+/// Parse the OpenRouter `GET /api/v1/models` response body into the reduced
+/// catalog the dashboard uses.
+///
+/// Pure + secret-free, so it is unit-testable without the network. Models without
+/// an `id` are skipped (an id is required to actually select one); the result is
+/// capped at [`MAX_MODELS_RETURNED`] and each description at
+/// [`MAX_MODEL_DESCRIPTION_CHARS`].
+pub fn parse_models_response(body: &str) -> Result<Vec<OpenRouterModel>, String> {
+    let raw: RawModelsResponse =
+        serde_json::from_str(body).map_err(|_| "invalid catalog response".to_string())?;
+    let mut out = Vec::new();
+    for m in raw.data {
+        let Some(id) = m
+            .id
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let prompt_price = m
+            .pricing
+            .as_ref()
+            .and_then(|p| clean_price(p.prompt.as_deref()));
+        let completion_price = m
+            .pricing
+            .as_ref()
+            .and_then(|p| clean_price(p.completion.as_deref()));
+        out.push(OpenRouterModel {
+            id,
+            name: m
+                .name
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            context_length: m.context_length,
+            prompt_price,
+            completion_price,
+            description: m
+                .description
+                .map(|s| truncate_chars(s.trim(), MAX_MODEL_DESCRIPTION_CHARS))
+                .filter(|s| !s.is_empty()),
+            modality: m
+                .architecture
+                .and_then(|a| a.modality)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+        });
+        if out.len() >= MAX_MODELS_RETURNED {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Fetch the OpenRouter model catalog from the PUBLIC `GET /api/v1/models`
+/// endpoint.
+///
+/// Bounded by [`MODELS_FETCH_TIMEOUT_MS`] and [`MAX_CATALOG_BODY_BYTES`]; needs NO
+/// API key (the catalog is public) and carries none, so no secret is exposed.
+/// Returns `Err(reason)` with a short, secret-free reason on any failure so the
+/// dashboard can show an honest fallback.
+pub async fn fetch_openrouter_models() -> Result<Vec<OpenRouterModel>, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(MODELS_FETCH_TIMEOUT_MS))
+        .build()
+        .map_err(|_| "http client init failed".to_string())?;
+    let resp = client
+        .get(OPENROUTER_MODELS_URL)
+        // Non-secret attribution headers, same as the chat path.
+        .header("X-Title", "Relux Prime")
+        .header("HTTP-Referer", "https://github.com/itsramananshul/Relux")
+        .send()
+        .await
+        .map_err(|e| classify_send_error(&e))?;
+    if !resp.status().is_success() {
+        return Err(format!("http {}", resp.status().as_u16()));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|_| "invalid response body".to_string())?;
+    if bytes.len() > MAX_CATALOG_BODY_BYTES {
+        return Err("catalog response too large".to_string());
+    }
+    let body = String::from_utf8_lossy(&bytes);
+    parse_models_response(&body)
+}
+
+/// Fetch the catalog and wrap it into the always-200 [`ModelCatalog`] the route
+/// returns: `ok` with models on success, or `ok:false` + a secret-free `error`
+/// (and an empty list) so the dashboard renders its honest fallback. Never blocks
+/// or depends on `GET /v1/relux/ai/status`.
+pub async fn openrouter_model_catalog() -> ModelCatalog {
+    match fetch_openrouter_models().await {
+        Ok(models) => ModelCatalog {
+            ok: true,
+            source: "openrouter",
+            models,
+            error: None,
+        },
+        Err(reason) => ModelCatalog {
+            ok: false,
+            source: "openrouter",
+            models: Vec::new(),
+            error: Some(reason),
+        },
+    }
+}
+
 #[derive(Serialize)]
 struct ChatRequest<'a> {
     model: &'a str,
@@ -3538,5 +3771,94 @@ mod tests {
         // The authoritative proposal is never mutated by validation.
         assert_eq!(p.steps.len(), 2);
         assert_eq!(p.steps[1].agent, "prime");
+    }
+
+    // --- OpenRouter model catalog parser -----------------------------------
+
+    #[test]
+    fn parse_models_response_extracts_the_dashboard_fields() {
+        // Shape mirrors the official `GET /api/v1/models` response
+        // (https://openrouter.ai/docs/api/api-reference/models/get-models):
+        // a top-level `data` array of model objects with pricing/architecture.
+        let body = r#"{
+            "data": [
+                {
+                    "id": "openai/gpt-4o-mini",
+                    "name": "OpenAI: GPT-4o mini",
+                    "description": "A fast, cheap general model.",
+                    "context_length": 128000,
+                    "architecture": { "modality": "text->text" },
+                    "pricing": { "prompt": "0.00000015", "completion": "0.0000006" }
+                }
+            ]
+        }"#;
+        let models = parse_models_response(body).expect("valid catalog parses");
+        assert_eq!(models.len(), 1);
+        let m = &models[0];
+        assert_eq!(m.id, "openai/gpt-4o-mini");
+        assert_eq!(m.name.as_deref(), Some("OpenAI: GPT-4o mini"));
+        assert_eq!(m.context_length, Some(128_000));
+        assert_eq!(m.prompt_price.as_deref(), Some("0.00000015"));
+        assert_eq!(m.completion_price.as_deref(), Some("0.0000006"));
+        assert_eq!(m.modality.as_deref(), Some("text->text"));
+        assert_eq!(m.description.as_deref(), Some("A fast, cheap general model."));
+    }
+
+    #[test]
+    fn parse_models_response_skips_models_without_an_id() {
+        // An id is required to select a model; an entry missing it is dropped, not
+        // turned into an un-selectable row.
+        let body = r#"{"data":[{"name":"no id here"},{"id":"a/b","name":"ok"}]}"#;
+        let models = parse_models_response(body).expect("parses");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "a/b");
+    }
+
+    #[test]
+    fn parse_models_response_tolerates_missing_pricing_and_architecture() {
+        // A spartan entry (just an id) must still parse, with the optional fields
+        // simply absent rather than fabricated.
+        let body = r#"{"data":[{"id":"x/y"}]}"#;
+        let models = parse_models_response(body).expect("parses");
+        assert_eq!(models.len(), 1);
+        let m = &models[0];
+        assert!(m.name.is_none());
+        assert!(m.context_length.is_none());
+        assert!(m.prompt_price.is_none());
+        assert!(m.completion_price.is_none());
+        assert!(m.modality.is_none());
+        assert!(m.description.is_none());
+    }
+
+    #[test]
+    fn parse_models_response_drops_blank_prices() {
+        // OpenRouter sometimes advertises an empty-string price; treat it as "not
+        // advertised" so the UI shows nothing rather than a misleading "$0".
+        let body = r#"{"data":[{"id":"x/y","pricing":{"prompt":"","completion":"  "}}]}"#;
+        let models = parse_models_response(body).expect("parses");
+        assert!(models[0].prompt_price.is_none());
+        assert!(models[0].completion_price.is_none());
+    }
+
+    #[test]
+    fn parse_models_response_truncates_long_descriptions() {
+        let long = "x".repeat(MAX_MODEL_DESCRIPTION_CHARS + 50);
+        let body = format!(r#"{{"data":[{{"id":"x/y","description":"{long}"}}]}}"#);
+        let models = parse_models_response(&body).expect("parses");
+        assert_eq!(
+            models[0].description.as_ref().map(|d| d.chars().count()),
+            Some(MAX_MODEL_DESCRIPTION_CHARS)
+        );
+    }
+
+    #[test]
+    fn parse_models_response_rejects_garbage() {
+        assert!(parse_models_response("not json").is_err());
+    }
+
+    #[test]
+    fn parse_models_response_handles_an_empty_catalog() {
+        let models = parse_models_response(r#"{"data":[]}"#).expect("parses");
+        assert!(models.is_empty());
     }
 }

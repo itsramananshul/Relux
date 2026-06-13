@@ -95,6 +95,8 @@ pub use ai::{
     polish_clarify_via_openrouter, polish_from_cli_text, polish_proposal, proposal_wants_polish,
     read_stored_config, shape_reply, write_stored_config, AiConfig, AiMode, AiOutcome, AiStatus,
     PrimeBrain, StoredAiConfig,
+    fetch_openrouter_models, openrouter_model_catalog, parse_models_response, ModelCatalog,
+    OpenRouterModel,
 };
 pub use agent_auth::{
     bearer_token_from_headers, AgentTokenIdentity, AgentTokenMeta, AgentTokenStore,

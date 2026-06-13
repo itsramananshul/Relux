@@ -4449,6 +4449,23 @@ in kernel state.
   absolute grounding. The LLM is never asked to narrate real state changes.
 - **Conversational Shaping**: For greetings, status queries, and general chat, the
   LLM rephrases the kernel's grounded facts into natural dialogue.
+- **Model picker (no slug memorization)**: OpenRouter model IDs are unintuitive and
+  change, so the dashboard does **not** require typing a slug. Prime AI settings shows a
+  searchable, selectable list of real models — name, context window, and prompt/completion
+  price per million tokens — fetched live from OpenRouter's **public** catalog endpoint
+  `GET https://openrouter.ai/api/v1/models`
+  (official docs: <https://openrouter.ai/docs/api/api-reference/models/get-models>). The
+  fetch is server-side, bounded (10s timeout, ≤4 MiB body, ≤400 models), and needs **no API
+  key** (so no secret is exposed). It is exposed to the dashboard as
+  `GET /v1/relux/ai/models` (session-protected), which **always** returns 200 with
+  `{ ok, source, models, error? }`: on success `ok:true` + the reduced model list (id, name,
+  context length, prompt/completion price, description, modality, in OpenRouter's server
+  order — the dashboard floats the currently-configured model to the top); on failure
+  `ok:false` + a short reason + empty list, so the UI degrades to an honest fallback (keep
+  the manual slug field + a Retry button, never a blank picker). The catalog route is
+  independent of `GET /v1/relux/ai/status` and never blocks it. The chosen model is saved
+  through the **same** write-only secret-reference config path below — the picker never sees
+  or stores a key. Manual slug entry remains as the advanced/fallback path.
 - **Configuration (dashboard, recommended; no env vars)**: Prime Brain → OpenRouter →
   Prime AI settings lets an operator point Prime at an OpenRouter key/model without
   environment variables (§18: "do not hardcode one model provider"). The key is supplied
@@ -4459,6 +4476,8 @@ in kernel state.
   provider key by reference"). Endpoints:
   - `GET /v1/relux/ai/status` — key-free status (mode/configured/`secret_missing`/
     referenced `api_key_secret` name/model/reason).
+  - `GET /v1/relux/ai/models` — the OpenRouter model catalog for the picker (public,
+    key-free; always 200 with `{ ok, source, models, error? }`; honest fallback on failure).
   - `PUT /v1/relux/ai/config` — `{ provider:"openrouter", api_key_secret, model?,
     disabled? }` (the dashboard sends the secret NAME, not a key; the legacy plaintext
     `api_key` field is still accepted for env/CLI setups and is mutually exclusive with
