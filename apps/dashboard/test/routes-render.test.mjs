@@ -89,9 +89,9 @@ test("Prime renders under a declarative router (chat-first, no blank page)", () 
   // pushing the chat down (RELUX_MASTER_PLAN §11.1).
   assert.match(html, /Advanced/);
   assert.match(html, /<details/);
-  // The "Tools Prime can use" inventory panel paints on first render (collapsed,
-  // lazy-loaded) so installed/MCP tools are a visible capability (docs/prime-tool-use.md).
-  assert.match(html, /Tools Prime can use/);
+  // The "Prime abilities" inventory panel paints on first render (open, lazy-loaded)
+  // so installed/MCP tools are a visible capability (docs/prime-tool-use.md).
+  assert.match(html, /Prime abilities/);
 });
 
 test("ReluxApprovals renders and uses the B&W design system, not Tailwind", () => {
