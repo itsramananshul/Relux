@@ -23,6 +23,7 @@ import {
   boundedContextReads,
   formatToolOutput,
   formatToolDetails,
+  replyCoversToolOutput,
   githubPluginInstallAction,
   agentCreatedAction,
   adapterBrandLabel,
@@ -443,6 +444,27 @@ test("formatToolOutput clamps a pathologically large output so it never floods c
   const huge = formatToolOutput({ result: "x".repeat(10000) });
   assert.ok(huge.length <= 4000);
   assert.ok(huge.endsWith("…"));
+});
+
+// replyCoversToolOutput dedupes the answer-first path: when the chat reply already leads with
+// the tool's human answer, the result block must not repeat it.
+test("replyCoversToolOutput is true when the reply already shows the tool's human answer", () => {
+  const output = { result: "found 2 rows", structuredContent: { rows: 2 } };
+  // Exact match (the deterministic kernel leads the reply with the human result).
+  assert.equal(replyCoversToolOutput("found 2 rows", output), true);
+  // Tolerant: the reply is the full answer while the block body was clamped with a trailing "…".
+  const long = "y".repeat(5000);
+  assert.equal(replyCoversToolOutput(long, { result: long }), true);
+});
+
+test("replyCoversToolOutput is false for the canned status line and empty bodies", () => {
+  const output = { result: "found 2 rows", structuredContent: { rows: 2 } };
+  // The canned "Running …" reply does NOT cover the answer → the block still renders.
+  assert.equal(replyCoversToolOutput("Running x/y.", output), false);
+  // No human body / empty reply → nothing to dedupe.
+  assert.equal(replyCoversToolOutput("anything", { said: "hi" }), false);
+  assert.equal(replyCoversToolOutput("", output), false);
+  assert.equal(replyCoversToolOutput(undefined, output), false);
 });
 
 test("githubPluginInstallAction extracts the canonical repo + proposed id from the action", () => {

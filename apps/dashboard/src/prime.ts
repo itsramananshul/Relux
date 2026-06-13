@@ -517,6 +517,25 @@ export function formatToolOutput(output: unknown): string {
   return text;
 }
 
+// Whether a turn's REPLY already shows the tool's natural answer, so the result block must
+// NOT repeat it. The deterministic (no-brain) kernel path now leads the chat bubble with the
+// tool's human answer ([`formatToolOutput`]'s body), so rendering the same body again under the
+// `tool` badge would duplicate it. The reply may be clamped differently than the block body, so
+// this compares tolerantly: a match when the reply equals the formatted text, or starts with it
+// (minus a trailing ellipsis marker). Returns false when there is no human body to dedupe (a
+// plain structured object, or an empty output) — that block still renders normally. Pure +
+// presentation-only: it hides a duplicate, never the audited raw-details expander.
+export function replyCoversToolOutput(reply: string | undefined, output: unknown): boolean {
+  const text = formatToolOutput(output);
+  if (!text) return false;
+  const r = (reply ?? "").trim();
+  if (!r) return false;
+  const t = text.trim();
+  if (r === t) return true;
+  const stem = t.replace(/…$/, "").trim();
+  return stem.length > 0 && r.startsWith(stem);
+}
+
 // The MACHINE half of a shaped tool result — the structured `structuredContent` detail —
 // pretty-printed for a collapsible "raw details" expander beneath the natural answer
 // ([`formatToolOutput`]). This keeps the audited, structured output available (expandable,

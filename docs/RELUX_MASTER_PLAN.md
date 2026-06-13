@@ -1109,6 +1109,19 @@ control-plane operator *second*:
   structured detail behind a collapsible **"raw details"** expander
   (`formatToolOutput` / `formatToolDetails` / `Prime.tsx` `ToolOutputBlock`). The
   structured body is preserved (audited, expandable), never dropped or fabricated.
+- **Answer-first even with no brain.** A deterministic (no-brain) single-invoke turn
+  leads the chat reply with the tool's **natural answer**, not a canned
+  `Running <tool>.` line: the kernel's two `Ready` execution arms route through
+  `answer_first_reply` → `natural_tool_reply`, which surfaces the shaped envelope's
+  human `result` (or a plain-string result). Status prose still wins (it is the
+  grounded answer), and a tool with **no** human result keeps the honest
+  `Running <tool>.` status line — never a fabricated summary. The dashboard
+  deduplicates (`replyCoversToolOutput`): when the reply already shows the answer,
+  the result block renders only the badge + the audited "raw details" expander, so
+  the answer appears **once**. With a brain configured the agent loop already
+  synthesizes the final answer; this gives the deterministic path parity, mirroring
+  Hermes `agent/conversation_loop.py` folding the tool result into the final
+  assistant content.
 - **Read-only by default; execution stays gated.** Plugin Lens source tools are
   `Low`/`Never`-approval read-only introspection. Turning a plugin into a runnable
   tool (MCP register / governed command tool) is always an explicit,

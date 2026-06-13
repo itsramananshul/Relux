@@ -3040,3 +3040,28 @@ returns no human `result` still shows its structured output (there is simply not
 expand), so non-Lens tools are unaffected. Honesty is maintained: the summary is computed from
 the real result, and a failed/empty result still surfaces honestly (no fabricated success).
 See `docs/plugins.md` "Plugin Lens → Result shaping" for the product surface.
+
+### Follow-up — deterministic (no-brain) reply must be answer-first too
+
+**Caveat closed (this slice).** The v0.1.41 shaping made the *result block* and the *brain*
+read prose, but the deterministic single-invoke chat reply (no brain configured) still led the
+bubble with the canned `Running <tool>.` line while the natural summary sat in the block beneath.
+
+**Reference re-read:**
+
+- `reference/hermes-agent-main/agent/conversation_loop.py` `run_conversation(...)` — re-read for the
+  FINAL-content behavior: after a tool runs, Hermes folds the tool result into the assistant's
+  final `content` (the user-facing message IS the answer); it never emits a bare "running the tool"
+  status as the visible reply. Relux's brain path already matched this (the agent loop synthesizes
+  the final answer); the deterministic path did not.
+- `reference/hermes-agent-main/agent/tools/mcp_tool.py` — re-confirmed the `{ result, structuredContent }`
+  envelope is the human-text-first contract the reply should surface.
+
+**How Relux maps it:** the kernel's two `Ready` execution arms in `prime_invoke_tool`
+(`crates/relux-kernel/src/state.rs`) now build the reply through one chokepoint,
+`answer_first_reply(prose, text, output)` → `natural_tool_reply(output)`: prose (the status tool's
+grounded answer) wins; else the tool's human `result`/string answer leads; else the honest
+`Running <tool>.` line stays (a tool with no human result — never a fabricated summary). The
+dashboard deduplicates with `replyCoversToolOutput(reply, output)` so the answer renders once
+(reply bubble) plus the audited "raw details" expander, never twice. Explicit task creation /
+run paths are untouched.

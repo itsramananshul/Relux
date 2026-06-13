@@ -48,23 +48,42 @@ const base = {
   ai_mode: "deterministic",
   state: {},
 };
+const SUMMARY_ANSWER = "**Acme** v1.0.0 — Manifestless.\\nDoes acme things.\\n7 files, 2 directories";
 // A Plugin Lens summary: the kernel shapes it into { result: <human prose>, structuredContent }.
+// Answer-first (no brain): the kernel now leads the chat REPLY with the human result text, so
+// the reply equals the shaped answer here — the result block must NOT repeat it.
 const SHAPED = {
   ...base,
+  reply: SUMMARY_ANSWER,
   invoked_tool: "acme-repo/plugin.summary",
   tool_output: {
-    result: "**Acme** v1.0.0 — Manifestless.\\nDoes acme things.\\n7 files, 2 directories",
+    result: SUMMARY_ANSWER,
+    structuredContent: { plugin_id: "acme-repo", file_count: 7, dir_count: 2 },
+  },
+};
+// A legacy/edge turn whose reply is still the canned status line (e.g. a tool with no human
+// answer that fell back to "Running …"): the result block should still surface the body.
+const CANNED = {
+  ...base,
+  reply: "Running acme-repo/plugin.summary.",
+  invoked_tool: "acme-repo/plugin.summary",
+  tool_output: {
+    result: SUMMARY_ANSWER,
     structuredContent: { plugin_id: "acme-repo", file_count: 7, dir_count: 2 },
   },
 };
 // A plain-string tool output (no structured detail): no expander should appear.
 const PLAIN = {
   ...base,
+  reply: "Nothing is running yet; the control plane is idle.",
   invoked_tool: "relux-tools-status/status.summary",
   tool_output: { result: "Nothing is running yet; the control plane is idle." },
 };
 export function renderShaped() {
   return at(<PrimeTurnCard turn={SHAPED} busy={false} onSuggestion={noop} onContinue={noop} />);
+}
+export function renderCanned() {
+  return at(<PrimeTurnCard turn={CANNED} busy={false} onSuggestion={noop} onContinue={noop} />);
 }
 export function renderPlain() {
   return at(<PrimeTurnCard turn={PLAIN} busy={false} onSuggestion={noop} onContinue={noop} />);
@@ -99,21 +118,31 @@ after(() => {
   if (tmp) rmSync(tmp, { recursive: true, force: true });
 });
 
-test("a shaped tool result shows the human answer plus a collapsible raw-details expander", () => {
+test("answer-first: the human answer shows ONCE (not duplicated) plus a raw-details expander", () => {
   const html = mod.renderShaped();
   // The natural answer text renders in the bubble.
   assert.match(html, /Acme/);
   assert.match(html, /Does acme things/);
   assert.match(html, /7 files, 2 directories/);
-  // The structured detail lives behind a "raw details" expander, not the main body.
+  // It is the chat REPLY now — and must NOT be repeated in the result block. A distinctive
+  // fragment of the answer appears exactly once in the markup.
+  const occurrences = html.split("Does acme things").length - 1;
+  assert.equal(occurrences, 1, `answer must render once, found ${occurrences}`);
+  // The structured detail still lives behind a "raw details" expander (audited, expandable).
   assert.match(html, /<details/);
   assert.match(html, /raw details/i);
-  // The structured JSON is present (inside the expander; quotes are HTML-entity-encoded in the
-  // server-rendered markup) but the human answer leads.
   assert.match(html, /plugin_id/);
   const idx = html.indexOf("Does acme things");
   const jsonIdx = html.indexOf("plugin_id");
   assert.ok(idx >= 0 && jsonIdx >= 0 && idx < jsonIdx, "human answer must precede the raw JSON");
+});
+
+test("a canned-reply turn still surfaces the human body in the result block", () => {
+  const html = mod.renderCanned();
+  // Reply is the status line, so the block is NOT deduped — the answer body renders there.
+  assert.match(html, /Running acme-repo\/plugin\.summary/);
+  assert.match(html, /Does acme things/);
+  assert.match(html, /raw details/i);
 });
 
 test("a plain-string tool result renders no raw-details expander", () => {

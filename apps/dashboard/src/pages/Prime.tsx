@@ -42,7 +42,7 @@ import {
   stepIsPrimeFallback,
   stepOutcomeTone,
 } from "../orchestration";
-import { afterActionLabel, agentCreatedView, boundedContextReads, brainSourceLabel, configureCommandToolAction, configurePluginCandidateAction, contextReadDetail, contextReadsHadMiss, contextReadsUsedLabel, decisionSourceLabel, formatToolOutput, formatToolDetails, githubPluginInstallAction, hasSteps, intentProvenance, isCapabilityGrantSuggestion, isRunOrchestrationSuggestion, pendingClarificationLabel, polishProvenance, PRIME_GREETING, PRIME_HINT, PRIME_PLACEHOLDER, PRIME_SUGGESTIONS, proposalDisplaySummary, replyPolishLabel, requestedToolLabel, slotProvenance, stepDisplayTitle, updateProvenance, type AgentCreatedView, type ConfigureCommandToolAction, type ConfigurePluginCandidateAction } from "../prime";
+import { afterActionLabel, agentCreatedView, boundedContextReads, brainSourceLabel, configureCommandToolAction, configurePluginCandidateAction, contextReadDetail, contextReadsHadMiss, contextReadsUsedLabel, decisionSourceLabel, formatToolOutput, formatToolDetails, replyCoversToolOutput, githubPluginInstallAction, hasSteps, intentProvenance, isCapabilityGrantSuggestion, isRunOrchestrationSuggestion, pendingClarificationLabel, polishProvenance, PRIME_GREETING, PRIME_HINT, PRIME_PLACEHOLDER, PRIME_SUGGESTIONS, proposalDisplaySummary, replyPolishLabel, requestedToolLabel, slotProvenance, stepDisplayTitle, updateProvenance, type AgentCreatedView, type ConfigureCommandToolAction, type ConfigurePluginCandidateAction } from "../prime";
 import { commandToolInputFromDraft, validateCommandToolDraft, type CommandToolDraft } from "../plugins";
 import { workTaskHref, workRunHref } from "../routing";
 import { consumeInvestigationSeed } from "../investigateseed";
@@ -412,9 +412,11 @@ function PrimeToolInventoryPanel() {
 // machine JSON is audited/available but never clutters the bubble (Plugin Lens / MCP shaping,
 // `docs/RELUX_MASTER_PLAN.md` §11.1). The UI fabricates nothing — both halves come from the
 // kernel-shaped result the turn already carried. Renders nothing for an empty output.
-function ToolOutputBlock({ output }: { output: unknown }) {
-  const text = formatToolOutput(output);
+function ToolOutputBlock({ output, dedupeReply }: { output: unknown; dedupeReply?: string }) {
   const details = formatToolDetails(output);
+  // Suppress the human body when the chat reply already leads with it (the answer-first
+  // deterministic path), so the answer shows once; the audited raw-details expander still renders.
+  const text = dedupeReply && replyCoversToolOutput(dedupeReply, output) ? "" : formatToolOutput(output);
   if (!text && !details) return null;
   const preStyle: CSSProperties = {
     margin: "6px 0 0",
@@ -460,7 +462,7 @@ function ToolResult({ turn }: { turn: ReluxPrimeTurn }) {
           </span>
           <span className="mono muted">{turn.invoked_tool}</span>
         </div>
-        <ToolOutputBlock output={turn.tool_output} />
+        <ToolOutputBlock output={turn.tool_output} dedupeReply={turn.reply} />
       </div>
     );
   }

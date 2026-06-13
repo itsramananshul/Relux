@@ -9311,13 +9311,9 @@ impl KernelState {
                 {
                     return match self.invoke_tool(&ctx.agent, &plugin, &tool, input) {
                         Ok(result) => {
-                            let reply = if prose.is_empty() {
-                                text.trim().to_string()
-                            } else {
-                                prose.clone()
-                            };
+                            let reply = answer_first_reply(&prose, text, &result.output);
                             Ok(turn(
-                                reply.trim().to_string(),
+                                reply,
                                 PrimeDisposition::Executed,
                                 Some(label),
                                 Some(result.output),
@@ -9426,16 +9422,16 @@ impl KernelState {
                     input,
                 ) {
                     Ok(result) => {
-                        // The reply stays concise ("Running <tool>." / the status
-                        // prose); the real JSON rides in `tool_output`, so it is
-                        // never restated in prose.
-                        let reply = if prose.is_empty() {
-                            text.trim().to_string()
-                        } else {
-                            prose.clone()
-                        };
+                        // Answer-first: lead with the tool's NATURAL result when it carries a
+                        // human-readable answer (a shaped `{ result, … }` envelope or a plain
+                        // string), so a no-brain turn reads like an answer, not a canned
+                        // `Running <tool>.` line. Status prose still wins (it IS the answer),
+                        // and a tool with no human result keeps the honest status line. The full
+                        // structured detail rides in `tool_output`, deduplicated by the
+                        // dashboard so the answer shows once (RELUX_MASTER_PLAN §11.1).
+                        let reply = answer_first_reply(&prose, text, &result.output);
                         Ok(turn(
-                            reply.trim().to_string(),
+                            reply,
                             PrimeDisposition::Executed,
                             Some(label),
                             Some(result.output),
@@ -11004,6 +11000,60 @@ fn mcp_event_result_summary(output: &serde_json::Value) -> String {
     let text = output.get("result").and_then(|v| v.as_str()).unwrap_or("");
     let redacted = relux_core::redact_secrets(text);
     redacted.chars().take(MAX_MCP_EVENT_SUMMARY_CHARS).collect()
+}
+
+/// Max chars of a tool's natural answer surfaced as the deterministic single-invoke chat
+/// reply. Matched to the dashboard's `MAX_TOOL_OUTPUT_CHARS` (and clamped the same way — a
+/// trailing `…` marker) so the top line and the dashboard's (deduplicated) result block agree
+/// on the same body even for a large read.
+const MAX_NATURAL_REPLY_CHARS: usize = 4000;
+
+/// The natural human ANSWER a tool result carries, for the deterministic (no-brain)
+/// single-invoke chat reply — so Prime leads with what the tool actually returned, not the
+/// canned `Running <tool>.` status line. Mirrors `prime_agent_loop::render_output` /
+/// `formatToolOutput` (the dashboard): a shaped `{ result, structuredContent }` envelope (the
+/// Hermes `mcp_tool.py` shape that Plugin Lens + MCP tools return) surfaces its human `result`
+/// text; a plain string output is used as-is. Returns `None` when the output carries no
+/// human-readable answer (a bare structured object, or an empty/absent output) — the caller
+/// then keeps an honest status line, never a fabricated summary.
+///
+/// Fabricates nothing: it only reshapes what the tool already returned, and the same body is
+/// preserved verbatim in `tool_output` (the audited result block). With a brain configured the
+/// agent loop already folds the tool result into the final assistant text; this gives the
+/// deterministic path the same answer-first behavior (Hermes `agent/conversation_loop.py`
+/// folds the tool result into the final assistant content — `docs/reference-driven-development.md`).
+fn natural_tool_reply(output: &serde_json::Value) -> Option<String> {
+    let raw = match output {
+        serde_json::Value::String(s) => s.as_str(),
+        serde_json::Value::Object(map) => map.get("result").and_then(|v| v.as_str())?,
+        _ => return None,
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.chars().count() <= MAX_NATURAL_REPLY_CHARS {
+        return Some(trimmed.to_string());
+    }
+    let mut out: String = trimmed.chars().take(MAX_NATURAL_REPLY_CHARS - 1).collect();
+    out.push('…');
+    Some(out)
+}
+
+/// Choose the visible reply for an EXECUTED deterministic single-invoke turn, answer-first:
+///
+/// 1. `prose` (non-empty only for the status tool, where the prose IS the grounded answer);
+/// 2. else the tool's natural human answer ([`natural_tool_reply`]);
+/// 3. else the canned status line (`text`, e.g. `Running <tool>.`) — the honest fallback when
+///    the tool produced no human result (a bare structured object).
+///
+/// This is the single chokepoint both `Ready` execution arms use, so the answer-first rule and
+/// its honest fallback stay identical.
+fn answer_first_reply(prose: &str, text: &str, output: &serde_json::Value) -> String {
+    if !prose.trim().is_empty() {
+        return prose.trim().to_string();
+    }
+    natural_tool_reply(output).unwrap_or_else(|| text.trim().to_string())
 }
 
 /// Parse the numeric sequence from a `revent_NNNN` event id. The kernel mints
@@ -16732,6 +16782,14 @@ mod tests {
         let human = out["result"].as_str().expect("shaped result text");
         assert!(!human.trim_start().starts_with('{'), "chat bubble leaked raw JSON: {human}");
         assert!(human.contains("Acme"), "summary names the plugin: {human}");
+        // Answer-first (no brain): the TOP reply line IS the tool's natural answer, not the
+        // canned `Running …` status line — the result must lead the bubble (§11.1).
+        assert_eq!(turn.reply, human, "deterministic reply should be the natural answer");
+        assert!(
+            !turn.reply.starts_with("Running "),
+            "reply must not be the canned status line: {}",
+            turn.reply
+        );
         // A read-only source read is NOT new work: no task, no run.
         assert_eq!(k.task_count(), before, "a read-only source read creates no task");
         assert!(turn.created_task.is_none());
@@ -16746,7 +16804,57 @@ mod tests {
         );
         let out = turn.tool_output.unwrap();
         assert!(out["structuredContent"]["content"].as_str().unwrap().contains("Acme"));
-        assert!(out["result"].as_str().unwrap().starts_with("Read README.md"));
+        let human = out["result"].as_str().unwrap();
+        assert!(human.starts_with("Read README.md"));
+        // Answer-first again: the file read leads the bubble with its natural header + body
+        // (the reply is trimmed, so it matches the result modulo trailing whitespace).
+        assert_eq!(turn.reply, human.trim());
+        assert!(turn.reply.starts_with("Read README.md"));
+    }
+
+    #[test]
+    fn answer_first_reply_leads_with_the_natural_result() {
+        // A shaped `{ result, structuredContent }` envelope → the human `result` leads.
+        let shaped = serde_json::json!({
+            "result": "**Acme** v1.2.0 — Manifestless.\n7 files, 2 directories",
+            "structuredContent": { "plugin_id": "acme-repo" },
+        });
+        let reply = answer_first_reply("", "Running acme-repo/plugin.summary.", &shaped);
+        assert!(reply.starts_with("**Acme**"), "expected natural answer, got: {reply}");
+        assert!(!reply.starts_with("Running "));
+
+        // A plain string output is the answer as-is.
+        let reply = answer_first_reply("", "Running x/y.", &serde_json::json!("all good"));
+        assert_eq!(reply, "all good");
+    }
+
+    #[test]
+    fn answer_first_reply_keeps_honest_status_line_when_no_human_result() {
+        // A bare structured object (no `result` key) carries no human answer → the honest
+        // status line stays, never a fabricated summary.
+        let bare = serde_json::json!({ "ok": true, "count": 3 });
+        let reply = answer_first_reply("", "Running x/y.", &bare);
+        assert_eq!(reply, "Running x/y.");
+        // An empty `result` is treated as no answer too.
+        let empty = serde_json::json!({ "result": "   " });
+        assert_eq!(answer_first_reply("", "Running x/y.", &empty), "Running x/y.");
+    }
+
+    #[test]
+    fn answer_first_reply_prefers_status_prose() {
+        // Status prose IS the grounded answer — it wins over a tool's natural result so the
+        // status path is unchanged.
+        let shaped = serde_json::json!({ "result": "tool said hi" });
+        let reply = answer_first_reply("There are 2 active runs.", "Running s/t.", &shaped);
+        assert_eq!(reply, "There are 2 active runs.");
+    }
+
+    #[test]
+    fn natural_tool_reply_clamps_a_huge_answer() {
+        let big = "x".repeat(MAX_NATURAL_REPLY_CHARS + 500);
+        let out = natural_tool_reply(&serde_json::json!({ "result": big })).unwrap();
+        assert_eq!(out.chars().count(), MAX_NATURAL_REPLY_CHARS);
+        assert!(out.ends_with('…'));
     }
 
     /// Install a manifest as a bundled, enabled plugin (test convenience).
