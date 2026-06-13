@@ -2021,6 +2021,28 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.43** (2026-06-13) — **Manifestless ZIP / local-folder repo-root inference** rollup. The
+  `relux-kernel` / `relux-core` crates move `0.1.42` → `0.1.43` in lockstep, packaging the
+  post-v0.1.42 slice into a fresh Windows bundle on top of all v0.1.42 (and v0.1.41) work
+  (RELUX_MASTER_PLAN §11.1; built reference-first per `docs/reference-driven-development.md`).
+  Headline: **manifestless ZIP / local-folder imports now infer a single nested GitHub-style repo
+  root, so the archive wrapper folder no longer leaks into the generated plugin.**
+  - **Generated identity comes from the repo root, not the archive wrapper.** When an extracted ZIP
+    / local folder has no manifest and contains exactly one nested directory that looks like a
+    GitHub-style repo root (e.g. `repo-main/`), the generated plugin id / name / README excerpt /
+    detected hints are derived from that inner repo root rather than the outer wrapper folder.
+  - **Plugin Lens reads the repo files directly.** Source summarize / inspect / search / read-file
+    resolve against the inferred repo root, so paths are the repo's own files (e.g. `README.md`,
+    not `repo-main/README.md`).
+  - **Ambiguous archives keep the root.** An archive with multiple top-level entries, or files at
+    the root, keeps the extracted root unchanged; the inference fires only for the unambiguous
+    single-nested-folder case. No arbitrary code is executed and path confinement is unchanged.
+  - Includes everything from v0.1.42 (redaction parity for visible tool/plugin replies and
+    raw-details) and v0.1.41 (Plugin/tool results render as natural assistant answers, not raw
+    JSON). Dashboard typecheck / tests / build green; the full-e2e release gate
+    (`scripts\relux-package-local.ps1 -FullE2E`) is run at package time. All reads/writes hit real
+    kernel state; no new authority is added (read-only source access, fail-closed). Every safety
+    property from v0.1.42 holds.
 - **v0.1.42** (2026-06-13) — **Redaction parity for visible tool/plugin replies** rollup. The
   `relux-kernel` / `relux-core` crates move `0.1.41` → `0.1.42` in lockstep, packaging the
   post-v0.1.41 slice into a fresh Windows bundle on top of all v0.1.41 (and v0.1.40) work

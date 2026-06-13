@@ -9,6 +9,33 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.43 (Windows bundle).** The `relux-kernel` and
+  `relux-core` crates move `0.1.42` → `0.1.43` in lockstep, packaging the
+  post-v0.1.42 **manifestless ZIP root inference** slice into a fresh Windows
+  bundle on top of everything in v0.1.42 (and v0.1.41). Everything reads-from /
+  writes-through real kernel state and conforms to `docs/RELUX_MASTER_PLAN.md`
+  §11.1; no master-plan safety property is weakened. Headline — **manifestless
+  ZIP / local-folder imports now infer a single nested GitHub-style repo root**,
+  so a `repo-main/` wrapper folder no longer leaks into the generated plugin:
+  - **Generated identity comes from the repo root, not the archive wrapper.**
+    When an extracted ZIP / local folder has no manifest and contains exactly one
+    nested directory that looks like a GitHub-style repo root, the generated
+    plugin id / name / README excerpt / detected hints are derived from that inner
+    repo root rather than the outer archive wrapper folder.
+  - **Plugin Lens reads the repo files directly.** Source summarize / inspect /
+    search / read-file resolve against the inferred repo root, so paths are the
+    repo's own files (e.g. `README.md`, not `repo-main/README.md`).
+  - **Ambiguous archives keep the root.** An archive with multiple top-level
+    entries, or files sitting directly at the root, keeps the extracted root
+    unchanged — the inference only fires for the unambiguous single-nested-folder
+    case. No arbitrary code is executed and path confinement is unchanged.
+  - Includes everything from v0.1.42 (**redaction parity for visible tool/plugin
+    replies and raw-details**) and v0.1.41 (**Prime plugin/tool results render as
+    natural assistant answers, not raw JSON**).
+  - Dashboard typecheck / tests / build green; the full-e2e release gate
+    (`scripts\relux-package-local.ps1 -FullE2E`) is run at package time. Every
+    safety property from v0.1.42 holds; no new authority is added (read-only
+    source access only, fail-closed).
 - **Relux local release v0.1.42 (Windows bundle).** The `relux-kernel` and
   `relux-core` crates move `0.1.41` → `0.1.42` in lockstep, packaging the
   post-v0.1.41 **redaction-parity** slice into a fresh Windows bundle on top of
