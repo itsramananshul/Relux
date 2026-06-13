@@ -148,7 +148,7 @@ test("Claude CLI detected on PATH but disabled is an actionable link to Crew", (
     adapter(CLAUDE_ADAPTER_ID, { available_on_path: true, state: "disabled" }),
   ]);
   assert.equal(item.status, "link");
-  assert.equal(item.linkTo, "/crew");
+  assert.equal(item.linkTo, "/crew#adapters");
   assert.match(item.description, /not enabled/i);
   assert.match(item.cta ?? "", /Enable on Crew/i);
 });
@@ -247,7 +247,8 @@ test("OpenRouter selected without a key is the only thing that blocks setup", ()
   assert.equal(r.ready, false);
   assert.equal(r.blockers.length, 1);
   assert.equal(r.blockers[0].id, "prime-brain");
-  assert.equal(r.blockers[0].linkTo, "/health");
+  // Canonical brain-setup deep-link is Crew → Prime Brain (§8.1), not /health.
+  assert.equal(r.blockers[0].linkTo, "/crew#prime-brain");
 });
 
 test("first action prioritises a pending decision, then work in flight", () => {
@@ -454,7 +455,7 @@ test("first action fixes a broken brain before anything else", () => {
     ai({ brain: "openrouter", configured: false }),
     [],
   );
-  assert.equal(fa.linkTo, "/health");
+  assert.equal(fa.linkTo, "/crew#prime-brain");
   assert.match(fa.label, /brain/i);
 });
 

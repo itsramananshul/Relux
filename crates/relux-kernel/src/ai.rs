@@ -283,8 +283,8 @@ impl AiConfig {
         // operator picked it. Falls through to the selection reason for every other case.
         let reason = if auto_detected {
             match brain {
-                PrimeBrain::ClaudeCli => "Claude CLI brain auto-detected — its adapter is enabled and the `claude` binary is on PATH, so Prime answers through it. Pick a brain explicitly on Crew → Adapters to override. Actions stay deterministic and kernel-grounded.".to_string(),
-                PrimeBrain::CodexCli => "Codex CLI brain auto-detected — its adapter is enabled and the `codex` binary is on PATH, so Prime answers through it. Pick a brain explicitly on Crew → Adapters to override. Actions stay deterministic and kernel-grounded.".to_string(),
+                PrimeBrain::ClaudeCli => "Claude CLI brain auto-detected — its adapter is enabled and the `claude` binary is on PATH, so Prime answers through it. Pick a brain explicitly on Crew → Prime Brain to override. Actions stay deterministic and kernel-grounded.".to_string(),
+                PrimeBrain::CodexCli => "Codex CLI brain auto-detected — its adapter is enabled and the `codex` binary is on PATH, so Prime answers through it. Pick a brain explicitly on Crew → Prime Brain to override. Actions stay deterministic and kernel-grounded.".to_string(),
                 _ => reason,
             }
         } else {

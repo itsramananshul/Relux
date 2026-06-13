@@ -9,9 +9,10 @@ import {
 
 // The first-run "connect Prime to a brain" step is the heart of Relux onboarding:
 // given the live AI status + adapter list, it must report an HONEST readiness and,
-// when not ready, the EXACT next step — always routed to /health (Prime Brain),
-// never the legacy Crew path. These assertions pin that behavior so a regression
-// (a misrouted link, a "done" shown for an unusable brain) fails loudly.
+// when not ready, the EXACT next step — always deep-linked to the canonical
+// Crew → Prime Brain anchor (/crew#prime-brain; RELUX_MASTER_PLAN §8.1), never the
+// stale "Health → AI settings" path. These assertions pin that behavior so a
+// regression (a misrouted link, a "done" shown for an unusable brain) fails loudly.
 
 // Minimal builders shaped like the real API types (the test is not type-checked;
 // it exercises runtime behavior only).
@@ -47,7 +48,7 @@ function adapter(id, over = {}) {
   };
 }
 
-test("every brain step routes to /health (Prime Brain), never /crew", () => {
+test("every brain step deep-links to /crew#prime-brain (canonical), never /health", () => {
   const cases = [
     primeBrainStep(null, null),
     primeBrainStep(aiStatus(), null),
@@ -55,8 +56,26 @@ test("every brain step routes to /health (Prime Brain), never /crew", () => {
     primeBrainStep(aiStatus({ brain: "openrouter" }), null),
   ];
   for (const step of cases) {
-    assert.equal(step.linkTo, "/health", `${step.label} must link to /health`);
+    assert.equal(
+      step.linkTo,
+      "/crew#prime-brain",
+      `${step.label} must deep-link to Crew → Prime Brain`,
+    );
     assert.equal(step.id, "prime-brain");
+  }
+});
+
+test("no brain step copy points at the stale Health → AI settings surface", () => {
+  const cases = [
+    primeBrainStep(null, null),
+    primeBrainStep(aiStatus({ brain: "local" }), []),
+    primeBrainStep(aiStatus({ brain: "claude_cli" }), []),
+    primeBrainStep(aiStatus({ brain: "openrouter", configured: false }), null),
+    primeBrainStep(aiStatus({ brain: "openrouter", configured: true, disabled: true }), null),
+  ];
+  for (const step of cases) {
+    assert.doesNotMatch(step.description, /Health →|AI settings/i, step.label);
+    assert.match(step.description, /Crew → Prime Brain/i, step.label);
   }
 });
 

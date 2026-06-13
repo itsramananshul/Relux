@@ -142,8 +142,12 @@ argument.
 > the deterministic classifier / Local brain is the fallback rail). Adapter probe contract:
 > `docs/relix-agent-adapters.md` §2 ("Probe/test environment — is the agent installed?").
 
-Everything above assumes Prime has a **real** brain. The setup surface for that lives on
-**Health → Prime Brain / AI Runtime** (the `PrimeBrainPanel`), and is product-grade by design:
+Everything above assumes Prime has a **real** brain. The **canonical** setup surface for that
+is **Crew → Prime Brain** (the shared `PrimeBrainPanel`; RELUX_MASTER_PLAN §8.1 "Crew → Prime
+Brain"). The same panel is **also** mounted on the **Health** page as a secondary diagnostics
+duplicate — Health is the read-only doctor/health hub, so it mirrors the panel for convenience,
+but all product guidance (first-run readiness, the doctor's remediation links, the local-prime
+refusal) deep-links to the canonical Crew → Prime Brain anchor. The panel is product-grade by design:
 
 - **Recommended vs fallback is explicit.** Claude CLI, Codex CLI, and OpenRouter are tagged
   *recommended* (a real conversational Prime). **Local** is tagged *fallback / test* — grounded,

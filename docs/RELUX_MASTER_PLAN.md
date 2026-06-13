@@ -510,6 +510,19 @@ Adapters answer:
 - How does it resume?
 - How does it fail?
 
+**Canonical setup surface — Crew → Prime Brain.** The single canonical place an operator
+configures Prime's brain (who answers chat) and its work adapters (Claude/Codex CLI) is the
+shared `PrimeBrainPanel` mounted under **Crew → Prime Brain**, with adapter enable/disable on
+**Crew → Adapters** (anchors `#prime-brain` / `#adapters`). All product guidance routes here:
+the first-run readiness guide (`onboarding.ts`/`readiness.ts`), the kernel doctor's remediation
+links (`doctor.rs`), and the local-prime external-work refusal (`KernelError::
+LocalAdapterUnsupported`) all deep-link to `/crew#prime-brain` or `/crew#adapters` (never the
+stale "Health → AI settings"). The **Health** page still mounts the same `PrimeBrainPanel` as a
+**secondary diagnostics duplicate** — Health is the read-only doctor/health hub, so it mirrors
+the panel for convenience while the doctor report it renders points at the canonical Crew anchor.
+The local-prime refusal additionally names the **plugin-install alternative** (Plugins → +
+Install → GitHub URL) when the requested work is "import a repository as a plugin".
+
 ### 8.2 ToolSet Plugins
 
 ToolSet plugins expose tools.

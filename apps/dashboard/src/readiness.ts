@@ -167,7 +167,9 @@ export function adapterWorkItem(
   adapters: ReluxAdapterStatus[] | null,
   failed = false,
 ): ReadinessItem {
-  const base = { id: "run-real-work", linkTo: "/crew" } as const;
+  // Deep-link to the Crew → Adapters anchor — the canonical place to enable the
+  // real-work CLI adapter the descriptions name (RELUX_MASTER_PLAN §8.1).
+  const base = { id: "run-real-work", linkTo: "/crew#adapters" } as const;
 
   // The adapter list read failed — say so rather than claiming "no CLI detected,
   // install one" (which would be a guess we cannot stand behind).
@@ -499,8 +501,10 @@ export function deriveFirstAction(
   continuation: ReluxPrimeContinuation | null | undefined = null,
 ): FirstAction {
   // A selected-but-unusable brain blocks everything Prime does — fix it first.
+  // Canonical setup surface is Crew → Prime Brain (RELUX_MASTER_PLAN §8.1), the
+  // same anchor the brain readiness item links to (via primeBrainStep).
   if (brainIsBlocked(ai, adapters)) {
-    return { label: "Set up Prime's brain", linkTo: "/health" };
+    return { label: "Set up Prime's brain", linkTo: "/crew#prime-brain" };
   }
   if (!state) return { label: "Talk to Prime", linkTo: "/prime" };
   if (state.pending_approvals > 0) {

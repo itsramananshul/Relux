@@ -151,14 +151,18 @@ fn brain_check(ai: &AiStatus, adapters: &[AdapterRuntimeStatus]) -> DoctorCheck 
     const ID: &str = "prime.brain";
     const LABEL: &str = "Prime brain";
 
+    // The canonical brain-setup surface is Crew → Prime Brain (the shared
+    // PrimeBrainPanel; RELUX_MASTER_PLAN §8.1 "Crew → Prime Brain"). The same panel
+    // is mirrored on the Health page as a secondary diagnostics duplicate, but
+    // guidance always deep-links to the canonical Crew anchor so the two never drift.
     if ai.disabled {
         return check(
             ID,
             LABEL,
             DoctorSeverity::Warn,
             "Prime's AI brain is disabled; replies use the built-in deterministic operator.",
-            Some("Re-enable a brain in Health → AI settings."),
-            Some("/health"),
+            Some("Re-enable a brain on Crew → Prime Brain."),
+            Some("/crew#prime-brain"),
         );
     }
 
@@ -167,9 +171,9 @@ fn brain_check(ai: &AiStatus, adapters: &[AdapterRuntimeStatus]) -> DoctorCheck 
             ID,
             LABEL,
             DoctorSeverity::Info,
-            "Prime is using the built-in local deterministic brain. Optional: connect OpenRouter, the Claude CLI, or the Codex CLI for richer replies.",
+            "Prime is using the built-in local deterministic brain. Optional: connect OpenRouter, the Claude CLI, or the Codex CLI for richer replies on Crew → Prime Brain.",
             None,
-            Some("/health"),
+            Some("/crew#prime-brain"),
         ),
         "openrouter" => {
             if ai.configured {
@@ -178,15 +182,15 @@ fn brain_check(ai: &AiStatus, adapters: &[AdapterRuntimeStatus]) -> DoctorCheck 
                 } else {
                     format!("OpenRouter brain is configured (model {}).", ai.model)
                 };
-                check(ID, LABEL, DoctorSeverity::Ok, msg, None, Some("/health"))
+                check(ID, LABEL, DoctorSeverity::Ok, msg, None, Some("/crew#prime-brain"))
             } else {
                 check(
                     ID,
                     LABEL,
                     DoctorSeverity::Fail,
                     "OpenRouter brain is selected but no API key is configured.",
-                    Some("Add the OpenRouter key in Health → AI settings, or switch to the local brain."),
-                    Some("/health"),
+                    Some("Add the OpenRouter key on Crew → Prime Brain, or switch to the local brain."),
+                    Some("/crew#prime-brain"),
                 )
             }
         }
@@ -198,7 +202,7 @@ fn brain_check(ai: &AiStatus, adapters: &[AdapterRuntimeStatus]) -> DoctorCheck 
             DoctorSeverity::Info,
             format!("Prime brain '{other}' is selected."),
             None,
-            Some("/health"),
+            Some("/crew#prime-brain"),
         ),
     }
 }
@@ -218,7 +222,7 @@ fn cli_brain_check(
                 DoctorSeverity::Ok,
                 format!("{name} brain is ready (adapter enabled and on PATH)."),
                 None,
-                Some("/crew"),
+                Some("/crew#adapters"),
             )
         }
         Some(AdapterRuntimeState::MissingBinary) => check(
@@ -227,7 +231,7 @@ fn cli_brain_check(
             DoctorSeverity::Fail,
             format!("{name} brain is selected but its CLI is not on PATH."),
             Some("Install and sign in to the CLI so it is on PATH, then enable its adapter on Crew → Adapters, or switch to the local brain."),
-            Some("/crew"),
+            Some("/crew#adapters"),
         ),
         Some(AdapterRuntimeState::Disabled) => check(
             id,
@@ -235,7 +239,7 @@ fn cli_brain_check(
             DoctorSeverity::Fail,
             format!("{name} brain is selected but its adapter runtime is disabled."),
             Some("Enable the adapter on Crew → Adapters, or switch to the local brain."),
-            Some("/crew"),
+            Some("/crew#adapters"),
         ),
         Some(AdapterRuntimeState::NeedsConfiguration) | None => check(
             id,
@@ -243,7 +247,7 @@ fn cli_brain_check(
             DoctorSeverity::Fail,
             format!("{name} brain is selected but its adapter is not enabled."),
             Some("Enable the adapter on Crew → Adapters, or switch to the local brain."),
-            Some("/crew"),
+            Some("/crew#adapters"),
         ),
     }
 }
@@ -277,7 +281,7 @@ fn real_work_check(adapters: &[AdapterRuntimeStatus]) -> DoctorCheck {
                 name_of(a)
             ),
             None,
-            Some("/crew"),
+            Some("/crew#adapters"),
         );
     }
 
@@ -291,7 +295,7 @@ fn real_work_check(adapters: &[AdapterRuntimeStatus]) -> DoctorCheck {
                 name_of(a)
             ),
             Some("Enable it on Crew → Adapters to execute real work (it runs in a safe, non-bypass mode)."),
-            Some("/crew"),
+            Some("/crew#adapters"),
         );
     }
 
@@ -301,7 +305,7 @@ fn real_work_check(adapters: &[AdapterRuntimeStatus]) -> DoctorCheck {
         DoctorSeverity::Info,
         "No real-work CLI adapter enabled (optional). Prime creates and tracks work without one.",
         Some("Install and sign in to the Claude CLI or Codex CLI, then enable its adapter on Crew → Adapters to execute tasks."),
-        Some("/crew"),
+        Some("/crew#adapters"),
     )
 }
 
@@ -653,7 +657,14 @@ mod tests {
         let brain = find(&report, "prime.brain");
         assert_eq!(brain.severity, DoctorSeverity::Fail);
         assert!(brain.remediation.is_some());
-        assert_eq!(brain.action_link.as_deref(), Some("/health"));
+        // Canonical brain-setup deep-link: Crew → Prime Brain, never the stale
+        // "Health → AI settings" (RELUX_MASTER_PLAN §8.1 "Crew → Prime Brain").
+        assert_eq!(brain.action_link.as_deref(), Some("/crew#prime-brain"));
+        assert!(brain
+            .remediation
+            .as_deref()
+            .unwrap()
+            .contains("Crew → Prime Brain"));
         assert_eq!(report.overall, DoctorSeverity::Fail);
     }
 
@@ -698,7 +709,8 @@ mod tests {
         let report2 = build_doctor_report(&inp2, 0);
         let brain = find(&report2, "prime.brain");
         assert_eq!(brain.severity, DoctorSeverity::Fail);
-        assert_eq!(brain.action_link.as_deref(), Some("/crew"));
+        // A CLI brain whose adapter needs work deep-links to Crew → Adapters.
+        assert_eq!(brain.action_link.as_deref(), Some("/crew#adapters"));
     }
 
     #[test]

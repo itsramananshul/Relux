@@ -1,5 +1,5 @@
-import { useState, useMemo } from "react";
-import { Link } from "react-router-dom";
+import { useState, useMemo, useEffect } from "react";
+import { Link, useLocation } from "react-router-dom";
 import {
   reluxWork,
   reluxAdapters,
@@ -113,6 +113,18 @@ export function Crew() {
     reloadAgents(); // refresh the roster so the edit/new member shows
     reloadTasks(); // and the per-agent task counts
   };
+
+  // Honour a deep-link anchor (Crew → Prime Brain / Crew → Adapters). The
+  // readiness guide, the doctor, and the local-prime refusal all route here with
+  // `#prime-brain` / `#adapters`, so cross-page navigation lands ON the relevant
+  // panel rather than the top of the page. Both sections render synchronously
+  // (they own their own async data), so the target element exists on mount.
+  const location = useLocation();
+  useEffect(() => {
+    if (!location.hash) return;
+    const el = document.getElementById(location.hash.slice(1));
+    if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, [location.hash]);
 
   return (
     <div className="crew-page">
@@ -1760,7 +1772,7 @@ function AdaptersSection() {
   );
 
   return (
-    <div className="section">
+    <div className="section" id="adapters">
       <h2>Adapters</h2>
       <p className="muted" style={{ fontSize: 13, marginTop: -8 }}>
         Adapters decide how an assigned task runs. The real product path is a
