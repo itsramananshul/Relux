@@ -9,6 +9,42 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.34 (Windows bundle).** The `relux-kernel` and
+  `relux-core` crates move `0.1.33` → `0.1.34` in lockstep, packaging the
+  post-v0.1.33 **conversational agent creation** fixes into a fresh Windows
+  bundle. Everything reads-from / writes-through real kernel state and conforms to
+  `docs/RELUX_MASTER_PLAN.md` §6 / §7.1 / §7.3 / §7.5 / §8.1 and
+  `docs/prime-tool-use.md`; no master-plan safety property is weakened. Headlines:
+  - **Conversational agent creation — hire an operative from Prime chat, honestly.**
+    Prime's chat now classifies natural hire phrasing (`make a coding agent for
+    this repo`, `<verb> a <role> agent`) as an `AgentCreation` turn via
+    `creates_an_operative()`, fail-closed so a task that merely *references* an
+    agent stays a `TaskCreation`. The new pure `prime_agent_create` module resolves
+    an adapter/brain preference (`uses Claude` / `run codex on`) **only when that
+    adapter plugin is installed** — checked against the new
+    `StateSummary.available_adapter_ids` — and otherwise falls back honestly to
+    `local-prime`; it never invents or enables an adapter (ref: openclaw
+    `common.ts::normalizeToolModelOverride`).
+  - **Requested-capability honesty + approval-gated grant follow-ups.**
+    `requested_capabilities()` detects asks like "can read GitHub" / terminal
+    access; the operative is created with **no** permissions, the reply says setup
+    is needed, and `attach_suggestions` offers a one-click `send:false`
+    "Grant X access to <agent>" that routes through the **unchanged**
+    approval-gated `PermissionChange` path (now roster-aware via `resolve_assignee`
+    so the follow-up lands on the real agent id). No auto-grant, no new authority,
+    no danger flags. A deterministic duplicate-name guard returns an honest reply
+    rather than a kernel `AgentExists` error.
+  - **Dashboard surfaces the conversational hire (UI only, no kernel change).**
+    Prime chat renders an `AgentCreatedCard` (built from the pure
+    `agentCreatedView`) on a real agent-creation turn — the operative's name/id, the
+    adapter it runs on (human brand + raw id, brain-validated slot preferred),
+    brain-shaped role/persona, a "View in Crew" link, and a "Give it work"
+    assignment pre-fill; a requested sensitive capability shows as NEEDING SETUP
+    with a "Grant X access to <agent>" button that pre-fills the existing
+    approval-gated follow-up (nothing is granted until approved). Casual ideation /
+    a duplicate refusal carry no `created_agent` and stay normal chat. Crew exports
+    a `CrewMemberCard` that renders the adapter brand beside its id with honest
+    placeholders for missing fields. Rebuilt `dashboard-dist` committed.
 - **Relux local release v0.1.33 (Windows bundle).** The `relux-kernel` and
   `relux-core` crates move `0.1.32` → `0.1.33` in lockstep, packaging the
   post-v0.1.32 **brain-aware run routing + plugin activation honesty** fixes into

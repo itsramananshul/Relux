@@ -1941,6 +1941,37 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.34** (2026-06-13) — **Conversational agent creation** rollup. The `relux-kernel` /
+  `relux-core` crates move `0.1.33` → `0.1.34` in lockstep, packaging the post-v0.1.33 fixes into a
+  fresh Windows bundle (`docs/prime-tool-use.md`; RELUX_MASTER_PLAN §6 / §7.1 / §7.3 / §7.5 / §8.1;
+  built reference-first per `docs/reference-driven-development.md`). Headlines: (1) **Hire an
+  operative from Prime chat, honestly** — Prime's chat now classifies natural hire phrasing
+  (`make a coding agent for this repo`, `<verb> a <role> agent`) as an `AgentCreation` turn via
+  `creates_an_operative()`, fail-closed so a task that merely references an agent stays a
+  `TaskCreation`. The new pure `prime_agent_create` module resolves an adapter/brain preference
+  (`uses Claude` / `run codex on`) only when that adapter plugin is installed — checked against the
+  new `StateSummary.available_adapter_ids` — and otherwise falls back honestly to `local-prime`;
+  it never invents or enables an adapter (ref: openclaw `common.ts::normalizeToolModelOverride`)
+  (§6 / §8.1). (2) **Requested-capability honesty + approval-gated grant follow-ups** —
+  `requested_capabilities()` detects asks like "can read GitHub" / terminal access; the operative is
+  created with no permissions, the reply says setup is needed, and `attach_suggestions` offers a
+  one-click `send:false` "Grant X access to <agent>" that routes through the unchanged
+  approval-gated `PermissionChange` path (now roster-aware via `resolve_assignee` so the follow-up
+  lands on the real agent id). A deterministic duplicate-name guard returns an honest reply rather
+  than a kernel `AgentExists` error; no auto-grant, no new authority, no danger flags (§7.1 / §7.3).
+  (3) **Dashboard surfaces the conversational hire (UI only, no kernel change)** — Prime chat renders
+  an `AgentCreatedCard` (built from the pure `agentCreatedView`) showing the operative's name/id, the
+  adapter it runs on (human brand + raw id, brain-validated slot preferred), brain-shaped
+  role/persona, a "View in Crew" link, and a "Give it work" pre-fill; a requested sensitive
+  capability shows as NEEDING SETUP with a "Grant X access to <agent>" button that pre-fills the
+  existing approval-gated follow-up (nothing granted until approved). Crew exports a `CrewMemberCard`
+  with honest placeholders for missing fields; rebuilt `dashboard-dist` committed (§7.3 / §7.5). All
+  reads/writes hit real kernel state; no new authority is added, nothing auto-runs without an explicit
+  gate. Per-slice `cargo test` + `clippy --all-targets -D warnings` clean on `relux-core` /
+  `relux-kernel`; dashboard typecheck / tests (687) / build green. The full-e2e release gate
+  (`scripts\relux-package-local.ps1 -FullE2E`) is run at package time. Every safety property from
+  v0.1.33 holds.
+
 - **v0.1.33** (2026-06-13) — **Brain-aware run routing + plugin activation honesty** rollup. The
   `relux-kernel` / `relux-core` crates move `0.1.32` → `0.1.33` in lockstep, packaging the
   post-v0.1.32 fixes into a fresh Windows bundle (`docs/prime-tool-use.md`, `docs/mcp.md`;
