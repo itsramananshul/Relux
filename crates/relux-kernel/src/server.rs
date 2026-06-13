@@ -12961,6 +12961,189 @@ mod tests {
         assert!(list.contains(v["tool_name"].as_str().unwrap()), "registered server missing: {list}");
     }
 
+    /// True when a real `node` is on PATH (argv-only `node --version`, no shell). The
+    /// install→configure→catalog→gate wiring below is asserted unconditionally; only the
+    /// final REAL governed run asserts captured stdout, and it does so only when node is
+    /// present (the realistic case for this repo's node-based toolchain). When node is
+    /// absent the same governed invocation is still driven and asserted to clear the
+    /// approval gate — proving the path, never faking a result.
+    fn node_on_path() -> bool {
+        std::process::Command::new("node")
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Write a realistic, non-echo SOURCE plugin with NO `relux-plugin.json` — a tiny npm
+    /// CLI that declares a `bin` and ships the script it points at — and install it through
+    /// the real install-dir route (manifestless ⇒ scaffolded wrapper, copied into the
+    /// plugins root so the candidate scan can read it). Returns (source-dir guard, id). The
+    /// declared `bin` (no MCP signal) detects as a `command_tool` candidate whose argv runs
+    /// `node ./cli.js`, which prints a deterministic marker — the realistic install→use path.
+    async fn install_npm_cli_fixture(state: &AppState) -> (tempfile::TempDir, String) {
+        let src = tempfile::tempdir().expect("src tempdir");
+        std::fs::write(
+            src.path().join("package.json"),
+            r#"{"name":"greeter","version":"1.0.0","bin":{"greeter":"./cli.js"},"description":"A tiny CLI that greets."}"#,
+        )
+        .expect("write package.json");
+        std::fs::write(
+            src.path().join("cli.js"),
+            "process.stdout.write('RELUX_FIXTURE_GREETER_OK\\n');\n",
+        )
+        .expect("write cli.js");
+        std::fs::write(src.path().join("README.md"), "# greeter\nA tiny CLI fixture.\n")
+            .expect("write readme");
+        let req = serde_json::json!({ "path": src.path().to_string_lossy() }).to_string();
+        let (status, _c, resp) =
+            call(state, "POST", "/v1/relux/plugins/install-dir", None, Some(&req)).await;
+        assert_eq!(status, StatusCode::OK, "install failed: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("install json");
+        // A source with no relux-plugin.json lands as an honest metadata-only wrapper.
+        assert_eq!(v["generated"], true, "manifestless source must scaffold a wrapper: {resp}");
+        let id = v["id"].as_str().expect("installed id").to_string();
+        (src, id)
+    }
+
+    #[tokio::test]
+    async fn install_configure_then_prime_can_use_the_governed_command_tool() {
+        // The product promise end-to-end (docs/prime-tool-use.md): a plugin is installed
+        // with NO relux-plugin.json, Relux detects a runnable candidate, Prime's backend
+        // action configures it, the new tool shows up in the SAME catalog Prime sees, and
+        // it is invocable only through the governed gate — refused without a grant, run
+        // (for real, argv-only) and audited with one. Every step is a real product route,
+        // the same sequence the dashboard/Prime drive; no private helper shortcut.
+        let (state, _dir) = auth_state(true);
+        let (_src, id) = install_npm_cli_fixture(&state).await;
+
+        // 1) The honest install result carries detected candidates with honest next steps.
+        //    The declared npm bin is a `command_tool` candidate (no MCP signal here).
+        let (hs, _c, hints) = call(
+            &state,
+            "GET",
+            &format!("/v1/relux/plugins/{id}/hints"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(hs, StatusCode::OK, "hints: {hints}");
+        let hv: serde_json::Value = serde_json::from_str(&hints).unwrap();
+        let cands = hv["candidates"].as_array().expect("candidates array");
+        let cmd_cand = cands
+            .iter()
+            .find(|c| c["activation"] == "command_tool")
+            .unwrap_or_else(|| panic!("expected a command_tool candidate: {hints}"));
+        assert_eq!(cmd_cand["id"], "cli-bin-greeter", "hints: {hints}");
+        assert!(
+            !cmd_cand["next_steps"].as_array().unwrap().is_empty(),
+            "a candidate must carry honest next steps: {hints}"
+        );
+
+        // 2) Configure the candidate through the GOVERNED Prime backend action (not a
+        //    private helper). The selector is advisory; the backend re-reads + re-resolves.
+        let req = serde_json::json!({ "plugin_id": id, "candidate_id": "command" }).to_string();
+        let (cs, _c, conf) = call(
+            &state,
+            "POST",
+            "/v1/relux/prime/actions/configure-candidate",
+            None,
+            Some(&req),
+        )
+        .await;
+        assert_eq!(cs, StatusCode::OK, "configure: {conf}");
+        let cv: serde_json::Value = serde_json::from_str(&conf).unwrap();
+        assert_eq!(cv["activation"], "command_tool", "configure: {conf}");
+        assert_eq!(cv["tool_name"], "greeter.run", "configure: {conf}");
+        assert_eq!(cv["no_code_executed"], true, "activation never runs code: {conf}");
+        // Honest: the tool is gated until invoked — never a fake "ready".
+        assert!(cv["next_step"].as_str().unwrap().contains("ask me to use"), "configure: {conf}");
+
+        let permission = format!("tool:{id}:run");
+
+        // 3) Prime must HOLD the tool's permission before it can be invoked or granted.
+        let perm_req = serde_json::json!({ "permission": permission }).to_string();
+        let (ps, _c, pbody) = call(
+            &state,
+            "POST",
+            "/v1/relux/agents/prime/permissions",
+            None,
+            Some(&perm_req),
+        )
+        .await;
+        assert_eq!(ps, StatusCode::OK, "grant permission: {pbody}");
+
+        // 4) The new tool now appears in the EXACT runnable catalog Prime is handed — gated
+        //    (needs approval), sourced from the plugin. This is what makes Prime able to
+        //    recognise and choose it from chat.
+        let (ts, _c, tools) = call(&state, "GET", "/v1/relux/prime/tools", None, None).await;
+        assert_eq!(ts, StatusCode::OK, "prime tools: {tools}");
+        let tv: Vec<serde_json::Value> = serde_json::from_str(&tools).unwrap();
+        let tool = tv
+            .iter()
+            .find(|t| t["tool_name"] == "greeter.run")
+            .unwrap_or_else(|| panic!("greeter.run missing from Prime's catalog: {tools}"));
+        assert_eq!(tool["source"], "plugin", "prime tools: {tools}");
+        assert_eq!(tool["gated"], true, "a configured command tool is gated: {tools}");
+
+        // 5) The gate is real: invoking WITHOUT a standing grant is refused (409), nothing
+        //    runs. (Permission is already held, so this isolates the approval gate.)
+        let inv = serde_json::json!({ "plugin_id": id, "tool_name": "greeter.run" }).to_string();
+        let (gs, _c, gbody) = call(&state, "POST", "/v1/relux/tools/invoke", None, Some(&inv)).await;
+        assert_eq!(
+            gs,
+            StatusCode::CONFLICT,
+            "a gated tool must refuse a direct invoke until granted: {gbody}"
+        );
+
+        // 6) Authorise it with a persistent allow-always grant (the Governance affordance).
+        let grant_req = serde_json::json!({ "plugin_id": id, "tool_name": "greeter.run" }).to_string();
+        let (grs, _c, grbody) =
+            call(&state, "POST", "/v1/relux/grants", None, Some(&grant_req)).await;
+        assert_eq!(grs, StatusCode::OK, "create grant: {grbody}");
+
+        // 7) Invoke through the governed path again. With node present this is a REAL
+        //    argv-only run whose captured stdout carries the fixture marker; either way the
+        //    call now clears the approval gate (no longer 409).
+        let (is, _c, ibody) = call(&state, "POST", "/v1/relux/tools/invoke", None, Some(&inv)).await;
+        assert_ne!(
+            is,
+            StatusCode::CONFLICT,
+            "with a standing grant the gate must let the call through: {ibody}"
+        );
+        if node_on_path() {
+            assert_eq!(is, StatusCode::OK, "the granted governed run should succeed: {ibody}");
+            let iv: serde_json::Value = serde_json::from_str(&ibody).unwrap();
+            assert_eq!(iv["output"]["success"], true, "invoke output: {ibody}");
+            assert_eq!(iv["output"]["timed_out"], false, "invoke output: {ibody}");
+            assert!(
+                iv["output"]["stdout"].as_str().unwrap().contains("RELUX_FIXTURE_GREETER_OK"),
+                "Prime must see the real captured tool output: {ibody}"
+            );
+
+            // 8) The successful invocation is recorded in the audit log against Prime + the
+            //    tool's permission — the durable proof Prime can summarise/see the result.
+            let (aus, _c, audit) = call(&state, "GET", "/v1/relux/audit", None, None).await;
+            assert_eq!(aus, StatusCode::OK, "audit: {audit}");
+            let av: Vec<serde_json::Value> = serde_json::from_str(&audit).unwrap();
+            let permission = format!("tool:{id}:run");
+            assert!(
+                av.iter().any(|e| e["action"] == permission
+                    && e["result"] == "success"
+                    && e["actor_id"] == "prime"),
+                "a successful governed tool run must be audited: {audit}"
+            );
+        } else {
+            eprintln!(
+                "note: `node` not on PATH — asserted the governed gate + grant path only, \
+                 skipped the real-run stdout/audit assertions"
+            );
+        }
+    }
+
     fn mcp_tool(name: &str, executable: relux_core::ToolExecutability) -> relux_core::ToolDescriptor {
         relux_core::ToolDescriptor {
             plugin_id: "mcp:srv".to_string(),

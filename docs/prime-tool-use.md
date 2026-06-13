@@ -377,5 +377,48 @@ separate step from running it** (configure ≠ run) — and openclaw's
 same server shape Relux rebuilds from the candidate's proposal before handing it to the
 existing registry validation.
 
+## The verified install → use path (end-to-end)
+
+This is the path a regression test pins end-to-end, route for route — the same sequence
+the dashboard / Prime drive, with no private-helper shortcut:
+
+1. **Install** — from GitHub (`POST /v1/relux/plugins/install-github` / the governed
+   `…/prime/actions/install-plugin`), a local **ZIP** (`…/install-zip`), or a local
+   **folder** (`…/install-dir`). A `relux-plugin.json` manifest is **optional**: a source
+   without one lands as an honest **metadata-only wrapper** (`generated: true`) that runs
+   nothing until configured.
+2. **Detect** — the same read-only scan (`detect_hints` + `detect_candidates`, exposed by
+   `GET /v1/relux/plugins/:id/hints` and folded into the GitHub install envelope) surfaces
+   capability **candidates** with honest `next_steps`: an `mcp_register` candidate (a
+   one-click governed MCP registration) or a `command_tool` candidate (a pre-filled,
+   reviewable argv draft). Detection **runs nothing**.
+3. **Configure** — Prime's governed backend action `POST
+   /v1/relux/prime/actions/configure-candidate` re-reads the candidates server-side and
+   activates the selected one through the **unchanged** governed path (the MCP registry, or
+   the command-tool validator/store). `no_code_executed: true` — activation registers
+   metadata/recipe only.
+4. **See it** — the new tool appears in the **exact runnable catalog Prime is handed**
+   (`GET /v1/relux/prime/tools` / the decision-prompt inventory), marked `gated` (needs
+   approval) until invoked.
+5. **Use it** — invocation flows only through the single gate. A gated tool is **refused**
+   (`409`) until a standing **allow-always grant** (`POST /v1/relux/grants`) or a per-call
+   approval authorises the exact `(agent, plugin, tool, permission, risk)`. With one, the
+   tool runs **argv-only** (no shell, confined cwd, bounded + secret-redacted output, hard
+   timeout) and the result is **recorded in the audit log** against Prime, so Prime can
+   summarise/see it.
+
+Regression coverage: `crates/relux-kernel/src/server.rs::install_configure_then_prime_can_use_the_governed_command_tool`
+drives steps 1–5 over the real routes against a local non-echo fixture (a tiny npm CLI),
+and `scripts/smoke-plugin-install-to-prime-use.ps1` is an optional, manual smoke that runs
+it (and the related configure-candidate tests) — local fixture only, no clone, no remote
+code, no real brain, not required by CI.
+
+**Honest limitations.** A **source-only** plugin with no detected runnable entrypoint
+(no `relux-plugin.json`, no declared MCP server / `bin` / console-script / Cargo binary)
+yields an honest `manual` candidate with **no one-click activation** — it points at the
+Plugins page to add a tool/runtime, and Relux never infers a command from repo content.
+A `manual` candidate is exactly that: Prime cannot wire it up for you, and nothing is ever
+claimed `ready` until it is actually configured and invoked.
+
 See `docs/ARTIFICIAL_CONSTRAINT_AUDIT.md` for the lifted constraints and `docs/mcp.md` for the
 agent loop and MCP transports.
