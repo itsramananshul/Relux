@@ -1940,6 +1940,34 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **unreleased** — **product-grade Prime brain setup + a safe brain probe** on top of v0.1.30,
+  closing the first-run pain "adapters are listed but I can't tell how to actually power Prime"
+  (RELUX_MASTER_PLAN §14 — recommended first adapter is Claude/Codex CLI or OpenRouter, "the
+  dashboard shows the state"; §10.1 — the LLM brain is the PRIMARY surface, Local is the fallback
+  rail; probe contract `docs/relix-agent-adapters.md` §2; built reference-first per
+  `docs/reference-driven-development.md`; `docs/prime-tool-use.md` "Powering Prime"). **New
+  capability — the safe Test/probe:** `POST /v1/relux/ai/probe { brain? }` answers "is this brain
+  usable right now?" with a clear status (`ready` / `disabled` / `missing_binary` / `not_configured`
+  / `missing_key` / `failed`) + a secret-free `detail` + next step. A CLI brain runs `<bin>
+  --version` ONLY when its adapter is enabled and on PATH — reusing the exact assigned-run spawn
+  contract (`probe_cli_version` → `run_adapter_command`: argv-only, empty stdin, short timeout,
+  output cap, secret redaction, **no `--dangerously-skip-permissions`/bypass flag**); it proves the
+  binary is runnable, with sign-in verified on the first real chat turn. OpenRouter reports whether
+  its key resolves WITHOUT a billable request (pure config check; names a missing secret reference);
+  Local is always ready. Pure classifiers `probe_local` / `probe_openrouter` / `classify_cli_probe`
+  + `BrainProbe`/`BrainProbeStatus` in `ai.rs`; the endpoint runs the blocking `--version` probe off
+  the async runtime via `spawn_blocking` and resolves the target brain through the unchanged
+  `resolve_brain`. **UI (Health → Prime Brain panel):** recommended brains (Claude/Codex/OpenRouter)
+  are tagged *recommended* and reordered first; **Local** is tagged *fallback / test* and the Prime
+  chat banner links *"Set up a real brain →"* whenever Prime is on the Local fallback; each brain has
+  a **Test** button rendering the probe verdict (badge + detail + captured version). No raw key is
+  ever stored or shown (OpenRouter stays a write-only secret reference; CLI brains use their own
+  local login). **Tests:** `relux-core`/`relux-kernel` `cargo test` + `clippy --all-targets -D
+  warnings` clean (new `ai.rs` probe-classifier tests, `adapter.rs` `probe_cli_version` spawn tests
+  incl. missing-binary/non-zero-exit, and `server.rs` `/v1/relux/ai/probe` route tests: local ready,
+  unknown-brain 400, openrouter-no-key missing_key, no-body probes the resolved brain). Dashboard
+  typechecks, builds, and all tests pass incl. a new `prime-brain-setup-render.test.mjs`; the
+  committed bundle was rebuilt.
 - **v0.1.30** (2026-06-13) — **agentic tool-use + MCP-surface completion** rollup. The
   `relux-kernel` / `relux-core` crates move `0.1.29` → `0.1.30` in lockstep, packaging the whole
   post-v0.1.29 line into a fresh Windows bundle (`docs/prime-tool-use.md`, `docs/mcp.md`;

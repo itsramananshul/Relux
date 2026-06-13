@@ -129,7 +129,8 @@ Then, in your browser:
    Prime"**. If `claude` is not yet on your PATH the panel shows the exact install
    + sign-in step (`npm i -g @anthropic-ai/claude-code`, then run `claude` once to
    log in); install it, click **Refresh**, then **"Use Claude CLI for Prime"**
-   again. No JSON or env-var editing is required for normal Claude setup.
+   again. Click **Test** to confirm it is usable before you chat. No JSON or
+   env-var editing is required for normal Claude setup.
 3. Open **Prime** and chat - e.g. `create a task to summarize the README`. A
    greeting stays a greeting and brainstorming stays a conversation (musing like
    *"I was thinking we could…"* never silently mints a task); only an explicit
@@ -702,14 +703,16 @@ Prime's **conversational** replies can come from one of four "brains", chosen fr
 starting runs, approvals) always stay deterministic and kernel-grounded no matter
 which brain is selected:
 
-- **Local** (default) - the grounded, rule-based operator. Always available; no
-  external call.
-- **OpenRouter** - shape replies with an OpenRouter model (needs an API key; see
-  below).
-- **Claude CLI** - delegate replies to your local `claude` CLI (uses your Claude
-  login; no key stored in Relux).
-- **Codex CLI** - delegate replies to your local `codex` CLI (uses your ChatGPT
-  login; no key stored in Relux).
+- **Claude CLI** *(recommended)* - delegate replies to your local `claude` CLI
+  (uses your Claude login; no key stored in Relux).
+- **Codex CLI** *(recommended)* - delegate replies to your local `codex` CLI (uses
+  your ChatGPT login; no key stored in Relux).
+- **OpenRouter** *(recommended)* - shape replies with an OpenRouter model (needs an
+  API key; see below).
+- **Local** *(fallback / test)* - the grounded, rule-based operator. Always
+  available and no external call, but **not** a real conversational agent; it is
+  used automatically only when no real brain is set up. The panel labels it as
+  fallback/test plumbing so it never reads as the product path.
 
 For the CLI brains, the panel shows the live adapter status (installed/on-PATH,
 enabled/disabled) and a one-click **"Use Claude/Codex for Prime"** that enables the
@@ -720,6 +723,16 @@ which provider produced it (`via Claude CLI` / `via OpenRouter` / `deterministic
 The brain is stored in the same local `ai-config.json`; the API is
 `PUT /v1/relux/ai/config { "brain": "claude_cli" }` (values: `local` | `openrouter`
 | `claude_cli` | `codex_cli`).
+
+**Test before you trust it.** Each brain has a **Test** button (and Prime's status
+banner links to it when you are on the Local fallback). It runs a *safe* probe that
+returns a clear status: for a CLI brain it runs `<bin> --version` (read-only - no
+agent turn, no `--dangerously-skip-permissions`); for OpenRouter it checks that the
+key resolves **without** sending a billable request; Local is always ready. A failed
+probe says exactly why and what to do next - *not installed*, *not on PATH*,
+*disabled*, *no key / missing secret*, or *probe failed*. The API is
+`POST /v1/relux/ai/probe { "brain"?: "claude_cli" }` (omit `brain` to probe the brain
+Prime is currently using); sign-in is verified on your first real chat turn.
 
 CLI brains are spawned the same safe way as assigned runs: argv-only, prompt on
 stdin, a wall-clock timeout, an output cap, and secret redaction. Claude is invoked
@@ -741,6 +754,7 @@ key up live, so no restart is needed. The API behind it:
 
 ```text
 GET    /v1/relux/ai/status     # key-free: mode / brain / configured / model / reason
+POST   /v1/relux/ai/probe      # safe brain test → { brain, ok, status, detail, version? } (no bypass, no billable call)
 PUT    /v1/relux/ai/config     # { "provider":"openrouter", "api_key":"...", "model"?, "disabled"?, "brain"? }
 DELETE /v1/relux/ai/config     # clear the stored key/config
 ```

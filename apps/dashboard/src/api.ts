@@ -2283,9 +2283,42 @@ export const reluxDoctor = {
   get: () => api.get<ReluxDoctorReport>("/v1/relux/doctor"),
 };
 
+// The result of a safe, read-only brain probe (POST /v1/relux/ai/probe). A probe
+// never runs an agent turn, never bypasses permissions, and (for OpenRouter)
+// never sends a billable request — it answers "is this brain usable right now?"
+export type ReluxBrainProbeStatus =
+  | "ready"
+  | "disabled"
+  | "missing_binary"
+  | "not_configured"
+  | "missing_key"
+  | "failed";
+
+export interface ReluxBrainProbe {
+  // The probed brain's wire string.
+  brain: ReluxPrimeBrain;
+  // Whether the brain is usable right now.
+  ok: boolean;
+  // The coarse status driving the badge.
+  status: ReluxBrainProbeStatus;
+  // A human-readable, secret-free explanation + the next step on failure.
+  detail: string;
+  // The CLI version line, when a `--version` probe captured one.
+  version?: string | null;
+  // How the probe was checked: always_available (Local), config_only (OpenRouter
+  // key resolution / a CLI not yet runnable), or version_probe (a real spawn).
+  checked: "always_available" | "config_only" | "version_probe";
+}
+
 export const reluxAi = {
   // Current AI configuration/status (key-free; never returns the API key).
   status: () => api.get<ReluxAiStatus>("/v1/relux/ai/status"),
+  // Safely test whether a brain is usable and return a clear status. Pass a
+  // `brain` to test a specific one; omit it to probe Prime's current brain. CLI
+  // brains run `<bin> --version` (read-only, no bypass flag); OpenRouter checks
+  // that its key resolves WITHOUT a billable request; Local is always ready.
+  probe: (brain?: ReluxPrimeBrain) =>
+    api.post<ReluxBrainProbe>("/v1/relux/ai/probe", brain ? { brain } : {}),
   // Configure Prime's AI provider/brain from the dashboard (no env vars). Only
   // OpenRouter takes a key; Claude/Codex adapters use local CLI auth. The key is
   // never sent or stored in plaintext here — reference a write-only secret by

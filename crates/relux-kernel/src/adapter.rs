@@ -266,6 +266,112 @@ pub fn run_adapter_command(spec: &AdapterCommandSpec) -> std::io::Result<Adapter
     run_adapter_command_streaming_cancellable(spec, None, None)
 }
 
+/// The result of a safe, read-only CLI probe (see [`probe_cli_version`]).
+///
+/// This is a *liveness* check: it proves the binary is installed and runnable,
+/// not that the operator is signed in (login is verified on the first real chat
+/// turn). It is deliberately scoped that way so the probe stays safe — it never
+/// runs an agent turn, never crosses a permission boundary, and never bills.
+#[derive(Debug, Clone)]
+pub struct CliVersionProbe {
+    /// Whether the process was actually spawned (false when the binary was not
+    /// found on PATH, so nothing ran).
+    pub ran: bool,
+    /// True only when the probe spawned, exited cleanly (code 0), and did not
+    /// time out.
+    pub ok: bool,
+    /// The reported version line (first non-empty line of stdout, else stderr),
+    /// trimmed and clamped. `None` when the binary printed nothing usable.
+    pub version: Option<String>,
+    /// A short, secret-free human explanation of the outcome.
+    pub detail: String,
+}
+
+/// Safely probe a CLI by running `<binary> --version`.
+///
+/// This reuses the exact safe-spawn contract of the adapter runtime
+/// (`docs/RELUX_MASTER_PLAN.md` §14 — "Probe/test environment: is the agent
+/// installed?"; `docs/relix-agent-adapters.md` §2): argv-only (no shell), an
+/// empty stdin closed immediately, a short wall-clock timeout, a small output
+/// cap, secret redaction, and **no bypass/danger flag** (the only argument is
+/// the universally read-only `--version`). The binary is resolved on PATH first
+/// so a Windows `.cmd`/`.exe` shim is spawnable.
+pub fn probe_cli_version(binary: &str) -> CliVersionProbe {
+    let program = match find_on_path(binary) {
+        Some(p) => p.to_string_lossy().to_string(),
+        None => {
+            return CliVersionProbe {
+                ran: false,
+                ok: false,
+                version: None,
+                detail: format!("`{binary}` was not found on PATH."),
+            };
+        }
+    };
+    let spec = AdapterCommandSpec {
+        program,
+        args: vec!["--version".to_string()],
+        stdin: String::new(),
+        working_dir: None,
+        timeout: Duration::from_secs(10),
+        max_output_bytes: 8 * 1024,
+    };
+    match run_adapter_command(&spec) {
+        Ok(out) => {
+            let version = first_nonempty_line(&out.stdout)
+                .or_else(|| first_nonempty_line(&out.stderr));
+            if out.success {
+                CliVersionProbe {
+                    ran: true,
+                    ok: true,
+                    version,
+                    detail: format!("`{binary}` is installed and runnable."),
+                }
+            } else if out.timed_out {
+                CliVersionProbe {
+                    ran: true,
+                    ok: false,
+                    version,
+                    detail: format!("`{binary} --version` did not respond within 10s."),
+                }
+            } else {
+                let code = out
+                    .exit_code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".to_string());
+                CliVersionProbe {
+                    ran: true,
+                    ok: false,
+                    version,
+                    detail: format!("`{binary} --version` exited with status {code}."),
+                }
+            }
+        }
+        Err(e) => CliVersionProbe {
+            ran: false,
+            ok: false,
+            version: None,
+            detail: format!("could not run `{binary}`: {e}"),
+        },
+    }
+}
+
+/// The first non-empty, trimmed line of `text`, clamped to a sane length so a
+/// chatty CLI cannot blow up the status payload.
+fn first_nonempty_line(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(|l| {
+            let mut s = l.to_string();
+            if s.chars().count() > 200 {
+                s = s.chars().take(200).collect::<String>();
+                s.push('…');
+            }
+            s
+        })
+}
+
 /// Like [`run_adapter_command`] but additionally **streams** each stdout/stderr
 /// chunk to an optional live [`RunLogSink`] as it is read, so a poll of
 /// `GET /v1/relux/runs/:id/logs` can show lines BEFORE the run finalizes
@@ -665,6 +771,37 @@ mod tests {
         let outcome = run_adapter_command(&spec).expect("spawn ok");
         assert!(!outcome.success);
         assert_eq!(outcome.exit_code, Some(3));
+    }
+
+    #[test]
+    fn probe_cli_version_missing_binary_did_not_run() {
+        let probe = probe_cli_version("relux-definitely-not-a-real-binary-xyz");
+        assert!(!probe.ran, "a missing binary must not spawn anything");
+        assert!(!probe.ok);
+        assert!(probe.version.is_none());
+        assert!(probe.detail.contains("PATH"));
+    }
+
+    #[test]
+    fn probe_cli_version_runs_and_reports_version() {
+        let dir = tempfile::tempdir().unwrap();
+        // The fake CLI ignores args and prints a version line, so a `--version`
+        // probe sees a clean exit and a captured line — exactly the Available case.
+        let bin = write_fake_cli(dir.path(), "fake-brain", "fake-brain 9.9.9");
+        let probe = probe_cli_version(&bin.to_string_lossy());
+        assert!(probe.ran);
+        assert!(probe.ok, "detail: {}", probe.detail);
+        assert_eq!(probe.version.as_deref(), Some("fake-brain 9.9.9"));
+    }
+
+    #[test]
+    fn probe_cli_version_nonzero_exit_is_not_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_failing_cli(dir.path(), "fail-brain");
+        let probe = probe_cli_version(&bin.to_string_lossy());
+        assert!(probe.ran, "the binary exists, so it was spawned");
+        assert!(!probe.ok, "a non-zero exit is not a healthy brain");
+        assert!(probe.detail.contains("exited"));
     }
 
     #[test]

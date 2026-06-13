@@ -135,6 +135,42 @@ If the user names a tool but not its arguments, the brain asks for them (a clari
 or the per-tool arg reading fails closed with an honest message — Prime never fabricates an
 argument.
 
+## Powering Prime: brain setup & the safe probe
+
+> Spec refs: `docs/RELUX_MASTER_PLAN.md` §14 (recommended first adapter: Claude CLI / Codex CLI /
+> OpenRouter; "the dashboard shows the state") and §10.1 (the LLM brain is the PRIMARY surface;
+> the deterministic classifier / Local brain is the fallback rail). Adapter probe contract:
+> `docs/relix-agent-adapters.md` §2 ("Probe/test environment — is the agent installed?").
+
+Everything above assumes Prime has a **real** brain. The setup surface for that lives on
+**Health → Prime Brain / AI Runtime** (the `PrimeBrainPanel`), and is product-grade by design:
+
+- **Recommended vs fallback is explicit.** Claude CLI, Codex CLI, and OpenRouter are tagged
+  *recommended* (a real conversational Prime). **Local** is tagged *fallback / test* — grounded,
+  always available, but **not** the product chat path; it is used automatically only when no real
+  brain is set up. When Prime is on the Local fallback, its chat banner says so and links straight
+  to the setup panel (*"Set up a real brain →"*).
+- **One-click enable + select.** For a CLI brain, *"Use Claude/Codex for Prime"* enables the
+  adapter and selects it as the brain in a single action; the panel shows live adapter state
+  (installed / on-PATH / enabled) and the exact install + sign-in step when the binary is missing.
+- **Test before you trust it.** Each brain has a **Test** button → `POST /v1/relux/ai/probe`
+  (`{ brain?, ... }`; omit `brain` to probe the brain Prime currently resolves to). The probe is
+  **safe and bounded** and reuses the exact same spawn contract as an assigned run:
+  - **CLI brains** run `<bin> --version` only when the adapter is enabled and on PATH — argv-only,
+    empty stdin closed immediately, a short timeout, an output cap, secret redaction, and **no
+    bypass/danger flag** (the only argument is the read-only `--version`). It proves the binary is
+    installed and runnable; **sign-in is verified on the first real chat turn**, not by the probe.
+  - **OpenRouter** reports whether its key resolves **without** sending a billable request (a pure
+    configuration check), and names a missing secret reference so the next step is obvious.
+  - **Local** is always `ready`.
+  The result is a clear status — `ready` / `disabled` / `missing_binary` / `not_configured` /
+  `missing_key` / `failed` — each with a secret-free `detail` and the next step. The probe never
+  runs an agent turn and never crosses a permission boundary.
+
+Keys are never stored or shown in plaintext: OpenRouter's key is a write-only secret reference
+(only the secret *name* and a redacted preview cross the wire); Claude/Codex authenticate through
+their own local CLI login, so Relux stores no key for them at all.
+
 ## What this slice changed
 
 - The decision prompt now carries the runnable-tool inventory (so the brain can choose a tool).

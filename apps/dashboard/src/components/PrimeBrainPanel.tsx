@@ -4,6 +4,7 @@ import {
   reluxAdapters,
   type ReluxAiStatus,
   type ReluxAdapterStatus,
+  type ReluxBrainProbe,
   type ReluxPrimeBrain,
 } from "../api";
 import { PrimeAiSettings } from "./PrimeAiSettings";
@@ -24,20 +25,24 @@ interface BrainOption {
   blurb: string;
   adapterId?: string;
   bin?: string;
+  // A real conversational-Prime path the product recommends.
+  recommended?: boolean;
+  // Test/fallback plumbing — grounded but not the product chat experience.
+  fallback?: boolean;
 }
 
+// Recommended brains first (a real conversational Prime), with the Local
+// fallback last and clearly labelled as test plumbing, so the obvious choice is
+// the product path — not the deterministic stand-in (RELUX_MASTER_PLAN §10.1 /
+// §14: the LLM brain is the primary surface; Local is the fallback rail).
 const OPTIONS: BrainOption[] = [
-  {
-    brain: "local",
-    label: "Local (deterministic)",
-    blurb: "Grounded, rule-based replies. Always available, no external call.",
-  },
   {
     brain: "claude_cli",
     label: "Claude CLI",
-    blurb: "Delegate chat to your local `claude` CLI (uses your Claude login).",
+    blurb: "Delegate chat to your local `claude` CLI (uses your Claude login). Recommended.",
     adapterId: CLAUDE_ADAPTER_ID,
     bin: "claude",
+    recommended: true,
   },
   {
     brain: "codex_cli",
@@ -45,11 +50,21 @@ const OPTIONS: BrainOption[] = [
     blurb: "Delegate chat to your local `codex` CLI (uses your ChatGPT login).",
     adapterId: CODEX_ADAPTER_ID,
     bin: "codex",
+    recommended: true,
   },
   {
     brain: "openrouter",
     label: "OpenRouter",
-    blurb: "Use an OpenRouter API key for conversational replies.",
+    blurb: "Use an OpenRouter API key for conversational replies (stored as a write-only secret).",
+    recommended: true,
+  },
+  {
+    brain: "local",
+    label: "Local (deterministic)",
+    blurb:
+      "Grounded, rule-based replies — fallback / test plumbing, not the product chat path. " +
+      "Used automatically only when no real brain is set up.",
+    fallback: true,
   },
 ];
 
@@ -59,6 +74,9 @@ export function PrimeBrainPanel() {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [banner, setBanner] = useState<{ kind: string; msg: string } | null>(null);
+  // The latest safe probe result per brain, plus which brain is mid-probe.
+  const [probes, setProbes] = useState<Record<string, ReluxBrainProbe>>({});
+  const [probing, setProbing] = useState<ReluxPrimeBrain | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -118,6 +136,21 @@ export function PrimeBrainPanel() {
     }
   }
 
+  // Safely test a brain: a read-only probe that never runs an agent turn, never
+  // bypasses permissions, and never sends a billable OpenRouter request.
+  async function testBrain(brain: ReluxPrimeBrain) {
+    setProbing(brain);
+    setBanner(null);
+    try {
+      const probe = await reluxAi.probe(brain);
+      setProbes((prev) => ({ ...prev, [brain]: probe }));
+    } catch (e) {
+      setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Probe failed" });
+    } finally {
+      setProbing(null);
+    }
+  }
+
   async function setAdapterEnabled(id: string, enabled: boolean) {
     setBusy(true);
     setBanner(null);
@@ -163,6 +196,13 @@ export function PrimeBrainPanel() {
           {status.reason}
         </div>
       )}
+      {status && status.brain === "local" && (
+        <div className="banner info" style={{ fontSize: 12 }}>
+          Prime is on the <strong>Local fallback</strong> — grounded, but not a real conversational
+          agent. Pick <strong>Claude CLI</strong>, <strong>Codex CLI</strong>, or{" "}
+          <strong>OpenRouter</strong> below for a real chat brain, then <strong>Test</strong> it.
+        </div>
+      )}
 
       <div className="grid" style={{ gap: 8 }}>
         {OPTIONS.map((opt) => {
@@ -177,13 +217,31 @@ export function PrimeBrainPanel() {
                 border: active ? "1px solid var(--accent, #4ade80)" : undefined,
               }}
             >
-              <div className="row" style={{ alignItems: "center", gap: 8 }}>
+              <div className="row wrap" style={{ alignItems: "center", gap: 8 }}>
                 <strong style={{ fontSize: 13 }}>{opt.label}</strong>
                 {active && <span className="badge done" style={{ fontSize: 9 }}>selected</span>}
+                {opt.recommended && (
+                  <span className="badge todo" style={{ fontSize: 9 }} title="A real conversational Prime — the product chat path">
+                    recommended
+                  </span>
+                )}
+                {opt.fallback && (
+                  <span className="badge backlog" style={{ fontSize: 9 }} title="Test/fallback plumbing — not the product chat path">
+                    fallback / test
+                  </span>
+                )}
                 {opt.adapterId && adapter && (
                   <AdapterBadge adapter={adapter} />
                 )}
                 <div className="spacer" style={{ flex: 1 }} />
+                <button
+                  className="btn ghost sm"
+                  disabled={probing === opt.brain}
+                  onClick={() => void testBrain(opt.brain)}
+                  title="Safely test whether this brain is usable (read-only; no agent run, no bypass, no billable call)"
+                >
+                  {probing === opt.brain ? "Testing…" : "Test"}
+                </button>
                 {!active && (
                   <button
                     className="btn ghost sm"
@@ -195,6 +253,8 @@ export function PrimeBrainPanel() {
                 )}
               </div>
               <p className="muted" style={{ fontSize: 12, margin: "6px 0 0" }}>{opt.blurb}</p>
+
+              {probes[opt.brain] && <ProbeResult probe={probes[opt.brain]} />}
 
               {opt.adapterId && (
                 <CliAdapterControls
@@ -232,6 +292,34 @@ function brainLabel(b: ReluxPrimeBrain): string {
     default:
       return "Local";
   }
+}
+
+// The outcome of a safe brain probe: a ready/blocked badge, the secret-free
+// detail (with the next step on failure), and the captured CLI version line.
+function ProbeResult({ probe }: { probe: ReluxBrainProbe }) {
+  const tone = probe.ok ? "ok" : probe.status === "failed" ? "err" : "info";
+  const label = probe.ok
+    ? "ready"
+    : probe.status === "disabled"
+      ? "disabled"
+      : probe.status === "missing_binary"
+        ? "not on PATH"
+        : probe.status === "not_configured"
+          ? "not enabled"
+          : probe.status === "missing_key"
+            ? "no key"
+            : "failed";
+  return (
+    <div className={"banner " + tone} style={{ fontSize: 11, marginTop: 8, marginBottom: 0 }}>
+      <strong>{probe.ok ? "✓ " : "⚠ "}{label}</strong> — {probe.detail}
+      {probe.version && (
+        <>
+          {" "}
+          <span className="mono">{probe.version}</span>
+        </>
+      )}
+    </div>
+  );
 }
 
 function AdapterBadge({ adapter }: { adapter: ReluxAdapterStatus }) {

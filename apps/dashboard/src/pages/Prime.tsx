@@ -470,14 +470,25 @@ function AiStatusBanner({ status }: { status: ReluxAiStatus | null }) {
     icon = "✦";
     label = `Prime: Codex CLI${auto}`;
   }
+  // Prime is on the deterministic Local fallback: say so plainly and make the
+  // one-click path to a real brain obvious (the chief first-run pain — Prime
+  // listed adapters but it was unclear how to actually power it).
+  const onFallback = brain === "local";
   return (
     <div className="row wrap muted" style={{ gap: 8, fontSize: 10, padding: "4px 8px", borderBottom: "1px solid var(--border)", marginBottom: 8, alignItems: "center" }} title={status.reason}>
       <span>{icon} {label}</span>
+      {onFallback && <span className="badge backlog" style={{ fontSize: 8 }}>fallback / test</span>}
       {status.disabled && status.configured && <span className="badge todo" style={{fontSize: 8}}>LLM disabled</span>}
       <div className="spacer" style={{ flex: 1 }} />
-      <Link to="/health" className="link" style={{ fontSize: 10 }} title="Choose Prime's brain (Local / OpenRouter / Claude CLI / Codex CLI)">
-        Prime Brain settings →
-      </Link>
+      {onFallback ? (
+        <Link to="/health" className="link" style={{ fontSize: 10, fontWeight: 600 }} title="Set up a real brain (Claude CLI / Codex CLI / OpenRouter) and test it">
+          Set up a real brain →
+        </Link>
+      ) : (
+        <Link to="/health" className="link" style={{ fontSize: 10 }} title="Choose Prime's brain (Local / OpenRouter / Claude CLI / Codex CLI)">
+          Prime Brain settings →
+        </Link>
+      )}
     </div>
   );
 }

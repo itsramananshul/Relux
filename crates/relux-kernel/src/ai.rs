@@ -685,6 +685,201 @@ pub struct AiStatus {
     pub auto_detected: bool,
 }
 
+// --- Brain probe ------------------------------------------------------------
+
+/// The coarse outcome of a safe brain probe (`POST /v1/relux/ai/probe`).
+/// Serializes to snake_case for the dashboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrainProbeStatus {
+    /// The brain is usable right now.
+    Ready,
+    /// The adapter / key exists but is switched off.
+    Disabled,
+    /// A CLI brain is enabled but its binary is not on PATH.
+    MissingBinary,
+    /// A CLI brain's adapter is not enabled at all.
+    NotConfigured,
+    /// OpenRouter is selected but no usable API key is configured.
+    MissingKey,
+    /// The probe ran but the brain reported a failure (non-zero exit / timeout).
+    Failed,
+}
+
+/// The result of a safe, read-only brain probe.
+///
+/// A probe never runs an agent turn, never bypasses permissions, and (for
+/// OpenRouter) never sends a billable request — it is a *liveness and
+/// configuration* check the dashboard can show as a clear status. For the CLI
+/// brains it runs `<bin> --version` ([`crate::adapter::probe_cli_version`]); for
+/// OpenRouter it reports whether the key resolves; for Local it is always ready.
+#[derive(Debug, Clone, Serialize)]
+pub struct BrainProbe {
+    /// The probed brain's wire string.
+    pub brain: String,
+    /// Whether the brain is usable right now.
+    pub ok: bool,
+    /// The coarse status driving the dashboard badge.
+    pub status: BrainProbeStatus,
+    /// A human-readable, secret-free explanation + the next step on failure.
+    pub detail: String,
+    /// The CLI version line, when a version probe captured one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// How the probe was checked: `always_available` (Local), `config_only`
+    /// (OpenRouter key resolution / CLI not yet runnable), or `version_probe`
+    /// (a real `--version` spawn).
+    pub checked: &'static str,
+}
+
+/// Probe the always-available Local deterministic brain.
+pub fn probe_local() -> BrainProbe {
+    BrainProbe {
+        brain: PrimeBrain::Local.as_str().to_string(),
+        ok: true,
+        status: BrainProbeStatus::Ready,
+        detail: "Local deterministic brain — always available, no external call.".to_string(),
+        version: None,
+        checked: "always_available",
+    }
+}
+
+/// Probe the OpenRouter brain by resolving its configuration only.
+///
+/// This deliberately makes NO network request (so a probe never bills or leaks):
+/// it reports whether a usable key resolves, whether the LLM path is disabled, or
+/// whether the referenced secret is missing — with the exact next step.
+pub fn probe_openrouter(cfg: &AiConfig) -> BrainProbe {
+    let brain = PrimeBrain::Openrouter.as_str().to_string();
+    if cfg.enabled() {
+        return BrainProbe {
+            brain,
+            ok: true,
+            status: BrainProbeStatus::Ready,
+            detail: format!(
+                "OpenRouter key resolves and Prime is enabled (model {}). Configuration check only — no request was sent.",
+                cfg.model
+            ),
+            version: None,
+            checked: "config_only",
+        };
+    }
+    if cfg.disabled && cfg.configured() {
+        return BrainProbe {
+            brain,
+            ok: false,
+            status: BrainProbeStatus::Disabled,
+            detail: "An OpenRouter key is set but Prime's LLM path is disabled (RELUX_LLM_DISABLED or the disabled toggle). Re-enable it to use OpenRouter.".to_string(),
+            version: None,
+            checked: "config_only",
+        };
+    }
+    let detail = if cfg.secret_missing {
+        match &cfg.api_key_secret {
+            Some(name) => format!(
+                "OpenRouter selected but the referenced secret '{name}' is not set. Add it under Secrets and re-probe."
+            ),
+            None => "OpenRouter selected but its API key secret is missing. Set it to activate the key.".to_string(),
+        }
+    } else {
+        "No OpenRouter API key is configured. Set a secret, then reference it here.".to_string()
+    };
+    BrainProbe {
+        brain,
+        ok: false,
+        status: BrainProbeStatus::MissingKey,
+        detail,
+        version: None,
+        checked: "config_only",
+    }
+}
+
+/// Classify a CLI brain probe from its live adapter status and an optional
+/// `--version` outcome. Pure: the caller runs the (blocking) version probe only
+/// when the adapter is `Available`, then hands the result here for the verdict.
+pub fn classify_cli_probe(
+    brain: PrimeBrain,
+    adapter: Option<&relux_core::AdapterRuntimeStatus>,
+    version: Option<crate::adapter::CliVersionProbe>,
+) -> BrainProbe {
+    let brain_str = brain.as_str().to_string();
+    let bin = adapter
+        .and_then(|a| a.command.clone())
+        .unwrap_or_else(|| match brain {
+            PrimeBrain::CodexCli => "codex".to_string(),
+            _ => "claude".to_string(),
+        });
+    let state = adapter.map(|a| &a.state);
+    match state {
+        None | Some(relux_core::AdapterRuntimeState::NeedsConfiguration) => BrainProbe {
+            brain: brain_str,
+            ok: false,
+            status: BrainProbeStatus::NotConfigured,
+            detail: format!(
+                "The {bin} adapter is not enabled yet. Click \"Use … for Prime\" (or Enable adapter), then re-test."
+            ),
+            version: None,
+            checked: "config_only",
+        },
+        Some(relux_core::AdapterRuntimeState::Disabled) => BrainProbe {
+            brain: brain_str,
+            ok: false,
+            status: BrainProbeStatus::Disabled,
+            detail: format!("The {bin} adapter is configured but disabled. Enable it to use it."),
+            version: None,
+            checked: "config_only",
+        },
+        Some(relux_core::AdapterRuntimeState::MissingBinary) => BrainProbe {
+            brain: brain_str,
+            ok: false,
+            status: BrainProbeStatus::MissingBinary,
+            detail: format!(
+                "`{bin}` was not found on PATH. Install the CLI and sign in, then Refresh and re-test."
+            ),
+            version: None,
+            checked: "config_only",
+        },
+        // Defensive: a CLI adapter never reports the local-deterministic state.
+        Some(relux_core::AdapterRuntimeState::LocalDeterministic) => probe_local(),
+        Some(relux_core::AdapterRuntimeState::Available) => match version {
+            Some(v) if v.ran && v.ok => BrainProbe {
+                brain: brain_str,
+                ok: true,
+                status: BrainProbeStatus::Ready,
+                detail: format!("{} Sign-in is verified on your first chat turn.", v.detail),
+                version: v.version,
+                checked: "version_probe",
+            },
+            Some(v) if v.ran => BrainProbe {
+                brain: brain_str,
+                ok: false,
+                status: BrainProbeStatus::Failed,
+                detail: v.detail,
+                version: v.version,
+                checked: "version_probe",
+            },
+            // Spawn failed despite an Available snapshot (e.g. removed from PATH
+            // between snapshot and probe): report it honestly as missing.
+            Some(v) => BrainProbe {
+                brain: brain_str,
+                ok: false,
+                status: BrainProbeStatus::MissingBinary,
+                detail: v.detail,
+                version: None,
+                checked: "version_probe",
+            },
+            None => BrainProbe {
+                brain: brain_str,
+                ok: true,
+                status: BrainProbeStatus::Ready,
+                detail: format!("`{bin}` is enabled and on PATH."),
+                version: None,
+                checked: "config_only",
+            },
+        },
+    }
+}
+
 /// The result of (optionally) shaping a Prime reply.
 #[derive(Debug, Clone)]
 pub struct AiOutcome {
@@ -2236,6 +2431,99 @@ mod tests {
         // The plain status (explicit) never claims auto-detection.
         let plain = cfg.status_for(PrimeBrain::Local, false);
         assert!(!plain.auto_detected);
+    }
+
+    #[test]
+    fn probe_local_is_always_ready() {
+        let p = probe_local();
+        assert_eq!(p.brain, "local");
+        assert!(p.ok);
+        assert_eq!(p.status, BrainProbeStatus::Ready);
+        assert_eq!(p.checked, "always_available");
+    }
+
+    #[test]
+    fn probe_openrouter_reports_each_config_state() {
+        // Usable key, enabled -> ready (no network call: config_only).
+        let keyed = AiConfig::from_parts(Some("k".into()), None, false, None);
+        let p = probe_openrouter(&keyed);
+        assert!(p.ok);
+        assert_eq!(p.status, BrainProbeStatus::Ready);
+        assert_eq!(p.checked, "config_only");
+
+        // Key present but disabled -> disabled.
+        let disabled = AiConfig::from_parts(Some("k".into()), None, true, None);
+        let p = probe_openrouter(&disabled);
+        assert!(!p.ok);
+        assert_eq!(p.status, BrainProbeStatus::Disabled);
+
+        // No key at all -> missing_key with a clear next step.
+        let bare = AiConfig::from_parts(None, None, false, None);
+        let p = probe_openrouter(&bare);
+        assert!(!p.ok);
+        assert_eq!(p.status, BrainProbeStatus::MissingKey);
+        assert!(p.detail.to_lowercase().contains("secret"));
+    }
+
+    #[test]
+    fn probe_openrouter_flags_a_missing_secret_reference() {
+        // A referenced-but-unset secret resolves to no key and a missing flag.
+        // Build that state directly so the test is hermetic (no secret store).
+        let mut cfg = AiConfig::from_parts(None, None, false, None);
+        cfg.api_key_secret = Some("openrouter-key".into());
+        cfg.secret_missing = true;
+        let p = probe_openrouter(&cfg);
+        assert_eq!(p.status, BrainProbeStatus::MissingKey);
+        assert!(p.detail.contains("openrouter-key"));
+    }
+
+    #[test]
+    fn classify_cli_probe_maps_adapter_state_to_status() {
+        use relux_core::AdapterRuntimeState::*;
+        // Not enabled at all (no adapter status) -> not_configured.
+        let p = classify_cli_probe(PrimeBrain::ClaudeCli, None, None);
+        assert!(!p.ok);
+        assert_eq!(p.status, BrainProbeStatus::NotConfigured);
+
+        // Disabled adapter -> disabled.
+        let st = adapter_status(relux_core::CLAUDE_CLI_ADAPTER_ID, Disabled);
+        let p = classify_cli_probe(PrimeBrain::ClaudeCli, Some(&st), None);
+        assert_eq!(p.status, BrainProbeStatus::Disabled);
+
+        // Enabled but binary missing -> missing_binary.
+        let st = adapter_status(relux_core::CODEX_CLI_ADAPTER_ID, MissingBinary);
+        let p = classify_cli_probe(PrimeBrain::CodexCli, Some(&st), None);
+        assert_eq!(p.status, BrainProbeStatus::MissingBinary);
+    }
+
+    #[test]
+    fn classify_cli_probe_uses_version_outcome_when_available() {
+        use relux_core::AdapterRuntimeState::Available;
+        let st = adapter_status(relux_core::CLAUDE_CLI_ADAPTER_ID, Available);
+
+        // A clean version probe -> ready, with the captured version surfaced.
+        let ok = crate::adapter::CliVersionProbe {
+            ran: true,
+            ok: true,
+            version: Some("claude 1.2.3".into()),
+            detail: "`claude` is installed and runnable.".into(),
+        };
+        let p = classify_cli_probe(PrimeBrain::ClaudeCli, Some(&st), Some(ok));
+        assert!(p.ok);
+        assert_eq!(p.status, BrainProbeStatus::Ready);
+        assert_eq!(p.version.as_deref(), Some("claude 1.2.3"));
+        assert_eq!(p.checked, "version_probe");
+
+        // A non-zero version probe -> failed (not ready), even though on PATH.
+        let bad = crate::adapter::CliVersionProbe {
+            ran: true,
+            ok: false,
+            version: None,
+            detail: "`claude --version` exited with status 1.".into(),
+        };
+        let p = classify_cli_probe(PrimeBrain::ClaudeCli, Some(&st), Some(bad));
+        assert!(!p.ok);
+        assert_eq!(p.status, BrainProbeStatus::Failed);
     }
 
     #[test]
