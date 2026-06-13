@@ -97,6 +97,11 @@ test("Crew RENDERS under a declarative router (no useLoaderData throw)", () => {
   // The create-member affordance is part of the same view, so the page is useful
   // even with zero agents.
   assert.match(html, /Create New Crew Member/);
+  // The Prime Brain section is mounted on Crew (the doc + recovery card name
+  // "Crew → Prime Brain"); its heading + the shared panel render synchronously, so
+  // the page always carries the brain-setup surface — never a brainless Crew.
+  assert.match(html, /Prime Brain/);
+  assert.match(html, /Prime Brain \/ AI Runtime/);
 });
 
 test("the create form exposes the name, persona, and adapter fields", () => {
@@ -124,6 +129,9 @@ test("the committed dashboard bundle carries the Crew copy (no stale dist)", () 
   assert.match(bundle, /Your Crew/);
   assert.match(bundle, /Loading your crew/);
   assert.match(bundle, /Create New Crew Member/);
+  // The Prime Brain section copy must ship too (catches a stale dist after the
+  // brain-on-Crew slice landed in source).
+  assert.match(bundle, /Prime Brain \/ AI Runtime/);
   // The skills/tags field copy must be in the shipped bundle (catches a stale dist
   // after the skills slice landed in source).
   assert.match(bundle, /Skills \/ Tags \(comma-separated/);

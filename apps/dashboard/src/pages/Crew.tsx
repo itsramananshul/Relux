@@ -39,6 +39,8 @@ import { parseSkillsInput, formatSkillsInput } from "../skills";
 import { applyPreset, presetFieldsDirty } from "../presets";
 import { managerOptions, leadLabel, directReportsSummary } from "../hierarchy";
 import { adapterBrandLabel } from "../prime";
+import { isPrimeOnlyRoster, PRIME_AGENT_ID } from "../crew";
+import { PrimeBrainPanel } from "../components/PrimeBrainPanel";
 
 type Agent = ReluxAgent;
 
@@ -114,66 +116,21 @@ export function Crew() {
 
   return (
     <div className="crew-page">
-      <div className="section">
-        <h2>Your Crew</h2>
-        {agentsError && (
-          <div className="error-message">
-            Could not load your crew: {String(agentsError)}{" "}
-            <button className="btn ghost sm" onClick={() => reloadAgents()}>
-              Retry
-            </button>
-          </div>
-        )}
-        {tasksError && (
-          <div className="error-message">
-            Error loading task counts: {String(tasksError)}
-          </div>
-        )}
-        <div className="agent-list">
-          {agentsLoading && !agentsData ? (
-            <p>Loading your crew&hellip;</p>
-          ) : agents.length === 0 ? (
-            <p>
-              {agentsError
-                ? "Crew unavailable — fix the error above and retry."
-                : "No agents yet. Create one below to get started."}
-            </p>
-          ) : (
-            agents.map((agent) =>
-              editingId === agent.id ? (
-                <div key={agent.id} className="agent-card">
-                  <h3>Edit {agent.name} ({agent.id})</h3>
-                  <CrewMemberForm
-                    mode="edit"
-                    agent={agent}
-                    adapters={adapters}
-                    roster={agents}
-                    onSaved={() => {
-                      setEditingId(null);
-                      afterChange();
-                    }}
-                    onCancel={() => setEditingId(null)}
-                  />
-                  <GovernanceSection
-                    agentId={agent.id}
-                    permissions={agent.permissions ?? []}
-                    roster={agents}
-                    onChanged={afterChange}
-                  />
-                </div>
-              ) : (
-                <CrewMemberCard
-                  key={agent.id}
-                  agent={agent}
-                  queued={agentTaskCounts[agent.id]?.queued || 0}
-                  running={agentTaskCounts[agent.id]?.running || 0}
-                  onEdit={() => setEditingId(agent.id)}
-                />
-              ),
-            )
-          )}
-        </div>
-      </div>
+      <CrewRoster
+        agents={agents}
+        loading={agentsLoading && !agentsData}
+        agentsError={agentsError}
+        tasksError={tasksError}
+        adapters={adapters}
+        agentTaskCounts={agentTaskCounts}
+        editingId={editingId}
+        onEdit={setEditingId}
+        onCancelEdit={() => setEditingId(null)}
+        onRetry={() => reloadAgents()}
+        afterChange={afterChange}
+      />
+
+      <PrimeBrainSection />
 
       <AdaptersSection />
 
@@ -191,6 +148,142 @@ export function Crew() {
           onSaved={afterChange}
         />
       </div>
+    </div>
+  );
+}
+
+// The roster section: the loading / error / empty / list states of "Your Crew",
+// extracted from the stateful `Crew` container so each state is render-testable in
+// isolation (the page loads agents through `useAsync`, which never fetches under
+// renderToStaticMarkup, so the full-page render only ever sees the loading state).
+// It owns NO data fetching — the container passes everything in. Acceptance: the
+// section never renders blank; it always shows a loading, error, empty, or list state
+// (RELUX_MASTER_PLAN §6, §8.1; docs/relix-dashboard-design.md Crew).
+export function CrewRoster({
+  agents,
+  loading,
+  agentsError,
+  tasksError,
+  adapters,
+  agentTaskCounts,
+  editingId,
+  onEdit,
+  onCancelEdit,
+  onRetry,
+  afterChange,
+}: {
+  agents: ReluxAgent[];
+  // True only while the FIRST load is in flight (loading with no data yet). A
+  // background reload keeps the current list painted.
+  loading: boolean;
+  agentsError?: string | null;
+  tasksError?: string | null;
+  adapters: ReluxAdapterStatus[];
+  agentTaskCounts: Record<string, { queued: number; running: number }>;
+  editingId: string | null;
+  onEdit: (id: string) => void;
+  onCancelEdit: () => void;
+  onRetry: () => void;
+  afterChange: () => void;
+}) {
+  // Prime is always seeded, so a roster of just Prime is the real "no crew yet"
+  // state — surface an actionable next step rather than letting the page read as
+  // "done" with a lone control-plane operative.
+  const primeOnly = !loading && !agentsError && isPrimeOnlyRoster(agents);
+
+  return (
+    <div className="section">
+      <h2>Your Crew</h2>
+      {agentsError && (
+        <div className="error-message">
+          Could not load your crew: {String(agentsError)}{" "}
+          <button className="btn ghost sm" onClick={onRetry}>
+            Retry
+          </button>
+        </div>
+      )}
+      {tasksError && (
+        <div className="error-message">
+          Error loading task counts: {String(tasksError)}
+        </div>
+      )}
+      {primeOnly && (
+        <div className="banner info" style={{ fontSize: 12, lineHeight: 1.6 }}>
+          Prime is your only operative so far — it keeps running the control plane on
+          its own. To build a crew you can delegate to:{" "}
+          <strong>create one below</strong>, ask{" "}
+          <Link to="/prime" className="link">Prime in chat</Link> to create one for you,
+          or give crew real runtimes via the <strong>Prime Brain</strong> and{" "}
+          <strong>Adapters</strong> sections on this page.
+        </div>
+      )}
+      <div className="agent-list">
+        {loading ? (
+          <p>Loading your crew&hellip;</p>
+        ) : agents.length === 0 ? (
+          <p>
+            {agentsError
+              ? "Crew unavailable — fix the error above and retry."
+              : "No agents yet. Create one below to get started."}
+          </p>
+        ) : (
+          agents.map((agent) =>
+            editingId === agent.id ? (
+              <div key={agent.id} className="agent-card">
+                <h3>Edit {agent.name} ({agent.id})</h3>
+                <CrewMemberForm
+                  mode="edit"
+                  agent={agent}
+                  adapters={adapters}
+                  roster={agents}
+                  onSaved={() => {
+                    onCancelEdit();
+                    afterChange();
+                  }}
+                  onCancel={onCancelEdit}
+                />
+                <GovernanceSection
+                  agentId={agent.id}
+                  permissions={agent.permissions ?? []}
+                  roster={agents}
+                  onChanged={afterChange}
+                />
+              </div>
+            ) : (
+              <CrewMemberCard
+                key={agent.id}
+                agent={agent}
+                queued={agentTaskCounts[agent.id]?.queued || 0}
+                running={agentTaskCounts[agent.id]?.running || 0}
+                onEdit={() => onEdit(agent.id)}
+              />
+            ),
+          )
+        )}
+      </div>
+    </div>
+  );
+}
+
+// The Prime Brain section on the Crew page. The design docs and the run-recovery card
+// both name "Crew → Prime Brain" as the canonical place to choose who answers Prime's
+// chat and which Claude/Codex CLI runs its work; this mounts the shared `PrimeBrainPanel`
+// there so that guidance lands on a real surface (it also remains reachable from Health,
+// the diagnostics hub). The panel fetches its own AI status + adapter roster and renders
+// its own loading/error states, so this never blanks (RELUX_MASTER_PLAN §8.1 "Crew → Prime
+// Brain"; docs/relix-dashboard-design.md).
+function PrimeBrainSection() {
+  return (
+    <div className="section" id="prime-brain">
+      <h2>Prime Brain</h2>
+      <p className="muted" style={{ fontSize: 13, marginTop: -8 }}>
+        Prime is your always-on operative. Choose who answers its conversational turns,
+        and enable + select the <strong>Claude</strong> or <strong>Codex</strong> CLI that
+        runs its work. With the local (deterministic) brain, a free-form work run fails
+        closed with a setup prompt rather than silently doing nothing — so connect a real
+        brain here to give Prime's runs an adapter.
+      </p>
+      <PrimeBrainPanel />
     </div>
   );
 }
@@ -215,9 +308,17 @@ export function CrewMemberCard({
   onEdit: () => void;
 }) {
   const adapterId = agent.adapter_plugin || "";
+  const isPrime = agent.id === PRIME_AGENT_ID;
   return (
     <div className="agent-card">
       <h3>{agent.name} ({agent.id})</h3>
+      {isPrime && (
+        <p className="muted" style={{ fontSize: 12 }}>
+          Prime is your always-on operative. See and change which brain answers its chat
+          and runs its work in{" "}
+          <a href="#prime-brain" className="link">Prime Brain</a> below.
+        </p>
+      )}
       <p><strong>Role:</strong> {agent.description || "N/A"}</p>
       {agent.persona && (
         <p style={{ fontStyle: "italic" }}>
