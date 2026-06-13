@@ -238,6 +238,7 @@ async fn serve() -> Result<(), KernelError> {
     println!("   GET    /v1/relux/prime/agent-policy        (chat agent-loop autonomy limits + resolved profiles)");
     println!("   PUT    /v1/relux/prime/agent-policy        {{ \"max_tool_calls\"?, \"max_brain_rounds\"?, \"max_duration_secs\"?, \"max_tool_plan_steps\"?, \"max_orchestration_steps\"?, \"max_context_rounds\"?, \"max_active_jobs\"?, \"extended_*\"? }}");
     println!("   POST   /v1/relux/prime/agent/continue      {{ \"continuation_id\": \"cont_0001\", \"extended\"? }}  (resume a paused agent loop)");
+    println!("   POST   /v1/relux/prime/actions/install-plugin {{ \"repo_url\": \"https://github.com/owner/repo\", \"plugin_id\"?, \"approval_id\"? }}  (confirm+execute a Prime GitHub plugin-import; metadata only, no code run)");
     println!("   GET    /v1/relux/prime/tools               (tools Prime can run from chat: installed + live MCP, with gated/ready status)");
     println!("   POST   /v1/relux/tasks                     {{ \"title\": \"...\" }}");
     println!("   POST   /v1/relux/tasks/:id/start");
@@ -535,6 +536,10 @@ fn protected_router() -> Router<AppState> {
         .route("/v1/relux/prime/autonomy/tick", post(run_autonomy_tick))
         .route("/v1/relux/prime/agent-policy", get(get_agent_policy).put(update_agent_policy).patch(update_agent_policy))
         .route("/v1/relux/prime/agent/continue", post(continue_prime_agent_loop))
+        .route(
+            "/v1/relux/prime/actions/install-plugin",
+            post(prime_install_plugin_action),
+        )
         .route("/v1/relux/prime/tools", get(prime_tools))
         // Multi-agent orchestration (Prime as orchestrator).
         .route(
@@ -7919,6 +7924,190 @@ async fn install_github(
     Ok(Json(record))
 }
 
+// --- Prime action: confirm + execute a GitHub plugin import ----------------
+
+/// The body of `POST /v1/relux/prime/actions/install-plugin`: the dashboard echoes
+/// the fields of Prime's `InstallPluginFromGithub` proposal back to a SINGLE backend
+/// chokepoint instead of chaining the generic install-github + hints routes client-
+/// side. Every field is re-validated server-side — nothing here is trusted.
+#[derive(Debug, Deserialize)]
+struct PrimeInstallPluginReq {
+    /// The proposed repository URL. Re-canonicalized + re-validated server-side; a
+    /// non-GitHub / unparseable value is a clean 400.
+    repo_url: String,
+    /// The advisory proposed local plugin id from the proposal. Optional. When present
+    /// it must equal the id the kernel re-derives from `repo_url` (a tampered id is a
+    /// 400); the real installed id is finalized by the installer from the manifest.
+    #[serde(default)]
+    plugin_id: Option<String>,
+    /// The logged governance approval staged for this proposal, closed as approved
+    /// when the import succeeds. Optional + best-effort: the install route is itself
+    /// the authoritative gate, so a missing/already-decided approval never blocks it.
+    #[serde(default)]
+    approval_id: Option<String>,
+}
+
+/// The structured result of a confirmed GitHub plugin import. One auditable envelope:
+/// what was installed, whether it was a scaffolded wrapper vs a real manifest, the
+/// read-only capability candidates from the same `/hints` scan, honest next actions,
+/// the no-code-run guarantee, and the closed governance approval.
+#[derive(Debug, Serialize)]
+struct PrimeInstallPluginResponse {
+    /// The installed plugin record (id/name/status/source/generated/tool_count …).
+    plugin: PluginRecord,
+    /// The canonical, credential-free source the kernel actually cloned — re-derived
+    /// server-side, never the raw client value.
+    source: String,
+    /// True when the installer scaffolded a metadata-only wrapper (no `relux-plugin.json`).
+    generated: bool,
+    /// Whether the install directory was scanned for capability candidates (false only
+    /// for the degenerate out-of-root case, which a fresh install never hits).
+    scanned: bool,
+    /// Count of detected capability candidates (`candidates.len()`), for a one-line summary.
+    candidate_count: usize,
+    /// The structured per-capability candidates from the same read-only `/hints` scan.
+    candidates: Vec<relux_kernel::CapabilityCandidate>,
+    /// Honest next steps through the existing governed paths — never a claim of readiness.
+    next_actions: Vec<String>,
+    /// Invariant the route guarantees: the import cloned METADATA only and ran no repo code.
+    no_code_executed: bool,
+    /// The governance approval id that was closed as approved, when one was supplied and resolvable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval_id: Option<String>,
+    /// True when `approval_id` was supplied and successfully closed as approved.
+    approval_closed: bool,
+}
+
+/// Honest next-step guidance for a freshly imported plugin, mirroring the dashboard
+/// card's copy: review candidates if any were detected, otherwise add a tool/runtime.
+/// Never claims a capability is runnable — configuration is a separate gated step.
+fn install_plugin_next_actions(
+    record: &PluginRecord,
+    candidates: &[relux_kernel::CapabilityCandidate],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if !candidates.is_empty() {
+        out.push(format!(
+            "Review {} detected capability candidate{} on the Plugins page.",
+            candidates.len(),
+            if candidates.len() == 1 { "" } else { "s" }
+        ));
+        out.push("Configure a tool or runtime to make a capability runnable — nothing runs until you do.".to_string());
+    } else if record.generated {
+        out.push(
+            "Metadata-only wrapper — add a tool definition or runtime on the Plugins page to make it runnable."
+                .to_string(),
+        );
+    } else {
+        out.push("Open the Plugins page to enable or configure this plugin's tools.".to_string());
+    }
+    out
+}
+
+/// POST `/v1/relux/prime/actions/install-plugin` — the backend-governed CONFIRM +
+/// EXECUTE chokepoint for Prime's `InstallPluginFromGithub` proposal
+/// (`docs/RELUX_MASTER_PLAN.md` §8 Plugin Model, §10.2 Action Layer, §10.3 Approval
+/// Rules; `docs/prime-tool-use.md` "Importing a plugin from GitHub").
+///
+/// Previously the dashboard ran the import by chaining the generic
+/// `POST /v1/relux/plugins/install-github` + read-only `GET /v1/relux/plugins/:id/hints`
+/// routes client-side — so a headless/API Prime had no single auditable execution
+/// path. This route is that path: it re-validates the proposed fields server-side
+/// (never trusting the client), runs the EXISTING manifestless installer + the SAME
+/// read-only candidate scan internally, optionally closes the logged governance
+/// approval, and returns one structured envelope.
+///
+/// Safety by construction (unchanged from the chat staging): the import clones
+/// METADATA only through `install_from_github` (which re-runs the authoritative
+/// `validate_github_url`), runs no repository code, and grants no new authority — every
+/// detected capability stays disabled until configured through the unchanged plugin/
+/// tool paths. Reference: Hermes `hermes_cli/plugins_cmd.py::cmd_install` (one entry
+/// resolves the URL, clones, returns a structured result; enable/configure is a
+/// separate step — install ≠ auto-enable).
+async fn prime_install_plugin_action(
+    State(state): State<AppState>,
+    Json(req): Json<PrimeInstallPluginReq>,
+) -> Result<Json<PrimeInstallPluginResponse>, ApiError> {
+    // 1. Re-validate + re-canonicalize the proposed URL server-side. The client value
+    //    is never trusted: a swapped host, an embedded credential, or junk is rejected
+    //    or rebuilt here before the installer ever runs.
+    let parsed = relux_kernel::prime_plugin_install::canonicalize_github_repo_url(&req.repo_url)
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "not a GitHub repository — expected https://github.com/<owner>/<repo>",
+            )
+        })?;
+
+    // 2. If the client echoed the proposed plugin id, it MUST match the id the kernel
+    //    re-derives from the canonical URL. A mismatch means a tampered proposal — reject
+    //    rather than silently install under a different name. (The real installed id is
+    //    still finalized by the installer from the repo's manifest.)
+    if let Some(client_id) = req.plugin_id.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if client_id != parsed.proposed_plugin_id {
+            return Err(ApiError::bad_request(format!(
+                "proposed plugin id {client_id:?} does not match the repository {:?} (expected {:?})",
+                parsed.repo_url, parsed.proposed_plugin_id
+            )));
+        }
+    }
+
+    // 3. Run the EXISTING gated install — the exact manifestless clone the Plugins page
+    //    uses. install_from_github re-runs validate_github_url, so the canonical URL is
+    //    re-checked at the authoritative gate. No repository code is executed.
+    let canonical = parsed.repo_url.clone();
+    let root = state.plugins_root.clone();
+    let record = locked_save(&state, |kernel| {
+        let installed = install_from_github(&canonical, &root, kernel)?;
+        Ok(record_for(kernel, &installed))
+    })?;
+
+    // 4. The SAME read-only candidate scan as GET /hints — off the lock, touches only
+    //    the install directory's bounded metadata. Executes nothing.
+    let install_dir = std::path::PathBuf::from(&record.install_dir);
+    let within_root = install_dir.starts_with(&state.plugins_root);
+    let (scanned, hints) = if within_root && install_dir.is_dir() {
+        (true, relux_kernel::detect_hints(&install_dir))
+    } else {
+        (false, Vec::new())
+    };
+    let candidates = if scanned {
+        relux_kernel::detect_candidates(&install_dir, &record.id, &hints)
+    } else {
+        Vec::new()
+    };
+
+    // 5. Close the logged governance approval as approved (best-effort). The install
+    //    above is the authoritative gate, so a missing/already-decided approval is fine.
+    let approval_id = req
+        .approval_id
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let mut approval_closed = false;
+    if let Some(aid) = &approval_id {
+        let id = relux_core::ApprovalId::new(aid.clone());
+        let resolved = locked_save(&state, |kernel| {
+            kernel.resolve_approval(&id, true, "dashboard_user", None)?;
+            Ok(())
+        });
+        approval_closed = resolved.is_ok();
+    }
+
+    let next_actions = install_plugin_next_actions(&record, &candidates);
+    Ok(Json(PrimeInstallPluginResponse {
+        generated: record.generated,
+        candidate_count: candidates.len(),
+        next_actions,
+        no_code_executed: true,
+        approval_id,
+        approval_closed,
+        source: canonical,
+        scanned,
+        candidates,
+        plugin: record,
+    }))
+}
+
 async fn install_zip(
     State(state): State<AppState>,
     mut multipart: Multipart,
@@ -12103,6 +12292,109 @@ mod tests {
             .map(|s| s.to_string());
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         (status, set_cookie, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    #[tokio::test]
+    async fn prime_install_plugin_action_rejects_a_non_github_url() {
+        let (state, _dir) = auth_state(true);
+        // A non-GitHub host is rejected at the server-side re-validation — the install
+        // route never runs, so no clone is attempted. The client value is never trusted.
+        let (status, _c, body) = call(
+            &state,
+            "POST",
+            "/v1/relux/prime/actions/install-plugin",
+            None,
+            Some(r#"{"repo_url":"https://gitlab.com/owner/repo"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert!(body.contains("GitHub"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn prime_install_plugin_action_rejects_an_empty_repo_url() {
+        let (state, _dir) = auth_state(true);
+        let (status, _c, body) = call(
+            &state,
+            "POST",
+            "/v1/relux/prime/actions/install-plugin",
+            None,
+            Some(r#"{"repo_url":"   "}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn prime_install_plugin_action_rejects_a_mismatched_plugin_id() {
+        let (state, _dir) = auth_state(true);
+        // The echoed plugin id must match the id re-derived from the repo. A tampered id
+        // (smuggling a different install name) is a 400 — the install never runs.
+        let (status, _c, body) = call(
+            &state,
+            "POST",
+            "/v1/relux/prime/actions/install-plugin",
+            None,
+            Some(
+                r#"{"repo_url":"https://github.com/owner/repo","plugin_id":"relux-plugin-evil"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert!(body.contains("does not match"), "body: {body}");
+    }
+
+    #[test]
+    fn install_plugin_next_actions_are_honest_about_runnability() {
+        // A record with detected candidates points the operator at review + configure,
+        // and never claims a capability is already runnable.
+        let base = PluginRecord {
+            id: "relux-plugin-repo".to_string(),
+            name: "repo".to_string(),
+            description: String::new(),
+            kind: "ToolSet".to_string(),
+            version: "0.0.0".to_string(),
+            enabled: false,
+            source_kind: "Github".to_string(),
+            source_label: "https://github.com/owner/repo".to_string(),
+            install_dir: String::new(),
+            protected: false,
+            bundled: false,
+            generated: true,
+            tool_count: 0,
+            trust_level: None,
+            health: None,
+        };
+        let cand_text = install_plugin_next_actions(
+            &base,
+            std::slice::from_ref(&sample_candidate()),
+        )
+        .join(" ");
+        assert!(cand_text.contains("Review 1 detected capability candidate"));
+        assert!(cand_text.contains("nothing runs until you do"));
+
+        // No candidates on a scaffolded wrapper => add a tool/runtime, still honest.
+        let none = install_plugin_next_actions(&base, &[]).join(" ");
+        assert!(none.contains("Metadata-only wrapper"));
+    }
+
+    /// A minimal capability candidate for the next-actions test. Honest manual pending —
+    /// activation is `manual`, so nothing is ever claimed as ready.
+    fn sample_candidate() -> relux_kernel::CapabilityCandidate {
+        relux_kernel::CapabilityCandidate {
+            id: "cand".to_string(),
+            kind: "cli_command".to_string(),
+            title: "Detected CLI".to_string(),
+            confidence: "low".to_string(),
+            risk: "medium".to_string(),
+            rationale: "a script entrypoint was found".to_string(),
+            command_preview: None,
+            env_placeholders: Vec::new(),
+            activation: "manual".to_string(),
+            mcp_registration: None,
+            command_tool: None,
+            next_steps: vec!["configure a tool".to_string()],
+        }
     }
 
     #[tokio::test]

@@ -3,12 +3,10 @@ import { Link } from "react-router-dom";
 import {
   reluxAi,
   reluxApprovals,
-  reluxPlugins,
   reluxPrime,
   reluxWork,
   type ReluxAiStatus,
-  type ReluxPlugin,
-  type ReluxPluginHints,
+  type ReluxPrimeInstallPluginResult,
   type ReluxPrimeProposal,
   type ReluxPrimeSuggestion,
   type ReluxPrimeToolApprovalRequest,
@@ -684,11 +682,13 @@ export function PrimeTurnCard({
 
       {/* A GitHub plugin-import Prime proposed this turn ("install owner/repo as a
           plugin"). The card shows the canonical source, the destination, and the
-          no-code-run guarantee, then confirms before doing anything. Confirm runs the
-          EXISTING gated install-github route + the read-only /hints candidate scan — no
-          new authority — and renders the installed plugin + detected candidates with
-          Configure / Open Plugins links. Deny just rejects the logged approval. Nothing
-          installs by showing it (RELUX_MASTER_PLAN §8/§10.2/§10.3; docs/plugins.md). */}
+          no-code-run guarantee, then confirms before doing anything. Confirm posts to the
+          single backend-governed action route (POST /v1/relux/prime/actions/install-plugin),
+          which re-validates server-side, runs the existing install + read-only candidate
+          scan, and closes the logged approval — no new authority — then renders the
+          installed plugin + detected candidates with Configure / Open Plugins links. Deny
+          just rejects the logged approval. Nothing installs by showing it
+          (RELUX_MASTER_PLAN §8/§10.2/§10.3; docs/plugins.md). */}
       {githubPluginInstallAction(turn.action) && turn.disposition === "awaiting_approval" && (
         <PluginInstallCard
           install={githubPluginInstallAction(turn.action)!}
@@ -1253,10 +1253,14 @@ function ApprovalCard({
 // import behind a human approval; this card surfaces the canonical source, the
 // destination, and the explicit no-code-run guarantee so the operator confirms with
 // full context (mirroring Hermes's clone-then-confirm and openclaw's confirmation
-// gate). Confirm runs the EXISTING gated routes only — `install-github` (the same
-// manifestless clone the Plugins page uses) then the read-only `/hints` candidate
-// scan — and shows the installed plugin id/status, the detected candidate count, and
-// Configure / Open Plugins links. It grants no new authority and runs no plugin code.
+// gate). Confirm posts to the SINGLE backend-governed action route
+// (`POST /v1/relux/prime/actions/install-plugin`): the kernel re-validates the repo
+// URL + proposed id server-side, runs the existing manifestless install + read-only
+// candidate scan internally, and closes the logged governance approval — one auditable
+// chokepoint instead of chaining install-github + hints + decide client-side. The card
+// shows the installed plugin id/status, the detected candidate count, the honest next
+// actions the kernel returned, and Configure / Open Plugins links. It grants no new
+// authority and runs no plugin code.
 function PluginInstallCard({
   install,
   approvalId,
@@ -1268,7 +1272,7 @@ function PluginInstallCard({
 }) {
   const [working, setWorking] = useState<null | "confirm" | "deny">(null);
   const [outcome, setOutcome] = useState<
-    null | { kind: "installed"; plugin: ReluxPlugin; hints: ReluxPluginHints | null } | { kind: "denied" }
+    null | { kind: "installed"; result: ReluxPrimeInstallPluginResult } | { kind: "denied" }
   >(null);
   const [err, setErr] = useState<string | null>(null);
   const locked = busy || working !== null || outcome !== null;
@@ -1278,25 +1282,16 @@ function PluginInstallCard({
     setErr(null);
     setWorking("confirm");
     try {
-      // Close the logged governance approval first (best-effort: the import is itself
-      // an operator-gated route, so a missing/!decidable approval never blocks it).
-      if (approvalId) {
-        try {
-          await reluxApprovals.decide(approvalId, "approved");
-        } catch {
-          /* the install route below stays the authoritative gate */
-        }
-      }
-      // The exact path the Plugins page uses: install via the manifestless GitHub
-      // installer, then read-only scan for capability candidates. No code is run.
-      const plugin = await reluxPlugins.installGithub(install.repoUrl);
-      let hints: ReluxPluginHints | null = null;
-      try {
-        hints = await reluxPlugins.hints(plugin.id);
-      } catch {
-        /* candidate scan is advisory — a failure must not hide a successful install */
-      }
-      setOutcome({ kind: "installed", plugin, hints });
+      // ONE backend-governed chokepoint: the kernel re-validates the repo URL + proposed
+      // id server-side, runs the existing manifestless install + read-only candidate scan
+      // internally, and closes the logged governance approval — no client-side chaining of
+      // install-github + hints + decide. Metadata only; no repository code runs.
+      const result = await reluxPrime.installPluginFromGithub(
+        install.repoUrl,
+        install.pluginId,
+        approvalId,
+      );
+      setOutcome({ kind: "installed", result });
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Could not import the plugin from GitHub");
     } finally {
@@ -1318,7 +1313,7 @@ function PluginInstallCard({
     }
   }
 
-  const candidateCount = outcome?.kind === "installed" ? (outcome.hints?.candidates?.length ?? 0) : 0;
+  const candidateCount = outcome?.kind === "installed" ? outcome.result.candidate_count : 0;
 
   return (
     <div
@@ -1384,13 +1379,18 @@ function PluginInstallCard({
       {outcome?.kind === "installed" && (
         <div className="banner" style={{ fontSize: 11, marginTop: 4 }}>
           <div style={{ marginBottom: 4 }}>
-            Imported <span className="mono" style={{ fontWeight: 600 }}>{outcome.plugin.id}</span>{" "}
+            Imported <span className="mono" style={{ fontWeight: 600 }}>{outcome.result.plugin.id}</span>{" "}
             <span className="badge backlog" style={{ fontSize: 8 }}>
-              {outcome.plugin.enabled ? "enabled" : "metadata only"}
+              {outcome.result.plugin.enabled ? "enabled" : "metadata only"}
             </span>
-            {outcome.plugin.generated && (
+            {outcome.result.generated && (
               <span className="badge todo" style={{ fontSize: 8, marginLeft: 4 }} title="Relux scaffolded a metadata-only manifest because the repo had no relux-plugin.json">
                 scaffolded
+              </span>
+            )}
+            {outcome.result.no_code_executed && (
+              <span className="badge backlog" style={{ fontSize: 8, marginLeft: 4 }} title="The import cloned metadata only — no repository code ran">
+                no code run
               </span>
             )}
           </div>
@@ -1399,6 +1399,13 @@ function PluginInstallCard({
               ? `${candidateCount} capability candidate${candidateCount === 1 ? "" : "s"} detected — configure one to make it runnable.`
               : "No runnable capability detected yet — open Plugins to add a tool definition or runtime."}
           </div>
+          {outcome.result.next_actions.length > 0 && (
+            <ul className="muted" style={{ fontSize: 11, margin: "0 0 6px 16px", padding: 0 }}>
+              {outcome.result.next_actions.map((step, i) => (
+                <li key={i}>{step}</li>
+              ))}
+            </ul>
+          )}
           <div className="row wrap" style={{ gap: 8 }}>
             <Link className="btn" style={{ fontSize: 12, padding: "4px 12px" }} to="/plugins">
               Configure on Plugins

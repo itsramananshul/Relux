@@ -245,15 +245,33 @@ The flow:
    Prime action. A logged approval is the governance/audit record. A GitHub-import
    request with **no parseable repo** ("import a plugin from github") asks *which repo*
    instead of proposing an unspecified install.
-3. **Confirm.** The chat renders a `PluginInstallCard` showing the source, the proposed
-   local id, the destination, and the explicit **"no code from the repository runs on
-   import"** guarantee. Confirm runs the **existing gated routes only** —
-   `POST /v1/relux/plugins/install-github` (the same manifestless clone the Plugins page
-   uses) then the read-only `GET /v1/relux/plugins/:id/hints` candidate scan.
-4. **Result.** The card shows the installed plugin id + status, the detected capability
-   candidate count, and **Configure / Open Plugins** links. A repo with no
-   `relux-plugin.json` lands as a metadata-only (scaffolded, disabled) wrapper that runs
-   nothing until the operator configures a tool/runtime.
+3. **Confirm (one backend chokepoint).** The chat renders a `PluginInstallCard` showing
+   the source, the proposed local id, the destination, and the explicit **"no code from
+   the repository runs on import"** guarantee. Confirm posts to the **single
+   backend-governed action route** `POST /v1/relux/prime/actions/install-plugin` instead
+   of chaining generic routes client-side. The kernel:
+   - **re-validates server-side** — it re-canonicalizes the submitted `repo_url` through
+     the same parser (`canonicalize_github_repo_url`), so a tampered URL (swapped host,
+     embedded credential, extra path) is rebuilt or rejected, and a client-echoed
+     `plugin_id` that does not match the id re-derived from the repo is a `400`. No
+     client-only field is trusted.
+   - runs the **existing** manifestless installer (`install_from_github`, which re-runs
+     the authoritative `validate_github_url`) and the **same** read-only candidate scan
+     (`detect_hints` + `detect_candidates`) **internally** — no duplicated shell code.
+   - closes the logged governance approval (best-effort; the install is the authoritative
+     gate) and returns **one structured envelope**.
+   This makes headless/API Prime usable and gives a single auditable execution path.
+   Reference: Hermes `hermes_cli/plugins_cmd.py::cmd_install` — one entry resolves the
+   URL, clones, and returns a structured result; enable/configure is a separate step
+   (install ≠ auto-enable).
+4. **Result.** The structured response carries the installed plugin record (id + status),
+   the canonical `source`, the `generated` (scaffolded wrapper vs real manifest) flag, the
+   detected capability `candidates` + `candidate_count`, honest `next_actions`, the
+   `no_code_executed` guarantee, and the closed `approval_id`. The card shows the plugin
+   id + status, the candidate count, the next-action list, and **Configure / Open
+   Plugins** links. A repo with no `relux-plugin.json` lands as a metadata-only
+   (scaffolded, disabled) wrapper that runs nothing until the operator configures a
+   tool/runtime.
 
 **Safety:** the import clones metadata, runs no repo code, and grants no new authority;
 tools stay disabled until configured through the unchanged plugin/tool paths. Casual

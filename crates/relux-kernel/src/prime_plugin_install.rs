@@ -146,6 +146,25 @@ pub fn parse_github_plugin_install(message: &str) -> Option<ParsedGithubPluginIn
     tokens.iter().find_map(|t| parse_shorthand_token(t))
 }
 
+/// Re-validate a submitted `repo_url` server-side and re-derive the canonical install
+/// descriptor, **never trusting a client-supplied field**. The backend confirm route
+/// (`POST /v1/relux/prime/actions/install-plugin`) calls this on the URL the dashboard
+/// echoes back from the proposal so a tampered URL — an embedded credential, a swapped
+/// host, an extra path segment — is re-canonicalized (or rejected) before the existing
+/// installer ever runs.
+///
+/// A single token (no whitespace) is expected, so this reuses the exact same parser as
+/// chat: a github.com URL anywhere in the value wins; otherwise the bare `owner/repo`
+/// shorthand. The result's `repo_url` is the rebuilt credential-free
+/// `https://github.com/<owner>/<repo>` and `proposed_plugin_id` is re-derived from the
+/// repo (so the client's advisory id is recomputed, not trusted). Returns `None` for a
+/// non-GitHub / unparseable value — the route then rejects with a clear 400, exactly as
+/// the kernel's authoritative `validate_github_url` would at install time. Pure; reads
+/// nothing.
+pub fn canonicalize_github_repo_url(repo_url: &str) -> Option<ParsedGithubPluginInstall> {
+    parse_github_plugin_install(repo_url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,5 +248,40 @@ mod tests {
     #[test]
     fn windows_path_is_not_shorthand() {
         assert!(parse_github_plugin_install("install C:\\repos\\thing as plugin").is_none());
+    }
+
+    #[test]
+    fn canonicalize_accepts_a_clean_repo_url() {
+        let p = canonicalize_github_repo_url("https://github.com/owner/repo")
+            .expect("clean url canonicalizes");
+        assert_eq!(p.repo_url, "https://github.com/owner/repo");
+        assert_eq!(p.proposed_plugin_id, "relux-plugin-repo");
+    }
+
+    #[test]
+    fn canonicalize_strips_a_tampered_credential() {
+        // A client that re-injects a credential into the echoed URL is sanitized, not
+        // trusted: the canonical URL is rebuilt credential-free.
+        let p = canonicalize_github_repo_url("https://user:token@github.com/owner/repo")
+            .expect("credentialed url is re-canonicalized");
+        assert_eq!(p.repo_url, "https://github.com/owner/repo");
+        assert!(!p.repo_url.contains('@'));
+    }
+
+    #[test]
+    fn canonicalize_rejects_a_non_github_url() {
+        assert!(canonicalize_github_repo_url("https://gitlab.com/owner/repo").is_none());
+        assert!(canonicalize_github_repo_url("file:///etc/passwd").is_none());
+        assert!(canonicalize_github_repo_url("   ").is_none());
+    }
+
+    #[test]
+    fn canonicalize_rederives_the_proposed_id_from_the_repo() {
+        // The proposed id is recomputed from the repo segment, so a deep path still
+        // yields the owner/repo-derived id rather than anything the client could smuggle.
+        let p = canonicalize_github_repo_url("https://github.com/owner/repo/tree/main")
+            .expect("deep url canonicalizes");
+        assert_eq!(p.repo_url, "https://github.com/owner/repo");
+        assert_eq!(p.proposed_plugin_id, "relux-plugin-repo");
     }
 }

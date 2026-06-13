@@ -1897,7 +1897,46 @@ export const reluxPrime = {
       continuation_id: continuationId,
       extended,
     }),
+  // Confirm + EXECUTE Prime's GitHub plugin-import proposal through the SINGLE
+  // backend-governed chokepoint (POST /v1/relux/prime/actions/install-plugin). The
+  // kernel re-validates the repo URL + proposed id server-side, runs the EXISTING
+  // manifestless install-github + read-only candidate scan internally, optionally
+  // closes the logged governance approval, and returns one structured result. Replaces
+  // the old client-side chain of install-github + hints. Metadata only — no repo code
+  // runs; every detected capability stays disabled until configured.
+  installPluginFromGithub: (repoUrl: string, pluginId?: string, approvalId?: string | null) =>
+    api.post<ReluxPrimeInstallPluginResult>("/v1/relux/prime/actions/install-plugin", {
+      repo_url: repoUrl,
+      ...(pluginId ? { plugin_id: pluginId } : {}),
+      ...(approvalId ? { approval_id: approvalId } : {}),
+    }),
 };
+
+// The structured result of a confirmed Prime GitHub plugin import (the kernel's
+// PrimeInstallPluginResponse). One auditable envelope: what was installed, whether it
+// was a scaffolded wrapper vs a real manifest, the read-only capability candidates from
+// the same /hints scan, honest next actions, the no-code-run guarantee, and the closed
+// governance approval. Nothing here is runnable until configured through the unchanged
+// plugin/tool paths.
+export interface ReluxPrimeInstallPluginResult {
+  plugin: ReluxPlugin;
+  // The canonical, credential-free source the kernel actually cloned (server-derived).
+  source: string;
+  // True when the installer scaffolded a metadata-only wrapper (no relux-plugin.json).
+  generated: boolean;
+  // Whether the install dir was scanned for candidates (false only for the degenerate
+  // out-of-root case a fresh install never hits).
+  scanned: boolean;
+  candidate_count: number;
+  candidates: ReluxCapabilityCandidate[];
+  // Honest next steps through the existing governed paths — never a claim of readiness.
+  next_actions: string[];
+  // Invariant: the import cloned metadata only and ran no repository code.
+  no_code_executed: boolean;
+  // The governance approval that was closed as approved (when one was supplied + resolvable).
+  approval_id?: string;
+  approval_closed: boolean;
+}
 
 // -- Relux Prime Autonomy --------------------------------------------------
 

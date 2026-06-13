@@ -10,9 +10,10 @@
 //
 // It transpiles the REAL component from Prime.tsx with esbuild + server-renders it
 // through react-dom/server + react-router's StaticRouter, so a render-time throw fails
-// here exactly as it would white-screen the chat. It does NOT fire onClick (those call
-// the live install-github / hints / approvals routes) — that path is covered by the
-// kernel routing tests and the existing install-result render test.
+// here exactly as it would white-screen the chat. It does NOT fire onClick (Confirm now
+// posts to the single backend action route POST /v1/relux/prime/actions/install-plugin) —
+// that path is covered by the kernel routing tests and the prime-install-plugin contract
+// test.
 //
 // Run: `npm test` (auto-discovered) or `node --test test/prime-plugin-install-render.test.mjs`.
 
