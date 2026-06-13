@@ -9,6 +9,51 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.31 (Windows bundle).** The `relux-kernel` and
+  `relux-core` crates move `0.1.30` → `0.1.31` in lockstep, packaging the whole
+  post-v0.1.30 **Prime brain setup + plugin install-to-usable** line into a fresh
+  Windows bundle. Everything reads-from / writes-through real kernel state (no
+  mocked data) and conforms to `docs/RELUX_MASTER_PLAN.md` §8 / §8.2 / §10.1 /
+  §10.2 / §10.3 / §14 / §22 and `docs/prime-tool-use.md`. No master-plan safety
+  property is weakened — no new authority is added, imports run no repo code, and
+  nothing auto-runs without an explicit gate. Headlines:
+  - **Product-grade Prime brain setup + a safe quick probe.** The Health → Prime
+    Brain panel makes powering Prime obvious (recommended Claude / Codex / OpenRouter
+    ordered first, Local tagged *fallback / test*), and a new `POST /v1/relux/ai/probe`
+    answers "is this brain usable right now?" — a CLI brain runs `<bin> --version`
+    only when enabled and on `PATH` (no bypass flag), OpenRouter checks whether its
+    key resolves **without** a billable request, Local is always ready. Setup
+    diagnostic only: no raw key is ever stored or shown (§14 / §10.1).
+  - **Live chat brain probe.** `POST /v1/relux/ai/probe/live` proves Prime can
+    complete a real turn (not just that the binary runs): one tiny bounded prompt
+    through the selected brain, classified `ready` / `auth_failed` / `timeout` /
+    `failed` / … with a redacted sample. A deliberate-click-only **Test live chat**
+    button warns it may use the real provider / CLI; it creates no task or run and
+    grants no broader permission.
+  - **First-run guided launchpad.** Home's first-run checklist becomes a coherent
+    guided path to a useful Prime — try the first useful turn, resume paused work,
+    inspect stuck work — derived purely from real `state` + `/v1/relux/oversight`
+    reads; the fallback Local brain is still labelled honestly (§22).
+  - **Prime-staged GitHub plugin import from chat.** "install owner/repo as a plugin"
+    is recognized, the repo URL is canonicalized credential-free, and the **safe
+    manifestless import** is staged behind a `RiskLevel::High` human confirmation,
+    then shows the installed plugin + detected capability candidates (§8 / §10.2 / §10.3).
+  - **Backend-governed plugin-install action — one auditable chokepoint.**
+    `POST /v1/relux/prime/actions/install-plugin` re-validates server-side
+    (re-canonicalizes the repo, rejects a mismatched `plugin_id`), runs the existing
+    manifestless installer + the read-only candidate scan internally, and returns one
+    structured envelope (plugin record, candidates, honest next actions, the
+    `no_code_executed` guarantee) so a headless / API Prime has a single execution path.
+  - **Prime-guided activation of detected candidates.** "configure the first candidate"
+    / "enable the MCP server from <plugin>" stages a confirm-gated
+    `POST /v1/relux/prime/actions/configure-candidate` that re-resolves the selection
+    server-side and activates it through the **unchanged** MCP registry / command-tool
+    paths — metadata / recipe only, the resulting tool stays gated until invoked.
+  - **Guided post-activation MCP discovery.** After Prime registers an MCP candidate,
+    the route runs one bounded `tools/list` probe **off the kernel lock** so the
+    operator immediately sees what Prime can now use. Best-effort (a probe failure is
+    actionable guidance, never a failed activation); discovery only lists tools and
+    never downgrades a tool's fail-closed classification (unclassified ⇒ `needs_approval`).
 - **Relux local release v0.1.30 (Windows bundle).** The `relux-kernel` and
   `relux-core` crates move `0.1.29` → `0.1.30` in lockstep, packaging the whole
   post-v0.1.29 **agentic tool-use** line into a fresh Windows bundle. Everything

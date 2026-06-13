@@ -1941,95 +1941,72 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
-- **unreleased** — **live chat brain probe** on top of the brain-setup slice below, closing the gap
-  the quick probe could not: it proves *availability* (`--version` / key-resolves) but not that
-  Prime can complete a chat turn — for CLI brains "sign-in is verified on the first real chat turn",
-  and OpenRouter is never contacted (RELUX_MASTER_PLAN §10.1 — the LLM brain is the PRIMARY surface;
-  §14 — Claude/Codex CLI is the recommended first brain; `docs/prime-tool-use.md` "Powering Prime";
-  reference-first per `docs/reference-driven-development.md`). **New capability:** `POST
-  /v1/relux/ai/probe/live { brain? }` sends ONE tiny, bounded prompt through the selected/resolved
-  brain and classifies the result (`ready` / `not_configured` / `missing_key` / `auth_failed` /
-  `timeout` / `failed` / `unsupported`) + a secret-free `detail`, a `duration_ms`, and (on success) a
-  redacted, truncated `sample` of the real reply. **CLI brains** run the **same safe adapter
-  invocation a real turn uses** (`build_adapter_args` → `run_adapter_command`: argv-only, tiny prompt
-  on stdin, **no `--dangerously-skip-permissions`/bypass flag**, 60 s timeout, 16 KiB output cap,
-  secret redaction); the reply is parsed via `parse_adapter_result`, an auth/sign-in failure is
-  detected → `auth_failed`, and a clean exit with no readable text is an honest `failed` (never a fake
-  success). **OpenRouter** sends one small, low-token (billable) request via the existing
-  `request_completion_with` client path (key only in the `Authorization` header), mapping 401/403 →
-  `auth_failed` and transport timeout → `timeout`; it returns WITHOUT a request when no usable key
-  resolves or the LLM path is disabled. **Local** answers deterministically, labelled a fallback/test
-  brain, contacting no provider. Pure classifiers `classify_openrouter_live` / `classify_cli_live_probe`
-  / `cli_live_probe_unavailable` + `probe_local_live` / `probe_openrouter_live` /
-  `cli_live_probe_blocking` + `LiveBrainProbe`/`LiveProbeStatus` in `ai.rs`; the endpoint runs the
-  blocking CLI turn off the async runtime via `spawn_blocking` and resolves the target through the
-  unchanged `resolve_brain`. Mirrors Hermes' "prove it with a real minimal completion, then classify
-  the failure" shape (`reference/hermes-agent-main/agent/auxiliary_client.py`). It is a **setup
-  diagnostic only**: creates no task and no run, grants no broader permission. **UI (Health → Prime
-  Brain panel):** a **Test live chat** button beside the quick **Quick probe**, disabled (with the
-  reason) until the brain is set up, with explicit panel copy that it runs **only on a deliberate
-  click** and **may use the real provider / CLI and may incur provider usage**; a `LiveProbeResult`
-  banner renders the verdict + duration + redacted sample. **Tests:** `relux-kernel` `cargo test` +
-  `clippy --all-targets -D warnings` clean (new `ai.rs` live-probe classifier tests incl.
-  ready/empty/missing-key/auth/timeout/failed + an async "never calls without a usable key" test, and
-  `server.rs` `/v1/relux/ai/probe/live` route tests: local ready, openrouter-no-key missing_key,
-  CLI-not-enabled not_configured, unknown-brain 400). Dashboard typechecks, builds, and all tests
-  pass incl. new `prime-brain-setup-render.test.mjs` assertions for the live button + warning copy;
-  the committed bundle was rebuilt.
-- **unreleased** — **product-grade Prime brain setup + a safe brain probe** on top of v0.1.30,
-  closing the first-run pain "adapters are listed but I can't tell how to actually power Prime"
-  (RELUX_MASTER_PLAN §14 — recommended first adapter is Claude/Codex CLI or OpenRouter, "the
-  dashboard shows the state"; §10.1 — the LLM brain is the PRIMARY surface, Local is the fallback
-  rail; probe contract `docs/relix-agent-adapters.md` §2; built reference-first per
-  `docs/reference-driven-development.md`; `docs/prime-tool-use.md` "Powering Prime"). **New
-  capability — the safe Test/probe:** `POST /v1/relux/ai/probe { brain? }` answers "is this brain
-  usable right now?" with a clear status (`ready` / `disabled` / `missing_binary` / `not_configured`
-  / `missing_key` / `failed`) + a secret-free `detail` + next step. A CLI brain runs `<bin>
-  --version` ONLY when its adapter is enabled and on PATH — reusing the exact assigned-run spawn
-  contract (`probe_cli_version` → `run_adapter_command`: argv-only, empty stdin, short timeout,
-  output cap, secret redaction, **no `--dangerously-skip-permissions`/bypass flag**); it proves the
-  binary is runnable, with sign-in verified on the first real chat turn. OpenRouter reports whether
-  its key resolves WITHOUT a billable request (pure config check; names a missing secret reference);
-  Local is always ready. Pure classifiers `probe_local` / `probe_openrouter` / `classify_cli_probe`
-  + `BrainProbe`/`BrainProbeStatus` in `ai.rs`; the endpoint runs the blocking `--version` probe off
-  the async runtime via `spawn_blocking` and resolves the target brain through the unchanged
-  `resolve_brain`. **UI (Health → Prime Brain panel):** recommended brains (Claude/Codex/OpenRouter)
-  are tagged *recommended* and reordered first; **Local** is tagged *fallback / test* and the Prime
-  chat banner links *"Set up a real brain →"* whenever Prime is on the Local fallback; each brain has
-  a **Test** button rendering the probe verdict (badge + detail + captured version). No raw key is
-  ever stored or shown (OpenRouter stays a write-only secret reference; CLI brains use their own
-  local login). **Tests:** `relux-core`/`relux-kernel` `cargo test` + `clippy --all-targets -D
-  warnings` clean (new `ai.rs` probe-classifier tests, `adapter.rs` `probe_cli_version` spawn tests
-  incl. missing-binary/non-zero-exit, and `server.rs` `/v1/relux/ai/probe` route tests: local ready,
-  unknown-brain 400, openrouter-no-key missing_key, no-body probes the resolved brain). Dashboard
-  typechecks, builds, and all tests pass incl. a new `prime-brain-setup-render.test.mjs`; the
-  committed bundle was rebuilt.
-- **first-run guided launchpad** (2026-06-13) — a **dashboard-side** slice that turns Home's
-  first-run checklist (§22) into a coherent guided path to a useful Prime, answering the lingering
-  "what do I do?" after a real brain, plugin install-to-usable, tool use, and recovery all shipped.
-  No new product surface, no new endpoint, no master-plan safety property weakened — it extends the
-  pure `apps/dashboard` `buildReadiness()` (`readiness.ts`) with the three stages the journey was
-  missing and renders them through the existing `ReadinessGuide`. **New stages:** (1) **try Prime —
-  the first useful turn** (`tryPrimeItem`): once the brain that would answer is connected, Home
-  invites "Ask Prime what it can do" and reads *done* once any task or run exists (the first turn is
-  inferred honestly from real `state` counts, never a flag we can't stand behind); it never appears
-  before the brain is connected, where the brain item is already the action. (2) **resume paused
-  work** (`continuationItem`): a paused Prime agent-loop continuation (from the composed
-  `/v1/relux/oversight` read — the one signal `state` lacks) surfaces as attention routed to Work,
-  with "approve first" copy when it is waiting on a gated tool. (3) **inspect stuck work**
-  (`attentionWorkItem`): blocked tasks / failed runs surface as attention routed to the Inbox. The
-  first-action priority now fixes a broken brain first, then a pending decision, then paused work,
-  then stuck work, then in-flight work, then the first turn — and `deriveFirstAction`'s new
-  `ai`/`adapters`/`continuation` arguments are optional so every existing one-argument caller keeps
-  its exact prior behaviour. The fallback Local brain is still labelled honestly and never sold as
-  the main path; the new attention stages are *warn*, never blockers, so they never fake "setup
-  needed" on a working instance. `ReluxHome.tsx` adds one supplementary `reluxOversight.get()` read
-  (a failed oversight read just means "no paused work surfaced", never a degraded report). Tests:
-  `apps/dashboard/test/readiness.test.ts` pins the new derivations + the legacy `deriveFirstAction`
-  contract; `apps/dashboard/test/home-states-render.test.mjs` drives the **real** `buildReadiness`
-  → `ReadinessGuide` pipeline for the five states a new operator lands in (fallback brain/no tools,
-  real brain ready, pending approval, paused continuation, blocked/failed work). Rebuilt dashboard
-  bundle committed to `crates/relix-web-bridge/dashboard-dist`.
+- **v0.1.31** (2026-06-13) — **Prime brain setup + plugin install-to-usable** rollup. The
+  `relux-kernel` / `relux-core` crates move `0.1.30` → `0.1.31` in lockstep, packaging the whole
+  post-v0.1.30 line into a fresh Windows bundle (`docs/prime-tool-use.md`; RELUX_MASTER_PLAN §8 /
+  §8.2 / §10.1 / §10.2 / §10.3 / §14 / §22; built reference-first per
+  `docs/reference-driven-development.md`). Headlines: (1) **Product-grade Prime brain setup + a safe
+  quick probe** — the Health → Prime Brain panel makes powering Prime obvious (recommended
+  Claude / Codex / OpenRouter ordered first, **Local** tagged *fallback / test*, a "Set up a real
+  brain →" banner whenever Prime is on the Local fallback), and `POST /v1/relux/ai/probe { brain? }`
+  answers "is this brain usable right now?" with a clear status + secret-free `detail` + next step: a
+  CLI brain runs `<bin> --version` ONLY when enabled and on `PATH` (reusing the assigned-run spawn
+  contract `probe_cli_version` → `run_adapter_command`: argv-only, empty stdin, short timeout, output
+  cap, secret redaction, **no `--dangerously-skip-permissions`/bypass flag**), OpenRouter reports
+  whether its key resolves **without** a billable request, Local is always ready; no raw key is ever
+  stored or shown (§14 / §10.1). (2) **Live chat brain probe** — `POST /v1/relux/ai/probe/live`
+  proves Prime can complete a real turn (not just that the binary runs): ONE tiny bounded prompt
+  through the selected / resolved brain, classified `ready` / `not_configured` / `missing_key` /
+  `auth_failed` / `timeout` / `failed` / `unsupported` with a redacted, truncated `sample` and a
+  `duration_ms`; CLI brains use the **same safe adapter invocation a real turn uses**
+  (`build_adapter_args` → `run_adapter_command`, no bypass flag, 60 s timeout, 16 KiB cap,
+  `parse_adapter_result` + auth/sign-in detection), OpenRouter sends one small (billable) request and
+  returns WITHOUT one when no key resolves, Local contacts no provider — mirroring Hermes'
+  prove-with-a-real-completion-then-classify shape
+  (`reference/hermes-agent-main/agent/auxiliary_client.py`). It is a **setup diagnostic only**:
+  the **Test live chat** button runs only on a deliberate click, warns it may use the real
+  provider / CLI and incur usage, and creates no task / run and grants no broader permission. (3)
+  **First-run guided launchpad** — a dashboard-side slice that turns Home's first-run checklist (§22)
+  into a coherent path to a useful Prime (try the first useful turn, resume paused work, inspect
+  stuck work), derived purely from real `state` + `/v1/relux/oversight` reads through the existing
+  `ReadinessGuide`; the fallback Local brain stays labelled honestly and the new attention stages are
+  *warn*, never blockers, so they never fake "setup needed" on a working instance. (4)
+  **Prime-staged GitHub plugin import from chat** — "install owner/repo as a plugin" /
+  "import https://github.com/owner/repo as plugin" is recognized
+  (`PrimeAction::InstallPluginFromGithub`), the repo is parsed into a canonical, **credential-free**
+  https URL (anything before `github.com/`, including `user:token@`, is dropped; non-GitHub host → no
+  match), and the **safe manifestless import** is staged behind a `RiskLevel::High` human
+  confirmation, then shows the installed plugin + detected capability candidates (§8 / §10.2 / §10.3).
+  (5) **Backend-governed plugin-install action — one auditable chokepoint** —
+  `POST /v1/relux/prime/actions/install-plugin` re-validates server-side
+  (`canonicalize_github_repo_url` rebuilds or rejects a swapped host / embedded credential / extra
+  path; an echoed `plugin_id` that does not match the id re-derived from the repo is a 400), runs the
+  EXISTING manifestless installer + the SAME read-only candidate scan internally (no duplicated shell
+  code), and returns one structured envelope (plugin record, canonical source, candidates +
+  `candidate_count`, honest `next_actions`, the `no_code_executed` guarantee, the closed
+  `approval_id`) so a headless / API Prime has a single execution path. (6) **Prime-guided activation
+  of detected candidates** — "configure the first candidate" / "enable the MCP server from <plugin>"
+  / "turn that script into a tool" stages a confirm-gated `POST /v1/relux/prime/actions/configure-candidate`
+  (`PrimeAction::ConfigurePluginCandidate`) that re-reads the plugin's candidates from a fresh
+  read-only scan, re-resolves the selection without trusting a client command (exact id /
+  unique-with-candidates / fuzzy name, honest 400 on ambiguity), and activates through the
+  **unchanged** MCP registry (`register_mcp_server` / `register_mcp_stdio_server`) or command-tool
+  (`parse_command_tool_input` + `configure_command_tool`) paths — metadata / recipe only, no source
+  code runs, and the resulting tool stays gated until invoked (§8.2 / §10.2 / §10.3). (7) **Guided
+  post-activation MCP discovery** — after Prime registers an MCP candidate, the configure-candidate
+  route runs ONE bounded `tools/list` probe against the freshly-registered server **off the kernel
+  lock** (`discover_and_classify_mcp_tools` via `spawn_blocking`) so the operator immediately sees
+  what Prime can now use; it is best-effort (a probe failure becomes actionable guidance — "map
+  secrets, then Discover" / "Start it on the MCP page" — never a failed activation), LISTS tools only
+  (never calls one), and never downgrades a tool's fail-closed classification (unclassified ⇒
+  `needs_approval`). Reference-driven (Hermes `hermes_cli/plugins_cmd.py` /
+  `hermes_cli/mcp_config.py` — resolve / clone / configure-is-not-run / discovery-first; openclaw
+  `approval-classifier.ts` — the stateful path is always confirmation-gated). All reads/writes hit
+  real kernel state; no new authority is added, imports run no repo code, and nothing auto-runs
+  without an explicit gate. Per-slice `cargo test` + `clippy --all-targets -D warnings` clean on
+  `relux-core` / `relux-kernel`; dashboard typecheck / tests / build green; tracked `dashboard-dist`
+  in sync. The full-e2e release gate (`scripts\relux-package-local.ps1 -FullE2E`) is run at package
+  time. Every safety property from v0.1.30 holds.
 
 - **v0.1.30** (2026-06-13) — **agentic tool-use + MCP-surface completion** rollup. The
   `relux-kernel` / `relux-core` crates move `0.1.29` → `0.1.30` in lockstep, packaging the whole
