@@ -3104,3 +3104,37 @@ ordinary prose, paths, counts, and URLs pass through unchanged, so the answer st
 the details stay useful. The scrub is conservative (not a security boundary) and bounded (answer
 clamped to 4 000 chars). See `docs/plugins.md` "Plugin Lens → Redaction parity" and
 `RELUX_MASTER_PLAN.md` §11.1 for the product surface.
+
+### Follow-up — manifestless ZIP/import root inference
+
+**Caveat closed (this slice).** A manifestless ZIP whose contents all live under one
+top-level folder (the normal GitHub download shape, `repo-branch/…`) installed and was usable,
+but Relux treated the archive's *extraction root* as the plugin root. The generated
+display/id/README excerpt/`detect_hints` therefore came from the empty wrapper and read generic /
+dead, and Plugin Lens forced the user to know the extra wrapper segment (`widgetron/README.md`).
+
+**Reference re-read:**
+
+- `reference/openclaw-main/src/plugins/discovery.ts` — `checkSourceEscapesRoot` (L114-135)
+  realpaths both the candidate `source` and its `rootDir` and refuses the candidate unless
+  `isPathInside(rootRealPath, sourceRealPath)`. Discovery walks `SCANNED_DIRECTORY_IGNORE_NAMES`
+  (`.git`, `node_modules`, `dist`, `build`, …) so structural/build dirs never count as a plugin
+  root. **Pattern: resolve the real source root with a symlink-safe containment check, and ignore
+  well-known non-source directories when deciding what the root is.**
+- `reference/openclaw-main/src/plugins/path-safety.ts` `safeRealpathSync` / `isPathInside` — the
+  canonicalize-then-containment primitive Relux already mirrors in `resolve_within` / `dir_within`.
+  OpenClaw resolves a package's real directory before trusting any metadata read from it.
+
+**How Relux maps it:**
+
+| Reference pattern | Relux adaptation (this slice) |
+|---|---|
+| `discovery.ts`: resolve the *real* source root rather than trusting the literal scan dir | `plugin_install.rs::infer_source_root` descends into a single non-hidden, non-noise top-level directory when the root has no meaningful files AND that directory looks like a repo root (`looks_like_source_root` — README/manifest/container/entrypoint marker). The inferred root drives the scaffolded id/name/description, `detect_hints`, and the copied install content Plugin Lens reads. |
+| `SCANNED_DIRECTORY_IGNORE_NAMES` / structural-dir awareness | `looks_like_source_root` keeps the archive root for a bare `src/` (no repo marker); `is_archive_noise` + the `.`-prefix rule ignore `__MACOSX`/`.DS_Store`/`.git` when counting top-level entries. Ambiguity (multiple dirs, or a meaningful root file) always keeps the root — never a guess. |
+| `checkSourceEscapesRoot` / `safeRealpathSync`: symlink-safe containment, no escape | `single_wrapper_subdir` uses `DirEntry::metadata` (non-traversing) and refuses any symlinked top-level entry, so an inferred root can never point outside the extraction dir. The existing `resolve_within` confinement on Plugin Lens is unchanged — traversal/escape still fail-closed. |
+
+**What we deliberately keep:** no execution, no manifest inference of *tools* — the descend only
+changes which directory's bytes seed the metadata and become the install dir. The generated
+manifest is still metadata-only (`GENERATED_MANIFEST_AUTHOR`, no tools), and turning the repo into
+a runnable tool stays an explicit, approval-gated `capability_detect` / `mcp_register` /
+`ConfigureCommandTool` action. See `docs/plugins.md` "Manifestless ZIP root inference".

@@ -488,6 +488,35 @@ install scaffolds a metadata-only manifest with **no** runnable tools.
 The kernel never executes downloaded code on install — it only reads the
 copied bytes.
 
+### Manifestless ZIP root inference
+
+A normal GitHub ZIP download wraps the whole repo under one top-level
+folder (`repo-branch/…`), so the archive's extraction root is an
+artificial wrapper, not the repo. Without correction the generated
+display/id/README excerpt/hints would come from that empty wrapper and the
+plugin would look generic and dead. So when a manifestless source has
+**exactly one** non-hidden top-level directory and **no meaningful files at
+the root**, and that directory looks like a repo root (it directly contains
+a README, a project/manifest file, a container/build file, or a
+conventional entrypoint), the kernel descends into it and treats it as the
+source root (`plugin_install.rs::infer_source_root`). The generated
+id/name/description/`detect_hints` and the copied install content (what
+Plugin Lens reads) then come from the repo itself, and the generated id is
+seeded from the repo folder name rather than the ZIP filename.
+
+Inference is deliberately conservative — it keeps the archive root whenever
+the shape is ambiguous:
+
+- **Multiple top-level directories** → never guess; keep the root.
+- **A meaningful file at the root** (e.g. a root `README.md`) → keep the root.
+- **A single structural subdirectory** that is *not* a repo root (e.g. a
+  bare `src/`) → keep the root; that is the project's own layout, not a
+  wrapper.
+- **Archive noise** (`__MACOSX`, `.DS_Store`, `Thumbs.db`) and hidden
+  entries (`.git`, …) are ignored when counting top-level entries.
+- **Symlinked entries are never followed**, so no inferred root can escape
+  the extraction directory; path confinement and audit are unchanged.
+
 ## Plugin Lens (read-only source capabilities)
 
 **Contract: if a thing is installed as a plugin, Prime must be able to

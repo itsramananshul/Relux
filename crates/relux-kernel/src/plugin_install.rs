@@ -293,10 +293,171 @@ fn locate_or_scaffold(
     dir: &Path,
     id_seed: &str,
 ) -> Result<(PathBuf, PluginManifest), KernelError> {
-    match try_locate_plugin_dir(dir)? {
-        Some(found) => Ok(found),
-        None => Ok((dir.to_path_buf(), scaffold_manifest(id_seed, dir)?)),
+    if let Some(found) = try_locate_plugin_dir(dir)? {
+        return Ok(found);
     }
+
+    // No `relux-plugin.json` anywhere obvious. Before scaffolding metadata from
+    // the extraction root, infer the *real* source root: a normal GitHub zip
+    // download wraps everything in a single `repo-branch/` directory, so the
+    // archive root is an artificial wrapper, not the repo. Descending into it
+    // makes the generated name/description/hints/README excerpt - and the copied
+    // install content the Plugin Lens reads - come from the repo itself rather
+    // than looking generic/empty (`docs/plugins.md` "Manifestless ZIP root
+    // inference").
+    let root = infer_source_root(dir);
+
+    // A manifest could live at the inferred (deeper) root even though the
+    // one-level scan from `dir` missed it; prefer a real manifest if so.
+    if root != dir {
+        if let Some(found) = try_locate_plugin_dir(&root)? {
+            return Ok(found);
+        }
+    }
+
+    // When we descended into a single wrapper directory, seed the generated id
+    // from that directory's name (the repo folder), not the archive/zip name, so
+    // the installed plugin reads like the repo.
+    let seed = if root != dir {
+        root.file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| id_seed.to_string())
+    } else {
+        id_seed.to_string()
+    };
+    let manifest = scaffold_manifest(&seed, &root)?;
+    Ok((root, manifest))
+}
+
+/// Maximum number of single-wrapper directories to descend through when
+/// inferring the source root. Two levels covers a doubly-wrapped archive without
+/// allowing a deep walk.
+const MAX_ROOT_INFERENCE_DEPTH: usize = 2;
+
+/// Infer the meaningful source root inside a manifestless `dir`.
+///
+/// Normal GitHub zip downloads place every file under one top-level
+/// `repo-branch/` directory, so the archive's extraction root is an artificial
+/// wrapper. When `dir` contains exactly one non-hidden, non-noise subdirectory
+/// and no meaningful files at the root, descend into that directory (bounded by
+/// [`MAX_ROOT_INFERENCE_DEPTH`]) and treat it as the source root. Anything
+/// ambiguous - multiple top-level directories, or a meaningful file at the root -
+/// keeps `dir` rather than guessing. Symlinked entries are never followed, so no
+/// inferred root can escape the extraction directory.
+fn infer_source_root(dir: &Path) -> PathBuf {
+    let mut current = dir.to_path_buf();
+    for _ in 0..MAX_ROOT_INFERENCE_DEPTH {
+        match single_wrapper_subdir(&current) {
+            Some(next) => current = next,
+            None => break,
+        }
+    }
+    current
+}
+
+/// If `dir` is a single-wrapper directory - exactly one non-hidden, non-noise
+/// subdirectory, no meaningful files at the root, and that subdirectory actually
+/// looks like a repo root - return that subdirectory. Otherwise `None` (keep
+/// `dir`). Hidden entries (`.*`) and obvious archive noise (`__MACOSX`,
+/// `.DS_Store`, `Thumbs.db`) are ignored when deciding. A symlinked entry is
+/// treated as blocking (never followed) so the inferred root can never point
+/// outside the extraction directory. A read or non-UTF-8 entry is conservative:
+/// it blocks inference rather than guessing.
+///
+/// The "looks like a repo root" check keeps us from descending into a plain
+/// structural subdirectory (e.g. a zip whose only top-level entry is `src/`):
+/// that is the project's own layout, not an archive wrapper, so the archive name
+/// stays the better seed.
+fn single_wrapper_subdir(dir: &Path) -> Option<PathBuf> {
+    let read = fs::read_dir(dir).ok()?;
+    let mut sole_dir: Option<PathBuf> = None;
+    for entry in read {
+        let entry = entry.ok()?;
+        let name_os = entry.file_name();
+        let name = name_os.to_str()?;
+        if name.starts_with('.') || is_archive_noise(name) {
+            continue;
+        }
+        // `DirEntry::metadata` does not traverse symlinks, so a symlinked entry
+        // reports `is_symlink()` here and is refused below.
+        let file_type = entry.metadata().ok()?.file_type();
+        if file_type.is_symlink() {
+            return None;
+        }
+        if file_type.is_dir() {
+            if sole_dir.is_some() {
+                return None; // more than one candidate directory
+            }
+            sole_dir = Some(entry.path());
+        } else {
+            return None; // a meaningful file at the root: keep `dir`
+        }
+    }
+    let candidate = sole_dir?;
+    if looks_like_source_root(&candidate) {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+/// Obvious archive cruft that should never count as a meaningful top-level entry
+/// when inferring the source root. (`.DS_Store`/`Thumbs.db` are also hidden by
+/// the `.` rule; listed for clarity and to cover `__MACOSX`.)
+fn is_archive_noise(name: &str) -> bool {
+    matches!(name, "__MACOSX" | ".DS_Store" | "Thumbs.db")
+}
+
+/// Whether `dir` directly contains a recognized repo-root marker - a README, a
+/// project/manifest file, a container/build file, or a conventional entrypoint.
+/// This is what distinguishes a GitHub-style wrapper directory (which holds the
+/// whole repo) from an ordinary structural subdirectory like `src/`.
+fn looks_like_source_root(dir: &Path) -> bool {
+    const MARKERS: &[&str] = &[
+        // READMEs
+        "README.md",
+        "README",
+        "README.txt",
+        "README.rst",
+        "readme.md",
+        "Readme.md",
+        // Project / dependency manifests
+        "package.json",
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "requirements.txt",
+        "Cargo.toml",
+        "go.mod",
+        "pom.xml",
+        "build.gradle",
+        "Gemfile",
+        "composer.json",
+        // MCP configs
+        "mcp.json",
+        ".mcp.json",
+        "mcp-config.json",
+        "mcp_config.json",
+        // Container / build
+        "Dockerfile",
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "compose.yml",
+        "compose.yaml",
+        "Makefile",
+        "Justfile",
+        // Conventional entrypoints
+        "main.py",
+        "server.py",
+        "__main__.py",
+        "app.py",
+        "index.js",
+        "index.ts",
+        "main.js",
+        "main.ts",
+    ];
+    MARKERS.iter().any(|name| dir.join(name).is_file())
 }
 
 /// Find the plugin folder (and parsed, validated manifest) inside `dir`, or
@@ -914,6 +1075,189 @@ mod tests {
         assert_eq!(installed.id, PluginId::new("relux-plugin-toolbox"));
         assert!(is_generated_manifest(kernel.plugin(&installed.id).unwrap()));
         assert!(!installed_root.join(".staging-zip").exists(), "staging cleaned");
+    }
+
+    /// Write a zip from a list of `(entry_path, contents)` pairs (Stored).
+    fn write_zip(zip_path: &Path, entries: &[(&str, &[u8])]) {
+        let file = fs::File::create(zip_path).unwrap();
+        let mut zw = zip::ZipWriter::new(file);
+        let opts =
+            zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (name, body) in entries {
+            zw.start_file(*name, opts).unwrap();
+            zw.write_all(body).unwrap();
+        }
+        zw.finish().unwrap();
+    }
+
+    /// A manifestless zip whose contents live under one top-level folder (the
+    /// normal GitHub download shape, `repo-branch/...`) is installed as the
+    /// *nested* repo, not the artificial archive wrapper: id/description/hints and
+    /// the Plugin Lens content all come from the repo root.
+    #[test]
+    fn zip_with_single_nested_root_infers_repo_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let installed_root = tmp.path().join("installed");
+        let zip_path = tmp.path().join("download-1a2b3c.zip");
+        write_zip(
+            &zip_path,
+            &[
+                ("widgetron/README.md", b"# Widgetron\n\nMakes widgets.\n"),
+                ("widgetron/main.py", b"print('hi')\n"),
+                ("__MACOSX/widgetron/._main.py", b"junk"),
+            ],
+        );
+
+        let mut kernel = KernelState::new();
+        let installed = install_from_zip(&zip_path, &installed_root, &mut kernel).expect("zip ok");
+
+        // Id + description come from the nested repo root, not the zip filename.
+        assert_eq!(installed.id, PluginId::new("relux-plugin-widgetron"));
+        let manifest = kernel.plugin(&installed.id).expect("registered");
+        assert!(is_generated_manifest(manifest));
+        assert!(
+            manifest.description.contains("Widgetron"),
+            "README excerpt from nested root: {}",
+            manifest.description
+        );
+
+        // Plugin Lens reads the repo files WITHOUT the wrapper folder prefix,
+        // because the install dir IS the nested root's content.
+        let install_dir = PathBuf::from(&installed.install_dir);
+        assert!(install_dir.join("README.md").is_file(), "README at install root");
+        assert!(install_dir.join("main.py").is_file(), "main.py at install root");
+        assert!(
+            !install_dir.join("widgetron").exists(),
+            "the artificial wrapper folder is gone"
+        );
+
+        // Hints detect the nested repo's README.
+        let hints = crate::introspect::detect_hints(&install_dir);
+        assert!(
+            hints.iter().any(|h| h.kind == "readme"),
+            "README hint from nested root: {hints:?}"
+        );
+
+        // Plugin Lens read_file resolves `README.md` (NOT `widgetron/README.md`).
+        let read = crate::plugin_source::read_file(
+            &install_dir,
+            &serde_json::json!({ "path": "README.md" }),
+        )
+        .expect("read README without wrapper prefix");
+        assert!(read["content"].as_str().unwrap().contains("Widgetron"));
+        assert!(!installed_root.join(".staging-zip").exists(), "staging cleaned");
+    }
+
+    /// A copied local folder with the same single-nested-root shape infers the
+    /// nested repo root too.
+    #[test]
+    fn dir_with_single_nested_root_infers_repo_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("extracted");
+        let repo = source.join("widgetron");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("README.md"), "# Widgetron\n\nMakes widgets.\n").unwrap();
+        fs::write(repo.join("main.py"), "print('hi')\n").unwrap();
+        let installed_root = tmp.path().join("installed");
+
+        let mut kernel = KernelState::new();
+        let installed = install_from_dir(&source, &installed_root, &mut kernel).expect("ok");
+
+        assert_eq!(installed.id, PluginId::new("relux-plugin-widgetron"));
+        assert!(
+            kernel
+                .plugin(&installed.id)
+                .unwrap()
+                .description
+                .contains("Widgetron"),
+            "README excerpt from nested root"
+        );
+        let install_dir = PathBuf::from(&installed.install_dir);
+        assert!(install_dir.join("README.md").is_file());
+        assert!(!install_dir.join("widgetron").exists());
+    }
+
+    /// A single top-level directory that does NOT look like a repo root (just a
+    /// `src/` layout) is the project's own structure, not an archive wrapper, so
+    /// the archive name stays the seed (no descent into `src`).
+    #[test]
+    fn single_structural_subdir_keeps_archive_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let installed_root = tmp.path().join("installed");
+        let zip_path = tmp.path().join("toolbox.zip");
+        write_zip(&zip_path, &[("src/lib.rs", b"// code")]);
+
+        let mut kernel = KernelState::new();
+        let installed = install_from_zip(&zip_path, &installed_root, &mut kernel).expect("zip ok");
+        assert_eq!(
+            installed.id,
+            PluginId::new("relux-plugin-toolbox"),
+            "a bare src/ dir is not a wrapper: archive name kept"
+        );
+    }
+
+    /// Meaningful files at the archive root keep the root (no descent), even when
+    /// a nested directory also exists.
+    #[test]
+    fn root_level_files_keep_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let installed_root = tmp.path().join("installed");
+        let zip_path = tmp.path().join("rooted.zip");
+        write_zip(
+            &zip_path,
+            &[
+                ("README.md", b"# Rooted\n\nAt the top.\n"),
+                ("nested/file.txt", b"x"),
+            ],
+        );
+
+        let mut kernel = KernelState::new();
+        let installed = install_from_zip(&zip_path, &installed_root, &mut kernel).expect("zip ok");
+        assert_eq!(installed.id, PluginId::new("relux-plugin-rooted"));
+        let install_dir = PathBuf::from(&installed.install_dir);
+        assert!(install_dir.join("README.md").is_file(), "root README kept");
+        assert!(install_dir.join("nested").is_dir(), "nested dir preserved under root");
+    }
+
+    /// Two meaningful top-level directories are ambiguous: never guess - keep the
+    /// archive root.
+    #[test]
+    fn multiple_top_level_dirs_do_not_guess() {
+        let tmp = tempfile::tempdir().unwrap();
+        let installed_root = tmp.path().join("installed");
+        let zip_path = tmp.path().join("multi.zip");
+        write_zip(
+            &zip_path,
+            &[
+                ("alpha/README.md", b"# Alpha\n"),
+                ("beta/README.md", b"# Beta\n"),
+            ],
+        );
+
+        let mut kernel = KernelState::new();
+        let installed = install_from_zip(&zip_path, &installed_root, &mut kernel).expect("zip ok");
+        assert_eq!(installed.id, PluginId::new("relux-plugin-multi"));
+        let install_dir = PathBuf::from(&installed.install_dir);
+        assert!(install_dir.join("alpha").is_dir());
+        assert!(install_dir.join("beta").is_dir());
+    }
+
+    /// `infer_source_root` ignores archive noise/hidden dirs when deciding there
+    /// is exactly one real top-level directory.
+    #[test]
+    fn noise_and_hidden_dirs_are_ignored_when_inferring_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("extract");
+        let repo = root.join("widgetron");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("README.md"), "# Widgetron\n").unwrap();
+        // Noise that must be ignored.
+        fs::create_dir_all(root.join("__MACOSX")).unwrap();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join(".DS_Store"), b"junk").unwrap();
+
+        let inferred = infer_source_root(&root);
+        assert_eq!(inferred, repo, "descended past noise/hidden into the repo");
     }
 
     #[test]
