@@ -928,6 +928,12 @@ fn ensure_bootstrapped(kernel: &mut KernelState) -> Result<PrimeContext, KernelE
             .expect("static echo permission is well-formed");
         let status_permission = Permission::new("tool:relux-tools-status:summary")
             .expect("static status permission is well-formed");
+        // Plugin Lens: Prime also holds the single read-only source-introspection capability
+        // so it can inspect/search/read/summarize ANY installed plugin's source without a
+        // per-plugin grant (`docs/plugins.md` "Plugin Lens"). Read-only + path-confined; the
+        // execution-capable command-tool / MCP paths still require their own approval.
+        let source_permission = Permission::new(relux_kernel::SOURCE_READ_PERMISSION)
+            .expect("static source-read permission is well-formed");
         kernel.create_agent(
             PRIME_AGENT,
             "Prime",
@@ -938,8 +944,18 @@ fn ensure_bootstrapped(kernel: &mut KernelState) -> Result<PrimeContext, KernelE
                 "You are Prime: understand intent, act through the kernel, never bypass permissions."
                     .to_string(),
             ),
-            vec![echo_permission, status_permission],
+            vec![echo_permission, status_permission, source_permission],
         )?;
+    }
+
+    // Idempotently ensure an ALREADY-bootstrapped Prime also picks up the read-only source
+    // capability (a long-lived store created before Plugin Lens shipped). Granting an
+    // already-held permission is a harmless no-op we swallow; any other error propagates.
+    let source_permission = Permission::new(relux_kernel::SOURCE_READ_PERMISSION)
+        .expect("static source-read permission is well-formed");
+    match kernel.grant_permission_to_agent(&prime_id, source_permission) {
+        Ok(()) | Err(KernelError::PermissionAlreadyGranted(_, _)) => {}
+        Err(e) => return Err(e),
     }
 
     Ok(PrimeContext {

@@ -177,6 +177,10 @@ pub fn classify_intent(message: &str) -> PrimeIntent {
         || (invoke_verb && (m.contains("relux-tools-") || references_plugin_tool))
         || has(&["use the echo", "use the status", "the echo tool", "the status tool"])
         || (references_mcp_tool && (invoke_verb || !is_chat_guarded(message)))
+        // A read-only Plugin Lens request ("read/inspect/search/summarize the installed X
+        // plugin"). The kernel-side resolver must still match a real installed plugin, so a
+        // generic "what is a plugin?" falls through to an honest clarify.
+        || references_installed_plugin_source(&m)
     {
         return PrimeIntent::ToolInvocation;
     }
@@ -1927,6 +1931,259 @@ pub fn brainstorm_offers_actionable_work(message: &str) -> bool {
 /// installed tool and reports it honestly (it will not be runnable here, which is
 /// the truthful answer). The input is the first JSON object found in the message,
 /// or - for an `echo <text>` request with no JSON - `{ "message": "<text>" }`.
+/// A minimal installed-plugin view the kernel hands to [`resolve_source_tool_request`] so the
+/// resolver stays pure + unit-testable (`docs/plugins.md` "Plugin Lens").
+#[derive(Debug, Clone)]
+pub struct InstalledPluginRef {
+    pub id: String,
+    pub name: String,
+    /// Bundled fixtures + internal dev plugins are excluded from source-tool resolution.
+    pub bundled: bool,
+}
+
+/// True when the message looks like a request to introspect an INSTALLED plugin's source
+/// (read / inspect / search / summarize) — the Plugin Lens read-only capabilities. Gated on
+/// the word "plugin" plus a source verb so ordinary chat is not captured; the kernel-side
+/// resolver still has to match a real installed plugin, so a miss falls through to an honest
+/// clarify rather than a wrong action.
+pub(crate) fn references_installed_plugin_source(m: &str) -> bool {
+    // Must mention a plugin as a WHOLE word (so "search" inside "nousresearch" or "install"
+    // inside "installed" never trips a match).
+    if !token_present(m, "plugin") && !token_present(m, "plugins") {
+        return false;
+    }
+    // Install / configure / activate / enable requests are NOT source reads — they belong to
+    // the PluginInstallation / PluginConfiguration intents that classify later. Token-bounded
+    // so "installed" (legit: "read the installed X plugin") is not mistaken for "install".
+    const NEGATIVE_TOKENS: &[&str] = &[
+        "install",
+        "import",
+        "configure",
+        "register",
+        "activate",
+        "setup",
+        "uninstall",
+        "remove",
+        "enable",
+        "disable",
+    ];
+    if NEGATIVE_TOKENS.iter().any(|n| token_present(m, n)) || m.contains("as a plugin") {
+        return false;
+    }
+    // Explicit source-read phrases (multi-word, matched as substrings)…
+    const PHRASES: &[&str] = &[
+        "what can",
+        "what is",
+        "what does",
+        "what's in",
+        "tell me about",
+        "look at",
+        "list the files",
+        "contents of",
+        "show me the",
+    ];
+    if PHRASES.iter().any(|p| m.contains(p)) {
+        return true;
+    }
+    // …or a single source verb as a whole word.
+    const VERBS: &[&str] = &[
+        "read",
+        "inspect",
+        "search",
+        "summarize",
+        "summary",
+        "examine",
+        "describe",
+        "explore",
+        "grep",
+    ];
+    VERBS.iter().any(|v| token_present(m, v))
+}
+
+/// Map the source verb in `lower` to the source tool it implies. `plugin.summary` is the safe
+/// default ("what is this plugin?").
+fn source_verb_tool(lower: &str) -> &'static str {
+    if lower.contains("search") || lower.contains("grep") || lower.contains("find ") {
+        "plugin.search"
+    } else if lower.contains("read ")
+        || lower.contains("open ")
+        || lower.contains("cat ")
+        || lower.contains("contents of")
+        || lower.contains("show me the")
+    {
+        "plugin.read_file"
+    } else if lower.contains("inspect")
+        || lower.contains("list the files")
+        || lower.contains("file tree")
+        || lower.contains("structure")
+        || lower.contains("files in")
+    {
+        "plugin.inspect"
+    } else {
+        "plugin.summary"
+    }
+}
+
+/// Words too generic to identify a plugin by a single token (would over-match).
+const SOURCE_MATCH_STOPWORDS: &[&str] = &[
+    "tool", "tools", "agent", "agents", "main", "relux", "plugin", "plugins", "this", "that",
+    "with", "from", "into", "your", "what", "does", "show",
+];
+
+/// Whether `word` appears as a whitespace-delimited token (punctuation-trimmed) in `lower`.
+fn token_present(lower: &str, word: &str) -> bool {
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|t| t == word)
+}
+
+/// Find the installed (non-bundled) plugin the message references — by exact id, by name, or
+/// by a significant id/name word. When nothing matches but exactly one non-bundled plugin is
+/// installed, that sole plugin is used (so "what can this plugin do?" resolves). Returns the
+/// strongest match.
+fn match_installed_plugin<'a>(
+    lower: &str,
+    installed: &'a [InstalledPluginRef],
+) -> Option<&'a InstalledPluginRef> {
+    let candidates: Vec<&InstalledPluginRef> = installed.iter().filter(|p| !p.bundled).collect();
+    let mut best: Option<(&InstalledPluginRef, usize)> = None;
+    for p in &candidates {
+        let id_l = p.id.to_lowercase();
+        let name_l = p.name.to_lowercase();
+        let mut score = 0usize;
+        if !id_l.is_empty() && lower.contains(&id_l) {
+            score = score.max(id_l.len() + 100); // an exact id mention is strongest
+        }
+        if name_l.len() >= 3 && lower.contains(&name_l) {
+            score = score.max(name_l.len() + 50);
+        }
+        for word in id_l
+            .split(|c: char| !c.is_alphanumeric())
+            .chain(name_l.split(|c: char| !c.is_alphanumeric()))
+        {
+            if word.len() >= 4
+                && !SOURCE_MATCH_STOPWORDS.contains(&word)
+                && token_present(lower, word)
+            {
+                score = score.max(word.len());
+            }
+        }
+        if score > 0 {
+            match best {
+                Some((_, b)) if b >= score => {}
+                _ => best = Some((p, score)),
+            }
+        }
+    }
+    if let Some((p, _)) = best {
+        return Some(p);
+    }
+    // No explicit reference. A DEICTIC referent ("this plugin", "that plugin") points at the
+    // installed plugin in context, so when exactly one non-bundled plugin is installed it
+    // disambiguates — but a message that names a DIFFERENT (e.g. bundled) plugin must NOT
+    // fall through to the sole survivor, so this is gated on the deictic phrase, not on the
+    // bare word "plugin".
+    let deictic = lower.contains("this plugin")
+        || lower.contains("that plugin")
+        || lower.contains("this installed plugin")
+        || lower.contains("the installed plugin");
+    if deictic && candidates.len() == 1 {
+        return Some(candidates[0]);
+    }
+    None
+}
+
+/// Extract a search query: a quoted phrase, else the text after " for ".
+fn extract_source_query(message: &str) -> String {
+    if let Some(start) = message.find(['"', '\'']) {
+        let quote = message.as_bytes()[start] as char;
+        if let Some(rel_end) = message[start + 1..].find(quote) {
+            let q = message[start + 1..start + 1 + rel_end].trim();
+            if !q.is_empty() {
+                return q.to_string();
+            }
+        }
+    }
+    let lower = message.to_lowercase();
+    if let Some(idx) = lower.find(" for ") {
+        return message[idx + 5..]
+            .trim()
+            .trim_end_matches(['.', '?', '!'])
+            .to_string();
+    }
+    String::new()
+}
+
+/// Whether `tok` (already quote/punct-trimmed) looks like a relative file path inside a plugin.
+fn looks_like_path(t: &str) -> bool {
+    if t.is_empty() || t.contains("..") {
+        return false;
+    }
+    if t.contains('/') {
+        return true;
+    }
+    match t.rsplit_once('.') {
+        Some((stem, ext)) => {
+            !stem.is_empty()
+                && (1..=5).contains(&ext.len())
+                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        }
+        None => false,
+    }
+}
+
+/// Extract a relative file path the user named for `plugin.read_file`, excluding the plugin id.
+fn extract_source_path(message: &str, plugin: &InstalledPluginRef) -> Option<String> {
+    let id_l = plugin.id.to_lowercase();
+    message.split_whitespace().find_map(|tok| {
+        let t = tok.trim_matches(|c: char| "\"'`,".contains(c));
+        let t = t.trim_end_matches(['.', '?', '!']);
+        if t.to_lowercase() == id_l {
+            return None;
+        }
+        if looks_like_path(t) {
+            Some(t.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+/// Resolve a natural request to introspect an INSTALLED plugin's source into a concrete
+/// `(plugin_id, source_tool, input_json)` (`docs/plugins.md` "Plugin Lens"). General over
+/// every installed plugin and all four read-only verbs — NOT a fixed phrase list. Returns
+/// `None` when no installed (non-bundled) plugin is referenced, so the caller keeps its
+/// deterministic clarify. The resolved tool still runs through the unchanged invoke gates.
+pub fn resolve_source_tool_request(
+    message: &str,
+    installed: &[InstalledPluginRef],
+) -> Option<(String, String, String)> {
+    let lower = message.to_lowercase();
+    if !references_installed_plugin_source(&lower) {
+        return None;
+    }
+    let plugin = match_installed_plugin(&lower, installed)?;
+    let (tool, input_json): (&str, String) = match source_verb_tool(&lower) {
+        "plugin.search" => {
+            let q = extract_source_query(message);
+            if q.is_empty() {
+                ("plugin.summary", "{}".to_string())
+            } else {
+                ("plugin.search", serde_json::json!({ "query": q }).to_string())
+            }
+        }
+        "plugin.read_file" => match extract_source_path(message, plugin) {
+            Some(p) => (
+                "plugin.read_file",
+                serde_json::json!({ "path": p }).to_string(),
+            ),
+            None => ("plugin.summary", "{}".to_string()),
+        },
+        other => (other, "{}".to_string()),
+    };
+    Some((plugin.id.clone(), tool.to_string(), input_json))
+}
+
 pub(crate) fn parse_tool_request(message: &str) -> Option<(String, String, String)> {
     let trimmed = message.trim();
     let lower = trimmed.to_lowercase();
@@ -2798,6 +3055,75 @@ pub fn clarify_needs_label(intent: &PrimeIntent, message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lens_installed() -> Vec<InstalledPluginRef> {
+        vec![
+            InstalledPluginRef {
+                id: "hermes-agent".to_string(),
+                name: "Hermes".to_string(),
+                bundled: false,
+            },
+            InstalledPluginRef {
+                id: "relux-tools-echo".to_string(),
+                name: "Echo".to_string(),
+                bundled: true,
+            },
+        ]
+    }
+
+    #[test]
+    fn source_request_classifies_as_tool_invocation() {
+        assert_eq!(
+            classify_intent("read the installed hermes plugin"),
+            PrimeIntent::ToolInvocation
+        );
+        assert_eq!(
+            classify_intent("what can this plugin do?"),
+            PrimeIntent::ToolInvocation
+        );
+        // No "plugin" word + no source verb → not a Lens request.
+        assert_ne!(
+            classify_intent("how are you today"),
+            PrimeIntent::ToolInvocation
+        );
+    }
+
+    #[test]
+    fn resolve_source_summary_by_name() {
+        let (plugin, tool, args) =
+            resolve_source_tool_request("what does the hermes plugin do?", &lens_installed())
+                .expect("resolved");
+        assert_eq!(plugin, "hermes-agent");
+        assert_eq!(tool, "plugin.summary");
+        assert_eq!(args, "{}");
+    }
+
+    #[test]
+    fn resolve_source_read_and_search() {
+        let (_p, tool, args) = resolve_source_tool_request(
+            "read README.md from the hermes-agent plugin",
+            &lens_installed(),
+        )
+        .expect("resolved");
+        assert_eq!(tool, "plugin.read_file");
+        assert!(args.contains("README.md"));
+
+        let (_p, tool, args) =
+            resolve_source_tool_request("search the hermes plugin for \"tool\"", &lens_installed())
+                .expect("resolved");
+        assert_eq!(tool, "plugin.search");
+        assert!(args.contains("tool"));
+    }
+
+    #[test]
+    fn resolve_source_ignores_bundled_and_unmatched() {
+        // The echo plugin is bundled → never a Lens target.
+        assert!(resolve_source_tool_request("read the echo plugin", &lens_installed()).is_none());
+        // No source verb → not a Lens request at all.
+        assert!(
+            resolve_source_tool_request("install the hermes plugin", &lens_installed()).is_none()
+        );
+    }
 
     fn empty_summary() -> StateSummary {
         StateSummary {

@@ -29,7 +29,7 @@ const distDir = join(repoRoot, "crates", "relix-web-bridge", "dashboard-dist");
 const RENDER_ENTRY = `
 import { renderToStaticMarkup } from "react-dom/server";
 import { StaticRouter } from "react-router-dom/server";
-import { Plugins } from "./Plugins.tsx";
+import { Plugins, PrimeCanUseSection } from "./Plugins.tsx";
 export function render() {
   return renderToStaticMarkup(
     <StaticRouter location="/plugins">
@@ -37,10 +37,26 @@ export function render() {
     </StaticRouter>
   );
 }
+const wrapperPlugin = {
+  id: "acme-repo", name: "Acme", description: "", kind: "ToolSet", version: "0.1.0",
+  enabled: true, source_kind: "Github", source_label: "https://github.com/acme/acme-repo",
+  install_dir: "/data/acme-repo", protected: false, bundled: false, generated: true, tool_count: 0,
+};
+const bundledPlugin = { ...wrapperPlugin, id: "relux-tools-echo", protected: true, bundled: true, generated: false };
+export function renderPrimeCanUse(p) {
+  return renderToStaticMarkup(
+    <StaticRouter location="/plugins">
+      <PrimeCanUseSection plugin={p} isWrapper={p.generated} />
+    </StaticRouter>
+  );
+}
+export const fixtures = { wrapperPlugin, bundledPlugin };
 `;
 
 let tmp = null;
 let render = null;
+let renderPrimeCanUse = null;
+let fixtures = null;
 
 before(async () => {
   const built = await esbuild.build({
@@ -60,7 +76,7 @@ before(async () => {
   tmp = mkdtempSync(join(tmpdir(), "relux-plugins-render-"));
   const out = join(tmp, "plugins-render-entry.cjs");
   writeFileSync(out, built.outputFiles[0].text);
-  ({ render } = await import(pathToFileURL(out).href));
+  ({ render, renderPrimeCanUse, fixtures } = await import(pathToFileURL(out).href));
 });
 
 after(() => {
@@ -88,6 +104,23 @@ test("Plugins RENDERS the 'no manifest needed' install guidance, never 'manifest
   assert.doesNotMatch(html, /manifest (is )?required/i);
 });
 
+test("PrimeCanUseSection RENDERS the read-only Plugin Lens capabilities for a non-bundled plugin", () => {
+  // The product contract: an installed plugin shows what Prime can use with it. The
+  // section lists the four read-only source tools and offers a "Summarize with Prime"
+  // action — and must render without a throw (it uses useNavigate, so needs Router ctx).
+  const html = renderPrimeCanUse(fixtures.wrapperPlugin);
+  assert.match(html, /Prime can use/i);
+  assert.match(html, /plugin\.summary/);
+  assert.match(html, /plugin\.read_file/);
+  assert.match(html, /Summarize with Prime/);
+});
+
+test("PrimeCanUseSection renders nothing for a bundled/protected fixture", () => {
+  // Bundled fixtures already ship known capabilities, so the Lens section is hidden.
+  const html = renderPrimeCanUse(fixtures.bundledPlugin);
+  assert.equal(html, "");
+});
+
 test("the committed dashboard bundle carries the tool-run-task form (no stale dist)", () => {
   const assetsDir = join(distDir, "assets");
   const jsFiles = readdirSync(assetsDir).filter((f) => f.endsWith(".js"));
@@ -105,4 +138,13 @@ test("the committed dashboard bundle carries the 'no manifest needed' copy (no s
   // bundle was never rebuilt — the shipped UI would still read the old way.
   assert.match(bundle, /No Relux manifest needed/i);
   assert.match(bundle, /Install any GitHub repo/i);
+});
+
+test("the committed dashboard bundle carries the 'Prime can use' Plugin Lens section (no stale dist)", () => {
+  const assetsDir = join(distDir, "assets");
+  const jsFiles = readdirSync(assetsDir).filter((f) => f.endsWith(".js"));
+  const bundle = jsFiles.map((f) => readFileSync(join(assetsDir, f), "utf8")).join("\n");
+  // The Plugin Lens UI must be in the shipped bundle, not just the source.
+  assert.match(bundle, /Prime can use/i);
+  assert.match(bundle, /Summarize with Prime/i);
 });

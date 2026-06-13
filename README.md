@@ -209,6 +209,31 @@ returns HTTP 501 (`ToolRuntimeUnavailable`) with a clear message and never
 fabricates output. The dashboard Plugins page lists tools with their status and
 provides a small invoke panel (JSON input + output/error) for ready tools.
 
+#### Plugin Lens: every installed plugin is usable by Prime (read-only)
+
+**If a thing is installed as a plugin, Prime can use it.** A normal GitHub repo
+/ ZIP / folder ships no `relux-plugin.json`, so it installs as *metadata only* —
+but it is no longer a dead row. Every **non-bundled** installed plugin
+automatically exposes four **real, read-only** capabilities Prime can invoke:
+
+- `plugin.summary` — what the plugin is (manifest metadata, detected signals,
+  README excerpt, file counts).
+- `plugin.inspect` — a bounded file tree with sizes.
+- `plugin.search` — a bounded text search over the source.
+- `plugin.read_file` — read one UTF-8 file, **path-confined** to the plugin dir.
+
+These are `Low`-risk, no-approval, and run through the same permission/audit gate
+as any tool (Prime holds the single `plugin:source:read` capability). They never
+write, spawn, or reach the network — only bounded, traversal-safe reads. Ask Prime
+*"summarize the `<id>` plugin"*, *"search the `<id>` plugin for X"*, or *"read
+README.md from the `<id>` plugin"* — a read-only source read creates no task. The
+dashboard Plugins page shows a **"Prime can use (read-only)"** panel per plugin
+with a one-click **Summarize with Prime**.
+
+Turning a repo into a **runnable** tool (an MCP server or a governed command tool)
+remains an explicit, **approval-gated** step — read-only inspection is safe to
+expose by default; execution is not.
+
 #### Prime can use tools from chat
 
 You no longer need to leave Prime for the Tools panel for simple, safe tool use.

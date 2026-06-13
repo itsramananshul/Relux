@@ -2909,3 +2909,72 @@ list), so progress is live and honest with zero new state. Hermes nests arbitrar
 parent/child trees; Relux's orchestration is a single level today, so the plan
 numbers `1..N` and deeper `1.1` nesting is **not** fabricated. See
 `docs/relix-dashboard-design.md` §6.2 for the shipped surface + remaining gaps.
+
+---
+
+## Reference read — universal read-only plugin-source capabilities (Plugin Lens, this slice)
+
+**Problem this slice fixes (product contract):** an installed plugin was visible in the UI
+but Prime had *nothing it could actually invoke* against it. A manifestless install
+scaffolds a metadata-only manifest with an **empty** `capabilities.tools`
+(`crates/relux-kernel/src/plugin_install.rs::scaffold_manifest`), and the only paths to a
+runnable tool were operator-configured MCP registration / command tools
+(`capability_detect.rs` candidates). So a normal GitHub repo / ZIP / folder — which never
+ships a `relux-plugin.json` — installed as a dead row. The contract: **if a thing is
+installed as a plugin, Prime must be able to discover it and use it somehow** — at minimum
+read-only source introspection scoped to that plugin's installed directory.
+
+Before building, read how the reference agents expose a freshly-installed body of source to
+their agent and how they keep that read-only and path-confined.
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/tools/skills_tool.py` `_find_all_skills` (L550-624): Hermes
+  discovers capabilities by **scanning an installed directory** (`~/.hermes/skills/` +
+  configured external dirs) for `SKILL.md` and parsing only the first ~4000 bytes of
+  frontmatter. **Pattern: capability discovery is a bounded, read-only scan of the
+  installed source tree — the agent never executes the source to learn what it is.**
+- `reference/hermes-agent-main/agent/prompt_builder.py` `build_skills_system_prompt`
+  (L992-1150) + `reference/hermes-agent-main/agent/system_prompt.py`
+  `build_system_prompt_parts` (L60-100): the agent first sees only **metadata** (name,
+  ≤1024-char description, category) injected into the stable prompt tier; the full body is
+  pulled on demand via a **`skill_view(name=...)` tool** (progressive disclosure). **Pattern:
+  a cheap "summary" capability up front, a separate "read this file" capability the agent
+  invokes only when it needs the detail — exactly the `plugin.summary` → `plugin.read_file`
+  split.**
+- `reference/hermes-agent-main/agent/transports/hermes_tools_mcp_server.py` `EXPOSED_TOOLS`
+  (L1-160): a curated **read/fetch** subset (`skill_view`, `skills_list`, `web_extract`, …)
+  is exposed to a subprocess; `terminal`/shell is **deliberately omitted**. **Pattern:
+  read-only inspection tools are safe to expose by default; execution is not.**
+
+### OpenClaw / Paperclip — files read
+
+- `reference/openclaw-main/src/plugins/discovery.ts` `discoverOpenClawPlugins`
+  (L1-200): plugin candidates are discovered by directory scan **without requiring**
+  `openclaw.plugin.json`; a candidate with `bundledManifest: undefined` still proceeds.
+  Each candidate validates that its source **does not escape its root**
+  (`checkSourceEscapesRoot`). **Pattern: a manifestless install is a first-class case, and
+  every source read is path-confined to the plugin root — no traversal out.**
+- `reference/openclaw-main/src/plugins/manifest.ts` (L34-300): the manifest is **optional
+  declaration metadata** (activation hints, config contracts), not a precondition for the
+  plugin to exist or be introspected. **Pattern: absence of a manifest must not block
+  capability exposure; it just means capabilities are derived/registered another way.**
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation (this slice) |
+|---|---|
+| Hermes: capability discovery is a **bounded read-only scan of the installed source tree**, never executing it | New `crates/relux-kernel/src/plugin_source.rs` implements four pure, side-effect-free, read-only operations over a plugin's `install_dir`: `inspect` (bounded file tree), `search` (bounded text grep), `read_file` (one bounded text file), `summary` (manifest metadata + `detect_hints` + README excerpt + counts). No process is spawned; nothing in the plugin is executed — this honors `RELUX_MASTER_PLAN.md` §8.2/§18 ("no shelling out, no side effects *from* installed plugins"): reading copied bytes is not running the plugin. |
+| Hermes: **`skill_view` is a tool the agent invokes**, gated and audited; metadata up front, detail on demand | The four ops are **real kernel tools** `plugin.summary` / `plugin.inspect` / `plugin.search` / `plugin.read_file`, synthesized for **every non-bundled installed plugin** and routed through the UNCHANGED `invoke_tool` gate (permission check → approval check → runtime → audit). They appear in `discover_tools` → `live_tool_catalog` → `prime_agent_catalog` / `GET /v1/relux/prime/tools`, so the brain sees + picks them like any other tool. |
+| Hermes: **read-only inspection is safe to expose; execution is not** | The source tools are `RiskLevel::Low` + `Approval::Never`, so `approval_blocks_direct_invocation` is false → directly `Ready` (no per-call approval), but they still require a real capability — a single `plugin:source:read` grant Prime holds from bootstrap (`ensure_bootstrapped`). They never write, spawn, or reach the network. The existing command-tool / MCP execution paths (which *can* run code) keep their `Required` approval, unchanged. |
+| OpenClaw: every source read is **path-confined to the plugin root**, traversal rejected | `plugin_source::resolve_within(base, rel)` canonicalizes both and rejects any path that escapes `install_dir` (absolute paths, `..`, symlink escape), mirroring `checkSourceEscapesRoot`. Unit-tested with traversal payloads. Reads are bounded (max files, max bytes, max matches) so a huge repo cannot exhaust memory. |
+| OpenClaw: a **manifestless install is first-class**; the manifest is optional metadata | Source tools are attached at *discovery* time from the installed-plugin record + `install_dir`, **independent of** the manifest's `capabilities.tools`. A manifestless scaffold (empty tools) therefore still exposes the four real capabilities — closing the "dead row" gap — while a manifest plugin gets them *in addition to* its declared tools. |
+
+**What we deliberately do differently:** Relux does NOT auto-generate runnable *execution*
+wrappers from source (no inferred argv, no inferred MCP endpoint) — that stays an explicit,
+approval-gated operator/Prime action (`capability_detect.rs` candidates + `ConfigureCommandTool`).
+The new capabilities are strictly **read-only source introspection**, which is why they can be
+`Ready` by default without an approval prompt. Bundled plugins (the shipped adapters/tools)
+are excluded from the synthetic source tools — their capabilities are already known and the
+contract is about *installed third-party* plugins that were dead rows. See
+`docs/plugins.md` "Plugin Lens (read-only source capabilities)" for the product surface.

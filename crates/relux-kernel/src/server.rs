@@ -11379,15 +11379,25 @@ mod tests {
             .expect("an mcp_register candidate carries a pre-filled draft");
         assert_eq!(draft.suggested_transport, "managed_stdio");
         assert_eq!(draft.detected_command.as_deref(), Some("node"));
-        // No tool was ever created from a hint: discovery still shows nothing.
+        // No EXECUTION tool was ever created from a hint: discovery shows only the four
+        // read-only Plugin Lens source tools (`docs/plugins.md`), never a runnable MCP /
+        // command tool synthesized from a signal.
         let tools = locked_read(&state, |k| {
             Ok(k.discover_tools(None)
                 .into_iter()
                 .filter(|t| t.plugin_id == record.id)
-                .count())
+                .map(|t| t.tool_name)
+                .collect::<Vec<_>>())
         })
         .unwrap();
-        assert_eq!(tools, 0, "a hint never becomes a runnable tool");
+        assert!(
+            tools.iter().all(|t| t.starts_with("plugin.")),
+            "a hint never becomes a runnable execution tool: {tools:?}"
+        );
+        assert!(
+            tools.iter().any(|t| t == "plugin.summary"),
+            "but the read-only source tools ARE exposed (Plugin Lens): {tools:?}"
+        );
     }
 
     /// The hints route never scans a directory outside the plugins root: a bundled
@@ -11511,11 +11521,13 @@ mod tests {
         assert_eq!(after.tool_count, 0, "the tool is gone after removal");
     }
 
-    /// The honest dead-end: a generated wrapper has no tool definitions, so even an
-    /// enabled loopback runtime surfaces NOTHING. This pins why the dashboard must
-    /// route a metadata-only plugin to "add a manifest", not "configure a runtime".
+    /// The honest dead-end (post Plugin Lens): a generated wrapper exposes the four
+    /// READ-ONLY source tools, but its empty manifest yields NO EXECUTION tool even with an
+    /// enabled loopback runtime. This pins why the dashboard must route a metadata-only
+    /// plugin to "add a manifest / configure a tool" for runnable work — the runtime alone
+    /// never conjures an executable capability.
     #[test]
-    fn enabling_a_runtime_on_a_wrapper_surfaces_no_tools() {
+    fn enabling_a_runtime_on_a_wrapper_surfaces_only_readonly_source_tools() {
         let mut kernel = KernelState::new();
         let id = PluginId::new("relux-plugin-empty");
         kernel.install_plugin(
@@ -11528,10 +11540,21 @@ mod tests {
         kernel
             .configure_tool_runtime(&id, "http://127.0.0.1:19999", true, None)
             .expect("configure runtime");
-        let tools = kernel.discover_tools(None);
+        let tools: Vec<String> = kernel
+            .discover_tools(None)
+            .into_iter()
+            .filter(|t| t.plugin_id == "relux-plugin-empty")
+            .map(|t| t.tool_name)
+            .collect();
+        // The read-only source tools ARE exposed now (closing the dead-row gap)…
         assert!(
-            !tools.iter().any(|t| t.plugin_id == "relux-plugin-empty"),
-            "a wrapper with no tool definitions yields no tools even with a runtime"
+            tools.iter().any(|t| t == "plugin.summary"),
+            "Plugin Lens source tools exposed: {tools:?}"
+        );
+        // …but no EXECUTION tool appears from the empty manifest, even with a runtime.
+        assert!(
+            tools.iter().all(|t| t.starts_with("plugin.")),
+            "an empty manifest yields no execution tool even with a runtime: {tools:?}"
         );
     }
 

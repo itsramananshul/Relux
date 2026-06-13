@@ -902,6 +902,28 @@ impl KernelState {
         self.installed_plugins.get(id)
     }
 
+    /// The installed plugins eligible for read-only source introspection (Plugin Lens),
+    /// projected for the pure resolver [`crate::prime::resolve_source_tool_request`]. Excludes
+    /// bundled fixtures + internal dev plugins (which do not expose source tools).
+    fn installed_source_plugin_refs(&self) -> Vec<crate::prime::InstalledPluginRef> {
+        self.installed_plugins()
+            .into_iter()
+            .filter(|p| {
+                p.source_kind != PluginSourceKind::Bundled
+                    && !crate::builtin::is_internal_plugin(p.id.as_str())
+            })
+            .map(|p| crate::prime::InstalledPluginRef {
+                id: p.id.as_str().to_string(),
+                name: self
+                    .plugins
+                    .get(&p.id)
+                    .map(|m| m.name.clone())
+                    .unwrap_or_default(),
+                bundled: false,
+            })
+            .collect()
+    }
+
     /// All installed plugin records, sorted by id for deterministic listing.
     pub fn installed_plugins(&self) -> Vec<&InstalledPlugin> {
         let mut out: Vec<&InstalledPlugin> = self.installed_plugins.values().collect();
@@ -5067,6 +5089,38 @@ impl KernelState {
                     executable,
                 });
             }
+            // Plugin Lens: every NON-bundled installed plugin ALSO exposes the four
+            // read-only source-introspection tools (`docs/plugins.md` "Plugin Lens"). They
+            // are synthesized here — NOT stored in the manifest — so a manifestless scaffold
+            // with zero declared tools STILL carries real capabilities Prime can invoke
+            // (closing the "installed but dead row" gap). Bundled fixtures are excluded (their
+            // capabilities are already known) and so are the internal dev fixtures. Each is
+            // `Ready` for an agent that holds the single `plugin:source:read` capability, else
+            // `MissingPermission` — never auto-runnable without the grant.
+            if !protected && !crate::builtin::is_internal_plugin(installed.id.as_str()) {
+                let source_permission = Permission::new(crate::plugin_source::SOURCE_READ_PERMISSION)
+                    .expect("static source-read permission is well-formed");
+                let source_executable = match agent_for_permission {
+                    Some(agent_id) if !self.agent_holds_permission(agent_id, &source_permission) => {
+                        ToolExecutability::MissingPermission
+                    }
+                    _ => ToolExecutability::Ready,
+                };
+                for spec in crate::plugin_source::SOURCE_TOOLS {
+                    out.push(ToolDescriptor {
+                        plugin_id: installed.id.as_str().to_string(),
+                        tool_name: spec.name.to_string(),
+                        description: spec.description.to_string(),
+                        permission: crate::plugin_source::SOURCE_READ_PERMISSION.to_string(),
+                        risk: crate::plugin_source::source_risk(),
+                        source_kind: format!("{:?}", installed.source_kind),
+                        installed: true,
+                        enabled: installed.enabled,
+                        protected,
+                        executable: source_executable.clone(),
+                    });
+                }
+            }
         }
         out.sort_by(|a, b| {
             a.plugin_id
@@ -5381,6 +5435,24 @@ impl KernelState {
                 })?;
             return Ok((namespace, required));
         }
+        // Plugin Lens: a read-only source tool (`plugin.summary` etc.) on a NON-bundled
+        // installed plugin resolves to the single `plugin:source:read` capability, regardless
+        // of what the manifest declares — so a manifestless scaffold (empty `tools`) still
+        // resolves them. Bundled fixtures and internal dev fixtures do not expose source tools.
+        if crate::plugin_source::is_source_tool(tool_name) {
+            if let Some(installed) = self.installed_plugins.get(plugin_id) {
+                if installed.source_kind != PluginSourceKind::Bundled
+                    && !crate::builtin::is_internal_plugin(plugin_id.as_str())
+                {
+                    let required = Permission::new(crate::plugin_source::SOURCE_READ_PERMISSION)
+                        .map_err(|_| KernelError::ToolNotFound {
+                            plugin: plugin_id.to_string(),
+                            tool: tool_name.to_string(),
+                        })?;
+                    return Ok((namespace, required));
+                }
+            }
+        }
         let manifest = self
             .plugins
             .get(plugin_id)
@@ -5473,6 +5545,13 @@ impl KernelState {
                 }
             });
         }
+        // Plugin Lens: a read-only source tool runs the path-confined introspection over the
+        // plugin's install dir. Nothing is spawned, written, or sent over the network — only
+        // bounded reads of bytes already copied into the install dir (`docs/plugins.md`
+        // "Plugin Lens"; master plan §8.2/§18: reading copied bytes is not running the plugin).
+        if crate::plugin_source::is_source_tool(tool_name) {
+            return self.source_tool_output(plugin_id, tool_name, input);
+        }
         if let Some(output) = self.builtin_tool_output(plugin_id.as_str(), tool_name, input) {
             return Ok(output);
         }
@@ -5523,6 +5602,69 @@ impl KernelState {
                     message: e.to_string(),
                 }),
             },
+        }
+    }
+
+    /// Run a read-only Plugin Lens source tool against the plugin's install dir.
+    ///
+    /// Pure read: no spawn, no write, no network. Every path is confined to the install dir
+    /// by [`crate::plugin_source::resolve_within`]; a traversal / missing-arg / non-text input
+    /// surfaces as a clean [`KernelError::ToolRuntimeInvocation`], never a fabricated result.
+    fn source_tool_output(
+        &self,
+        plugin_id: &PluginId,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) -> Result<serde_json::Value, KernelError> {
+        let installed = self
+            .installed_plugins
+            .get(plugin_id)
+            .ok_or_else(|| KernelError::PluginNotInstalled(plugin_id.to_string()))?;
+        let dir = std::path::Path::new(&installed.install_dir);
+        let map_err = |e: crate::plugin_source::SourceError| KernelError::ToolRuntimeInvocation {
+            plugin: plugin_id.to_string(),
+            tool: tool_name.to_string(),
+            message: e.to_string(),
+        };
+        match tool_name {
+            "plugin.inspect" => crate::plugin_source::inspect(dir, input).map_err(map_err),
+            "plugin.search" => crate::plugin_source::search(dir, input).map_err(map_err),
+            "plugin.read_file" => crate::plugin_source::read_file(dir, input).map_err(map_err),
+            "plugin.summary" => {
+                let meta = self.build_source_summary_meta(plugin_id, installed);
+                crate::plugin_source::summary(dir, &meta, input).map_err(map_err)
+            }
+            _ => Err(KernelError::ToolNotFound {
+                plugin: plugin_id.to_string(),
+                tool: tool_name.to_string(),
+            }),
+        }
+    }
+
+    /// Build the [`crate::plugin_source::SummaryMeta`] for `plugin.summary` from the
+    /// installed-plugin record + its (possibly generated) manifest.
+    fn build_source_summary_meta(
+        &self,
+        plugin_id: &PluginId,
+        installed: &InstalledPlugin,
+    ) -> crate::plugin_source::SummaryMeta {
+        let manifest = self.plugins.get(plugin_id);
+        crate::plugin_source::SummaryMeta {
+            plugin_id: plugin_id.as_str().to_string(),
+            name: manifest.map(|m| m.name.clone()).unwrap_or_default(),
+            version: installed.version.clone(),
+            kind: format!("{:?}", installed.kind),
+            description: manifest.map(|m| m.description.clone()).unwrap_or_default(),
+            author: manifest.map(|m| m.author.clone()).unwrap_or_default(),
+            trust_level: manifest
+                .map(|m| format!("{:?}", m.trust_level))
+                .unwrap_or_default(),
+            source_kind: format!("{:?}", installed.source_kind),
+            source_label: installed.source_label.clone(),
+            declared_tool_count: manifest.map(|m| m.capabilities.tools.len()).unwrap_or(0),
+            generated_manifest: manifest
+                .map(crate::plugin_install::is_generated_manifest)
+                .unwrap_or(false),
         }
     }
 
@@ -7722,6 +7864,41 @@ impl KernelState {
                         orchestration_id: oid.clone(),
                     },
                     text: format!("Running orchestration {oid}."),
+                },
+                None => plan,
+            }
+        } else {
+            plan
+        };
+
+        // Deterministic Plugin Lens resolution (`docs/plugins.md` "Plugin Lens"): when the
+        // intent is `ToolInvocation` but the deterministic plan did NOT already resolve a
+        // concrete tool (`parse_tool_request` found no explicit `plugin/tool` ref), try to
+        // ground a natural "read / inspect / search / summarize the installed <plugin>"
+        // request against the LIVE installed-plugin registry. General over every installed
+        // plugin and all four read-only verbs — not a fixed phrase list; a miss leaves the
+        // deterministic clarify untouched. The resolved tool runs through the SAME
+        // `prime_invoke_tool` gates (permission/approval/audit) as any other tool, and a
+        // read-only source tool creates NO task.
+        let plan = if intent == relux_core::PrimeIntent::ToolInvocation
+            && !matches!(
+                &plan,
+                PrimePlan::Act {
+                    action: PrimeAction::InvokeTool { .. },
+                    ..
+                }
+            ) {
+            match crate::prime::resolve_source_tool_request(
+                message,
+                &self.installed_source_plugin_refs(),
+            ) {
+                Some((plugin_id, tool_name, input_json)) => PrimePlan::Act {
+                    text: format!("Inspecting the {plugin_id} plugin ({tool_name})."),
+                    action: PrimeAction::InvokeTool {
+                        plugin_id,
+                        tool_name,
+                        input_json,
+                    },
                 },
                 None => plan,
             }
@@ -16322,6 +16499,235 @@ mod tests {
             actor: "founder".to_string(),
         };
         (k, ctx)
+    }
+
+    /// Build + install a NON-bundled plugin into a real temp dir (with a README, a source
+    /// file, and a package.json that trips an MCP hint), grant `agent` the read-only source
+    /// capability, and return `(plugin_id, install_dir)`. When `declared_tool` is false the
+    /// manifest mimics a manifestless scaffold (empty tools + the generated-manifest author).
+    fn install_source_plugin(
+        k: &mut KernelState,
+        agent: &AgentId,
+        id: &str,
+        name: &str,
+        declared_tool: bool,
+    ) -> (PluginId, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("README.md"),
+            format!("# {name}\nDoes {name} things.\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src").join("main.rs"),
+            "fn main() { println!(\"hello world\"); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            "{\"name\":\"x\",\"dependencies\":{\"@modelcontextprotocol/sdk\":\"^1\"}}\n",
+        )
+        .unwrap();
+
+        let (tools, author) = if declared_tool {
+            (
+                vec![ToolDefinition {
+                    name: "x.act".to_string(),
+                    description: "does a thing".to_string(),
+                    risk: RiskLevel::Medium,
+                    permission: Permission::new(format!("tool:{id}:act")).unwrap(),
+                    approval: ApprovalRequirement::Never,
+                    timeout_secs: Some(5),
+                }],
+                "acme".to_string(),
+            )
+        } else {
+            (
+                vec![],
+                crate::plugin_install::GENERATED_MANIFEST_AUTHOR.to_string(),
+            )
+        };
+        let manifest = PluginManifest {
+            id: PluginId::new(id),
+            name: name.to_string(),
+            version: "0.1.0".to_string(),
+            kind: PluginKind::ToolSet,
+            description: format!("{name} plugin"),
+            author,
+            trust_level: TrustLevel::Community,
+            capabilities: PluginCapability {
+                tools,
+                permissions: vec![],
+            },
+            health: PluginHealth::Unknown,
+        };
+        k.install_plugin(
+            manifest,
+            PluginSourceKind::Github,
+            format!("https://github.com/acme/{id}"),
+            dir.path().display().to_string(),
+            true,
+        );
+        // Idempotently grant the single read-only source capability.
+        let _ = k.grant_permission_to_agent(
+            agent,
+            Permission::new(crate::plugin_source::SOURCE_READ_PERMISSION).unwrap(),
+        );
+        (PluginId::new(id), dir)
+    }
+
+    #[test]
+    fn manifestless_install_exposes_runnable_source_tools() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let (acme, _dir) = install_source_plugin(&mut k, &ctx.agent, "acme-repo", "Acme", false);
+
+        // The four read-only source tools are discoverable + Ready for Prime.
+        let tools = k.discover_tools(Some(&ctx.agent));
+        let names: Vec<&str> = tools
+            .iter()
+            .filter(|d| d.plugin_id == "acme-repo")
+            .map(|d| d.tool_name.as_str())
+            .collect();
+        for expected in [
+            "plugin.summary",
+            "plugin.inspect",
+            "plugin.search",
+            "plugin.read_file",
+        ] {
+            assert!(names.contains(&expected), "missing {expected}: {names:?}");
+        }
+        let summary = tools
+            .iter()
+            .find(|d| d.plugin_id == "acme-repo" && d.tool_name == "plugin.summary")
+            .unwrap();
+        assert!(matches!(summary.executable, ToolExecutability::Ready));
+        assert_eq!(summary.permission, "plugin:source:read");
+
+        // They actually RUN, returning real data — not echo, not fabricated.
+        let res = k
+            .invoke_tool(&ctx.agent, &acme, "plugin.summary", serde_json::json!({}))
+            .unwrap();
+        assert_eq!(res.output["plugin_id"], "acme-repo");
+        assert_eq!(res.output["generated_manifest"], true);
+        assert!(res.output["readme_excerpt"]
+            .as_str()
+            .unwrap()
+            .contains("Acme"));
+    }
+
+    #[test]
+    fn manifest_plugin_also_gets_source_tools() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let _ = install_source_plugin(&mut k, &ctx.agent, "acme-tools", "Acme", true);
+        let tools = k.discover_tools(Some(&ctx.agent));
+        let names: Vec<&str> = tools
+            .iter()
+            .filter(|d| d.plugin_id == "acme-tools")
+            .map(|d| d.tool_name.as_str())
+            .collect();
+        assert!(names.contains(&"x.act"), "declared tool present: {names:?}");
+        assert!(
+            names.contains(&"plugin.summary"),
+            "source tools present alongside the declared tool: {names:?}"
+        );
+    }
+
+    #[test]
+    fn source_read_file_runs_and_denies_traversal() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let (acme, _dir) = install_source_plugin(&mut k, &ctx.agent, "acme-repo", "Acme", false);
+
+        // A legitimate in-dir read works.
+        let res = k
+            .invoke_tool(
+                &ctx.agent,
+                &acme,
+                "plugin.read_file",
+                serde_json::json!({ "path": "README.md" }),
+            )
+            .unwrap();
+        assert!(res.output["content"].as_str().unwrap().contains("Acme"));
+
+        // A traversal payload fails closed — never reads outside the install dir.
+        let err = k
+            .invoke_tool(
+                &ctx.agent,
+                &acme,
+                "plugin.read_file",
+                serde_json::json!({ "path": "../../etc/passwd" }),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, KernelError::ToolRuntimeInvocation { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn source_tools_require_the_capability() {
+        let (mut k, ctx) = prime_chat_kernel();
+        let (acme, _dir) = install_source_plugin(&mut k, &ctx.agent, "acme-repo", "Acme", false);
+        // A second agent that does NOT hold `plugin:source:read`.
+        let weak = k
+            .create_agent(
+                "weak",
+                "Weak",
+                "no perms",
+                &PluginId::new("relux-adapter-local-prime"),
+                &ctx.namespace,
+                None,
+                vec![],
+            )
+            .unwrap();
+        let d = k
+            .discover_tools(Some(&weak))
+            .into_iter()
+            .find(|d| d.plugin_id == "acme-repo" && d.tool_name == "plugin.read_file")
+            .unwrap();
+        assert!(matches!(d.executable, ToolExecutability::MissingPermission));
+        let err = k
+            .invoke_tool(
+                &weak,
+                &acme,
+                "plugin.read_file",
+                serde_json::json!({ "path": "README.md" }),
+            )
+            .unwrap_err();
+        assert!(matches!(err, KernelError::PermissionDenied { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn prime_chat_reads_installed_plugin_without_a_task() {
+        let (mut k, ctx) = prime_chat_kernel();
+        // Keep `_dir` bound for the whole test — dropping the TempDir removes the install dir.
+        let (_acme, _dir) = install_source_plugin(&mut k, &ctx.agent, "acme-repo", "Acme", false);
+        let before = k.task_count();
+
+        let turn = k.prime_turn(&ctx, "summarize the acme-repo plugin").unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::ToolInvocation);
+        assert_eq!(turn.disposition, PrimeDisposition::Executed);
+        assert_eq!(
+            turn.invoked_tool.as_deref(),
+            Some("acme-repo/plugin.summary")
+        );
+        assert!(turn.tool_output.is_some());
+        // A read-only source read is NOT new work: no task, no run.
+        assert_eq!(k.task_count(), before, "a read-only source read creates no task");
+        assert!(turn.created_task.is_none());
+
+        // A natural file-read request resolves to the read_file source tool.
+        let turn = k
+            .prime_turn(&ctx, "read README.md from the acme-repo plugin")
+            .unwrap();
+        assert_eq!(
+            turn.invoked_tool.as_deref(),
+            Some("acme-repo/plugin.read_file")
+        );
+        assert!(turn.tool_output.unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .contains("Acme"));
     }
 
     /// Install a manifest as a bundled, enabled plugin (test convenience).

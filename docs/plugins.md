@@ -469,3 +469,77 @@ clickable list + a detail card with Reload / Disable buttons.
   scan, so the registry row for a given plugin is stable across
   reboots as long as the (name, version, manifest path) triple
   does not change.
+
+---
+
+# Relux kernel plugins (the `relux-*` control plane)
+
+> The sections above describe the **legacy relix mesh** plugin host
+> (`relix-plugin-v1`, subprocess + TLS loopback). The shipping product
+> — the `relux-kernel` crate + `apps/dashboard` — has its OWN, simpler
+> plugin model. This section documents that one. (`docs/RELUX_MASTER_PLAN.md`
+> §8.2/§18; `docs/relix-hermes-integration.md`.)
+
+In the Relux kernel a "plugin" is an **installed source tree** (a GitHub
+repo, a ZIP, or a local folder) copied under the plugins root. A
+first-class Relux plugin ships a `relux-plugin.json` manifest that
+declares runnable tools; a normal repo does **not**, so a manifestless
+install scaffolds a metadata-only manifest with **no** runnable tools.
+The kernel never executes downloaded code on install — it only reads the
+copied bytes.
+
+## Plugin Lens (read-only source capabilities)
+
+**Contract: if a thing is installed as a plugin, Prime must be able to
+discover it and use it somehow.** A manifestless repo used to install as
+a *dead row* — visible, but with nothing Prime could invoke. Plugin Lens
+closes that gap.
+
+Every **non-bundled** installed plugin (manifest or not) automatically
+exposes four **real, runnable, read-only** capabilities, synthesized by
+the kernel (`crates/relux-kernel/src/plugin_source.rs`) and surfaced to
+Prime exactly like any other tool:
+
+| Tool | What it does | Example chat phrase |
+|---|---|---|
+| `plugin.summary` | Manifest metadata + detected signals (`detect_hints`) + a README excerpt + file/dir counts. | "summarize the `<id>` plugin" |
+| `plugin.inspect` | A bounded file tree with sizes. Optional `{"path":"subdir","max_entries":N}`. | "list the files in the `<id>` plugin" |
+| `plugin.search` | A bounded, case-insensitive text search. `{"query":"...","max_matches":N}`. | "search the `<id>` plugin for \"api_key\"" |
+| `plugin.read_file` | One UTF-8 text file, path-confined. `{"path":"relative/path","max_bytes":N}`. | "read README.md from the `<id>` plugin" |
+
+**Safety.** These tools are `Low` risk + `Never`-approval, so they are
+directly `Ready` (no per-call prompt) — but they still require a real
+capability, the single `plugin:source:read` grant Prime holds from
+bootstrap, and they route through the unchanged `invoke_tool`
+permission/audit gate. They never write, spawn a process, or touch the
+network: only bounded reads of the install dir, confined to it by
+`plugin_source::resolve_within` (absolute paths, `..`, and symlink
+escapes are rejected fail-closed). Bundled fixtures (the shipped
+adapters/tools) are excluded — their capabilities are already known.
+
+**What this is NOT.** Plugin Lens does not auto-generate *executable*
+wrappers from source. Turning a repo into a runnable tool (an MCP server
+or a governed command tool) stays an explicit, **approval-gated**
+operator/Prime action (`capability_detect.rs` candidates +
+`ConfigureCommandTool`/`mcp_register`). Read-only inspection is safe to
+expose by default; execution is not — mirroring Hermes (`skill_view`
+read-only, `terminal` withheld) and OpenClaw's path-confined source
+discovery (`docs/reference-driven-development.md`).
+
+## How Prime uses it
+
+- **Catalogue.** The four tools appear in `GET /v1/relux/prime/tools`
+  and in Prime's decision/agent-loop catalogue, so a configured brain
+  picks them like any tool.
+- **Deterministic fallback.** With no brain, the kernel resolves natural
+  phrasing ("read/inspect/search/summarize the installed `<plugin>`")
+  against the live installed-plugin registry
+  (`prime::resolve_source_tool_request`) — general over every installed
+  plugin and all four verbs, not a fixed phrase list. A miss falls
+  through to an honest clarify; a read-only source read creates **no
+  task**.
+- **Dashboard.** The Plugins page shows a **"Prime can use (read-only)"**
+  panel on every non-bundled row listing the four capabilities, plus a
+  one-click **"Summarize with Prime"** that seeds a read-only chat turn.
+  A manifestless wrapper additionally points at the Configure step for
+  *runnable* tools.

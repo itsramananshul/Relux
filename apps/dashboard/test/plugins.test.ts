@@ -34,6 +34,10 @@ import {
   parseCommandArgs,
   capabilitySummary,
   primeUseCue,
+  primeSourceCapabilities,
+  exposesPrimeSourceCapabilities,
+  buildPluginSummarySeed,
+  PRIME_SOURCE_CAPABILITIES,
 } from "../src/plugins.ts";
 
 // The Plugins page must read HONESTLY: a generated metadata-only wrapper is never
@@ -77,6 +81,36 @@ function tool(over = {}) {
     ...over,
   };
 }
+
+// Plugin Lens: every non-bundled installed plugin exposes the four read-only source
+// capabilities; a bundled fixture exposes none (its capabilities are already known).
+test("plugin lens exposes the four read-only source capabilities for a non-bundled plugin", () => {
+  const caps = primeSourceCapabilities(plugin({ generated: true, tool_count: 0 }));
+  assert.equal(caps.length, 4);
+  const names = caps.map((c) => c.tool);
+  assert.deepEqual(names, [
+    "plugin.summary",
+    "plugin.inspect",
+    "plugin.search",
+    "plugin.read_file",
+  ]);
+  // A manifest plugin gets them too (in addition to its declared tools).
+  assert.equal(primeSourceCapabilities(plugin({ tool_count: 3 })).length, 4);
+  assert.equal(PRIME_SOURCE_CAPABILITIES.length, 4);
+});
+
+test("plugin lens is hidden for bundled/protected fixtures", () => {
+  assert.equal(exposesPrimeSourceCapabilities(plugin({ bundled: true })), false);
+  assert.equal(exposesPrimeSourceCapabilities(plugin({ protected: true })), false);
+  assert.equal(primeSourceCapabilities(plugin({ bundled: true })).length, 0);
+  assert.equal(exposesPrimeSourceCapabilities(plugin()), true);
+});
+
+test("plugin summary seed names the plugin id and is read-only", () => {
+  const seed = buildPluginSummarySeed(plugin({ id: "acme-repo" }));
+  assert.match(seed, /acme-repo/);
+  assert.match(seed, /read-only/i);
+});
 
 function mcpServer(over = {}) {
   return {

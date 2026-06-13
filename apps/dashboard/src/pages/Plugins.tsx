@@ -1,5 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
+import { stashInvestigationSeed } from "../investigateseed";
 import {
   reluxAdapters,
   reluxMcp,
@@ -59,6 +60,8 @@ import {
   pluginNextStep,
   pluginStatus,
   primeUseCue,
+  primeSourceCapabilities,
+  buildPluginSummarySeed,
   toolReadiness,
   validateMcpRegisterDraft,
   visibleTools,
@@ -2220,6 +2223,64 @@ function InvokeTool({ tool }: { tool: ReluxToolDescriptor }) {
   );
 }
 
+// "Prime can use" — the read-only Plugin Lens capabilities every non-bundled installed
+// plugin exposes (docs/plugins.md "Plugin Lens"). The kernel synthesizes `plugin.summary /
+// inspect / search / read_file` for every installed third-party plugin (manifest or not) and
+// Prime holds the single `plugin:source:read` capability, so these are runnable the moment a
+// plugin is installed — no configuration. This block makes that visible right on the row,
+// with a one-click "Summarize with Prime" that seeds a read-only chat turn (creates no task).
+// A manifestless wrapper additionally gets an honest pointer to the Configure step for
+// RUNNABLE tools (which still require a manifest/MCP/command-tool + approval).
+export function PrimeCanUseSection({ plugin, isWrapper }: { plugin: ReluxPlugin; isWrapper: boolean }) {
+  const navigate = useNavigate();
+  const caps = primeSourceCapabilities(plugin);
+  if (caps.length === 0) return null; // bundled fixtures: capabilities already known
+
+  function summarizeWithPrime() {
+    if (typeof window !== "undefined") {
+      stashInvestigationSeed(window.sessionStorage, buildPluginSummarySeed(plugin));
+    }
+    navigate("/prime");
+  }
+
+  return (
+    <div
+      className="card"
+      style={{ marginTop: 8, marginBottom: 0, padding: 8, maxWidth: 420 }}
+      data-testid="prime-can-use"
+    >
+      <div className="row" style={{ alignItems: "center", marginBottom: 4 }}>
+        <strong style={{ fontSize: 11 }}>Prime can use (read-only)</strong>
+        <div className="spacer" style={{ flex: 1 }} />
+        <button
+          className="btn ghost sm"
+          onClick={summarizeWithPrime}
+          title="Open Prime and ask it to summarize this plugin (read-only; creates no task)"
+        >
+          Summarize with Prime
+        </button>
+      </div>
+      <ul style={{ margin: 0, paddingLeft: 16, fontSize: 11 }}>
+        {caps.map((c) => (
+          <li key={c.tool} className="muted" style={{ marginBottom: 2 }}>
+            <span className="mono">{c.tool}</span> — {c.detail}
+          </li>
+        ))}
+      </ul>
+      <p className="muted" style={{ margin: "4px 0 0", fontSize: 10.5 }}>
+        Say e.g. <span className="mono">{caps[0].example}</span> in Prime chat.
+        {isWrapper && (
+          <>
+            {" "}
+            For <strong>runnable</strong> tools (beyond read-only), configure a tool / register
+            an MCP server below — those run only with your approval.
+          </>
+        )}
+      </p>
+    </div>
+  );
+}
+
 function PluginRow({
   plugin,
   onChanged,
@@ -2300,6 +2361,7 @@ function PluginRow({
               {err}
             </div>
           )}
+          <PrimeCanUseSection plugin={plugin} isWrapper={isWrapper} />
         </td>
         <td className="muted" style={{ fontSize: 12 }}>
           <div>{pluginKindLabel(plugin)}</div>

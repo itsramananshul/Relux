@@ -843,11 +843,22 @@ mod tests {
         assert!(manifest.capabilities.permissions.is_empty());
         assert_eq!(manifest.trust_level, TrustLevel::Unverified);
         assert!(manifest.description.contains("My Cool Repo"), "README summary used");
-        // No tool is runnable from a generated manifest.
-        let tools = kernel.discover_tools(None);
+        // Plugin Lens: a manifestless install now exposes the four READ-ONLY source tools
+        // (`docs/plugins.md` "Plugin Lens") — closing the old "installed but dead row" gap —
+        // but NO execution tool, since the generated manifest declares none.
+        let tools: Vec<_> = kernel
+            .discover_tools(None)
+            .into_iter()
+            .filter(|t| t.plugin_id == installed.id.as_str())
+            .collect();
+        let names: Vec<&str> = tools.iter().map(|t| t.tool_name.as_str()).collect();
         assert!(
-            !tools.iter().any(|t| t.plugin_id == installed.id.as_str()),
-            "generated plugin exposes no runnable tools"
+            names.contains(&"plugin.summary") && names.contains(&"plugin.read_file"),
+            "manifestless install exposes read-only source tools: {names:?}"
+        );
+        assert!(
+            tools.iter().all(|t| t.tool_name.starts_with("plugin.")),
+            "a generated manifest exposes only source tools, no execution tool: {names:?}"
         );
 
         // A real manifest in the same folder is still preferred over scaffolding.

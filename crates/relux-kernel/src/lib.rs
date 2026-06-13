@@ -37,6 +37,7 @@ pub mod mcp_proposal;
 pub mod mcp_sampling;
 pub mod mcp_stdio;
 pub mod plugin_install;
+pub mod plugin_source;
 pub mod plugin_tool_config;
 pub mod prime;
 pub mod prime_after_action;
@@ -123,6 +124,7 @@ pub use plugin_install::{
     install_from_dir, install_from_github, install_from_zip, is_generated_manifest, list_installed,
     refresh_bundled_plugins, remove_plugin, GENERATED_MANIFEST_AUTHOR,
 };
+pub use plugin_source::{is_source_tool, SourceToolSpec, SOURCE_READ_PERMISSION, SOURCE_TOOLS};
 pub use command_tool_config::{parse_command_tool_input, CommandToolDraft};
 pub use prime_candidate_config::{
     command_tool_body, is_activatable, parse_candidate_config_request, resolve_candidate,

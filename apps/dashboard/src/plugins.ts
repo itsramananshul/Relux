@@ -95,6 +95,73 @@ export function canConfigureTools(p: ReluxPlugin): boolean {
   return category === "wrapper" || category === "toolset";
 }
 
+// --- Plugin Lens: the read-only source capabilities Prime gets on EVERY non-bundled
+// install (docs/plugins.md "Plugin Lens (read-only source capabilities)"). The kernel
+// synthesizes these four tools for every installed third-party plugin — manifest or not —
+// and Prime holds the single `plugin:source:read` capability, so they are runnable
+// immediately and need no configuration. This mirrors the backend exactly (it does not
+// fetch — the guarantee is structural), so the page can honestly say "Prime can use" the
+// moment a plugin is installed, closing the old "installed but dead row" gap.
+
+export interface PrimeSourceCapability {
+  // The bare tool name as it appears in Prime's catalogue (e.g. "plugin.summary").
+  tool: string;
+  // A short human label for the UI.
+  label: string;
+  // What it does, read-only.
+  detail: string;
+  // An example natural-language phrase the operator can say to Prime.
+  example: string;
+}
+
+// The four read-only source capabilities, in the order they are most useful.
+export const PRIME_SOURCE_CAPABILITIES: readonly PrimeSourceCapability[] = [
+  {
+    tool: "plugin.summary",
+    label: "Summarize",
+    detail: "What this plugin is: manifest metadata, detected signals, a README excerpt, and file counts.",
+    example: "summarize this plugin",
+  },
+  {
+    tool: "plugin.inspect",
+    label: "Inspect files",
+    detail: "List the plugin's file tree with sizes (read-only).",
+    example: "list the files in this plugin",
+  },
+  {
+    tool: "plugin.search",
+    label: "Search",
+    detail: "Search the plugin's source text for a string (read-only).",
+    example: "search this plugin for \"api_key\"",
+  },
+  {
+    tool: "plugin.read_file",
+    label: "Read a file",
+    detail: "Read one UTF-8 text file, path-confined to the plugin's directory (read-only).",
+    example: "read README.md from this plugin",
+  },
+] as const;
+
+// Whether Prime exposes the read-only source capabilities for this plugin. True for every
+// installed NON-bundled plugin (bundled fixtures ship known capabilities, so they are
+// excluded — matching the kernel's `discover_tools` gate).
+export function exposesPrimeSourceCapabilities(p: ReluxPlugin): boolean {
+  return !p.protected && !p.bundled;
+}
+
+// The capabilities to render for this plugin (empty for a bundled fixture).
+export function primeSourceCapabilities(p: ReluxPlugin): readonly PrimeSourceCapability[] {
+  return exposesPrimeSourceCapabilities(p) ? PRIME_SOURCE_CAPABILITIES : [];
+}
+
+// Build the one-shot Prime chat seed for "summarize this installed plugin". Routed through
+// the SAME consume-once handoff the Investigate card uses (investigateseed.ts), and resolves
+// — via the brain or the deterministic Plugin Lens resolver — to a read-only `plugin.summary`
+// run that creates no task. The plugin id is named explicitly so resolution is unambiguous.
+export function buildPluginSummarySeed(p: ReluxPlugin): string {
+  return `Summarize the ${p.id} plugin — what is it and what can it do? (read-only)`;
+}
+
 // A friendly group label for a read-only source hint kind (api.ts ReluxPluginHint).
 // These describe what Relux DETECTED in an imported source so the operator can
 // decide how to wire it up. They are advisory only: Relux never turns a hint into
