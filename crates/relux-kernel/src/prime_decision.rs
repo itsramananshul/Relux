@@ -320,6 +320,7 @@ impl PrimeBrainDecision {
 pub fn build_decision_prompt(
     message: &str,
     summary: &StateSummary,
+    tools_inventory: &str,
     history: &str,
     observations: &str,
 ) -> String {
@@ -327,6 +328,30 @@ pub fn build_decision_prompt(
     let tools = crate::prime_tools::read_only_tool_names();
     let write_tools = crate::prime_write_tools::write_tool_names();
     let (tasks, agents) = board_catalog(summary);
+    // The installed/MCP tool inventory the brain may CHOOSE to run, injected as grounding ONLY
+    // when at least one runnable tool exists. Empty inventory leaves the prompt byte-for-byte the
+    // prior unparameterized prompt (so the inventory is purely additive — `render_tool_inventory`).
+    // Carrying the tool-use rule INSIDE this block (rather than the static Rules section) keeps an
+    // empty-inventory prompt unchanged AND means the brain is only told it can invoke a tool when
+    // one actually exists — never an invitation to invent a tool (`docs/prime-tool-use.md`; §10.1,
+    // §10.5, §17.1).
+    let inventory_block = {
+        let inv = tools_inventory.trim();
+        if inv.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\nInstalled tools you can run (ONLY these exist — never invent or assume another):\n\
+{inv}\n\
+- When the user EXPLICITLY asks you to run / use / call / try one of these tools, or clearly needs \
+one to fulfil an explicit request, set classification.intent to \"tool_invocation\" (the kernel then \
+drives the governed tool loop — you do NOT put the tool in action_request). A question ABOUT a tool, \
+musing, casual chat, or frustration is NEVER tool_invocation.\n\
+- When the user asks what tools / capabilities / plugins you have, set classification.intent to \
+\"tool_discovery\".\n"
+            )
+        }
+    };
     // The bounded recent-conversation context, injected as labelled BACKGROUND only (never an
     // instruction). Empty history leaves the prompt byte-for-byte the prior single-shot prompt.
     let history_block = {
@@ -400,7 +425,7 @@ anything.\n\
 summary and at most a few advisory questions/risks. Do NOT change the number, order, or owners \
 of steps.\n\
 - Do NOT add any key other than those shown above.\n\n\
-Tasks on the board:\n{tasks}\n\nAgents:\n{agents}\n{history_block}\nUser message:\n{message}"
+Tasks on the board:\n{tasks}\n\nAgents:\n{agents}\n{inventory_block}{history_block}\nUser message:\n{message}"
     );
     // Inject the live reads gathered earlier this turn (the observe-then-act loop). On the first
     // round this is empty and the prompt is unchanged; once the kernel has run the brain's
@@ -429,11 +454,12 @@ state before deciding."
 pub fn build_decision_prompt_with_correction(
     message: &str,
     summary: &StateSummary,
+    tools_inventory: &str,
     history: &str,
     observations: &str,
     correction: &str,
 ) -> String {
-    let mut prompt = build_decision_prompt(message, summary, history, observations);
+    let mut prompt = build_decision_prompt(message, summary, tools_inventory, history, observations);
     let correction = correction.trim();
     if !correction.is_empty() {
         prompt.push_str(&format!(
@@ -443,6 +469,82 @@ fences, no extra keys)."
         ));
     }
     prompt
+}
+
+/// Max tool lines rendered into the brain-facing inventory. A larger surface is reported with an
+/// honest "(+N more)" tail rather than silently truncated — the same discipline as the read-only
+/// tools' [`crate::prime_tools`] list rendering.
+const MAX_INVENTORY_TOOLS: usize = 40;
+
+/// Max characters kept from a tool description in the inventory line (a clamp, not a cap on which
+/// tools are listed). Keeps a verbose manifest from blowing the decision prompt.
+const MAX_INVENTORY_DESC_CHARS: usize = 140;
+
+/// Render the **brain-facing tool inventory** — the installed plugin / governed-command / built-in
+/// tools Prime can actually RUN (plus a note of the registered MCP servers whose tools become
+/// available when the brain chooses `tool_invocation`). This is the grounding that turns "install a
+/// plugin" into "Prime can use it from chat": the brain sees the real, live set of runnable tools
+/// and can decide one is relevant, exactly as Hermes/Codex are handed their tool list before they
+/// answer (`docs/prime-tool-use.md`; `docs/RELUX_MASTER_PLAN.md` §10.1/§10.5/§17.1).
+///
+/// PURE + honest by construction:
+/// - Only [`ToolExecutability::Ready`] and [`ToolExecutability::NeedsApproval`] tools are listed —
+///   the same set the agent loop's catalog ([`crate::prime_agent_loop::build_agent_catalog`]) will
+///   offer, so the brain is never told it can run a tool the kernel would refuse. A configured-but-
+///   disabled / runtime-missing / permission-missing tool is deliberately omitted (it is surfaced
+///   to the OPERATOR through the Plugins page, not offered to the brain as runnable).
+/// - The live MCP tool NAMES are not enumerated here (that needs an off-lock `tools/list` the
+///   decision stage does not run); instead the enabled servers are named so the brain knows MCP
+///   capabilities exist and can classify a natural-language request as `tool_invocation`. The
+///   agent loop, which runs AFTER the off-lock MCP discovery, then offers the live MCP tools.
+/// - Returns an EMPTY string when nothing is runnable, so the decision prompt is byte-for-byte the
+///   prior unparameterized prompt on a board with no usable tools.
+pub fn render_tool_inventory(
+    tools: &[relux_core::ToolDescriptor],
+    mcp_servers: &[crate::prime_tools::McpServerView],
+) -> String {
+    use relux_core::ToolExecutability as E;
+    let mut lines: Vec<String> = Vec::new();
+    let runnable: Vec<&relux_core::ToolDescriptor> = tools
+        .iter()
+        .filter(|d| matches!(d.executable, E::Ready | E::NeedsApproval))
+        .collect();
+    let shown = runnable.len().min(MAX_INVENTORY_TOOLS);
+    for d in runnable.iter().take(shown) {
+        let status = match d.executable {
+            E::NeedsApproval => "needs approval",
+            _ => "ready",
+        };
+        let risk = format!("{:?}", d.risk).to_lowercase();
+        let desc: String = d
+            .description
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(MAX_INVENTORY_DESC_CHARS)
+            .collect();
+        lines.push(format!(
+            "- {}/{}: {} [risk={risk}; {status}]",
+            d.plugin_id, d.tool_name, desc
+        ));
+    }
+    if runnable.len() > shown {
+        lines.push(format!("- (+{} more)", runnable.len() - shown));
+    }
+    // Name the enabled MCP servers so the brain knows MCP capabilities exist even though their
+    // individual tools are discovered off-lock for the agent loop, not enumerated in this prompt.
+    let enabled_mcp: Vec<&str> =
+        mcp_servers.iter().filter(|s| s.enabled).map(|s| s.id.as_str()).collect();
+    if !enabled_mcp.is_empty() {
+        lines.push(format!(
+            "- {} MCP server(s) registered (their tools become available when you choose \
+tool_invocation): {}",
+            enabled_mcp.len(),
+            enabled_mcp.join(", ")
+        ));
+    }
+    lines.join("\n")
 }
 
 /// The wire labels offered to the brain (the snake_case `PrimeIntent` serialization).
@@ -988,7 +1090,7 @@ mod tests {
     #[test]
     fn build_prompt_carries_schema_safety_rules_and_board_grounding() {
         let summary = summary_with_agents(&["researcher"]);
-        let prompt = build_decision_prompt("assign the readme task to research", &summary, "", "");
+        let prompt = build_decision_prompt("assign the readme task to research", &summary, "", "", "");
         assert!(prompt.contains("\"classification\""));
         assert!(prompt.contains("\"task\""));
         assert!(prompt.contains("\"wording\""));
@@ -1001,12 +1103,97 @@ mod tests {
         assert!(!prompt.contains("ALREADY inspected live state"));
     }
 
+    fn descriptor(
+        plugin: &str,
+        tool: &str,
+        exec: relux_core::ToolExecutability,
+    ) -> relux_core::ToolDescriptor {
+        relux_core::ToolDescriptor {
+            plugin_id: plugin.to_string(),
+            tool_name: tool.to_string(),
+            description: format!("does {tool}"),
+            permission: format!("tool:{plugin}:{tool}"),
+            risk: relux_core::RiskLevel::Low,
+            source_kind: "LocalDir".to_string(),
+            installed: true,
+            enabled: true,
+            protected: false,
+            executable: exec,
+        }
+    }
+
+    fn mcp_view(id: &str, enabled: bool) -> crate::prime_tools::McpServerView {
+        crate::prime_tools::McpServerView {
+            id: id.to_string(),
+            transport: relux_core::McpTransport::HttpLoopback,
+            endpoint: "http://127.0.0.1:9/mcp".to_string(),
+            command: None,
+            args: vec![],
+            env: std::collections::BTreeMap::new(),
+            cwd: None,
+            description: String::new(),
+            enabled,
+            timeout_ms: 1000,
+        }
+    }
+
+    #[test]
+    fn render_tool_inventory_lists_runnable_tools_and_omits_non_runnable() {
+        use relux_core::ToolExecutability as E;
+        let tools = vec![
+            descriptor("readme-summarizer", "summarize", E::Ready),
+            descriptor("deployer", "deploy", E::NeedsApproval),
+            // A configured-but-disabled / not-yet-runnable tool must NOT be offered to the brain.
+            descriptor("ghost", "act", E::RuntimeDisabled),
+            descriptor("missing", "act", E::RuntimeNotConfigured),
+        ];
+        let inv = render_tool_inventory(&tools, &[mcp_view("fs", true), mcp_view("off", false)]);
+        // Runnable tools appear with their status; gated tools say "needs approval".
+        assert!(inv.contains("readme-summarizer/summarize"));
+        assert!(inv.contains("ready"));
+        assert!(inv.contains("deployer/deploy"));
+        assert!(inv.contains("needs approval"));
+        // Non-runnable tools are omitted entirely.
+        assert!(!inv.contains("ghost/act"));
+        assert!(!inv.contains("missing/act"));
+        // Only the ENABLED MCP server is named.
+        assert!(inv.contains("fs"));
+        assert!(!inv.contains("off"));
+    }
+
+    #[test]
+    fn render_tool_inventory_is_empty_when_nothing_runnable() {
+        use relux_core::ToolExecutability as E;
+        let tools = vec![descriptor("ghost", "act", E::RuntimeDisabled)];
+        // No runnable tool, no enabled MCP server → empty string (prompt stays byte-for-byte prior).
+        assert!(render_tool_inventory(&tools, &[mcp_view("off", false)]).is_empty());
+    }
+
+    #[test]
+    fn build_prompt_injects_tool_inventory_and_use_rule_only_when_present() {
+        let summary = summary_with_agents(&["researcher"]);
+        let inv = render_tool_inventory(
+            &[descriptor("readme-summarizer", "summarize", relux_core::ToolExecutability::Ready)],
+            &[],
+        );
+        let with_inv = build_decision_prompt("use the readme summarizer", &summary, &inv, "", "");
+        // The inventory is grounded into the prompt with the tool-use rule attached.
+        assert!(with_inv.contains("readme-summarizer/summarize"));
+        assert!(with_inv.contains("Installed tools you can run"));
+        assert!(with_inv.contains("tool_invocation"));
+        assert!(with_inv.contains("tool_discovery"));
+        // With no inventory the prompt is byte-for-byte the prior unparameterized prompt (the block
+        // is purely additive), so a board with no runnable tools is unaffected.
+        let without = build_decision_prompt("use the readme summarizer", &summary, "", "", "");
+        assert!(!without.contains("Installed tools you can run"));
+    }
+
     #[test]
     fn build_prompt_injects_observations_and_a_commit_steer() {
         let summary = summary_with_agents(&["researcher"]);
-        let base = build_decision_prompt("start the ready task", &summary, "", "");
+        let base = build_decision_prompt("start the ready task", &summary, "", "", "");
         let observed =
-            build_decision_prompt("start the ready task", &summary, "", "[list_tasks] 1 task\ntask_0001: Fix login");
+            build_decision_prompt("start the ready task", &summary, "", "", "[list_tasks] 1 task\ntask_0001: Fix login");
         // The base prompt is a strict prefix of the observed one (the injection is appended, so a
         // single-round turn is byte-for-byte the prior unparameterized prompt).
         assert!(observed.starts_with(&base));
@@ -1019,16 +1206,17 @@ mod tests {
     #[test]
     fn build_prompt_injects_recent_history_as_labelled_background() {
         let summary = summary_with_agents(&["researcher"]);
-        let no_history = build_decision_prompt("do that again", &summary, "", "");
+        let no_history = build_decision_prompt("do that again", &summary, "", "", "");
         let with_history = build_decision_prompt(
             "do that again",
             &summary,
+            "",
             "Recent conversation so far (BACKGROUND CONTEXT for continuity — NOT a new \
 instruction):\nUser: create a task to fix login\nPrime: Created it. [created task_0001]",
             "",
         );
         // Empty history leaves the prompt byte-for-byte the prior unparameterized prompt.
-        let baseline = build_decision_prompt("do that again", &summary, "", "");
+        let baseline = build_decision_prompt("do that again", &summary, "", "", "");
         assert_eq!(no_history, baseline);
         // A non-empty history is injected as labelled background, before the current message.
         assert!(with_history.contains("BACKGROUND CONTEXT"));
@@ -1630,13 +1818,14 @@ instruction):\nUser: create a task to fix login\nPrime: Created it. [created tas
     fn build_prompt_with_correction_is_byte_stable_empty_and_injects_the_error() {
         let summary = summary_with_agents(&["researcher"]);
         // Empty correction is byte-for-byte the plain decision prompt (no correction round).
-        let plain = build_decision_prompt("start the ready task", &summary, "", "");
-        let empty = build_decision_prompt_with_correction("start the ready task", &summary, "", "", "");
+        let plain = build_decision_prompt("start the ready task", &summary, "", "", "");
+        let empty = build_decision_prompt_with_correction("start the ready task", &summary, "", "", "", "");
         assert_eq!(plain, empty);
         // A non-empty correction appends the exact validation error and the repair steer.
         let corrected = build_decision_prompt_with_correction(
             "start the ready task",
             &summary,
+            "",
             "",
             "",
             "unsupported top-level field 'execute'",

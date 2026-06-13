@@ -238,6 +238,7 @@ async fn serve() -> Result<(), KernelError> {
     println!("   GET    /v1/relux/prime/agent-policy        (chat agent-loop autonomy limits + resolved profiles)");
     println!("   PUT    /v1/relux/prime/agent-policy        {{ \"max_tool_calls\"?, \"max_brain_rounds\"?, \"max_duration_secs\"?, \"max_tool_plan_steps\"?, \"max_orchestration_steps\"?, \"max_context_rounds\"?, \"max_active_jobs\"?, \"extended_*\"? }}");
     println!("   POST   /v1/relux/prime/agent/continue      {{ \"continuation_id\": \"cont_0001\", \"extended\"? }}  (resume a paused agent loop)");
+    println!("   GET    /v1/relux/prime/tools               (tools Prime can run from chat: installed + live MCP, with gated/ready status)");
     println!("   POST   /v1/relux/tasks                     {{ \"title\": \"...\" }}");
     println!("   POST   /v1/relux/tasks/:id/start");
     println!("   POST   /v1/relux/tasks/:id/execute-assigned");
@@ -532,6 +533,7 @@ fn protected_router() -> Router<AppState> {
         .route("/v1/relux/prime/autonomy/tick", post(run_autonomy_tick))
         .route("/v1/relux/prime/agent-policy", get(get_agent_policy).put(update_agent_policy).patch(update_agent_policy))
         .route("/v1/relux/prime/agent/continue", post(continue_prime_agent_loop))
+        .route("/v1/relux/prime/tools", get(prime_tools))
         // Multi-agent orchestration (Prime as orchestrator).
         .route(
             "/v1/relux/prime/orchestrations",
@@ -4010,6 +4012,50 @@ struct ReplyPolishProvenance {
     source: String,
 }
 
+/// GET `/v1/relux/prime/tools` — the inventory of tools **Prime can actually run from chat**: the
+/// installed plugin / governed-command / built-in tools that are `ready` or `needs_approval`, PLUS
+/// the live tools of every enabled MCP server (discovered off-lock). This is the EXACT catalog the
+/// agent loop offers the brain ([`KernelState::prime_agent_catalog`] → `build_agent_catalog`,
+/// filtered to the runnable set), so the view never lists a tool Prime cannot use and never hides
+/// one it can. `gated == true` means a per-call approval (or a standing allow-always grant) is
+/// required before it runs; `source` is `"mcp"` or `"plugin"`. This is what makes an
+/// installed/configured plugin a real, visible capability for the operator and for Prime
+/// (`docs/prime-tool-use.md`; `docs/RELUX_MASTER_PLAN.md` §10.1/§10.5/§17.1).
+///
+/// The bounded `tools/list` discovery runs OUTSIDE the kernel lock (exactly like the agent loop's
+/// catalog acquisition), so the lock never spans a network read; an unreachable / disabled server
+/// simply contributes no tools (fail-closed, never a fabricated entry).
+async fn prime_tools(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<relux_kernel::AgentTool>>, ApiError> {
+    // 1. Snapshot the registered MCP servers under a short read lock.
+    let servers = {
+        let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let store = SqliteStore::open(&state.db_path)?;
+        let mut kernel = store.load()?;
+        let ctx = crate::ensure_bootstrapped(&mut kernel)?;
+        kernel.context_snapshot(&ctx).mcp_servers
+    };
+    // 2. Discover each enabled server's live tools OFF-LOCK (bounded `tools/list`).
+    let proposal_mcp_catalog = if servers.iter().any(|s| s.enabled) {
+        tokio::task::spawn_blocking(move || relux_kernel::discover_proposal_mcp_catalog(&servers))
+            .await
+            .unwrap_or_default()
+    } else {
+        relux_kernel::ProposalMcpCatalog::default()
+    };
+    // 3. Build the runnable catalog under a short lock with the discovered MCP tools injected.
+    let catalog = {
+        let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let store = SqliteStore::open(&state.db_path)?;
+        let mut kernel = store.load()?;
+        kernel.set_proposal_mcp_catalog(proposal_mcp_catalog);
+        let ctx = crate::ensure_bootstrapped(&mut kernel)?;
+        kernel.prime_agent_catalog(&ctx)
+    };
+    Ok(Json(catalog))
+}
+
 /// Run exactly one durable Prime turn (`docs/RELUX_MASTER_PLAN.md` section 10) over
 /// HTTP: the same grounded `prime_turn` the CLI uses, so a greeting stays a
 /// greeting and "create a task to X" creates that task. Persisted under the lock
@@ -4064,7 +4110,14 @@ async fn run_prime(
     // not the bare answer. The board summary grounds an assignment/update against real ids. The
     // kernel re-decides the continuation authoritatively under its own lock; this preview only
     // steers which message the (slow, off-lock) brain is asked about.
-    let (continuation, board_summary, context_snapshot, recent_history, context_rounds) = {
+    let (
+        continuation,
+        board_summary,
+        context_snapshot,
+        recent_history,
+        context_rounds,
+        tools_inventory,
+    ) = {
         let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut kernel = {
             let store = SqliteStore::open(&state.db_path)?;
@@ -4076,6 +4129,14 @@ async fn run_prime(
         // Snapshot the read-only context the governed tool loop reads from (the whole board,
         // bounded), taken under THIS lock so the loop's brain rounds run lock-free below.
         let snapshot = kernel.context_snapshot(&ctx);
+        // The brain-facing inventory of RUNNABLE installed tools (+ enabled MCP servers), rendered
+        // under this lock from the live tool registry so the (off-lock) decision brain can SEE the
+        // tools it may choose and classify an explicit "use the X tool" request as tool_invocation.
+        // This is what makes an installed/configured plugin actually usable from chat instead of a
+        // dead row on the Plugins page (`docs/prime-tool-use.md`; §10.1/§10.5/§17.1). Cheap +
+        // in-memory; live MCP tool NAMES are discovered off-lock for the agent loop below.
+        let inventory =
+            relux_kernel::render_tool_inventory(&kernel.discover_tools(None), &snapshot.mcp_servers);
         // The bounded, secret-redacted recent-conversation context, so the (slow, off-lock) brain
         // can interpret a follow-up in context. Advisory BACKGROUND only — it is injected into the
         // decision prompt and never reaches the deterministic classifier or any gate.
@@ -4084,7 +4145,7 @@ async fn run_prime(
         // the observe-then-act loop and the sidecar context loop both run under (replacing the bare
         // `MAX_TOOL_ROUNDS` module constant). Read under this lock; the loops below run lock-free.
         let rounds = kernel.prime_agent_policy.context_rounds(false);
-        (preview, summary, snapshot, history, rounds)
+        (preview, summary, snapshot, history, rounds, inventory)
     };
     let is_continuation = continuation.is_some();
     // The message the brain reasons about: the COMBINED message on a continuation, else raw.
@@ -4114,10 +4175,33 @@ async fn run_prime(
         &context_snapshot,
         &decision_message,
         &board_summary,
+        &tools_inventory,
         &recent_history,
         context_rounds,
     )
     .await;
+
+    // 0c-bis. The EFFECTIVE intent for this turn — brain-first, with the deterministic keyword
+    // classifier as the fallback SAFETY RAIL (`docs/RELUX_MASTER_PLAN.md` §10.1; this is the rule
+    // in `docs/reference-driven-development.md`: keyword rules are fallback rails, never the primary
+    // brain). When a brain proposed a classification it is reconciled through the UNCHANGED
+    // fail-closed `reconcile_intent` gate (which keeps guarded chat — a question/musing/insult —
+    // from EVER being promoted to a sensitive intent like `tool_invocation`); otherwise the bare
+    // keyword intent stands. This single derived intent is what gates the off-lock MCP discovery and
+    // the agent loop below, so a tool request the brain recognises (e.g. "summarise this with the
+    // readme tool") enters the governed tool path even when the keyword rail alone would miss it,
+    // while normal chat still never does.
+    let keyword_intent = relux_kernel::classify_intent(&message);
+    let effective_intent = match decision.as_ref().and_then(|d| d.classification.as_ref()) {
+        Some(p) => relux_kernel::reconcile_intent(keyword_intent.clone(), p, &message).0,
+        None => keyword_intent,
+    };
+    let effective_is_tool_turn = matches!(
+        effective_intent,
+        relux_core::PrimeIntent::ToolInvocation
+            | relux_core::PrimeIntent::ToolPlanRequest
+            | relux_core::PrimeIntent::ToolDiscovery
+    );
 
     // 0d. Derive the intent proposal + the slot bundle. PREFERRED: the one unified decision
     // (no further brain calls this turn). FALLBACK: when the unified call produced nothing
@@ -4298,17 +4382,20 @@ async fn run_prime(
         }
     }
 
-    // 0e. Off-lock MCP tool discovery for grounding an `mcp:<server>/<tool>` reference the
-    // user named in chat — BOTH a multi-tool-plan proposal (each step) AND a single explicit
-    // MCP tool invocation (`prime_invoke_tool` resolves the one ref against this catalog). We
-    // run that bounded `tools/list` HERE, OUTSIDE the lock (exactly like the context
-    // snapshot's off-lock reads), and inject the result so `live_tool_catalog` grounds without
-    // the kernel lock ever spanning a network read. Gated cheaply: only when the message
-    // actually carries an `mcp:` reference AND at least one MCP server is enabled — only an
-    // `mcp:` token can resolve to an MCP tool, so no other message pays the discovery cost. A
-    // failed/empty discovery ⇒ the reference grounds as `unavailable` (fail-closed).
-    // `docs/mcp.md` "Invocation" + "Run-driven multi-tool plan"; §10.5, §17.1.
-    let proposal_mcp_catalog = if decision_message.to_ascii_lowercase().contains("mcp:")
+    // 0e. Off-lock MCP tool discovery so the agent loop / plan proposal can ground against the live
+    // MCP tools — BOTH a multi-tool-plan proposal (each step) AND an MCP tool invocation
+    // (`prime_invoke_tool` / the agent loop resolve a ref against this catalog). We run that bounded
+    // `tools/list` HERE, OUTSIDE the lock (exactly like the context snapshot's off-lock reads), and
+    // inject the result so `live_tool_catalog` grounds without the kernel lock ever spanning a
+    // network read. Gated so only a plausibly-tool-using turn pays the discovery cost: the
+    // brain-derived `effective_is_tool_turn` (so a natural-language tool request like "search my
+    // notes" — NOT just a literal `mcp:` token — discovers the live tools), OR a literal `mcp:`
+    // reference, AND at least one MCP server is enabled. Normal chat / a greeting / frustration is
+    // not a tool turn and pays nothing. A failed/empty discovery ⇒ the reference grounds as
+    // `unavailable` (fail-closed). `docs/prime-tool-use.md`; `docs/mcp.md` "Invocation" +
+    // "Run-driven multi-tool plan"; §10.5, §17.1.
+    let proposal_mcp_catalog = if (effective_is_tool_turn
+        || decision_message.to_ascii_lowercase().contains("mcp:"))
         && context_snapshot.mcp_servers.iter().any(|s| s.enabled)
     {
         let servers = context_snapshot.mcp_servers.clone();
@@ -4320,20 +4407,24 @@ async fn run_prime(
     };
 
     // 0f. PRIME AGENT LOOP v1 — a bounded think → tool → observe → respond loop for an EXPLICIT
-    // tool-request turn. Engaged ONLY when (a) a brain is configured and (b) the deterministic
-    // classifier says the user explicitly asked to use / check / call a tool (`ToolInvocation`),
-    // and never on a continuation. That gate is the safety wall: normal chat, a greeting,
-    // frustration / profanity, a vague idea, a Q&A or a brainstorm classifies as some other intent
-    // and NEVER enters the loop — it stays conversational. Inside the loop the brain may call an
-    // allowed tool, observe its real output, and continue, bounded by the operator's CONFIGURABLE
-    // autonomy policy (`AgentLimits` — standard or, when the user explicitly asks to keep working,
-    // the higher extended profile; never an infinite loop), pausing with the EXISTING per-call
-    // approval card on a gated tool with no standing grant. Every execution flows through the UNCHANGED
-    // `prime_invoke_tool` gate (`prime_agent_step`), so there is no second security model. When the
-    // brain never picks a tool the loop returns `None` and the normal turn path below runs
-    // unchanged (`docs/mcp.md` "Prime Agent Loop"; §10.5, §17.1).
+    // tool-request turn. Engaged ONLY when (a) a brain is configured and (b) the EFFECTIVE intent
+    // (brain-first, reconciled through the fail-closed `reconcile_intent` gate, keyword as the
+    // fallback rail — see 0c-bis) is `ToolInvocation`, and never on a continuation. That gate is the
+    // safety wall and it is now BRAIN-DRIVEN per §10.1 ("the keyword classifier is a fallback safety
+    // rail, not the primary brain"): normal chat, a greeting, frustration / profanity, a vague idea,
+    // a Q&A or a brainstorm reconciles to some other intent — and crucially `reconcile_intent` will
+    // NOT let guarded chat be promoted to the sensitive `tool_invocation`, so it still NEVER enters
+    // the loop — while an explicit tool request the brain recognises (but the bare keyword rail would
+    // miss) now does. Inside the loop the brain may call an allowed tool, observe its real output,
+    // and continue, bounded by the operator's CONFIGURABLE autonomy policy (`AgentLimits` — standard
+    // or, when the user explicitly asks to keep working, the higher extended profile; never an
+    // infinite loop), pausing with the EXISTING per-call approval card on a gated tool with no
+    // standing grant. Every execution flows through the UNCHANGED `prime_invoke_tool` gate
+    // (`prime_agent_step`), so there is no second security model. When the brain never picks a tool
+    // the loop returns `None` and the normal turn path below runs unchanged
+    // (`docs/prime-tool-use.md`; `docs/mcp.md` "Prime Agent Loop"; §10.1, §10.5, §17.1).
     let agent_loop_turn = if !is_continuation
-        && matches!(relux_kernel::classify_intent(&message), relux_core::PrimeIntent::ToolInvocation)
+        && matches!(effective_intent, relux_core::PrimeIntent::ToolInvocation)
         && !matches!(brain, relux_kernel::PrimeBrain::Local)
     {
         drive_prime_agent_loop(
@@ -5250,11 +5341,13 @@ fn parse_cli_permission_slots(
 /// boundary as the specialized slot paths. Any failure → `None` (the caller falls back to the
 /// specialized intent / slot / wording calls). The kernel still validates each section against
 /// the live state behind the fail-closed gate.
+#[allow(clippy::too_many_arguments)]
 async fn decide_prime_via_cli(
     brain: relux_kernel::PrimeBrain,
     status: Option<relux_core::AdapterRuntimeStatus>,
     message: &str,
     summary: &relux_core::StateSummary,
+    tools_inventory: &str,
     history: &str,
     observations: &str,
     correction: &str,
@@ -5265,6 +5358,7 @@ async fn decide_prime_via_cli(
         relux_kernel::build_decision_prompt_with_correction(
             message,
             summary,
+            tools_inventory,
             history,
             observations,
             correction,
@@ -5305,6 +5399,7 @@ async fn decide_prime_with_observation(
     snapshot: &relux_kernel::ContextSnapshot,
     message: &str,
     summary: &relux_core::StateSummary,
+    tools_inventory: &str,
     history: &str,
     max_context_reads: usize,
 ) -> (Option<relux_kernel::PrimeBrainDecision>, Vec<relux_kernel::ContextRead>) {
@@ -5321,6 +5416,7 @@ async fn decide_prime_with_observation(
                     ai_config,
                     message,
                     summary,
+                    tools_inventory,
                     history,
                     &observations,
                     &correction,
@@ -5333,6 +5429,7 @@ async fn decide_prime_with_observation(
                     cli_status.clone(),
                     message,
                     summary,
+                    tools_inventory,
                     history,
                     &observations,
                     &correction,
@@ -12224,6 +12321,26 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn prime_tools_route_lists_runnable_tools_prime_can_use() {
+        // The Prime tool-inventory route returns the EXACT runnable catalog the agent loop offers:
+        // a freshly bootstrapped kernel ships the built-in status tool as `ready`, so it must appear
+        // with source=plugin and gated=false. This is the surface that makes an installed tool a
+        // visible, usable capability rather than a dead Plugins-page row (`docs/prime-tool-use.md`).
+        let (state, _dir) = auth_state(true);
+        let (status, _, body) = call(&state, "GET", "/v1/relux/prime/tools", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let tools: Vec<serde_json::Value> =
+            serde_json::from_str(&body).expect("json array");
+        let status_tool = tools
+            .iter()
+            .find(|t| t["tool_name"] == "status.summary")
+            .expect("bundled status tool is offered");
+        assert_eq!(status_tool["source"], "plugin");
+        assert_eq!(status_tool["gated"], false, "a low-risk built-in runs without approval");
+        assert!(status_tool["label"].as_str().unwrap().contains("status.summary"));
     }
 
     #[tokio::test]

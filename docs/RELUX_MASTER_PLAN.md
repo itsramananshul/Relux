@@ -1924,6 +1924,40 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **Unreleased (on `main`, post-v0.1.29)** — **Prime tool/plugin awareness + brain-driven tool use
+  (closes the "installed tool is unusable from chat" gap).** Installing/configuring a plugin tool was
+  largely inert: Prime would only use a tool if the *deterministic keyword classifier* matched the
+  message, the live MCP `tools/list` discovery only ran when the message literally contained `"mcp:"`,
+  and the decision brain was never handed the installed-tool inventory — so a user could install a
+  capability and still not get Prime to use it from natural language. This slice makes an installed/
+  configured tool a real, usable capability (`docs/prime-tool-use.md`; built reference-first per
+  `docs/reference-driven-development.md` against Hermes' "hand the model its tool list, then loop"
+  shape — §10.1/§10.5/§17.1). **What changes (no gate weakened):** (1) the Prime Agent Loop entry is
+  now **brain-driven** — the brain proposes the intent and the UNCHANGED fail-closed `reconcile_intent`
+  decides (keyword classifier demoted to the fallback rail per §10.1), so an explicit request the
+  brain recognises (*"summarise this repo with the readme tool"*) enters the governed loop while
+  guarded chat still **never** can (`tool_invocation` is a *sensitive* intent `reconcile_intent`
+  refuses to promote from guarded chat); (2) `render_tool_inventory` injects the **runnable** tool
+  inventory (installed `ready`/`needs_approval` tools + enabled MCP server names — exactly the agent
+  loop's offered set, never a tool the kernel would refuse) into the decision prompt, with a tool-use
+  rule carried INSIDE that block so an empty inventory leaves the prompt byte-for-byte unchanged;
+  (3) the live MCP discovery gate becomes the brain-derived `effective_is_tool_turn` (or a literal
+  `mcp:` ref) + an enabled server, so a natural-language request can use an MCP tool and normal chat
+  pays nothing; (4) new `GET /v1/relux/prime/tools` (the runnable catalog incl. live MCP) + a
+  dashboard **"Tools Prime can use"** panel on the Prime page (collapsed, lazy-loaded). Every
+  execution still flows through the single `prime_invoke_tool` → `invoke_tool` chokepoint
+  (permission → risk/approval + per-call / allow-always grant → audit); a gated tool still stages the
+  existing per-call approval card and pauses, nothing is auto-approved, no raw CLI/MCP envelope
+  reaches the user. Recorded in `docs/ARTIFICIAL_CONSTRAINT_AUDIT.md` (FIX NOW #6). `cargo test` +
+  `clippy` clean on `relux-core`/`relux-kernel` (new tests: inventory lists runnable + omits
+  non-runnable + empty when none, the decision prompt injects the inventory + tool-use rule only when
+  present, the `/v1/relux/prime/tools` route lists the runnable catalog); dashboard typecheck + 599
+  tests + build green, `dashboard-dist` rebuilt in sync; the Prime render smoke pins the new panel.
+  **Files:** `crates/relux-kernel/src/prime_decision.rs`, `crates/relux-kernel/src/server.rs`,
+  `crates/relux-kernel/src/ai.rs`, `crates/relux-kernel/src/lib.rs`, `apps/dashboard/src/api.ts`,
+  `apps/dashboard/src/pages/Prime.tsx`, `apps/dashboard/test/routes-render.test.mjs`,
+  `docs/prime-tool-use.md`, `docs/ARTIFICIAL_CONSTRAINT_AUDIT.md`. No release cut; no master-plan
+  safety property is weakened.
 - **Unreleased (on `main`, post-v0.1.29)** — **Governed command tools (closes the "non-MCP
   candidate is a dead end" gap).** A detected `cli_command` capability candidate (an npm `bin`, a
   Python `[project.scripts]`, a Cargo `[[bin]]`) is no longer an honest-but-dead-end `manual`

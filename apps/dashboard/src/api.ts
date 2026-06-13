@@ -1856,10 +1856,35 @@ export interface ReluxPrimeTurn {
   after_action_source?: string;
 }
 
+// One entry in the inventory of tools Prime can actually RUN from chat (GET /v1/relux/prime/tools).
+// This is the EXACT runnable catalog the agent loop offers the brain — installed plugin /
+// governed-command / built-in tools that are ready or need approval, PLUS the live tools of every
+// enabled MCP server. Honest by construction: a tool Prime cannot run is never listed.
+// (docs/prime-tool-use.md; §10.1/§10.5/§17.1)
+export interface ReluxPrimeToolView {
+  // The backing plugin id ("mcp:<server>" for an MCP tool).
+  plugin_id: string;
+  // The tool's wire name.
+  tool_name: string;
+  // The "<plugin_id>/<tool_name>" display label.
+  label: string;
+  // A one-line, sanitized description of what the tool does.
+  description: string;
+  // The tool's risk band ("low" | "medium" | "high" | "critical").
+  risk: string;
+  // The source kind for the badge: "mcp" or "plugin".
+  source: "mcp" | "plugin";
+  // true when a per-call approval (or a standing allow-always grant) is required before it runs.
+  gated: boolean;
+}
+
 export const reluxPrime = {
   // Send one message to Prime. Throws an ApiError on failure so the chat can
   // show the real reason (e.g. "relux-kernel serve" not running).
   send: (message: string) => api.post<ReluxPrimeTurn>("/v1/relux/prime", { message }),
+  // The inventory of tools Prime can run from chat (installed + live MCP, with gated/ready status).
+  // Powers the "Tools Prime can use" panel; the discovery of live MCP tools runs server-side.
+  tools: () => api.get<ReluxPrimeToolView[]>("/v1/relux/prime/tools"),
   // Clear this conversation's bounded memory (recent-turn history + any pending
   // clarification). Drops only advisory context — no task/run/agent is touched.
   reset: () => api.post<{ cleared: boolean }>("/v1/relux/prime/reset", {}),

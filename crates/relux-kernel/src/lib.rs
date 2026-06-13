@@ -135,9 +135,10 @@ pub use prime_clarify_memory::{
     CLARIFY_TTL_SECS,
 };
 pub use prime_decision::{
-    build_decision_prompt, build_decision_prompt_with_correction, parse_decision, run_decision_loop,
-    run_decision_loop_with_correction, DecisionLoop, DecisionOutcome, DecisionStep,
-    PrimeBrainDecision, MAX_DECISION_CORRECTIONS, MAX_DECISION_ROUNDS,
+    build_decision_prompt, build_decision_prompt_with_correction, parse_decision,
+    render_tool_inventory, run_decision_loop, run_decision_loop_with_correction, DecisionLoop,
+    DecisionOutcome, DecisionStep, PrimeBrainDecision, MAX_DECISION_CORRECTIONS,
+    MAX_DECISION_ROUNDS,
 };
 pub use prime_history::{
     build_turn as build_history_turn, render_context as render_history_context, MAX_CONTEXT_CHARS,

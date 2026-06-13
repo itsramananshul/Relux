@@ -10,6 +10,7 @@ import {
   type ReluxPrimeSuggestion,
   type ReluxPrimeToolApprovalRequest,
   type ReluxPrimeToolPlanProposal,
+  type ReluxPrimeToolView,
   type ReluxPrimeTurn,
   type ReluxToolInvocationResult,
 } from "../api";
@@ -265,6 +266,12 @@ export function Prime() {
         </button>
       </div>
 
+      {/* The inventory of tools Prime can actually RUN from chat (installed plugins +
+          governed command tools + live MCP), so "I installed a plugin — can Prime use
+          it?" has a visible, honest answer. Collapsed + lazy-loaded so it never blocks
+          the chat or pays the MCP discovery cost until opened (docs/prime-tool-use.md). */}
+      <PrimeToolInventoryPanel />
+
       {/* Advanced controls: Prime Autonomy (the self-driving tick loop) and
           multi-agent Orchestration. Collapsed by default so they never block the
           chat (§11.1) — still one click away below the input. */}
@@ -276,6 +283,95 @@ export function Prime() {
         </div>
       </details>
     </div>
+  );
+}
+
+// The inventory of tools Prime can actually run from chat — installed plugin /
+// governed-command / built-in tools (ready or needs-approval) PLUS the live tools of
+// every enabled MCP server, as returned by GET /v1/relux/prime/tools. This is the
+// EXACT runnable catalog the agent loop offers Prime's brain, so a tool listed here is
+// one a user can ask Prime to use in chat ("use the readme summarizer on this repo").
+// Honest by construction: a tool Prime cannot run is never listed; a `gated` tool needs
+// an approval (or a standing allow-always grant) before it runs. Lazy-loaded on first
+// open so the chat is never blocked and the live MCP discovery cost is only paid on
+// demand (docs/prime-tool-use.md; RELUX_MASTER_PLAN §10.1/§10.5/§17.1).
+function PrimeToolInventoryPanel() {
+  const [tools, setTools] = useState<ReluxPrimeToolView[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const loadedRef = useRef(false);
+
+  async function load() {
+    if (loading) return;
+    setLoading(true);
+    setError(null);
+    try {
+      setTools(await reluxPrime.tools());
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not load tools");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <details
+      className="prime-advanced"
+      onToggle={(e) => {
+        if (e.currentTarget.open && !loadedRef.current) {
+          loadedRef.current = true;
+          void load();
+        }
+      }}
+    >
+      <summary>🧰 Tools Prime can use</summary>
+      <div className="prime-advanced-body">
+        <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+          <div className="muted" style={{ fontSize: 12 }}>
+            Tools Prime can run from chat — installed plugins, governed command tools, and live MCP
+            tools. Ask Prime to use one (e.g. <span className="mono">use {tools?.[0]?.label ?? "the tool"}</span>).
+            A <span className="badge in_review" style={{ fontSize: 9 }}>needs approval</span> tool
+            pauses for your OK before it runs.
+          </div>
+          <button className="btn ghost" disabled={loading} onClick={() => void load()}>
+            {loading ? "..." : "Refresh"}
+          </button>
+        </div>
+        {error && (
+          <div className="banner err" style={{ marginTop: 8 }}>
+            {error}. Make sure <span className="mono">relux-kernel serve</span> is running.
+          </div>
+        )}
+        {tools && tools.length === 0 && !error && (
+          <div className="muted" style={{ marginTop: 8, fontSize: 12 }}>
+            No runnable tools yet. Install a plugin and configure its command tool or register an MCP
+            server from the <Link to="/plugins">Plugins</Link> page, then it will appear here
+            and Prime can use it.
+          </div>
+        )}
+        {tools && tools.length > 0 && (
+          <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 6 }}>
+            {tools.map((t) => (
+              <div
+                key={t.label}
+                className="row wrap"
+                style={{ gap: 6, alignItems: "baseline", fontSize: 12 }}
+              >
+                <span className="badge" style={{ fontSize: 9 }}>
+                  {t.source}
+                </span>
+                <span className={`badge ${t.gated ? "in_review" : "done"}`} style={{ fontSize: 9 }}>
+                  {t.gated ? "needs approval" : "ready"}
+                </span>
+                <span className="mono">{t.label}</span>
+                <span className="muted">risk={t.risk}</span>
+                {t.description && <span className="muted">— {t.description}</span>}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </details>
   );
 }
 

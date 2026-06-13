@@ -162,6 +162,44 @@ presented as a capability).
   `crates/relux-kernel/src/main.rs`, `apps/dashboard/src/api.ts`,
   `apps/dashboard/src/components/PrimeAgentPolicyPanel.tsx`.
 
+### 6. Prime tool use was keyword-gated + MCP-discovery was `"mcp:"`-token-gated + the brain saw no tool inventory
+- **Was:** three artificial constraints meant an installed/configured tool was largely a dead
+  row on the Plugins page rather than something Prime would actually use from chat:
+  1. The **Prime Agent Loop entry** was gated on the *deterministic keyword classifier*
+     (`classify_intent(message) == ToolInvocation`) — directly contradicting §10.1 and
+     `docs/reference-driven-development.md` ("the keyword classifier is a fallback safety rail,
+     not the primary brain"). A natural-language tool request the keyword rail did not pattern-match
+     (e.g. *"summarise this repo with the readme tool"*) never entered the governed tool path,
+     even with a capable brain configured.
+  2. The off-lock **live MCP `tools/list` discovery** only ran when the message literally
+     contained the substring `"mcp:"` — a toy gate that made MCP tools usable only if the user
+     typed the internal reference syntax, never from plain language.
+  3. The **decision brain was never handed the installed-tool inventory**, so it could not know
+     which tools existed, could not reliably classify a tool request, and could not answer
+     "what tools do you have?" from the real runnable set.
+- **Now:** all three lifted **without weakening any gate** (`docs/prime-tool-use.md`):
+  1. The agent-loop entry is **brain-driven** — the brain proposes the intent and the
+     **unchanged fail-closed `reconcile_intent`** decides, with the keyword classifier as the
+     fallback rail. `reconcile_intent` already treats `tool_invocation` / `tool_plan_request` as
+     **sensitive**, so guarded chat (a greeting, a question, frustration, a vague musing) can
+     **never** be promoted into the loop — the safety wall holds, but an explicit request the
+     brain recognises now enters it.
+  2. The MCP discovery gate is the brain-derived `effective_is_tool_turn` (or a literal `mcp:`
+     ref), still requiring an enabled server — so a plausible tool turn discovers the live MCP
+     tools and normal chat pays nothing. Still fail-closed: an unreachable/disabled server
+     contributes no tools.
+  3. `render_tool_inventory` injects the **runnable** installed tools (+ enabled MCP server
+     names) into the decision prompt — only `ready` / `needs_approval` tools, the same set the
+     agent loop offers, so the brain is never told it can run a tool the kernel would refuse.
+     `GET /v1/relux/prime/tools` exposes the full runnable catalog (incl. live MCP) for the
+     dashboard "Tools Prime can use" panel.
+  Every execution still flows through the single `prime_invoke_tool` → `invoke_tool` chokepoint
+  (permission → risk/approval + per-call/allow-always grant → audit); there is no second
+  security model and nothing is auto-approved.
+- **Files:** `crates/relux-kernel/src/prime_decision.rs`, `crates/relux-kernel/src/server.rs`,
+  `crates/relux-kernel/src/ai.rs`, `crates/relux-kernel/src/lib.rs`,
+  `apps/dashboard/src/api.ts`, `apps/dashboard/src/pages/Prime.tsx`, `docs/prime-tool-use.md`.
+
 ---
 
 ## KEEP (with reason) — real guardrails, not toy caps

@@ -1123,6 +1123,7 @@ pub async fn decide_prime_via_openrouter(
     cfg: &AiConfig,
     message: &str,
     summary: &relux_core::StateSummary,
+    tools_inventory: &str,
     history: &str,
     observations: &str,
     correction: &str,
@@ -1133,6 +1134,7 @@ pub async fn decide_prime_via_openrouter(
         crate::prime_decision::build_decision_prompt_with_correction(
             message,
             summary,
+            tools_inventory,
             history,
             observations,
             correction,
