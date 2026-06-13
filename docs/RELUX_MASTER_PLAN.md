@@ -1941,6 +1941,25 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.38** (2026-06-13) — **Prime plugin-use + Crew usability** rollup. The `relux-kernel` /
+  `relux-core` crates move `0.1.37` → `0.1.38` in lockstep, packaging two post-v0.1.37 slices into a
+  fresh Windows bundle on top of all v0.1.37 work (RELUX_MASTER_PLAN §8.1 / §10.1 / §11.6;
+  `docs/prime-tool-use.md`; built reference-first per `docs/reference-driven-development.md`).
+  Headline: **the install→configure→use path closes and Crew is never blank.**
+  - **Plugin post-configure "Prime can use this now" cue + Prime-catalog refresh** (§11.6 / §10.1).
+    After a plugin is installed and configured (MCP server registered or command tool activated), the
+    flow surfaces the concrete `primeUseCue` and refreshes the Prime tool catalog so the freshly
+    configured tool is immediately visible to Prime (`docs/prime-tool-use.md` verified install→use
+    steps 4–5).
+  - **Prime chat install/configure result-card `next_step` aligned to the concrete `run the <tool>
+    tool` phrase** (§11.6). The post-configure result card's `next_step` now matches the exact
+    `primeUseCue` phrasing the user can act on (`docs/prime-tool-use.md` Result step).
+  - **Crew page is never blank/useless** (§8.1 "Crew → Prime Brain"). The dashboard Crew view
+    surfaces the Prime Brain and renders actionable empty / populated / error states instead of an
+    empty page.
+  - Dashboard typecheck / tests / build green. The full-e2e release gate
+    (`scripts\relux-package-local.ps1 -FullE2E`) is run at package time. All reads/writes hit real
+    kernel state; no new authority is added. Every safety property from v0.1.37 holds.
 - **v0.1.37** (2026-06-13) — **Stuck/no-activity run fix** rollup. The `relux-kernel` / `relux-core`
   crates move `0.1.36` → `0.1.37` in lockstep, packaging the post-v0.1.36 fix into a fresh Windows
   bundle on top of all v0.1.36 work (RELUX_MASTER_PLAN §8.1; built reference-first per

@@ -9,6 +9,30 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.38 (Windows bundle).** The `relux-kernel` and
+  `relux-core` crates move `0.1.37` → `0.1.38` in lockstep, packaging two
+  post-v0.1.37 **Prime plugin-use + Crew usability** slices into a fresh Windows
+  bundle on top of everything in v0.1.37. Everything reads-from / writes-through
+  real kernel state and conforms to `docs/RELUX_MASTER_PLAN.md` §8.1 / §10.1 /
+  §11.6 and `docs/prime-tool-use.md`; no master-plan safety property is weakened.
+  Headline:
+  - **Plugin post-configure "Prime can use this now" cue + Prime-catalog refresh.**
+    After a plugin is installed and configured (MCP server registered or command
+    tool activated), the flow now surfaces the concrete `primeUseCue` — Prime can
+    use this now — and refreshes the Prime tool catalog so the freshly configured
+    tool is immediately visible to Prime, closing the install→configure→use path
+    (`docs/prime-tool-use.md` verified install→use steps 4–5; §11.6 / §10.1).
+  - **Prime chat install/configure result-card `next_step` aligned to the concrete
+    `run the <tool> tool` phrase.** The post-configure result card no longer hints
+    vaguely; its `next_step` matches the exact `primeUseCue` phrasing a user can act
+    on (`docs/prime-tool-use.md` Result step; §11.6).
+  - **Crew page is never blank/useless — surfaces Prime Brain + actionable states.**
+    The dashboard Crew view now surfaces the Prime Brain and renders actionable
+    empty / populated / error states instead of an empty page, so Crew is always
+    meaningful (RELUX_MASTER_PLAN §8.1 "Crew → Prime Brain").
+  - Dashboard typecheck / tests / build green; the full-e2e release gate
+    (`scripts\relux-package-local.ps1 -FullE2E`) is run at package time. Every
+    safety property from v0.1.37 holds; no new authority is added.
 - **Relux local release v0.1.37 (Windows bundle).** The `relux-kernel` and
   `relux-core` crates move `0.1.36` → `0.1.37` in lockstep, packaging the
   post-v0.1.36 **stuck/no-activity run fix** into a fresh Windows bundle on top of
