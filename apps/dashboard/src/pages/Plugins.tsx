@@ -45,6 +45,7 @@ import {
   isOneClickCandidate,
   commandToolDraftFromCandidate,
   commandToolInputFromDraft,
+  emptyCommandToolDraft,
   validateCommandToolDraft,
   mcpDraftFromCandidate,
   managedStdioStatusBadge,
@@ -2586,6 +2587,8 @@ function ManifestPanel({
 
       <AddToolForm plugin={plugin} onAdded={reloadAfterChange} />
 
+      <AddCommandToolSection plugin={plugin} onConfigured={reloadAfterChange} />
+
       <div style={{ marginTop: 12 }}>
         <button
           className="btn ghost sm"
@@ -3094,12 +3097,14 @@ function ConfigureCommandToolForm({
   onConfigured,
 }: {
   plugin: ReluxPlugin;
-  candidate: ReluxCapabilityCandidate;
+  // Present ⇒ a DETECTED candidate seeds the form (a best-guess argv recipe to confirm).
+  // Absent ⇒ a from-scratch, blank form for a source-only plugin with no candidate.
+  candidate?: ReluxCapabilityCandidate;
   onClose: () => void;
   onConfigured: () => void;
 }) {
   const [draft, setDraft] = useState<CommandToolDraft>(() =>
-    commandToolDraftFromCandidate(candidate),
+    candidate ? commandToolDraftFromCandidate(candidate) : emptyCommandToolDraft(),
   );
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -3128,9 +3133,11 @@ function ConfigureCommandToolForm({
     <div className="card" style={{ margin: 0, padding: 10 }}>
       <p className="muted" style={{ margin: "0 0 8px", fontSize: 11 }}>
         Relux runs this <strong>argv-only</strong> (never through a shell), confined to
-        this plugin's install directory, with a timeout and bounded, redacted output.
-        The program is a best guess from the source — confirm it. The tool always
-        requires approval to invoke.
+        this plugin's install directory, with a timeout and bounded, redacted output.{" "}
+        {candidate
+          ? "The program is a best guess from the source — confirm it."
+          : "Nothing runs now and no code from the source is executed until you invoke the tool — and the tool always requires approval to invoke."}{" "}
+        The tool always requires approval to invoke.
       </p>
       <label className="field" style={{ margin: "0 0 6px" }}>
         <span style={{ fontSize: 12 }}>Tool name</span>
@@ -3204,6 +3211,63 @@ function ConfigureCommandToolForm({
           Cancel
         </button>
       </div>
+    </div>
+  );
+}
+
+// The from-scratch "Add a command tool" entry — the bridge for a SOURCE-ONLY plugin
+// that ships no relux-plugin.json and whose import detected no runnable candidate, so
+// there is no pre-filled Configure button. The operator names a safe argv recipe
+// (program + args, an optional cwd inside the install dir) and it is configured through
+// the SAME governed path a detected candidate uses (POST /v1/relux/plugins/:id/command-tools):
+// argv-only, no shell, confined cwd, approval always required. Nothing runs until invoked.
+// This is what makes an arbitrary repo usable from the UI / Prime without hand-editing JSON.
+function AddCommandToolSection({
+  plugin,
+  onConfigured,
+}: {
+  plugin: ReluxPlugin;
+  onConfigured: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  // A bundled/protected first-class plugin owns its tools — never offer the form there.
+  if (plugin.protected || plugin.bundled) return null;
+  return (
+    <div style={{ marginTop: 12 }}>
+      <div className="row" style={{ alignItems: "center", marginBottom: 6 }}>
+        <strong style={{ fontSize: 12 }}>Add a command tool</strong>
+        <div className="spacer" style={{ flex: 1 }} />
+        <span
+          className="badge backlog"
+          title="Runs a repo script/binary argv-only, gated by approval — no relux-plugin.json needed"
+        >
+          argv-only · gated
+        </span>
+      </div>
+      <p className="muted" style={{ margin: "0 0 8px", fontSize: 11 }}>
+        For a source-only repo with no manifest and no detected capability, define a
+        governed command tool yourself — e.g. a build/test/serve script. Relux runs it{" "}
+        <strong>argv-only</strong> (never through a shell), confined to this plugin's
+        install directory, only through approval. Defining it runs nothing.
+      </p>
+      {open ? (
+        <ConfigureCommandToolForm
+          plugin={plugin}
+          onClose={() => setOpen(false)}
+          onConfigured={() => {
+            setOpen(false);
+            onConfigured();
+          }}
+        />
+      ) : (
+        <button
+          className="btn sm"
+          onClick={() => setOpen(true)}
+          title="Open a blank, reviewable command-tool form; nothing is stored or run until you confirm, and the tool always requires approval to invoke"
+        >
+          Add a command tool…
+        </button>
+      )}
     </div>
   );
 }

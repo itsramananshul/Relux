@@ -621,6 +621,30 @@ pub enum PrimeAction {
         plugin_id: String,
         candidate_id: String,
     },
+    /// Configure a governed command tool on an ALREADY-INSTALLED plugin from the
+    /// operator's reviewed argv recipe — the bridge for a **source-only** plugin that
+    /// ships no `relux-plugin.json` and whose import detected no runnable candidate (an
+    /// honest `manual` candidate), so there is nothing for [`ConfigurePluginCandidate`]
+    /// to re-resolve. Unlike that action (which rebuilds a DETECTED candidate's recipe
+    /// server-side), this carries the operator-supplied fields: the plugin selector, the
+    /// tool name, the program (argv[0]), the fixed args, and an optional `cwd` confined to
+    /// the plugin's install dir. The confirm route re-validates the whole recipe through
+    /// the UNCHANGED command-tool validator (argv-only, no shell, no danger flag, confined
+    /// `cwd`, approval always Required) and stores it through the unchanged path — nothing
+    /// runs at configuration time and the resulting tool stays gated (needs approval) until
+    /// invoked. Always proposed behind a human approval. Spec ref:
+    /// `docs/RELUX_MASTER_PLAN.md` §8.2 (Command Tools), §10.2 (Action Layer), §10.3
+    /// (Approval Rules); `docs/prime-tool-use.md` "Configuring a command tool for a
+    /// source-only plugin". Reference: Hermes `hermes_cli/mcp_config.py` (`cmd_mcp_add` —
+    /// key a `{command,args}` entry by name; configure ≠ run).
+    ConfigureCommandTool {
+        plugin_id: String,
+        tool_name: String,
+        program: String,
+        args: Vec<String>,
+        /// Optional working dir within the plugin's install dir. Empty ⇒ install root.
+        cwd: String,
+    },
     GrantPermission {
         subject_id: String,
         permission: String,

@@ -679,6 +679,16 @@ What install does with the source (`crate::plugin_install`):
   operator configure tools / register an MCP server afterward (see the next section).
   Arbitrary plugin code is never executed by install. The generated id is derived from the
   repo/folder/zip name, sanitized and collision-safe (`relux-plugin-<seed>`).
+  - **Source-only with no detected entrypoint is not a dead-end.** When the scan infers no
+    runnable candidate (an honest `manual` record — Relux never *guesses* a command), the
+    operator can still make the plugin usable WITHOUT hand-editing JSON: the **Configure
+    tools** panel's **"Add a command tool"** section (`AddCommandToolSection`) defines a
+    governed argv command tool (program + args + optional `cwd`), and Prime can stage the
+    same from-scratch configuration when the user names the command (*"configure this repo
+    as a tool that runs npm test"*) via `POST /v1/relux/prime/actions/configure-command-tool`.
+    Both flow through the **unchanged** command-tool path (argv-only, no shell, confined
+    `cwd`, approval always Required); the tool stays gated until invoked. See
+    `docs/prime-tool-use.md` "Configuring a command tool for a source-only plugin".
 - If the source **does** happen to carry a `relux-plugin.json` manifest (a first-class
   Relux plugin), it is validated and installed directly with its declared tools.
 

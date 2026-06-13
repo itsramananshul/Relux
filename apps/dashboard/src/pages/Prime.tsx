@@ -8,6 +8,7 @@ import {
   type ReluxAiStatus,
   type ReluxCapabilityCandidate,
   type ReluxPrimeConfigureCandidateResult,
+  type ReluxPrimeConfigureCommandToolResult,
   type ReluxPrimeInstallPluginResult,
   type ReluxPrimeProposal,
   type ReluxPrimeSuggestion,
@@ -18,7 +19,8 @@ import {
   type ReluxToolDescriptor,
   type ReluxToolInvocationResult,
 } from "../api";
-import { afterActionLabel, boundedContextReads, brainSourceLabel, configurePluginCandidateAction, contextReadDetail, contextReadsHadMiss, contextReadsUsedLabel, decisionSourceLabel, formatToolOutput, githubPluginInstallAction, hasSteps, intentProvenance, pendingClarificationLabel, polishProvenance, PRIME_GREETING, PRIME_HINT, PRIME_PLACEHOLDER, PRIME_SUGGESTIONS, proposalDisplaySummary, replyPolishLabel, requestedToolLabel, slotProvenance, stepDisplayTitle, updateProvenance, type ConfigurePluginCandidateAction } from "../prime";
+import { afterActionLabel, boundedContextReads, brainSourceLabel, configureCommandToolAction, configurePluginCandidateAction, contextReadDetail, contextReadsHadMiss, contextReadsUsedLabel, decisionSourceLabel, formatToolOutput, githubPluginInstallAction, hasSteps, intentProvenance, pendingClarificationLabel, polishProvenance, PRIME_GREETING, PRIME_HINT, PRIME_PLACEHOLDER, PRIME_SUGGESTIONS, proposalDisplaySummary, replyPolishLabel, requestedToolLabel, slotProvenance, stepDisplayTitle, updateProvenance, type ConfigureCommandToolAction, type ConfigurePluginCandidateAction } from "../prime";
+import { commandToolInputFromDraft, validateCommandToolDraft, type CommandToolDraft } from "../plugins";
 import { workTaskHref, workRunHref } from "../routing";
 import { consumeInvestigationSeed } from "../investigateseed";
 import { PrimeAutonomyPanel } from "../components/PrimeAutonomyPanel";
@@ -714,6 +716,22 @@ export function PrimeTurnCard({
       {configurePluginCandidateAction(turn.action) && turn.disposition === "awaiting_approval" && (
         <ConfigureCandidateCard
           action={configurePluginCandidateAction(turn.action)!}
+          approvalId={turn.approval}
+          busy={busy}
+        />
+      )}
+
+      {/* A from-scratch command-tool configuration Prime proposed this turn ("configure
+          this repo as a tool that runs npm test", "use npm test from this plugin") — the
+          bridge for a source-only plugin with no detected candidate. The card pre-fills
+          the reviewed argv recipe; the operator edits it, then Confirm posts to the single
+          backend-governed action route (POST /v1/relux/prime/actions/configure-command-tool),
+          which re-validates the recipe through the unchanged command-tool path (argv-only,
+          no shell, confined cwd, approval always required) and closes the logged approval.
+          Nothing runs — the tool stays gated until invoked (docs/prime-tool-use.md). */}
+      {configureCommandToolAction(turn.action) && turn.disposition === "awaiting_approval" && (
+        <ConfigureCommandToolCard
+          action={configureCommandToolAction(turn.action)!}
           approvalId={turn.approval}
           busy={busy}
         />
@@ -1728,6 +1746,173 @@ function ConfigureCandidateCard({
         showCancel
         busy={busy}
       />
+    </div>
+  );
+}
+
+// The success view after a confirmed from-scratch command-tool configuration: the new
+// tool, its derived permission, the honest "ask me to use it" next step, and a link.
+// Exported so a render test can mount it directly. Nothing here invokes a tool — the
+// configured tool stays gated until asked for.
+export function ConfigureCommandToolResult({
+  result,
+}: {
+  result: ReluxPrimeConfigureCommandToolResult;
+}) {
+  return (
+    <div className="banner" style={{ fontSize: 11, marginTop: 4 }}>
+      <div style={{ marginBottom: 4 }}>
+        Configured <span className="mono" style={{ fontWeight: 600 }}>{result.tool_name}</span>{" "}
+        <span className="badge backlog" style={{ fontSize: 8 }}>command tool</span>
+        {result.gated && (
+          <span className="badge backlog" style={{ fontSize: 8, marginLeft: 4 }} title="Approval is always required to invoke it">
+            gated
+          </span>
+        )}
+        {result.no_code_executed && (
+          <span className="badge backlog" style={{ fontSize: 8, marginLeft: 4 }} title="Configuration stored a recipe only — no source code ran">
+            no code run
+          </span>
+        )}
+      </div>
+      <div className="muted mono" style={{ fontSize: 10, marginBottom: 4 }} title="The permission an actor must hold to invoke it">
+        {result.permission}
+      </div>
+      <div className="muted" style={{ marginBottom: 6 }}>{result.next_step}</div>
+      <div className="row wrap" style={{ gap: 8 }}>
+        <Link className="chip" style={{ fontSize: 11, padding: "3px 10px" }} to="/plugins">Open Plugins</Link>
+      </div>
+    </div>
+  );
+}
+
+// A from-scratch command-tool configuration Prime proposed from chat ("configure this
+// repo as a tool that runs npm test", "use npm test from this plugin") — the bridge for a
+// source-only plugin with no detected candidate. The card pre-fills the reviewed argv
+// recipe (program + args + tool name + optional cwd) and lets the operator EDIT it before
+// confirming, with the same client-side argv pre-check the Plugins-page form uses. Confirm
+// posts to the single backend-governed route (POST /v1/relux/prime/actions/configure-command-tool),
+// which re-validates the whole recipe server-side and closes the logged approval. Cancel
+// rejects the approval. Nothing runs by showing it; the configured tool stays gated.
+function ConfigureCommandToolCard({
+  action,
+  approvalId,
+  busy,
+}: {
+  action: ConfigureCommandToolAction;
+  approvalId: string | null;
+  busy: boolean;
+}) {
+  const [draft, setDraft] = useState<CommandToolDraft>(() => ({
+    name: action.toolName,
+    description: "",
+    program: action.program,
+    argsText: action.args.join("\n"),
+    cwd: action.cwd,
+    timeoutSecs: "30",
+    risk: "high",
+  }));
+  const [working, setWorking] = useState<null | "confirm" | "deny">(null);
+  const [result, setResult] = useState<ReluxPrimeConfigureCommandToolResult | null>(null);
+  const [denied, setDenied] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const set = (patch: Partial<CommandToolDraft>) => setDraft((d) => ({ ...d, ...patch }));
+  const locked = !!busy || working !== null || result !== null || denied;
+  const where = action.pluginId ? `plugin ${action.pluginId}` : "the plugin";
+
+  async function go() {
+    if (locked) return;
+    const problem = validateCommandToolDraft(draft);
+    if (problem) {
+      setErr(problem);
+      return;
+    }
+    setErr(null);
+    setWorking("confirm");
+    try {
+      const input = commandToolInputFromDraft(draft);
+      const r = await reluxPrime.configureCommandTool(
+        { plugin_id: action.pluginId, ...input },
+        approvalId,
+      );
+      setResult(r);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Could not configure the command tool");
+    } finally {
+      setWorking(null);
+    }
+  }
+
+  async function deny() {
+    if (locked) return;
+    setErr(null);
+    setWorking("deny");
+    try {
+      if (approvalId) await reluxApprovals.decide(approvalId, "rejected");
+      setDenied(true);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Could not cancel the configuration");
+    } finally {
+      setWorking(null);
+    }
+  }
+
+  if (result) return <ConfigureCommandToolResult result={result} />;
+  if (denied) {
+    return <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>Configuration cancelled — nothing was configured.</div>;
+  }
+
+  return (
+    <div style={{ marginTop: 10, border: "1px solid var(--border)", borderRadius: 6, padding: "10px 12px" }}>
+      <div className="row wrap" style={{ gap: 6, alignItems: "center", marginBottom: 4 }}>
+        <span className="badge in_review" style={{ fontSize: 9 }} title="A command-tool configuration awaiting your confirmation — nothing is configured yet">
+          confirm needed
+        </span>
+        <span className="badge backlog" style={{ fontSize: 8 }} title="Configures a governed argv command tool through the existing path">
+          command tool
+        </span>
+        <span style={{ fontSize: 13, fontWeight: 600 }}>I can configure a command tool on {where}.</span>
+      </div>
+      <ul className="muted" style={{ fontSize: 11, margin: "0 0 8px 16px", padding: 0 }}>
+        <li><strong>Argv-only, never a shell.</strong> Confined to the plugin's install directory, with a timeout and redacted output.</li>
+        <li>Nothing runs now — the tool stays gated (needs approval) until you ask me to use it.</li>
+        <li>Review the fields below before confirming.</li>
+      </ul>
+      <label className="field" style={{ margin: "0 0 6px" }}>
+        <span style={{ fontSize: 12 }}>Tool name</span>
+        <input className="input" value={draft.name} onChange={(e) => set({ name: e.target.value })} placeholder="repo.build" />
+      </label>
+      <label className="field" style={{ margin: "0 0 6px" }}>
+        <span style={{ fontSize: 12 }}>Program (argv[0])</span>
+        <input className="input mono" value={draft.program} onChange={(e) => set({ program: e.target.value })} placeholder="npm" />
+      </label>
+      <label className="field" style={{ margin: "0 0 6px" }}>
+        <span style={{ fontSize: 12 }}>Args (one per line)</span>
+        <textarea className="input mono" style={{ minHeight: 56, fontSize: 12 }} value={draft.argsText} onChange={(e) => set({ argsText: e.target.value })} placeholder={"test"} />
+      </label>
+      <div className="row wrap" style={{ gap: 8 }}>
+        <label className="field" style={{ margin: "0 0 6px", flex: 1 }}>
+          <span style={{ fontSize: 12 }}>Working dir (in install dir, optional)</span>
+          <input className="input mono" value={draft.cwd} onChange={(e) => set({ cwd: e.target.value })} placeholder="(install dir root)" />
+        </label>
+        <label className="field" style={{ margin: "0 0 6px", width: 120 }}>
+          <span style={{ fontSize: 12 }}>Risk</span>
+          <select className="input" value={draft.risk} onChange={(e) => set({ risk: e.target.value })}>
+            <option value="medium">medium</option>
+            <option value="high">high</option>
+            <option value="critical">critical</option>
+          </select>
+        </label>
+      </div>
+      {err && <div className="banner err" style={{ fontSize: 12, marginTop: 6 }}>{err}</div>}
+      <div className="row wrap" style={{ gap: 8, marginTop: 8 }}>
+        <button className="btn" style={{ fontSize: 12, padding: "4px 12px" }} disabled={locked} onClick={() => void go()} title="Configure this command tool through the existing governed path — nothing runs until you invoke it">
+          {working === "confirm" ? "Configuring…" : "Configure with Prime"}
+        </button>
+        <button className="chip" style={{ fontSize: 11, padding: "3px 10px" }} disabled={locked} onClick={() => void deny()} title="Cancel — reject the logged approval and configure nothing">
+          Cancel
+        </button>
+      </div>
     </div>
   );
 }

@@ -47,6 +47,37 @@ export function configurePluginCandidateAction(
   return { pluginId, candidateId };
 }
 
+// A typed view of the from-scratch command-tool action Prime proposes for a "configure
+// this repo as a tool that runs npm test" / "use npm test from this plugin" turn (the
+// kernel `PrimeAction::ConfigureCommandTool`) — the bridge for a source-only plugin with
+// no detected candidate. `pluginId` may be a fuzzy selector; the rest is the reviewed
+// argv recipe the confirm card pre-fills (and the operator edits before confirming).
+// Pure + defensive so the card never trusts an unshaped action.
+export interface ConfigureCommandToolAction {
+  pluginId: string;
+  toolName: string;
+  program: string;
+  args: string[];
+  cwd: string;
+}
+
+// Extract the command-tool descriptor from a Prime action, or null when the action is
+// absent / a different type / missing a program. Every field is validated before use.
+export function configureCommandToolAction(
+  action: ReluxPrimeAction | null | undefined,
+): ConfigureCommandToolAction | null {
+  if (!action || action.type !== "configure_command_tool") return null;
+  const program = typeof action.program === "string" ? action.program.trim() : "";
+  if (!program) return null;
+  const pluginId = typeof action.plugin_id === "string" ? action.plugin_id.trim() : "";
+  const toolName = typeof action.tool_name === "string" ? action.tool_name.trim() : "";
+  const args = Array.isArray(action.args)
+    ? action.args.filter((a): a is string => typeof a === "string")
+    : [];
+  const cwd = typeof action.cwd === "string" ? action.cwd.trim() : "";
+  return { pluginId, toolName, program, args, cwd };
+}
+
 // Prime's chat-surface copy (RELUX_MASTER_PLAN §11.1; `docs/prime-processing-audit.md`
 // "Hermes-first general agent"). Prime is presented as a GENERAL local AI agent —
 // a chat companion that can ALSO drive the Relux control plane — not a company /

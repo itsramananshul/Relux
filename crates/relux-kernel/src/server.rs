@@ -239,6 +239,7 @@ async fn serve() -> Result<(), KernelError> {
     println!("   PUT    /v1/relux/prime/agent-policy        {{ \"max_tool_calls\"?, \"max_brain_rounds\"?, \"max_duration_secs\"?, \"max_tool_plan_steps\"?, \"max_orchestration_steps\"?, \"max_context_rounds\"?, \"max_active_jobs\"?, \"extended_*\"? }}");
     println!("   POST   /v1/relux/prime/agent/continue      {{ \"continuation_id\": \"cont_0001\", \"extended\"? }}  (resume a paused agent loop)");
     println!("   POST   /v1/relux/prime/actions/install-plugin {{ \"repo_url\": \"https://github.com/owner/repo\", \"plugin_id\"?, \"approval_id\"? }}  (confirm+execute a Prime GitHub plugin-import; metadata only, no code run)");
+    println!("   POST   /v1/relux/prime/actions/configure-command-tool {{ \"plugin_id\":\"...\", \"name\":\"repo.build\", \"program\":\"cargo\", \"args\":[\"build\"], \"cwd\"?, \"timeout_secs\"?, \"risk\"?, \"approval_id\"? }}  (configure a governed argv command tool on a source-only plugin; argv-only, gated, nothing runs)");
     println!("   GET    /v1/relux/prime/tools               (tools Prime can run from chat: installed + live MCP, with gated/ready status)");
     println!("   POST   /v1/relux/tasks                     {{ \"title\": \"...\" }}");
     println!("   POST   /v1/relux/tasks/:id/start");
@@ -545,6 +546,10 @@ fn protected_router() -> Router<AppState> {
         .route(
             "/v1/relux/prime/actions/configure-candidate",
             post(prime_configure_candidate_action),
+        )
+        .route(
+            "/v1/relux/prime/actions/configure-command-tool",
+            post(prime_configure_command_tool_action),
         )
         .route("/v1/relux/prime/tools", get(prime_tools))
         // Multi-agent orchestration (Prime as orchestrator).
@@ -8016,7 +8021,10 @@ fn install_plugin_next_actions(
         out.push("Configure a tool or runtime to make a capability runnable — nothing runs until you do.".to_string());
     } else if record.generated {
         out.push(
-            "Metadata-only wrapper — add a tool definition or runtime on the Plugins page to make it runnable."
+            "Metadata-only wrapper — no runnable capability was detected automatically.".to_string(),
+        );
+        out.push(
+            "Add a governed command tool (e.g. a build/test/serve script) on the Plugins page, or ask Prime to \"configure a command tool that runs <command>\" — argv-only, gated, nothing runs until you invoke it."
                 .to_string(),
         );
     } else {
@@ -8619,6 +8627,214 @@ async fn prime_configure_candidate_action(
         tool_name,
         next_step,
         no_code_executed: true,
+        approval_id,
+        approval_closed,
+    }))
+}
+
+/// The body of `POST /v1/relux/prime/actions/configure-command-tool`: the operator's
+/// reviewed argv recipe for a governed command tool, echoed back to a SINGLE backend
+/// chokepoint. `plugin_id` is a SELECTOR (an exact installed id, or a fuzzy name the
+/// route re-resolves); the rest are the same safe fields the plain
+/// `POST /v1/relux/plugins/:id/command-tools` route accepts and re-validates. Nothing
+/// here is trusted — the whole recipe re-flows through the unchanged command-tool
+/// validator before storage.
+#[derive(Debug, Deserialize)]
+struct PrimeConfigureCommandToolReq {
+    /// The target plugin: an exact installed id wins; otherwise a fuzzy name resolved
+    /// against installed plugins (ambiguity is an honest 400, never a silent guess).
+    plugin_id: String,
+    /// The manifest tool name (re-sanitized by the validator), e.g. `repo.build`.
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    /// The program (argv[0]) — a single bounded token, no shell metacharacter.
+    program: String,
+    #[serde(default)]
+    args: Vec<String>,
+    /// Optional working dir within the plugin's install dir (no `..` traversal).
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    input_args: Option<serde_json::Value>,
+    #[serde(default)]
+    timeout_secs: Option<u32>,
+    #[serde(default)]
+    risk: Option<String>,
+    /// The logged governance approval staged for this proposal, closed best-effort.
+    #[serde(default)]
+    approval_id: Option<String>,
+}
+
+/// The structured result of a confirmed from-scratch command-tool configuration. One
+/// auditable envelope: which plugin got the tool, the new tool's name + derived
+/// permission, that it is gated (needs approval) until invoked, the honest next step,
+/// the no-code-run guarantee, the catalog-refresh hint (so the dashboard re-pulls
+/// `GET /v1/relux/prime/tools`), and the closed governance approval.
+#[derive(Debug, Serialize)]
+struct PrimeConfigureCommandToolResponse {
+    plugin_id: String,
+    plugin_name: String,
+    /// The stored tool name (post-sanitization). The id by which it is invoked.
+    tool_name: String,
+    /// The derived permission an actor must hold to invoke it (`tool:<plugin>:<verb>`).
+    permission: String,
+    /// Always true: a command tool's approval is always Required — it is gated until
+    /// a per-call approval or an allow-always grant authorises the exact call.
+    gated: bool,
+    /// The updated plugin record (carries the new tool in its count).
+    plugin: PluginRecord,
+    /// Honest next step — the tool is gated until invoked.
+    next_step: String,
+    /// Invariant the route guarantees: configuration stored a recipe and ran no code.
+    no_code_executed: bool,
+    /// Hint to the dashboard/Prime: re-pull the runnable tool catalog so the new tool
+    /// shows up in "Tools Prime can use" (`GET /v1/relux/prime/tools`).
+    catalog_refresh: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval_id: Option<String>,
+    approval_closed: bool,
+}
+
+/// POST `/v1/relux/prime/actions/configure-command-tool` — the backend-governed CONFIRM +
+/// CONFIGURE chokepoint for Prime's `ConfigureCommandTool` proposal and the bridge for a
+/// **source-only** plugin (no `relux-plugin.json`, no detected runnable candidate) that
+/// the operator wants to make usable WITHOUT hand-editing JSON
+/// (`docs/RELUX_MASTER_PLAN.md` §8.2 Command Tools, §10.2 Action Layer, §10.3 Approval
+/// Rules; `docs/prime-tool-use.md` "Configuring a command tool for a source-only
+/// plugin").
+///
+/// Unlike `…/configure-candidate` (which re-resolves a DETECTED candidate's recipe), this
+/// takes the operator's reviewed argv recipe and configures it through the EXACT SAME
+/// governed path the plain `POST /v1/relux/plugins/:id/command-tools` route uses
+/// (`parse_command_tool_input` → `configure_command_tool`): argv-only, no shell, no
+/// danger flag, confined `cwd`, approval always Required. It adds only (a) fuzzy plugin
+/// selector resolution (so a chat proposal that named the plugin loosely still lands on
+/// the right plugin), (b) a structured envelope (tool name + permission + gated status +
+/// next step + catalog-refresh hint), and (c) a best-effort governance-approval close.
+/// Nothing runs at configuration time and the resulting tool stays gated until invoked.
+/// Reference: Hermes `hermes_cli/mcp_config.py::cmd_mcp_add` (key a `{command,args}` entry
+/// by name; configure ≠ run).
+async fn prime_configure_command_tool_action(
+    State(state): State<AppState>,
+    Json(req): Json<PrimeConfigureCommandToolReq>,
+) -> Result<Json<PrimeConfigureCommandToolResponse>, ApiError> {
+    // 1. Resolve the target plugin server-side. An exact installed id wins; otherwise a
+    //    fuzzy name match against installed plugins. A source-only plugin needs NO
+    //    candidates here (that is the whole point), so resolution never requires one.
+    let records: Vec<PluginRecord> = locked_read(&state, |kernel| {
+        Ok(kernel
+            .installed_plugins()
+            .iter()
+            .map(|p| record_for(kernel, p))
+            .collect())
+    })?;
+    let selector = req.plugin_id.trim().to_string();
+    if selector.is_empty() {
+        return Err(ApiError::bad_request(
+            "name the plugin to configure the command tool on (an installed plugin id or name)",
+        ));
+    }
+    let target: PluginRecord = if let Some(exact) = records.iter().find(|r| r.id == selector) {
+        exact.clone()
+    } else {
+        let needle = selector.to_lowercase();
+        let matches: Vec<&PluginRecord> = records
+            .iter()
+            .filter(|r| {
+                r.id.to_lowercase().contains(&needle) || r.name.to_lowercase().contains(&needle)
+            })
+            .collect();
+        match matches.as_slice() {
+            [one] => (*one).clone(),
+            [] => {
+                return Err(ApiError::bad_request(format!(
+                    "no installed plugin matching {selector:?} — import or install the plugin first"
+                )));
+            }
+            many => {
+                let names: Vec<String> = many.iter().map(|r| r.id.clone()).collect();
+                return Err(ApiError::bad_request(format!(
+                    "more than one installed plugin matches {selector:?} ({}). Name the exact plugin id.",
+                    names.join(", ")
+                )));
+            }
+        }
+    };
+
+    // 2. Build the EXACT JSON body the unchanged command-tool validator accepts, from the
+    //    operator's reviewed fields. A secret value is never part of a command-tool recipe
+    //    (it carries argv only), so no value is ever stored or echoed.
+    let mut body = serde_json::json!({
+        "name": req.name,
+        "program": req.program,
+        "args": req.args,
+    });
+    if let Some(d) = req.description.as_ref() {
+        body["description"] = serde_json::json!(d);
+    }
+    if let Some(cwd) = req.cwd.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        body["cwd"] = serde_json::json!(cwd);
+    }
+    if let Some(input_args) = req.input_args.as_ref() {
+        body["input_args"] = input_args.clone();
+    }
+    if let Some(t) = req.timeout_secs {
+        body["timeout_secs"] = serde_json::json!(t);
+    }
+    if let Some(r) = req.risk.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        body["risk"] = serde_json::json!(r);
+    }
+
+    // 3. Validate + store through the UNCHANGED command-tool path. A bad recipe (shell
+    //    metacharacter, danger flag, `..` cwd, duplicate, bad name) is an honest 400 and
+    //    never touches the store; bundled plugins are refused by configure_command_tool.
+    let draft = relux_kernel::parse_command_tool_input(&body).map_err(ApiError::bad_request)?;
+    let tool_name = draft.name.clone();
+    // The permission VERB is the one the draft authoritatively derived (the kernel uses the
+    // same to build the tool's `tool:<plugin>:<verb>` permission), so the envelope names the
+    // exact permission an actor must hold to invoke it.
+    let permission = format!("tool:{}:{}", target.id, draft.verb);
+    let plugin_id = relux_core::PluginId::new(target.id.clone());
+    let target_id = target.id.clone();
+    let record = locked_save(&state, |kernel| {
+        kernel.configure_command_tool(&plugin_id, draft)?;
+        let installed = kernel
+            .installed_plugin(&plugin_id)
+            .ok_or_else(|| KernelError::PluginNotInstalled(target_id.clone()))?
+            .clone();
+        Ok(record_for(kernel, &installed))
+    })?;
+
+    // 4. Close the logged governance approval as approved (best-effort).
+    let approval_id = req
+        .approval_id
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let mut approval_closed = false;
+    if let Some(aid) = &approval_id {
+        let id = relux_core::ApprovalId::new(aid.clone());
+        let resolved = locked_save(&state, |kernel| {
+            kernel.resolve_approval(&id, true, "dashboard_user", None)?;
+            Ok(())
+        });
+        approval_closed = resolved.is_ok();
+    }
+
+    let next_step = format!(
+        "Configured command tool \"{tool_name}\". It is gated (needs approval) — ask me to use {tool_name} and I'll stage the approval before it runs."
+    );
+    Ok(Json(PrimeConfigureCommandToolResponse {
+        plugin_id: target.id,
+        plugin_name: target.name,
+        tool_name,
+        permission,
+        gated: true,
+        plugin: record,
+        next_step,
+        no_code_executed: true,
+        catalog_refresh: true,
         approval_id,
         approval_closed,
     }))
@@ -13081,9 +13297,14 @@ mod tests {
         assert!(cand_text.contains("Review 1 detected capability candidate"));
         assert!(cand_text.contains("nothing runs until you do"));
 
-        // No candidates on a scaffolded wrapper => add a tool/runtime, still honest.
+        // No candidates on a scaffolded wrapper => the honest bridge: add a governed
+        // command tool (UI or via Prime), never a claim of readiness.
         let none = install_plugin_next_actions(&base, &[]).join(" ");
         assert!(none.contains("Metadata-only wrapper"));
+        assert!(
+            none.contains("command tool") && none.contains("nothing runs until you invoke it"),
+            "a source-only wrapper must point at the governed command-tool bridge: {none}"
+        );
     }
 
     /// A minimal capability candidate for the next-actions test. Honest manual pending —
@@ -13600,6 +13821,239 @@ mod tests {
                  skipped the real-run stdout/audit assertions"
             );
         }
+    }
+
+    /// Install a SOURCE-ONLY repo: NO relux-plugin.json, NO package.json `bin`, NO MCP
+    /// signal — just a README and a runnable script. It lands as a metadata-only wrapper
+    /// whose import detects no runnable command-tool candidate (the honest `manual`/empty
+    /// case this slice bridges). The script prints a deterministic marker AND a `sk-`
+    /// token to prove output redaction. Returns (source-dir guard, id).
+    async fn install_source_only_fixture(state: &AppState) -> (tempfile::TempDir, String) {
+        let src = tempfile::tempdir().expect("src tempdir");
+        std::fs::write(
+            src.path().join("README.md"),
+            "# tool-repo\nA source-only repo with a script but no manifest/bin.\n",
+        )
+        .expect("write readme");
+        std::fs::write(
+            src.path().join("run.js"),
+            "process.stdout.write('RELUX_SRCONLY_OK sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ012345\\n');\n",
+        )
+        .expect("write run.js");
+        let req = serde_json::json!({ "path": src.path().to_string_lossy() }).to_string();
+        let (status, _c, resp) =
+            call(state, "POST", "/v1/relux/plugins/install-dir", None, Some(&req)).await;
+        assert_eq!(status, StatusCode::OK, "install failed: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("install json");
+        assert_eq!(v["generated"], true, "manifestless source must scaffold a wrapper: {resp}");
+        let id = v["id"].as_str().expect("installed id").to_string();
+        (src, id)
+    }
+
+    #[tokio::test]
+    async fn source_only_plugin_configure_command_tool_then_prime_can_use() {
+        // The bridge end-to-end (docs/prime-tool-use.md "Configuring a command tool for a
+        // source-only plugin"): a plugin imported with NO manifest AND no detected runnable
+        // candidate is made usable by the operator NAMING a command, through the governed
+        // Prime action — the new tool shows up in the SAME catalog Prime sees, and is
+        // invocable only through the unchanged gate (refused without a grant, run + audited
+        // with one). Every step is a real product route, no private-helper shortcut.
+        let (state, _dir) = auth_state(true);
+        let (_src, id) = install_source_only_fixture(&state).await;
+
+        // 1) The import detected NO command-tool candidate — this is the source-only case.
+        let (hs, _c, hints) =
+            call(&state, "GET", &format!("/v1/relux/plugins/{id}/hints"), None, None).await;
+        assert_eq!(hs, StatusCode::OK, "hints: {hints}");
+        let hv: serde_json::Value = serde_json::from_str(&hints).unwrap();
+        let cands = hv["candidates"].as_array().expect("candidates array");
+        assert!(
+            cands.iter().all(|c| c["activation"] != "command_tool"),
+            "fixture must have NO auto-detected command_tool candidate: {hints}"
+        );
+
+        // 2) Configure a command tool from the operator's reviewed fields via the GOVERNED
+        //    Prime action — no candidate involved. The plugin selector is the exact id.
+        let req = serde_json::json!({
+            "plugin_id": id,
+            "name": "repo.run",
+            "program": "node",
+            "args": ["./run.js"],
+        })
+        .to_string();
+        let (cs, _c, conf) = call(
+            &state,
+            "POST",
+            "/v1/relux/prime/actions/configure-command-tool",
+            None,
+            Some(&req),
+        )
+        .await;
+        assert_eq!(cs, StatusCode::OK, "configure: {conf}");
+        let cv: serde_json::Value = serde_json::from_str(&conf).unwrap();
+        assert_eq!(cv["tool_name"], "repo.run", "configure: {conf}");
+        assert_eq!(cv["gated"], true, "a command tool is always gated: {conf}");
+        assert_eq!(cv["no_code_executed"], true, "configuration never runs code: {conf}");
+        assert_eq!(cv["catalog_refresh"], true, "the dashboard must re-pull the catalog: {conf}");
+        assert_eq!(cv["permission"], format!("tool:{id}:run"), "configure: {conf}");
+        assert!(cv["next_step"].as_str().unwrap().contains("ask me to use"), "configure: {conf}");
+
+        let permission = format!("tool:{id}:run");
+
+        // 3) Prime must HOLD the tool's permission before it can be invoked or granted.
+        let perm_req = serde_json::json!({ "permission": permission }).to_string();
+        let (ps, _c, pbody) = call(
+            &state,
+            "POST",
+            "/v1/relux/agents/prime/permissions",
+            None,
+            Some(&perm_req),
+        )
+        .await;
+        assert_eq!(ps, StatusCode::OK, "grant permission: {pbody}");
+
+        // 4) The new tool appears in the EXACT runnable catalog Prime is handed — gated.
+        let (ts, _c, tools) = call(&state, "GET", "/v1/relux/prime/tools", None, None).await;
+        assert_eq!(ts, StatusCode::OK, "prime tools: {tools}");
+        let tv: Vec<serde_json::Value> = serde_json::from_str(&tools).unwrap();
+        let tool = tv
+            .iter()
+            .find(|t| t["tool_name"] == "repo.run")
+            .unwrap_or_else(|| panic!("repo.run missing from Prime's catalog: {tools}"));
+        assert_eq!(tool["source"], "plugin", "prime tools: {tools}");
+        assert_eq!(tool["gated"], true, "a configured command tool is gated: {tools}");
+
+        // 5) The gate is real: invoking WITHOUT a standing grant is refused (409).
+        let inv = serde_json::json!({ "plugin_id": id, "tool_name": "repo.run" }).to_string();
+        let (gs, _c, gbody) = call(&state, "POST", "/v1/relux/tools/invoke", None, Some(&inv)).await;
+        assert_eq!(
+            gs,
+            StatusCode::CONFLICT,
+            "a gated tool must refuse a direct invoke until granted: {gbody}"
+        );
+
+        // 6) Authorise it with a persistent allow-always grant.
+        let grant_req = serde_json::json!({ "plugin_id": id, "tool_name": "repo.run" }).to_string();
+        let (grs, _c, grbody) =
+            call(&state, "POST", "/v1/relux/grants", None, Some(&grant_req)).await;
+        assert_eq!(grs, StatusCode::OK, "create grant: {grbody}");
+
+        // 7) Invoke through the governed path. With node present this is a REAL argv-only
+        //    run; the gate now lets it through (no longer 409). Output is secret-redacted.
+        let (is, _c, ibody) = call(&state, "POST", "/v1/relux/tools/invoke", None, Some(&inv)).await;
+        assert_ne!(
+            is,
+            StatusCode::CONFLICT,
+            "with a standing grant the gate must let the call through: {ibody}"
+        );
+        if node_on_path() {
+            assert_eq!(is, StatusCode::OK, "the granted governed run should succeed: {ibody}");
+            let iv: serde_json::Value = serde_json::from_str(&ibody).unwrap();
+            assert_eq!(iv["output"]["success"], true, "invoke output: {ibody}");
+            let stdout = iv["output"]["stdout"].as_str().unwrap();
+            assert!(stdout.contains("RELUX_SRCONLY_OK"), "Prime must see real output: {ibody}");
+            // A secret-shaped token in the tool's output is REDACTED before Prime sees it.
+            assert!(
+                !stdout.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"),
+                "a secret-shaped token must be redacted from the captured output: {ibody}"
+            );
+
+            // 8) The successful invocation is audited against Prime + the tool's permission.
+            let (aus, _c, audit) = call(&state, "GET", "/v1/relux/audit", None, None).await;
+            assert_eq!(aus, StatusCode::OK, "audit: {audit}");
+            let av: Vec<serde_json::Value> = serde_json::from_str(&audit).unwrap();
+            assert!(
+                av.iter().any(|e| e["action"] == permission
+                    && e["result"] == "success"
+                    && e["actor_id"] == "prime"),
+                "a successful governed tool run must be audited: {audit}"
+            );
+        } else {
+            eprintln!(
+                "note: `node` not on PATH — asserted the governed gate + grant path only, \
+                 skipped the real-run stdout/redaction/audit assertions"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn configure_command_tool_action_validates_and_resolves_fail_closed() {
+        let (state, _dir) = auth_state(true);
+        let (_src, id) = install_source_only_fixture(&state).await;
+        let post = |body: String| {
+            let state = state.clone();
+            async move {
+                call(
+                    &state,
+                    "POST",
+                    "/v1/relux/prime/actions/configure-command-tool",
+                    None,
+                    Some(&body),
+                )
+                .await
+            }
+        };
+
+        // An unknown plugin selector is an honest 400 — never a silent guess.
+        let (s, _c, b) = post(
+            serde_json::json!({ "plugin_id": "no-such-plugin", "name": "x.run", "program": "node" })
+                .to_string(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "unknown plugin: {b}");
+        assert!(b.contains("no installed plugin"), "unknown plugin: {b}");
+
+        // A shell-metacharacter program is refused by the unchanged argv contract.
+        let (s, _c, b) = post(
+            serde_json::json!({ "plugin_id": id, "name": "x.run", "program": "node && rm" })
+                .to_string(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "shell metachar program: {b}");
+
+        // A `..` traversal cwd is refused.
+        let (s, _c, b) = post(
+            serde_json::json!({ "plugin_id": id, "name": "x.run", "program": "node", "cwd": "../escape" })
+                .to_string(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "traversal cwd: {b}");
+
+        // A danger/bypass flag in args is refused.
+        let (s, _c, b) = post(
+            serde_json::json!({ "plugin_id": id, "name": "x.run", "program": "node", "args": ["--dangerously-skip-permissions"] })
+                .to_string(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "danger flag: {b}");
+
+        // A valid configure succeeds; a SECOND identical name re-configures (idempotent
+        // replace), so the plugin never ends up with a duplicate tool entry.
+        let ok = serde_json::json!({ "plugin_id": id, "name": "repo.run", "program": "node", "args": ["./run.js"] })
+            .to_string();
+        let (s, _c, b) = post(ok.clone()).await;
+        assert_eq!(s, StatusCode::OK, "first configure: {b}");
+        let (s, _c, b) = post(ok).await;
+        assert_eq!(s, StatusCode::OK, "re-configure same name is allowed: {b}");
+        let (ls, _c, listed) =
+            call(&state, "GET", &format!("/v1/relux/plugins/{id}/command-tools"), None, None).await;
+        assert_eq!(ls, StatusCode::OK, "list: {listed}");
+        let lv: Vec<serde_json::Value> = serde_json::from_str(&listed).unwrap();
+        assert_eq!(
+            lv.iter().filter(|c| c["tool_name"] == "repo.run").count(),
+            1,
+            "re-configuring the same name must not create a duplicate: {listed}"
+        );
+
+        // Fuzzy plugin resolution: a partial name (not the exact id) resolves to the
+        // unique installed plugin.
+        let needle = id.split('-').next_back().unwrap_or(&id).to_string();
+        let (s, _c, b) = post(
+            serde_json::json!({ "plugin_id": needle, "name": "repo.build", "program": "node", "args": ["./run.js"] })
+                .to_string(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "fuzzy plugin name should resolve: {b}");
     }
 
     fn mcp_tool(name: &str, executable: relux_core::ToolExecutability) -> relux_core::ToolDescriptor {

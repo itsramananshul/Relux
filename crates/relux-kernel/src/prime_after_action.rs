@@ -246,6 +246,7 @@ fn is_high_risk_action(action: Option<&PrimeAction>) -> bool {
         Some(PrimeAction::InstallPlugin { .. })
             | Some(PrimeAction::InstallPluginFromGithub { .. })
             | Some(PrimeAction::ConfigurePluginCandidate { .. })
+            | Some(PrimeAction::ConfigureCommandTool { .. })
             | Some(PrimeAction::GrantPermission { .. })
     )
 }
@@ -286,6 +287,7 @@ pub fn build_action_envelope(turn: &PrimeTurn, kind: ActionResultKind) -> Action
         Some(PrimeAction::InstallPlugin { plugin_id }) => push(plugin_id),
         Some(PrimeAction::InstallPluginFromGithub { plugin_id, .. }) => push(plugin_id),
         Some(PrimeAction::ConfigurePluginCandidate { plugin_id, .. }) => push(plugin_id),
+        Some(PrimeAction::ConfigureCommandTool { plugin_id, .. }) => push(plugin_id),
         Some(PrimeAction::GrantPermission { subject_id, .. }) => push(subject_id),
         _ => {}
     }
@@ -346,6 +348,13 @@ fn action_label(turn: &PrimeTurn, kind: ActionResultKind) -> String {
                     .to_string()
             }
             _ => "configured a detected capability".to_string(),
+        },
+        Some(PrimeAction::ConfigureCommandTool { .. }) => match kind {
+            ActionResultKind::Proposed => {
+                "proposed configuring a governed command tool (awaiting your approval; argv-only recipe, nothing runs until invoked)"
+                    .to_string()
+            }
+            _ => "configured a governed command tool".to_string(),
         },
         Some(PrimeAction::GrantPermission { .. }) => match kind {
             ActionResultKind::Proposed => {

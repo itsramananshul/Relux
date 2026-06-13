@@ -388,6 +388,76 @@ separate step from running it** (configure ≠ run) — and openclaw's
 same server shape Relux rebuilds from the candidate's proposal before handing it to the
 existing registry validation.
 
+## Configuring a command tool for a source-only plugin
+
+> Spec refs: `docs/RELUX_MASTER_PLAN.md` §8.2 (Command Tools), §10.2 (Action Layer),
+> §10.3 (Approval Rules); `docs/mcp.md` "Importing a repository as a plugin".
+
+The *detected-candidate* path above only fires when the import inferred a runnable
+entrypoint. A **source-only** plugin — an arbitrary repo with no `relux-plugin.json`,
+no declared MCP server / `bin` / console-script / Cargo binary — yields an honest
+`manual` candidate with **nothing to one-click**, and Relux refuses to *guess* a command
+from repo content. That used to be a dead-end: the operator had to hand-edit JSON to make
+the plugin usable. This is the bridge that closes it — the operator (or Prime, when the
+user names the command) defines a governed command tool through the **existing**
+command-tool path, with **no new authority** and **no manifest editing**.
+
+What works:
+
+- **On the Plugins page.** A non-bundled plugin's **Configure tools** panel now has an
+  **"Add a command tool"** section (`apps/dashboard/src/pages/Plugins.tsx`
+  `AddCommandToolSection`). The operator names a safe argv recipe — tool name, **program
+  (argv[0])**, **args (one per line)**, an optional **working dir** inside the install dir,
+  a timeout, and a risk band — and submits to the **unchanged**
+  `POST /v1/relux/plugins/:id/command-tools` route. Defining it runs nothing; the tool is
+  always approval-gated.
+- **From chat.** *"configure this repo as a tool that runs npm test"* / *"use npm test
+  from this plugin"* / *"make a command tool that runs cargo build for <plugin>"*. The
+  deterministic classifier (`crate::prime_command_tool_config::parse_command_tool_config_request`
+  — a **fallback rail only**, `docs/reference-driven-development.md`) extracts the plugin
+  selector + the argv recipe **only when the user named a concrete command** (a bare
+  "run the tests", a pronoun, or an article is refused, never fabricated). Prime stages it
+  as a `RiskLevel::High` `PrimeAction::ConfigureCommandTool` **proposal awaiting
+  approval** — never an unrelated task. The chat renders a `ConfigureCommandToolCard` that
+  **pre-fills the reviewable fields** (the operator edits program/args/name/cwd before
+  confirming, with the same client-side argv pre-check the Plugins form uses).
+
+The flow (one backend chokepoint):
+
+1. **Propose (confirmation-gated).** A from-scratch command-tool request routes to
+   `PluginConfiguration` and proposes `ConfigureCommandTool { plugin_id, tool_name,
+   program, args, cwd }` — a logged approval is the governance/audit record. The fields are
+   advisory; the route re-validates everything.
+2. **Confirm (`POST /v1/relux/prime/actions/configure-command-tool`).** A session-protected
+   route that re-resolves the plugin server-side (an exact installed id wins; otherwise a
+   unique fuzzy name match — ambiguity / no-match is an honest `400`, **never a silent
+   guess**), then builds the **exact JSON** the **unchanged** `parse_command_tool_input`
+   validator accepts and stores it through `configure_command_tool` — the **same** governed
+   path a detected candidate uses: **argv-only, no shell, no danger flag, confined `cwd`,
+   approval always Required.** A bad recipe (shell metacharacter, danger flag, `..` cwd
+   traversal, missing program) is a clean `400` that never touches the store; a bundled
+   plugin is refused. It closes the logged approval (best-effort) and returns **one
+   structured envelope**.
+3. **Result.** The envelope carries the `plugin_id` / `plugin_name`, the `tool_name`, the
+   derived `permission` (`tool:<plugin>:<verb>`), `gated: true`, the honest `next_step`
+   (**"ask me to use it"**), `no_code_executed: true`, and `catalog_refresh: true` so the
+   dashboard re-pulls `GET /v1/relux/prime/tools` and the new tool shows up in **"Tools
+   Prime can use"** — gated until invoked.
+
+**Safety:** configuration stores an argv **recipe** only — it runs no code from the source,
+grants no new authority, and the resulting command tool stays gated (needs approval) until
+invoked, where it runs through the **single** `prime_invoke_tool` → `invoke_tool` gate
+(permission → approval/grant → execute argv-only, confined cwd, bounded + secret-redacted
+output, hard timeout, audited). A command tool carries **argv only** — never a secret
+value — so the config and the result envelope never store or echo a secret.
+
+**Reference-driven** (`docs/reference-driven-development.md`): this mirrors Hermes
+`reference/hermes-agent-main/hermes_cli/mcp_config.py` (`cmd_mcp_add` — key a
+`{command,args}` entry by name; **configuring is a separate, confirmed step from running
+it**) and openclaw's single-classifier confirmation discipline
+(`reference/openclaw-main/src/acp/approval-classifier.ts`): one deterministic function
+decides, and the stateful path is always confirmation-gated, never auto-run.
+
 ## The verified install → use path (end-to-end)
 
 This is the path a regression test pins end-to-end, route for route — the same sequence
@@ -426,10 +496,13 @@ code, no real brain, not required by CI.
 
 **Honest limitations.** A **source-only** plugin with no detected runnable entrypoint
 (no `relux-plugin.json`, no declared MCP server / `bin` / console-script / Cargo binary)
-yields an honest `manual` candidate with **no one-click activation** — it points at the
-Plugins page to add a tool/runtime, and Relux never infers a command from repo content.
-A `manual` candidate is exactly that: Prime cannot wire it up for you, and nothing is ever
-claimed `ready` until it is actually configured and invoked.
+yields an honest `manual` candidate with **no auto-detected activation** — Relux never
+infers a command from repo content. But it is **no longer a dead-end**: the operator (or
+Prime, when the user names the command) can define a governed command tool through the
+bridge above (**"Configuring a command tool for a source-only plugin"**) — argv-only,
+gated, no manifest editing. Detection still never *guesses* a command; the operator
+supplies it, and nothing is ever claimed `ready` until it is actually configured and
+invoked.
 
 See `docs/ARTIFICIAL_CONSTRAINT_AUDIT.md` for the lifted constraints and `docs/mcp.md` for the
 agent loop and MCP transports.

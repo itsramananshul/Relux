@@ -1926,7 +1926,58 @@ export const reluxPrime = {
         ...(approvalId ? { approval_id: approvalId } : {}),
       },
     ),
+  // Configure a governed command tool on a SOURCE-ONLY plugin from the operator's
+  // reviewed fields (POST /v1/relux/prime/actions/configure-command-tool) — the bridge
+  // for a plugin that ships no relux-plugin.json and detected no runnable candidate.
+  // `pluginId` is a selector (exact id or fuzzy name); the rest is the same safe argv
+  // recipe the Plugins-page form sends, re-validated server-side (argv-only, no shell,
+  // confined cwd, approval always required). Nothing runs — the tool stays gated.
+  configureCommandTool: (
+    body: ReluxPrimeConfigureCommandToolReq,
+    approvalId?: string | null,
+  ) =>
+    api.post<ReluxPrimeConfigureCommandToolResult>(
+      "/v1/relux/prime/actions/configure-command-tool",
+      { ...body, ...(approvalId ? { approval_id: approvalId } : {}) },
+    ),
 };
+
+// The operator's reviewed argv recipe for the from-scratch command-tool action. The
+// permission + approval are DERIVED server-side; the form never sends them, and a
+// command tool carries argv ONLY — never a secret value.
+export interface ReluxPrimeConfigureCommandToolReq {
+  plugin_id: string;
+  name: string;
+  description?: string;
+  program: string;
+  args?: string[];
+  cwd?: string;
+  timeout_secs?: number;
+  risk?: string;
+}
+
+// The structured result of a confirmed from-scratch command-tool configuration (the
+// kernel's PrimeConfigureCommandToolResponse). One auditable envelope: which plugin got
+// the tool, its name + derived permission, that it is gated until invoked, the honest
+// next step, the no-code-run guarantee, and the catalog-refresh hint.
+export interface ReluxPrimeConfigureCommandToolResult {
+  plugin_id: string;
+  plugin_name: string;
+  tool_name: string;
+  // The permission an actor must hold to invoke it (`tool:<plugin>:<verb>`).
+  permission: string;
+  // Always true: a command tool's approval is always required.
+  gated: boolean;
+  // The updated plugin record (carries the new tool in its count).
+  plugin?: ReluxPlugin;
+  next_step: string;
+  // Invariant: configuration stored a recipe and ran no source code.
+  no_code_executed: boolean;
+  // Hint to re-pull GET /v1/relux/prime/tools so the new tool shows in "Tools Prime can use".
+  catalog_refresh: boolean;
+  approval_id?: string;
+  approval_closed: boolean;
+}
 
 // The result of the bounded `tools/list` probe Relux runs right after it registers an MCP
 // candidate from Prime chat — the guided discovery/classification step (the kernel's

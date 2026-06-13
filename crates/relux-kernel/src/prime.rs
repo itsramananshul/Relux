@@ -336,6 +336,21 @@ pub fn classify_intent(message: &str) -> PrimeIntent {
     if configure_verb && candidate_cue {
         return PrimeIntent::PluginConfiguration;
     }
+    // From-scratch command tool: the user NAMES the command themselves for a source-only
+    // plugin that detected no runnable candidate ("configure this repo as a tool that runs
+    // npm test", "use npm test from this plugin"). Distinct from the DETECTED-candidate
+    // path above — anchored on a command-tool cue AND a concrete extractable command, so a
+    // bare "run the tests" (no tool cue) is never swallowed. Keyword rail only
+    // (`docs/reference-driven-development.md`); the decide() branch re-parses + re-validates
+    // through the unchanged command-tool path (`docs/prime-tool-use.md` "Configuring a
+    // command tool for a source-only plugin").
+    let command_tool_cue =
+        configure_verb || has(&["command tool", "as a tool", "into a tool", "make a tool"]) || starts("use ");
+    if command_tool_cue
+        && crate::prime_command_tool_config::parse_command_tool_config_request(message).is_some()
+    {
+        return PrimeIntent::PluginConfiguration;
+    }
     // Orchestration RUN/continue: the user wants Prime to START (or continue) the
     // governed batch for an EXISTING orchestration — distinct from CREATING one above
     // (which is keyed on "orchestrate"/"coordinate"/…). Keyed on a run/continue verb
@@ -503,6 +518,27 @@ fn configure_candidate_text(sel: &crate::prime_candidate_config::CandidateConfig
     };
     format!(
         "I can {what} from {where_} through the existing governed path. This registers metadata/recipe only — no code from the source runs, and the resulting tool stays gated (needs approval) until you ask me to use it."
+    )
+}
+
+/// The grounded, honest proposal text for a `ConfigureCommandTool` turn (a from-scratch
+/// command tool the user named for a source-only plugin): exactly what argv recipe will
+/// be stored, where, and the unchanged safety posture (argv-only, never a shell, confined
+/// to the plugin's install dir, nothing runs at configuration, the tool stays gated).
+fn configure_command_tool_text(req: &crate::prime_command_tool_config::CommandToolConfigRequest) -> String {
+    let argv = if req.args.is_empty() {
+        req.program.clone()
+    } else {
+        format!("{} {}", req.program, req.args.join(" "))
+    };
+    let where_ = if req.plugin_selector.is_empty() {
+        "the plugin".to_string()
+    } else {
+        format!("plugin \"{}\"", req.plugin_selector)
+    };
+    format!(
+        "I can configure a governed command tool \"{}\" on {where_} that runs `{argv}` argv-only (never through a shell), confined to the plugin's install directory. Nothing runs now — the tool stays gated (needs approval) until you ask me to use it. Review the fields before confirming.",
+        req.tool_name
     )
 }
 
@@ -708,6 +744,29 @@ pub fn decide(message: &str, intent: &PrimeIntent, summary: &StateSummary) -> Pr
             // confirm route never trusts a client-supplied command). Reference: Hermes
             // `hermes_cli/mcp_config.py` (`cmd_mcp_add` — register a server by name;
             // configure ≠ run).
+            // A from-scratch command-tool request (the user NAMED the command) is the
+            // bridge for a source-only plugin with no detected candidate — try it FIRST,
+            // and only fall through to the DETECTED-candidate path when no concrete command
+            // was named. Both are re-validated AUTHORITATIVELY server-side; nothing here is
+            // trusted as a final command (`docs/prime-tool-use.md` "Configuring a command
+            // tool for a source-only plugin").
+            if let Some(req) =
+                crate::prime_command_tool_config::parse_command_tool_config_request(message)
+            {
+                return PrimePlan::Propose {
+                    action: PrimeAction::ConfigureCommandTool {
+                        plugin_id: req.plugin_selector.clone(),
+                        tool_name: req.tool_name.clone(),
+                        program: req.program.clone(),
+                        args: req.args.clone(),
+                        cwd: String::new(),
+                    },
+                    reason: "Configuring a command tool registers a governed argv recipe on the control plane — a new capability that runs the named program (argv-only, confined to the plugin's install dir), gated until you invoke it."
+                        .to_string(),
+                    risk: RiskLevel::High,
+                    text: configure_command_tool_text(&req),
+                };
+            }
             match crate::prime_candidate_config::parse_candidate_config_request(message) {
                 Some(sel) => PrimePlan::Propose {
                     action: PrimeAction::ConfigurePluginCandidate {
@@ -2997,6 +3056,54 @@ mod tests {
             }
             other => panic!("expected a Propose ConfigurePluginCandidate, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn decide_from_scratch_command_tool_proposes_configure_command_tool() {
+        let s = empty_summary();
+        // The user NAMES the command (no detected candidate) — the bridge for a source-only
+        // plugin. It classifies as PluginConfiguration and proposes a gated ConfigureCommandTool.
+        assert_eq!(
+            classify_intent("configure this repo as a tool that runs npm test"),
+            PrimeIntent::PluginConfiguration
+        );
+        assert_eq!(
+            classify_intent("use npm test from this plugin"),
+            PrimeIntent::PluginConfiguration
+        );
+        let plan = decide(
+            "make a command tool that runs cargo build for acme-tools",
+            &PrimeIntent::PluginConfiguration,
+            &s,
+        );
+        match plan {
+            PrimePlan::Propose { action, risk, .. } => {
+                assert_eq!(risk, RiskLevel::High, "configuring a command tool is gated");
+                match action {
+                    PrimeAction::ConfigureCommandTool {
+                        plugin_id,
+                        tool_name,
+                        program,
+                        args,
+                        cwd,
+                    } => {
+                        assert_eq!(plugin_id, "acme-tools");
+                        assert_eq!(tool_name, "cargo.build");
+                        assert_eq!(program, "cargo");
+                        assert_eq!(args, vec!["build".to_string()]);
+                        assert_eq!(cwd, "", "cwd defaults to the install root");
+                    }
+                    other => panic!("expected ConfigureCommandTool, got {other:?}"),
+                }
+            }
+            other => panic!("expected a Propose, got {other:?}"),
+        }
+        // A bare "run the tests" (no tool cue, no concrete command) is NOT a command-tool
+        // configuration — it must not be swallowed by the from-scratch branch.
+        assert_ne!(
+            classify_intent("run the tests"),
+            PrimeIntent::PluginConfiguration
+        );
     }
 
     #[test]

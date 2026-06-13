@@ -12146,6 +12146,27 @@ fn describe_action(action: &PrimeAction) -> String {
                 "configure detected capability \"{candidate_id}\" of {plugin} (metadata/recipe only, no code run)"
             )
         }
+        PrimeAction::ConfigureCommandTool {
+            plugin_id,
+            tool_name,
+            program,
+            args,
+            ..
+        } => {
+            let plugin = if plugin_id.trim().is_empty() {
+                "the plugin".to_string()
+            } else {
+                format!("plugin {plugin_id}")
+            };
+            let argv = if args.is_empty() {
+                program.clone()
+            } else {
+                format!("{program} {}", args.join(" "))
+            };
+            format!(
+                "configure command tool \"{tool_name}\" on {plugin} running `{argv}` (argv-only, gated, nothing runs until invoked)"
+            )
+        }
         PrimeAction::CreateAgent {
             name,
             adapter_plugin,
