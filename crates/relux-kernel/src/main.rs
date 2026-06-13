@@ -722,7 +722,7 @@ fn run_health() -> ExitCode {
             if ai_status.configured {
                 println!("PASS: AI mode: OpenRouter (configured)");
             } else {
-                warnings.push("WARN: AI mode: OpenRouter (not configured; set a key in the dashboard AI settings or RELUX_OPENROUTER_API_KEY)".to_string());
+                warnings.push("WARN: AI mode: OpenRouter (not configured; set a key in the dashboard at Crew → Prime Brain or RELUX_OPENROUTER_API_KEY)".to_string());
                 if exit_code == ExitCode::SUCCESS {
                     exit_code = ExitCode::from(1);
                 }

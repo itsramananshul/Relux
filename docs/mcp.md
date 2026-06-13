@@ -1147,7 +1147,7 @@ Even "extended" is bounded, so a request burst can never spawn unbounded workers
 **Configuring + continuing.** The policy is served at `GET/PUT/PATCH /v1/relux/prime/agent-policy`
 (response carries the resolved standard/extended limits, including `max_tool_plan_steps`,
 `max_orchestration_steps`, `max_context_rounds`, and `max_active_jobs`), set in the dashboard's **Prime
-Autonomy Limits** panel (Health → Prime Brain) — which now has **Tool plan**, **Orchestration**,
+Autonomy Limits** panel (Crew → Prime Brain) — which now has **Tool plan**, **Orchestration**,
 **Context loop**, and **Active jobs** rows for the standard/extended limits — or via `relux-kernel prime
 agent-policy <status|configure>` (flags `--max-tool-plan-steps N` / `--ext-max-tool-plan-steps N`,
 `--max-orchestration-steps N` / `--ext-max-orchestration-steps N`, `--max-context-rounds N` /

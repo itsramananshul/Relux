@@ -125,7 +125,7 @@ Then, in your browser:
    hard re-sign-in ceiling. Forgot it? `relux-kernel.exe reset-admin` clears the
    credential so you can set a new one. (Set `RELUX_AUTH_DISABLED=1` only for a
    throwaway local dev box.)
-2. Go to **Health → Prime Brain / AI Runtime** and click **"Use Claude CLI for
+2. Go to **Crew → Prime Brain** and click **"Use Claude CLI for
    Prime"**. If `claude` is not yet on your PATH the panel shows the exact install
    + sign-in step (`npm i -g @anthropic-ai/claude-code`, then run `claude` once to
    log in); install it, click **Refresh**, then **"Use Claude CLI for Prime"**
@@ -148,7 +148,7 @@ it is fully self-contained and portable.
 **Product path (first release):** real work runs through a coding-agent **adapter**
 - the **Claude CLI** or the **Codex CLI** - driven by **Prime** and its tools. Set
 up an adapter from the dashboard (Crew → Adapters) and, optionally, give Prime a
-natural voice with an OpenRouter key (Health → Prime AI settings). The bundled
+natural voice with an OpenRouter key (Crew → Prime Brain). The bundled
 `relux-tools-echo` / `relux-tools-status` handlers are **internal dev/test tools**
 that prove the loop end-to-end (they back the offline smoke); they are not the
 recommended user path and are not surfaced as a "run echo" button in the product.
@@ -769,7 +769,8 @@ paid CLI); orchestration runs are operator-triggered from the UI, CLI, or API.
 ### Prime Brain (who answers Prime's chat)
 
 Prime's **conversational** replies can come from one of four "brains", chosen from
-**Health → Prime Brain / AI Runtime**. Prime's **actions** (creating tasks,
+**Crew → Prime Brain** (the same panel is also mirrored on **Health** as a
+read-only diagnostics duplicate). Prime's **actions** (creating tasks,
 starting runs, approvals) always stay deterministic and kernel-grounded no matter
 which brain is selected:
 
@@ -829,8 +830,8 @@ The OpenRouter brain enables a natural, LLM-backed chat path. Conversational
 replies (greetings, status, explanations) are shaped by the model while actions
 stay grounded and deterministic in the kernel.
 
-**From the dashboard (recommended; no env vars).** Open **Health → Prime AI
-settings**, paste your OpenRouter key (and optionally a model), and save. The key
+**From the dashboard (recommended; no env vars).** Open **Crew → Prime Brain**,
+select **OpenRouter**, paste your OpenRouter key (and optionally a model), and save. The key
 is stored in a local, gitignored secrets file under the data root
 (`<data-root>/ai-config.json`, e.g. `dev-data/relux/ai-config.json`) at `0600` on
 Unix. It is **never** returned by the API or shown in the UI - only the key-free
