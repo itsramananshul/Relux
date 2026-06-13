@@ -734,9 +734,24 @@ probe says exactly why and what to do next - *not installed*, *not on PATH*,
 `POST /v1/relux/ai/probe { "brain"?: "claude_cli" }` (omit `brain` to probe the brain
 Prime is currently using); sign-in is verified on your first real chat turn.
 
+**Prove it can actually chat - the live probe.** The Test button proves a brain is
+*available*; it cannot prove Prime can complete a chat turn (a CLI's sign-in is only
+confirmed on the first real turn, and OpenRouter is never contacted). The
+**Test live chat** button does: it sends one tiny, bounded prompt through the brain
+and reports whether a real reply came back. It runs **only when you click it** and
+**may use the real provider / CLI and may incur provider usage** - so it is never run
+automatically, and it is disabled (with the reason shown) until the brain is set up.
+It is a setup diagnostic: it creates no task and no run. The API is
+`POST /v1/relux/ai/probe/live { "brain"?: "claude_cli" }`, returning a clear status -
+`ready` / `not_configured` / `missing_key` / `auth_failed` / `timeout` / `failed` -
+with a `duration_ms` and, on success, a redacted `sample` of the real reply. A CLI
+that is not signed in is reported as `auth_failed` with the next step.
+
 CLI brains are spawned the same safe way as assigned runs: argv-only, prompt on
 stdin, a wall-clock timeout, an output cap, and secret redaction. Claude is invoked
-in `--permission-mode default` (never `--dangerously-skip-permissions`).
+in `--permission-mode default` (never `--dangerously-skip-permissions`). The live
+probe uses this **exact same safe invocation** - the only difference from a real turn
+is a tiny fixed prompt and a tighter timeout/output cap.
 
 #### Optional LLM-backed Prime (OpenRouter)
 

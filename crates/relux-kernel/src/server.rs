@@ -518,6 +518,7 @@ fn protected_router() -> Router<AppState> {
         .route("/v1/relux/doctor", get(get_doctor))
         .route("/v1/relux/ai/status", get(get_ai_status))
         .route("/v1/relux/ai/probe", post(probe_ai_brain))
+        .route("/v1/relux/ai/probe/live", post(probe_ai_brain_live))
         .route(
             "/v1/relux/ai/config",
             put(set_ai_config).patch(set_ai_config).delete(clear_ai_config),
@@ -1402,6 +1403,83 @@ async fn probe_ai_brain(
 #[derive(Debug, Deserialize, Default)]
 struct ProbeBrainReq {
     brain: Option<String>,
+}
+
+/// Explicit LIVE chat probe (`POST /v1/relux/ai/probe/live`).
+///
+/// Unlike [`probe_ai_brain`] (availability only), this actually completes one
+/// tiny bounded chat turn through the selected/resolved brain and returns a
+/// classified result. It is ONLY ever invoked on a deliberate operator click —
+/// the dashboard never calls it on page load — because it may use the real
+/// provider / CLI and may incur provider usage. It creates no task and no run and
+/// grants no broader permission: it is a setup diagnostic only.
+async fn probe_ai_brain_live(
+    State(state): State<AppState>,
+    body: Option<Json<ProbeBrainReq>>,
+) -> Result<Json<relux_kernel::LiveBrainProbe>, ApiError> {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let cfg = resolve_ai(&state);
+    let adapter_statuses = {
+        let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
+        match SqliteStore::open(&state.db_path).and_then(|s| s.load()) {
+            Ok(kernel) => kernel.adapter_runtime_status(),
+            Err(_) => Vec::new(),
+        }
+    };
+    let target = match req.brain.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
+        Some(b) => relux_kernel::PrimeBrain::parse(b).ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "unsupported brain '{b}'. Use one of: local, openrouter, claude_cli, codex_cli."
+            ))
+        })?,
+        None => {
+            let available = relux_kernel::available_cli_brains(&adapter_statuses);
+            relux_kernel::resolve_brain(&cfg, &available).0
+        }
+    };
+    let probe = match target {
+        relux_kernel::PrimeBrain::Local => relux_kernel::probe_local_live(),
+        relux_kernel::PrimeBrain::Openrouter => relux_kernel::probe_openrouter_live(&cfg).await,
+        relux_kernel::PrimeBrain::ClaudeCli | relux_kernel::PrimeBrain::CodexCli => {
+            let is_codex = target == relux_kernel::PrimeBrain::CodexCli;
+            let adapter_id = if is_codex {
+                relux_core::CODEX_CLI_ADAPTER_ID
+            } else {
+                relux_core::CLAUDE_CLI_ADAPTER_ID
+            };
+            let adapter = adapter_statuses
+                .iter()
+                .find(|a| a.plugin_id == adapter_id)
+                .cloned();
+            // Only spawn a real chat turn when the adapter is enabled AND on PATH;
+            // otherwise classify from the snapshot alone (no process, no usage).
+            match adapter
+                .as_ref()
+                .filter(|a| a.state == relux_core::AdapterRuntimeState::Available)
+            {
+                Some(a) => {
+                    let bin = a.command.clone().unwrap_or_else(|| {
+                        if is_codex { "codex".to_string() } else { "claude".to_string() }
+                    });
+                    tokio::task::spawn_blocking(move || {
+                        relux_kernel::cli_live_probe_blocking(target, &bin)
+                    })
+                    .await
+                    .unwrap_or_else(|_| relux_kernel::LiveBrainProbe {
+                        brain: target.as_str().to_string(),
+                        ok: false,
+                        status: relux_kernel::LiveProbeStatus::Failed,
+                        detail: "The live probe worker did not finish. Try again.".to_string(),
+                        sample: None,
+                        duration_ms: 0,
+                        checked: "cli_chat",
+                    })
+                }
+                None => relux_kernel::cli_live_probe_unavailable(target, adapter.as_ref()),
+            }
+        }
+    };
+    Ok(Json(probe))
 }
 
 async fn list_agents(State(state): State<AppState>) -> Result<Json<Vec<AgentRecord>>, ApiError> {
@@ -12086,6 +12164,78 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "body: {body}");
         assert!(body.contains("\"brain\":\"local\""), "body: {body}");
         assert!(body.contains("\"status\":\"ready\""), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn ai_live_probe_local_brain_completes_without_a_provider() {
+        let (state, _dir) = auth_state(true);
+        // The Local live probe is deterministic, labelled a fallback/test brain, and
+        // contacts no provider — so it is safe to assert it always completes ready.
+        let (status, _c, body) = call(
+            &state,
+            "POST",
+            "/v1/relux/ai/probe/live",
+            None,
+            Some(r#"{"brain":"local"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert!(body.contains("\"brain\":\"local\""), "body: {body}");
+        assert!(body.contains("\"status\":\"ready\""), "body: {body}");
+        assert!(body.contains("\"ok\":true"), "body: {body}");
+        assert!(body.contains("\"checked\":\"local_fallback\""), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn ai_live_probe_openrouter_without_a_key_is_missing_key_not_a_call() {
+        let (state, _dir) = auth_state(true);
+        // OpenRouter with no key: a clean, actionable "missing_key". Crucially the
+        // live probe must NOT make a billable request when no key resolves.
+        let (status, _c, body) = call(
+            &state,
+            "POST",
+            "/v1/relux/ai/probe/live",
+            None,
+            Some(r#"{"brain":"openrouter"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert!(body.contains("\"status\":\"missing_key\""), "body: {body}");
+        assert!(body.contains("\"ok\":false"), "body: {body}");
+        assert!(body.contains("\"checked\":\"openrouter_chat\""), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn ai_live_probe_cli_without_an_enabled_adapter_is_not_configured() {
+        let (state, _dir) = auth_state(true);
+        // A freshly-bootstrapped store has no enabled CLI adapter, so a CLI live
+        // probe classifies from the snapshot alone — no process is ever spawned.
+        let (status, _c, body) = call(
+            &state,
+            "POST",
+            "/v1/relux/ai/probe/live",
+            None,
+            Some(r#"{"brain":"claude_cli"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert!(body.contains("\"brain\":\"claude_cli\""), "body: {body}");
+        assert!(body.contains("\"status\":\"not_configured\""), "body: {body}");
+        assert!(body.contains("\"checked\":\"cli_chat\""), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn ai_live_probe_rejects_an_unknown_brain() {
+        let (state, _dir) = auth_state(true);
+        let (status, _c, _body) = call(
+            &state,
+            "POST",
+            "/v1/relux/ai/probe/live",
+            None,
+            Some(r#"{"brain":"gpt-9000"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

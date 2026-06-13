@@ -5,6 +5,7 @@ import {
   type ReluxAiStatus,
   type ReluxAdapterStatus,
   type ReluxBrainProbe,
+  type ReluxLiveBrainProbe,
   type ReluxPrimeBrain,
 } from "../api";
 import { PrimeAiSettings } from "./PrimeAiSettings";
@@ -77,6 +78,11 @@ export function PrimeBrainPanel() {
   // The latest safe probe result per brain, plus which brain is mid-probe.
   const [probes, setProbes] = useState<Record<string, ReluxBrainProbe>>({});
   const [probing, setProbing] = useState<ReluxPrimeBrain | null>(null);
+  // The latest LIVE chat-probe result per brain, plus which brain is mid-live-probe.
+  // The live probe is explicit-only (see `testBrainLive`) and may use the real
+  // provider / CLI, so it is never run on load — only on a deliberate click.
+  const [liveProbes, setLiveProbes] = useState<Record<string, ReluxLiveBrainProbe>>({});
+  const [liveProbing, setLiveProbing] = useState<ReluxPrimeBrain | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -99,6 +105,24 @@ export function PrimeBrainPanel() {
 
   const adapterFor = (id?: string) =>
     id ? (adapters ?? []).find((a) => a.plugin_id === id) ?? null : null;
+
+  // Whether a LIVE chat probe can do anything useful for this brain yet. When it
+  // cannot, the live button is disabled with the reason shown — so we never invite
+  // a pointless (and for OpenRouter, billable) attempt on an unconfigured brain.
+  function liveApplicable(opt: BrainOption): { ok: boolean; reason: string } {
+    if (opt.brain === "local") {
+      return { ok: true, reason: "Deterministic local brain — safe to test (no provider call)." };
+    }
+    if (opt.brain === "openrouter") {
+      return status?.configured
+        ? { ok: true, reason: "Sends one small, billable OpenRouter request." }
+        : { ok: false, reason: "Configure an OpenRouter key first, then live-test it." };
+    }
+    const adapter = adapterFor(opt.adapterId);
+    return adapter?.state === "available"
+      ? { ok: true, reason: "Runs one real CLI chat turn (uses your CLI login)." }
+      : { ok: false, reason: "Enable the adapter and get the CLI on PATH first, then live-test it." };
+  }
 
   async function selectBrain(brain: ReluxPrimeBrain) {
     setBusy(true);
@@ -151,6 +175,22 @@ export function PrimeBrainPanel() {
     }
   }
 
+  // EXPLICIT live chat probe: actually completes one tiny bounded chat turn
+  // through the brain. This MAY use the real provider / CLI and MAY incur
+  // provider usage, so it only ever runs on a deliberate click (never on load).
+  async function testBrainLive(brain: ReluxPrimeBrain) {
+    setLiveProbing(brain);
+    setBanner(null);
+    try {
+      const probe = await reluxAi.probeLive(brain);
+      setLiveProbes((prev) => ({ ...prev, [brain]: probe }));
+    } catch (e) {
+      setBanner({ kind: "err", msg: e instanceof Error ? e.message : "Live probe failed" });
+    } finally {
+      setLiveProbing(null);
+    }
+  }
+
   async function setAdapterEnabled(id: string, enabled: boolean) {
     setBusy(true);
     setBanner(null);
@@ -186,6 +226,14 @@ export function PrimeBrainPanel() {
         <strong>actions</strong> (creating tasks, starting runs, approvals) stay deterministic and
         kernel-grounded no matter which brain is selected. Claude and Codex run as local CLIs and
         use their own login — no API key is stored in Relux for them.
+      </p>
+      <p className="muted" style={{ marginTop: -6, marginBottom: 12, fontSize: 11, lineHeight: 1.6 }}>
+        <strong>Quick probe</strong> is safe and free — it checks availability only (a CLI's{" "}
+        <span className="mono">--version</span>, or that an OpenRouter key resolves), so it cannot
+        prove a chat turn actually works. <strong>Test live chat</strong> proves it: it sends one
+        tiny message through the brain. It runs <strong>only when you click it</strong> and{" "}
+        <strong>may use the real provider / CLI and may incur provider usage</strong>. It never
+        creates a task or run.
       </p>
 
       {banner && (
@@ -238,10 +286,30 @@ export function PrimeBrainPanel() {
                   className="btn ghost sm"
                   disabled={probing === opt.brain}
                   onClick={() => void testBrain(opt.brain)}
-                  title="Safely test whether this brain is usable (read-only; no agent run, no bypass, no billable call)"
+                  title="Quick probe: safely check whether this brain is usable (read-only; no agent run, no bypass, no billable call)"
                 >
-                  {probing === opt.brain ? "Testing…" : "Test"}
+                  {probing === opt.brain ? "Testing…" : "Quick probe"}
                 </button>
+                {(() => {
+                  const live = liveApplicable(opt);
+                  const isLocal = opt.brain === "local";
+                  return (
+                    <button
+                      className="btn ghost sm"
+                      disabled={liveProbing === opt.brain || !live.ok}
+                      onClick={() => void testBrainLive(opt.brain)}
+                      title={
+                        live.ok
+                          ? isLocal
+                            ? `Live chat test — ${live.reason}`
+                            : `Live chat test — sends a real message through this brain. ${live.reason} Runs only when you click.`
+                          : `Live chat test unavailable — ${live.reason}`
+                      }
+                    >
+                      {liveProbing === opt.brain ? "Testing live…" : "Test live chat"}
+                    </button>
+                  );
+                })()}
                 {!active && (
                   <button
                     className="btn ghost sm"
@@ -255,6 +323,7 @@ export function PrimeBrainPanel() {
               <p className="muted" style={{ fontSize: 12, margin: "6px 0 0" }}>{opt.blurb}</p>
 
               {probes[opt.brain] && <ProbeResult probe={probes[opt.brain]} />}
+              {liveProbes[opt.brain] && <LiveProbeResult probe={liveProbes[opt.brain]} />}
 
               {opt.adapterId && (
                 <CliAdapterControls
@@ -317,6 +386,41 @@ function ProbeResult({ probe }: { probe: ReluxBrainProbe }) {
           {" "}
           <span className="mono">{probe.version}</span>
         </>
+      )}
+    </div>
+  );
+}
+
+// The outcome of an explicit LIVE chat probe: a ready/failed badge, the
+// secret-free detail (with the next step on failure), a redacted sample of the
+// real reply when one came back, and how long the turn took.
+function LiveProbeResult({ probe }: { probe: ReluxLiveBrainProbe }) {
+  const tone = probe.ok
+    ? "ok"
+    : probe.status === "not_configured" || probe.status === "missing_key"
+      ? "info"
+      : "err";
+  const label = probe.ok
+    ? "live chat OK"
+    : probe.status === "auth_failed"
+      ? "auth failed"
+      : probe.status === "timeout"
+        ? "timed out"
+        : probe.status === "missing_key"
+          ? "no key"
+          : probe.status === "not_configured"
+            ? "not set up"
+            : probe.status === "unsupported"
+              ? "unsupported"
+              : "failed";
+  const seconds = probe.duration_ms > 0 ? ` · ${(probe.duration_ms / 1000).toFixed(1)}s` : "";
+  return (
+    <div className={"banner " + tone} style={{ fontSize: 11, marginTop: 8, marginBottom: 0 }}>
+      <strong>{probe.ok ? "✓ " : "⚠ "}Live: {label}</strong>{seconds} — {probe.detail}
+      {probe.sample && (
+        <div style={{ marginTop: 4 }}>
+          Reply: <span className="mono">{probe.sample}</span>
+        </div>
       )}
     </div>
   );

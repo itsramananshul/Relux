@@ -166,6 +166,33 @@ Everything above assumes Prime has a **real** brain. The setup surface for that 
   The result is a clear status — `ready` / `disabled` / `missing_binary` / `not_configured` /
   `missing_key` / `failed` — each with a secret-free `detail` and the next step. The probe never
   runs an agent turn and never crosses a permission boundary.
+- **Prove a real chat turn — the live probe.** The quick probe proves *availability*; it cannot
+  prove Prime can complete a chat turn (for CLI brains, sign-in is only confirmed on the first real
+  turn, and OpenRouter is never contacted). The **Test live chat** button → `POST
+  /v1/relux/ai/probe/live` (`{ brain?, ... }`) closes that gap by sending **one tiny, bounded
+  prompt** through the selected/resolved brain and classifying the result. It is **explicit-only**:
+  the dashboard never calls it on load, the button copy states it **may use the real provider / CLI
+  and may incur provider usage**, and it is disabled (with the reason shown) when the brain is not
+  set up yet. It is a setup diagnostic — it creates **no task and no run** and grants no broader
+  permission.
+  - **CLI brains** run the **same safe adapter invocation a real turn uses** (`build_adapter_args`,
+    so **no bypass/danger flag**), with the tiny prompt on stdin, a bounded timeout (60 s), an
+    output cap, and secret redaction. The reply is parsed via `parse_adapter_result` and a redacted,
+    truncated `sample` is returned. A not-logged-in / auth error is detected and reported as
+    `auth_failed` with the next step; a clean exit with no readable reply is an honest `failed`,
+    never a fake success.
+  - **OpenRouter** sends **one** small, low-token (billable) request through the existing client
+    path; the key travels only in the `Authorization` header and never appears in the result. A
+    401/403 maps to `auth_failed`, a transport timeout to `timeout`. When no usable key resolves (or
+    the LLM path is disabled) it returns **without** making any request.
+  - **Local** answers deterministically and is labelled a fallback/test brain — no provider is
+    contacted and no usage is incurred.
+  The live result is a clear status — `ready` / `not_configured` / `missing_key` / `auth_failed` /
+  `timeout` / `failed` / `unsupported` — with a secret-free `detail`, a `duration_ms`, and (on
+  success) a redacted `sample` of the real reply. Reference-driven (`reference/hermes-agent-main/
+  agent/auxiliary_client.py`): Hermes validates a provider with a real minimal completion and
+  classifies the failure (auth / payment / timeout) rather than trusting a config check — the live
+  probe mirrors that "prove it with a real call, then classify" shape.
 
 Keys are never stored or shown in plaintext: OpenRouter's key is a write-only secret reference
 (only the secret *name* and a redacted preview cross the wire); Claude/Codex authenticate through

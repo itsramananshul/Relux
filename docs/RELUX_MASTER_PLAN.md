@@ -1940,6 +1940,41 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **unreleased** — **live chat brain probe** on top of the brain-setup slice below, closing the gap
+  the quick probe could not: it proves *availability* (`--version` / key-resolves) but not that
+  Prime can complete a chat turn — for CLI brains "sign-in is verified on the first real chat turn",
+  and OpenRouter is never contacted (RELUX_MASTER_PLAN §10.1 — the LLM brain is the PRIMARY surface;
+  §14 — Claude/Codex CLI is the recommended first brain; `docs/prime-tool-use.md` "Powering Prime";
+  reference-first per `docs/reference-driven-development.md`). **New capability:** `POST
+  /v1/relux/ai/probe/live { brain? }` sends ONE tiny, bounded prompt through the selected/resolved
+  brain and classifies the result (`ready` / `not_configured` / `missing_key` / `auth_failed` /
+  `timeout` / `failed` / `unsupported`) + a secret-free `detail`, a `duration_ms`, and (on success) a
+  redacted, truncated `sample` of the real reply. **CLI brains** run the **same safe adapter
+  invocation a real turn uses** (`build_adapter_args` → `run_adapter_command`: argv-only, tiny prompt
+  on stdin, **no `--dangerously-skip-permissions`/bypass flag**, 60 s timeout, 16 KiB output cap,
+  secret redaction); the reply is parsed via `parse_adapter_result`, an auth/sign-in failure is
+  detected → `auth_failed`, and a clean exit with no readable text is an honest `failed` (never a fake
+  success). **OpenRouter** sends one small, low-token (billable) request via the existing
+  `request_completion_with` client path (key only in the `Authorization` header), mapping 401/403 →
+  `auth_failed` and transport timeout → `timeout`; it returns WITHOUT a request when no usable key
+  resolves or the LLM path is disabled. **Local** answers deterministically, labelled a fallback/test
+  brain, contacting no provider. Pure classifiers `classify_openrouter_live` / `classify_cli_live_probe`
+  / `cli_live_probe_unavailable` + `probe_local_live` / `probe_openrouter_live` /
+  `cli_live_probe_blocking` + `LiveBrainProbe`/`LiveProbeStatus` in `ai.rs`; the endpoint runs the
+  blocking CLI turn off the async runtime via `spawn_blocking` and resolves the target through the
+  unchanged `resolve_brain`. Mirrors Hermes' "prove it with a real minimal completion, then classify
+  the failure" shape (`reference/hermes-agent-main/agent/auxiliary_client.py`). It is a **setup
+  diagnostic only**: creates no task and no run, grants no broader permission. **UI (Health → Prime
+  Brain panel):** a **Test live chat** button beside the quick **Quick probe**, disabled (with the
+  reason) until the brain is set up, with explicit panel copy that it runs **only on a deliberate
+  click** and **may use the real provider / CLI and may incur provider usage**; a `LiveProbeResult`
+  banner renders the verdict + duration + redacted sample. **Tests:** `relux-kernel` `cargo test` +
+  `clippy --all-targets -D warnings` clean (new `ai.rs` live-probe classifier tests incl.
+  ready/empty/missing-key/auth/timeout/failed + an async "never calls without a usable key" test, and
+  `server.rs` `/v1/relux/ai/probe/live` route tests: local ready, openrouter-no-key missing_key,
+  CLI-not-enabled not_configured, unknown-brain 400). Dashboard typechecks, builds, and all tests
+  pass incl. new `prime-brain-setup-render.test.mjs` assertions for the live button + warning copy;
+  the committed bundle was rebuilt.
 - **unreleased** — **product-grade Prime brain setup + a safe brain probe** on top of v0.1.30,
   closing the first-run pain "adapters are listed but I can't tell how to actually power Prime"
   (RELUX_MASTER_PLAN §14 — recommended first adapter is Claude/Codex CLI or OpenRouter, "the

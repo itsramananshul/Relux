@@ -880,6 +880,429 @@ pub fn classify_cli_probe(
     }
 }
 
+// --- Live chat probe --------------------------------------------------------
+//
+// The quick probe above proves *availability*: a CLI binary runs `--version`, an
+// OpenRouter key *resolves*. It cannot prove Prime can actually complete a chat
+// turn — for the CLI brains "sign-in is verified on your first chat turn", and
+// OpenRouter is never contacted at all. The *live* probe closes that gap with an
+// explicit, operator-triggered test that sends ONE tiny bounded prompt through
+// the selected brain and reports a classified result.
+//
+// Safety contract (binding, same spirit as the quick probe):
+// - It is NEVER run automatically — only on a deliberate operator click.
+// - CLI brains run the SAME safe adapter invocation a real turn uses
+//   (`build_adapter_args`, NO bypass/danger flag), with a bounded timeout +
+//   output cap; the reply is redacted + truncated before it leaves the kernel.
+// - OpenRouter makes one tiny, low-token (billable) request via the existing
+//   client path; no key ever appears in the result.
+// - Local is deterministic and labelled a fallback/test brain.
+// - It creates NO task and NO run, and grants no broader permission. It is a
+//   setup diagnostic only.
+//
+// Reference-driven: Hermes validates a provider with a real minimal completion
+// and classifies the failure (auth / payment / timeout) rather than trusting a
+// config check (`reference/hermes-agent-main/agent/auxiliary_client.py`
+// `_mark_provider_unhealthy` / `_is_payment_error`). This mirrors that
+// "prove it with a real call, then classify" shape onto the Relux brains.
+
+/// A tiny, fixed prompt for the live chat probe. Asks for one short fixed token so
+/// a success is unambiguous and the reply stays small.
+const LIVE_PROBE_PROMPT: &str = "Reply with exactly this text and nothing else: relux probe ok";
+/// Wall-clock bound on a live CLI chat turn — generous enough for a real cold turn
+/// (the CLI may spin up), but never unbounded.
+const LIVE_PROBE_CLI_TIMEOUT_MS: u64 = 60_000;
+/// Output cap for a live CLI probe. A probe reply is tiny; this only stops a
+/// runaway adapter from streaming forever.
+const LIVE_PROBE_MAX_OUTPUT_BYTES: usize = 16 * 1024;
+/// Completion-token cap for a live OpenRouter probe — keeps the billable call as
+/// small as possible.
+const LIVE_PROBE_MAX_TOKENS: u32 = 32;
+/// Max characters kept from the sample reply shown back to the operator.
+const LIVE_PROBE_SAMPLE_CHARS: usize = 280;
+
+/// The coarse outcome of an explicit LIVE chat probe
+/// (`POST /v1/relux/ai/probe/live`). Serializes to snake_case for the dashboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveProbeStatus {
+    /// A real chat turn completed and returned a usable reply.
+    Ready,
+    /// The brain cannot run a live turn yet (CLI adapter not enabled / not on
+    /// PATH / disabled). The `detail` carries the exact next step.
+    NotConfigured,
+    /// OpenRouter is selected but no usable API key resolved.
+    MissingKey,
+    /// The provider/CLI reported an authentication / sign-in failure.
+    AuthFailed,
+    /// The brain did not respond before the bounded timeout.
+    Timeout,
+    /// The probe ran but the turn failed (non-zero exit / error envelope / no
+    /// readable reply).
+    Failed,
+    /// A live probe is not implemented for this brain.
+    Unsupported,
+}
+
+/// The result of an explicit live chat probe.
+///
+/// Unlike [`BrainProbe`] (availability only), this is produced by actually
+/// completing one bounded chat turn. The `sample` is a redacted, truncated slice
+/// of the real reply so the operator can see the brain answered.
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveBrainProbe {
+    /// The probed brain's wire string.
+    pub brain: String,
+    /// Whether the brain completed a usable chat turn.
+    pub ok: bool,
+    /// The coarse status driving the dashboard badge.
+    pub status: LiveProbeStatus,
+    /// A human-readable, secret-free explanation + the next step on failure.
+    pub detail: String,
+    /// A redacted, truncated slice of the real reply, when one came back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample: Option<String>,
+    /// How long the probe took, in milliseconds (0 when no call was made).
+    pub duration_ms: u64,
+    /// How the probe was checked: `local_fallback` (Local), `openrouter_chat`, or
+    /// `cli_chat`.
+    pub checked: &'static str,
+}
+
+impl LiveBrainProbe {
+    /// A failed live probe with no sample (used for join panics / spawn errors).
+    fn failed(brain: PrimeBrain, status: LiveProbeStatus, detail: String, duration_ms: u64, checked: &'static str) -> Self {
+        Self {
+            brain: brain.as_str().to_string(),
+            ok: false,
+            status,
+            detail,
+            sample: None,
+            duration_ms,
+            checked,
+        }
+    }
+}
+
+/// Redact + truncate a candidate reply into a small operator-facing sample.
+/// Returns `None` for an empty reply (so callers can treat "no text" as a failure
+/// rather than a fake success).
+fn sample_reply(text: &str) -> Option<String> {
+    let redacted = relux_core::redact_secrets(text);
+    let trimmed = redacted.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(truncate_chars(trimmed, LIVE_PROBE_SAMPLE_CHARS))
+}
+
+/// Probe the always-available Local deterministic brain with a (deterministic)
+/// live answer. No external provider is contacted and no usage is incurred.
+pub fn probe_local_live() -> LiveBrainProbe {
+    LiveBrainProbe {
+        brain: PrimeBrain::Local.as_str().to_string(),
+        ok: true,
+        status: LiveProbeStatus::Ready,
+        detail: "Local deterministic brain answered. This is the grounded fallback/test brain — no external provider was contacted and no usage was incurred.".to_string(),
+        sample: Some("relux probe ok (local deterministic brain)".to_string()),
+        duration_ms: 0,
+        checked: "local_fallback",
+    }
+}
+
+/// Build the minimal chat messages for a live probe.
+fn build_live_probe_messages() -> Vec<ChatMessage> {
+    vec![
+        ChatMessage {
+            role: "system",
+            content: "You are a connectivity probe. Reply with exactly the text the user asks for, and nothing else.".to_string(),
+        },
+        ChatMessage {
+            role: "user",
+            content: LIVE_PROBE_PROMPT.to_string(),
+        },
+    ]
+}
+
+/// Classify a live OpenRouter probe from the completion result. Pure: the caller
+/// makes the (billable) request and hands the outcome here. `Ok(text)` is a real
+/// reply; `Err(reason)` is the short, secret-free reason from
+/// [`request_completion`].
+pub fn classify_openrouter_live(result: Result<String, String>, duration_ms: u64) -> LiveBrainProbe {
+    let brain = PrimeBrain::Openrouter.as_str().to_string();
+    match result {
+        Ok(text) => match sample_reply(&text) {
+            Some(sample) => LiveBrainProbe {
+                brain,
+                ok: true,
+                status: LiveProbeStatus::Ready,
+                detail: "OpenRouter completed a live chat turn. The key works and Prime can reach the provider.".to_string(),
+                sample: Some(sample),
+                duration_ms,
+                checked: "openrouter_chat",
+            },
+            None => LiveBrainProbe {
+                brain,
+                ok: false,
+                status: LiveProbeStatus::Failed,
+                detail: "OpenRouter returned an empty completion. The key may be valid but the model produced no text — try a different model, then re-test.".to_string(),
+                sample: None,
+                duration_ms,
+                checked: "openrouter_chat",
+            },
+        },
+        Err(reason) => {
+            let (status, detail) = classify_openrouter_error(&reason);
+            LiveBrainProbe {
+                brain,
+                ok: false,
+                status,
+                detail,
+                sample: None,
+                duration_ms,
+                checked: "openrouter_chat",
+            }
+        }
+    }
+}
+
+/// Map a secret-free OpenRouter failure reason to a coarse status + next step.
+fn classify_openrouter_error(reason: &str) -> (LiveProbeStatus, String) {
+    let r = reason.to_ascii_lowercase();
+    if r.contains("no api key") {
+        (
+            LiveProbeStatus::MissingKey,
+            "No OpenRouter API key resolved. Set a secret and reference it, then re-test.".to_string(),
+        )
+    } else if r.contains("401") || r.contains("403") {
+        (
+            LiveProbeStatus::AuthFailed,
+            format!("OpenRouter rejected the request ({reason}). Check the key value and that the account is active, then re-test."),
+        )
+    } else if r.contains("timeout") {
+        (
+            LiveProbeStatus::Timeout,
+            "OpenRouter did not respond before the timeout. Check connectivity (or raise the timeout), then re-test.".to_string(),
+        )
+    } else {
+        (
+            LiveProbeStatus::Failed,
+            format!("OpenRouter live probe failed: {reason}."),
+        )
+    }
+}
+
+/// Run a live OpenRouter chat probe: one tiny, bounded, billable request, then a
+/// classified [`LiveBrainProbe`]. When no usable key resolves (or the LLM path is
+/// disabled) it returns WITHOUT making any request, so the probe never bills on a
+/// misconfigured brain.
+pub async fn probe_openrouter_live(cfg: &AiConfig) -> LiveBrainProbe {
+    let brain = PrimeBrain::Openrouter.as_str().to_string();
+    if cfg.disabled && cfg.configured() {
+        return LiveBrainProbe {
+            brain,
+            ok: false,
+            status: LiveProbeStatus::NotConfigured,
+            detail: "An OpenRouter key is set but Prime's LLM path is disabled (RELUX_LLM_DISABLED or the disabled toggle). Re-enable it, then re-test.".to_string(),
+            sample: None,
+            duration_ms: 0,
+            checked: "openrouter_chat",
+        };
+    }
+    if !cfg.configured() {
+        let detail = if cfg.secret_missing {
+            match &cfg.api_key_secret {
+                Some(name) => format!(
+                    "OpenRouter selected but the referenced secret '{name}' is not set. Add it under Secrets, then re-test."
+                ),
+                None => "OpenRouter selected but its API key secret is missing. Set it to activate the key.".to_string(),
+            }
+        } else {
+            "No OpenRouter API key is configured. Set a secret, then reference it here.".to_string()
+        };
+        return LiveBrainProbe {
+            brain,
+            ok: false,
+            status: LiveProbeStatus::MissingKey,
+            detail,
+            sample: None,
+            duration_ms: 0,
+            checked: "openrouter_chat",
+        };
+    }
+    let messages = build_live_probe_messages();
+    let start = std::time::Instant::now();
+    let result = request_completion_with(cfg, messages, LIVE_PROBE_MAX_TOKENS).await;
+    let duration_ms = start.elapsed().as_millis() as u64;
+    classify_openrouter_live(result, duration_ms)
+}
+
+/// Heuristic: does this (lowercased) CLI output look like an auth / sign-in
+/// failure? Only consulted when the turn already FAILED, so a normal probe reply
+/// (which says only "relux probe ok") never trips it.
+fn looks_like_auth_failure(haystack_lower: &str) -> bool {
+    const NEEDLES: &[&str] = &[
+        "not logged in",
+        "please log in",
+        "log in",
+        "login",
+        "sign in",
+        "not signed in",
+        "authentication",
+        "unauthorized",
+        "401",
+        "403",
+        "forbidden",
+        "invalid api key",
+        "api key",
+        "credentials",
+        "expired",
+        "/login",
+    ];
+    NEEDLES.iter().any(|n| haystack_lower.contains(n))
+}
+
+/// Classify a live CLI chat probe from the process outcome + parsed summary. Pure:
+/// the caller runs the safe adapter invocation (the SAME argv a real turn uses, NO
+/// bypass/danger flag) and hands the outcome here for the verdict.
+pub fn classify_cli_live_probe(
+    brain: PrimeBrain,
+    outcome: &crate::adapter::AdapterRunOutcome,
+    summary: &relux_core::AdapterResultSummary,
+    duration_ms: u64,
+) -> LiveBrainProbe {
+    let brain_str = brain.as_str().to_string();
+    if outcome.timed_out {
+        return LiveBrainProbe {
+            brain: brain_str,
+            ok: false,
+            status: LiveProbeStatus::Timeout,
+            detail: "The CLI did not finish a chat turn before the probe timeout. It may be waiting on input, downloading a model, or stuck. Run a chat turn manually to confirm, then re-test.".to_string(),
+            sample: None,
+            duration_ms,
+            checked: "cli_chat",
+        };
+    }
+    let process_ok = outcome.success && summary.is_error != Some(true);
+    if process_ok {
+        return match sample_reply(&summary.text) {
+            Some(sample) => LiveBrainProbe {
+                brain: brain_str,
+                ok: true,
+                status: LiveProbeStatus::Ready,
+                detail: "The CLI completed a real chat turn and replied. Sign-in and the chat path are verified.".to_string(),
+                sample: Some(sample),
+                duration_ms,
+                checked: "cli_chat",
+            },
+            // Exit 0 but no readable text — honest failure, never a fake success.
+            None => LiveBrainProbe {
+                brain: brain_str,
+                ok: false,
+                status: LiveProbeStatus::Failed,
+                detail: "The CLI exited cleanly but produced no readable reply. It may not be fully signed in. Run a chat turn manually to confirm.".to_string(),
+                sample: None,
+                duration_ms,
+                checked: "cli_chat",
+            },
+        };
+    }
+    let haystack = format!("{}\n{}\n{}", summary.text, outcome.stderr, outcome.stdout).to_ascii_lowercase();
+    if looks_like_auth_failure(&haystack) {
+        return LiveBrainProbe {
+            brain: brain_str,
+            ok: false,
+            status: LiveProbeStatus::AuthFailed,
+            detail: "The CLI reported an authentication / sign-in problem. Sign in to the CLI (run it once interactively to log in), then re-test.".to_string(),
+            sample: None,
+            duration_ms,
+            checked: "cli_chat",
+        };
+    }
+    let exit = outcome
+        .exit_code
+        .map(|c| format!(" (exit {c})"))
+        .unwrap_or_default();
+    LiveBrainProbe {
+        brain: brain_str,
+        ok: false,
+        status: LiveProbeStatus::Failed,
+        detail: format!("The CLI chat turn failed{exit}. Run a chat turn manually to see the full error, then re-test."),
+        sample: None,
+        duration_ms,
+        checked: "cli_chat",
+    }
+}
+
+/// Map a non-`Available` CLI adapter snapshot to a live-probe result WITHOUT
+/// spawning anything (mirrors the quick probe's pre-spawn gating). Every
+/// not-yet-runnable reason folds to [`LiveProbeStatus::NotConfigured`]; the
+/// `detail` (reused from the quick probe) carries the specific next step.
+pub fn cli_live_probe_unavailable(
+    brain: PrimeBrain,
+    adapter: Option<&relux_core::AdapterRuntimeStatus>,
+) -> LiveBrainProbe {
+    let quick = classify_cli_probe(brain, adapter, None);
+    LiveBrainProbe {
+        brain: quick.brain,
+        ok: false,
+        status: LiveProbeStatus::NotConfigured,
+        detail: quick.detail,
+        sample: None,
+        duration_ms: 0,
+        checked: "cli_chat",
+    }
+}
+
+/// Run a live CLI chat probe end-to-end (BLOCKING — spawns a child process).
+/// Resolves the binary, builds the SAME safe argv a real turn uses (no
+/// bypass/danger flag), sends [`LIVE_PROBE_PROMPT`] on stdin under a bounded
+/// timeout + output cap, then parses + classifies the result. Run this on a
+/// blocking thread.
+pub fn cli_live_probe_blocking(brain: PrimeBrain, bin: &str) -> LiveBrainProbe {
+    let kind = match brain {
+        PrimeBrain::CodexCli => relux_core::AdapterKind::CodexCli,
+        _ => relux_core::AdapterKind::ClaudeCli,
+    };
+    let program = match crate::adapter::find_on_path(bin) {
+        Some(p) => p.to_string_lossy().to_string(),
+        None => {
+            return LiveBrainProbe::failed(
+                brain,
+                LiveProbeStatus::NotConfigured,
+                format!("`{bin}` is no longer on PATH. Install/enable the CLI and Refresh, then re-test."),
+                0,
+                "cli_chat",
+            );
+        }
+    };
+    let spec = crate::adapter::AdapterCommandSpec {
+        program,
+        args: crate::adapter::build_adapter_args(&kind),
+        stdin: LIVE_PROBE_PROMPT.to_string(),
+        working_dir: None,
+        timeout: Duration::from_millis(LIVE_PROBE_CLI_TIMEOUT_MS),
+        max_output_bytes: LIVE_PROBE_MAX_OUTPUT_BYTES,
+    };
+    let start = std::time::Instant::now();
+    let outcome = crate::adapter::run_adapter_command(&spec);
+    let duration_ms = start.elapsed().as_millis() as u64;
+    match outcome {
+        Ok(o) => {
+            // `o.stdout`/`o.stderr` are already secret-redacted by the adapter.
+            let summary = relux_core::parse_adapter_result(&o.stdout, kind);
+            classify_cli_live_probe(brain, &o, &summary, duration_ms)
+        }
+        Err(e) => LiveBrainProbe::failed(
+            brain,
+            LiveProbeStatus::Failed,
+            format!("Could not run `{bin}`: {e}."),
+            duration_ms,
+            "cli_chat",
+        ),
+    }
+}
+
 /// The result of (optionally) shaping a Prime reply.
 #[derive(Debug, Clone)]
 pub struct AiOutcome {
@@ -1774,6 +2197,17 @@ struct ChatChoiceMessage {
 /// secret-free reason on any failure. The key travels only in the `Authorization`
 /// header and never appears in an error.
 async fn request_completion(cfg: &AiConfig, messages: Vec<ChatMessage>) -> Result<String, String> {
+    request_completion_with(cfg, messages, MAX_TOKENS).await
+}
+
+/// Like [`request_completion`] but with an explicit completion-token cap, so a
+/// caller that only needs a tiny reply (e.g. the live chat probe) can bound the
+/// billable cost further than the default [`MAX_TOKENS`].
+async fn request_completion_with(
+    cfg: &AiConfig,
+    messages: Vec<ChatMessage>,
+    max_tokens: u32,
+) -> Result<String, String> {
     let key = cfg
         .api_key
         .as_deref()
@@ -1787,7 +2221,7 @@ async fn request_completion(cfg: &AiConfig, messages: Vec<ChatMessage>) -> Resul
     let body = ChatRequest {
         model: &cfg.model,
         messages,
-        max_tokens: MAX_TOKENS,
+        max_tokens,
         temperature: 0.4,
     };
 
@@ -2524,6 +2958,162 @@ mod tests {
         let p = classify_cli_probe(PrimeBrain::ClaudeCli, Some(&st), Some(bad));
         assert!(!p.ok);
         assert_eq!(p.status, BrainProbeStatus::Failed);
+    }
+
+    // --- Live chat probe ---------------------------------------------------
+
+    /// Build an [`crate::adapter::AdapterRunOutcome`] for a live-probe test.
+    fn cli_outcome(
+        success: bool,
+        timed_out: bool,
+        exit_code: Option<i32>,
+        stdout: &str,
+        stderr: &str,
+    ) -> crate::adapter::AdapterRunOutcome {
+        crate::adapter::AdapterRunOutcome {
+            program: "claude".to_string(),
+            exit_code,
+            success,
+            timed_out,
+            cancelled: false,
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            duration_ms: 12,
+        }
+    }
+
+    #[test]
+    fn probe_local_live_is_always_ready_and_labelled_test() {
+        let p = probe_local_live();
+        assert_eq!(p.brain, "local");
+        assert!(p.ok);
+        assert_eq!(p.status, LiveProbeStatus::Ready);
+        assert_eq!(p.checked, "local_fallback");
+        // It must say plainly that no provider was contacted (no fake usage).
+        assert!(p.detail.to_lowercase().contains("no external provider"));
+        assert!(p.sample.is_some());
+    }
+
+    #[test]
+    fn classify_openrouter_live_maps_each_outcome() {
+        // A real reply -> ready, with a redacted/bounded sample.
+        let p = classify_openrouter_live(Ok("relux probe ok".to_string()), 80);
+        assert!(p.ok);
+        assert_eq!(p.status, LiveProbeStatus::Ready);
+        assert_eq!(p.sample.as_deref(), Some("relux probe ok"));
+        assert_eq!(p.duration_ms, 80);
+        assert_eq!(p.checked, "openrouter_chat");
+
+        // An empty completion is an honest failure, not a fake success.
+        let p = classify_openrouter_live(Ok("   ".to_string()), 5);
+        assert!(!p.ok);
+        assert_eq!(p.status, LiveProbeStatus::Failed);
+        assert!(p.sample.is_none());
+
+        // No key -> missing_key.
+        let p = classify_openrouter_live(Err("no api key".to_string()), 0);
+        assert_eq!(p.status, LiveProbeStatus::MissingKey);
+
+        // A 401/403 -> auth_failed.
+        let p = classify_openrouter_live(Err("http 401".to_string()), 30);
+        assert_eq!(p.status, LiveProbeStatus::AuthFailed);
+
+        // A timeout -> timeout.
+        let p = classify_openrouter_live(Err("timeout".to_string()), 60);
+        assert_eq!(p.status, LiveProbeStatus::Timeout);
+
+        // Anything else -> failed (and the reason is surfaced, not swallowed).
+        let p = classify_openrouter_live(Err("http 500".to_string()), 10);
+        assert_eq!(p.status, LiveProbeStatus::Failed);
+        assert!(p.detail.contains("http 500"));
+    }
+
+    #[tokio::test]
+    async fn probe_openrouter_live_never_calls_without_a_usable_key() {
+        // No key -> missing_key, no request made (duration stays 0).
+        let bare = AiConfig::from_parts(None, None, false, None);
+        let p = probe_openrouter_live(&bare).await;
+        assert_eq!(p.status, LiveProbeStatus::MissingKey);
+        assert_eq!(p.duration_ms, 0);
+        assert!(p.sample.is_none());
+
+        // Key present but disabled -> not_configured, still no request.
+        let disabled = AiConfig::from_parts(Some("k".into()), None, true, None);
+        let p = probe_openrouter_live(&disabled).await;
+        assert_eq!(p.status, LiveProbeStatus::NotConfigured);
+        assert_eq!(p.duration_ms, 0);
+    }
+
+    #[test]
+    fn classify_cli_live_probe_succeeds_on_a_real_reply() {
+        let summary = relux_core::parse_adapter_result(
+            r#"{"type":"result","is_error":false,"result":"relux probe ok"}"#,
+            relux_core::AdapterKind::ClaudeCli,
+        );
+        let outcome = cli_outcome(true, false, Some(0), "", "");
+        let p = classify_cli_live_probe(PrimeBrain::ClaudeCli, &outcome, &summary, 900);
+        assert!(p.ok);
+        assert_eq!(p.status, LiveProbeStatus::Ready);
+        assert_eq!(p.sample.as_deref(), Some("relux probe ok"));
+        assert_eq!(p.checked, "cli_chat");
+    }
+
+    #[test]
+    fn classify_cli_live_probe_exit_zero_without_text_is_failed() {
+        let summary = relux_core::parse_adapter_result("", relux_core::AdapterKind::CodexCli);
+        let outcome = cli_outcome(true, false, Some(0), "", "");
+        let p = classify_cli_live_probe(PrimeBrain::CodexCli, &outcome, &summary, 50);
+        assert!(!p.ok);
+        assert_eq!(p.status, LiveProbeStatus::Failed);
+        assert!(p.sample.is_none());
+    }
+
+    #[test]
+    fn classify_cli_live_probe_detects_timeout_and_auth_failure() {
+        // A timeout is reported as such regardless of the (empty) output.
+        let summary = relux_core::parse_adapter_result("", relux_core::AdapterKind::ClaudeCli);
+        let timed = cli_outcome(false, true, None, "", "");
+        let p = classify_cli_live_probe(PrimeBrain::ClaudeCli, &timed, &summary, 60_000);
+        assert_eq!(p.status, LiveProbeStatus::Timeout);
+
+        // A failed turn whose stderr looks like a sign-in problem -> auth_failed.
+        let summary = relux_core::parse_adapter_result("", relux_core::AdapterKind::ClaudeCli);
+        let auth = cli_outcome(
+            false,
+            false,
+            Some(1),
+            "",
+            "Error: Not logged in. Run `claude /login` to authenticate.",
+        );
+        let p = classify_cli_live_probe(PrimeBrain::ClaudeCli, &auth, &summary, 120);
+        assert_eq!(p.status, LiveProbeStatus::AuthFailed);
+
+        // A generic non-zero exit with no auth signal -> failed (exit surfaced).
+        let summary = relux_core::parse_adapter_result("", relux_core::AdapterKind::ClaudeCli);
+        let fail = cli_outcome(false, false, Some(2), "boom", "segfault");
+        let p = classify_cli_live_probe(PrimeBrain::ClaudeCli, &fail, &summary, 30);
+        assert_eq!(p.status, LiveProbeStatus::Failed);
+        assert!(p.detail.contains("exit 2"));
+    }
+
+    #[test]
+    fn cli_live_probe_unavailable_folds_to_not_configured_with_next_step() {
+        use relux_core::AdapterRuntimeState::*;
+        // Not enabled at all -> not_configured, no spawn.
+        let p = cli_live_probe_unavailable(PrimeBrain::ClaudeCli, None);
+        assert!(!p.ok);
+        assert_eq!(p.status, LiveProbeStatus::NotConfigured);
+        assert_eq!(p.checked, "cli_chat");
+        // The quick-probe detail (the specific next step) is preserved.
+        assert!(!p.detail.is_empty());
+
+        // A missing binary also folds to not_configured (the detail explains it).
+        let st = adapter_status(relux_core::CODEX_CLI_ADAPTER_ID, MissingBinary);
+        let p = cli_live_probe_unavailable(PrimeBrain::CodexCli, Some(&st));
+        assert_eq!(p.status, LiveProbeStatus::NotConfigured);
+        assert!(p.detail.to_lowercase().contains("path"));
     }
 
     #[test]

@@ -2310,6 +2310,36 @@ export interface ReluxBrainProbe {
   checked: "always_available" | "config_only" | "version_probe";
 }
 
+// The coarse outcome of an explicit LIVE chat probe (POST /v1/relux/ai/probe/live).
+// Distinct from `ReluxBrainProbeStatus` (availability only): these come from
+// actually completing one bounded chat turn.
+export type ReluxLiveProbeStatus =
+  | "ready"
+  | "not_configured"
+  | "missing_key"
+  | "auth_failed"
+  | "timeout"
+  | "failed"
+  | "unsupported";
+
+export interface ReluxLiveBrainProbe {
+  // The probed brain's wire string.
+  brain: ReluxPrimeBrain;
+  // Whether the brain completed a usable chat turn.
+  ok: boolean;
+  // The coarse status driving the badge.
+  status: ReluxLiveProbeStatus;
+  // A human-readable, secret-free explanation + the next step on failure.
+  detail: string;
+  // A redacted, truncated slice of the real reply, when one came back.
+  sample?: string | null;
+  // How long the probe took, in milliseconds (0 when no call was made).
+  duration_ms: number;
+  // How the probe was checked: local_fallback (Local, no provider),
+  // openrouter_chat (a real billable request), or cli_chat (a real CLI turn).
+  checked: "local_fallback" | "openrouter_chat" | "cli_chat";
+}
+
 export const reluxAi = {
   // Current AI configuration/status (key-free; never returns the API key).
   status: () => api.get<ReluxAiStatus>("/v1/relux/ai/status"),
@@ -2319,6 +2349,14 @@ export const reluxAi = {
   // that its key resolves WITHOUT a billable request; Local is always ready.
   probe: (brain?: ReluxPrimeBrain) =>
     api.post<ReluxBrainProbe>("/v1/relux/ai/probe", brain ? { brain } : {}),
+  // EXPLICIT live chat probe: actually completes one tiny bounded chat turn
+  // through the brain and returns a classified result. Unlike `probe`, this MAY
+  // use the real provider / CLI and MAY incur provider usage, so it must only be
+  // called on a deliberate operator click — never on page load. It creates no
+  // task and no run. CLI brains run the normal safe adapter invocation (no bypass
+  // flag); OpenRouter sends one small low-token request; Local is deterministic.
+  probeLive: (brain?: ReluxPrimeBrain) =>
+    api.post<ReluxLiveBrainProbe>("/v1/relux/ai/probe/live", brain ? { brain } : {}),
   // Configure Prime's AI provider/brain from the dashboard (no env vars). Only
   // OpenRouter takes a key; Claude/Codex adapters use local CLI auth. The key is
   // never sent or stored in plaintext here — reference a write-only secret by

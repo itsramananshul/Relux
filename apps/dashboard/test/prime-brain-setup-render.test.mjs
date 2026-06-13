@@ -85,10 +85,22 @@ test("real brains are marked recommended and Local is labelled fallback/test", (
   assert.match(html, /fallback \/ test/);
 });
 
-test("every brain exposes a safe Test action on first paint", () => {
+test("every brain exposes both the safe quick probe and the live chat test", () => {
   const html = render();
-  // The read-only probe button is the discoverable "is this usable?" action.
-  assert.match(html, /Test/);
+  // The read-only quick probe is the discoverable "is this usable?" action...
+  assert.match(html, /Quick probe/);
+  // ...and the explicit live chat test sits right beside it.
+  assert.match(html, /Test live chat/);
+});
+
+test("the live chat test carries an explicit deliberate-action warning", () => {
+  const html = render();
+  // The panel must make it obvious the live test is explicit and may incur real
+  // provider usage — never a silent or automatic billable call.
+  assert.match(html, /only when you click it/);
+  assert.match(html, /may use the real provider \/ CLI and may incur provider usage/);
+  // And it must reassure that it creates no task or run (setup diagnostic only).
+  assert.match(html, /never[\s\S]*creates a task or run/);
 });
 
 test("the committed dashboard bundle carries the Prime Brain setup labelling", () => {
@@ -99,4 +111,7 @@ test("the committed dashboard bundle carries the Prime Brain setup labelling", (
   // was never rebuilt (a stale dist the kernel would actually serve).
   assert.match(bundle, /Prime Brain \/ AI Runtime/);
   assert.match(bundle, /fallback \/ test/);
+  // The live chat probe + its warning must be in the shipped bundle too.
+  assert.match(bundle, /Test live chat/);
+  assert.match(bundle, /may incur provider usage/);
 });
