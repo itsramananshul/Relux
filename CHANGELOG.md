@@ -9,6 +9,30 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.32 (Windows bundle).** The `relux-kernel` and
+  `relux-core` crates move `0.1.31` → `0.1.32` in lockstep, packaging the
+  post-v0.1.31 **Prime conversation-first + plugin-tool honesty** fixes into a
+  fresh Windows bundle. Everything reads-from / writes-through real kernel state
+  and conforms to `docs/RELUX_MASTER_PLAN.md` §8 / §8.2 / §10.1 / §10.2 / §10.3
+  and `docs/prime-tool-use.md`; no master-plan safety property is weakened.
+  Headlines:
+  - **Dev/test echo fixture hidden from Prime's brain by default.** The built-in
+    echo/dev fixture no longer leaks into Prime-facing product surfaces — it is
+    omitted from the tool catalog and the brain decision prompt unless the new
+    `RELUX_DEV_FIXTURES` master switch is set — so Prime never proposes a test
+    fixture as if it were a real installed capability.
+  - **Install → configure → Prime-can-use is regression-proofed end-to-end.** A
+    standalone smoke (`scripts/smoke-plugin-install-to-prime-use.ps1`) and new
+    server route coverage drive the full real-route path — import a plugin,
+    activate the detected candidate, and confirm Prime can actually use the
+    resulting governed tool — so the install-to-usable journey cannot silently
+    regress. Documented in `docs/prime-tool-use.md`.
+  - **Prime defaults to conversation, with explicit / staged action.** The brain
+    decision prompt is tiered so a plain message is answered as conversation by
+    default, action is taken only when explicitly intended (and stays staged /
+    confirm-gated), contextless cold-start work chips are dropped, and the
+    end-to-end conversation→action contract is pinned by tests. Rebuilt
+    `dashboard-dist` committed.
 - **Relux local release v0.1.31 (Windows bundle).** The `relux-kernel` and
   `relux-core` crates move `0.1.30` → `0.1.31` in lockstep, packaging the whole
   post-v0.1.30 **Prime brain setup + plugin install-to-usable** line into a fresh

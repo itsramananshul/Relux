@@ -1941,6 +1941,30 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.32** (2026-06-13) — **Prime conversation-first + plugin-tool honesty** rollup. The
+  `relux-kernel` / `relux-core` crates move `0.1.31` → `0.1.32` in lockstep, packaging the
+  post-v0.1.31 fixes into a fresh Windows bundle (`docs/prime-tool-use.md`; RELUX_MASTER_PLAN §8 /
+  §8.2 / §10.1 / §10.2 / §10.3; built reference-first per `docs/reference-driven-development.md`).
+  Headlines: (1) **Dev/test echo fixture hidden from Prime's brain by default** — the built-in
+  echo/dev fixture is omitted from both the tool catalog and the brain decision prompt unless the
+  new `RELUX_DEV_FIXTURES` master switch is set, so Prime never proposes a test fixture as if it
+  were a real installed capability (`builtin.rs` / `lib.rs` / `server.rs` / `state.rs`). (2)
+  **Install → configure → Prime-can-use is regression-proofed end-to-end** — a standalone smoke
+  (`scripts/smoke-plugin-install-to-prime-use.ps1`) plus new `server.rs` route coverage drive the
+  full real-route path (import a plugin → activate the detected candidate → confirm Prime can use
+  the resulting governed tool) so the install-to-usable journey cannot silently regress; documented
+  in `docs/prime-tool-use.md` (§8 / §8.2 / §10.2 / §10.3). (3) **Prime defaults to conversation,
+  with explicit / staged action** — the brain decision prompt is tiered so a plain message is
+  answered as conversation by default and action is taken only when explicitly intended (and stays
+  staged / confirm-gated), contextless cold-start work chips are dropped, and the
+  conversation→action contract is pinned by tests (`apps/dashboard/src/prime.ts` +
+  `prime.test.ts`); the rebuilt tracked `dashboard-dist` is committed (§10.1). All reads/writes hit
+  real kernel state; no new authority is added, imports run no repo code, and nothing auto-runs
+  without an explicit gate. Per-slice `cargo test` + `clippy --all-targets -D warnings` clean on
+  `relux-core` / `relux-kernel`; dashboard typecheck / tests / build green. The full-e2e release
+  gate (`scripts\relux-package-local.ps1 -FullE2E`) is run at package time. Every safety property
+  from v0.1.31 holds.
+
 - **v0.1.31** (2026-06-13) — **Prime brain setup + plugin install-to-usable** rollup. The
   `relux-kernel` / `relux-core` crates move `0.1.30` → `0.1.31` in lockstep, packaging the whole
   post-v0.1.30 line into a fresh Windows bundle (`docs/prime-tool-use.md`; RELUX_MASTER_PLAN §8 /
