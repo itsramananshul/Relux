@@ -2021,6 +2021,26 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.42** (2026-06-13) — **Redaction parity for visible tool/plugin replies** rollup. The
+  `relux-kernel` / `relux-core` crates move `0.1.41` → `0.1.42` in lockstep, packaging the
+  post-v0.1.41 slice into a fresh Windows bundle on top of all v0.1.41 (and v0.1.40) work
+  (RELUX_MASTER_PLAN §11.1; built reference-first per `docs/reference-driven-development.md`).
+  Headline: **Prime tool/plugin visible replies and raw-details are now secret-redacted and
+  bounded — obvious secrets in tool or plugin output no longer leak into the chat transcript.**
+  - **Kernel redacts the visible answer at the source.** Plugin Lens `result` and
+    `structuredContent` are scrubbed with `redact_secrets` / `redact_json` before they leave the
+    kernel, so the natural tool answer and the **raw details** expander are both bounded and
+    secret-free.
+  - **Dashboard re-scrubs before rendering.** `formatToolOutput` and `formatToolDetails` re-run
+    secret redaction on the client, so a tool reply or raw-details block can never render an obvious
+    secret even if one slipped upstream.
+  - **Parity across both visible surfaces.** The deterministic/natural tool reply and the
+    collapsible raw-details detail redact identically; neither surface shows more than the other.
+  - Includes everything from v0.1.41 (Plugin/tool results render as natural assistant answers, not
+    raw JSON) and v0.1.40 (Plugin Lens — installed plugins usable by Prime). Dashboard typecheck /
+    tests / build green; the full-e2e release gate (`scripts\relux-package-local.ps1 -FullE2E`) is
+    run at package time. All reads/writes hit real kernel state; no new authority is added
+    (read-only source access, fail-closed). Every safety property from v0.1.41 holds.
 - **v0.1.41** (2026-06-13) — **Plugin Lens: natural answers, not raw JSON** rollup. The
   `relux-kernel` / `relux-core` crates move `0.1.40` → `0.1.41` in lockstep, packaging the
   post-v0.1.40 slice into a fresh Windows bundle on top of all v0.1.40 work (RELUX_MASTER_PLAN

@@ -9,6 +9,32 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.42 (Windows bundle).** The `relux-kernel` and
+  `relux-core` crates move `0.1.41` → `0.1.42` in lockstep, packaging the
+  post-v0.1.41 **redaction-parity** slice into a fresh Windows bundle on top of
+  everything in v0.1.41 (and v0.1.40). Everything reads-from / writes-through real
+  kernel state and conforms to `docs/RELUX_MASTER_PLAN.md` §11.1; no master-plan
+  safety property is weakened. Headline — **Prime tool/plugin visible replies and
+  raw-details are now secret-redacted and bounded**, so obvious secrets in tool or
+  plugin output never leak into the chat transcript:
+  - **Kernel redacts the visible answer at the source.** Plugin Lens `result` and
+    `structuredContent` are scrubbed with `redact_secrets` / `redact_json` before
+    they leave the kernel, so the natural tool answer and the **raw details**
+    expander are both bounded and secret-free.
+  - **Dashboard re-scrubs before rendering.** `formatToolOutput` and
+    `formatToolDetails` re-run secret redaction on the client so a tool reply or
+    raw-details block can never render an obvious secret even if one slipped
+    upstream.
+  - **Parity across both visible surfaces.** The deterministic/natural tool reply
+    and the collapsible raw-details detail now redact identically — there is no
+    surface that shows more than the other.
+  - Includes everything from v0.1.41 (**Prime plugin/tool results render as natural
+    assistant answers, not raw JSON**) and v0.1.40 (**Plugin Lens — installed
+    plugins usable by Prime**).
+  - Dashboard typecheck / tests / build green; the full-e2e release gate
+    (`scripts\relux-package-local.ps1 -FullE2E`) is run at package time. Every
+    safety property from v0.1.41 holds; no new authority is added (read-only
+    source access only, fail-closed).
 - **Relux local release v0.1.41 (Windows bundle).** The `relux-kernel` and
   `relux-core` crates move `0.1.40` → `0.1.41` in lockstep, packaging the
   post-v0.1.40 **Plugin Lens — natural answers** slice into a fresh Windows bundle
