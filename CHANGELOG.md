@@ -9,6 +9,32 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.37 (Windows bundle).** The `relux-kernel` and
+  `relux-core` crates move `0.1.36` → `0.1.37` in lockstep, packaging the
+  post-v0.1.36 **stuck/no-activity run fix** into a fresh Windows bundle on top of
+  everything in v0.1.36. Everything reads-from / writes-through real kernel state
+  and conforms to `docs/RELUX_MASTER_PLAN.md` §8.1; no master-plan safety property
+  is weakened. Headline:
+  - **Local-prime fails honestly on external-work tasks, and a started run always
+    reaches a terminal state — no more "running but nothing happens".** A task whose
+    human title is obvious external work (clone a repo, import/install a plugin,
+    download from a URL) — the dashboard New Task form shape, with no `prime_request`
+    key — was previously either echo-faked as "done" or, when started via the bare
+    `/start` route, left dangling in `Running` with only a `run_started` event ("No
+    activity forever"). `relux-core` adds `title_requires_external_execution` (a
+    narrow keyword safety-rail) and `local_prime_cannot_fulfill(title, input)`, which
+    combines it with the existing `is_unfulfillable_local_request` and short-circuits
+    to fulfillable for a `tool_call` / `tool_plan` directive. The kernel's
+    `effective_run_adapter` + `execute_local_run` key the redirect-to-brain /
+    fail-closed decision on `local_prime_cannot_fulfill`, so an external-work title
+    routes to a configured real brain or fails closed (`Failed`/`adapter_missing` +
+    `Blocked`) with actionable guidance — never echo-fakes, never hangs.
+    `POST /tasks/:id/start` now routes through `execute_assigned_run` (not bare
+    `start_run`), so a started run always reaches a terminal state; a fail-closed
+    start returns `200` with the terminal run/task plus a refused message. The
+    dashboard's **Run (Assigned)** no longer double-starts, an assigned created task
+    is runnable, and `startTask` carries the optional refused reason. Core / kernel /
+    server regression tests pin the new semantics. No new authority is added.
 - **Relux local release v0.1.36 (Windows bundle).** The `relux-kernel` and
   `relux-core` crates move `0.1.35` → `0.1.36` in lockstep, packaging two
   post-v0.1.35 **Prime usability** slices into a fresh Windows bundle. Everything

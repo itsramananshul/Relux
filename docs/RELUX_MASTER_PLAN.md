@@ -1941,6 +1941,29 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.37** (2026-06-13) — **Stuck/no-activity run fix** rollup. The `relux-kernel` / `relux-core`
+  crates move `0.1.36` → `0.1.37` in lockstep, packaging the post-v0.1.36 fix into a fresh Windows
+  bundle on top of all v0.1.36 work (RELUX_MASTER_PLAN §8.1; built reference-first per
+  `docs/reference-driven-development.md`). Headline: **local-prime fails honestly on external-work
+  tasks, and a started run always reaches a terminal state** (§8.1). A task whose human title is
+  obvious external work (clone a repo, import/install a plugin, download from a URL) — the dashboard
+  New Task form shape, with no `prime_request` key — was previously either echo-faked as "done" or,
+  when started via the bare `/start` route, left dangling in `Running` with only a `run_started`
+  event ("No activity forever"). `relux-core` adds `title_requires_external_execution` (a narrow
+  keyword safety-rail) and `local_prime_cannot_fulfill(title, input)`, which combines it with the
+  existing `is_unfulfillable_local_request` and short-circuits to fulfillable for a `tool_call` /
+  `tool_plan` directive. `effective_run_adapter` + `execute_local_run` key the redirect-to-brain /
+  fail-closed decision on `local_prime_cannot_fulfill`, so an external-work title routes to a
+  configured real brain or fails closed (`Failed`/`adapter_missing` + `Blocked`) with actionable
+  guidance — never echo-fakes, never hangs. `POST /tasks/:id/start` routes through
+  `execute_assigned_run` (not bare `start_run`), so a started run always reaches a terminal state; a
+  fail-closed start returns `200` with the terminal run/task + a refused message. The dashboard's
+  **Run (Assigned)** no longer double-starts, an assigned created task is runnable, and `startTask`
+  carries the optional refused reason. Core / kernel / server regression tests pin the new semantics.
+  All reads/writes hit real kernel state; no new authority is added. Per-slice `cargo test` +
+  `clippy --all-targets -D warnings` clean on `relux-core` / `relux-kernel`; dashboard typecheck /
+  tests / build green. The full-e2e release gate (`scripts\relux-package-local.ps1 -FullE2E`) is run
+  at package time. Every safety property from v0.1.36 holds.
 - **v0.1.36** (2026-06-13) — **Orchestration result card becomes a run control + plugin-use proof**
   rollup. The `relux-kernel` / `relux-core` crates move `0.1.35` → `0.1.36` in lockstep, packaging
   two post-v0.1.35 Prime-usability slices into a fresh Windows bundle (`docs/prime-tool-use.md`;
