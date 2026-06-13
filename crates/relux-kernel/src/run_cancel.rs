@@ -227,6 +227,19 @@ impl RunCancellations {
     pub fn live_count(&self) -> usize {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).runs.len()
     }
+
+    /// The ids of the runs that currently hold a live cancel token — i.e. in-flight
+    /// off-lock runs with a real process behind them. The run watchdog excludes
+    /// these so a genuinely-executing run is never recovered as stale.
+    pub fn active_run_ids(&self) -> Vec<RunId> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .runs
+            .keys()
+            .map(|k| RunId::new(k.clone()))
+            .collect()
+    }
 }
 
 #[cfg(test)]

@@ -775,6 +775,60 @@ Fields:
   approved, explicitly applies into the run's controlled workspace root with a
   baseline-conflict check (see section 15). Empty when the adapter declared none.
   Never fabricated; apply is never automatic.
+- last_activity_at — real wall-clock seconds (Unix epoch) of the run's most recent
+  transcript activity, set when the run starts and bumped on every run event the
+  kernel pushes. Distinct from `started_at`/`ended_at` (logical-clock strings for
+  ordering, not wall time). It is the heartbeat the **run watchdog** reads (see
+  section 9.6.1). Honest wall-clock, like `duration_ms`; omitted from the wire when
+  absent (an older record).
+
+#### 9.6.1 Run Lifecycle & Stall Recovery (the no-silent-hang guarantee)
+
+A run is created in `running` the instant `start_run` commits it, and a real
+execution — the deterministic local path, or an off-lock CLI spawn — is expected
+to drive it to a terminal state (`completed` / `failed` / `cancelled`). Every run
+MUST end in exactly one of four observable outcomes, never an indefinite silent
+`running`:
+
+1. **Progress** — visible transcript/log activity (adapter selected, command/brain
+   path, tool calls, streamed output).
+2. **Success** — `completed` with a visible result.
+3. **Failure / blocked** — `failed` (with a structured `failure_class` +
+   remediation) or the task moved to `blocked` with an actionable reason.
+4. **Recoverable stale** — recovered by the watchdog with a visible
+   retry / cancel / investigate path.
+
+A few things can break the "execution drives it to terminal" expectation without
+any error reaching the operator: a run that is started but never executed (a
+dangling `start_run`), an off-lock adapter spawn whose process is killed (or the
+whole kernel restarted) before `finalize_cli_run` records the outcome (an
+**orphaned** run), or a background job that dies mid-flight. In every case the run
+would otherwise sit in `running` forever with a transcript that stops after
+`run_started`.
+
+The **run watchdog** is the server-side backstop. A periodic sweep (in the always-on
+background loop, every iteration regardless of whether Prime autonomy is enabled)
+recovers any run that has been `running` with **no new transcript activity**
+(`last_activity_at`) for longer than the configured stall window AND is **not**
+currently live. "Live" = the run is streaming a log buffer or holds a live cancel
+token (a genuinely-executing off-lock run); those are NEVER flagged, so a long,
+quiet-but-real run (the model is thinking) is safe. A recovered run is marked
+`failed` with `failure_class = stale`, gets a `run_stalled` transcript event, and
+its task moves to `blocked` so it surfaces in oversight + the Inbox with the usual
+recovery actions. A stall is NOT auto-retried (it is unexpected) — the operator
+chooses retry / cancel / investigate; **Retry** re-queues and actually re-executes
+through the assigned adapter.
+
+This mirrors how the reference agents refuse to hang: Hermes caps a provider read
+with a hard wall-clock timeout (`agent/anthropic_adapter.py` `_read_timeout`,
+default 900s) and the openclaw/codex runtime carries a `stream_idle_timeout_ms`
+inactivity abort (`extensions/acpx/src/codex-trust-config.ts`). Relux maps the same
+"no progress ⇒ stop, never hang" idea onto its own run lifecycle.
+
+The policy is operator-tunable and visible, never a hidden constant:
+`GET`/`PUT /v1/relux/watchdog` → `{ enabled, stale_after_secs }`, surfaced on the
+Health page (Run Watchdog panel). `stale_after_secs` is clamped to a safe band
+(30s–6h; default 180s) on load and on update.
 
 ### 9.7 Run Event
 

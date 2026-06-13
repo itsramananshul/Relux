@@ -24,6 +24,7 @@ pub mod run;
 pub mod run_failure;
 pub mod run_log;
 pub mod run_session;
+pub mod run_watchdog;
 pub mod runtime;
 pub mod secret;
 pub mod task;
@@ -114,6 +115,9 @@ pub use run_failure::{
 };
 pub use run_session::{
     plan_resume, sanitize_session_id, ResumeDisposition, RunSession, MAX_SESSION_ID_LEN,
+};
+pub use run_watchdog::{
+    RunWatchdogConfig, DEFAULT_STALE_AFTER_SECS, MAX_STALE_AFTER_SECS, MIN_STALE_AFTER_SECS,
 };
 pub use runtime::{
     clamp_runtime_timeout, parse_loopback_url, validate_loopback_url, LoopbackUrl, LoopbackUrlError,

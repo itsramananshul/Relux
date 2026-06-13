@@ -123,6 +123,13 @@ pub enum RunFailureClass {
     /// failure is NOT auto-retried (unlike Hermes, which retries its `unknown`
     /// bucket) — it surfaces for operator review and a deliberate manual retry.
     Unknown,
+    /// The run watchdog recovered a run that had been `Running` with no transcript
+    /// activity for longer than the configured stall window, and was not backed by
+    /// any live (streaming/cancellable) process — a dangling start, an orphaned
+    /// off-lock spawn, or a restart casualty. NOT auto-retried: a stall is
+    /// unexpected, so it surfaces for an explicit operator choice (retry / cancel /
+    /// investigate) rather than silently looping. See [`crate::RunWatchdogConfig`].
+    Stale,
 }
 
 impl RunFailureClass {
@@ -138,6 +145,7 @@ impl RunFailureClass {
             Self::Cancelled => "cancelled",
             Self::OutputValidation => "output_validation",
             Self::Unknown => "unknown",
+            Self::Stale => "stale",
         }
     }
 
@@ -153,6 +161,7 @@ impl RunFailureClass {
             Self::Cancelled => "Cancelled",
             Self::OutputValidation => "Output validation failed",
             Self::Unknown => "Unknown failure",
+            Self::Stale => "Stalled (no activity)",
         }
     }
 
@@ -175,6 +184,7 @@ impl RunFailureClass {
                 | Self::InvalidPrompt
                 | Self::OutputValidation
                 | Self::Unknown
+                | Self::Stale
         )
     }
 
@@ -214,6 +224,13 @@ impl RunFailureClass {
             Self::Unknown => {
                 "The failure could not be classified. Review the run output and retry \
                  manually if it looks transient."
+            }
+            Self::Stale => {
+                "This run stopped making progress and was automatically recovered by the \
+                 run watchdog — no transcript activity for the configured stall window, \
+                 and no live process behind it. Retry it, cancel it, or investigate with \
+                 Prime. Raise the watchdog window on the Health page if a legitimately \
+                 long, quiet run is being recovered too early."
             }
         }
     }

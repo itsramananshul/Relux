@@ -214,6 +214,8 @@ async fn serve() -> Result<(), KernelError> {
     println!("   POST   /v1/auth/change-password            {{ \"current_password\":\"...\", \"new_password\":\"...\" }} (requires session)");
     println!("   GET    /v1/relux/health                    (public liveness; no session required)");
     println!("   GET    /v1/relux/state");
+    println!("   GET    /v1/relux/watchdog                  (run-watchdog policy: enabled + stale window)");
+    println!("   PUT    /v1/relux/watchdog                  {{ \"enabled\": bool, \"stale_after_secs\": u64 }}  (clamped; recovers hung runs)");
     println!("   GET    /v1/relux/doctor                     (read-only structured diagnostics report)");
     println!("   GET    /v1/relux/ai/status");
     println!("   PUT    /v1/relux/ai/config                 {{ \"provider\":\"openrouter\", \"api_key\":\"...\", \"model\"?, \"disabled\"? }}");
@@ -319,10 +321,38 @@ async fn run_autonomy_loop(state: AppState) {
             }
         };
 
+        // Run-watchdog sweep: recover any run stuck `Running` with no activity for
+        // the configured stall window and no live process behind it. Runs every
+        // loop iteration regardless of whether Prime autonomy is enabled — a hung
+        // run must be recovered even on an otherwise-idle, autonomy-off install.
+        // The genuinely-live runs (streaming a log or holding a cancel token) are
+        // excluded so an executing run is never falsely flagged. See
+        // `relux_core::RunWatchdogConfig` and `docs/RELUX_MASTER_PLAN.md` §9.6.1.
+        let active_run_ids = active_off_lock_run_ids(&state);
+        match locked_save_persisting(&state, |kernel| {
+            Ok(kernel.recover_stale_runs(now_unix_secs(), &active_run_ids))
+        }) {
+            Ok(recovered) if !recovered.is_empty() => {
+                let ids: Vec<&str> = recovered.iter().map(|r| r.as_str()).collect();
+                println!(
+                    "INFO: run watchdog recovered {} stale run(s): {}",
+                    recovered.len(),
+                    ids.join(", ")
+                );
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("ERROR: run watchdog sweep failed: {:?}", e),
+        }
+
         let sleep_seconds = current_config
             .as_ref()
             .map(|config| config.interval_seconds.clamp(5, 3600))
-            .unwrap_or(60);
+            .unwrap_or(60)
+            // Cap the loop's sleep so the watchdog stays responsive even when the
+            // autonomy interval is long (or autonomy is off): a stalled run is
+            // surfaced within roughly its window, not one whole autonomy period
+            // later.
+            .min(60);
 
         if current_config.as_ref().is_some_and(|config| config.enabled) {
             println!("INFO: Running Prime autonomy tick...");
@@ -341,6 +371,28 @@ async fn run_autonomy_loop(state: AppState) {
 
         tokio::time::sleep(tokio::time::Duration::from_secs(sleep_seconds)).await;
     }
+}
+
+/// The current real wall-clock instant in unix seconds. Used by the run watchdog
+/// (the kernel's `last_activity_at` heartbeat is the same real-time clock), never
+/// for any deterministic/logical-clock value.
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The set of runs the server knows are genuinely in flight off the kernel lock:
+/// those currently streaming a live log buffer OR holding a live cancel token.
+/// The run watchdog excludes these so a long, quiet-but-executing run is never
+/// recovered as stale. Both registries live OUTSIDE the kernel snapshot (the live
+/// pool), so this union is the server's authoritative "really running now" view.
+fn active_off_lock_run_ids(state: &AppState) -> std::collections::HashSet<relux_core::RunId> {
+    let mut ids: std::collections::HashSet<relux_core::RunId> =
+        state.live_run_logs.active_run_ids().into_iter().collect();
+    ids.extend(state.run_cancellations.active_run_ids());
+    ids
 }
 
 /// Build an actionable error message when `serve` cannot bind `addr`.
@@ -455,6 +507,10 @@ fn protected_router() -> Router<AppState> {
         .route("/v1/auth/change-password", post(auth_change_password))
         // The /v1/relux control-plane API the dashboard calls on the same origin.
         .route("/v1/relux/state", get(get_state))
+        .route(
+            "/v1/relux/watchdog",
+            get(get_watchdog).put(set_watchdog).patch(set_watchdog),
+        )
         .route("/v1/relux/doctor", get(get_doctor))
         .route("/v1/relux/ai/status", get(get_ai_status))
         .route(
@@ -1133,6 +1189,26 @@ point at a bundle elsewhere.</p>\
 async fn get_state(State(state): State<AppState>) -> Result<Json<StateResponse>, ApiError> {
     let resp = locked_read(&state, |kernel| Ok(state_response(kernel, &state.db_path)))?;
     Ok(Json(resp))
+}
+
+/// The current run-watchdog policy, so the dashboard can show (and let the operator
+/// tune) how runs are protected from silently hanging.
+async fn get_watchdog(
+    State(state): State<AppState>,
+) -> Result<Json<relux_core::RunWatchdogConfig>, ApiError> {
+    let cfg = locked_read(&state, |kernel| Ok(kernel.run_watchdog_config()))?;
+    Ok(Json(cfg))
+}
+
+/// Update the run-watchdog policy (enable/disable the sweep, set the stall window).
+/// The supplied window is clamped into the honored band; the effective config is
+/// returned so the caller sees exactly what took effect.
+async fn set_watchdog(
+    State(state): State<AppState>,
+    Json(config): Json<relux_core::RunWatchdogConfig>,
+) -> Result<Json<relux_core::RunWatchdogConfig>, ApiError> {
+    let effective = locked_save(&state, |kernel| Ok(kernel.set_run_watchdog_config(config)))?;
+    Ok(Json(effective))
 }
 
 async fn get_ai_status(State(state): State<AppState>) -> Json<AiStatus> {
@@ -9290,6 +9366,7 @@ mod tests {
             proposed_changes: Vec::new(),
             failure_class: None,
             retry: None,
+            last_activity_at: None,
         }
     }
 
@@ -11449,6 +11526,45 @@ mod tests {
                 > v["standard"]["max_active_jobs"].as_u64().unwrap(),
             "extended profile must admit more concurrent jobs than standard"
         );
+    }
+
+    #[tokio::test]
+    async fn watchdog_route_serves_default_and_persists_a_clamped_update() {
+        // GET returns the default watchdog policy (enabled, sane window). PUT updates
+        // it, clamping an out-of-range window, and the change persists across a fresh
+        // router (it is written to the store).
+        let (state, _dir) = auth_state(true);
+
+        let (status, _, body) = call(&state, "GET", "/v1/relux/watchdog", None, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["enabled"].as_bool(), Some(true), "watchdog on by default");
+        assert_eq!(
+            v["stale_after_secs"].as_u64(),
+            Some(relux_core::DEFAULT_STALE_AFTER_SECS)
+        );
+
+        // An absurdly small window is clamped UP to the honored floor, not accepted raw.
+        let (status, _, body) = call(
+            &state,
+            "PUT",
+            "/v1/relux/watchdog",
+            None,
+            Some(r#"{"enabled":true,"stale_after_secs":1}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["stale_after_secs"].as_u64(),
+            Some(relux_core::MIN_STALE_AFTER_SECS),
+            "an out-of-range window is clamped, never disabling the watchdog"
+        );
+
+        // The update is durable: a fresh read sees the clamped value.
+        let (_status, _, body) = call(&state, "GET", "/v1/relux/watchdog", None, None).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["stale_after_secs"].as_u64(), Some(relux_core::MIN_STALE_AFTER_SECS));
     }
 
     #[tokio::test]

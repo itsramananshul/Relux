@@ -168,6 +168,19 @@ test("cancelled is framed as a non-error with a fresh-run option", () => {
   assert.match(a.actions[0].label, /Run again/);
 });
 
+// ── Stale (watchdog-recovered) run ─────────────────────────────────────────
+test("a watchdog-recovered stale run leads with retry, then reassign + inspect", () => {
+  const a = assessRunRecovery(run({ status: "failed", failure_class: "stale", retryable: true }))!;
+  assert.match(a.classLabel, /Stalled/i);
+  assert.match(a.rootCause, /stopped making progress|no transcript activity/i);
+  assert.equal(a.actions[0].kind, "retry_run");
+  assert.match(a.actions[0].label, /Retry/);
+  assert.ok(kinds(a.actions).includes("reassign"), "offers reassign");
+  assert.ok(kinds(a.actions).includes("inspect"), "offers inspect");
+  // Recovery follow-ups are still appended.
+  assert.ok(kinds(a.actions).includes("investigate"), "appends Investigate");
+});
+
 // ── Unknown / unclassified failure ─────────────────────────────────────────
 test("an unclassified failed run says what's missing and offers inspect", () => {
   const a = assessRunRecovery(run({ status: "failed", failure_class: undefined, retryable: true }))!;

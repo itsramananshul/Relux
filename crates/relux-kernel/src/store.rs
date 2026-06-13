@@ -111,6 +111,7 @@ impl SqliteStore {
             prime_agent_policy: self
                 .load_meta_json("prime_agent_policy")?
                 .unwrap_or_default(),
+            run_watchdog: self.load_meta_json("run_watchdog")?.unwrap_or_default(),
             tool_runtime_configs: self
                 .load_meta_json("tool_runtime_configs")?
                 .unwrap_or_default(),
@@ -193,6 +194,7 @@ impl SqliteStore {
         put_counter(&tx, "next_continuation", c.next_continuation)?;
         put_meta_json(&tx, "prime_autonomy_config", &snapshot.prime_autonomy_config)?;
         put_meta_json(&tx, "prime_agent_policy", &snapshot.prime_agent_policy)?;
+        put_meta_json(&tx, "run_watchdog", &snapshot.run_watchdog)?;
         put_meta_json(&tx, "orchestrations", &snapshot.orchestrations)?;
         put_meta_json(
             &tx,

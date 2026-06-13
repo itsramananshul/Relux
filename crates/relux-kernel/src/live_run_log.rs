@@ -108,6 +108,19 @@ impl LiveRunLogs {
     pub fn live_count(&self) -> usize {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).runs.len()
     }
+
+    /// The ids of the runs that currently have a live streaming buffer — i.e. runs
+    /// the kernel is genuinely streaming output for right now. The run watchdog
+    /// excludes these so a long, quiet-but-live run is never flagged stale.
+    pub fn active_run_ids(&self) -> Vec<RunId> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .runs
+            .keys()
+            .map(|k| RunId::new(k.clone()))
+            .collect()
+    }
 }
 
 /// The append handle handed to an adapter spawn. Cloneable + `Send + Sync` so each

@@ -82,6 +82,7 @@ const KNOWN_FAILURE_CLASSES = new Set([
   "cancelled",
   "output_validation",
   "unknown",
+  "stale",
 ]);
 
 // A retry action spec, present only when the run is actually retry-eligible (the
@@ -360,6 +361,35 @@ function assessRunRecoveryInner(
         missingInfo: retryable
           ? null
           : "A fresh run isn't offered from this record. Re-run the task from its board card if it is still wanted.",
+      };
+
+    case "stale":
+      // The run watchdog recovered a run that had been Running with no activity and
+      // no live process behind it — a dangling start, an orphaned spawn, or a
+      // restart casualty. This is the explicit "no silent hang" recovery path: the
+      // run never sits Running forever, and the operator gets clear choices.
+      return {
+        subject: "run",
+        classLabel: "Stalled (no activity)",
+        failureClass: cls,
+        rootCause:
+          "This run stopped making progress: it stayed running with no transcript activity for the watchdog's stall window, and nothing was executing behind it (a start that never ran, an interrupted process, or a restart). It was automatically recovered so it would not hang indefinitely.",
+        recommendation:
+          "Retry to run it again from a clean start, reassign it to another operative, or investigate with Prime. If a legitimately long, quiet run was recovered too early, raise the watchdog window on the Health page.",
+        actions: [
+          ...(retryable
+            ? [retryAction("Retry", "Start a fresh run of this work.", true)]
+            : []),
+          {
+            kind: "reassign",
+            label: "Reassign",
+            hint: "Hand the work to a different operative.",
+          },
+          INSPECT_ACTION,
+        ],
+        missingInfo: retryable
+          ? null
+          : "A fresh run isn't offered from this record (the task moved on). Re-run it from its board card if it is still wanted.",
       };
 
     default: {

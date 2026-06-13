@@ -131,6 +131,17 @@ pub struct Run {
     /// (`prime.retry_run`) or on the next autonomy tick.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry: Option<RunRetryState>,
+    /// Real wall-clock seconds (Unix epoch) of this run's most recent transcript
+    /// activity — set when the run starts and bumped on every run event the kernel
+    /// pushes. Distinct from `started_at`/`ended_at`, which are logical-clock
+    /// strings for ordering, not wall time. This is the heartbeat the run watchdog
+    /// reads to decide whether a `Running` run has stalled (no new activity for the
+    /// configured window). Like `duration_ms` and `retry.next_attempt_at`, it is
+    /// honest wall-clock, not a deterministic value. `None` only for older
+    /// snapshots written before the field existed (they default to never-active,
+    /// so the watchdog can recover a pre-existing orphan after one window).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_at: Option<u64>,
 }
 
 #[cfg(test)]
@@ -159,6 +170,7 @@ mod tests {
             proposed_changes: Vec::new(),
             failure_class: None,
             retry: None,
+            last_activity_at: None,
         }
     }
 

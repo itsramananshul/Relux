@@ -3583,6 +3583,23 @@ export const reluxOversight = {
   get: () => api.get<ReluxOversight>("/v1/relux/oversight"),
 };
 
+// -- Run watchdog policy (GET/PUT /v1/relux/watchdog) -----------------------
+// The operator-tunable stall-recovery policy: whether the periodic sweep runs and
+// how long a run may stay running with no activity before it is recovered as a
+// stale failure (relux_core::RunWatchdogConfig). Visible + editable so the "no
+// silent hang" guarantee is never a hidden constant (RELUX_MASTER_PLAN §9.6.1).
+export interface ReluxWatchdogConfig {
+  enabled: boolean;
+  stale_after_secs: number;
+}
+
+export const reluxWatchdog = {
+  get: () => api.get<ReluxWatchdogConfig>("/v1/relux/watchdog"),
+  // Returns the EFFECTIVE (server-clamped) config so the UI shows what took effect.
+  set: (config: ReluxWatchdogConfig) =>
+    api.put<ReluxWatchdogConfig>("/v1/relux/watchdog", config),
+};
+
 // -- Cross-Guild Inbox (GET /v1/relux/inbox) --------------------------------
 // The unified attention queue (docs/relix-dashboard-design.md §5 "The Inbox";
 // docs/relix-execution-and-issue-design.md §3.3b). A read-only projection of live

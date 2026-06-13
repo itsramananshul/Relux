@@ -117,6 +117,10 @@ pub struct KernelSnapshot {
     /// wrote it) load with the practical default profile.
     #[serde(default)]
     pub prime_agent_policy: relux_core::PrimeAgentPolicy,
+    /// The operator-tunable run watchdog policy. Defaulted so older snapshots (which
+    /// never wrote it) load with the watchdog enabled at the default stall window.
+    #[serde(default)]
+    pub run_watchdog: relux_core::RunWatchdogConfig,
     /// Durable Prime orchestrations (goal -> briefs -> agents -> runs), sorted by
     /// id. Defaulted so older snapshots load cleanly.
     #[serde(default)]
@@ -333,6 +337,12 @@ pub struct KernelState {
     /// turn into [`crate::prime_agent_loop::AgentLimits`]. Distinct from
     /// `prime_autonomy_config` (which governs the background task-tick loop).
     pub prime_agent_policy: relux_core::PrimeAgentPolicy,
+    /// The operator-tunable run watchdog policy: whether the periodic stale-run
+    /// sweep runs, and how long a `Running` run may go without transcript activity
+    /// before it is recovered as a stale failure ([`recover_stale_runs`](Self::recover_stale_runs)).
+    /// Persisted so the recovery behavior survives restarts and is editable over
+    /// the control plane (`GET`/`PUT /v1/relux/watchdog`).
+    pub run_watchdog: relux_core::RunWatchdogConfig,
     /// Multi-turn clarification memory: the small, bounded pending-clarification
     /// record per conversation (keyed by namespace + actor), so a follow-up answer
     /// can resolve the clarifying question Prime asked last turn instead of being
@@ -473,6 +483,7 @@ impl KernelState {
             audit_events: self.audit_log.clone(),
             prime_autonomy_config: self.prime_autonomy_config.clone(),
             prime_agent_policy: self.prime_agent_policy.clone(),
+            run_watchdog: self.run_watchdog.clone(),
             orchestrations: sorted(&self.orchestrations, |o| o.id.as_str()),
             pending_clarifications: {
                 let mut out: Vec<PendingClarificationEntry> = self
@@ -623,6 +634,7 @@ impl KernelState {
         state.next_continuation = snapshot.counters.next_continuation;
         state.prime_autonomy_config = snapshot.prime_autonomy_config;
         state.prime_agent_policy = snapshot.prime_agent_policy.clamped();
+        state.run_watchdog = snapshot.run_watchdog.clamped();
         state
     }
 
@@ -4364,6 +4376,10 @@ impl KernelState {
             proposed_changes: Vec::new(),
             failure_class: None,
             retry: None,
+            // Stamp the watchdog heartbeat at creation so a run that is started but
+            // never executed (a dangling start) becomes recoverable after one stall
+            // window instead of hanging forever. Bumped by every later run event.
+            last_activity_at: Some(real_now_secs()),
         };
         self.runs.insert(run_id.clone(), run);
 
@@ -9986,6 +10002,149 @@ impl KernelState {
         Ok(())
     }
 
+    /// The current run watchdog policy (read-only projection for the HTTP surface).
+    pub fn run_watchdog_config(&self) -> relux_core::RunWatchdogConfig {
+        self.run_watchdog.clone()
+    }
+
+    /// Replace the run watchdog policy with `config`, clamped into the honored
+    /// range, and record an audit entry. Returns the effective (clamped) config so
+    /// the caller can report exactly what took effect.
+    pub fn set_run_watchdog_config(
+        &mut self,
+        config: relux_core::RunWatchdogConfig,
+    ) -> relux_core::RunWatchdogConfig {
+        let effective = config.clamped();
+        self.run_watchdog = effective.clone();
+        self.record_audit(
+            "kernel",
+            "kernel",
+            "watchdog:configure",
+            Some("config"),
+            None,
+            None,
+            AuditResult::Success,
+            serde_json::json!({
+                "enabled": effective.enabled,
+                "stale_after_secs": effective.stale_after_secs,
+            }),
+        );
+        effective
+    }
+
+    /// Watchdog sweep: recover every run stuck in [`RunStatus::Running`] that has
+    /// shown no transcript activity for longer than the configured stall window and
+    /// is **not** currently live.
+    ///
+    /// `now_secs` is the real wall-clock instant of the sweep; `active_run_ids` is
+    /// the set of runs the server knows are genuinely in flight off-lock (currently
+    /// streaming their log, or holding a live cancel token). Those are NEVER flagged
+    /// — a long, quiet CLI run that is really executing keeps a live cancel token,
+    /// so the watchdog only ever recovers a run with nothing behind it: a dangling
+    /// `start_run`, an orphaned spawn whose finalize never ran, or a run left
+    /// `Running` by a process restart.
+    ///
+    /// Each recovered run is marked failed with [`RunFailureClass::Stale`], gets a
+    /// `run_stalled` transcript event, and its task is moved to
+    /// [`TaskStatus::Blocked`] so it surfaces in oversight + the inbox with the
+    /// usual recovery actions (retry / reassign / investigate). Returns the ids of
+    /// the runs recovered this sweep (empty when the watchdog is disabled or nothing
+    /// is stale), so the caller can log honestly.
+    pub fn recover_stale_runs(
+        &mut self,
+        now_secs: u64,
+        active_run_ids: &std::collections::HashSet<RunId>,
+    ) -> Vec<RunId> {
+        if !self.run_watchdog.enabled {
+            return Vec::new();
+        }
+        let config = self.run_watchdog.clamped();
+        // Collect candidates first so the borrow of `self.runs` is dropped before we
+        // mutate state per run. A run with no recorded `last_activity_at` (an older
+        // snapshot) reads as activity-at-epoch, so it becomes recoverable after one
+        // window — the honest outcome for a pre-existing orphan.
+        let candidates: Vec<(RunId, u64)> = self
+            .runs
+            .iter()
+            .filter(|(id, run)| {
+                run.status == RunStatus::Running && !active_run_ids.contains(*id)
+            })
+            .filter_map(|(id, run)| {
+                let last = run.last_activity_at.unwrap_or(0);
+                if config.is_stale(last, now_secs) {
+                    Some((id.clone(), now_secs.saturating_sub(last)))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut recovered = Vec::new();
+        for (run_id, idle_secs) in candidates {
+            self.mark_run_stale(&run_id, idle_secs);
+            recovered.push(run_id);
+        }
+        recovered
+    }
+
+    /// Mark one run as a stale failure recovered by the watchdog: emit the honest
+    /// `run_stalled` transcript event, fail the run with [`RunFailureClass::Stale`],
+    /// and block its task so it surfaces for an explicit operator choice. `idle_secs`
+    /// is how long the run had gone without activity (for the human-readable event).
+    fn mark_run_stale(&mut self, run_id: &RunId, idle_secs: u64) {
+        let ended = self.clock.tick();
+        let (agent_id, task_id) = {
+            let run = match self.runs.get_mut(run_id) {
+                Some(run) => run,
+                None => return,
+            };
+            run.status = RunStatus::Failed;
+            run.ended_at = Some(ended);
+            run.error = Some(format!(
+                "run watchdog: no activity for {idle_secs}s and no live process — recovered as stale"
+            ));
+            run.failure_class = Some(RunFailureClass::Stale);
+            // A stall is unexpected, so it is NOT auto-retried — the operator decides
+            // (retry / cancel / investigate). Clear any prior retry schedule.
+            run.retry = None;
+            (run.agent_id.clone(), run.task_id.clone())
+        };
+        // Emit the transcript evidence FIRST so the run's `last_activity_at` is
+        // bumped and the event is the visible terminal entry, then block the task.
+        self.push_run_event(
+            run_id,
+            "run_stalled",
+            "kernel",
+            &format!(
+                "run recovered by the watchdog after {idle_secs}s with no activity \
+                 (no live process behind it)"
+            ),
+            serde_json::json!({
+                "failure_class": RunFailureClass::Stale.as_str(),
+                "idle_secs": idle_secs,
+            }),
+        );
+        let task_namespace = self.tasks.get(&task_id).map(|t| t.namespace_id.clone());
+        if let Some(task) = self.tasks.get_mut(&task_id) {
+            // Only move a still-Running task off the running state — never overwrite a
+            // task an operator already moved on (terminal, reassigned, etc.).
+            if task.status == TaskStatus::Running {
+                task.status = TaskStatus::Blocked;
+                task.updated_at = self.clock.tick();
+            }
+        }
+        self.record_audit(
+            "agent",
+            agent_id.as_str(),
+            "run:stale_recovered",
+            Some("run"),
+            Some(run_id.as_str()),
+            task_namespace.as_ref(),
+            AuditResult::Failed,
+            serde_json::json!({ "idle_secs": idle_secs }),
+        );
+    }
+
     /// The transient-retry attempt index for `run_id`: the length of its
     /// `retried_from` lineage (0 for an original run, 1 for the first retry, …).
     /// Bounded against a pathological cycle. This is the 0-based attempt the
@@ -10226,6 +10385,14 @@ impl KernelState {
             message: message.to_string(),
             payload,
         });
+        // Bump the run's wall-clock heartbeat: every transcript event IS activity,
+        // so `last_activity_at` is the honest "last seen progress" the watchdog
+        // reads. This is the single chokepoint for all run events, so adapter
+        // spawns, tool calls, completions, and failures all refresh it — a run is
+        // only ever flagged stale when nothing at all has happened for the window.
+        if let Some(run) = self.runs.get_mut(run_id) {
+            run.last_activity_at = Some(real_now_secs());
+        }
     }
 }
 
@@ -22365,6 +22532,117 @@ mod tests {
         assert_eq!(k.run(&run_id).unwrap().status, RunStatus::Completed);
         let err = k.retry_run(&run_id).unwrap_err();
         assert!(matches!(err, KernelError::RunNotRetryable { .. }));
+    }
+
+    // --- Run watchdog: no run hangs silently (RELUX_MASTER_PLAN §9.6.1) --------
+
+    #[test]
+    fn watchdog_recovers_a_dangling_started_run() {
+        // A run that was started but never executed (no adapter drove it to a
+        // terminal state) must not sit Running forever. The watchdog recovers it as
+        // a stale failure with transcript evidence and blocks the task so the
+        // operator gets an explicit retry/cancel/investigate path.
+        let (mut k, _prime, task, run, _echo) = primed_kernel();
+        assert_eq!(k.run(&run).unwrap().status, RunStatus::Running);
+        let last = k.run(&run).unwrap().last_activity_at.expect("heartbeat at start");
+        let window = k.run_watchdog_config().stale_after_secs;
+
+        // No live process behind the run (empty active set) + past the window.
+        let recovered =
+            k.recover_stale_runs(last + window + 1, &std::collections::HashSet::new());
+        assert_eq!(recovered, vec![run.clone()], "the dangling run is recovered");
+
+        let r = k.run(&run).unwrap();
+        assert_eq!(r.status, RunStatus::Failed);
+        assert_eq!(r.failure_class, Some(RunFailureClass::Stale));
+        assert!(r.ended_at.is_some(), "a recovered run is terminal");
+        assert!(r.retry.is_none(), "a stall is surfaced, not silently auto-retried");
+        assert_eq!(
+            k.task(&task).unwrap().status,
+            TaskStatus::Blocked,
+            "the task leaves Running so it surfaces for recovery"
+        );
+        let kinds: Vec<&str> = k.run_events(&run).iter().map(|e| e.kind.as_str()).collect();
+        assert!(kinds.contains(&"run_stalled"), "transcript records the stall: {kinds:?}");
+        assert!(k
+            .audit_log()
+            .iter()
+            .any(|e| e.action == "run:stale_recovered"));
+    }
+
+    #[test]
+    fn watchdog_never_flags_a_genuinely_live_run() {
+        // A run that is actually executing off-lock (streaming a log or holding a
+        // live cancel token) is in the active set and must NEVER be recovered, even
+        // if it has gone quiet far past the window (the model is just thinking).
+        let (mut k, _prime, task, run, _echo) = primed_kernel();
+        let last = k.run(&run).unwrap().last_activity_at.unwrap();
+        let window = k.run_watchdog_config().stale_after_secs;
+
+        let mut active = std::collections::HashSet::new();
+        active.insert(run.clone());
+        let recovered = k.recover_stale_runs(last + window + 10_000, &active);
+        assert!(recovered.is_empty(), "a live run is never flagged stale");
+        assert_eq!(k.run(&run).unwrap().status, RunStatus::Running);
+        assert_eq!(k.task(&task).unwrap().status, TaskStatus::Running);
+    }
+
+    #[test]
+    fn watchdog_leaves_a_fresh_run_alone_within_the_window() {
+        // A run whose heartbeat is recent (inside the window) is not stale yet.
+        let (mut k, _prime, _task, run, _echo) = primed_kernel();
+        let last = k.run(&run).unwrap().last_activity_at.unwrap();
+        let window = k.run_watchdog_config().stale_after_secs;
+        let recovered = k.recover_stale_runs(last + window - 1, &std::collections::HashSet::new());
+        assert!(recovered.is_empty(), "a fresh run is not recovered early");
+        assert_eq!(k.run(&run).unwrap().status, RunStatus::Running);
+    }
+
+    #[test]
+    fn watchdog_disabled_recovers_nothing() {
+        // The sweep is a no-op when the operator disabled the watchdog.
+        let (mut k, _prime, _task, run, _echo) = primed_kernel();
+        let last = k.run(&run).unwrap().last_activity_at.unwrap();
+        k.set_run_watchdog_config(relux_core::RunWatchdogConfig {
+            enabled: false,
+            stale_after_secs: 60,
+        });
+        let recovered = k.recover_stale_runs(last + 100_000, &std::collections::HashSet::new());
+        assert!(recovered.is_empty(), "disabled watchdog never recovers");
+        assert_eq!(k.run(&run).unwrap().status, RunStatus::Running);
+    }
+
+    #[test]
+    fn a_watchdog_recovered_run_is_retryable() {
+        // After recovery the operator can retry — and the retry actually re-executes
+        // through the assigned adapter (the local echo path here), driving the work
+        // to a real terminal state instead of dangling again.
+        let (mut k, _prime, task, run, _echo) = primed_kernel();
+        let last = k.run(&run).unwrap().last_activity_at.unwrap();
+        let window = k.run_watchdog_config().stale_after_secs;
+        k.recover_stale_runs(last + window + 1, &std::collections::HashSet::new());
+        assert_eq!(k.run(&run).unwrap().status, RunStatus::Failed);
+
+        // Retry re-queues + runs through execute_assigned_run -> a fresh terminal run.
+        let new_run = k.retry_run(&run).expect("a stale run is retryable");
+        assert_ne!(new_run, run);
+        assert_eq!(k.run(&new_run).unwrap().status, RunStatus::Completed);
+        assert_eq!(k.task(&task).unwrap().status, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn watchdog_does_not_overwrite_a_task_already_moved_on() {
+        // If an operator already moved the task to a terminal/other state, the
+        // watchdog recovers the run but does not clobber the task status.
+        let (mut k, _prime, task, run, _echo) = primed_kernel();
+        let last = k.run(&run).unwrap().last_activity_at.unwrap();
+        let window = k.run_watchdog_config().stale_after_secs;
+        // Operator cancels the task out of band (it is no longer Running).
+        k.set_task_status(&task, &TaskStatus::Cancelled).unwrap();
+        k.recover_stale_runs(last + window + 1, &std::collections::HashSet::new());
+        // The run is still recovered (it was Running), but the task keeps its state.
+        assert_eq!(k.run(&run).unwrap().status, RunStatus::Failed);
+        assert_eq!(k.task(&task).unwrap().status, TaskStatus::Cancelled);
     }
 
     #[test]
