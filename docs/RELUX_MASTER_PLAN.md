@@ -4105,13 +4105,33 @@ Safety properties (the product safety bar, §17.5):
 - **No secrets stored.** The per-adapter config persists only kind/command, the
   enabled flag, timeout, output cap, and an optional working dir.
 
-Execution dispatch: `KernelState::execute_assigned_run` resolves the assigned
-agent's adapter. The local-prime adapter runs the existing deterministic echo
-path; a recognized/enabled CLI adapter spawns its local binary via
-`relux_kernel::adapter`; anything else fails honestly. The Work page's
-"Run (Assigned)" action and the `task run-assigned` CLI both route through this
-dispatcher. **Prime autonomy is unchanged**: it still runs only the deterministic
-local path and never spawns a CLI (§17, "autonomy does not call paid LLMs").
+Execution dispatch: `KernelState::execute_assigned_run` resolves the **effective**
+adapter via `KernelState::effective_run_adapter` and dispatches on it. For a crew
+operative with an explicitly-assigned CLI adapter that adapter is used verbatim; the
+local-prime adapter runs the existing deterministic echo path; a recognized/enabled
+CLI adapter spawns its local binary via `relux_kernel::adapter`; anything else fails
+honestly. The Work page's "Run (Assigned)" action and the `task run-assigned` CLI
+both route through this dispatcher.
+
+**Brain-aware routing for a free-form Prime goal.** When the assigned adapter is the
+local-prime default AND the task is a free-form natural-language goal with no gated
+`tool_call`/`tool_plan` directive (`relux_core::is_unfulfillable_local_request`), the
+dispatcher routes the run to the **real adapter Prime's configured brain resolves to**
+(Claude/Codex CLI) rather than echoing on local-prime. The run record + transcript are
+stamped with the adapter actually used (an `adapter_selected` event), so the Work page
+shows the truth. If that CLI adapter is not enabled/on-PATH, the downstream CLI gate
+fails closed with a clear setup action; if the resolved brain has no coding-agent run
+adapter (`Local`/`Openrouter`, which is conversational only), the run stays on
+local-prime and fails closed (below). The brain preference is a secret-free snapshot
+the server re-syncs from the on-disk `AiConfig` before every run
+(`KernelState::set_prime_brain_preference`); it carries no key material and changes no
+durable-action path (every state change still flows through the deterministic kernel).
+
+**Prime autonomy is unchanged**: the background autonomy tick still calls
+`start_run` + `execute_local_run` directly (never `execute_assigned_run`), so it runs
+only the deterministic local path and never auto-spawns a paid CLI (§17, "autonomy
+does not call paid LLMs"). The brain-aware redirect is confined to the
+operator-initiated `execute_assigned_run` chokepoint.
 
 CLI:
 
@@ -4154,25 +4174,37 @@ But a task that carries a **free-form natural-language goal** Prime was handed (
 non-empty `prime_request`) with **no executable directive** is something the
 deterministic adapter cannot turn into actions. Earlier such a run could be *started*
 and then sit in `Running` forever with nothing executing it (the "running but nothing
-happens" bug) — or fake-echo the input back as "done". Adapter Runtime v1 closes
-this with a **fail-closed branch** in `execute_local_run`
-(`relux_core::is_unfulfillable_local_request`):
+happens" bug) — or fake-echo the input back as "done".
+
+The first remedy is the **brain-aware routing** above: when the operator has a real
+Prime brain configured (a Claude/Codex CLI adapter selected on Crew → Prime Brain),
+`execute_assigned_run` routes the goal to that adapter and runs it for real. The
+fail-closed branch below is the honest floor for when **no real brain is configured**
+— so a free-form Prime run either uses a real brain or fails closed with a setup
+action, never silently running on local-prime. When the resolved brain is `Local` or
+`Openrouter` (conversational only, no coding-agent run adapter), the run stays on
+local-prime and the **fail-closed branch** in `execute_local_run`
+(`relux_core::is_unfulfillable_local_request`) fires:
 
 - the run reaches a terminal **`Failed`** state classified `adapter_missing` (never
   an infinite `Running`, never a fabricated success), and the task is parked
   **`Blocked`** (operator-actionable + reopenable once a real adapter is assigned);
-- the run transcript + `run.error` carry **actionable guidance** naming both
-  remedies: import a repository as a plugin via **Plugins → + Install → GitHub URL**,
-  or assign the task to a configured **Claude/Codex** adapter, then run it again
-  (`KernelError::LocalAdapterUnsupported`, HTTP 422).
+- the run transcript + `run.error` carry **actionable guidance** naming the
+  remedies: enable a **Claude/Codex** CLI adapter and select it as Prime's brain on
+  **Crew → Prime Brain**, then run it again; or import a repository as a plugin via
+  **Plugins → + Install → GitHub URL** (`KernelError::LocalAdapterUnsupported`, HTTP
+  422). The guidance also notes that **OpenRouter is conversational only** and cannot
+  execute work runs.
 
 The two Prime-chat entry points that *create and run* / *start* a task
 (`PrimeAction::CreateAndRunTask`, `PrimeAction::StartRun`) now **drive the run to a
 terminal state** through the same governed `execute_assigned_run` path the Work
 page's "Run (Assigned)" uses — a started run is never left dangling. The Work page's
 recovery card recognizes the local-Prime case (an `adapter_missing` failure whose run
-adapter is `relux-adapter-local-prime`) and offers **Open Plugins** + **Reassign**
-rather than the generic "install your CLI" guidance.
+adapter is `relux-adapter-local-prime`) and offers **Set Prime's brain** (Crew →
+Prime Brain) as the primary remedy, plus **Open Plugins** + **Reassign**, rather than
+the generic "install your CLI" guidance. The run detail shows the human adapter label
++ an honest note that the local adapter does no external work.
 
 ### Bundled plugin refresh is idempotent (existing stores pick up new capabilities)
 

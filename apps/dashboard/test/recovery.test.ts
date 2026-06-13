@@ -78,10 +78,10 @@ test("adapter_missing omits Retry when the run is not retry-eligible", () => {
   assert.ok(kinds(a.actions).includes("inspect"));
 });
 
-test("adapter_missing on the local Prime adapter points at plugin import + a real adapter", () => {
+test("adapter_missing on the local Prime adapter points at Prime's brain + plugin import", () => {
   // The "running but nothing happens" fix: a local-prime run that refused a free-form
-  // external request (clone/import) surfaces the plugin-import flow, NOT the generic
-  // "install your CLI" guidance (local Prime is never a missing CLI).
+  // external request surfaces the real remedy — configure Prime's brain (Claude/Codex
+  // CLI), plus the plugin-import flow — NOT the generic "install your CLI" guidance.
   const a = assessRunRecovery(
     run({
       adapter_plugin: "relux-adapter-local-prime",
@@ -90,18 +90,17 @@ test("adapter_missing on the local Prime adapter points at plugin import + a rea
       retryable: false,
     }),
   )!;
-  assert.match(a.classLabel, /local adapter/i);
+  assert.match(a.classLabel, /brain/i);
   assert.match(a.rootCause, /deterministic/i);
-  assert.match(a.recommendation, /Plugins/);
+  assert.match(a.recommendation, /Prime Brain/i);
   assert.match(a.recommendation, /Claude or Codex/);
-  // The primary, recommended action opens the Plugins page (the import flow).
-  assert.equal(a.actions[0].kind, "open_plugins");
+  // The primary, recommended action opens Crew → Prime Brain (configure_agent → /crew).
+  assert.equal(a.actions[0].kind, "configure_agent");
   assert.equal(a.actions[0].primary, true);
-  // It offers reassigning to a real adapter and inspecting — never the generic
-  // "configure adapter" CLI card (local Prime isn't a missing CLI).
+  // It still offers the plugin-import flow, reassignment, and inspection.
+  assert.ok(kinds(a.actions).includes("open_plugins"));
   assert.ok(kinds(a.actions).includes("reassign"));
   assert.ok(kinds(a.actions).includes("inspect"));
-  assert.ok(!kinds(a.actions).includes("configure_agent"));
 });
 
 // ── Auth required ──────────────────────────────────────────────────────────

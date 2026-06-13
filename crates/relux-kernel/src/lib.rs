@@ -80,6 +80,7 @@ pub use agent_config::{
 pub use agent_presets::{find_agent_preset, AgentPreset, AGENT_PRESETS};
 pub use ai::{
     available_cli_brains, classify_cli_probe, probe_local, probe_openrouter, resolve_brain,
+    PrimeBrainPreference,
     classify_cli_live_probe, classify_openrouter_live, cli_live_probe_blocking,
     cli_live_probe_unavailable, probe_local_live, probe_openrouter_live, LiveBrainProbe,
     LiveProbeStatus,
@@ -337,7 +338,7 @@ pub enum KernelError {
     AdapterBinaryMissing { plugin: String, binary: String },
     #[error("adapter {plugin} run failed: {message}")]
     AdapterExecutionFailed { plugin: String, message: String },
-    #[error("the local Prime adapter is deterministic and cannot fulfil task {0}: it performs no external work (cloning a repository, filesystem or network access, or importing a plugin). To import a repository as a plugin, open Plugins → + Install → GitHub URL; to run this as real agent work, assign the task to a configured Claude or Codex adapter on Crew → Adapters, then run it again.")]
+    #[error("the local Prime adapter is deterministic and cannot fulfil task {0}: it performs no external work (cloning a repository, filesystem or network access, or importing a plugin), and no real Prime brain is configured to do it. To run this as real agent work, enable a Claude or Codex CLI adapter on Crew → Adapters and select it as Prime's brain on Crew → Prime Brain, then run it again; to import a repository as a plugin instead, open Plugins → + Install → GitHub URL. (OpenRouter is a conversational brain only and cannot execute work runs.)")]
     LocalAdapterUnsupported(String),
     #[error("permission denied: agent {agent} lacks {permission}")]
     PermissionDenied { agent: String, permission: String },

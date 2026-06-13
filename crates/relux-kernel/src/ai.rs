@@ -196,6 +196,17 @@ impl AiConfig {
         }
     }
 
+    /// A secret-free [`PrimeBrainPreference`] snapshot the kernel can store to make
+    /// the run-execution path brain-aware (see [`PrimeBrainPreference`]). Carries
+    /// only the explicit brain choice and whether a usable OpenRouter key exists —
+    /// never the key itself.
+    pub fn brain_preference(&self) -> PrimeBrainPreference {
+        PrimeBrainPreference {
+            explicit: self.brain,
+            openrouter_usable: self.enabled(),
+        }
+    }
+
     /// Whether a key is configured at all (independent of the disabled flag).
     pub fn configured(&self) -> bool {
         self.api_key.is_some()
@@ -556,6 +567,25 @@ pub enum PrimeBrain {
 }
 
 impl PrimeBrain {
+    /// The bundled adapter plugin id that EXECUTES real work for this brain, or
+    /// `None` for a brain with no coding-agent run adapter.
+    ///
+    /// `ClaudeCli`/`CodexCli` map to their local-CLI adapters — the same governed,
+    /// non-bypass spawn path the Work page's "Run (Assigned)" uses. `Local` is the
+    /// in-memory deterministic echo (no external work) and `Openrouter` is a
+    /// *conversational* brain only (it shapes Prime's replies; it is not a coding
+    /// agent that can clone a repo or touch the filesystem), so both return `None`.
+    /// The run-adapter resolver (`KernelState::effective_run_adapter`) uses this to
+    /// decide whether a free-form Prime goal can be routed to a real adapter or must
+    /// fail closed with setup guidance (`docs/RELUX_MASTER_PLAN.md` §8.1).
+    pub fn run_adapter_id(&self) -> Option<&'static str> {
+        match self {
+            PrimeBrain::ClaudeCli => Some(relux_core::CLAUDE_CLI_ADAPTER_ID),
+            PrimeBrain::CodexCli => Some(relux_core::CODEX_CLI_ADAPTER_ID),
+            PrimeBrain::Local | PrimeBrain::Openrouter => None,
+        }
+    }
+
     /// The stable wire string for this brain.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -592,6 +622,45 @@ pub enum BrainResolution {
     CliAutoDetected,
     /// No brain available; the deterministic local fallback.
     LocalFallback,
+}
+
+impl BrainResolution {
+    /// A short, secret-free label for why the brain was chosen, for run-transcript
+    /// and diagnostic strings.
+    pub fn label(&self) -> &'static str {
+        match self {
+            BrainResolution::Explicit => "operator-selected",
+            BrainResolution::OpenRouterAuto => "OpenRouter key configured",
+            BrainResolution::CliAutoDetected => "auto-detected enabled CLI",
+            BrainResolution::LocalFallback => "no brain configured",
+        }
+    }
+}
+
+/// A secret-free snapshot of how Prime's conversational brain is selected, kept in
+/// the kernel ([`crate::KernelState`]) so the run-execution path can map a free-form
+/// Prime goal to the SAME real adapter the brain resolves to.
+///
+/// Carries NO key material — only the explicit brain choice (if any) and whether a
+/// usable OpenRouter key is currently configured. The kernel reloads itself from the
+/// store on every request, so this field is re-synced from the on-disk [`AiConfig`]
+/// by the server before any run is started (it is never persisted). An un-synced
+/// default (no explicit brain, no key) resolves to `Local`, so the deterministic
+/// echo/test path is byte-for-byte unchanged when nothing set it.
+#[derive(Debug, Clone, Default)]
+pub struct PrimeBrainPreference {
+    /// The explicitly-selected brain, or `None` for the legacy auto choice.
+    pub explicit: Option<PrimeBrain>,
+    /// Whether a usable OpenRouter key is configured (`AiConfig::enabled()`).
+    pub openrouter_usable: bool,
+}
+
+impl PrimeBrainPreference {
+    /// Resolve the effective brain exactly like [`resolve_brain`] (explicit choice >
+    /// OpenRouter key > available CLI > Local), from this stored snapshot.
+    pub fn resolve(&self, available_clis: &[PrimeBrain]) -> (PrimeBrain, BrainResolution) {
+        resolve_brain_from(self.explicit, self.openrouter_usable, available_clis)
+    }
 }
 
 /// The CLI brains whose adapter is enabled AND whose binary resolved on PATH
@@ -639,10 +708,21 @@ pub fn resolve_brain(
     cfg: &AiConfig,
     available_clis: &[PrimeBrain],
 ) -> (PrimeBrain, BrainResolution) {
-    if let Some(b) = cfg.brain {
+    resolve_brain_from(cfg.brain, cfg.enabled(), available_clis)
+}
+
+/// The shared resolution core behind [`resolve_brain`] and
+/// [`PrimeBrainPreference::resolve`]: explicit choice > OpenRouter key > available
+/// CLI > Local. Pure: no env, no network, no clock.
+fn resolve_brain_from(
+    explicit: Option<PrimeBrain>,
+    openrouter_usable: bool,
+    available_clis: &[PrimeBrain],
+) -> (PrimeBrain, BrainResolution) {
+    if let Some(b) = explicit {
         return (b, BrainResolution::Explicit);
     }
-    if cfg.enabled() {
+    if openrouter_usable {
         return (PrimeBrain::Openrouter, BrainResolution::OpenRouterAuto);
     }
     if let Some(&b) = available_clis
@@ -2815,6 +2895,48 @@ mod tests {
         // Only Codex available -> only Codex.
         let codex_only = vec![adapter_status(relux_core::CODEX_CLI_ADAPTER_ID, Available)];
         assert_eq!(available_cli_brains(&codex_only), vec![PrimeBrain::CodexCli]);
+    }
+
+    #[test]
+    fn brain_preference_snapshot_resolves_like_resolve_brain() {
+        // Explicit choice wins even with no key and no available CLI.
+        let pref = PrimeBrainPreference {
+            explicit: Some(PrimeBrain::CodexCli),
+            openrouter_usable: false,
+        };
+        assert_eq!(pref.resolve(&[]).0, PrimeBrain::CodexCli);
+
+        // No explicit choice + OpenRouter key → OpenRouter (CLI not adopted).
+        let pref = PrimeBrainPreference {
+            explicit: None,
+            openrouter_usable: true,
+        };
+        let (brain, res) = pref.resolve(&[PrimeBrain::ClaudeCli]);
+        assert_eq!(brain, PrimeBrain::Openrouter);
+        assert_eq!(res, BrainResolution::OpenRouterAuto);
+
+        // No explicit choice, no key, Claude available → auto-adopt Claude.
+        let pref = PrimeBrainPreference::default();
+        let (brain, res) = pref.resolve(&[PrimeBrain::ClaudeCli]);
+        assert_eq!(brain, PrimeBrain::ClaudeCli);
+        assert_eq!(res, BrainResolution::CliAutoDetected);
+
+        // Nothing at all → deterministic Local fallback.
+        assert_eq!(
+            PrimeBrainPreference::default().resolve(&[]).0,
+            PrimeBrain::Local
+        );
+    }
+
+    #[test]
+    fn ai_config_brain_preference_carries_no_secret() {
+        // A configured key surfaces only as the `openrouter_usable` bool, never a value.
+        let cfg = AiConfig::from_parts(Some("sk-secret".to_string()), None, false, None);
+        let pref = cfg.brain_preference();
+        assert!(pref.openrouter_usable);
+        assert_eq!(pref.explicit, None);
+        // The snapshot type holds no string field that could carry the key.
+        assert!(!format!("{pref:?}").contains("sk-secret"));
     }
 
     #[test]

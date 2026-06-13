@@ -181,18 +181,23 @@ function assessRunRecoveryInner(
       if (run.adapter_plugin === LOCAL_PRIME_ADAPTER_ID) {
         return {
           subject: "run",
-          classLabel: "Not supported by the local adapter",
+          classLabel: "No real brain configured",
           failureClass: cls,
           rootCause:
-            "This run used Prime's local adapter, which is deterministic and performs no external work — it cannot clone a repository, access the filesystem/network, or import a plugin.",
+            "This run used Prime's local adapter, which is deterministic and performs no external work — it cannot clone a repository, access the filesystem/network, or import a plugin — and no real Prime brain (Claude/Codex CLI) was configured to do the work, so it failed closed instead of running silently.",
           recommendation:
-            "To import a repository as a plugin, open Plugins → + Install → GitHub URL. To run this as real agent work, reassign the task to an operative backed by a configured Claude or Codex adapter, then run it again.",
+            "Enable a Claude or Codex CLI adapter and select it as Prime's brain on Crew → Prime Brain, then run this again. (OpenRouter is a conversational brain only and cannot execute work runs.) To import a repository as a plugin instead, open Plugins → + Install → GitHub URL.",
           actions: [
+            {
+              kind: "configure_agent",
+              label: "Set Prime's brain",
+              hint: "Open Crew → Prime Brain to enable a Claude/Codex CLI adapter and select it, so Prime's work runs use a real brain.",
+              primary: true,
+            },
             {
               kind: "open_plugins",
               label: "Open Plugins",
               hint: "Go to Plugins → + Install to import a repository (GitHub URL / ZIP / folder) as a plugin. No repo code runs at install.",
-              primary: true,
             },
             {
               kind: "reassign",

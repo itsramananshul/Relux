@@ -82,6 +82,8 @@ import {
   sessionHandoffLabel,
   runMetricsLine,
   phaseLabel,
+  adapterLabel,
+  adapterCapabilityNote,
   isRunInFlight,
   eventPayloadPreview,
   toolCallSummary,
@@ -2491,7 +2493,17 @@ function RunDetailPanel({ runId, onClose, onOpenRun, onRetried }: { runId: strin
           {run.task_title && <div className="kv"><span>Task:</span><span>{run.task_title}</span></div>}
           <div className="kv"><span>Task ID:</span><span className="mono">{run.task_id}</span></div>
           <div className="kv"><span>Agent ID:</span><span className="mono">{run.agent_id}</span></div>
-          <div className="kv"><span>Adapter:</span><span className="mono">{run.adapter_plugin}</span></div>
+          <div className="kv"><span>Adapter:</span>
+            <span title={run.adapter_plugin}>
+              {adapterLabel(run.adapter_plugin)}{" "}
+              <span className="mono muted" style={{ fontSize: 10 }}>({run.adapter_plugin})</span>
+            </span>
+          </div>
+          {adapterCapabilityNote(run.adapter_plugin) && (
+            <div className="kv"><span></span>
+              <span className="muted" style={{ fontSize: 10 }}>{adapterCapabilityNote(run.adapter_plugin)}</span>
+            </div>
+          )}
           <div className="kv"><span>Phase:</span><span>{phaseLabel(run.phase, run.status)}</span></div>
           <div className="kv"><span>Duration:</span><span>{duration ?? "—"}</span></div>
           {metrics && <div className="kv"><span>Metrics:</span><span>{metrics}</span></div>}

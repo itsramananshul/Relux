@@ -6,6 +6,8 @@ import {
   canRetryRun,
   runMetricsLine,
   phaseLabel,
+  adapterLabel,
+  adapterCapabilityNote,
   isRunInFlight,
   eventPayloadPreview,
   toolCallSummary,
@@ -152,6 +154,26 @@ test("phaseLabel humanizes event kinds and falls back to status", () => {
   assert.equal(phaseLabel("mcp_tool_call", "running"), "MCP tool call");
   assert.equal(phaseLabel("mcp_tool_call_denied", "running"), "MCP tool call denied");
   assert.equal(phaseLabel("mcp_tool_call_failed", "running"), "MCP tool call failed");
+  // The brain-aware run-routing event renders nicely on the transcript.
+  assert.equal(phaseLabel("adapter_selected", "running"), "Adapter selected");
+});
+
+test("adapterLabel gives a human name and flags the deterministic local adapter", () => {
+  assert.equal(adapterLabel("relux-adapter-local-prime"), "Local Prime (deterministic)");
+  assert.equal(adapterLabel("relux-adapter-claude-cli"), "Claude CLI");
+  assert.equal(adapterLabel("relux-adapter-codex-cli"), "Codex CLI");
+  // An unknown/custom adapter id renders verbatim, never blank.
+  assert.equal(adapterLabel("relux-adapter-mystery"), "relux-adapter-mystery");
+  assert.equal(adapterLabel(undefined), "—");
+});
+
+test("adapterCapabilityNote explains the local adapter's honest limits only", () => {
+  const note = adapterCapabilityNote("relux-adapter-local-prime");
+  assert.ok(note && /no external work/i.test(note));
+  assert.ok(note && /fails closed/i.test(note));
+  // A CLI/custom adapter carries no extra caveat.
+  assert.equal(adapterCapabilityNote("relux-adapter-claude-cli"), null);
+  assert.equal(adapterCapabilityNote("relux-adapter-mystery"), null);
 });
 
 test("isRunInFlight is true only for non-terminal states", () => {

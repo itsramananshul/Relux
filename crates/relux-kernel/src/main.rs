@@ -596,6 +596,12 @@ fn run_assigned_task(task_id_str: &str) -> Result<(), KernelError> {
     let mut store = SqliteStore::open(&path)?;
     let mut kernel = store.load()?;
     ensure_bootstrapped(&mut kernel)?;
+    // Make this run brain-aware (secret-free): a free-form Prime goal routes to the
+    // configured real adapter instead of silently echoing on local-prime. Mirrors
+    // the HTTP `locked_save` sync. See `KernelState::effective_run_adapter`.
+    kernel.set_prime_brain_preference(
+        relux_kernel::AiConfig::resolve(Some(&ai_config_path())).brain_preference(),
+    );
 
     // Dispatch on the assigned agent's adapter: local Prime echoes; an enabled
     // CLI adapter spawns its local binary; anything else fails honestly. The run

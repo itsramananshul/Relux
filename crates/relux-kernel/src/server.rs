@@ -10197,6 +10197,11 @@ where
     let mut store = SqliteStore::open(&state.db_path)?;
     let mut kernel = store.load()?;
     crate::ensure_bootstrapped(&mut kernel)?;
+    // Re-sync Prime's brain preference (secret-free) so any run this op starts
+    // routes a free-form Prime goal to the real configured adapter rather than
+    // silently echoing on local-prime. The kernel reloads per request, so this is
+    // the reliable injection point. See `KernelState::effective_run_adapter`.
+    kernel.set_prime_brain_preference(resolve_ai(state).brain_preference());
     let out = f(&mut kernel)?;
     store.save(&kernel)?;
     Ok(out)
@@ -10216,6 +10221,9 @@ where
     let mut store = SqliteStore::open(&state.db_path)?;
     let mut kernel = store.load()?;
     crate::ensure_bootstrapped(&mut kernel)?;
+    // Re-sync Prime's brain preference (secret-free) before the op so a started run
+    // is brain-aware (see [`locked_save`] for the rationale).
+    kernel.set_prime_brain_preference(resolve_ai(state).brain_preference());
     let result = f(&mut kernel);
     // Persist whatever the kernel recorded, success or honest failure, before
     // propagating the outcome.

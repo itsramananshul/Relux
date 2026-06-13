@@ -228,6 +228,14 @@ export function PrimeBrainPanel() {
         use their own login — no API key is stored in Relux for them.
       </p>
       <p className="muted" style={{ marginTop: -6, marginBottom: 12, fontSize: 11, lineHeight: 1.6 }}>
+        This choice also decides how Prime runs <strong>work</strong>: when you start a free-form
+        goal assigned to Prime, it executes on the selected <strong>Claude</strong> or{" "}
+        <strong>Codex</strong> CLI adapter. With <strong>Local</strong> (or{" "}
+        <strong>OpenRouter</strong>, which is conversational only), such a run <strong>fails
+        closed</strong> with a setup prompt instead of silently doing nothing — so enable and select
+        a CLI brain here to give Prime's work runs a real adapter.
+      </p>
+      <p className="muted" style={{ marginTop: -6, marginBottom: 12, fontSize: 11, lineHeight: 1.6 }}>
         <strong>Quick probe</strong> is safe and free — it checks availability only (a CLI's{" "}
         <span className="mono">--version</span>, or that an OpenRouter key resolves), so it cannot
         prove a chat turn actually works. <strong>Test live chat</strong> proves it: it sends one

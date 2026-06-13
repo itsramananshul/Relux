@@ -121,6 +121,41 @@ export function runMetricsLine(run: ReluxRunDetail): string | null {
   return parts.length ? parts.join(" · ") : null;
 }
 
+// The stable wire ids of the bundled adapters (relux_core::adapter::*_ADAPTER_ID).
+// Kept here so the run view can render a human adapter label + an honest note about
+// what the adapter actually does, without guessing from the raw id.
+export const LOCAL_PRIME_ADAPTER_ID = "relux-adapter-local-prime";
+export const CLAUDE_CLI_ADAPTER_ID = "relux-adapter-claude-cli";
+export const CODEX_CLI_ADAPTER_ID = "relux-adapter-codex-cli";
+
+// A short, human label for the adapter a run executed on. An unknown/custom adapter
+// id renders verbatim (never blank). Never invents capability — `local Prime` is
+// explicitly tagged deterministic so the operator knows it does no external work.
+export function adapterLabel(adapterPlugin: string | undefined): string {
+  switch (adapterPlugin) {
+    case LOCAL_PRIME_ADAPTER_ID:
+      return "Local Prime (deterministic)";
+    case CLAUDE_CLI_ADAPTER_ID:
+      return "Claude CLI";
+    case CODEX_CLI_ADAPTER_ID:
+      return "Codex CLI";
+    default:
+      return adapterPlugin ?? "—";
+  }
+}
+
+// An honest one-line note about what a run's adapter can do, for the run-detail
+// Adapter row. The local Prime adapter is deterministic and does no external work,
+// so a run on it that needs real reasoning will either route to a configured brain
+// or fail closed — say so. A CLI/custom adapter just names what it spawns. Returns
+// null for a CLI adapter when no extra caveat is useful.
+export function adapterCapabilityNote(adapterPlugin: string | undefined): string | null {
+  if (adapterPlugin === LOCAL_PRIME_ADAPTER_ID) {
+    return "Deterministic local path — no external work. A free-form goal routes to Prime's configured brain (Claude/Codex), or fails closed when none is set.";
+  }
+  return null;
+}
+
 // A human label for the current/last phase of a run, derived from the latest
 // transcript event kind. Falls back to the run status when there are no events.
 export function phaseLabel(
@@ -129,6 +164,7 @@ export function phaseLabel(
 ): string {
   const map: Record<string, string> = {
     run_started: "Started",
+    adapter_selected: "Adapter selected",
     adapter_spawn: "Spawning adapter",
     adapter_output: "Adapter output",
     run_completed: "Completed",

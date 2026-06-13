@@ -384,6 +384,17 @@ pub struct KernelState {
     /// background and is never consulted by the deterministic classifier, the fail-closed intent
     /// gate, or any existence/approval check. Every field is bounded + secret-redacted.
     conversation_summaries: HashMap<String, relux_core::ConversationSummary>,
+    /// A secret-free snapshot of Prime's conversational-brain selection, so the
+    /// operator-initiated run path ([`Self::execute_assigned_run`]) can route a
+    /// free-form Prime goal to the SAME real adapter the brain resolves to
+    /// (Claude/Codex CLI) instead of silently echoing on local-prime, or fail
+    /// closed with setup guidance when no real brain is configured
+    /// (`docs/RELUX_MASTER_PLAN.md` §8.1). NOT persisted by the store: the server
+    /// re-syncs it from the on-disk `AiConfig` before every run (see
+    /// [`Self::set_prime_brain_preference`]). A default (no explicit brain, no key)
+    /// resolves to `Local`, so the deterministic echo/test path — what every test
+    /// and any caller that never set it sees — is byte-for-byte unchanged.
+    prime_brain_pref: crate::ai::PrimeBrainPreference,
     clock: Clock,
     next_task: u64,
     next_run: u64,
@@ -445,9 +456,127 @@ fn manifests_equal(a: &PluginManifest, b: &PluginManifest) -> bool {
     }
 }
 
+/// The adapter an operator-initiated run will ACTUALLY execute on, plus why — so
+/// the run record, transcript, and diagnostics can explain a brain-based redirect
+/// honestly (`docs/RELUX_MASTER_PLAN.md` §8.1). Produced by
+/// [`KernelState::effective_run_adapter`].
+#[derive(Debug, Clone)]
+pub struct EffectiveRunAdapter {
+    /// The adapter plugin the run is dispatched on.
+    pub adapter: PluginId,
+    /// `true` when the choice was redirected from the local-prime default to a real
+    /// brain adapter because a CLI brain is configured for a free-form Prime goal.
+    pub redirected: bool,
+    /// A short, secret-free explanation of the choice.
+    pub reason: String,
+}
+
 impl KernelState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Re-sync the secret-free snapshot of Prime's conversational-brain selection
+    /// (see [`Self::prime_brain_pref`]). The server calls this from its
+    /// load→bootstrap→run chokepoint before any run is started, so the
+    /// operator-initiated run path can route a free-form Prime goal to the real
+    /// adapter the brain resolves to. Carries no key material.
+    pub fn set_prime_brain_preference(&mut self, pref: crate::ai::PrimeBrainPreference) {
+        self.prime_brain_pref = pref;
+    }
+
+    /// Resolve the adapter a run for `task_id` (assigned to `agent_id`) should
+    /// actually execute on, making the operator-initiated path **brain-aware**
+    /// (`docs/RELUX_MASTER_PLAN.md` §8.1 — "Local Prime is deterministic; it fails
+    /// closed on real external work", extended so a CONFIGURED real brain is *used*
+    /// rather than refused):
+    ///
+    /// - A crew agent with an explicitly-assigned NON-local adapter keeps it verbatim
+    ///   (the operator's choice wins; never overridden).
+    /// - The Prime/local-prime default keeps local-prime for an echo/test task and
+    ///   for an operator-authored `tool_call`/`tool_plan` directive — gated
+    ///   deterministic tool execution stays on the local path.
+    /// - A FREE-FORM natural-language Prime goal (a `prime_request` with no directive)
+    ///   that local-prime cannot turn into actions is routed to the real CLI adapter
+    ///   the operator's brain selection resolves to (Claude/Codex CLI). When that
+    ///   adapter is not actually enabled/on-PATH the downstream CLI gate fails closed
+    ///   with a clear setup action — never a silent local echo.
+    /// - When the resolved brain has no coding-agent run adapter (`Local` /
+    ///   `Openrouter`, which is conversational only), it stays on local-prime, which
+    ///   then fails closed with setup guidance (`is_unfulfillable_local_request`).
+    ///
+    /// Pure (no clock/network): it reads the agent, the task input, this kernel's own
+    /// adapter runtime status, and the stored brain preference. Confined to the
+    /// operator path: it is NOT consulted by [`Self::start_run`] (so Prime autonomy
+    /// and the orchestration batch keep their existing local/assigned dispatch and
+    /// never auto-spawn a paid CLI — §17).
+    pub fn effective_run_adapter(
+        &self,
+        agent_id: &AgentId,
+        task_id: &TaskId,
+    ) -> EffectiveRunAdapter {
+        let local_prime = || PluginId::new(relux_core::LOCAL_PRIME_ADAPTER_ID);
+        let base = match self.agents.get(agent_id) {
+            Some(a) => a.adapter_plugin.clone(),
+            None => {
+                return EffectiveRunAdapter {
+                    adapter: local_prime(),
+                    redirected: false,
+                    reason: "unknown agent; local Prime".to_string(),
+                }
+            }
+        };
+        // An explicitly-assigned CLI/generic adapter is the operator's choice — used
+        // verbatim, never redirected.
+        if recognize_adapter_kind(base.as_str()) != Some(AdapterKind::LocalPrime) {
+            return EffectiveRunAdapter {
+                adapter: base,
+                redirected: false,
+                reason: "assigned adapter".to_string(),
+            };
+        }
+        // Only a free-form goal local-prime cannot fulfil is a redirect candidate; a
+        // plain echo/test task and a gated `tool_call`/`tool_plan` directive stay on
+        // the deterministic local path. Scope the task borrow so the adapter-status
+        // read below does not overlap it.
+        let unfulfillable = match self.tasks.get(task_id) {
+            Some(t) => relux_core::is_unfulfillable_local_request(&t.input),
+            None => {
+                return EffectiveRunAdapter {
+                    adapter: base,
+                    redirected: false,
+                    reason: "unknown task; local Prime".to_string(),
+                }
+            }
+        };
+        if !unfulfillable {
+            return EffectiveRunAdapter {
+                adapter: base,
+                redirected: false,
+                reason: "deterministic local path".to_string(),
+            };
+        }
+        let available = crate::ai::available_cli_brains(&self.adapter_runtime_status());
+        let (brain, resolution) = self.prime_brain_pref.resolve(&available);
+        match brain.run_adapter_id() {
+            Some(id) => EffectiveRunAdapter {
+                adapter: PluginId::new(id),
+                redirected: true,
+                reason: format!(
+                    "routed to the {} brain ({}) for a free-form Prime goal",
+                    brain.as_str(),
+                    resolution.label()
+                ),
+            },
+            None => EffectiveRunAdapter {
+                adapter: base,
+                redirected: false,
+                reason: format!(
+                    "no real brain configured ({}); local Prime fails closed",
+                    resolution.label()
+                ),
+            },
+        }
     }
 
     // --- Persistence -------------------------------------------------------
@@ -9568,15 +9697,48 @@ impl KernelState {
                 .ok_or_else(|| KernelError::TaskNotAssigned(task_id.to_string()))?;
             (agent_id, task.status.clone())
         };
-        let adapter = self
-            .agents
-            .get(&agent_id)
-            .ok_or_else(|| KernelError::UnknownAgent(agent_id.to_string()))?
-            .adapter_plugin
-            .clone();
+        // Make sure the agent exists before doing anything else (the brain-aware
+        // resolver below is total, so guard the unknown-agent case here explicitly).
+        if !self.agents.contains_key(&agent_id) {
+            return Err(KernelError::UnknownAgent(agent_id.to_string()));
+        }
 
         if matches!(status, TaskStatus::Created | TaskStatus::Queued) {
             self.start_run(task_id)?;
+        }
+
+        // Resolve the adapter this operator-initiated run should ACTUALLY execute on.
+        // For a crew agent with an assigned CLI adapter this is just that adapter; for
+        // a free-form Prime goal it is the real brain's adapter when one is configured
+        // (otherwise local-prime, which fails closed). See `effective_run_adapter`.
+        let effective = self.effective_run_adapter(&agent_id, task_id);
+        let adapter = effective.adapter.clone();
+
+        // Keep the run record + transcript honest when the dispatch was redirected
+        // away from the agent's stored local-prime adapter: stamp the adapter the run
+        // is really executing on so the Work page shows the truth, not local-prime.
+        if effective.redirected {
+            if let Some(run_id) = self
+                .runs
+                .values()
+                .filter(|r| r.task_id == *task_id && r.status == RunStatus::Running)
+                .max_by_key(|r| r.started_at.clone())
+                .map(|r| r.id.clone())
+            {
+                if let Some(run) = self.runs.get_mut(&run_id) {
+                    run.adapter_plugin = adapter.clone();
+                }
+                self.push_run_event(
+                    &run_id,
+                    "adapter_selected",
+                    "kernel",
+                    &effective.reason,
+                    serde_json::json!({
+                        "adapter": adapter.as_str(),
+                        "redirected_from": relux_core::LOCAL_PRIME_ADAPTER_ID,
+                    }),
+                );
+            }
         }
 
         match recognize_adapter_kind(adapter.as_str()) {
@@ -21021,6 +21183,228 @@ mod tests {
             .audit_log()
             .iter()
             .any(|e| e.action == "adapter:execute" && e.result == AuditResult::Success));
+    }
+
+    // --- Brain-aware run routing for a free-form Prime goal (§8.1) -------------
+
+    /// A Prime-style agent on the local-prime adapter (the default Prime runtime).
+    fn local_prime_agent(k: &mut KernelState) -> AgentId {
+        let ns = NamespaceId::new("workspace");
+        k.create_agent(
+            "prime",
+            "Prime",
+            "operator",
+            &PluginId::new(relux_core::LOCAL_PRIME_ADAPTER_ID),
+            &ns,
+            None,
+            vec![],
+        )
+        .unwrap()
+    }
+
+    /// A free-form natural-language goal task assigned to `agent` (a `prime_request`
+    /// with no `tool_call`/`tool_plan` directive — `is_unfulfillable_local_request`).
+    fn free_form_goal_task(k: &mut KernelState, agent: &AgentId) -> TaskId {
+        let ns = NamespaceId::new("workspace");
+        let task = k.create_task(
+            "Fix the failing test",
+            serde_json::json!({ "prime_request": "clone the repo and fix the failing test" }),
+            "founder",
+            &ns,
+            vec![],
+        );
+        k.assign_task(&task, agent).unwrap();
+        task
+    }
+
+    #[test]
+    fn run_adapter_id_maps_only_cli_brains() {
+        use crate::ai::PrimeBrain;
+        assert_eq!(
+            PrimeBrain::ClaudeCli.run_adapter_id(),
+            Some(relux_core::CLAUDE_CLI_ADAPTER_ID)
+        );
+        assert_eq!(
+            PrimeBrain::CodexCli.run_adapter_id(),
+            Some(relux_core::CODEX_CLI_ADAPTER_ID)
+        );
+        // The conversational/echo brains have no coding-agent run adapter.
+        assert_eq!(PrimeBrain::Local.run_adapter_id(), None);
+        assert_eq!(PrimeBrain::Openrouter.run_adapter_id(), None);
+    }
+
+    #[test]
+    fn effective_run_adapter_routes_free_form_goal_to_configured_cli_brain() {
+        use crate::ai::{PrimeBrain, PrimeBrainPreference};
+        let mut k = adapter_kernel();
+        let agent = local_prime_agent(&mut k);
+        let task = free_form_goal_task(&mut k, &agent);
+
+        // No brain configured → stays on local-prime (it then fails closed).
+        let eff = k.effective_run_adapter(&agent, &task);
+        assert_eq!(eff.adapter.as_str(), relux_core::LOCAL_PRIME_ADAPTER_ID);
+        assert!(!eff.redirected);
+
+        // An explicit Claude brain → routed to the Claude CLI adapter.
+        k.set_prime_brain_preference(PrimeBrainPreference {
+            explicit: Some(PrimeBrain::ClaudeCli),
+            openrouter_usable: false,
+        });
+        let eff = k.effective_run_adapter(&agent, &task);
+        assert_eq!(eff.adapter.as_str(), relux_core::CLAUDE_CLI_ADAPTER_ID);
+        assert!(eff.redirected);
+
+        // OpenRouter is conversational only → no run adapter, stays local-prime.
+        k.set_prime_brain_preference(PrimeBrainPreference {
+            explicit: Some(PrimeBrain::Openrouter),
+            openrouter_usable: true,
+        });
+        let eff = k.effective_run_adapter(&agent, &task);
+        assert_eq!(eff.adapter.as_str(), relux_core::LOCAL_PRIME_ADAPTER_ID);
+        assert!(!eff.redirected);
+    }
+
+    #[test]
+    fn effective_run_adapter_keeps_local_path_for_directive_and_echo_tasks() {
+        use crate::ai::{PrimeBrain, PrimeBrainPreference};
+        let mut k = adapter_kernel();
+        let agent = local_prime_agent(&mut k);
+        let ns = NamespaceId::new("workspace");
+        // Even with a real brain configured, a gated directive task and a plain
+        // echo/test task stay on the deterministic local path.
+        k.set_prime_brain_preference(PrimeBrainPreference {
+            explicit: Some(PrimeBrain::ClaudeCli),
+            openrouter_usable: false,
+        });
+
+        let directive = k.create_task(
+            "run a tool",
+            serde_json::json!({
+                "tool_call": { "plugin": "relux-tools-echo", "tool": "echo.say", "args": {} }
+            }),
+            "founder",
+            &ns,
+            vec![],
+        );
+        k.assign_task(&directive, &agent).unwrap();
+        let eff = k.effective_run_adapter(&agent, &directive);
+        assert_eq!(eff.adapter.as_str(), relux_core::LOCAL_PRIME_ADAPTER_ID);
+        assert!(!eff.redirected);
+
+        let echo = k.create_task(
+            "echo me",
+            serde_json::json!({ "msg": "hi" }),
+            "founder",
+            &ns,
+            vec![],
+        );
+        k.assign_task(&echo, &agent).unwrap();
+        let eff = k.effective_run_adapter(&agent, &echo);
+        assert_eq!(eff.adapter.as_str(), relux_core::LOCAL_PRIME_ADAPTER_ID);
+        assert!(!eff.redirected);
+    }
+
+    #[test]
+    fn effective_run_adapter_never_overrides_an_assigned_cli_adapter() {
+        use crate::ai::{PrimeBrain, PrimeBrainPreference};
+        let mut k = adapter_kernel();
+        // A crew agent explicitly assigned the Claude adapter keeps it verbatim, even
+        // if the brain preference would resolve differently.
+        let (agent, task) = cli_task(&mut k);
+        k.set_prime_brain_preference(PrimeBrainPreference {
+            explicit: Some(PrimeBrain::CodexCli),
+            openrouter_usable: false,
+        });
+        let eff = k.effective_run_adapter(&agent, &task);
+        assert_eq!(eff.adapter.as_str(), relux_core::CLAUDE_CLI_ADAPTER_ID);
+        assert!(!eff.redirected);
+    }
+
+    #[test]
+    fn free_form_prime_goal_fails_closed_quickly_without_a_real_brain() {
+        // No real brain configured: the run reaches a terminal Failed (AdapterMissing)
+        // and the task is parked Blocked with actionable setup guidance — never a
+        // silent echo "done", never a hung Running.
+        let mut k = adapter_kernel();
+        let agent = local_prime_agent(&mut k);
+        let task = free_form_goal_task(&mut k, &agent);
+        let err = k.execute_assigned_run(&task).unwrap_err();
+        assert!(matches!(err, KernelError::LocalAdapterUnsupported(_)));
+        assert_eq!(k.task(&task).unwrap().status, TaskStatus::Blocked);
+        let run = k
+            .runs
+            .values()
+            .filter(|r| r.task_id == task)
+            .max_by_key(|r| r.started_at.clone())
+            .unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(run.failure_class, Some(RunFailureClass::AdapterMissing));
+        assert_eq!(run.adapter_plugin.as_str(), relux_core::LOCAL_PRIME_ADAPTER_ID);
+    }
+
+    #[test]
+    fn free_form_prime_goal_with_claude_brain_fails_closed_on_unconfigured_adapter() {
+        // The operator selected the Claude brain but never enabled its adapter
+        // runtime: the run is redirected to the Claude adapter and fails closed with
+        // the clear "enable it first" setup action — not a silent local echo.
+        use crate::ai::{PrimeBrain, PrimeBrainPreference};
+        let mut k = adapter_kernel();
+        let agent = local_prime_agent(&mut k);
+        let task = free_form_goal_task(&mut k, &agent);
+        k.set_prime_brain_preference(PrimeBrainPreference {
+            explicit: Some(PrimeBrain::ClaudeCli),
+            openrouter_usable: false,
+        });
+        let err = k.execute_assigned_run(&task).unwrap_err();
+        assert!(matches!(err, KernelError::AdapterRuntimeNotConfigured { .. }));
+        assert_eq!(k.task(&task).unwrap().status, TaskStatus::Failed);
+        let run = k
+            .runs
+            .values()
+            .filter(|r| r.task_id == task)
+            .max_by_key(|r| r.started_at.clone())
+            .unwrap();
+        assert_eq!(run.adapter_plugin.as_str(), relux_core::CLAUDE_CLI_ADAPTER_ID);
+        // The redirect is on the transcript so the Work page can explain it.
+        assert!(k
+            .run_events(&run.id)
+            .iter()
+            .any(|e| e.kind == "adapter_selected"));
+    }
+
+    #[test]
+    fn free_form_prime_goal_with_enabled_claude_brain_runs_on_the_real_adapter() {
+        // The full happy path: Claude brain selected AND its adapter enabled (here a
+        // fake CLI). The Prime-assigned free-form goal runs on the real adapter and
+        // the run records that adapter, not local-prime.
+        use crate::ai::{PrimeBrain, PrimeBrainPreference};
+        let dir = tempfile::tempdir().unwrap();
+        let fake = write_fake_cli(dir.path(), "fake-claude", "REAL_BRAIN_RAN");
+        let mut k = adapter_kernel();
+        k.configure_adapter_runtime(
+            &PluginId::new(relux_core::CLAUDE_CLI_ADAPTER_ID),
+            Some(true),
+            Some(fake.to_string_lossy().to_string()),
+            Some(30),
+            Some(4096),
+            None,
+        )
+        .unwrap();
+        let agent = local_prime_agent(&mut k);
+        let task = free_form_goal_task(&mut k, &agent);
+        k.set_prime_brain_preference(PrimeBrainPreference {
+            explicit: Some(PrimeBrain::ClaudeCli),
+            openrouter_usable: false,
+        });
+        let run_id = k.execute_assigned_run(&task).expect("real-brain run ok");
+        assert_eq!(k.task(&task).unwrap().status, TaskStatus::Completed);
+        let run = k.run(&run_id).unwrap();
+        assert_eq!(run.status, RunStatus::Completed);
+        assert_eq!(run.adapter_plugin.as_str(), relux_core::CLAUDE_CLI_ADAPTER_ID);
+        let kinds: Vec<&str> = k.run_events(&run_id).iter().map(|e| e.kind.as_str()).collect();
+        assert!(kinds.contains(&"adapter_selected"));
+        assert!(kinds.contains(&"adapter_spawn"));
+        assert!(kinds.contains(&"adapter_output"));
     }
 
     #[test]
