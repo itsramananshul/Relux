@@ -23,6 +23,7 @@ pub mod agent_presets;
 pub mod ai;
 pub mod auth;
 pub mod builtin;
+pub mod capability_detect;
 pub mod clock;
 pub mod doctor;
 pub mod event;
@@ -97,6 +98,7 @@ pub use auth::{
 pub use builtin::{is_builtin_tool, is_internal_plugin, BUILTIN_TOOLS, INTERNAL_PLUGIN_IDS};
 pub use clock::Clock;
 pub use event::RunEvent;
+pub use capability_detect::{detect_candidates, CapabilityCandidate};
 pub use introspect::{detect_hints, PluginHint};
 pub use mcp_proposal::{propose_mcp_registration, McpRegistrationProposal};
 pub use loader::{load_plugin_manifests, MANIFEST_FILENAME};

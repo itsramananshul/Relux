@@ -15,6 +15,7 @@
 
 import type {
   ReluxAdapterStatus,
+  ReluxCapabilityCandidate,
   ReluxManagedStdioStatus,
   ReluxMcpRegistrationProposal,
   ReluxMcpServer,
@@ -216,6 +217,90 @@ export function mcpDraftFromProposal(
     envText: "",
     cwd: "",
     description: p.suggested_description ?? "",
+  };
+}
+
+// ── Detected capability candidates (install-to-usable configuration) ──────────
+// RELUX_MASTER_PLAN §8.2 "Converting an imported repo into a real plugin / tool /
+// MCP config": the kernel's read-only scan now returns STRUCTURED, per-capability
+// candidates (api.ts ReluxCapabilityCandidate) — not just flat hints — so the page
+// can say "Detected N possible capabilities" and give each one a concrete Configure
+// path. The single honesty rule mirrored from the backend: only an `mcp_register`
+// candidate has a one-click governed path to a usable capability (it carries a
+// pre-filled mcp_registration); a `manual` candidate is an HONEST PENDING capability
+// with concrete next steps — never a faked "ready". These helpers are pure so
+// `node --test` can assert the presentation without a DOM.
+
+// A friendly label for a candidate kind.
+export function candidateKindLabel(kind: string): string {
+  switch (kind) {
+    case "mcp_stdio":
+      return "MCP server (stdio)";
+    case "mcp_http":
+      return "MCP server (loopback HTTP)";
+    case "cli_command":
+      return "Command-line tool";
+    default:
+      return kind;
+  }
+}
+
+// A confidence badge: high reads ok, medium muted, low muted — never inflated, and a
+// low/medium candidate is visibly less certain so an operator weighs it honestly.
+export function candidateConfidenceBadge(confidence: string): {
+  label: string;
+  variant: StatusVariant;
+} {
+  switch (confidence) {
+    case "high":
+      return { label: "high confidence", variant: "ok" };
+    case "medium":
+      return { label: "medium confidence", variant: "muted" };
+    default:
+      return { label: `${confidence} confidence`, variant: "muted" };
+  }
+}
+
+// True when a candidate is the one-click governed path (an MCP registration). The UI
+// surfaces these first and renders a pre-filled "Register MCP server…" review form.
+export function isOneClickCandidate(c: ReluxCapabilityCandidate): boolean {
+  return c.activation === "mcp_register" && !!c.mcp_registration;
+}
+
+// Seed the MCP review form from a candidate's pre-filled registration. Reuses the
+// same draft builder as the proposal path, so a candidate registers through the
+// identical loopback-only `POST /v1/relux/mcp/servers` route + validation.
+export function mcpDraftFromCandidate(c: ReluxCapabilityCandidate): McpRegisterDraft {
+  if (c.mcp_registration) return mcpDraftFromProposal(c.mcp_registration);
+  // Defensive: a malformed mcp_register candidate with no draft falls back to empty
+  // rather than throwing — the operator still gets a usable (manual) form.
+  return emptyMcpRegisterDraft();
+}
+
+export interface CapabilitySummary {
+  total: number;
+  // Candidates Relux can activate one-click through the MCP registry.
+  oneClick: number;
+  // Honest pending candidates (a CLI tool / script) that need manual wiring.
+  manual: number;
+  // True once the source was scanned but no runnable capability was detected, so the
+  // UI shows exact "what to add" guidance instead of a dead end.
+  emptyAfterScan: boolean;
+}
+
+// Summarize a hints payload's candidates for the panel headline + empty-state. Pure;
+// degrades to an honest zero/!empty when hints are still loading (scanned undefined).
+export function capabilitySummary(
+  hints: ReluxPluginHints | undefined,
+): CapabilitySummary {
+  const candidates = hints?.candidates ?? [];
+  const oneClick = candidates.filter(isOneClickCandidate).length;
+  return {
+    total: candidates.length,
+    oneClick,
+    manual: candidates.length - oneClick,
+    // Only call it "empty" once we KNOW the source was scanned and produced nothing.
+    emptyAfterScan: hints?.scanned === true && candidates.length === 0,
   };
 }
 

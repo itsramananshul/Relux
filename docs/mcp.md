@@ -697,6 +697,17 @@ details now offer a **"Register MCP server…"** action that turns that detectio
 **pre-filled, reviewable** registration on the EXISTING loopback registry — never an
 auto-action, and never running the source.
 
+> **Structured capability candidates.** The same scan now also returns a `candidates`
+> array (`crate::capability_detect::detect_candidates`, see RELUX_MASTER_PLAN §8.2
+> "Structured capability candidates"). An MCP candidate (`mcp_stdio`/`mcp_http`) is an
+> `mcp_register` candidate: its **Configure** opens this exact pre-filled
+> `AddMcpServerForm` (seeded by `mcpDraftFromCandidate`), so registering a detected MCP
+> capability flows through the identical loopback-only `POST /v1/relux/mcp/servers`
+> route + validation described below. An npm `@modelcontextprotocol/sdk` source with a
+> declared `bin` is enriched into a one-click `node <bin>` managed-stdio draft. A
+> detected non-MCP command-line tool is a `manual` candidate (an honest pending
+> capability with next steps), never auto-run. The MCP path below is unchanged.
+
 - **Proposal (read-only, fail-closed).** The same `/v1/relux/plugins/:id/hints`
   scan additionally builds a `relux_kernel::McpRegistrationProposal`
   (`crate::mcp_proposal::propose_mcp_registration`) **only when an MCP signal was

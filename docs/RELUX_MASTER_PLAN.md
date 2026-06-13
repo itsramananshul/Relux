@@ -3834,6 +3834,52 @@ asserting the pre-filled proposal) / `hints_route_does_not_scan_outside_the_plug
 (no proposal when nothing scanned), and the dashboard
 `hintKindLabel`/`hintsNextStep`/`mcpDraftFromProposal`/`validateMcpRegisterDraft` assertions.
 
+##### Structured capability candidates (install → usable, per capability)
+
+Flat hints + a single MCP proposal answer "what is this source?" but an ordinary repo
+(a CLI tool, a Python/Cargo script, several entrypoints) still got no concrete,
+per-capability path. `GET /v1/relux/plugins/:id/hints` now additionally returns a
+**`candidates`** array (`crates/relux-kernel/src/capability_detect.rs`
+`detect_candidates`) built from the SAME read-only scan — it executes nothing, reads
+only the same bounded metadata files, and never promotes a candidate into a runnable
+tool. Each `CapabilityCandidate` carries a `kind` (`mcp_stdio` | `mcp_http` |
+`cli_command`), an honest `confidence` (`high`/`medium`/`low`), a `risk` band, a
+one-line `rationale` (the exact signal matched), a non-secret `command_preview`, any
+required `env_placeholders` (names only — never values), and an `activation`:
+
+- **`mcp_register` — one-click governed activation.** The only shape Relux can turn
+  into a usable capability today. The candidate carries a pre-filled
+  `McpRegistrationProposal` for the unchanged loopback-only `POST /v1/relux/mcp/servers`
+  review form (managed-stdio for a stdio command, HTTP for a loopback `url`). An npm
+  `@modelcontextprotocol/sdk` source with a declared `bin` is **enriched** into a
+  reviewable `node <bin>` managed-stdio draft — surfaced for review, never run by
+  detection; managed-stdio re-validates + spawns it argv-only only after the operator
+  registers and Discovers. MCP candidates lead the list.
+- **`manual` — an honest pending capability.** A detected CLI binary / Python or Cargo
+  script that Relux has **no generic auto-runner** for (it never runs downloaded code).
+  No fake "ready": the candidate carries concrete `next_steps` through the existing
+  governed paths (register an MCP/stdio interface, run it as a loopback server + add a
+  tool definition, or author a `relux-plugin.json`).
+
+When the source was scanned but produced **no** candidate, the dashboard shows exact
+"what to add" guidance (an `mcp.json` / an MCP dependency / a loopback server + tool
+definition / a manifest) — never a dead end. The Configure panel renders
+`DetectedCapabilities` → `CapabilityCard` (`apps/dashboard/src/pages/Plugins.tsx`),
+with presentation derived purely by `apps/dashboard/src/plugins.ts`
+(`candidateKindLabel`/`candidateConfidenceBadge`/`isOneClickCandidate`/
+`mcpDraftFromCandidate`/`capabilitySummary`). An `mcp_register` candidate's Configure
+opens the SAME pre-filled `AddMcpServerForm` the MCP-hint path uses, so a candidate
+registers through the identical loopback-only route + validation — no new backend, no
+parallel registry, nothing auto-registered or auto-run. Pinned by
+`crates/relux-kernel/src/capability_detect.rs` unit tests (npm-MCP+bin → one-click
+managed-stdio, env keys → placeholders not values, pyproject/cargo bin → manual CLI,
+README-only → no candidate, candidate-count bound, slug safety), the server test
+`hints_route_introspects_an_imported_repo_without_a_manifest` (now asserting the MCP
+stdio candidate) / `hints_route_does_not_scan_outside_the_plugins_root` (no candidates
+when nothing scanned), the dashboard `plugins.test.ts` candidate-helper assertions, and
+`apps/dashboard/test/install-to-usable-render.test.mjs` (one-click vs manual rendering,
+env name not value, empty-after-scan guidance).
+
 #### Per-tool-call approval flow (gated tools)
 
 A `needs_approval` tool can be run for ONE specific invocation through a real

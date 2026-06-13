@@ -2999,6 +2999,36 @@ export interface ReluxMcpRegistrationProposal {
   notes: string[];
 }
 
+// One structured capability candidate detected in an imported source (the kernel's
+// capability_detect::CapabilityCandidate). Advisory + read-only — nothing is executed.
+// Only an `mcp_register` candidate has a one-click governed path to a usable
+// capability (it carries a pre-filled `mcp_registration`); a `manual` candidate is an
+// honest pending capability with concrete next steps, never a faked "ready".
+export interface ReluxCapabilityCandidate {
+  // A stable per-source slug ([a-z0-9-]) so the UI can key/configure a candidate.
+  id: string;
+  // "mcp_stdio" | "mcp_http" | "cli_command".
+  kind: string;
+  title: string;
+  // "high" | "medium" | "low" — honest, never inflated.
+  confidence: string;
+  // "low" | "medium" | "high" — advisory; the per-tool classification is the gate.
+  risk: string;
+  // Why Relux thinks this is a candidate (the exact signal matched). Non-secret.
+  rationale: string;
+  // A non-secret preview of the command to register/run, or absent when none could
+  // be inferred. Display text — never run by detection.
+  command_preview?: string;
+  // Required env var NAMES the source expects (names only — never values/secrets).
+  env_placeholders?: string[];
+  // "mcp_register" (one-click via the existing MCP registry) or "manual" (pending).
+  activation: string;
+  // Present only for an mcp_register candidate: the pre-filled registration draft.
+  mcp_registration?: ReluxMcpRegistrationProposal;
+  // Concrete next steps through the existing governed paths. Never claims readiness.
+  next_steps: string[];
+}
+
 export interface ReluxPluginHints {
   plugin_id: string;
   install_dir: string;
@@ -3010,6 +3040,9 @@ export interface ReluxPluginHints {
   // A pre-filled MCP registration draft, present only when an MCP signal was
   // detected. Absent ⇒ no MCP action is offered.
   mcp_proposal?: ReluxMcpRegistrationProposal;
+  // Structured per-capability candidates from the same read-only scan. Empty when
+  // nothing runnable was detected (the UI then shows exact "what to add" guidance).
+  candidates?: ReluxCapabilityCandidate[];
 }
 
 // -- Relux plugin tool runtime (HTTP loopback) ------------------------------

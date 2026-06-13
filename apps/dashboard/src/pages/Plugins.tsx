@@ -21,6 +21,7 @@ import {
   type ReluxMcpPrompt,
   type ReluxMcpPromptsResult,
   type ReluxMcpPromptResult,
+  type ReluxCapabilityCandidate,
   type ReluxPlugin,
   type ReluxPluginHints,
   type ReluxPluginRuntime,
@@ -32,10 +33,15 @@ import { useAsync } from "../components/common";
 import {
   adapterStatusBadge,
   canConfigureTools,
+  candidateConfidenceBadge,
+  candidateKindLabel,
+  capabilitySummary,
   guidedConfigSteps,
   hintKindLabel,
   hintsNextStep,
   installResultSummary,
+  isOneClickCandidate,
+  mcpDraftFromCandidate,
   managedStdioStatusBadge,
   mcpDraftFromProposal,
   mcpServerStatusBadge,
@@ -2552,6 +2558,13 @@ function ManifestPanel({
         hints={hintsAsync.data ?? undefined}
       />
 
+      <DetectedCapabilities
+        plugin={plugin}
+        hints={hintsAsync.data ?? undefined}
+        loading={hintsAsync.loading}
+        error={hintsAsync.error}
+      />
+
       <DetectedHints
         hints={hintsAsync.data ?? undefined}
         loading={hintsAsync.loading}
@@ -2799,6 +2812,214 @@ function AddToolForm({
           {busy ? "Adding..." : "Add tool"}
         </button>
       </div>
+    </div>
+  );
+}
+
+// The structured "install-to-usable" panel (RELUX_MASTER_PLAN §8.2 "Converting an
+// imported repo into a real plugin / tool / MCP config"). The same read-only scan that
+// produces the advisory hints below also returns STRUCTURED capability candidates, so
+// instead of a flat hint list the operator sees "Detected N possible capabilities" and
+// a concrete Configure path for each. The honesty rule (mirrored from the backend): an
+// `mcp_register` candidate gets a one-click pre-filled review form that creates a real,
+// usable capability through the existing loopback-only registry; a `manual` candidate
+// is an HONEST PENDING capability with concrete next steps — never a faked "ready".
+// When nothing runnable was detected, it shows exact "what to add" guidance, not a dead
+// end. Relux runs nothing here — registration is always explicit and gated.
+// Exported for the render harness (install-to-usable-render.test.mjs).
+export function DetectedCapabilities({
+  plugin,
+  hints,
+  loading,
+  error,
+}: {
+  plugin: ReluxPlugin;
+  hints: ReluxPluginHints | undefined;
+  loading: boolean;
+  error: string | null;
+}) {
+  if (loading && !hints) {
+    return <div className="loading" style={{ fontSize: 12 }}>Detecting capabilities…</div>;
+  }
+  if (error || !hints) return null;
+  // Outside the plugins root (a bundled fixture) nothing was scanned; DetectedHints
+  // already says so honestly, so this structured panel stays out of the way.
+  if (!hints.scanned) return null;
+
+  const summary = capabilitySummary(hints);
+  const candidates = hints.candidates ?? [];
+
+  return (
+    <div className="card" style={{ margin: "0 0 12px", padding: 10 }}>
+      <div className="row" style={{ alignItems: "center", marginBottom: 6 }}>
+        <strong style={{ fontSize: 12 }}>
+          {summary.total > 0
+            ? `Detected ${summary.total} possible capabilit${summary.total === 1 ? "y" : "ies"}`
+            : "No runnable capability detected"}
+        </strong>
+        <div className="spacer" style={{ flex: 1 }} />
+        {summary.oneClick > 0 && (
+          <span className="badge done" title="Can be registered through the existing MCP registry">
+            {summary.oneClick} one-click
+          </span>
+        )}
+      </div>
+
+      {summary.emptyAfterScan ? (
+        <div className="banner info" style={{ fontSize: 11, margin: 0 }}>
+          <p style={{ margin: "0 0 6px" }}>
+            Relux scanned the source and found no shape it can wire up automatically.
+            That’s not a dead end — here’s exactly what to add to make it usable:
+          </p>
+          <ul style={{ margin: 0, paddingLeft: 18 }}>
+            <li>
+              If it speaks MCP, drop an <span className="mono">mcp.json</span> (or add{" "}
+              <span className="mono">@modelcontextprotocol/sdk</span> / an{" "}
+              <span className="mono">mcp</span> dependency) and re-scan — it becomes a
+              one-click register.
+            </li>
+            <li>
+              Otherwise run it yourself as a loopback HTTP server, then{" "}
+              <strong>Add a tool definition</strong> below and point a{" "}
+              <strong>Runtime</strong> at it.
+            </li>
+            <li>
+              Or author a <span className="mono">relux-plugin.json</span> (Advanced
+              below) and re-install for a first-class plugin.
+            </li>
+          </ul>
+        </div>
+      ) : (
+        <>
+          <p className="muted" style={{ marginTop: 0, marginBottom: 8, fontSize: 11 }}>
+            Each candidate below was detected read-only — Relux ran nothing. A{" "}
+            <strong>Configure</strong> on an MCP candidate opens a pre-filled,
+            loopback-only review form (you confirm before anything registers); a
+            command-line tool is an honest pending capability with manual next steps.
+          </p>
+          {candidates.map((c) => (
+            <CapabilityCard key={c.id} plugin={plugin} candidate={c} />
+          ))}
+        </>
+      )}
+    </div>
+  );
+}
+
+// One detected capability candidate. An MCP candidate offers a one-click, pre-filled
+// "Configure" that opens the EXISTING AddMcpServerForm (loopback-only registry); a
+// command-line candidate expands to its honest manual next steps. Nothing here runs
+// the source.
+function CapabilityCard({
+  plugin,
+  candidate,
+}: {
+  plugin: ReluxPlugin;
+  candidate: ReluxCapabilityCandidate;
+}) {
+  const [open, setOpen] = useState(false);
+  const [registered, setRegistered] = useState(false);
+  const oneClick = isOneClickCandidate(candidate);
+  const confidence = candidateConfidenceBadge(candidate.confidence);
+
+  return (
+    <div
+      className="card"
+      style={{ margin: "0 0 8px", padding: 8, background: "transparent" }}
+    >
+      <div className="row" style={{ alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
+        <span className="badge" style={{ flexShrink: 0 }}>
+          {candidateKindLabel(candidate.kind)}
+        </span>
+        <strong style={{ fontSize: 12 }}>{candidate.title}</strong>
+        <span className={"badge " + BADGE_CLASS[confidence.variant]}>{confidence.label}</span>
+        <span className="badge backlog" title="Advisory risk band; the per-tool classification is the real gate">
+          {candidate.risk} risk
+        </span>
+        <div className="spacer" style={{ flex: 1 }} />
+        {oneClick ? (
+          <span className="badge done" title="Relux can register this through the existing MCP registry">
+            one-click
+          </span>
+        ) : (
+          <span className="badge in_progress" title="An honest pending capability — needs manual wiring; Relux runs nothing for you">
+            needs configuration
+          </span>
+        )}
+      </div>
+
+      <p className="muted" style={{ margin: "6px 0 4px", fontSize: 11 }}>
+        {candidate.rationale}
+      </p>
+
+      {candidate.command_preview && (
+        <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>
+          {oneClick ? "Will register as" : "Detected command (not run by Relux)"}:{" "}
+          <span className="mono" style={{ wordBreak: "break-all" }}>
+            {candidate.command_preview}
+          </span>
+        </div>
+      )}
+
+      {candidate.env_placeholders && candidate.env_placeholders.length > 0 && (
+        <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>
+          Expects env (map each to a stored secret, names only):{" "}
+          {candidate.env_placeholders.map((n, i) => (
+            <span key={n}>
+              {i > 0 ? ", " : ""}
+              <span className="mono">{n}</span>
+            </span>
+          ))}
+        </div>
+      )}
+
+      {oneClick && candidate.mcp_registration ? (
+        registered ? (
+          <p className="banner ok" style={{ fontSize: 11, margin: "6px 0 0" }}>
+            MCP server registered. Open the <strong>MCP servers</strong> section above
+            and click <strong>Discover</strong> to list its tools through the gate.
+          </p>
+        ) : open ? (
+          <div style={{ marginTop: 8 }}>
+            <AddMcpServerForm
+              title="Register MCP server"
+              initial={mcpDraftFromCandidate(candidate)}
+              advisory={<McpProposalAdvisory proposal={candidate.mcp_registration} />}
+              onClose={() => setOpen(false)}
+              onAdded={() => {
+                setOpen(false);
+                setRegistered(true);
+              }}
+            />
+          </div>
+        ) : (
+          <button
+            className="btn sm"
+            onClick={() => setOpen(true)}
+            title="Open a pre-filled, loopback-only review form; nothing registers or runs until you confirm"
+          >
+            Configure (register MCP server)…
+          </button>
+        )
+      ) : (
+        <details open={open} onToggle={(e) => setOpen((e.target as HTMLDetailsElement).open)}>
+          <summary className="btn ghost sm" style={{ display: "inline-block" }}>
+            How to make this usable
+          </summary>
+          <ul style={{ margin: "6px 0 0", paddingLeft: 18, fontSize: 11 }} className="muted">
+            {candidate.next_steps.map((s, i) => (
+              <li key={i} style={{ marginBottom: 3 }}>
+                {s}
+              </li>
+            ))}
+          </ul>
+          <p className="muted" style={{ margin: "6px 0 0", fontSize: 11 }}>
+            Use the <strong>Add a tool definition</strong> form below on{" "}
+            <strong>{plugin.name || plugin.id}</strong> once you have a loopback server
+            running.
+          </p>
+        </details>
+      )}
     </div>
   );
 }

@@ -7850,6 +7850,13 @@ struct PluginHintsResponse {
     /// `POST /v1/relux/mcp/servers` route + validation. Absent ⇒ no MCP action.
     #[serde(skip_serializing_if = "Option::is_none")]
     mcp_proposal: Option<relux_kernel::McpRegistrationProposal>,
+    /// Structured, per-capability candidates derived from the same read-only scan
+    /// (`crate::capability_detect::detect_candidates`): each carries a kind,
+    /// confidence, risk, rationale, a non-secret command preview, required env
+    /// placeholders, and an honest activation (`mcp_register` one-click vs `manual`
+    /// pending). Empty when the source has no runnable capability, so the UI can show
+    /// exact "what to add" guidance instead of a dead end. Executes nothing.
+    candidates: Vec<relux_kernel::CapabilityCandidate>,
 }
 
 /// GET `/v1/relux/plugins/:id/hints` - safe, read-only introspection of an
@@ -7900,6 +7907,15 @@ async fn plugin_hints(
         None
     };
 
+    // Structured per-capability candidates from the SAME read-only scan: the concrete,
+    // per-candidate paths to make each detected capability usable (MCP one-click vs an
+    // honest manual pending). Empty when nothing scanned or nothing runnable detected.
+    let candidates = if scanned {
+        relux_kernel::detect_candidates(&dir, &id, &hints)
+    } else {
+        Vec::new()
+    };
+
     Ok(Json(PluginHintsResponse {
         plugin_id: id,
         install_dir,
@@ -7907,6 +7923,7 @@ async fn plugin_hints(
         generated,
         hints,
         mcp_proposal,
+        candidates,
     }))
 }
 
@@ -9654,6 +9671,22 @@ mod tests {
             "no inferable endpoint ⇒ manual entry required"
         );
         assert!(proposal.detected_command.is_none(), "no command was executed/derived");
+        // The same scan also returns a structured capability candidate: the declared
+        // bin + MCP SDK becomes a one-click managed-stdio MCP candidate (the candidate
+        // layer enriches the npm bin into a reviewable draft — still nothing executed).
+        let mcp_candidate = resp
+            .candidates
+            .iter()
+            .find(|c| c.kind == "mcp_stdio")
+            .expect("an npm MCP SDK + bin source yields a one-click MCP stdio candidate");
+        assert_eq!(mcp_candidate.activation, "mcp_register");
+        assert_eq!(mcp_candidate.command_preview.as_deref(), Some("node ./bin.js"));
+        let draft = mcp_candidate
+            .mcp_registration
+            .as_ref()
+            .expect("an mcp_register candidate carries a pre-filled draft");
+        assert_eq!(draft.suggested_transport, "managed_stdio");
+        assert_eq!(draft.detected_command.as_deref(), Some("node"));
         // No tool was ever created from a hint: discovery still shows nothing.
         let tools = locked_read(&state, |k| {
             Ok(k.discover_tools(None)
@@ -9683,6 +9716,10 @@ mod tests {
         assert!(
             resp.mcp_proposal.is_none(),
             "nothing scanned => no MCP registration proposal"
+        );
+        assert!(
+            resp.candidates.is_empty(),
+            "nothing scanned => no capability candidates"
         );
     }
 

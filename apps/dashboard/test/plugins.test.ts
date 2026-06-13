@@ -23,6 +23,11 @@ import {
   parseEnvMappingLines,
   mcpEnvFromText,
   normalizeGithubUrl,
+  candidateKindLabel,
+  candidateConfidenceBadge,
+  isOneClickCandidate,
+  mcpDraftFromCandidate,
+  capabilitySummary,
 } from "../src/plugins.ts";
 
 // The Plugins page must read HONESTLY: a generated metadata-only wrapper is never
@@ -766,4 +771,97 @@ test("guidedConfigSteps: unloaded runtime/hints degrade honestly (no fake progre
   // Runtime unknown → treated as not-ready, the current actionable step.
   assert.equal(byKey.runtime.status, "current");
   assert.equal(g.complete, false);
+});
+
+// ── Detected capability candidates (install-to-usable configuration) ──────────
+// The structured layer the kernel returns alongside hints. The honesty rule the
+// page depends on: an mcp_register candidate is one-click + carries a draft; a
+// manual candidate is an honest pending capability, never faked ready.
+
+function mcpCandidate(over = {}) {
+  return {
+    id: "mcp-server",
+    kind: "mcp_stdio",
+    title: "MCP server (stdio)",
+    confidence: "high",
+    risk: "medium",
+    rationale: "depends on @modelcontextprotocol/sdk",
+    command_preview: "node ./server.js",
+    env_placeholders: [],
+    activation: "mcp_register",
+    mcp_registration: {
+      suggested_id: "cool-mcp",
+      suggested_description: "",
+      endpoint_required: true,
+      suggested_transport: "managed_stdio",
+      detected_command: "node",
+      detected_args: ["./server.js"],
+      notes: [],
+    },
+    next_steps: ["Open the review form."],
+    ...over,
+  };
+}
+function cliCandidate(over = {}) {
+  return {
+    id: "cli-bin-tool",
+    kind: "cli_command",
+    title: "Command-line tool (npm bin)",
+    confidence: "medium",
+    risk: "medium",
+    rationale: "package.json declares a bin entrypoint",
+    command_preview: "node ./cli.js",
+    env_placeholders: [],
+    activation: "manual",
+    next_steps: ["Run it yourself as a loopback server, then add a tool."],
+    ...over,
+  };
+}
+
+test("candidateKindLabel maps each kind to a friendly label", () => {
+  assert.equal(candidateKindLabel("mcp_stdio"), "MCP server (stdio)");
+  assert.equal(candidateKindLabel("mcp_http"), "MCP server (loopback HTTP)");
+  assert.equal(candidateKindLabel("cli_command"), "Command-line tool");
+  assert.equal(candidateKindLabel("future"), "future");
+});
+
+test("candidateConfidenceBadge: high reads ok, lower reads muted (never inflated)", () => {
+  assert.deepEqual(candidateConfidenceBadge("high"), { label: "high confidence", variant: "ok" });
+  assert.equal(candidateConfidenceBadge("medium").variant, "muted");
+  assert.equal(candidateConfidenceBadge("low").variant, "muted");
+});
+
+test("isOneClickCandidate: true only for an mcp_register candidate that carries a draft", () => {
+  assert.equal(isOneClickCandidate(mcpCandidate()), true);
+  assert.equal(isOneClickCandidate(cliCandidate()), false);
+  // An mcp_register activation with no draft is NOT treated as one-click (defensive).
+  assert.equal(isOneClickCandidate(mcpCandidate({ mcp_registration: undefined })), false);
+});
+
+test("mcpDraftFromCandidate seeds the SAME draft the existing registry form uses", () => {
+  const d = mcpDraftFromCandidate(mcpCandidate());
+  assert.equal(d.transport, "managed_stdio");
+  assert.equal(d.command, "node");
+  assert.equal(d.argsText, "./server.js");
+  assert.equal(d.id, "cool-mcp");
+  // A malformed candidate falls back to a usable empty draft, never throws.
+  const empty = mcpDraftFromCandidate(cliCandidate());
+  assert.equal(empty.transport, "http_loopback");
+});
+
+test("capabilitySummary counts one-click vs manual and flags a true empty-after-scan", () => {
+  const s = capabilitySummary(hints({ candidates: [mcpCandidate(), cliCandidate()] }));
+  assert.equal(s.total, 2);
+  assert.equal(s.oneClick, 1);
+  assert.equal(s.manual, 1);
+  assert.equal(s.emptyAfterScan, false);
+
+  // Scanned, no candidates → empty-after-scan true (the page shows what-to-add guidance).
+  const empty = capabilitySummary(hints({ candidates: [] }));
+  assert.equal(empty.total, 0);
+  assert.equal(empty.emptyAfterScan, true);
+
+  // Not yet loaded (undefined) or not scanned → never claims "empty" (no false dead-end).
+  assert.equal(capabilitySummary(undefined).emptyAfterScan, false);
+  assert.equal(capabilitySummary(hints({ scanned: false, candidates: [] })).emptyAfterScan, false);
 });
