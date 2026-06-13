@@ -23,6 +23,30 @@ export function githubPluginInstallAction(
   return { repoUrl, pluginId };
 }
 
+// A typed view of the capability-activation action Prime proposes for a "configure the
+// first candidate" / "enable the MCP server from <plugin>" / "turn that script into a
+// tool" turn (the kernel `PrimeAction::ConfigurePluginCandidate`). `pluginId` may be a
+// fuzzy selector or empty (the backend resolves the unique plugin), and `candidateId`
+// may be a keyword ("mcp" / "command" / "first") — both re-resolved + re-validated
+// server-side. Pure + defensive so the chat card never trusts an unshaped action.
+export interface ConfigurePluginCandidateAction {
+  pluginId: string;
+  candidateId: string;
+}
+
+// Extract the capability-activation descriptor from a Prime action, or null when the
+// action is absent / a different type / missing its candidate selector. The action
+// shape is `{ type, [k]: unknown }`, so every field is validated before use.
+export function configurePluginCandidateAction(
+  action: ReluxPrimeAction | null | undefined,
+): ConfigurePluginCandidateAction | null {
+  if (!action || action.type !== "configure_plugin_candidate") return null;
+  const candidateId = typeof action.candidate_id === "string" ? action.candidate_id.trim() : "";
+  if (!candidateId) return null;
+  const pluginId = typeof action.plugin_id === "string" ? action.plugin_id.trim() : "";
+  return { pluginId, candidateId };
+}
+
 // Prime's chat-surface copy (RELUX_MASTER_PLAN §11.1; `docs/prime-processing-audit.md`
 // "Hermes-first general agent"). Prime is presented as a GENERAL local AI agent —
 // a chat companion that can ALSO drive the Relux control plane — not a company /

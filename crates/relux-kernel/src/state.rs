@@ -12142,6 +12142,16 @@ fn describe_action(action: &PrimeAction) -> String {
             format!("import GitHub repo {repo_url} as a plugin (metadata only, no code run)")
         }
         PrimeAction::ConfigurePlugin { plugin_id } => format!("configure plugin {plugin_id}"),
+        PrimeAction::ConfigurePluginCandidate { plugin_id, candidate_id } => {
+            let plugin = if plugin_id.trim().is_empty() {
+                "the imported plugin".to_string()
+            } else {
+                format!("plugin {plugin_id}")
+            };
+            format!(
+                "configure detected capability \"{candidate_id}\" of {plugin} (metadata/recipe only, no code run)"
+            )
+        }
         PrimeAction::CreateAgent {
             name,
             adapter_plugin,

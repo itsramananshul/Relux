@@ -311,6 +311,31 @@ pub fn classify_intent(message: &str) -> PrimeIntent {
     if is_question(&m) && !is_explicit_command(&m) {
         return PrimeIntent::Brainstorming;
     }
+    // Plugin capability CONFIGURATION: the user wants Prime to ACTIVATE a capability the
+    // import already DETECTED — register its MCP server, or turn a detected script into a
+    // governed command tool — distinct from INSTALLING a plugin (cloning a repo) below.
+    // Anchored on an explicit activation verb AND a candidate / MCP-server / command-tool
+    // cue, so casual talk ("configure my editor") never reaches here; a question was
+    // already routed to Brainstorming by the conversation guard above. Activation runs no
+    // downloaded code — it registers metadata/recipe through the EXISTING governed paths
+    // (`docs/prime-tool-use.md` "Configuring a detected capability"; §8/§8.2/§10.2/§10.3).
+    let configure_verb =
+        has(&["configure", "activate", "set up the", "register the", "turn "]) || starts("enable ");
+    let candidate_cue = has(&[
+        "candidate",
+        "the mcp server",
+        "mcp server from",
+        "mcp server for",
+        "into a tool",
+        "into a command tool",
+        "as a command tool",
+        "command tool from",
+        "that script",
+        "the script",
+    ]);
+    if configure_verb && candidate_cue {
+        return PrimeIntent::PluginConfiguration;
+    }
     // Orchestration RUN/continue: the user wants Prime to START (or continue) the
     // governed batch for an EXISTING orchestration — distinct from CREATING one above
     // (which is keyed on "orchestrate"/"coordinate"/…). Keyed on a run/continue verb
@@ -460,6 +485,25 @@ pub fn classify_intent(message: &str) -> PrimeIntent {
     }
 
     PrimeIntent::DirectAnswer
+}
+
+/// The grounded, honest proposal text for a `ConfigurePluginCandidate` turn: what
+/// Prime will activate, where, and the unchanged safety posture (metadata/recipe only,
+/// no downloaded code runs, the resulting tool stays gated until invoked).
+fn configure_candidate_text(sel: &crate::prime_candidate_config::CandidateConfigSelector) -> String {
+    let what = match sel.candidate_selector.as_str() {
+        "mcp" => "register the detected MCP server",
+        "command" => "configure the detected command tool",
+        _ => "configure the first detected capability",
+    };
+    let where_ = if sel.plugin_selector.is_empty() {
+        "the imported plugin".to_string()
+    } else {
+        format!("plugin \"{}\"", sel.plugin_selector)
+    };
+    format!(
+        "I can {what} from {where_} through the existing governed path. This registers metadata/recipe only — no code from the source runs, and the resulting tool stays gated (needs approval) until you ask me to use it."
+    )
 }
 
 /// Decide what Prime should do, grounded in the current [`StateSummary`].
@@ -653,6 +697,31 @@ pub fn decide(message: &str, intent: &PrimeIntent, summary: &StateSummary) -> Pr
                     .to_string(),
                 risk: RiskLevel::High,
                 text: format!("I can install the plugin {plugin}."),
+            }
+        }
+        PrimeIntent::PluginConfiguration => {
+            // Activating a DETECTED capability candidate of an installed plugin: register
+            // its MCP server, or configure a detected script as a governed command tool —
+            // through the EXISTING governed paths, always behind a human approval. The
+            // selectors (plugin + candidate) are parsed from text here and re-resolved +
+            // re-validated AUTHORITATIVELY server-side against a fresh candidate scan (the
+            // confirm route never trusts a client-supplied command). Reference: Hermes
+            // `hermes_cli/mcp_config.py` (`cmd_mcp_add` — register a server by name;
+            // configure ≠ run).
+            match crate::prime_candidate_config::parse_candidate_config_request(message) {
+                Some(sel) => PrimePlan::Propose {
+                    action: PrimeAction::ConfigurePluginCandidate {
+                        plugin_id: sel.plugin_selector.clone(),
+                        candidate_id: sel.candidate_selector.clone(),
+                    },
+                    reason: "Activating a detected capability registers a new third-party MCP server or a governed command tool on the control plane — a new capability, gated until you invoke it."
+                        .to_string(),
+                    risk: RiskLevel::High,
+                    text: configure_candidate_text(&sel),
+                },
+                None => PrimePlan::Clarify {
+                    text: "Which detected capability should I configure? Name the plugin and whether you mean its MCP server or a command tool (e.g. \"enable the MCP server from <plugin>\"), or use the Configure buttons on the Plugins page.".to_string(),
+                },
             }
         }
         PrimeIntent::PermissionChange => {
@@ -2518,6 +2587,7 @@ pub fn is_standalone_request(message: &str) -> bool {
             | I::RunRetry
             | I::AgentCreation
             | I::PluginInstallation
+            | I::PluginConfiguration
             | I::PermissionChange
             | I::Orchestration
             | I::OrchestrationRun
@@ -2848,6 +2918,85 @@ mod tests {
     fn greeting_only_matches_whole_words() {
         // "this" contains "hi" but is not a greeting.
         assert_ne!(classify_intent("is this thing on"), PrimeIntent::Greeting);
+    }
+
+    #[test]
+    fn classifies_plugin_candidate_configuration_explicitly() {
+        // Explicit activation requests route to PluginConfiguration…
+        assert_eq!(
+            classify_intent("configure the first candidate"),
+            PrimeIntent::PluginConfiguration
+        );
+        assert_eq!(
+            classify_intent("enable the MCP server from hermes-agent"),
+            PrimeIntent::PluginConfiguration
+        );
+        assert_eq!(
+            classify_intent("turn that script into a tool"),
+            PrimeIntent::PluginConfiguration
+        );
+        // …but INSTALLING a plugin (cloning a repo) stays PluginInstallation, and a
+        // bare "enable plugin" is an install/enable, not candidate configuration.
+        assert_eq!(
+            classify_intent("install nousresearch/hermes-agent as a plugin"),
+            PrimeIntent::PluginInstallation
+        );
+        assert_eq!(
+            classify_intent("enable plugin relux-tools-echo"),
+            PrimeIntent::PluginInstallation
+        );
+        // Casual/question talk that merely mentions configuring stays conversational.
+        assert_ne!(
+            classify_intent("should I configure my editor?"),
+            PrimeIntent::PluginConfiguration
+        );
+        assert_ne!(
+            classify_intent("how do I set up the project?"),
+            PrimeIntent::PluginConfiguration
+        );
+    }
+
+    #[test]
+    fn decide_plugin_configuration_proposes_a_candidate_activation() {
+        let s = empty_summary();
+        // An MCP request with a named plugin proposes ConfigurePluginCandidate.
+        let plan = decide(
+            "enable the MCP server from hermes-agent",
+            &PrimeIntent::PluginConfiguration,
+            &s,
+        );
+        match plan {
+            PrimePlan::Propose { action, risk, .. } => {
+                assert_eq!(risk, RiskLevel::High, "activating a capability is gated");
+                match action {
+                    PrimeAction::ConfigurePluginCandidate {
+                        plugin_id,
+                        candidate_id,
+                    } => {
+                        assert_eq!(plugin_id, "hermes-agent");
+                        assert_eq!(candidate_id, "mcp");
+                    }
+                    other => panic!("expected ConfigurePluginCandidate, got {other:?}"),
+                }
+            }
+            other => panic!("expected a Propose, got {other:?}"),
+        }
+        // "the first candidate" with no plugin named ⇒ empty plugin selector + "first".
+        let plan = decide(
+            "configure the first candidate",
+            &PrimeIntent::PluginConfiguration,
+            &s,
+        );
+        match plan {
+            PrimePlan::Propose {
+                action: PrimeAction::ConfigurePluginCandidate { plugin_id, candidate_id },
+                ..
+            } => {
+                assert_eq!(plugin_id, "", "no plugin named ⇒ backend resolves the unique one");
+                assert_eq!(candidate_id, "first");
+            }
+            other => panic!("expected a Propose ConfigurePluginCandidate, got {other:?}"),
+        }
     }
 
     #[test]

@@ -155,6 +155,7 @@ fn intent_labels() -> Vec<&'static str> {
         "run_retry",
         "agent_creation",
         "plugin_installation",
+        "plugin_configuration",
         "permission_change",
         "approval_response",
         "explanation_request",
@@ -275,6 +276,7 @@ fn is_sensitive_intent(intent: &PrimeIntent) -> bool {
             | PrimeIntent::RunRetry
             | PrimeIntent::AgentCreation
             | PrimeIntent::PluginInstallation
+            | PrimeIntent::PluginConfiguration
             | PrimeIntent::PermissionChange
             | PrimeIntent::ApprovalResponse
             | PrimeIntent::Orchestration

@@ -245,6 +245,7 @@ fn is_high_risk_action(action: Option<&PrimeAction>) -> bool {
         action,
         Some(PrimeAction::InstallPlugin { .. })
             | Some(PrimeAction::InstallPluginFromGithub { .. })
+            | Some(PrimeAction::ConfigurePluginCandidate { .. })
             | Some(PrimeAction::GrantPermission { .. })
     )
 }
@@ -284,6 +285,7 @@ pub fn build_action_envelope(turn: &PrimeTurn, kind: ActionResultKind) -> Action
         Some(PrimeAction::StartRun { task_id }) => push(task_id),
         Some(PrimeAction::InstallPlugin { plugin_id }) => push(plugin_id),
         Some(PrimeAction::InstallPluginFromGithub { plugin_id, .. }) => push(plugin_id),
+        Some(PrimeAction::ConfigurePluginCandidate { plugin_id, .. }) => push(plugin_id),
         Some(PrimeAction::GrantPermission { subject_id, .. }) => push(subject_id),
         _ => {}
     }
@@ -337,6 +339,13 @@ fn action_label(turn: &PrimeTurn, kind: ActionResultKind) -> String {
                     .to_string()
             }
             _ => "imported a plugin from GitHub".to_string(),
+        },
+        Some(PrimeAction::ConfigurePluginCandidate { .. }) => match kind {
+            ActionResultKind::Proposed => {
+                "proposed configuring a detected capability (awaiting your approval; metadata/recipe only, no code run)"
+                    .to_string()
+            }
+            _ => "configured a detected capability".to_string(),
         },
         Some(PrimeAction::GrantPermission { .. }) => match kind {
             ActionResultKind::Proposed => {

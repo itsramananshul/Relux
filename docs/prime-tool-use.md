@@ -286,5 +286,78 @@ auto-enable) — and openclaw's single-classifier confirmation discipline
 (`reference/openclaw-main/src/acp/approval-classifier.ts`): one deterministic function
 decides, and the stateful path is always confirmation-gated, never auto-run.
 
+## Configuring a detected capability (from chat)
+
+Importing a plugin (above) *detects* capability candidates but configures nothing — a
+repo with no `relux-plugin.json` lands as a metadata-only wrapper whose detected MCP
+server / scripts are still inert. Prime can now **guide the next step**: activate one
+detected candidate through the **existing governed configuration paths**, behind a human
+confirmation, without the operator leaving chat for the Plugins page.
+
+What works from chat:
+
+- `configure the first candidate`
+- `enable the MCP server from hermes-agent`
+- `turn that script into a tool`
+
+The flow:
+
+1. **Parse.** The deterministic classifier routes an explicit activation request
+   (`configure`/`activate`/`enable`/`set up`/`register` + a candidate / MCP-server /
+   command-tool cue) to `PluginConfiguration`. `crate::prime_candidate_config::parse_candidate_config_request`
+   turns the message into a **plugin selector** (a fuzzy name, or empty when none is
+   named) + a **candidate selector** (`mcp` / `command` / `first`). Casual talk
+   ("should I configure my editor?") and questions stay conversational — the conversation
+   guard routes a question to Brainstorming before this check.
+2. **Propose (confirmation-gated).** The turn routes to
+   `PrimeAction::ConfigurePluginCandidate { plugin_id, candidate_id }` and comes back as a
+   `RiskLevel::High` **proposal awaiting approval** — a logged approval is the
+   governance/audit record. Both selectors are advisory: the backend re-resolves and
+   re-validates them, so nothing here is trusted as a concrete command.
+3. **Confirm (one backend chokepoint).** The chat renders a `ConfigureCandidateCard` (and
+   the import result renders a **Configure with Prime** button per detected candidate)
+   stating what will be activated, where, and the explicit **"no code from the source
+   runs"** guarantee. Confirm posts to the **single backend-governed action route**
+   `POST /v1/relux/prime/actions/configure-candidate`. The kernel:
+   - **re-reads the candidates server-side** from the plugin's install directory (the same
+     read-only `detect_hints` + `detect_candidates` scan as `/hints`), then **re-resolves**
+     the selector against that fresh list (an exact id wins; otherwise `mcp` / `command` /
+     `first`). A tampered command in the request body can never reach a spawn, because the
+     spawn recipe is rebuilt from the server-side scan, not the request.
+   - resolves the **target plugin**: an exact installed id wins (the button path);
+     otherwise it picks the unique plugin that has an activatable candidate, or the one
+     whose id/name matches a named selector. Ambiguity ("more than one plugin has
+     candidates") is an honest `400`, never a silent guess.
+   - **activates through the existing governed path** — no duplicated unsafe code:
+     - an `mcp_register` candidate is registered on the **unchanged MCP registry**
+       (`register_mcp_server` / `register_mcp_stdio_server`, which re-validate the
+       loopback/argv contract). `env` is **not** pre-filled — a managed-stdio server's
+       secrets are mapped separately on the MCP page, never carried in this request.
+     - a `command_tool` candidate's pre-filled argv draft is rendered into the exact JSON
+       the **unchanged** `parse_command_tool_input` validator accepts and stored through
+       `configure_command_tool` (argv-only, no shell, confined cwd, approval always
+       Required).
+   - closes the logged governance approval (best-effort) and returns **one structured
+     envelope**.
+4. **Result.** The structured response carries the `plugin_id` / `plugin_name`, the
+   activated candidate's `kind` + `activation`, the registered `mcp_server` **or** the
+   updated `plugin` record, the new `tool_name`, the honest `next_step` (**"ask me to use
+   it"** — the tool stays gated until invoked), and the `no_code_executed` guarantee. A
+   registered MCP server still needs a **Discover** + per-tool classification; a command
+   tool is invokable through the same gated chat path (`prime_invoke_tool`).
+
+**Safety:** activation registers metadata/recipe only — it runs no code from the source,
+grants no new authority, and the resulting MCP tool / command tool stays gated (needs
+approval) until invoked. An honest `manual` candidate (a CLI Relux has no runtime for)
+has no one-click path and points at the Plugins page instead of faking a "ready" state.
+
+**Reference-driven** (`docs/reference-driven-development.md`): this mirrors Hermes
+`reference/hermes-agent-main/hermes_cli/mcp_config.py` — `cmd_mcp_add` keys a
+`{command, args, env}` (or `{url}`) server by name, and **configuring a server is a
+separate step from running it** (configure ≠ run) — and openclaw's
+`extensions/acpx/src/config-schema.ts` (`McpServerConfig = {command, args, env}`), the
+same server shape Relux rebuilds from the candidate's proposal before handing it to the
+existing registry validation.
+
 See `docs/ARTIFICIAL_CONSTRAINT_AUDIT.md` for the lifted constraints and `docs/mcp.md` for the
 agent loop and MCP transports.

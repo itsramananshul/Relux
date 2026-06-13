@@ -48,6 +48,7 @@ pub mod prime_clarify;
 pub mod prime_clarify_memory;
 pub mod prime_decision;
 pub mod prime_history;
+pub mod prime_candidate_config;
 pub mod prime_intent;
 pub mod prime_orchestration_slots;
 pub mod prime_plugin_install;
@@ -115,6 +116,10 @@ pub use plugin_install::{
     refresh_bundled_plugins, remove_plugin, GENERATED_MANIFEST_AUTHOR,
 };
 pub use command_tool_config::{parse_command_tool_input, CommandToolDraft};
+pub use prime_candidate_config::{
+    command_tool_body, is_activatable, parse_candidate_config_request, resolve_candidate,
+    CandidateConfigSelector,
+};
 pub use plugin_tool_config::{parse_plugin_tool_input, PluginToolInput};
 pub use prime::{
     clarify_needs_label, classify_intent, decide, is_chat_guarded, is_standalone_request,

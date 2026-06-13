@@ -540,6 +540,10 @@ fn protected_router() -> Router<AppState> {
             "/v1/relux/prime/actions/install-plugin",
             post(prime_install_plugin_action),
         )
+        .route(
+            "/v1/relux/prime/actions/configure-candidate",
+            post(prime_configure_candidate_action),
+        )
         .route("/v1/relux/prime/tools", get(prime_tools))
         // Multi-agent orchestration (Prime as orchestrator).
         .route(
@@ -8108,6 +8112,288 @@ async fn prime_install_plugin_action(
     }))
 }
 
+// --- Prime action: confirm + activate a detected capability candidate ------
+
+/// The body of `POST /v1/relux/prime/actions/configure-candidate`: the dashboard's
+/// "Configure with Prime" button echoes the EXACT plugin + candidate ids; a chat
+/// proposal may instead carry a fuzzy plugin selector and a candidate keyword. Every
+/// field is re-resolved + re-validated server-side against a FRESH read-only candidate
+/// scan — a client-supplied command can never reach a spawn.
+#[derive(Debug, Deserialize)]
+struct PrimeConfigureCandidateReq {
+    /// The target plugin: a concrete installed plugin id (button), or a fuzzy selector /
+    /// empty string (chat). Empty ⇒ the kernel resolves the unique installed plugin that
+    /// has activatable candidates; ambiguity is a clean 400.
+    plugin_id: String,
+    /// The candidate selector: a concrete candidate id (button) or a keyword
+    /// (`"mcp"` / `"command"` / `"first"`) (chat). Re-resolved against the fresh scan.
+    candidate_id: String,
+    /// The logged governance approval staged for the proposal, closed as approved when
+    /// activation succeeds. Optional + best-effort (this route is the authoritative gate).
+    #[serde(default)]
+    approval_id: Option<String>,
+}
+
+/// The structured result of a confirmed capability activation. One auditable envelope:
+/// which plugin/candidate was activated, through which governed path (MCP registry or
+/// command tool), the resulting server/tool status, the honest "ask me to use it" next
+/// step, and the no-code-run guarantee.
+#[derive(Debug, Serialize)]
+struct PrimeConfigureCandidateResponse {
+    plugin_id: String,
+    plugin_name: String,
+    candidate_id: String,
+    /// The candidate kind (`"mcp_stdio"` | `"mcp_http"` | `"cli_command"`).
+    kind: String,
+    /// The activation taken: `"mcp_register"` or `"command_tool"`.
+    activation: String,
+    /// Present for an `mcp_register` activation: the registered server's redacted status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mcp_server: Option<McpServerResponse>,
+    /// Present for a `command_tool` activation: the updated plugin record (carries the
+    /// new tool in its count) so the page can refresh.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plugin: Option<PluginRecord>,
+    /// The new tool name (command tool) or registered MCP server id, so chat/UI can say
+    /// exactly what to invoke next.
+    tool_name: String,
+    /// Honest next step — the activated capability is gated (needs approval) until invoked.
+    next_step: String,
+    /// Invariant this route guarantees: activation registered metadata/recipe only and
+    /// ran no code from the source.
+    no_code_executed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval_id: Option<String>,
+    approval_closed: bool,
+}
+
+/// Read-only candidate scan for one installed plugin's directory (the SAME scan as GET
+/// `/hints`), bounded to the plugins root. Returns an empty vec for an out-of-root /
+/// missing directory. Executes nothing.
+fn scan_candidates_for(
+    plugins_root: &std::path::Path,
+    install_dir: &str,
+    plugin_id: &str,
+) -> Vec<relux_kernel::CapabilityCandidate> {
+    let dir = std::path::PathBuf::from(install_dir);
+    if !dir.starts_with(plugins_root) || !dir.is_dir() {
+        return Vec::new();
+    }
+    let hints = relux_kernel::detect_hints(&dir);
+    relux_kernel::detect_candidates(&dir, plugin_id, &hints)
+}
+
+/// POST `/v1/relux/prime/actions/configure-candidate` — the backend-governed CONFIRM +
+/// ACTIVATE chokepoint for Prime's `ConfigurePluginCandidate` proposal
+/// (`docs/RELUX_MASTER_PLAN.md` §8 Plugin Model, §8.2 Command Tools, §10.2 Action
+/// Layer, §10.3 Approval Rules; `docs/prime-tool-use.md` "Configuring a detected
+/// capability"). It re-resolves the target plugin + candidate from a FRESH read-only
+/// scan (never trusting client-supplied commands), then activates through the EXISTING
+/// governed paths: an `mcp_register` candidate is registered on the unchanged MCP
+/// registry (which re-validates the loopback/argv contract), a `command_tool` candidate
+/// is configured through the unchanged command-tool path (argv-only, no shell, confined
+/// cwd, approval always Required). Activation runs NO code from the source, and the
+/// resulting server/tool stays gated until invoked. Reference: Hermes
+/// `hermes_cli/mcp_config.py::cmd_mcp_add` (register a `{command,args,env}` server by
+/// name; configuration is a separate step from running it).
+async fn prime_configure_candidate_action(
+    State(state): State<AppState>,
+    Json(req): Json<PrimeConfigureCandidateReq>,
+) -> Result<Json<PrimeConfigureCandidateResponse>, ApiError> {
+    // 1. Snapshot every installed plugin (id/name/install_dir) under one short read.
+    let records: Vec<PluginRecord> = locked_read(&state, |kernel| {
+        Ok(kernel
+            .installed_plugins()
+            .iter()
+            .map(|p| record_for(kernel, p))
+            .collect())
+    })?;
+    let plugins_root = state.plugins_root.clone();
+
+    // 2. Resolve the target plugin server-side. An exact installed id wins (the button
+    //    path); otherwise scan candidates and pick by fuzzy name / uniqueness (the chat
+    //    path). Ambiguity / no-candidates is an honest 4xx, never a silent guess.
+    let selector = req.plugin_id.trim().to_string();
+    let target: PluginRecord = if let Some(exact) = records.iter().find(|r| r.id == selector).filter(|_| !selector.is_empty()) {
+        exact.clone()
+    } else {
+        // Plugins that actually have an activatable detected candidate.
+        let with_candidates: Vec<&PluginRecord> = records
+            .iter()
+            .filter(|r| {
+                scan_candidates_for(&plugins_root, &r.install_dir, &r.id)
+                    .iter()
+                    .any(relux_kernel::is_activatable)
+            })
+            .collect();
+        let matches: Vec<&PluginRecord> = if selector.is_empty() {
+            with_candidates.clone()
+        } else {
+            let needle = selector.to_lowercase();
+            with_candidates
+                .iter()
+                .copied()
+                .filter(|r| {
+                    r.id.to_lowercase().contains(&needle) || r.name.to_lowercase().contains(&needle)
+                })
+                .collect()
+        };
+        match matches.as_slice() {
+            [one] => (*one).clone(),
+            [] => {
+                return Err(ApiError::bad_request(if selector.is_empty() {
+                    "no installed plugin has an activatable detected capability — import a plugin first, then configure its candidate".to_string()
+                } else {
+                    format!("no installed plugin matching {selector:?} has an activatable detected capability")
+                }));
+            }
+            many => {
+                let names: Vec<String> = many.iter().map(|r| r.id.clone()).collect();
+                return Err(ApiError::bad_request(format!(
+                    "more than one plugin has detected candidates ({}). Name the plugin (e.g. \"configure the MCP server from <plugin>\").",
+                    names.join(", ")
+                )));
+            }
+        }
+    };
+
+    // 3. Re-read THIS plugin's candidates and resolve the selected one server-side.
+    let candidates = scan_candidates_for(&plugins_root, &target.install_dir, &target.id);
+    if candidates.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "plugin {:?} has no detected capability candidates to configure",
+            target.id
+        )));
+    }
+    let candidate = relux_kernel::resolve_candidate(&candidates, &req.candidate_id)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "no candidate matching {:?} on plugin {:?}",
+                req.candidate_id, target.id
+            ))
+        })?
+        .clone();
+
+    // 4. Activate through the EXISTING governed path for this candidate's activation.
+    let plugin_id = relux_core::PluginId::new(target.id.clone());
+    let (mcp_server, plugin_record, tool_name, next_step) = match candidate.activation.as_str() {
+        "mcp_register" => {
+            let proposal = candidate.mcp_registration.as_ref().ok_or_else(|| {
+                ApiError::bad_request("MCP candidate is missing its registration draft")
+            })?;
+            let server_id = proposal.suggested_id.clone();
+            let description = if proposal.suggested_description.is_empty() {
+                format!("Imported from plugin {}", target.id)
+            } else {
+                proposal.suggested_description.clone()
+            };
+            // Register through the unchanged registry (which re-validates the loopback/argv
+            // contract). env is intentionally NOT pre-filled — a managed-stdio server's
+            // secrets are mapped separately on the MCP page, never carried in this request.
+            let resp = if proposal.suggested_transport == "managed_stdio" {
+                let command = proposal.detected_command.clone().ok_or_else(|| {
+                    ApiError::bad_request(
+                        "this MCP candidate has no command to register — open the MCP page to enter one",
+                    )
+                })?;
+                let args = proposal.detected_args.clone();
+                locked_save(&state, |kernel| {
+                    let cfg = kernel.register_mcp_stdio_server(
+                        &server_id,
+                        &command,
+                        &args,
+                        std::collections::BTreeMap::new(),
+                        None,
+                        &description,
+                        true,
+                        None,
+                    )?;
+                    Ok(McpServerResponse::from_config(&cfg))
+                })?
+            } else {
+                let endpoint = proposal.suggested_endpoint.clone().ok_or_else(|| {
+                    ApiError::bad_request(
+                        "this MCP candidate needs a loopback endpoint — open the MCP page to enter it",
+                    )
+                })?;
+                locked_save(&state, |kernel| {
+                    let cfg =
+                        kernel.register_mcp_server(&server_id, &endpoint, &description, true, None)?;
+                    Ok(McpServerResponse::from_config(&cfg))
+                })?
+            };
+            let mut step = format!(
+                "Registered MCP server \"{server_id}\". Run Discover on it to list its tools through the gate, then ask me to use one — each tool stays gated until you classify it."
+            );
+            if !candidate.env_placeholders.is_empty() {
+                step.push_str(&format!(
+                    " It expects secrets ({}); map ENV_VAR=secret_name on the MCP page before its tools will work.",
+                    candidate.env_placeholders.join(", ")
+                ));
+            }
+            (Some(resp), None, server_id, step)
+        }
+        "command_tool" => {
+            let body = relux_kernel::command_tool_body(&candidate).ok_or_else(|| {
+                ApiError::bad_request("command-tool candidate is missing its argv draft")
+            })?;
+            // Parse + validate through the EXISTING command-tool validator (argv-only, no
+            // shell, no danger flag, confined cwd) — never a duplicated unsafe path.
+            let draft = relux_kernel::parse_command_tool_input(&body).map_err(ApiError::bad_request)?;
+            let tool_name = draft.name.clone();
+            let record = locked_save(&state, |kernel| {
+                kernel.configure_command_tool(&plugin_id, draft)?;
+                let installed = kernel
+                    .installed_plugin(&plugin_id)
+                    .ok_or_else(|| KernelError::PluginNotInstalled(target.id.clone()))?
+                    .clone();
+                Ok(record_for(kernel, &installed))
+            })?;
+            let step = format!(
+                "Configured command tool \"{tool_name}\". It is gated (needs approval) — ask me to use {tool_name} and I'll stage the approval before it runs."
+            );
+            (None, Some(record), tool_name, step)
+        }
+        other => {
+            return Err(ApiError::bad_request(format!(
+                "candidate {:?} has no one-click activation (it is {other:?}) — follow its next steps on the Plugins page",
+                candidate.id
+            )));
+        }
+    };
+
+    // 5. Close the logged governance approval as approved (best-effort).
+    let approval_id = req
+        .approval_id
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let mut approval_closed = false;
+    if let Some(aid) = &approval_id {
+        let id = relux_core::ApprovalId::new(aid.clone());
+        let resolved = locked_save(&state, |kernel| {
+            kernel.resolve_approval(&id, true, "dashboard_user", None)?;
+            Ok(())
+        });
+        approval_closed = resolved.is_ok();
+    }
+
+    Ok(Json(PrimeConfigureCandidateResponse {
+        plugin_id: target.id,
+        plugin_name: target.name,
+        candidate_id: candidate.id,
+        kind: candidate.kind,
+        activation: candidate.activation,
+        mcp_server,
+        plugin: plugin_record,
+        tool_name,
+        next_step,
+        no_code_executed: true,
+        approval_id,
+        approval_closed,
+    }))
+}
+
 async fn install_zip(
     State(state): State<AppState>,
     mut multipart: Multipart,
@@ -9701,7 +9987,7 @@ fn agent_record(agent: &relux_core::Agent) -> AgentRecord {
 /// One installed plugin, flattened for the dashboard table. Carries the durable
 /// install record plus the manifest's display fields when the manifest is in the
 /// live index (it always is for a successful install).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct PluginRecord {
     id: String,
     name: String,
@@ -12395,6 +12681,121 @@ mod tests {
             command_tool: None,
             next_steps: vec!["configure a tool".to_string()],
         }
+    }
+
+    /// Write a throwaway plugin SOURCE dir with one metadata file, install it through the
+    /// real install-dir route (manifestless ⇒ scaffolded wrapper, copied into the plugins
+    /// root so the candidate scan can read it), and return (source-dir-guard, installed id).
+    async fn install_source_plugin(state: &AppState, file: &str, body: &str) -> (tempfile::TempDir, String) {
+        let src = tempfile::tempdir().expect("src tempdir");
+        std::fs::write(src.path().join(file), body).expect("write fixture");
+        let req = serde_json::json!({ "path": src.path().to_string_lossy() }).to_string();
+        let (status, _c, resp) =
+            call(state, "POST", "/v1/relux/plugins/install-dir", None, Some(&req)).await;
+        assert_eq!(status, StatusCode::OK, "install failed: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("install json");
+        let id = v["id"].as_str().expect("installed id").to_string();
+        (src, id)
+    }
+
+    #[tokio::test]
+    async fn prime_configure_candidate_activates_a_command_tool() {
+        let (state, _dir) = auth_state(true);
+        // A plain npm bin (no MCP signal) is a `command_tool` candidate. Configuring it
+        // runs through the EXISTING command-tool validator + storage — nothing is spawned.
+        let (_src, id) = install_source_plugin(
+            &state,
+            "package.json",
+            r#"{"name":"plain","bin":{"plain":"./cli.js"},"dependencies":{"left-pad":"1.0.0"}}"#,
+        )
+        .await;
+        let req = serde_json::json!({ "plugin_id": id, "candidate_id": "command" }).to_string();
+        let (status, _c, body) = call(
+            &state,
+            "POST",
+            "/v1/relux/prime/actions/configure-candidate",
+            None,
+            Some(&req),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["activation"], "command_tool", "body: {body}");
+        assert_eq!(v["tool_name"], "plain.run", "body: {body}");
+        assert_eq!(v["no_code_executed"], true, "activation never runs code");
+        // The new tool lands on the plugin record (its tool_count grows).
+        assert!(v["plugin"]["tool_count"].as_u64().unwrap() >= 1, "body: {body}");
+        assert!(v["next_step"].as_str().unwrap().contains("ask me to use"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn prime_configure_candidate_registers_an_mcp_server() {
+        let (state, _dir) = auth_state(true);
+        // A standalone MCP stdio config is an `mcp_register` candidate. Configuring it
+        // registers a managed-stdio server through the UNCHANGED registry — never spawned.
+        let (_src, id) = install_source_plugin(
+            &state,
+            "mcp.json",
+            r#"{"mcpServers":{"gh":{"command":"npx","args":["-y","@x/server-github"]}}}"#,
+        )
+        .await;
+        let req = serde_json::json!({ "plugin_id": id, "candidate_id": "mcp" }).to_string();
+        let (status, _c, body) = call(
+            &state,
+            "POST",
+            "/v1/relux/prime/actions/configure-candidate",
+            None,
+            Some(&req),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["activation"], "mcp_register", "body: {body}");
+        assert_eq!(v["mcp_server"]["transport"], "managed_stdio", "body: {body}");
+        assert_eq!(v["no_code_executed"], true, "registration never runs code");
+        // The server is now in the registry (a follow-up list shows it).
+        let (ls, _c, list) = call(&state, "GET", "/v1/relux/mcp/servers", None, None).await;
+        assert_eq!(ls, StatusCode::OK);
+        assert!(list.contains(v["tool_name"].as_str().unwrap()), "registered server missing: {list}");
+    }
+
+    #[tokio::test]
+    async fn prime_configure_candidate_rejects_an_unknown_candidate() {
+        let (state, _dir) = auth_state(true);
+        let (_src, id) = install_source_plugin(
+            &state,
+            "package.json",
+            r#"{"name":"plain","bin":{"plain":"./cli.js"}}"#,
+        )
+        .await;
+        let req = serde_json::json!({ "plugin_id": id, "candidate_id": "nope-not-real" }).to_string();
+        let (status, _c, body) = call(
+            &state,
+            "POST",
+            "/v1/relux/prime/actions/configure-candidate",
+            None,
+            Some(&req),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert!(body.contains("no candidate"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn prime_configure_candidate_rejects_an_unknown_plugin() {
+        let (state, _dir) = auth_state(true);
+        // No plugin installed ⇒ an empty selector resolves nothing, honestly.
+        let req = serde_json::json!({ "plugin_id": "", "candidate_id": "first" }).to_string();
+        let (status, _c, body) = call(
+            &state,
+            "POST",
+            "/v1/relux/prime/actions/configure-candidate",
+            None,
+            Some(&req),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert!(body.contains("no installed plugin"), "body: {body}");
     }
 
     #[tokio::test]

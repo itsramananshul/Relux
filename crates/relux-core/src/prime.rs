@@ -435,6 +435,17 @@ pub enum PrimeIntent {
     RunRetry,
     AgentCreation,
     PluginInstallation,
+    /// The user asked Prime to ACTIVATE a detected capability candidate of an already
+    /// installed plugin from chat — "configure the first candidate", "enable the MCP
+    /// server from hermes-agent", "turn that script into a tool". Distinct from
+    /// [`PluginInstallation`](PrimeIntent::PluginInstallation) (which clones a repo): this
+    /// wires a capability the import already detected through the EXISTING governed paths
+    /// (register the MCP server, or configure a command tool). Always proposed behind a
+    /// human approval; the activation is metadata/recipe registration only — it runs no
+    /// downloaded code, and the resulting tool stays gated until invoked.
+    /// Spec ref: `docs/RELUX_MASTER_PLAN.md` §8 (Plugin Model), §10.2 (Action Layer),
+    /// §10.3 (Approval Rules); `docs/prime-tool-use.md` "Configuring a detected capability".
+    PluginConfiguration,
     PermissionChange,
     ApprovalResponse,
     ExplanationRequest,
@@ -590,6 +601,25 @@ pub enum PrimeAction {
     },
     ConfigurePlugin {
         plugin_id: String,
+    },
+    /// Activate ONE detected capability candidate of an installed plugin through the
+    /// EXISTING governed configuration paths: an `mcp_register` candidate becomes a
+    /// registered MCP server (loopback HTTP or managed-stdio) on the unchanged MCP
+    /// registry, and a `command_tool` candidate becomes a governed command tool on the
+    /// plugin. `plugin_id` and `candidate_id` are SELECTORS the backend re-resolves and
+    /// re-validates server-side from a fresh read-only candidate scan — never trusted as
+    /// concrete commands (the dashboard's "Configure with Prime" button passes the exact
+    /// ids; a chat proposal may pass a fuzzy plugin name and a candidate keyword like
+    /// `"mcp"` / `"command"` / `"first"`). Always proposed behind a human approval. The
+    /// activation is metadata/recipe registration ONLY: it runs no downloaded code, and
+    /// the resulting MCP tool / command tool stays gated (needs approval) until invoked.
+    /// Spec ref: `docs/RELUX_MASTER_PLAN.md` §8 (Plugin Model), §8.2 (Command Tools),
+    /// §10.2 (Action Layer), §10.3 (Approval Rules); `docs/prime-tool-use.md`
+    /// "Configuring a detected capability". Reference: Hermes `hermes_cli/mcp_config.py`
+    /// (`cmd_mcp_add` — register a `{command,args,env}` server by name; configure ≠ run).
+    ConfigurePluginCandidate {
+        plugin_id: String,
+        candidate_id: String,
     },
     GrantPermission {
         subject_id: String,

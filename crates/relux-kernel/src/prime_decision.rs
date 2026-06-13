@@ -641,6 +641,7 @@ fn intent_labels() -> Vec<&'static str> {
         "run_retry",
         "agent_creation",
         "plugin_installation",
+        "plugin_configuration",
         "permission_change",
         "approval_response",
         "explanation_request",

@@ -1910,7 +1910,49 @@ export const reluxPrime = {
       ...(pluginId ? { plugin_id: pluginId } : {}),
       ...(approvalId ? { approval_id: approvalId } : {}),
     }),
+  // Confirm + ACTIVATE a detected capability candidate through the SINGLE backend-
+  // governed chokepoint (POST /v1/relux/prime/actions/configure-candidate). The kernel
+  // re-reads the plugin's candidates server-side, re-resolves the selection, and
+  // activates through the EXISTING governed paths (register the MCP server, or configure
+  // a governed command tool). `pluginId`/`candidateId` may be exact ids (the Configure
+  // button) or selectors (a chat proposal). Metadata/recipe only — no source code runs,
+  // and the resulting tool stays gated until invoked.
+  configureCandidate: (pluginId: string, candidateId: string, approvalId?: string | null) =>
+    api.post<ReluxPrimeConfigureCandidateResult>(
+      "/v1/relux/prime/actions/configure-candidate",
+      {
+        plugin_id: pluginId,
+        candidate_id: candidateId,
+        ...(approvalId ? { approval_id: approvalId } : {}),
+      },
+    ),
 };
+
+// The structured result of a confirmed capability activation (the kernel's
+// PrimeConfigureCandidateResponse). One auditable envelope: which plugin/candidate was
+// activated, through which governed path, the resulting server/tool status, the honest
+// "ask me to use it" next step, and the no-code-run guarantee.
+export interface ReluxPrimeConfigureCandidateResult {
+  plugin_id: string;
+  plugin_name: string;
+  candidate_id: string;
+  // "mcp_stdio" | "mcp_http" | "cli_command".
+  kind: string;
+  // "mcp_register" | "command_tool" — the governed path that activated it.
+  activation: string;
+  // Present for an mcp_register activation: the registered server's redacted status.
+  mcp_server?: ReluxMcpServer;
+  // Present for a command_tool activation: the updated plugin record (carries the new tool).
+  plugin?: ReluxPlugin;
+  // The new tool name (command tool) or registered MCP server id, for "ask me to use it".
+  tool_name: string;
+  // Honest next step — the activated capability is gated until invoked.
+  next_step: string;
+  // Invariant: activation registered metadata/recipe only and ran no source code.
+  no_code_executed: boolean;
+  approval_id?: string;
+  approval_closed: boolean;
+}
 
 // The structured result of a confirmed Prime GitHub plugin import (the kernel's
 // PrimeInstallPluginResponse). One auditable envelope: what was installed, whether it

@@ -6,6 +6,8 @@ import {
   reluxPrime,
   reluxWork,
   type ReluxAiStatus,
+  type ReluxCapabilityCandidate,
+  type ReluxPrimeConfigureCandidateResult,
   type ReluxPrimeInstallPluginResult,
   type ReluxPrimeProposal,
   type ReluxPrimeSuggestion,
@@ -15,7 +17,7 @@ import {
   type ReluxPrimeTurn,
   type ReluxToolInvocationResult,
 } from "../api";
-import { afterActionLabel, boundedContextReads, brainSourceLabel, contextReadDetail, contextReadsHadMiss, contextReadsUsedLabel, decisionSourceLabel, formatToolOutput, githubPluginInstallAction, hasSteps, intentProvenance, pendingClarificationLabel, polishProvenance, PRIME_GREETING, PRIME_HINT, PRIME_PLACEHOLDER, PRIME_SUGGESTIONS, proposalDisplaySummary, replyPolishLabel, requestedToolLabel, slotProvenance, stepDisplayTitle, updateProvenance } from "../prime";
+import { afterActionLabel, boundedContextReads, brainSourceLabel, configurePluginCandidateAction, contextReadDetail, contextReadsHadMiss, contextReadsUsedLabel, decisionSourceLabel, formatToolOutput, githubPluginInstallAction, hasSteps, intentProvenance, pendingClarificationLabel, polishProvenance, PRIME_GREETING, PRIME_HINT, PRIME_PLACEHOLDER, PRIME_SUGGESTIONS, proposalDisplaySummary, replyPolishLabel, requestedToolLabel, slotProvenance, stepDisplayTitle, updateProvenance, type ConfigurePluginCandidateAction } from "../prime";
 import { workTaskHref, workRunHref } from "../routing";
 import { consumeInvestigationSeed } from "../investigateseed";
 import { PrimeAutonomyPanel } from "../components/PrimeAutonomyPanel";
@@ -692,6 +694,23 @@ export function PrimeTurnCard({
       {githubPluginInstallAction(turn.action) && turn.disposition === "awaiting_approval" && (
         <PluginInstallCard
           install={githubPluginInstallAction(turn.action)!}
+          approvalId={turn.approval}
+          busy={busy}
+        />
+      )}
+
+      {/* A capability ACTIVATION Prime proposed this turn ("configure the first
+          candidate", "enable the MCP server from <plugin>", "turn that script into a
+          tool"). Confirm posts to the single backend-governed action route
+          (POST /v1/relux/prime/actions/configure-candidate), which re-reads the plugin's
+          candidates server-side, re-resolves the selection, and activates through the
+          EXISTING governed path (register the MCP server, or configure a command tool) —
+          metadata/recipe only, no source code runs, and the resulting tool stays gated
+          until invoked. Cancel just rejects the logged approval (RELUX_MASTER_PLAN
+          §8/§8.2/§10.2/§10.3; docs/prime-tool-use.md). */}
+      {configurePluginCandidateAction(turn.action) && turn.disposition === "awaiting_approval" && (
+        <ConfigureCandidateCard
+          action={configurePluginCandidateAction(turn.action)!}
           approvalId={turn.approval}
           busy={busy}
         />
@@ -1406,6 +1425,17 @@ function PluginInstallCard({
               ))}
             </ul>
           )}
+          {/* Detected candidates, each with a one-click "Configure with Prime" button
+              that posts to the backend-governed activation route (register the MCP
+              server / configure the command tool). A manual candidate has no one-click
+              path, so it points at the Plugins page instead — never a fake "ready". */}
+          {outcome.result.candidates.length > 0 && (
+            <div style={{ marginBottom: 6 }}>
+              {outcome.result.candidates.map((c) => (
+                <CandidateRow key={c.id} pluginId={outcome.result.plugin.id} candidate={c} />
+              ))}
+            </div>
+          )}
           <div className="row wrap" style={{ gap: 8 }}>
             <Link className="btn" style={{ fontSize: 12, padding: "4px 12px" }} to="/plugins">
               Configure on Plugins
@@ -1430,6 +1460,196 @@ function PluginInstallCard({
           Nothing has been cloned yet — confirming runs the same gated import the Plugins page uses.
         </div>
       )}
+    </div>
+  );
+}
+
+// A human label + button copy for a detected candidate's activation. A one-click MCP
+// register and a governed command tool each get a "Configure with Prime" button; an
+// honest `manual` candidate has no one-click path (it points at the Plugins page).
+function candidateActivationLabel(activation: string): { kind: string; button: string } | null {
+  if (activation === "mcp_register") return { kind: "MCP server", button: "Configure with Prime (register MCP server)" };
+  if (activation === "command_tool") return { kind: "command tool", button: "Configure with Prime (command tool)" };
+  return null;
+}
+
+// One detected candidate in the install result: its kind/confidence + a one-click
+// "Configure with Prime" button when it has a governed activation path, or honest
+// "open Plugins" guidance for a manual pending candidate. The button calls the same
+// backend-governed activation route the chat proposal uses.
+function CandidateRow({ pluginId, candidate }: { pluginId: string; candidate: ReluxCapabilityCandidate }) {
+  const act = candidateActivationLabel(candidate.activation);
+  return (
+    <div style={{ border: "1px solid var(--border)", borderRadius: 6, padding: "6px 8px", marginTop: 6 }}>
+      <div className="row wrap" style={{ gap: 6, alignItems: "center", marginBottom: 2 }}>
+        <span className="mono" style={{ fontSize: 12, fontWeight: 600 }}>{candidate.title}</span>
+        <span className="badge backlog" style={{ fontSize: 8 }} title="Detection confidence">{candidate.confidence}</span>
+        {!act && (
+          <span className="badge todo" style={{ fontSize: 8 }} title="No one-click activation — follow the next steps on the Plugins page">manual</span>
+        )}
+      </div>
+      <div className="muted" style={{ fontSize: 10, marginBottom: act ? 6 : 2 }}>{candidate.rationale}</div>
+      {act ? (
+        <CandidateActivation
+          pluginId={pluginId}
+          candidateId={candidate.id}
+          label={act.button}
+          title={`Activate this ${act.kind} through the existing governed path — no source code runs`}
+        />
+      ) : (
+        <Link className="chip" style={{ fontSize: 11, padding: "3px 10px" }} to="/plugins">Configure on Plugins</Link>
+      )}
+    </div>
+  );
+}
+
+// Activate ONE detected candidate through the SINGLE backend-governed route
+// (POST /v1/relux/prime/actions/configure-candidate), then show the result: the new
+// tool / MCP server, the honest "ask me to use it" next step, and links. Shared by the
+// install-result candidate rows and the chat proposal card. Optionally renders a Cancel
+// that rejects the logged approval (the chat proposal case). Nothing runs by showing it;
+// confirming registers metadata/recipe only and the resulting tool stays gated.
+function CandidateActivation({
+  pluginId,
+  candidateId,
+  label,
+  title,
+  approvalId,
+  showCancel,
+  busy,
+}: {
+  pluginId: string;
+  candidateId: string;
+  label: string;
+  title: string;
+  approvalId?: string | null;
+  showCancel?: boolean;
+  busy?: boolean;
+}) {
+  const [working, setWorking] = useState<null | "confirm" | "deny">(null);
+  const [result, setResult] = useState<ReluxPrimeConfigureCandidateResult | null>(null);
+  const [denied, setDenied] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const locked = !!busy || working !== null || result !== null || denied;
+
+  async function go() {
+    if (locked) return;
+    setErr(null);
+    setWorking("confirm");
+    try {
+      const r = await reluxPrime.configureCandidate(pluginId, candidateId, approvalId ?? null);
+      setResult(r);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Could not configure the capability");
+    } finally {
+      setWorking(null);
+    }
+  }
+
+  async function deny() {
+    if (locked) return;
+    setErr(null);
+    setWorking("deny");
+    try {
+      if (approvalId) await reluxApprovals.decide(approvalId, "rejected");
+      setDenied(true);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Could not cancel the activation");
+    } finally {
+      setWorking(null);
+    }
+  }
+
+  if (result) {
+    return (
+      <div className="banner" style={{ fontSize: 11, marginTop: 4 }}>
+        <div style={{ marginBottom: 4 }}>
+          Configured <span className="mono" style={{ fontWeight: 600 }}>{result.tool_name}</span>{" "}
+          <span className="badge backlog" style={{ fontSize: 8 }}>
+            {result.activation === "mcp_register" ? "MCP server" : "command tool"}
+          </span>
+          {result.no_code_executed && (
+            <span className="badge backlog" style={{ fontSize: 8, marginLeft: 4 }} title="Activation registered metadata/recipe only — no source code ran">
+              no code run
+            </span>
+          )}
+        </div>
+        <div className="muted" style={{ marginBottom: 6 }}>{result.next_step}</div>
+        <div className="row wrap" style={{ gap: 8 }}>
+          <Link className="chip" style={{ fontSize: 11, padding: "3px 10px" }} to="/plugins">Open Plugins</Link>
+        </div>
+      </div>
+    );
+  }
+
+  if (denied) {
+    return <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>Activation cancelled — nothing was configured.</div>;
+  }
+
+  return (
+    <div>
+      <div className="row wrap" style={{ gap: 8 }}>
+        <button className="btn" style={{ fontSize: 12, padding: "4px 12px" }} disabled={locked} onClick={go} title={title}>
+          {working === "confirm" ? "Configuring…" : label}
+        </button>
+        {showCancel && (
+          <button className="chip" style={{ fontSize: 11, padding: "3px 10px" }} disabled={locked} onClick={deny} title="Cancel — reject the logged approval and configure nothing">
+            Cancel
+          </button>
+        )}
+      </div>
+      {err && <div className="banner err" style={{ fontSize: 11, marginTop: 6 }}>{err}</div>}
+    </div>
+  );
+}
+
+// A capability ACTIVATION Prime proposed from chat ("configure the first candidate",
+// "enable the MCP server from <plugin>", "turn that script into a tool"). The card
+// states what will be activated, where, and the no-code-run guarantee, then confirms
+// before doing anything. Confirm posts to the single backend-governed action route,
+// which re-reads + re-resolves the candidate server-side and activates through the
+// existing governed path. Cancel rejects the logged approval. Nothing activates by
+// showing it (RELUX_MASTER_PLAN §8/§8.2/§10.2/§10.3; docs/prime-tool-use.md).
+function ConfigureCandidateCard({
+  action,
+  approvalId,
+  busy,
+}: {
+  action: ConfigurePluginCandidateAction;
+  approvalId: string | null;
+  busy: boolean;
+}) {
+  const what =
+    action.candidateId === "mcp"
+      ? "register the detected MCP server"
+      : action.candidateId === "command"
+        ? "configure the detected command tool"
+        : `configure the detected capability "${action.candidateId}"`;
+  const where = action.pluginId ? `plugin ${action.pluginId}` : "the imported plugin";
+  return (
+    <div style={{ marginTop: 10, border: "1px solid var(--border)", borderRadius: 6, padding: "10px 12px" }}>
+      <div className="row wrap" style={{ gap: 6, alignItems: "center", marginBottom: 4 }}>
+        <span className="badge in_review" style={{ fontSize: 9 }} title="A capability activation awaiting your confirmation — nothing is configured yet">
+          confirm needed
+        </span>
+        <span className="badge backlog" style={{ fontSize: 8 }} title="Activates a detected capability through the existing governed path">
+          configure
+        </span>
+        <span style={{ fontSize: 13, fontWeight: 600 }}>I can {what} from {where}.</span>
+      </div>
+      <ul className="muted" style={{ fontSize: 11, margin: "0 0 8px 16px", padding: 0 }}>
+        <li><strong>No code from the source runs.</strong> Activation registers metadata/recipe only.</li>
+        <li>The resulting tool stays gated (needs approval) until you ask me to use it.</li>
+      </ul>
+      <CandidateActivation
+        pluginId={action.pluginId}
+        candidateId={action.candidateId}
+        label="Configure with Prime"
+        title="Activate this capability through the existing governed path — no source code runs"
+        approvalId={approvalId}
+        showCancel
+        busy={busy}
+      />
     </div>
   );
 }
