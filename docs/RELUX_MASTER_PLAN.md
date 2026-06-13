@@ -1941,6 +1941,33 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **v0.1.35** (2026-06-13) — **Grounded orchestration result card** rollup. The `relux-kernel` /
+  `relux-core` crates move `0.1.34` → `0.1.35` in lockstep, packaging the post-v0.1.34 fix into a
+  fresh Windows bundle (`docs/prime-tool-use.md`; RELUX_MASTER_PLAN §10.4 / §11.1 / §17.1; built
+  reference-first per `docs/reference-driven-development.md`). The first real coordination loop in
+  Prime chat becomes legible. Headlines: (1) **Explicit multi-agent goal becomes a grounded chat
+  result card** — an explicit goal (`orchestrate research the options, build a prototype, and write
+  the docs`) already created a durable `Orchestration`, but the chat turn returned only prose. The
+  executed `OrchestrateGoal` turn now carries the record as structured data: `PrimeTurn` gains an
+  optional `orchestration` field (skip-if-none, wire-compatible) set to the durable record, so the
+  fan-out is legible the moment Prime mints it. Casual ideation stays conversation and mints no
+  record (§10.4 / §11.1). (2) **One-click governed next actions, never a privileged path** — the
+  turn attaches `suggested_actions`: "Run this orchestration" (the explicit, governed batch) and a
+  pre-filled (not auto-sent) "Hire a <role> agent" for each role that fell back to Prime. Each is an
+  ordinary user message; creating an orchestration still runs nothing on its own (§11.1 / §17.1).
+  (3) **Skill-aware role grounding** — planner grounding resolves role→agent by the agent's id
+  keyword or its declared specialty skill, so a manually-configured operative with an opaque id but a
+  `research` skill matches the same as a conversational `researcher` hire. Width still comes from the
+  configurable `PrimeAgentPolicy` (no hidden cap) (§10.4). (4) **Dashboard renders the result card
+  (UI only, no kernel change)** — `OrchestrationResultCard` shows the ordered briefs (assignee + role
+  + outcome), the specialist/Prime-fallback split, the planner's honest notes, and a Work link; pure
+  `orchestrationAssignmentSummary` / `stepIsPrimeFallback` helpers + unit tests cover the split;
+  rebuilt `dashboard-dist` committed (§17.1). All reads/writes hit real kernel state; no new authority
+  is added, nothing auto-runs without an explicit gate. Per-slice `cargo test` +
+  `clippy --all-targets -D warnings` clean on `relux-core` / `relux-kernel`; dashboard typecheck /
+  tests / build green. The full-e2e release gate (`scripts\relux-package-local.ps1 -FullE2E`) is run
+  at package time. Every safety property from v0.1.34 holds.
+
 - **v0.1.34** (2026-06-13) — **Conversational agent creation** rollup. The `relux-kernel` /
   `relux-core` crates move `0.1.33` → `0.1.34` in lockstep, packaging the post-v0.1.33 fixes into a
   fresh Windows bundle (`docs/prime-tool-use.md`; RELUX_MASTER_PLAN §6 / §7.1 / §7.3 / §7.5 / §8.1;

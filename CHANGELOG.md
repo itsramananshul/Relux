@@ -9,6 +9,35 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.35 (Windows bundle).** The `relux-kernel` and
+  `relux-core` crates move `0.1.34` → `0.1.35` in lockstep, packaging the
+  post-v0.1.34 **grounded orchestration result card** fix into a fresh Windows
+  bundle. Everything reads-from / writes-through real kernel state and conforms to
+  `docs/RELUX_MASTER_PLAN.md` §10.4 / §11.1 / §17.1 and `docs/prime-tool-use.md`;
+  no master-plan safety property is weakened. Headlines:
+  - **Explicit multi-agent goal becomes a grounded chat result card.** An explicit
+    goal in Prime chat (`orchestrate research the options, build a prototype, and
+    write the docs`) already created a durable `Orchestration`, but the chat turn
+    returned only prose. The executed `OrchestrateGoal` turn now carries the record
+    as **structured data** — `PrimeTurn` gains an optional `orchestration` field
+    (skip-if-none, wire-compatible) set to the durable record — so the fan-out is
+    legible the moment Prime mints it. Casual ideation stays conversation and mints
+    no record (and still runs nothing).
+  - **One-click governed next actions, never a privileged path.** The turn attaches
+    `suggested_actions`: "Run this orchestration" (the explicit, governed batch) and
+    a pre-filled (not auto-sent) "Hire a <role> agent" for each role that fell back
+    to Prime. Each is an ordinary user message — creating an orchestration still runs
+    nothing on its own.
+  - **Skill-aware role grounding.** Planner grounding now resolves role→agent by the
+    agent's id keyword **or** its declared specialty skill, so a manually-configured
+    operative with an opaque id but a `research` skill matches the same as a
+    conversational `researcher` hire. Width still comes from the configurable
+    `PrimeAgentPolicy` (no hidden cap).
+  - **Dashboard renders the result card (UI only, no kernel change).**
+    `OrchestrationResultCard` shows the ordered briefs (assignee + role + outcome),
+    the specialist/Prime-fallback split, the planner's honest notes, and a Work link;
+    pure `orchestrationAssignmentSummary` / `stepIsPrimeFallback` helpers cover the
+    split. Rebuilt `dashboard-dist` committed.
 - **Relux local release v0.1.34 (Windows bundle).** The `relux-kernel` and
   `relux-core` crates move `0.1.33` → `0.1.34` in lockstep, packaging the
   post-v0.1.33 **conversational agent creation** fixes into a fresh Windows
