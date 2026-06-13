@@ -9,6 +9,31 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.41 (Windows bundle).** The `relux-kernel` and
+  `relux-core` crates move `0.1.40` → `0.1.41` in lockstep, packaging the
+  post-v0.1.40 **Plugin Lens — natural answers** slice into a fresh Windows bundle
+  on top of everything in v0.1.40. Everything reads-from / writes-through real
+  kernel state and conforms to `docs/RELUX_MASTER_PLAN.md` §11.1; no master-plan
+  safety property is weakened. Headline — **Prime plugin/tool results now render as
+  natural assistant answers, not raw JSON**:
+  - **Plugin/tool results render as natural assistant answers, not raw JSON.** When
+    Prime uses a plugin or tool, the chat reply is a clean assistant answer instead
+    of a raw JSON envelope dumped into the transcript.
+  - **Plugin Lens results use `{ result, structuredContent }`.** The four read-only
+    source tools (`plugin.summary`, `plugin.inspect`, `plugin.search`,
+    `plugin.read_file`) now return human prose up front in `result`, with the full
+    structured detail kept in `structuredContent` under a collapsible **raw
+    details** expander.
+  - **Agent loop prefers the human `result` text for tool observations.** The Prime
+    agent loop reads the human `result` string for its observation when present —
+    including MCP-style envelopes — instead of serializing the whole payload.
+  - **Dashboard Prime transcript has a dedicated tool result block.** The dashboard
+    Prime transcript renders the natural answer with the raw structured detail
+    tucked behind a collapsible expander.
+  - Dashboard typecheck / tests / build green; the full-e2e release gate
+    (`scripts\relux-package-local.ps1 -FullE2E`) is run at package time. Every
+    safety property from v0.1.40 holds; no new authority is added (read-only
+    source access only, fail-closed).
 - **Relux local release v0.1.40 (Windows bundle).** The `relux-kernel` and
   `relux-core` crates move `0.1.39` → `0.1.40` in lockstep, packaging two
   post-v0.1.39 **Plugin Lens** slices into a fresh Windows bundle on top of
