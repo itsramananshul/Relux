@@ -49,6 +49,7 @@ pub mod prime_assign_slots;
 pub mod prime_clarify;
 pub mod prime_clarify_memory;
 pub mod prime_decision;
+pub mod prime_glue;
 pub mod prime_history;
 pub mod prime_candidate_config;
 pub mod prime_command_tool_config;
@@ -165,6 +166,7 @@ pub use prime_decision::{
     DecisionOutcome, DecisionStep, PrimeBrainDecision, MAX_DECISION_CORRECTIONS,
     MAX_DECISION_ROUNDS,
 };
+pub use prime_glue::{parse_glue_plan, BrainGluePlan, MAX_PARSED_GLUE_STEPS};
 pub use prime_history::{
     build_turn as build_history_turn, render_context as render_history_context, MAX_CONTEXT_CHARS,
     MAX_HISTORY_CONVERSATIONS, MAX_HISTORY_TURNS,

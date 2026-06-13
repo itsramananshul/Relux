@@ -535,6 +535,27 @@ pub enum PrimeAction {
     ProposeToolPlan {
         goal: String,
     },
+    /// Build a bounded, INERT multi-tool plan preview from a BRAIN-AUTHORED tool-glue
+    /// program — the structured-program analogue of [`ProposeToolPlan`]
+    /// (`docs/RELUX_MASTER_PLAN.md` §23; `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §2). Where
+    /// `ProposeToolPlan` splits the operator's prose with the fallback keyword rail, here
+    /// the brain authored the ordered `(plugin, tool, args)` steps DIRECTLY and the kernel
+    /// is the deterministic validator: every step is grounded against the live tool catalog
+    /// ([`crate::ground_tool_glue_plan`]), an unknown tool is flagged `readiness: "unknown"`
+    /// and blocks the one-click commit, and a gated tool keeps its honest gate. It CREATES
+    /// nothing and RUNS nothing — the only path that materializes it is the operator's
+    /// explicit `tool_plan` task commit and its unchanged permission/approval/grant/audit
+    /// gates. Read-only.
+    ///
+    /// `steps_json` is the JSON-encoded `Vec<ProposedGlueStep>` (kept as text so the action
+    /// stays `Eq`, mirroring [`InvokeTool`]'s `input_json`); it is parsed back immediately
+    /// before grounding. `extended` selects the configured extended vs. standard tool-plan
+    /// step limit (still bounded by the policy, never an unbounded fan-out).
+    ProposeGluePlan {
+        goal: String,
+        steps_json: String,
+        extended: bool,
+    },
     /// Invoke one tool through the kernel's permission/audit path. `input_json`
     /// is the JSON-encoded tool input (kept as text so the action stays `Eq`);
     /// it is parsed back to a value immediately before invocation.

@@ -128,6 +128,11 @@ const ALLOWED_TOP_LEVEL_KEYS: &[&str] = &[
     // answer / explanation). `assistant_message` is accepted as an alias for the same field.
     "reply",
     "assistant_message",
+    // A brain-AUTHORED tool-glue program: ordered `(plugin, tool, args)` steps for an
+    // explicit multi-step tool request. Grounded into an INERT preview, never executed.
+    // `tool_glue` is accepted as an alias.
+    "glue",
+    "tool_glue",
     // The advisory presentation polish for a multi-step plan-preview card (wording only).
     "plan_polish",
     "confidence",
@@ -180,6 +185,16 @@ pub struct PrimeBrainDecision {
     /// validated slot through the unchanged chokepoint, so casual chat can never trigger it and every
     /// existence/approval gate still applies. `None` when the brain requested no write tool.
     pub action_request: Option<crate::prime_write_tools::ParsedWriteTool>,
+    /// A brain-AUTHORED tool-glue program (ordered `(plugin, tool, args)` steps) for an
+    /// explicit multi-step tool request, already validated STRUCTURALLY by
+    /// [`crate::prime_glue::parse_glue_plan`] (unknown top-level / per-step fields rejected,
+    /// a non-empty well-formed `steps` array required). It is NOT yet grounded against the
+    /// live catalog — a step may still name a tool that does not exist; the kernel grounds
+    /// it through the EXISTING [`crate::KernelState::preview_tool_glue_plan`] only on a turn
+    /// whose reconciled intent is `ToolPlanRequest` (a SENSITIVE intent the fail-closed gate
+    /// keeps casual/guarded chat from ever reaching), producing an INERT preview card that
+    /// creates and runs nothing. `None` when the brain proposed no glue program.
+    pub glue: Option<crate::prime_glue::BrainGluePlan>,
     /// The raw wording sub-object (`{text, confidence, rationale?}`) re-serialized to JSON,
     /// NOT yet validated against a `ClarifyKind`. It is validated and reconciled later via
     /// [`Self::validated_wording`] against the turn's actual kind + deterministic text
@@ -228,6 +243,7 @@ impl PrimeBrainDecision {
             self.wording.is_some(),
             !self.context_requests.is_empty(),
             self.action_request.is_some(),
+            self.glue.is_some(),
             self.reply.is_some(),
             self.plan_polish.is_some(),
         ]
@@ -389,6 +405,7 @@ the rest. The shape is:\n\
   \"wording\": {{\"text\":\"<one clarifying question, or a short brainstorm reply>\",\"confidence\":0.0-1.0}},\n\
   \"tool_requests\": [{{\"tool\":\"<read-only tool>\",\"args\":{{...}}}}],\n\
   \"action_request\": {{\"tool\":\"<one write tool>\",\"args\":{{...}}}},\n\
+  \"glue\": {{\"goal\":\"<optional>\",\"steps\":[{{\"plugin\":\"<plugin id>\",\"tool\":\"<tool name>\",\"args\":{{...}}}}],\"extended\":false}},\n\
   \"reply\": {{\"text\":\"<a short, natural conversational answer>\",\"confidence\":0.0-1.0}},\n\
   \"plan_polish\": {{\"summary\":\"<clearer one-line plan summary>\",\"questions\":[\"<optional>\"],\"risks\":[\"<optional>\"]}},\n\
   \"confidence\": 0.0-1.0\n\
@@ -424,6 +441,13 @@ board, the queue, the crew, or \"what do you want to set up\" unless the user ac
 about work, state, or the control plane, and do NOT push the user toward creating tasks or \
 company setup. Keep it brief; never claim you created, started, installed, granted, or changed \
 anything.\n\
+- Include \"glue\" ONLY when the user EXPLICITLY asks to run SEVERAL tools in order (a \
+multi-step / chained tool program), AND set classification.intent to \"tool_plan_request\". Each \
+step names a plugin + tool from the installed tools list above (never invent one). The kernel \
+grounds every step against the live catalog and shows an INERT preview — an unknown tool is \
+flagged and nothing runs; the operator commits it with one click. NEVER author a glue program \
+from casual chat, a question, brainstorming, an idea, or frustration; a single tool is \
+\"tool_invocation\", not glue.\n\
 - Include \"plan_polish\" ONLY when proposing a multi-step plan, to improve WORDING: a clearer \
 summary and at most a few advisory questions/risks. Do NOT change the number, order, or owners \
 of steps.\n\
@@ -818,6 +842,17 @@ pub fn parse_decision(raw: &str) -> Result<PrimeBrainDecision, String> {
         .or_else(|| obj.get("tool_call"))
         .and_then(crate::prime_write_tools::parse_write_tool_request);
 
+    // A brain-AUTHORED tool-glue program: validated STRUCTURALLY (unknown top-level/per-step
+    // fields rejected, a non-empty well-formed `steps` array required) via
+    // `prime_glue::parse_glue_plan`. A malformed shape is DROPPED here (the deterministic
+    // keyword `ProposeToolPlan` path stands as the fallback). Catalog grounding — the
+    // allowlist gate that flags an unknown tool — happens later, and only on a turn whose
+    // reconciled intent is `ToolPlanRequest`. `tool_glue` is accepted as an alias.
+    let glue = validate_section(
+        obj.get("glue").or_else(|| obj.get("tool_glue")),
+        crate::prime_glue::parse_glue_plan,
+    );
+
     // Carry the free-form reply raw (re-serialized), validated later via `validated_reply`. A
     // brain may emit `reply` as a bare string ("Hello!") or as a `{text, confidence}` object;
     // normalize a bare string to `{text:...}` so the existing brainstorm validator sees the
@@ -863,6 +898,7 @@ pub fn parse_decision(raw: &str) -> Result<PrimeBrainDecision, String> {
         update,
         context_requests,
         action_request,
+        glue,
         wording,
         reply,
         plan_polish,
@@ -1404,6 +1440,52 @@ instruction):\nUser: create a task to fix login\nPrime: Created it. [created tas
         assert_eq!(d.confidence, 0.9);
         assert_eq!(d.provenance, "explicit create");
         assert_eq!(d.section_count(), 3);
+    }
+
+    #[test]
+    fn parses_a_brain_authored_glue_section_in_the_unified_envelope() {
+        // The brain classifies the turn `tool_plan_request` and authors a structured
+        // tool-glue program in the SAME envelope; both sections survive, validated.
+        let raw = r#"{
+            "classification": {"intent":"tool_plan_request","confidence":0.9},
+            "glue": {"goal":"inspect then build","steps":[
+                {"plugin":"acme","tool":"inspect"},
+                {"plugin":"acme","tool":"build","args":{"target":"x"}}
+            ],"extended":true}
+        }"#;
+        let d = parse_decision(raw).unwrap();
+        assert_eq!(
+            d.classification.as_ref().unwrap().intent,
+            PrimeIntent::ToolPlanRequest
+        );
+        let g = d.glue.as_ref().expect("the glue section parses");
+        assert_eq!(g.goal.as_deref(), Some("inspect then build"));
+        assert_eq!(g.steps.len(), 2);
+        assert_eq!(g.steps[1].args, serde_json::json!({"target":"x"}));
+        assert!(g.extended);
+        assert_eq!(d.section_count(), 2);
+    }
+
+    #[test]
+    fn tool_glue_is_accepted_as_an_alias_for_glue() {
+        let raw = r#"{"tool_glue":{"steps":[{"plugin":"a","tool":"b"}]}}"#;
+        let d = parse_decision(raw).unwrap();
+        assert_eq!(d.glue.as_ref().unwrap().steps.len(), 1);
+        assert_eq!(d.section_count(), 1);
+    }
+
+    #[test]
+    fn a_malformed_glue_section_is_dropped_but_the_envelope_stands() {
+        // An empty `steps` array fails the glue validator closed; the valid classification
+        // survives and the deterministic keyword `ProposeToolPlan` path is the fallback.
+        let raw = r#"{
+            "classification": {"intent":"tool_plan_request","confidence":0.9},
+            "glue": {"steps":[]}
+        }"#;
+        let d = parse_decision(raw).unwrap();
+        assert!(d.classification.is_some());
+        assert!(d.glue.is_none(), "the empty glue section must be dropped");
+        assert_eq!(d.section_count(), 1);
     }
 
     #[test]

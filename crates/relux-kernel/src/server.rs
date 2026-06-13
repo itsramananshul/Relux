@@ -4646,6 +4646,10 @@ async fn run_prime(
     let mut run_slots: Option<relux_kernel::BrainRunStart> = None;
     let mut orchestration_slots: Option<relux_kernel::BrainOrchestrationSlots> = None;
     let mut run_orchestration_slots: Option<relux_kernel::BrainRunOrchestration> = None;
+    // A brain-AUTHORED tool-glue program, honored ONLY on a `ToolPlanRequest` turn (§23). It is
+    // carried from the classification path; a write-tool-driven turn never reconciles to
+    // `ToolPlanRequest`, so the kernel ignores it there.
+    let mut glue_plan: Option<relux_kernel::BrainGluePlan> = None;
     if let Some(d) = decision.as_ref() {
         if let Some(wt) = d.action_request.as_ref() {
             // A WRITE tool request is the authority for this turn's intent + its one slot. Its
@@ -4678,6 +4682,7 @@ async fn run_prime(
             permission_slots = d.permission.clone();
             assign_slots = d.assign.clone();
             update_slots = d.update.clone();
+            glue_plan = d.glue.clone();
         }
     } else {
         // Specialized fallback (the prior multi-call stack), reached only when the unified
@@ -4897,6 +4902,7 @@ async fn run_prime(
                 run: run_slots.as_ref(),
                 orchestration: orchestration_slots.as_ref(),
                 run_orchestration: run_orchestration_slots.as_ref(),
+                glue: glue_plan.as_ref(),
                 continuation: is_continuation,
             },
         )?;

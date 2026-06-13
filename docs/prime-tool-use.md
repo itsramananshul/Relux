@@ -568,10 +568,23 @@ fan-out legible the moment Prime creates it.
 
 The **Prime abilities** panel above shows the tools Prime can run *one at a time* from
 chat. A **tool-glue program** is the next step up: an ordered multi-step plan — the
-structured-program analogue of the keyword `tool_plan` path — where the brain (or, today,
-the operator) writes the `(plugin, tool, args)` steps directly and the kernel is the
-deterministic validator. The first safe slice is the **grounding + inert preview**; the
-sandboxed script runtime is future work (§23).
+structured-program analogue of the keyword `tool_plan` path — where the brain or the
+operator writes the `(plugin, tool, args)` steps directly and the kernel is the
+deterministic validator. Both authoring paths are shipped (the operator-driven preview
+panel below, and the chat-turn integration described next); the sandboxed script runtime
+is future work (§23).
+
+**Authoring from chat.** Prime's brain can author the same program from a natural-language
+multi-step request in a chat turn. The unified decision envelope carries an optional
+**`glue`** section (`{ goal?, steps: [{ plugin, tool, args? }], extended? }`, `tool_glue`
+alias), parsed STRUCTURALLY and fail-closed by `relux-kernel`'s
+`prime_glue::parse_glue_plan`. On a turn whose **reconciled** intent is `ToolPlanRequest`,
+the brain's steps drive a `PrimeAction::ProposeGluePlan` that grounds through the SAME
+`KernelState::preview_tool_glue_plan` path and surfaces the SAME inert `ToolPlanCard`. It is
+gated by the unchanged fail-closed `reconcile_intent`: `ToolPlanRequest` is a SENSITIVE
+intent, so casual / guarded chat (a greeting, an insult, frustration, a vague
+musing/question, a brainstorm) can NEVER become a glue plan. The card stays inert — the only
+commit is the existing one-click `tool_plan` task and its unchanged gates.
 
 The Prime page exposes it as a small, collapsed-by-default **"Tool glue — multi-step
 ability plan (preview)"** panel, right below the abilities inventory:

@@ -7941,6 +7941,43 @@ impl KernelState {
             plan
         };
 
+        // Brain-AUTHORED tool-glue program (`docs/RELUX_MASTER_PLAN.md` §23): when the intent
+        // is `ToolPlanRequest` and the brain authored a structured `(plugin, tool, args)`
+        // program, its steps REPLACE the keyword-sliced segments that would otherwise feed the
+        // INERT `ProposeToolPlan` preview. The deterministic keyword `ProposeToolPlan` action is
+        // the fallback (when the brain authored no glue program). This adds NO authority: the
+        // turn still produces only an inert, grounded preview card — `prime_execute` grounds the
+        // brain's steps through the SAME `preview_tool_glue_plan` path the operator-driven glue
+        // route uses (unknown tools fail closed and block commit, gated tools stay gated), and
+        // the only path that materializes the program is the operator's explicit `tool_plan`
+        // task commit with its unchanged gates. CASUAL-CHAT SAFETY is the fail-closed intent
+        // gate: `ToolPlanRequest` is a SENSITIVE intent, so `reconcile_intent` already forbids
+        // guarded chat (a greeting, an insult, frustration, a vague musing/question, a
+        // brainstorm) from ever being promoted to it — a glue program can never come from chat.
+        let plan = if intent == relux_core::PrimeIntent::ToolPlanRequest {
+            match slots.glue {
+                Some(glue) => PrimePlan::Act {
+                    action: PrimeAction::ProposeGluePlan {
+                        goal: glue
+                            .goal
+                            .clone()
+                            .unwrap_or_else(|| message.trim().to_string()),
+                        // Carry the brain's steps as text so the action stays `Eq` (mirrors
+                        // `InvokeTool.input_json`); `prime_execute` parses them back to ground.
+                        steps_json: serde_json::to_string(&glue.steps)
+                            .unwrap_or_else(|_| "[]".to_string()),
+                        extended: glue.extended,
+                    },
+                    text: "Here's the tool-glue plan I drafted — review the steps and create the \
+                           tool-run task when you're ready."
+                        .to_string(),
+                },
+                None => plan,
+            }
+        } else {
+            plan
+        };
+
         self.record_audit(
             "agent",
             ctx.agent.as_str(),
@@ -8961,6 +8998,54 @@ impl KernelState {
                     pending_tool_approval: None,
                 tool_trace: vec![],
                 orchestration: None,
+                })
+            }
+            PrimeAction::ProposeGluePlan {
+                goal,
+                steps_json,
+                extended,
+            } => {
+                // INERT preview from a BRAIN-AUTHORED program (`docs/RELUX_MASTER_PLAN.md`
+                // §23). Identical posture to `ProposeToolPlan` — it grounds + validates a
+                // bounded plan against the LIVE catalog and creates / runs nothing — but the
+                // steps come from the brain's structured program rather than the keyword
+                // segment splitter. The shared `preview_tool_glue_plan` fails an unknown tool
+                // closed (`readiness: "unknown"` blocks the commit) and keeps a gated tool
+                // gated; the only path that materializes it is the operator's explicit
+                // `tool_plan` task commit and its unchanged gates.
+                let proposed: Vec<relux_core::ProposedGlueStep> =
+                    serde_json::from_str(steps_json).unwrap_or_default();
+                let proposal = self.preview_tool_glue_plan(ctx, goal, &proposed, *extended);
+                let disposition = if proposal.ready_to_create {
+                    PrimeDisposition::Answered
+                } else {
+                    PrimeDisposition::NeedsClarification
+                };
+                let reply = render_tool_plan_reply(&text, &proposal);
+                Ok(PrimeTurn {
+                    intent,
+                    reply,
+                    disposition,
+                    action: Some(action),
+                    created_task: None,
+                    started_run: None,
+                    created_agent: None,
+                    approval: None,
+                    invoked_tool: None,
+                    tool_output: None,
+                    tool_error: None,
+                    suggested_actions: Vec::new(),
+                    proposal: None,
+                    slots: None,
+                    agent_slots: None,
+                    admin_slots: None,
+                    assign_slots: None,
+                    update: None,
+                    context_reads: vec![],
+                    tool_plan_proposal: Some(proposal),
+                    pending_tool_approval: None,
+                    tool_trace: vec![],
+                    orchestration: None,
                 })
             }
             PrimeAction::InvokeTool {
@@ -12531,6 +12616,16 @@ pub struct BrainSlotProposals<'a> {
     /// live orchestration records (it must EXIST with at least one pending brief) before
     /// promoting to the SAME safe `RunOrchestration` action.
     pub run_orchestration: Option<&'a crate::prime_write_tools::BrainRunOrchestration>,
+    /// A brain-AUTHORED tool-glue program for a `ToolPlanRequest` turn. When present on a
+    /// turn whose reconciled intent is `ToolPlanRequest`, its structured `(plugin, tool,
+    /// args)` steps REPLACE the keyword-sliced segments that flow into the INERT
+    /// `ProposeToolPlan` preview — the brain authors the program directly and the kernel
+    /// grounds it through the SAME [`KernelState::preview_tool_glue_plan`] path (fail-closed
+    /// on unknown tools, gated tools stay gated). It creates and runs nothing; only the
+    /// operator's explicit `tool_plan` task commit materializes it. Ignored on any other
+    /// intent — and the fail-closed intent gate keeps casual/guarded chat from ever reaching
+    /// `ToolPlanRequest`, so a glue program can never come from chat.
+    pub glue: Option<&'a crate::prime_glue::BrainGluePlan>,
     /// Whether this bundle was computed by the caller on the COMBINED message of a
     /// multi-turn *continuation* (vs. the raw message of a fresh turn). The kernel keeps
     /// the bundle only when this matches the turn it actually produced — continuation
@@ -20359,6 +20454,203 @@ mod tests {
             })
             .collect();
         assert!(relux_core::task::TaskToolPlan { steps: calls }.validate().is_ok());
+    }
+
+    /// A brain intent proposal at a confidence high enough to be honored.
+    fn brain_intent(intent: relux_core::PrimeIntent) -> crate::prime_intent::BrainIntentProposal {
+        crate::prime_intent::BrainIntentProposal {
+            intent,
+            confidence: 0.95,
+            rationale: "test".to_string(),
+        }
+    }
+
+    /// A brain-authored tool-glue program.
+    fn glue(goal: Option<&str>, steps: &[(&str, &str)]) -> crate::prime_glue::BrainGluePlan {
+        crate::prime_glue::BrainGluePlan {
+            goal: goal.map(|s| s.to_string()),
+            steps: steps
+                .iter()
+                .map(|(p, t)| relux_core::ProposedGlueStep {
+                    plugin: p.to_string(),
+                    tool: t.to_string(),
+                    args: serde_json::json!({}),
+                })
+                .collect(),
+            extended: false,
+        }
+    }
+
+    #[test]
+    fn brain_authored_glue_plan_in_chat_returns_an_inert_preview_and_creates_nothing() {
+        // §23 chat-turn wiring: an explicit multi-step request that the brain answers with a
+        // STRUCTURED tool-glue program returns the SAME inert `tool_plan_proposal` card the
+        // keyword path produces — grounded against the live catalog, creating no task / run.
+        let (mut k, ctx) = prime_chat_kernel();
+        // A manifestless plugin: its read-only Plugin Lens source tools are real Ready tools.
+        let (_acme, _dir) = install_source_plugin(&mut k, &ctx.agent, "acme-repo", "Acme", false);
+        assert!(k.tasks().is_empty(), "preconditions: no tasks");
+        let runs_before = k.runs().len();
+
+        // The brain authored the program from natural language; the message itself names NO
+        // `plugin/tool` ref, so the keyword splitter could never have produced these steps —
+        // proving the BRAIN's structured steps drive the preview.
+        let intent = brain_intent(relux_core::PrimeIntent::ToolPlanRequest);
+        let program = glue(
+            Some("inspect the repo then read its status"),
+            &[
+                ("relux-tools-status", "status.summary"),
+                ("acme-repo", "plugin.summary"),
+            ],
+        );
+        let (turn, source) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "run a tool-glue plan: summarise the acme repo then report status",
+                Some(&intent),
+                BrainSlotProposals {
+                    glue: Some(&program),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(turn.intent, relux_core::PrimeIntent::ToolPlanRequest);
+        assert_eq!(source, crate::prime_intent::IntentSource::Brain);
+        assert!(
+            matches!(turn.action, Some(relux_core::PrimeAction::ProposeGluePlan { .. })),
+            "the brain-authored glue program drives a ProposeGluePlan action, got {:?}",
+            turn.action
+        );
+        let plan = turn.tool_plan_proposal.expect("an inert preview card is attached");
+        assert_eq!(plan.steps.len(), 2);
+        // The preview carries the BRAIN's exact (plugin, tool) refs, in order.
+        assert_eq!(plan.steps[0].plugin, "relux-tools-status");
+        assert_eq!(plan.steps[0].tool, "status.summary");
+        assert_eq!(plan.steps[0].readiness, "ready");
+        assert_eq!(plan.steps[1].plugin, "acme-repo");
+        assert_eq!(plan.steps[1].tool, "plugin.summary");
+        assert_eq!(
+            plan.steps[1].readiness, "ready",
+            "the manifestless plugin's Plugin Lens source tool grounds ready"
+        );
+        assert!(plan.ready_to_create, "a clean program offers the one-click commit: {:?}", plan.issues);
+
+        // INERT: the preview created nothing and ran nothing — the only commit is the
+        // operator's explicit `tool_plan` task on the card.
+        assert!(turn.created_task.is_none(), "a glue preview creates no task");
+        assert!(k.tasks().is_empty(), "a glue preview creates no task");
+        assert_eq!(k.runs().len(), runs_before, "a glue preview starts no run");
+    }
+
+    #[test]
+    fn brain_authored_glue_plan_flags_gated_and_unknown_steps_honestly() {
+        // Grounding is fail-closed: a gated tool keeps its honest gate, and an UNKNOWN tool
+        // is flagged (never fabricated) and blocks the one-click commit — through the chat path.
+        let (mut k, ctx) = prime_chat_kernel();
+        let (_acme, _dir) = install_source_plugin(&mut k, &ctx.agent, "acme-repo", "Acme", false);
+        // github.create_pr is installed but has NO runtime handler here, so it grounds as an
+        // honest gate (`not_runnable`); a made-up tool on it is `unknown`.
+        install_bundled(&mut k, github_manifest());
+        let runs_before = k.runs().len();
+
+        let intent = brain_intent(relux_core::PrimeIntent::ToolPlanRequest);
+        let program = glue(
+            Some("inspect then open a PR"),
+            &[
+                ("acme-repo", "plugin.summary"),         // ready (Plugin Lens)
+                ("relux-tools-github", "github.create_pr"), // installed but gated/not-runnable
+                ("relux-tools-github", "github.invented"),  // not in the catalog -> unknown
+            ],
+        );
+        let (turn, _src) = k
+            .prime_turn_with_brain(
+                &ctx,
+                "run a tool-glue plan to inspect the repo and open a pull request",
+                Some(&intent),
+                BrainSlotProposals {
+                    glue: Some(&program),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(turn.intent, relux_core::PrimeIntent::ToolPlanRequest);
+        let plan = turn.tool_plan_proposal.expect("an inert preview card is attached");
+        assert_eq!(plan.steps.len(), 3);
+        assert_eq!(plan.steps[0].readiness, "ready");
+        assert_ne!(
+            plan.steps[1].readiness, "unknown",
+            "an INSTALLED-but-gated tool grounds honestly, not as unknown: {:?}",
+            plan.steps[1]
+        );
+        assert_eq!(
+            plan.steps[2].readiness, "unknown",
+            "a tool not in the catalog fails closed as unknown"
+        );
+        assert!(!plan.ready_to_create, "an unknown step blocks the one-click commit");
+        assert!(
+            plan.issues.iter().any(|i| i.contains("relux-tools-github/github.invented")),
+            "the honest issue names the unknown tool: {:?}",
+            plan.issues
+        );
+        // Still inert.
+        assert!(turn.created_task.is_none());
+        assert!(k.tasks().is_empty());
+        assert_eq!(k.runs().len(), runs_before);
+    }
+
+    #[test]
+    fn casual_chat_with_an_attached_glue_program_never_becomes_a_plan() {
+        // The safety wall: even a high-confidence `tool_plan_request` proposal WITH a valid
+        // glue program can never promote guarded chat (small talk / a vent / a vague musing)
+        // into a tool plan — `reconcile_intent` vetoes the sensitive intent, so the glue
+        // section is ignored and nothing is proposed, created, or run.
+        let cases = [
+            "lol nice, thanks",                              // small talk
+            "ugh I hate this, this is so frustrating",       // emotional / vent
+            "what if we someday wired a few tools together?", // brainstorm / musing
+        ];
+        for msg in cases {
+            let (mut k, ctx) = prime_chat_kernel();
+            let (_acme, _dir) = install_source_plugin(&mut k, &ctx.agent, "acme-repo", "Acme", false);
+            let runs_before = k.runs().len();
+            let intent = crate::prime_intent::BrainIntentProposal {
+                intent: relux_core::PrimeIntent::ToolPlanRequest,
+                confidence: 0.97,
+                rationale: "test".to_string(),
+            };
+            let program = glue(Some("do stuff"), &[("acme-repo", "plugin.summary")]);
+            let (turn, _src) = k
+                .prime_turn_with_brain(
+                    &ctx,
+                    msg,
+                    Some(&intent),
+                    BrainSlotProposals {
+                        glue: Some(&program),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+
+            assert_ne!(
+                turn.intent,
+                relux_core::PrimeIntent::ToolPlanRequest,
+                "guarded chat must not reconcile to a tool plan: {msg:?}"
+            );
+            assert!(
+                !matches!(turn.action, Some(relux_core::PrimeAction::ProposeGluePlan { .. })),
+                "casual chat must never produce a glue plan: {msg:?} -> {:?}",
+                turn.action
+            );
+            assert!(
+                turn.tool_plan_proposal.is_none(),
+                "no inert plan card on a chat turn: {msg:?}"
+            );
+            assert!(turn.created_task.is_none(), "chat creates no task: {msg:?}");
+            assert!(k.tasks().is_empty(), "chat creates no task: {msg:?}");
+            assert_eq!(k.runs().len(), runs_before, "chat starts no run: {msg:?}");
+        }
     }
 
     /// The three response bodies for one successful `tools/list` discovery: the

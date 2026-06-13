@@ -5094,6 +5094,30 @@ collapsed-by-default **"Tool glue — multi-step ability plan (preview)"** panel
   with its unchanged permission/approval/grant/audit gates at run time — no new
   execution model. See `docs/prime-tool-use.md` "Authoring a tool-glue ability plan".
 
+### Chat-turn integration (shipped)
+
+Prime's BRAIN can now author the same tool-glue program from a natural-language
+multi-step request inside a chat turn and surface the SAME inert preview card — no
+new execution model and no new authority:
+
+- The unified decision envelope carries an optional **`glue`** section
+  (`{ goal?, steps: [{ plugin, tool, args? }], extended? }`, `tool_glue` alias),
+  parsed STRUCTURALLY and fail-closed by `relux-kernel`'s `prime_glue::parse_glue_plan`
+  (unknown top-level / per-step fields rejected, a non-empty well-formed `steps` array
+  required; an unknown TOOL is carried through, not rejected — grounding is the
+  allowlist gate). A malformed section is dropped and the deterministic keyword
+  `ProposeToolPlan` path stands as the fallback.
+- On a turn whose **reconciled** intent is `ToolPlanRequest`, the brain's steps REPLACE
+  the keyword-sliced segments and flow into a new `PrimeAction::ProposeGluePlan`, which
+  `prime_execute` grounds through the SAME `KernelState::preview_tool_glue_plan` path
+  the operator route uses — an unknown tool blocks the one-click commit, a gated tool
+  keeps its gate, and the turn creates and runs nothing.
+- **Casual-chat safety** is the unchanged fail-closed gate: `ToolPlanRequest` is a
+  SENSITIVE intent, so `reconcile_intent` forbids guarded chat (a greeting, an insult,
+  frustration, a vague musing/question, a brainstorm) from ever being promoted to it —
+  a glue program can never come from chat. The operator still commits the rendered card
+  through the existing `tool_plan` task path and its unchanged gates.
+
 ### What remains (next slices)
 
 - **The sandboxed script runtime** itself (Hermes' RPC-from-script): a real
@@ -5102,7 +5126,3 @@ collapsed-by-default **"Tool glue — multi-step ability plan (preview)"** panel
   child-environment scrubbing, and stdout/stderr bounding. This is the larger
   subsystem the audit flags as "high leverage but a real subsystem"; the grounding
   + commit path shipped here is its safe foundation.
-- **Wiring the brain to author glue programs inside a chat turn** (today the
-  grounding surface is an explicit route + the operator-driven preview panel; the
-  chat-turn integration that has Prime emit and commit a grounded program from a
-  natural-language goal is a follow-up).
