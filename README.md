@@ -543,7 +543,8 @@ Use the local release check before cutting or sharing a Windows bundle:
 # run doctor, and smoke Prime task creation + assigned-task execution.
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\relux-first-release-check.ps1
 
-# Full product gate: everything above PLUS the standalone end-to-end smoke.
+# Full product gate: everything above PLUS the standalone end-to-end smoke AND the
+# manifestless-plugin -> Prime smoke (both run against the just-built binary + dashboard).
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\relux-first-release-check.ps1 -FullE2E
 ```
 
@@ -586,6 +587,46 @@ It records PASS/FAIL/SKIP for each flow and proves:
 Flags: `-SkipBuild` (reuse the existing release binary), `-SkipServe`,
 `-SkipLoopback`, `-KeepTemp`. The script always cleans up its temp DB, server,
 jobs, and processes, and exits non-zero on any failure.
+
+#### Manifestless-plugin -> Prime smoke (part of `-FullE2E`)
+
+`scripts\smoke-manifestless-plugin-prime.ps1` turns the manual proof we did for
+v0.1.42/v0.1.43 into a durable gate, so a future release cannot silently regress
+the "install a plugin -> Prime can actually use it" promise. The `-FullE2E` gate
+runs it after the standalone e2e smoke, against the same just-built release binary
+and dashboard bundle (HTTP/API only - no browser, no network, no real Claude/Codex).
+Run it directly any time:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke-manifestless-plugin-prime.ps1
+
+# Point it at an EXTRACTED release bundle instead of the in-repo build:
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke-manifestless-plugin-prime.ps1 -BundlePath C:\path\to\relux-local-0.1.x-windows-x64
+```
+
+It boots a real `serve` on an isolated loopback port + throwaway `RELUX_DB`,
+completes first-run operator login, then proves end to end:
+
+- **Manifestless install with nested-root inference**: a tiny local plugin with no
+  `relux-plugin.json`, whose files live under a single GitHub-style `repo-branch/`
+  wrapper, installs through `/v1/relux/plugins/install-dir`, lands as an honest
+  metadata-only wrapper, and its generated id/name/description come from the **nested
+  repo root** - not the artificial archive folder (v0.1.43 behavior).
+- **Plugin Lens tools visible to Prime**: `GET /v1/relux/prime/tools` lists the four
+  read-only source tools (`plugin.summary` / `inspect` / `search` / `read_file`) for
+  the plugin, sourced from the plugin and directly runnable.
+- **Prime chat uses them** (the deterministic local brain, no LLM): natural
+  "summarize / search / read" messages invoke the real kernel-executed source tool,
+  return a **natural answer** (never a raw JSON envelope), create **no task**, and a
+  planted **fake secret never leaks** into the reply or the structured/raw tool detail
+  (redaction parity, RELUX_MASTER_PLAN §11.1).
+- **Dashboard SPA shell** is served for `/dashboard` and the client routes
+  `/dashboard/{plugins,prime,work,crew}` (or an honest SKIP when the bundle is not
+  built).
+
+It records PASS/FAIL/SKIP per check, always cleans up its temp DB / fixture /
+serve process, and exits non-zero on any failure. The fake credentials are
+assembled at runtime, so no real secret is ever written.
 
 Create a portable local bundle:
 

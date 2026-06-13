@@ -185,8 +185,22 @@ if ($FullE2E) {
     if ($KeepTemp) { $e2eArgs += "-KeepTemp" }
     # Invoke-NativeStep records PASS/FAIL (and increments $Failures on non-zero exit).
     [void](Invoke-NativeStep -Name "full e2e smoke" -Exe "powershell" -Arguments $e2eArgs)
+
+    # The manifestless-plugin -> Prime flow we hand-verified for v0.1.42/v0.1.43
+    # (manifestless install with nested-root inference, Plugin Lens tools, Prime
+    # using them with natural answers + no task + secret redaction) is now a durable
+    # gate too, so a future release cannot silently regress it (docs/plugins.md
+    # "Plugin Lens"/"Manifestless ZIP root inference"; RELUX_MASTER_PLAN §11.1). It
+    # drives the SAME release binary + built dashboard against its own isolated DB /
+    # port; HTTP/API only, no browser, no network. Reuses the dashboard-dist the
+    # `dashboard build` step above produced.
+    $mfSmoke = Join-Path $PSScriptRoot "smoke-manifestless-plugin-prime.ps1"
+    $mfArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $mfSmoke)
+    if ($KeepTemp) { $mfArgs += "-KeepTemp" }
+    [void](Invoke-NativeStep -Name "manifestless plugin -> Prime smoke" -Exe "powershell" -Arguments $mfArgs)
 } else {
     Write-Step "full e2e smoke" "SKIP" "pass -FullE2E to run scripts\relux-e2e-smoke.ps1"
+    Write-Step "manifestless plugin -> Prime smoke" "SKIP" "pass -FullE2E to run scripts\smoke-manifestless-plugin-prime.ps1"
 }
 
 Write-Host ""
