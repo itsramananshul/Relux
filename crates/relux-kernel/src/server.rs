@@ -4057,6 +4057,92 @@ async fn prime_tools(
 }
 
 /// Run exactly one durable Prime turn (`docs/RELUX_MASTER_PLAN.md` section 10) over
+/// One process-cached live MCP `tools/list` result for the DECISION prompt, keyed by db path.
+/// The cache lets repeated chat turns reuse a recent discovery instead of re-dialing every enabled
+/// server each message; it lives in the SERVER layer (which may use a wall clock) rather than the
+/// kernel (which is clock-free by design). Invalidated when the server set changes (`fingerprint`)
+/// or the TTL elapses.
+struct CachedDecisionMcp {
+    at: std::time::Instant,
+    fingerprint: String,
+    catalog: relux_kernel::ProposalMcpCatalog,
+}
+
+fn decision_mcp_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, CachedDecisionMcp>> {
+    static C: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, CachedDecisionMcp>>,
+    > = std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// How long a decision-time MCP discovery stays fresh — so chat never re-pays the `tools/list`
+/// round more than once per window for the same server set.
+const DECISION_MCP_TTL: std::time::Duration = std::time::Duration::from_secs(20);
+/// An OVERALL bound on the decision-time discovery (a backstop above each server's own
+/// `timeout_ms`), so a slow/hung server can never block chat: on timeout the prompt falls back to
+/// the last cached catalog (or the safe empty default) and continues.
+const DECISION_MCP_OVERALL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2500);
+
+/// Bounded, TTL-cached, OFF-LOCK live MCP `tools/list` for the DECISION prompt. So Prime's FIRST
+/// decision sees the actual tool NAMES of every enabled MCP server (not merely that some server
+/// exists), the brain can recognise a natural-language request that names an MCP tool and classify
+/// it `tool_invocation`. Fail-closed + non-blocking by construction:
+/// - no enabled server ⇒ the empty default (nothing to discover);
+/// - a fresh cache hit for this exact server set ⇒ reuse (chat pays nothing again within the TTL);
+/// - otherwise discover off-lock, bounded by [`DECISION_MCP_OVERALL_TIMEOUT`]; a timeout / panic
+///   falls back to the last cached catalog (or empty), never hanging the turn. A server whose live
+///   discovery FAILS is carried as `unavailable` in the catalog (the renderer says so), never faked.
+///
+/// The SAME catalog is reused for the agent loop's grounding below (no second network round), so
+/// this adds at most one bounded discovery per turn and usually zero (a cache hit).
+async fn decision_time_mcp_catalog(
+    db_path: &std::path::Path,
+    servers: &[relux_kernel::prime_tools::McpServerView],
+) -> relux_kernel::ProposalMcpCatalog {
+    if !servers.iter().any(|s| s.enabled) {
+        return relux_kernel::ProposalMcpCatalog::default();
+    }
+    let key = db_path.to_string_lossy().into_owned();
+    let fingerprint = serde_json::to_string(servers).unwrap_or_default();
+    {
+        let cache = decision_mcp_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = cache.get(&key) {
+            if c.fingerprint == fingerprint && c.at.elapsed() < DECISION_MCP_TTL {
+                return c.catalog.clone();
+            }
+        }
+    }
+    let servers_owned = servers.to_vec();
+    let discovered = tokio::time::timeout(
+        DECISION_MCP_OVERALL_TIMEOUT,
+        tokio::task::spawn_blocking(move || {
+            relux_kernel::discover_proposal_mcp_catalog(&servers_owned)
+        }),
+    )
+    .await;
+    match discovered {
+        Ok(Ok(catalog)) => {
+            let mut cache = decision_mcp_cache().lock().unwrap_or_else(|e| e.into_inner());
+            cache.insert(
+                key,
+                CachedDecisionMcp {
+                    at: std::time::Instant::now(),
+                    fingerprint,
+                    catalog: catalog.clone(),
+                },
+            );
+            catalog
+        }
+        // Timed out or the blocking task panicked: prefer the last cached value (even if a little
+        // stale) so the prompt still carries SOME live names; else the safe empty default.
+        _ => {
+            let cache = decision_mcp_cache().lock().unwrap_or_else(|e| e.into_inner());
+            cache.get(&key).map(|c| c.catalog.clone()).unwrap_or_default()
+        }
+    }
+}
+
 /// HTTP: the same grounded `prime_turn` the CLI uses, so a greeting stays a
 /// greeting and "create a task to X" creates that task. Persisted under the lock
 /// so the next turn (and the dashboard) sees the result.
@@ -4116,7 +4202,7 @@ async fn run_prime(
         context_snapshot,
         recent_history,
         context_rounds,
-        tools_inventory,
+        tool_descriptors,
     ) = {
         let _guard = state.lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut kernel = {
@@ -4129,14 +4215,12 @@ async fn run_prime(
         // Snapshot the read-only context the governed tool loop reads from (the whole board,
         // bounded), taken under THIS lock so the loop's brain rounds run lock-free below.
         let snapshot = kernel.context_snapshot(&ctx);
-        // The brain-facing inventory of RUNNABLE installed tools (+ enabled MCP servers), rendered
-        // under this lock from the live tool registry so the (off-lock) decision brain can SEE the
-        // tools it may choose and classify an explicit "use the X tool" request as tool_invocation.
-        // This is what makes an installed/configured plugin actually usable from chat instead of a
-        // dead row on the Plugins page (`docs/prime-tool-use.md`; §10.1/§10.5/§17.1). Cheap +
-        // in-memory; live MCP tool NAMES are discovered off-lock for the agent loop below.
-        let inventory =
-            relux_kernel::render_tool_inventory(&kernel.discover_tools(None), &snapshot.mcp_servers);
+        // The RUNNABLE installed-tool descriptors, taken (owned) under this lock from the live tool
+        // registry so the (off-lock) decision brain can SEE the tools it may choose. Rendered into
+        // the prompt inventory OFF-LOCK below, enriched with the live MCP tool names — so what makes
+        // an installed/configured plugin usable from chat is not a dead row on the Plugins page
+        // (`docs/prime-tool-use.md`; §10.1/§10.5/§17.1). Cheap + in-memory.
+        let descriptors = kernel.discover_tools(None);
         // The bounded, secret-redacted recent-conversation context, so the (slow, off-lock) brain
         // can interpret a follow-up in context. Advisory BACKGROUND only — it is injected into the
         // decision prompt and never reaches the deterministic classifier or any gate.
@@ -4145,9 +4229,24 @@ async fn run_prime(
         // the observe-then-act loop and the sidecar context loop both run under (replacing the bare
         // `MAX_TOOL_ROUNDS` module constant). Read under this lock; the loops below run lock-free.
         let rounds = kernel.prime_agent_policy.context_rounds(false);
-        (preview, summary, snapshot, history, rounds, inventory)
+        (preview, summary, snapshot, history, rounds, descriptors)
     };
     let is_continuation = continuation.is_some();
+
+    // 0b-mcp. Bounded, off-lock LIVE MCP tool-name discovery for the DECISION prompt, so Prime's
+    // FIRST decision sees the actual tool NAMES of every enabled MCP server — not merely that one
+    // exists — and can classify a natural-language MCP request ("search my notes") as
+    // `tool_invocation`. TTL-cached + overall-timeout bounded so chat never hangs on a slow /
+    // unreachable server (fail-closed: a server that times out contributes an "unavailable" note,
+    // never a fabricated tool). This SAME catalog is reused for the agent loop's grounding below, so
+    // a tool turn pays at most one bounded discovery (`docs/prime-tool-use.md`; §10.1/§17.1).
+    let decision_mcp_catalog =
+        decision_time_mcp_catalog(&state.db_path, &context_snapshot.mcp_servers).await;
+    let tools_inventory = relux_kernel::render_tool_inventory_with_mcp(
+        &tool_descriptors,
+        &context_snapshot.mcp_servers,
+        &decision_mcp_catalog,
+    );
     // The message the brain reasons about: the COMBINED message on a continuation, else raw.
     let decision_message = match continuation.as_ref() {
         Some((combined, _)) => combined.clone(),
@@ -4394,14 +4493,14 @@ async fn run_prime(
     // not a tool turn and pays nothing. A failed/empty discovery ⇒ the reference grounds as
     // `unavailable` (fail-closed). `docs/prime-tool-use.md`; `docs/mcp.md` "Invocation" +
     // "Run-driven multi-tool plan"; §10.5, §17.1.
-    let proposal_mcp_catalog = if (effective_is_tool_turn
-        || decision_message.to_ascii_lowercase().contains("mcp:"))
-        && context_snapshot.mcp_servers.iter().any(|s| s.enabled)
+    // REUSE the bounded, off-lock catalog already discovered for the decision prompt (0b-mcp) — it
+    // covers every enabled server's live `tools/list`, so a tool turn grounds against live MCP tools
+    // WITHOUT a second network round. On a non-tool turn we still pass the empty default so the loop
+    // grounds against installed plugin tools only (the deterministic default), exactly as before.
+    let proposal_mcp_catalog = if effective_is_tool_turn
+        || decision_message.to_ascii_lowercase().contains("mcp:")
     {
-        let servers = context_snapshot.mcp_servers.clone();
-        tokio::task::spawn_blocking(move || relux_kernel::discover_proposal_mcp_catalog(&servers))
-            .await
-            .unwrap_or_default()
+        decision_mcp_catalog
     } else {
         relux_kernel::ProposalMcpCatalog::default()
     };
@@ -9545,6 +9644,65 @@ mod tests {
         assert!(msg.contains("Start-Relux.ps1 -Port"), "got: {msg}");
         // Suggests a concrete alternative port to use.
         assert!(msg.contains("20000"), "got: {msg}");
+    }
+
+    fn mcp_view(id: &str, endpoint: &str, enabled: bool, timeout_ms: u64) -> relux_kernel::prime_tools::McpServerView {
+        relux_kernel::prime_tools::McpServerView {
+            id: id.to_string(),
+            transport: relux_core::McpTransport::HttpLoopback,
+            endpoint: endpoint.to_string(),
+            command: None,
+            args: vec![],
+            env: std::collections::BTreeMap::new(),
+            cwd: None,
+            description: String::new(),
+            enabled,
+            timeout_ms,
+        }
+    }
+
+    #[tokio::test]
+    async fn decision_time_mcp_catalog_is_empty_when_no_server_is_enabled() {
+        // No enabled server ⇒ nothing to discover (the deterministic empty default), and no
+        // network round is attempted at all.
+        let servers = vec![mcp_view("off", "http://127.0.0.1:1/mcp", false, 200)];
+        let cat = decision_time_mcp_catalog(std::path::Path::new("dt-mcp-empty.db"), &servers).await;
+        assert!(cat.servers.is_empty(), "no enabled server ⇒ empty catalog");
+    }
+
+    #[tokio::test]
+    async fn decision_time_mcp_catalog_fails_closed_on_an_unreachable_server() {
+        // An ENABLED but unreachable server must not hang the turn: the bounded discovery returns
+        // promptly with that server marked UNAVAILABLE (tools: None + a reason) — fail-closed, never
+        // dropped and never given a fabricated tool. A unique db key keeps the process cache from
+        // colliding with another test.
+        let servers =
+            vec![mcp_view("deadsrv", "http://127.0.0.1:1/mcp", true, 200)];
+        let started = std::time::Instant::now();
+        let cat = decision_time_mcp_catalog(
+            std::path::Path::new("dt-mcp-unreachable.db"),
+            &servers,
+        )
+        .await;
+        // It returned well within the overall bound (no hang).
+        assert!(started.elapsed() < DECISION_MCP_OVERALL_TIMEOUT + std::time::Duration::from_secs(1));
+        let entry = cat
+            .servers
+            .iter()
+            .find(|s| s.server_id == "deadsrv")
+            .expect("the enabled server is represented, not dropped");
+        assert!(entry.tools.is_none(), "an unreachable server advertises no tools");
+        assert!(entry.error.is_some(), "the honest unavailable reason is carried");
+
+        // A second call for the SAME server set is served from the process cache (no second dial),
+        // so it returns the same fail-closed shape essentially instantly.
+        let again = decision_time_mcp_catalog(
+            std::path::Path::new("dt-mcp-unreachable.db"),
+            &servers,
+        )
+        .await;
+        assert_eq!(again.servers.len(), cat.servers.len());
+        assert!(again.servers.iter().any(|s| s.server_id == "deadsrv" && s.tools.is_none()));
     }
 
     fn run_with(artifacts: Vec<relux_core::RunArtifact>) -> relux_core::Run {

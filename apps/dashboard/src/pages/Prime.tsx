@@ -133,9 +133,10 @@ export function Prime() {
   // Resume a paused agent loop ("Keep working"): call the continuation route with the stored token
   // (NOT a re-sent message), and append the resumed loop's turn. This continues from the
   // already-gathered observations, so it does not repeat completed tool calls.
-  async function continueLoop(id: string, extended: boolean) {
+  async function continueLoop(id: string, extended: boolean, label?: string) {
     if (busy) return;
-    setLog((l) => [...l, { role: "user", text: extended ? "Keep working (extended)" : "Keep working" }]);
+    const line = label ?? (extended ? "Keep working (extended)" : "Keep working");
+    setLog((l) => [...l, { role: "user", text: line }]);
     setBusy(true);
     try {
       const turn = await reluxPrime.continue(id, extended);
@@ -484,8 +485,11 @@ function AiStatusBanner({ status }: { status: ReluxAiStatus | null }) {
 // One Prime turn rendered as a compact card: the reply text, an intent +
 // disposition chip, and any durable artifact (task created, run started, or an
 // approval that is now pending). All of it is read straight from the turn — the
-// UI never fabricates an outcome Prime did not report.
-function PrimeTurnCard({
+// UI never fabricates an outcome Prime did not report. Exported so the
+// approval-continuation render test can seed a paused-on-approval turn directly
+// (a first-paint Prime render cannot stage one — useEffect never fires under
+// renderToStaticMarkup).
+export function PrimeTurnCard({
   turn,
   busy,
   onSuggestion,
@@ -494,7 +498,7 @@ function PrimeTurnCard({
   turn: ReluxPrimeTurn;
   busy: boolean;
   onSuggestion: (s: ReluxPrimeSuggestion) => void;
-  onContinue: (id: string, extended: boolean) => void;
+  onContinue: (id: string, extended: boolean, label?: string) => void;
 }) {
   const tone = DISPOSITION_TONE[turn.disposition] ?? "todo";
   const suggestions = turn.suggested_actions ?? [];
@@ -634,7 +638,7 @@ function PrimeTurnCard({
           </span>
           {continuation.awaiting_approval ? (
             <span className="muted" style={{ fontSize: 10 }}>
-              Approve the tool above, then keep working.
+              Approve the tool above — I'll continue automatically with its result.
             </span>
           ) : (
             <button
@@ -656,7 +660,12 @@ function PrimeTurnCard({
           always, deny) — Prime ran nothing by showing it, and nothing is auto-approved
           (docs/mcp.md "Invocation"; §7.4). */}
       {turn.pending_tool_approval && (
-        <ApprovalCard request={turn.pending_tool_approval} busy={busy} />
+        <ApprovalCard
+          request={turn.pending_tool_approval}
+          busy={busy}
+          continuationId={continuation?.awaiting_approval ? continuation.id : undefined}
+          onContinue={onContinue}
+        />
       )}
 
       {/* The reviewable plan proposal (RELUX_MASTER_PLAN §10 planning layer, §11.1):
@@ -1004,17 +1013,38 @@ function PrimeTurnCard({
 function ApprovalCard({
   request,
   busy,
+  continuationId,
+  onContinue,
 }: {
   request: ReluxPrimeToolApprovalRequest;
   busy: boolean;
+  // When this approval paused an agent loop, the continuation token to resume once the tool ran.
+  continuationId?: string;
+  onContinue?: (id: string, extended: boolean, label?: string) => void;
 }) {
   const [working, setWorking] = useState<null | "approve" | "always" | "deny">(null);
   const [outcome, setOutcome] = useState<
     null | { kind: "ran"; result: ReluxToolInvocationResult } | { kind: "denied" }
   >(null);
   const [err, setErr] = useState<string | null>(null);
+  const continuedRef = useRef(false);
   const id = request.approval_id;
   const locked = busy || working !== null || outcome !== null;
+
+  // After the operator approves and the gated tool RUNS, the kernel has already folded its result
+  // into the paused continuation (execute_approved_tool_invocation → fold_approved_into_continuation
+  // clears the pending-approval marker). So if this approval paused an agent loop, resume it ONCE —
+  // automatically — so Prime continues with the real result and answers WITHOUT the operator typing
+  // another prompt (the agentic approve → run → continue flow; docs/prime-tool-use.md). Idempotent
+  // (continuedRef) and safe: the resume runs behind the same gates and never re-runs the completed
+  // call (the loop skips it by signature). When there is no continuation (e.g. a non-loop approval),
+  // the inline result below is the answer — never a dead-end.
+  function resumeAfterRun() {
+    if (continuedRef.current) return;
+    if (!continuationId || !onContinue) return;
+    continuedRef.current = true;
+    onContinue(continuationId, false, "Continue with the approved tool result");
+  }
 
   async function approveAndRun() {
     if (locked) return;
@@ -1025,6 +1055,7 @@ function ApprovalCard({
       await reluxApprovals.decide(id, "approved");
       const result = await reluxApprovals.execute(id);
       setOutcome({ kind: "ran", result });
+      resumeAfterRun();
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Could not approve and run the tool");
     } finally {
@@ -1041,6 +1072,7 @@ function ApprovalCard({
       await reluxApprovals.allowAlways(id);
       const result = await reluxApprovals.execute(id);
       setOutcome({ kind: "ran", result });
+      resumeAfterRun();
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Could not allow-always and run the tool");
     } finally {
@@ -1156,6 +1188,7 @@ function ApprovalCard({
         <div>
           <div className="banner" style={{ fontSize: 11, margin: 0 }}>
             Ran <span className="mono">{request.label}</span> once through the approved path.
+            {continuationId && " Prime is continuing with the result…"}
           </div>
           {ranOutput && (
             <pre

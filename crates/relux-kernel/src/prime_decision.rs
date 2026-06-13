@@ -480,6 +480,11 @@ const MAX_INVENTORY_TOOLS: usize = 40;
 /// tools are listed). Keeps a verbose manifest from blowing the decision prompt.
 const MAX_INVENTORY_DESC_CHARS: usize = 140;
 
+/// Max LIVE MCP tool names listed per enabled server in the decision inventory, with an honest
+/// "(+N more)" tail beyond it — the same discipline as [`MAX_INVENTORY_TOOLS`], so a chatty MCP
+/// server cannot blow the decision prompt while the brain still sees the representative tool names.
+const MAX_MCP_TOOLS_PER_SERVER: usize = 16;
+
 /// Render the **brain-facing tool inventory** — the installed plugin / governed-command / built-in
 /// tools Prime can actually RUN (plus a note of the registered MCP servers whose tools become
 /// available when the brain chooses `tool_invocation`). This is the grounding that turns "install a
@@ -502,6 +507,32 @@ const MAX_INVENTORY_DESC_CHARS: usize = 140;
 pub fn render_tool_inventory(
     tools: &[relux_core::ToolDescriptor],
     mcp_servers: &[crate::prime_tools::McpServerView],
+) -> String {
+    // The servers-only rendering is exactly the empty-live-catalog case of the enriched
+    // renderer, so there is a single source of truth and the output is byte-for-byte the prior
+    // form on a board with no live MCP discovery (the deterministic / test / CLI default).
+    render_tool_inventory_with_mcp(tools, mcp_servers, &crate::ProposalMcpCatalog::default())
+}
+
+/// Like [`render_tool_inventory`] but ALSO enumerates the LIVE tools of every enabled MCP server
+/// from the off-lock-discovered `live` catalog, so Prime's FIRST decision sees not merely *that*
+/// an MCP server exists but its actual tool NAMES — enough for the brain to recognise a
+/// natural-language request that names one ("search my notes") and classify the turn
+/// `tool_invocation`. Without this the first decision is weaker than the agent loop (which gets the
+/// full live catalog later). Bounded + honest by construction:
+/// - the installed-plugin block is identical to [`render_tool_inventory`] (only `Ready` /
+///   `NeedsApproval` tools, capped at [`MAX_INVENTORY_TOOLS`]);
+/// - each enabled server's live tools are listed (capped at [`MAX_MCP_TOOLS_PER_SERVER`]); a server
+///   whose live `tools/list` FAILED is named with its honest "unavailable" reason (never dropped,
+///   never faked); a server the discovery did not cover falls back to the bare server name;
+/// - MCP tool risk/approval is NOT asserted here (it is derived under the lock at invocation), so
+///   the brain is told MCP tools route through the approval gate, never given a false "ready";
+/// - an EMPTY `live` catalog renders byte-for-byte like [`render_tool_inventory`] (names servers
+///   only), so a turn with no live discovery is unaffected.
+pub fn render_tool_inventory_with_mcp(
+    tools: &[relux_core::ToolDescriptor],
+    mcp_servers: &[crate::prime_tools::McpServerView],
+    live: &crate::ProposalMcpCatalog,
 ) -> String {
     use relux_core::ToolExecutability as E;
     let mut lines: Vec<String> = Vec::new();
@@ -532,17 +563,65 @@ pub fn render_tool_inventory(
     if runnable.len() > shown {
         lines.push(format!("- (+{} more)", runnable.len() - shown));
     }
-    // Name the enabled MCP servers so the brain knows MCP capabilities exist even though their
-    // individual tools are discovered off-lock for the agent loop, not enumerated in this prompt.
-    let enabled_mcp: Vec<&str> =
-        mcp_servers.iter().filter(|s| s.enabled).map(|s| s.id.as_str()).collect();
+    let enabled_mcp: Vec<&crate::prime_tools::McpServerView> =
+        mcp_servers.iter().filter(|s| s.enabled).collect();
     if !enabled_mcp.is_empty() {
-        lines.push(format!(
-            "- {} MCP server(s) registered (their tools become available when you choose \
+        if live.servers.is_empty() {
+            // No live discovery this turn — name the servers exactly as the servers-only renderer
+            // did, so the brain still knows MCP capabilities exist (their tools become available
+            // when it chooses `tool_invocation` and the agent loop discovers them).
+            let names: Vec<&str> = enabled_mcp.iter().map(|s| s.id.as_str()).collect();
+            lines.push(format!(
+                "- {} MCP server(s) registered (their tools become available when you choose \
 tool_invocation): {}",
-            enabled_mcp.len(),
-            enabled_mcp.join(", ")
-        ));
+                names.len(),
+                names.join(", ")
+            ));
+        } else {
+            // Live discovery ran — enumerate each enabled server's real tool names.
+            let mut ungrounded: Vec<&str> = Vec::new();
+            for s in &enabled_mcp {
+                match live.servers.iter().find(|e| e.server_id == s.id) {
+                    Some(entry) => match &entry.tools {
+                        Some(t) if !t.is_empty() => {
+                            let n = t.len().min(MAX_MCP_TOOLS_PER_SERVER);
+                            let names: Vec<&str> =
+                                t.iter().take(n).map(|x| x.name.as_str()).collect();
+                            let more = if t.len() > n {
+                                format!(" (+{} more)", t.len() - n)
+                            } else {
+                                String::new()
+                            };
+                            lines.push(format!(
+                                "- MCP server \"{}\" tools (route through approval): mcp:{}/{}{more}",
+                                s.id,
+                                s.id,
+                                names.join(format!(", mcp:{}/", s.id).as_str())
+                            ));
+                        }
+                        Some(_) => lines.push(format!(
+                            "- MCP server \"{}\" is enabled but advertised no tools",
+                            s.id
+                        )),
+                        None => lines.push(format!(
+                            "- MCP server \"{}\" is enabled but unavailable right now ({})",
+                            s.id,
+                            entry.error.as_deref().unwrap_or("discovery failed")
+                        )),
+                    },
+                    // The discovery did not cover this server (it should, but be robust): name it.
+                    None => ungrounded.push(s.id.as_str()),
+                }
+            }
+            if !ungrounded.is_empty() {
+                lines.push(format!(
+                    "- {} MCP server(s) registered (their tools become available when you choose \
+tool_invocation): {}",
+                    ungrounded.len(),
+                    ungrounded.join(", ")
+                ));
+            }
+        }
     }
     lines.join("\n")
 }
@@ -1159,6 +1238,78 @@ mod tests {
         // Only the ENABLED MCP server is named.
         assert!(inv.contains("fs"));
         assert!(!inv.contains("off"));
+    }
+
+    fn live_server(id: &str, tools: &[&str]) -> crate::ProposalMcpServer {
+        crate::ProposalMcpServer {
+            server_id: id.to_string(),
+            tools: Some(
+                tools
+                    .iter()
+                    .map(|n| crate::ProposalMcpTool {
+                        name: n.to_string(),
+                        description: String::new(),
+                    })
+                    .collect(),
+            ),
+            error: None,
+        }
+    }
+
+    fn unavailable_server(id: &str, err: &str) -> crate::ProposalMcpServer {
+        crate::ProposalMcpServer {
+            server_id: id.to_string(),
+            tools: None,
+            error: Some(err.to_string()),
+        }
+    }
+
+    fn live_catalog(servers: Vec<crate::ProposalMcpServer>) -> crate::ProposalMcpCatalog {
+        crate::ProposalMcpCatalog { servers }
+    }
+
+    #[test]
+    fn render_with_mcp_enumerates_live_tool_names_for_enabled_servers() {
+        use relux_core::ToolExecutability as E;
+        let tools = vec![descriptor("readme-summarizer", "summarize", E::Ready)];
+        let live = live_catalog(vec![live_server("notes", &["search", "append", "list"])]);
+        let inv = render_tool_inventory_with_mcp(&tools, &[mcp_view("notes", true)], &live);
+        // The installed plugin tool is still listed.
+        assert!(inv.contains("readme-summarizer/summarize"));
+        // The LIVE MCP tool names appear in the exact mcp:<server>/<tool> reference form the brain
+        // (and the agent loop) can use to name the tool — not merely the server name.
+        assert!(inv.contains("mcp:notes/search"), "live tool name in inventory: {inv}");
+        assert!(inv.contains("mcp:notes/append"));
+        assert!(inv.contains("mcp:notes/list"));
+    }
+
+    #[test]
+    fn render_with_mcp_marks_an_unavailable_server_honestly_not_dropped() {
+        // A server whose live tools/list FAILED is named with its reason (fail-closed), never
+        // dropped silently and never given a fabricated tool.
+        let live = live_catalog(vec![unavailable_server("notes", "connection refused")]);
+        let inv = render_tool_inventory_with_mcp(&[], &[mcp_view("notes", true)], &live);
+        assert!(inv.contains("notes"));
+        assert!(inv.contains("unavailable"));
+        assert!(inv.contains("connection refused"));
+        assert!(!inv.contains("mcp:notes/"), "no fabricated tool for an unreachable server");
+    }
+
+    #[test]
+    fn render_with_mcp_empty_live_catalog_matches_servers_only_rendering() {
+        // The enriched renderer with an EMPTY live catalog is byte-for-byte the servers-only
+        // renderer (the deterministic / no-discovery default), so a turn without live discovery is
+        // unaffected.
+        use relux_core::ToolExecutability as E;
+        let tools = vec![descriptor("readme-summarizer", "summarize", E::Ready)];
+        let servers = [mcp_view("fs", true), mcp_view("off", false)];
+        let enriched =
+            render_tool_inventory_with_mcp(&tools, &servers, &crate::ProposalMcpCatalog::default());
+        let servers_only = render_tool_inventory(&tools, &servers);
+        assert_eq!(enriched, servers_only);
+        // And it still names only the enabled server.
+        assert!(enriched.contains("fs"));
+        assert!(!enriched.contains("off"));
     }
 
     #[test]

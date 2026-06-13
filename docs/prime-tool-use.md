@@ -38,12 +38,18 @@ refuse.
 
 Two surfaces expose this inventory:
 
-- **In the decision prompt.** `render_tool_inventory` (in `prime_decision.rs`) renders the
-  runnable installed tools (+ the names of enabled MCP servers) into the unified decision
-  prompt, so the brain can recognise *"use the readme summarizer"* as a tool request and
-  classify the turn as `tool_invocation`. The live MCP tool **names** are not enumerated in
-  this prompt (that needs an off-lock `tools/list`); the agent loop below has the full live
-  catalog when it actually picks a tool.
+- **In the decision prompt.** `render_tool_inventory_with_mcp` (in `prime_decision.rs`) renders
+  the runnable installed tools **and the live tool names of every enabled MCP server** into the
+  unified decision prompt, so the brain can recognise both *"use the readme summarizer"* and a
+  natural-language MCP request like *"search my notes"* as a tool request and classify the turn
+  as `tool_invocation`. The live MCP tool names come from a **bounded, off-lock, TTL-cached**
+  `tools/list` run *before* the decision (`decision_time_mcp_catalog` in `server.rs`): a slow or
+  unreachable server can never hang chat (an overall timeout falls back to the last cached
+  catalog, or to naming the servers only), and a server whose discovery fails is listed as
+  *unavailable* — never given a fabricated tool. The **same** discovered catalog is reused to
+  ground the agent loop below, so a tool turn pays at most one bounded discovery (usually a cache
+  hit). With no enabled MCP server (or a discovery that yields nothing), the prompt is
+  byte-for-byte the prior installed-tools-only form.
 - **In the dashboard / over HTTP.** `GET /v1/relux/prime/tools` returns the exact runnable
   catalog the agent loop offers (`KernelState::prime_agent_catalog`), including live MCP tools.
   The Prime page renders it as the collapsible **"Tools Prime can use"** panel.
@@ -99,6 +105,30 @@ Every tool execution flows through the single existing chokepoint
    `tool_output`. A failed run is an honest `ok:false` observation with the error — never a
    fabricated success. Raw CLI / MCP envelopes never reach the user.
 
+## Continuous approval (approve → run → continue)
+
+When the agent loop pauses on a gated tool, it persists a **resumable continuation** whose
+pending-approval marker names the staged approval. The flow is then continuous, with no second
+typed prompt required from the operator:
+
+1. The chat renders the `ApprovalCard` (and the same handle drives the Board-Oversight / Inbox
+   surfaces). Nothing has run.
+2. The operator clicks **Approve & run** (or **Allow always**). That drives the **existing**
+   `/v1/relux/approvals/*` routes: `decide(approved)` then `execute`. `execute` runs the bound
+   call **once** through `execute_approved_tool_invocation`, which then calls
+   `fold_approved_into_continuation` — appending the real, shaped result to the paused
+   continuation, **clearing** its pending-approval marker, and marking the call completed.
+3. The dashboard then **automatically resumes** the loop (`POST /v1/relux/prime/agent/continue`
+   with the continuation token). Because the result is already folded in and the marker cleared,
+   the resumed loop proceeds **with the tool result in context** and Prime summarises / continues
+   — it never re-runs the completed call (the loop skips it by signature), and if it needs
+   another gated tool it pauses again with a fresh card.
+
+This is safe and adds **no new authority**: every step is an existing route behind the unchanged
+gates; **Deny** drops the continuation (`drop_continuation_for_approval`) so a refused tool can
+never resume; and when there is no continuation (e.g. a non-loop approval, or a Local brain that
+has no agent loop) the inline tool result is the answer — the chat is **never** a dead-end.
+
 ## Asking for missing input
 
 If the user names a tool but not its arguments, the brain asks for them (a clarifying turn),
@@ -114,6 +144,18 @@ argument.
   message; it runs whenever the turn is a plausible tool turn and an MCP server is enabled, so a
   natural-language request can use an MCP tool.
 - New `GET /v1/relux/prime/tools` + the dashboard "Tools Prime can use" panel.
+
+### Later additions (continuous tool use)
+
+- **Live MCP tool names in the *first* decision.** A bounded, off-lock, TTL-cached `tools/list`
+  (`decision_time_mcp_catalog`) runs before the decision and feeds `render_tool_inventory_with_mcp`,
+  so the brain's first classification sees the actual MCP tool names — not just that a server
+  exists. It is non-blocking (overall timeout → cached / servers-only fallback) and fail-closed
+  (an unreachable server is listed *unavailable*), and the same catalog grounds the agent loop
+  (one discovery per turn, usually a cache hit).
+- **Continuous approval.** After the operator approves a staged Prime tool call, the dashboard
+  auto-resumes the paused loop so Prime continues with the real result without a second typed
+  prompt (see *Continuous approval* above). The chat never dead-ends on an approval.
 
 See `docs/ARTIFICIAL_CONSTRAINT_AUDIT.md` for the lifted constraints and `docs/mcp.md` for the
 agent loop and MCP transports.

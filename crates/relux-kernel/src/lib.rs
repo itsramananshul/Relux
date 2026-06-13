@@ -136,7 +136,8 @@ pub use prime_clarify_memory::{
 };
 pub use prime_decision::{
     build_decision_prompt, build_decision_prompt_with_correction, parse_decision,
-    render_tool_inventory, run_decision_loop, run_decision_loop_with_correction, DecisionLoop,
+    render_tool_inventory, render_tool_inventory_with_mcp, run_decision_loop,
+    run_decision_loop_with_correction, DecisionLoop,
     DecisionOutcome, DecisionStep, PrimeBrainDecision, MAX_DECISION_CORRECTIONS,
     MAX_DECISION_ROUNDS,
 };

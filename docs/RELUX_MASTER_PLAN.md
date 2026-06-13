@@ -1924,6 +1924,38 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **Unreleased (on `main`, post-v0.1.29)** — **Continuous tool use: live MCP names in Prime's first
+  decision + continuous approval (approve → run → continue).** Two follow-ups to the tool-awareness
+  slice below made tool use feel like a real agent flow rather than a disconnected admin step
+  (`docs/prime-tool-use.md`; §10.1/§10.5/§17.1; reference-first per
+  `docs/reference-driven-development.md`). **(A) Live MCP tool names in the *first* decision.** The
+  decision prompt previously named only the *enabled MCP servers* (their tool names needed an
+  off-lock `tools/list` the decision stage did not run), so the brain's first classification was
+  weaker than the agent loop's. Now a **bounded, off-lock, TTL-cached** discovery
+  (`decision_time_mcp_catalog` in `server.rs`) runs *before* the decision and feeds the new
+  `render_tool_inventory_with_mcp`, so the brain sees the actual MCP tool names (in `mcp:<server>/<tool>`
+  form) and can classify a natural-language MCP request. It is **non-blocking** (an overall timeout
+  falls back to the last cached catalog, or to naming the servers only) and **fail-closed** (an
+  unreachable server is listed *unavailable*, never given a fabricated tool); the **same** catalog is
+  reused to ground the agent loop, so a tool turn pays at most one bounded discovery (usually a cache
+  hit). An empty/absent catalog renders byte-for-byte the prior servers-only prompt. **(B) Continuous
+  approval.** When the agent loop paused on a gated tool, the operator had to approve *and then
+  manually* send another message to resume. Now, after **Approve & run** / **Allow always** runs the
+  bound call through the unchanged `/v1/relux/approvals/*` routes (`execute_approved_tool_invocation`
+  → `fold_approved_into_continuation` folds the real result in and clears the pause), the dashboard
+  **auto-resumes** the paused loop (`POST /v1/relux/prime/agent/continue`), so Prime continues with the
+  result **without a second typed prompt**. **No gate weakened:** nothing is auto-approved, **Deny**
+  still drops the continuation, the resumed loop runs behind the same gates and never re-runs the
+  completed call, and a turn with no continuation simply shows the inline result (never a dead-end).
+  `cargo test` + `clippy --all-targets` clean on `relux-kernel` (new: `render_with_mcp_*` enumerate /
+  fail-closed / empty-equals-servers-only, `decision_time_mcp_catalog_*` empty-when-disabled +
+  fail-closed-on-unreachable + cache-reuse; the existing `approved_tool_result_folds_into_the_waiting_continuation`
+  pins the resume foundation); dashboard typecheck + 601 tests + build green, `dashboard-dist` rebuilt
+  in sync (new `prime-approval-continuation-render.test.mjs`). **Files:**
+  `crates/relux-kernel/src/prime_decision.rs`, `crates/relux-kernel/src/server.rs`,
+  `crates/relux-kernel/src/lib.rs`, `apps/dashboard/src/pages/Prime.tsx`,
+  `apps/dashboard/test/prime-approval-continuation-render.test.mjs`, `docs/prime-tool-use.md`. No
+  release cut; no master-plan safety property is weakened.
 - **Unreleased (on `main`, post-v0.1.29)** — **Prime tool/plugin awareness + brain-driven tool use
   (closes the "installed tool is unusable from chat" gap).** Installing/configuring a plugin tool was
   largely inert: Prime would only use a tool if the *deterministic keyword classifier* matched the
