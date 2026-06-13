@@ -1063,6 +1063,52 @@ export function managedStdioStatusBadge(
   }
 }
 
+// ── "Prime can use this now" cue (post-configure) ─────────────────────────────
+// docs/prime-tool-use.md "The verified install → use path" (§4 See it / §5 Use it)
+// + the "Tools Prime can use" catalog; RELUX_MASTER_PLAN §11.6 + §10.1/§10.5/§17.1.
+// The moment an operator configures a runnable tool (a governed command tool, or a
+// classified MCP tool), the honest next thing is that PRIME can run it from chat —
+// not "find it in a list" and a dead end. This derives the cue from the configured
+// tool: the EXACT natural-language phrase to try at Prime, plus an honest gated note.
+// Pure (no DOM / fetch) so `node --test` can pin the copy; the page renders whatever
+// this returns and invents nothing.
+//
+// Honesty rule (mirrors openclaw's single-classifier discipline — a gated tool is
+// never presented as auto-approved): a freshly configured command tool / classified
+// MCP tool is ALWAYS gated until invoked, so the cue says Prime can use it now AND
+// that the first call pauses for your approval — it never claims auto-run.
+export type PrimeUseCueKind = "command_tool" | "mcp_server";
+
+export interface PrimeUseCue {
+  // The headline state cue.
+  headline: string;
+  // The exact natural-language phrase to type at Prime to use it.
+  phrase: string;
+  // One honest sentence: it is gated, so the first call pauses for approval.
+  detail: string;
+}
+
+export function primeUseCue(
+  toolName: string,
+  kind: PrimeUseCueKind = "command_tool",
+): PrimeUseCue {
+  const name = toolName.trim() || "the tool";
+  if (kind === "mcp_server") {
+    return {
+      headline: "Prime can use this now.",
+      phrase: `use the ${name} tools`,
+      detail:
+        "Discover its tools above (or Prime discovers them live), then ask Prime in chat. A discovered tool stays gated — the first call pauses for your approval before anything runs.",
+    };
+  }
+  return {
+    headline: "Prime can use this now.",
+    phrase: `run the ${name} tool`,
+    detail:
+      "It is in the inventory of tools Prime can run from chat. It is approval-gated, so the first time you ask, Prime pauses for your approval — it then runs argv-only with a timeout and the output is audited. Nothing runs until you approve.",
+  };
+}
+
 export interface VisibleTools {
   shown: ReluxToolDescriptor[];
   hiddenCount: number;

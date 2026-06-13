@@ -33,6 +33,7 @@ import {
   validateCommandToolDraft,
   parseCommandArgs,
   capabilitySummary,
+  primeUseCue,
 } from "../src/plugins.ts";
 
 // The Plugins page must read HONESTLY: a generated metadata-only wrapper is never
@@ -971,4 +972,30 @@ test("capabilitySummary counts command-tool candidates separately from manual/on
   assert.equal(s.oneClick, 1);
   assert.equal(s.commandTool, 1);
   assert.equal(s.manual, 1);
+});
+
+// docs/prime-tool-use.md "The verified install → use path" §4/§5 + "Tools Prime can
+// use": after configuring a runnable tool, the page owes the operator a clear "Prime
+// can use this now" cue with the EXACT chat phrase to try — and an honest gated note
+// (the first call pauses for approval; it never claims auto-run).
+test("primeUseCue gives the natural chat phrase for a command tool + an honest gated note", () => {
+  const cue = primeUseCue("repo.build", "command_tool");
+  assert.match(cue.headline, /Prime can use this now/i);
+  assert.match(cue.phrase, /run the repo\.build tool/);
+  // Honest: gated, pauses for approval, nothing runs until approved — never "auto".
+  assert.match(cue.detail, /approval/i);
+  assert.match(cue.detail, /Nothing runs until you approve/i);
+  assert.doesNotMatch(cue.detail, /auto-?run/i);
+});
+
+test("primeUseCue's MCP variant points at discovery and stays honest about gating", () => {
+  const cue = primeUseCue("cool-mcp", "mcp_server");
+  assert.match(cue.phrase, /use the cool-mcp tools/);
+  assert.match(cue.detail, /[Dd]iscover/);
+  assert.match(cue.detail, /gated/i);
+});
+
+test("primeUseCue defaults to the command-tool phrasing and tolerates a blank name", () => {
+  assert.match(primeUseCue("x").phrase, /run the x tool/);
+  assert.match(primeUseCue("  ").phrase, /run the the tool tool/);
 });

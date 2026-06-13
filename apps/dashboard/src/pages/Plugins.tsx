@@ -5,10 +5,12 @@ import {
   reluxMcp,
   reluxPluginRuntime,
   reluxPlugins,
+  reluxPrime,
   reluxSecrets,
   reluxTools,
   reluxWork,
   type ReluxAdapterStatus,
+  type ReluxPrimeToolView,
   type ReluxManagedStdioStatus,
   type ReluxSecretStatus,
   type ReluxManifestTemplate,
@@ -56,6 +58,7 @@ import {
   pluginKindLabel,
   pluginNextStep,
   pluginStatus,
+  primeUseCue,
   toolReadiness,
   validateMcpRegisterDraft,
   visibleTools,
@@ -67,6 +70,7 @@ import {
   type StatusVariant,
   type ToolReadiness,
   type CommandToolDraft,
+  type PrimeUseCueKind,
 } from "../plugins";
 import {
   buildToolPickerOptions,
@@ -2920,6 +2924,56 @@ export function DetectedCapabilities({
   );
 }
 
+// The honest success state after configuring a runnable tool (docs/prime-tool-use.md
+// "The verified install → use path" §4 See it / §5 Use it; RELUX_MASTER_PLAN §11.6,
+// §10.1/§10.5/§17.1). It closes the loop the page used to leave open — "saved, now
+// what?" — by saying clearly that PRIME can use it from chat, giving the exact phrase
+// to try, linking to Prime, and re-pulling the EXACT runnable catalog Prime is handed
+// (GET /v1/relux/prime/tools) so the operator sees the tool land. It claims nothing it
+// can't back: a command tool is named gated (the first call pauses for approval), and
+// if the re-pull does not yet list the tool the banner says so honestly rather than
+// faking "ready". Read-only — it never invokes anything. Exported for the render
+// harness (prime-use-cue-render.test.mjs).
+export function PrimeCanUseNowBanner({
+  toolName,
+  kind,
+}: {
+  toolName: string;
+  kind: PrimeUseCueKind;
+}) {
+  const cue = primeUseCue(toolName, kind);
+  const catalog = useAsync<ReluxPrimeToolView[]>(() => reluxPrime.tools(), [toolName]);
+  // A command tool lands directly in Prime's catalog; an MCP server's tools only
+  // appear after discovery, so absence there is honest, not a failure.
+  const listed = (catalog.data ?? []).some((t) => t.tool_name === toolName);
+
+  return (
+    <div className="banner ok" style={{ fontSize: 11, margin: "6px 0 0" }}>
+      <strong>{cue.headline}</strong>
+      <div style={{ marginTop: 4 }}>
+        Try it in Prime chat: <span className="mono">{cue.phrase}</span>
+      </div>
+      <div className="muted" style={{ marginTop: 4 }}>{cue.detail}</div>
+      <div className="muted" style={{ marginTop: 4 }}>
+        {catalog.loading
+          ? "Refreshing the tools Prime can use…"
+          : catalog.error
+            ? "Saved. (Could not re-pull Prime's tool list just now — open Prime to confirm.)"
+            : kind === "mcp_server"
+              ? "Saved. Its tools join the set Prime can use once you Discover them above."
+              : listed
+                ? "✓ It now appears in the tools Prime can use."
+                : "Saved. It joins the tools Prime can use once its runtime/permission is in place."}
+      </div>
+      <div className="row wrap" style={{ gap: 8, marginTop: 6 }}>
+        <Link className="btn sm" to="/prime" title="Open Prime chat and ask it to use this tool">
+          Open Prime
+        </Link>
+      </div>
+    </div>
+  );
+}
+
 // One detected capability candidate. An MCP candidate offers a one-click, pre-filled
 // "Configure" that opens the EXISTING AddMcpServerForm (loopback-only registry); a
 // command-line candidate expands to its honest manual next steps. Nothing here runs
@@ -2933,7 +2987,9 @@ function CapabilityCard({
 }) {
   const [open, setOpen] = useState(false);
   const [registered, setRegistered] = useState(false);
-  const [configured, setConfigured] = useState(false);
+  // The configured command tool's name (null until configured) — drives the honest
+  // "Prime can use this now" cue with the exact chat phrase to try.
+  const [configuredTool, setConfiguredTool] = useState<string | null>(null);
   const oneClick = isOneClickCandidate(candidate);
   const commandTool = isCommandToolCandidate(candidate);
   const confidence = candidateConfidenceBadge(candidate.confidence);
@@ -3008,10 +3064,16 @@ function CapabilityCard({
               expected={candidate.env_placeholders}
             />
           ) : (
-            <p className="banner ok" style={{ fontSize: 11, margin: "6px 0 0" }}>
-              MCP server registered. Open the <strong>MCP servers</strong> section above
-              and click <strong>Discover</strong> to list its tools through the gate.
-            </p>
+            <>
+              <p className="banner ok" style={{ fontSize: 11, margin: "6px 0 0" }}>
+                MCP server registered. Open the <strong>MCP servers</strong> section above
+                and click <strong>Discover</strong> to list its tools through the gate.
+              </p>
+              <PrimeCanUseNowBanner
+                toolName={candidate.mcp_registration.suggested_id}
+                kind="mcp_server"
+              />
+            </>
           )
         ) : open ? (
           <div style={{ marginTop: 8 }}>
@@ -3036,21 +3098,17 @@ function CapabilityCard({
           </button>
         )
       ) : commandTool && candidate.command_tool ? (
-        configured ? (
-          <p className="banner ok" style={{ fontSize: 11, margin: "6px 0 0" }}>
-            Command tool configured. Find it in the <strong>Tools</strong> list above —
-            it requires approval to invoke, runs argv-only with a timeout, and shows its
-            output.
-          </p>
+        configuredTool ? (
+          <PrimeCanUseNowBanner toolName={configuredTool} kind="command_tool" />
         ) : open ? (
           <div style={{ marginTop: 8 }}>
             <ConfigureCommandToolForm
               plugin={plugin}
               candidate={candidate}
               onClose={() => setOpen(false)}
-              onConfigured={() => {
+              onConfigured={(toolName) => {
                 setOpen(false);
-                setConfigured(true);
+                setConfiguredTool(toolName);
               }}
             />
           </div>
@@ -3101,7 +3159,9 @@ function ConfigureCommandToolForm({
   // Absent ⇒ a from-scratch, blank form for a source-only plugin with no candidate.
   candidate?: ReluxCapabilityCandidate;
   onClose: () => void;
-  onConfigured: () => void;
+  // Receives the configured tool's name so the caller can show the "Prime can use
+  // this now" cue with the exact chat phrase.
+  onConfigured: (toolName: string) => void;
 }) {
   const [draft, setDraft] = useState<CommandToolDraft>(() =>
     candidate ? commandToolDraftFromCandidate(candidate) : emptyCommandToolDraft(),
@@ -3119,9 +3179,10 @@ function ConfigureCommandToolForm({
     }
     setBusy(true);
     setErr(null);
+    const input = commandToolInputFromDraft(draft);
     try {
-      await reluxPlugins.configureCommandTool(plugin.id, commandToolInputFromDraft(draft));
-      onConfigured();
+      await reluxPlugins.configureCommandTool(plugin.id, input);
+      onConfigured(input.name);
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Could not configure the command tool.");
     } finally {
@@ -3230,6 +3291,10 @@ function AddCommandToolSection({
   onConfigured: () => void;
 }) {
   const [open, setOpen] = useState(false);
+  // The just-configured tool name (null until configured) — drives the honest "Prime
+  // can use this now" cue with the exact chat phrase, so a from-scratch configure is
+  // never a silent close with no feedback.
+  const [configuredTool, setConfiguredTool] = useState<string | null>(null);
   // A bundled/protected first-class plugin owns its tools — never offer the form there.
   if (plugin.protected || plugin.bundled) return null;
   return (
@@ -3250,12 +3315,26 @@ function AddCommandToolSection({
         <strong>argv-only</strong> (never through a shell), confined to this plugin's
         install directory, only through approval. Defining it runs nothing.
       </p>
-      {open ? (
+      {configuredTool ? (
+        <>
+          <PrimeCanUseNowBanner toolName={configuredTool} kind="command_tool" />
+          <div style={{ marginTop: 8 }}>
+            <button
+              className="btn ghost sm"
+              onClick={() => setConfiguredTool(null)}
+              title="Define another command tool on this plugin"
+            >
+              Add another command tool…
+            </button>
+          </div>
+        </>
+      ) : open ? (
         <ConfigureCommandToolForm
           plugin={plugin}
           onClose={() => setOpen(false)}
-          onConfigured={() => {
+          onConfigured={(toolName) => {
             setOpen(false);
+            setConfiguredTool(toolName);
             onConfigured();
           }}
         />
