@@ -557,6 +557,63 @@ The full run controls (live progress, cancel, restart-honest resume) stay on the
 operative's open/running brief counts. The chat card is the entry point that makes the
 fan-out legible the moment Prime creates it.
 
+## Authoring a tool-glue ability plan (the execute_code foundation)
+
+> Spec refs: `docs/RELUX_MASTER_PLAN.md` §23 (Tool-Glue Programs, the `execute_code`
+> foundation); `docs/HERMES_OPENCLAW_DEEP_AUDIT.md` §2. Code: `relux_core::tool_glue`
+> (`ground_tool_glue_plan`), `KernelState::preview_tool_glue_plan`, the route
+> `POST /v1/relux/prime/glue/preview`, and the dashboard
+> `apps/dashboard/src/pages/Prime.tsx` (`ToolGluePreviewPanel`) +
+> `apps/dashboard/src/toolglue.ts`.
+
+The **Prime abilities** panel above shows the tools Prime can run *one at a time* from
+chat. A **tool-glue program** is the next step up: an ordered multi-step plan — the
+structured-program analogue of the keyword `tool_plan` path — where the brain (or, today,
+the operator) writes the `(plugin, tool, args)` steps directly and the kernel is the
+deterministic validator. The first safe slice is the **grounding + inert preview**; the
+sandboxed script runtime is future work (§23).
+
+The Prime page exposes it as a small, collapsed-by-default **"Tool glue — multi-step
+ability plan (preview)"** panel, right below the abilities inventory:
+
+1. **Author.** The operator writes a goal and a program two ways:
+   - **Paste or edit structured steps** — a JSON array of `{ plugin, tool, args? }`. The
+     pure `parseGlueSteps` (`apps/dashboard/src/toolglue.ts`) validates the *shape* and
+     fails closed BEFORE any POST (not an array, a step missing plugin/tool, bad JSON —
+     each named to the row), the same way `toolruntask.ts` guards the single-tool path.
+   - **Build from known Prime abilities** — clicking an inventory tool appends it as a
+     step (`appendAbilityStep`, non-destructive: it never clobbers hand-edited JSON). The
+     ability list is the SAME `GET /v1/relux/prime/tools` catalog the chat brain is handed,
+     so a step can only ever name a tool Prime was actually shown.
+2. **Preview (INERT).** *Preview plan* POSTs `{ goal, steps, extended }` to
+   `POST /v1/relux/prime/glue/preview` (`reluxPrime.previewGlue`). The kernel grounds every
+   step against the live catalog (installed plugin tools, the manifestless **Plugin Lens**
+   source tools, governed command tools, and live MCP tools discovered off-lock) and returns
+   the **same `PrimeToolPlanProposal`** the keyword path produces. Previewing **creates
+   nothing and runs nothing**.
+3. **See it honestly.** The result renders through the **existing `ToolPlanCard`** — the
+   identical readiness/gating labels: a `ready` step, a `needs approval` gated step, a
+   `needs permission` / `not runnable` step, and an **`unknown tool`** step (a tool not in
+   the catalog) shown as such and **never hidden**. An unknown (or any blocking) step forces
+   `ready_to_create: false`, and the blocking reason is listed under *Before this can be
+   created*. The `extended` checkbox raises the step bound to the configured
+   `PrimeAgentPolicy` extended limit (standard 16 / extended 64) — an over-long program is
+   reported, never silently truncated.
+4. **Commit (the one existing path).** The only way to act on the plan is the card's single
+   **Create tool-run task** button, which POSTs the validated steps to the **unchanged**
+   `tool_plan` task path (`reluxWork.createTask`). Even then nothing RUNS until the task is
+   started, and each step still flows through the single `prime_invoke_tool` → `invoke_tool`
+   gate (permission → approval/grant → execute) at run time. There is **no second execution
+   model and no generic shell runner** — the glue preview is just a brain-authored way to
+   compose the same governed multi-tool task.
+
+**Safety:** the preview is read-only and fail-closed; the grounding never downgrades a gate
+or fabricates a capability the operator was not shown; the commit is the existing gated
+`tool_plan` task. **Reference-driven** (`docs/reference-driven-development.md`): this mirrors
+Hermes' `tools/code_execution_tool.py` allowlist-before-dispatch posture — every tool name is
+validated against the live catalog (the Relux analogue of `SANDBOX_ALLOWED_TOOLS`) before
+anything is offered for commit.
+
 ## The verified install → use path (end-to-end)
 
 This is the path a regression test pins end-to-end, route for route — the same sequence

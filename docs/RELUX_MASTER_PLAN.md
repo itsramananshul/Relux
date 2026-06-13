@@ -5070,6 +5070,30 @@ pinned to the existing multi-tool path — **not a second execution model**:
   `{ "goal", "steps": [{ "plugin", "tool", "args"? }], "extended"? }`. Live MCP
   `tools/list` discovery runs off-lock exactly like `GET /v1/relux/prime/tools`.
 
+### Product exposure (shipped)
+
+The grounding surface now has a product entry point on the Prime page — a small,
+collapsed-by-default **"Tool glue — multi-step ability plan (preview)"** panel
+(`apps/dashboard/src/pages/Prime.tsx` `ToolGluePreviewPanel`), sitting just below the
+**Prime abilities** inventory:
+
+- The operator authors a program two ways: **paste/edit structured steps** (a JSON
+  array of `{ plugin, tool, args? }`) or **build from known Prime abilities** by
+  clicking the inventory tools (the same `GET /v1/relux/prime/tools` catalog), which
+  append a step non-destructively (`apps/dashboard/src/toolglue.ts`
+  `appendAbilityStep`). The pure `parseGlueSteps` fails closed on a malformed shape
+  *before* any POST, mirroring `toolruntask.ts`.
+- **Preview plan** POSTs `{ goal, steps, extended }` via `reluxPrime.previewGlue`
+  (`api.ts`) and renders the returned `PrimeToolPlanProposal` through the **existing
+  `ToolPlanCard`** — the SAME readiness/gating labels the keyword path uses, with
+  unknown tools shown as `unknown tool` (never hidden) and gated steps as `needs
+  approval`. An unknown step forces `ready_to_create: false`, so the commit button
+  stays disabled until the program is clean.
+- The card is **INERT**: previewing creates and runs nothing. The only commit is the
+  existing one-click `tool_plan` task (`reluxWork.createTask`) on the rendered card,
+  with its unchanged permission/approval/grant/audit gates at run time — no new
+  execution model. See `docs/prime-tool-use.md` "Authoring a tool-glue ability plan".
+
 ### What remains (next slices)
 
 - **The sandboxed script runtime** itself (Hermes' RPC-from-script): a real
@@ -5079,8 +5103,6 @@ pinned to the existing multi-tool path — **not a second execution model**:
   subsystem the audit flags as "high leverage but a real subsystem"; the grounding
   + commit path shipped here is its safe foundation.
 - **Wiring the brain to author glue programs inside a chat turn** (today the
-  grounding surface is an explicit route; the chat-turn integration that has Prime
-  emit and commit a grounded program is a follow-up).
-- **A dashboard card** for the glue-preview surface (the backend + route + the
-  shared `PrimeToolPlanProposal` rendering exist; a dedicated UI entry point is a
-  later slice).
+  grounding surface is an explicit route + the operator-driven preview panel; the
+  chat-turn integration that has Prime emit and commit a grounded program from a
+  natural-language goal is a follow-up).

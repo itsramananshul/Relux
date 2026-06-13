@@ -1886,6 +1886,22 @@ export interface ReluxPrimeToolView {
   gated: boolean;
 }
 
+// One step of a brain-authored / operator-edited tool-glue PROGRAM posted to the
+// glue-preview surface (RELUX_MASTER_PLAN §23, the `execute_code` foundation). It mirrors
+// `relux_core::ProposedGlueStep` — the `(plugin, tool, args)` triple. `args` defaults to
+// `{}` server-side when omitted. A step is a PROPOSAL, never a command: the preview grounds
+// it against the live catalog and the only path that runs it is the explicit operator
+// commit through the existing gated `tool_plan` task.
+export interface ReluxProposedGlueStep {
+  // The plugin id the step targets (a real installed plugin id, or `mcp:<server>` for an
+  // MCP-backed tool — the same namespacing the gated `call_tool` path uses).
+  plugin: string;
+  // The tool name on that plugin.
+  tool: string;
+  // The JSON arguments to forward verbatim; omitted => `{}` server-side.
+  args?: unknown;
+}
+
 export const reluxPrime = {
   // Send one message to Prime. Throws an ApiError on failure so the chat can
   // show the real reason (e.g. "relux-kernel serve" not running).
@@ -1893,6 +1909,20 @@ export const reluxPrime = {
   // The inventory of tools Prime can run from chat (installed + live MCP, with gated/ready status).
   // Powers the "Tools Prime can use" panel; the discovery of live MCP tools runs server-side.
   tools: () => api.get<ReluxPrimeToolView[]>("/v1/relux/prime/tools"),
+  // Ground a brain-authored / operator-edited tool-glue program (RELUX_MASTER_PLAN §23, the
+  // `execute_code` foundation) into an INERT, catalog-validated `ReluxPrimeToolPlanProposal`.
+  // POSTs `{ goal, steps, extended }` to `/v1/relux/prime/glue/preview`. The preview creates
+  // nothing and runs nothing — an unknown tool comes back `readiness: "unknown"` and forces
+  // `ready_to_create: false` (never fabricated), gated tools keep their gate, and the step
+  // bound is the configured PrimeAgentPolicy limit (standard vs `extended`). The operator
+  // commits the result through the EXISTING one-click `tool_plan` task path with its unchanged
+  // permission / approval / grant / audit gates — the same `ToolPlanCard` the keyword path uses.
+  previewGlue: (goal: string, steps: ReluxProposedGlueStep[], extended = false) =>
+    api.post<ReluxPrimeToolPlanProposal>("/v1/relux/prime/glue/preview", {
+      goal,
+      steps,
+      extended,
+    }),
   // Clear this conversation's bounded memory (recent-turn history + any pending
   // clarification). Drops only advisory context — no task/run/agent is touched.
   reset: () => api.post<{ cleared: boolean }>("/v1/relux/prime/reset", {}),

@@ -23,6 +23,7 @@ import {
   type ReluxToolDescriptor,
   type ReluxToolInvocationResult,
 } from "../api";
+import { appendAbilityStep, EMPTY_GLUE_STEPS_TEXT, parseGlueSteps } from "../toolglue";
 import {
   orchestrationStatusTone,
   orchestrationProgressLabel,
@@ -315,6 +316,13 @@ export function Prime() {
           it?" has a visible, honest answer right on the chat page (docs/prime-tool-use.md). */}
       <PrimeToolInventoryPanel onAsk={stagePrompt} />
 
+      {/* The execute_code FOUNDATION (RELUX_MASTER_PLAN §23): an operator can author a
+          multi-step "tool glue" ability plan — paste/edit structured steps or add known
+          abilities — and PREVIEW it. The preview is INERT (it grounds each step against the
+          live catalog and shows readiness/gating + unknown tools honestly); nothing is
+          created or run until the same explicit tool_plan commit the keyword path uses. */}
+      <ToolGluePreviewPanel busy={busy} />
+
       {/* Advanced controls: Prime Autonomy (the self-driving tick loop) and
           multi-agent Orchestration. Collapsed by default so they never block the
           chat (§11.1) — still one click away below the input. */}
@@ -429,6 +437,187 @@ function PrimeToolInventoryPanel({ onAsk }: { onAsk: (message: string) => void }
             ))}
           </div>
         )}
+      </div>
+    </details>
+  );
+}
+
+// The execute_code FOUNDATION surface (RELUX_MASTER_PLAN §23): a small, collapsed-by-default
+// affordance that lets the operator author a multi-step "tool glue" ability plan and PREVIEW
+// it. The operator pastes/edits a STRUCTURED program (a JSON array of { plugin, tool, args? })
+// or builds one by clicking known Prime abilities; "Preview plan" POSTs it to the inert
+// `POST /v1/relux/prime/glue/preview` surface (`reluxPrime.previewGlue`), which grounds every
+// step against the live tool catalog and returns the SAME `ReluxPrimeToolPlanProposal` the
+// keyword path produces. The result renders through the EXISTING `ToolPlanCard` — same
+// readiness/gating labels, unknown tools shown as unknown (never hidden), and the same single
+// explicit "Create tool-run task" commit (nothing is created or run by previewing). This adds
+// no new execution model: it is the brain-authored analogue of the keyword tool-plan path,
+// committed through the unchanged gated tool_plan task.
+export function ToolGluePreviewPanel({ busy }: { busy: boolean }) {
+  const [goal, setGoal] = useState("");
+  const [stepsText, setStepsText] = useState(EMPTY_GLUE_STEPS_TEXT);
+  const [extended, setExtended] = useState(false);
+  const [abilities, setAbilities] = useState<ReluxPrimeToolView[] | null>(null);
+  const [proposal, setProposal] = useState<ReluxPrimeToolPlanProposal | null>(null);
+  const [previewing, setPreviewing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const abilitiesLoadedRef = useRef(false);
+
+  // Load the known abilities lazily the first time the panel is opened (it is collapsed by
+  // default), so building from a known ability has options without a duplicate mount fetch.
+  async function loadAbilities() {
+    if (abilitiesLoadedRef.current) return;
+    abilitiesLoadedRef.current = true;
+    try {
+      setAbilities(await reluxPrime.tools());
+    } catch {
+      // The abilities chooser is a convenience; a failure here never blocks pasting steps.
+      setAbilities([]);
+    }
+  }
+
+  function addAbility(plugin: string, tool: string) {
+    setStepsText((t) => appendAbilityStep(t, plugin, tool));
+    // Adding a step invalidates the last preview — it described a different program.
+    setProposal(null);
+  }
+
+  async function preview() {
+    if (previewing) return;
+    setError(null);
+    const trimmedGoal = goal.trim();
+    if (!trimmedGoal) {
+      setError("Describe the goal this program is for.");
+      return;
+    }
+    const parsed = parseGlueSteps(stepsText);
+    if (!parsed.ok) {
+      setError(parsed.error);
+      return;
+    }
+    setPreviewing(true);
+    try {
+      const result = await reluxPrime.previewGlue(trimmedGoal, parsed.steps, extended);
+      setProposal(result);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not preview the tool-glue plan");
+    } finally {
+      setPreviewing(false);
+    }
+  }
+
+  return (
+    <details
+      className="prime-advanced"
+      onToggle={(e) => {
+        if (e.currentTarget.open) void loadAbilities();
+      }}
+    >
+      <summary>Tool glue — multi-step ability plan (preview)</summary>
+      <div className="prime-advanced-body">
+        <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
+          Author a multi-step plan from Prime's abilities, then{" "}
+          <strong>preview</strong> it. Paste or edit the structured steps (a JSON array of{" "}
+          <span className="mono">{`{ plugin, tool, args? }`}</span>) or add a known ability below.
+          Previewing grounds every step against the live tool catalog and{" "}
+          <strong>creates and runs nothing</strong> — an unknown tool shows as{" "}
+          <span className="badge err" style={{ fontSize: 9 }}>unknown tool</span> and a gated one
+          as <span className="badge in_review" style={{ fontSize: 9 }}>needs approval</span>. You
+          commit it with the same explicit one-click tool-run task the chat uses.
+        </div>
+
+        <label className="muted" style={{ fontSize: 11, display: "block", marginBottom: 2 }}>
+          Goal
+        </label>
+        <input
+          className="input"
+          style={{ width: "100%", marginBottom: 8 }}
+          placeholder="e.g. inspect the repo, then summarise what it does"
+          value={goal}
+          onChange={(e) => {
+            setGoal(e.target.value);
+            setProposal(null);
+          }}
+        />
+
+        {abilities && abilities.length > 0 && (
+          <div style={{ marginBottom: 8 }}>
+            <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>
+              Add a known ability as a step:
+            </div>
+            <div className="row wrap" style={{ gap: 6 }}>
+              {abilities.map((t) => (
+                <button
+                  key={t.label}
+                  className="btn ghost sm"
+                  onClick={() => addAbility(t.plugin_id, t.tool_name)}
+                  title={`Append ${t.label} as a step${t.gated ? " (needs approval to run)" : ""}`}
+                >
+                  + {t.label}
+                  {t.gated && (
+                    <span className="badge in_review" style={{ fontSize: 8, marginLeft: 4 }}>
+                      needs approval
+                    </span>
+                  )}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+        {abilities && abilities.length === 0 && (
+          <div className="muted" style={{ fontSize: 11, marginBottom: 8 }}>
+            No known abilities to add yet — install a plugin or register an MCP server on the{" "}
+            <Link to="/plugins">Plugins</Link> page, or paste steps below by hand.
+          </div>
+        )}
+
+        <label className="muted" style={{ fontSize: 11, display: "block", marginBottom: 2 }}>
+          Steps (JSON array of {`{ plugin, tool, args? }`})
+        </label>
+        <textarea
+          className="input mono"
+          style={{ width: "100%", minHeight: 96, fontSize: 12 }}
+          spellCheck={false}
+          value={stepsText}
+          onChange={(e) => {
+            setStepsText(e.target.value);
+            setProposal(null);
+          }}
+        />
+
+        <div className="row wrap" style={{ gap: 10, alignItems: "center", marginTop: 8 }}>
+          <button
+            className="btn"
+            style={{ fontSize: 12, padding: "4px 12px" }}
+            disabled={busy || previewing}
+            onClick={() => void preview()}
+            title="Ground these steps against the live catalog (nothing is created or run)"
+          >
+            {previewing ? "Previewing…" : "Preview plan"}
+          </button>
+          <label className="muted row" style={{ fontSize: 11, gap: 4, alignItems: "center" }}>
+            <input
+              type="checkbox"
+              checked={extended}
+              onChange={(e) => {
+                setExtended(e.target.checked);
+                setProposal(null);
+              }}
+            />
+            Extended step limit
+          </label>
+          <span className="muted" style={{ fontSize: 10, fontStyle: "italic" }}>
+            Preview only — nothing runs.
+          </span>
+        </div>
+
+        {error && (
+          <div className="banner err" style={{ fontSize: 11, marginTop: 8 }}>
+            {error}
+          </div>
+        )}
+
+        {proposal && <ToolPlanCard proposal={proposal} busy={busy} />}
       </div>
     </details>
   );
@@ -2620,7 +2809,7 @@ function compactArgs(args: unknown): string {
 // EXISTING tool_plan task-create route (reluxWork.createTask); the usual
 // permission/approval/grant gates still apply at run time. The card invents no step
 // (§10.5, §17.1).
-function ToolPlanCard({ proposal, busy }: { proposal: ReluxPrimeToolPlanProposal; busy: boolean }) {
+export function ToolPlanCard({ proposal, busy }: { proposal: ReluxPrimeToolPlanProposal; busy: boolean }) {
   const [creating, setCreating] = useState(false);
   const [createdId, setCreatedId] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
