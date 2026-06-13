@@ -458,6 +458,43 @@ it**) and openclaw's single-classifier confirmation discipline
 (`reference/openclaw-main/src/acp/approval-classifier.ts`): one deterministic function
 decides, and the stateful path is always confirmation-gated, never auto-run.
 
+## Hiring an operative (from chat)
+
+> Spec refs: `docs/RELUX_MASTER_PLAN.md` §6 (the canonical hire exchange), §7.3 (an agent
+> has an adapter plugin + permissions), §7.5 (granting permissions is a reviewed action),
+> §8.1 (the adapter catalog); reference: openclaw `src/agents/tools/common.ts`
+> (`normalizeToolModelOverride` — a backend preference is honored only when it resolves).
+
+Prime can **hire an operative** from chat: *"make a coding agent for this repo"*, *"hire a
+research agent named researcher that uses Claude"*. The deterministic classifier
+(`creates_an_operative`, a **fallback rail only**) reads a natural hire phrasing as
+`AgentCreation`; a message that merely *references* an agent stays a task. Two things are
+resolved honestly, and **nothing risky is auto-done**:
+
+- **Adapter preference.** *"uses Claude"* / *"run codex on this"* / a verbatim adapter id is
+  honored **only when that adapter plugin is installed** (`resolve_adapter_preference`
+  against the live adapter roster). A named-but-uninstalled adapter falls back to the local
+  adapter with an honest caveat — Prime never invents or enables an adapter. The operative is
+  always created on a real, resolved adapter (default `relux-adapter-local-prime`).
+- **Capability honesty.** *"that can read GitHub"* / *"…and run shell commands"* is **not**
+  silently dropped and **not** granted on creation. The operative is created with **no
+  permissions**; Prime names the scoped permission it would need and offers the grant as a
+  **separate, approval-gated follow-up** (the unchanged `PermissionChange` path). No access
+  is fabricated.
+
+**In the dashboard** (`apps/dashboard/src/pages/Prime.tsx` `AgentCreatedCard`, built from the
+pure `agentCreatedView` in `apps/dashboard/src/prime.ts`): a real hire turn renders a
+**result card** — the new operative's name/id, the **adapter it runs on** (human brand +
+raw id), any brain-shaped role/persona, and a clear **"View in Crew"** link plus a
+**"Give it work"** assignment pre-fill. When the user asked for a sensitive capability the
+card shows it as **needing setup** with a *"Grant &lt;X&gt; access to &lt;agent&gt;"* button
+that pre-fills the approval-gated grant — clicking it can do nothing the user could not type,
+and **nothing is granted until the approval is greenlit**. Casual ideation and a
+duplicate-name refusal carry no `created_agent`, so they render as **normal chat**, never an
+action card. The operative then shows up on **Crew** (`CrewMemberCard`) with its adapter
+brand, status, Lead/reporting line, skills/persona, and least-privilege permissions — and the
+card renders cleanly even when an optional field is missing.
+
 ## The verified install → use path (end-to-end)
 
 This is the path a regression test pins end-to-end, route for route — the same sequence

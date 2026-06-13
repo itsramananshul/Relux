@@ -38,8 +38,17 @@ import {
 import { parseSkillsInput, formatSkillsInput } from "../skills";
 import { applyPreset, presetFieldsDirty } from "../presets";
 import { managerOptions, leadLabel, directReportsSummary } from "../hierarchy";
+import { adapterBrandLabel } from "../prime";
 
 type Agent = ReluxAgent;
+
+// A created_at that isn't a parseable date must not throw inside render — a missing/odd
+// value falls back to the raw string (or an em dash). Module-level + pure so the Crew
+// member card can be rendered and unit-tested in isolation.
+export function createdLabel(raw: string): string {
+  const d = new Date(raw);
+  return Number.isNaN(d.getTime()) ? raw || "—" : d.toLocaleString();
+}
 
 // NOTE: this page deliberately does NOT use react-router's `useLoaderData()`.
 // The SPA mounts under a plain <BrowserRouter> (a declarative router, not a data
@@ -103,12 +112,6 @@ export function Crew() {
     reloadTasks(); // and the per-agent task counts
   };
 
-  // A created_at that isn't a parseable date must not throw inside render.
-  const createdLabel = (raw: string): string => {
-    const d = new Date(raw);
-    return Number.isNaN(d.getTime()) ? raw || "—" : d.toLocaleString();
-  };
-
   return (
     <div className="crew-page">
       <div className="section">
@@ -159,57 +162,13 @@ export function Crew() {
                   />
                 </div>
               ) : (
-                <div key={agent.id} className="agent-card">
-                  <h3>{agent.name} ({agent.id})</h3>
-                  <p><strong>Role:</strong> {agent.description || "N/A"}</p>
-                  {agent.persona && (
-                    <p style={{ fontStyle: "italic" }}>
-                      <strong>Persona:</strong> {agent.persona}
-                    </p>
-                  )}
-                  <p><strong>Status:</strong> {agent.status || "—"}</p>
-                  <p><strong>Adapter:</strong> {agent.adapter_plugin || "—"}</p>
-                  <p>
-                    <strong>Reports to (Lead):</strong>{" "}
-                    {agent.reports_to ? (
-                      <span className="mono">
-                        {leadLabel(agent.reports_to, agent.reports_to_name)}
-                      </span>
-                    ) : (
-                      <span className="muted">none (top-level)</span>
-                    )}
-                  </p>
-                  <p>
-                    <strong>Direct reports:</strong>{" "}
-                    {(agent.reports?.length ?? 0) === 0 ? (
-                      <span className="muted">none</span>
-                    ) : (
-                      <span title={(agent.reports ?? []).join(", ")}>
-                        {directReportsSummary(agent.reports)}
-                      </span>
-                    )}
-                  </p>
-                  <SkillChips skills={agent.skills ?? []} />
-                  <PermissionsList permissions={agent.permissions ?? []} />
-                  <p>
-                    <strong>Queued Tasks:</strong>{" "}
-                    <Link to={`/work?agentId=${agent.id}&status=queued`} className="link">
-                      {agentTaskCounts[agent.id]?.queued || 0}
-                    </Link>
-                  </p>
-                  <p>
-                    <strong>Running Tasks:</strong>{" "}
-                    <Link to={`/work?agentId=${agent.id}&status=running`} className="link">
-                      {agentTaskCounts[agent.id]?.running || 0}
-                    </Link>
-                  </p>
-                  <p className="created-at">Created: {createdLabel(agent.created_at)}</p>
-                  <div style={{ marginTop: 8 }}>
-                    <button className="btn ghost sm" onClick={() => setEditingId(agent.id)}>
-                      Edit
-                    </button>
-                  </div>
-                </div>
+                <CrewMemberCard
+                  key={agent.id}
+                  agent={agent}
+                  queued={agentTaskCounts[agent.id]?.queued || 0}
+                  running={agentTaskCounts[agent.id]?.running || 0}
+                  onEdit={() => setEditingId(agent.id)}
+                />
               ),
             )
           )}
@@ -231,6 +190,89 @@ export function Crew() {
           roster={agents}
           onSaved={afterChange}
         />
+      </div>
+    </div>
+  );
+}
+
+// One read-only crew member card. Renders an operative cleanly REGARDLESS of which
+// optional fields the record carries — a missing role/persona/status/adapter/skills/Lead
+// falls back to an honest placeholder, never a blank or a throw. The adapter shows a human
+// brand (e.g. "Claude") next to its raw plugin id so the runtime is legible the same way
+// Prime names it when it hires the operative; permissions read as least-privilege when
+// empty (the honest setup hint). Exported so the created-agent render test can mount a
+// populated card directly (useAsync never fetches under renderToStaticMarkup).
+// docs/relix-dashboard-design.md (Crew); RELUX_MASTER_PLAN §6, §7.3, §8.1.
+export function CrewMemberCard({
+  agent,
+  queued,
+  running,
+  onEdit,
+}: {
+  agent: ReluxAgent;
+  queued: number;
+  running: number;
+  onEdit: () => void;
+}) {
+  const adapterId = agent.adapter_plugin || "";
+  return (
+    <div className="agent-card">
+      <h3>{agent.name} ({agent.id})</h3>
+      <p><strong>Role:</strong> {agent.description || "N/A"}</p>
+      {agent.persona && (
+        <p style={{ fontStyle: "italic" }}>
+          <strong>Persona:</strong> {agent.persona}
+        </p>
+      )}
+      <p><strong>Status:</strong> {agent.status || "—"}</p>
+      <p>
+        <strong>Adapter:</strong>{" "}
+        {adapterId ? (
+          <>
+            {adapterBrandLabel(adapterId)}{" "}
+            <span className="mono muted" style={{ fontSize: 11 }}>{adapterId}</span>
+          </>
+        ) : (
+          "—"
+        )}
+      </p>
+      <p>
+        <strong>Reports to (Lead):</strong>{" "}
+        {agent.reports_to ? (
+          <span className="mono">{leadLabel(agent.reports_to, agent.reports_to_name)}</span>
+        ) : (
+          <span className="muted">none (top-level)</span>
+        )}
+      </p>
+      <p>
+        <strong>Direct reports:</strong>{" "}
+        {(agent.reports?.length ?? 0) === 0 ? (
+          <span className="muted">none</span>
+        ) : (
+          <span title={(agent.reports ?? []).join(", ")}>
+            {directReportsSummary(agent.reports)}
+          </span>
+        )}
+      </p>
+      <SkillChips skills={agent.skills ?? []} />
+      <PermissionsList permissions={agent.permissions ?? []} />
+      <p>
+        <strong>Queued Tasks:</strong>{" "}
+        <Link to={`/work?agentId=${agent.id}&status=queued`} className="link">
+          {queued}
+        </Link>
+      </p>
+      <p>
+        <strong>Running Tasks:</strong>{" "}
+        <Link to={`/work?agentId=${agent.id}&status=running`} className="link">
+          {running}
+        </Link>
+      </p>
+      <p className="created-at">Created: {createdLabel(agent.created_at)}</p>
+      <div style={{ marginTop: 8 }}>
+        <button className="btn ghost sm" onClick={onEdit}>
+          Edit
+        </button>
       </div>
     </div>
   );

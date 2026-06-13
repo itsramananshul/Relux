@@ -19,7 +19,7 @@ import {
   type ReluxToolDescriptor,
   type ReluxToolInvocationResult,
 } from "../api";
-import { afterActionLabel, boundedContextReads, brainSourceLabel, configureCommandToolAction, configurePluginCandidateAction, contextReadDetail, contextReadsHadMiss, contextReadsUsedLabel, decisionSourceLabel, formatToolOutput, githubPluginInstallAction, hasSteps, intentProvenance, pendingClarificationLabel, polishProvenance, PRIME_GREETING, PRIME_HINT, PRIME_PLACEHOLDER, PRIME_SUGGESTIONS, proposalDisplaySummary, replyPolishLabel, requestedToolLabel, slotProvenance, stepDisplayTitle, updateProvenance, type ConfigureCommandToolAction, type ConfigurePluginCandidateAction } from "../prime";
+import { afterActionLabel, agentCreatedView, boundedContextReads, brainSourceLabel, configureCommandToolAction, configurePluginCandidateAction, contextReadDetail, contextReadsHadMiss, contextReadsUsedLabel, decisionSourceLabel, formatToolOutput, githubPluginInstallAction, hasSteps, intentProvenance, isCapabilityGrantSuggestion, pendingClarificationLabel, polishProvenance, PRIME_GREETING, PRIME_HINT, PRIME_PLACEHOLDER, PRIME_SUGGESTIONS, proposalDisplaySummary, replyPolishLabel, requestedToolLabel, slotProvenance, stepDisplayTitle, updateProvenance, type AgentCreatedView, type ConfigureCommandToolAction, type ConfigurePluginCandidateAction } from "../prime";
 import { commandToolInputFromDraft, validateCommandToolDraft, type CommandToolDraft } from "../plugins";
 import { workTaskHref, workRunHref } from "../routing";
 import { consumeInvestigationSeed } from "../investigateseed";
@@ -522,6 +522,13 @@ export function PrimeTurnCard({
   const tone = DISPOSITION_TONE[turn.disposition] ?? "todo";
   const suggestions = turn.suggested_actions ?? [];
   const continuation = turn.prime_continuation;
+  // A "Prime created an operative" turn gets a dedicated result card (below). When it is
+  // shown it OWNS the capability-grant follow-ups and the Crew link, so they are filtered
+  // out of the generic suggestion row / artifact line to avoid rendering them twice.
+  const agentCreated = agentCreatedView(turn);
+  const shownSuggestions = agentCreated
+    ? suggestions.filter((s) => !isCapabilityGrantSuggestion(s))
+    : suggestions;
   return (
     <div className="msg assistant" style={{ maxWidth: 720 }}>
       <div className="row wrap" style={{ gap: 6, marginBottom: 6, alignItems: "center" }}>
@@ -800,13 +807,26 @@ export function PrimeTurnCard({
         </div>
       )}
 
+      {/* A "Prime created an operative" result card (RELUX_MASTER_PLAN §6, §7.3, §7.5,
+          §8.1; docs/prime-tool-use.md). Built straight from what the turn carried — the
+          new agent's name/id, the adapter it runs on, any brain-shaped role/persona, and
+          the capability-grant follow-ups Prime staged. It makes the outcome legible (View
+          in Crew) and the honest setup path obvious: a requested sensitive capability was
+          NOT granted on creation; each grant button pre-fills the approval-gated follow-up
+          the user confirms. Present ONLY on a real agent-creation turn — casual ideation
+          and a duplicate-name refusal render as normal chat. */}
+      {agentCreated && (
+        <AgentCreatedCard view={agentCreated} busy={busy} onSuggestion={onSuggestion} />
+      )}
+
       {/* Brain-assisted AGENT slots (RELUX_MASTER_PLAN §10.1, §10.2, §17.1). A compact
           chip surfacing the normalized name/id, role, and adapter the brain proposed
           and the kernel validated (duplicate id rejected, adapter checked against the
           live roster) — present ONLY when the kernel attached them. The agent was
           already created through the deterministic execute path; this shows what the
-          brain contributed, never a fresh authority. */}
-      {turn.agent_slots && (
+          brain contributed, never a fresh authority. Suppressed when the result card
+          above is shown (it already folds in the brain-shaped fields). */}
+      {turn.agent_slots && !agentCreated && (
         <div
           style={{
             marginTop: 10,
@@ -1017,7 +1037,7 @@ export function PrimeTurnCard({
         </details>
       )}
 
-      {(turn.created_task || turn.started_run || turn.created_agent || turn.approval) && (
+      {(turn.created_task || turn.started_run || (turn.created_agent && !agentCreated) || turn.approval) && (
         <div className="row wrap" style={{ gap: 10, marginTop: 10, fontSize: 11 }}>
           {turn.created_task && (
             <span className="muted">
@@ -1029,7 +1049,9 @@ export function PrimeTurnCard({
               run <Link to={workRunHref(turn.started_run)} className="mono" title="Open this run on the Work board">{turn.started_run}</Link>
             </span>
           )}
-          {turn.created_agent && (
+          {/* The result card (above) already links the new operative into Crew; show the
+              bare artifact chip only when that card is not rendered. */}
+          {turn.created_agent && !agentCreated && (
             <span className="muted">
               agent <Link to="/crew" className="mono" title="View the crew">{turn.created_agent}</Link>
             </span>
@@ -1046,9 +1068,9 @@ export function PrimeTurnCard({
           buttons that replace telling the user what to type. Each just routes a
           pre-written message through the normal turn, so a button can do nothing
           the user could not type. A non-`send` suggestion pre-fills the input. */}
-      {suggestions.length > 0 && (
+      {shownSuggestions.length > 0 && (
         <div className="row wrap" style={{ gap: 8, marginTop: 12 }}>
-          {suggestions.map((s, i) => (
+          {shownSuggestions.map((s, i) => (
             <button
               key={i}
               className="btn"
@@ -1063,6 +1085,124 @@ export function PrimeTurnCard({
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+// The "Prime created an operative" result card (RELUX_MASTER_PLAN §6, §7.3, §7.5, §8.1;
+// docs/prime-tool-use.md "Hiring an operative from chat"). It renders STRICTLY the
+// `AgentCreatedView` the turn produced — the new operative's name/id, the adapter it runs
+// on (a human brand + the raw id), any brain-shaped role/persona, and the capability-grant
+// follow-ups Prime staged. The honesty contract from §6/§7.5 is made visible: a requested
+// sensitive capability is NOT granted on creation, so each grant renders as a clear button
+// that PRE-FILLS the approval-gated `grant … to <agent>` follow-up — clicking it can do
+// nothing the user could not type, and nothing is granted until the operator confirms the
+// approval. "View in Crew" links the operative into the roster (adapter/permission status);
+// "Give it work" pre-fills an assignment. It invents no outcome Prime did not report.
+function AgentCreatedCard({
+  view,
+  busy,
+  onSuggestion,
+}: {
+  view: AgentCreatedView;
+  busy: boolean;
+  onSuggestion: (s: ReluxPrimeSuggestion) => void;
+}) {
+  return (
+    <div
+      style={{
+        marginTop: 10,
+        border: "1px solid var(--border)",
+        borderRadius: 6,
+        padding: "10px 12px",
+        fontSize: 12,
+      }}
+    >
+      <div className="row wrap" style={{ gap: 6, alignItems: "center", marginBottom: 6 }}>
+        <span className="badge done" style={{ fontSize: 9 }} title="Prime created this operative">
+          operative created
+        </span>
+        <strong>{view.name}</strong>
+        <span className="mono muted" style={{ fontSize: 11 }}>{view.agentId}</span>
+        {view.brainSource && (
+          <span
+            className="badge done"
+            style={{ fontSize: 9 }}
+            title="Prime's brain shaped this operative — validated against the live roster"
+          >
+            🧠 {view.brainSource}
+          </span>
+        )}
+      </div>
+      {view.description && <div className="muted" style={{ marginBottom: 4 }}>{view.description}</div>}
+      {view.persona && (
+        <div className="muted" style={{ fontSize: 11, fontStyle: "italic", marginBottom: 4 }}>
+          persona: {view.persona}
+        </div>
+      )}
+      <div className="row wrap" style={{ gap: 6, fontSize: 11, marginBottom: 6, alignItems: "center" }}>
+        <span className="muted">runs on</span>
+        {view.adapterId ? (
+          <>
+            <span className="badge backlog" style={{ fontSize: 9 }} title="The adapter runtime this operative runs its work on">
+              {view.adapterLabel}
+            </span>
+            <span className="mono muted">{view.adapterId}</span>
+          </>
+        ) : (
+          <span className="muted">the default adapter</span>
+        )}
+      </div>
+
+      {/* Capability setup — honest per §6/§7.5: nothing was granted on creation. */}
+      {view.capabilitiesNeedSetup ? (
+        <div style={{ marginTop: 2, marginBottom: 8 }}>
+          <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>
+            The access you asked for isn't granted on creation — each needs the matching tool plugin
+            and a scoped permission you approve. Nothing was granted yet.
+          </div>
+          <div className="row wrap" style={{ gap: 8 }}>
+            {view.grants.map((g, i) => (
+              <button
+                key={i}
+                className="btn"
+                style={{ fontSize: 12, padding: "4px 12px" }}
+                disabled={busy}
+                onClick={() => onSuggestion(g)}
+                title={`Pre-fill: ${g.message} — routes through your approval; nothing is granted until you confirm`}
+              >
+                {g.label}
+                <span style={{ opacity: 0.6 }}> …</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      ) : (
+        <div className="muted" style={{ fontSize: 11, marginBottom: 8 }}>
+          No special access requested — it starts with least privilege. Grant tools from Crew when it
+          needs them.
+        </div>
+      )}
+
+      <div className="row wrap" style={{ gap: 8, alignItems: "center" }}>
+        <Link
+          to="/crew"
+          className="btn ghost"
+          style={{ fontSize: 12, padding: "4px 12px" }}
+          title="See this operative in your Crew — adapter, status, and permissions"
+        >
+          View in Crew
+        </Link>
+        <button
+          className="btn ghost"
+          style={{ fontSize: 12, padding: "4px 12px" }}
+          disabled={busy}
+          onClick={() => onSuggestion({ label: "Give it work", message: `assign a task to ${view.agentId}`, send: false })}
+          title="Pre-fill an assignment for this operative — you complete and send it"
+        >
+          Give it work <span style={{ opacity: 0.6 }}>…</span>
+        </button>
+      </div>
     </div>
   );
 }

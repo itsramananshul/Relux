@@ -1,4 +1,4 @@
-import type { ReluxPendingClarification, ReluxPrimeAction, ReluxPrimeContextRead, ReluxPrimeProposal, ReluxPrimeProposalStep, ReluxPrimeTaskSlots, ReluxPrimeTaskUpdate, ReluxReplyPolish } from "./api";
+import type { ReluxPendingClarification, ReluxPrimeAction, ReluxPrimeContextRead, ReluxPrimeProposal, ReluxPrimeProposalStep, ReluxPrimeSuggestion, ReluxPrimeTaskSlots, ReluxPrimeTaskUpdate, ReluxPrimeTurn, ReluxReplyPolish } from "./api";
 
 // A typed view of the GitHub plugin-import action Prime proposes for an
 // "install owner/repo as a plugin" / "import https://github.com/… as plugin" turn
@@ -76,6 +76,110 @@ export function configureCommandToolAction(
     : [];
   const cwd = typeof action.cwd === "string" ? action.cwd.trim() : "";
   return { pluginId, toolName, program, args, cwd };
+}
+
+// A typed view of the agent-creation action Prime executed for a "hire/make an agent"
+// turn (the kernel `PrimeAction::CreateAgent`). `name` is the display name and
+// `adapterPlugin` is the adapter the operative was created on — the resolved adapter the
+// deterministic path always fills (default `relux-adapter-local-prime`), or the brand the
+// user named when its adapter plugin is installed (RELUX_MASTER_PLAN §6, §7.3, §8.1).
+// Pure + defensive so the result card never trusts an unshaped action.
+export interface AgentCreatedAction {
+  name: string;
+  adapterPlugin: string;
+}
+
+// Extract the agent-creation descriptor from a Prime action, or null when the action is
+// absent / a different type. Every field is validated before use.
+export function agentCreatedAction(
+  action: ReluxPrimeAction | null | undefined,
+): AgentCreatedAction | null {
+  if (!action || action.type !== "create_agent") return null;
+  const name = typeof action.name === "string" ? action.name.trim() : "";
+  const adapterPlugin = typeof action.adapter_plugin === "string" ? action.adapter_plugin.trim() : "";
+  return { name, adapterPlugin };
+}
+
+// A friendly human BRAND for a known adapter plugin id, else the id itself. Mirrors the
+// kernel's `adapter_label` (crates/relux-kernel/src/prime_agent_create.rs) so the result
+// card and Crew name the runtime the same way Prime does in its reply.
+export function adapterBrandLabel(id: string): string {
+  switch (id) {
+    case "relux-adapter-claude-cli":
+      return "Claude";
+    case "relux-adapter-codex-cli":
+      return "Codex";
+    case "relux-adapter-local-prime":
+      return "Local (deterministic)";
+    default:
+      return id;
+  }
+}
+
+// Whether a suggested action is a CAPABILITY-GRANT follow-up Prime staged for a freshly
+// created operative ("Grant GitHub access to <agent>"). Identified structurally: a
+// pre-fill (`send: false`) whose message is the approval-gated `grant <permission> to
+// <agent>` command the kernel emits (attach_suggestions, state.rs). Used so the result
+// card OWNS these as prominent buttons instead of letting them blend into the generic
+// suggestion row — clicking one still only pre-fills the exact text the user could type,
+// and nothing is granted until the approval is greenlit (RELUX_MASTER_PLAN §6, §7.5).
+export function isCapabilityGrantSuggestion(s: ReluxPrimeSuggestion): boolean {
+  return s.send === false && s.message.trim().toLowerCase().startsWith("grant ");
+}
+
+// A structured, presentation-only view of a "Prime created an operative" turn, built
+// STRICTLY from what the turn already carried — the created agent id, the adapter the
+// `CreateAgent` action resolved (or the brain-validated adapter slot), any brain-shaped
+// description/persona, and the capability-grant follow-ups Prime staged. Returns null
+// unless this turn genuinely created an operative (`agent_creation` intent with a real
+// `created_agent`), so casual ideation / a duplicate-name refusal / any other turn renders
+// as normal chat, never an action card. It fabricates nothing: no field is invented, and
+// `capabilitiesNeedSetup` is true ONLY when Prime itself offered a grant follow-up — Prime
+// never grants access on creation (RELUX_MASTER_PLAN §6, §7.3, §7.5, §8.1).
+export interface AgentCreatedView {
+  agentId: string;
+  name: string;
+  // The adapter plugin id the operative runs on, or null when the turn carried none.
+  adapterId: string | null;
+  // The human brand for `adapterId` ("Claude" / "Codex" / "Local (deterministic)"), or null.
+  adapterLabel: string | null;
+  // A brain-shaped role/description, when the brain sharpened the create. Else null.
+  description: string | null;
+  // A brain-shaped starter persona, when one was proposed + validated. Else null.
+  persona: string | null;
+  // The brain-source provenance label, present ONLY when the kernel attached agent slots
+  // (i.e. a configured brain genuinely shaped the operative). Null on the deterministic path.
+  brainSource: string | null;
+  // The capability-grant follow-ups Prime staged ("Grant GitHub access to <agent>"). Each is
+  // an approval-gated pre-fill; nothing is granted until the operator confirms.
+  grants: ReluxPrimeSuggestion[];
+  // Whether the user asked for a sensitive capability that still needs setup/approval — true
+  // exactly when Prime offered at least one grant follow-up.
+  capabilitiesNeedSetup: boolean;
+}
+
+export function agentCreatedView(turn: ReluxPrimeTurn): AgentCreatedView | null {
+  if (turn.intent !== "agent_creation") return null;
+  const agentId = (turn.created_agent ?? "").trim();
+  if (!agentId) return null;
+  const slots = turn.agent_slots;
+  const action = agentCreatedAction(turn.action);
+  const name = (slots?.name?.trim() || action?.name || agentId) ?? agentId;
+  // The adapter actually used: the brain-validated adapter slot wins (the kernel applies it
+  // over the action's pre-brain default), else the resolved action adapter.
+  const adapterId = (slots?.adapter?.trim() || action?.adapterPlugin || "") || null;
+  const grants = (turn.suggested_actions ?? []).filter(isCapabilityGrantSuggestion);
+  return {
+    agentId,
+    name,
+    adapterId,
+    adapterLabel: adapterId ? adapterBrandLabel(adapterId) : null,
+    description: slots?.description?.trim() || null,
+    persona: slots?.persona?.trim() || null,
+    brainSource: slots ? brainSourceLabel(slots.source) : null,
+    grants,
+    capabilitiesNeedSetup: grants.length > 0,
+  };
 }
 
 // Prime's chat-surface copy (RELUX_MASTER_PLAN §11.1; `docs/prime-processing-audit.md`

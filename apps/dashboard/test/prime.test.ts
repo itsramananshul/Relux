@@ -23,12 +23,16 @@ import {
   boundedContextReads,
   formatToolOutput,
   githubPluginInstallAction,
+  agentCreatedAction,
+  adapterBrandLabel,
+  isCapabilityGrantSuggestion,
+  agentCreatedView,
   PRIME_GREETING,
   PRIME_HINT,
   PRIME_PLACEHOLDER,
   PRIME_SUGGESTIONS,
 } from "../src/prime.ts";
-import type { ReluxPendingClarification, ReluxPrimeContextRead, ReluxPrimeProposal, ReluxPrimeTaskSlots, ReluxPrimeTaskUpdate } from "../src/api.ts";
+import type { ReluxPendingClarification, ReluxPrimeContextRead, ReluxPrimeProposal, ReluxPrimeSuggestion, ReluxPrimeTaskSlots, ReluxPrimeTaskUpdate, ReluxPrimeTurn } from "../src/api.ts";
 
 // The plan proposal card must read HONESTLY: the summary reflects the actual step
 // and agent counts, a single-step proposal is steered to the one-task path (not
@@ -440,4 +444,113 @@ test("githubPluginInstallAction returns null for a non-import / absent / malform
   assert.equal(githubPluginInstallAction({ type: "grant_permission" }), null);
   // Right type but no repo URL → null (the card never trusts an unshaped action).
   assert.equal(githubPluginInstallAction({ type: "install_plugin_from_github" }), null);
+});
+
+// ── Agent-creation result card (RELUX_MASTER_PLAN §6, §7.3, §7.5, §8.1) ───────
+// The "Prime created an operative" card must read HONESTLY: it surfaces the adapter the
+// operative actually runs on, names a requested sensitive capability as needing setup
+// (never granted on creation), and is shown ONLY on a real agent-creation turn. These pin
+// that the card never invents an outcome Prime did not return (§17.1).
+
+// A minimal agent-creation turn. Only the fields the pure builder reads are set; the cast
+// keeps the fixture small without re-stating every wire field.
+function agentTurn(extra: Partial<ReluxPrimeTurn> = {}): ReluxPrimeTurn {
+  return {
+    intent: "agent_creation",
+    reply: "Creating agent \"researcher\" on the local adapter.",
+    disposition: "executed",
+    action: { type: "create_agent", name: "researcher", adapter_plugin: "relux-adapter-local-prime" },
+    created_task: null,
+    started_run: null,
+    created_agent: "researcher",
+    approval: null,
+    ...extra,
+  } as unknown as ReluxPrimeTurn;
+}
+
+test("agentCreatedAction extracts the name + adapter from a create_agent action", () => {
+  assert.deepEqual(
+    agentCreatedAction({ type: "create_agent", name: "Researcher", adapter_plugin: "relux-adapter-claude-cli" }),
+    { name: "Researcher", adapterPlugin: "relux-adapter-claude-cli" },
+  );
+  // Wrong type / absent → null; never trusts an unshaped action.
+  assert.equal(agentCreatedAction(null), null);
+  assert.equal(agentCreatedAction({ type: "grant_permission" }), null);
+});
+
+test("adapterBrandLabel maps known adapters to a human brand and passes others through", () => {
+  assert.equal(adapterBrandLabel("relux-adapter-claude-cli"), "Claude");
+  assert.equal(adapterBrandLabel("relux-adapter-codex-cli"), "Codex");
+  assert.equal(adapterBrandLabel("relux-adapter-local-prime"), "Local (deterministic)");
+  assert.equal(adapterBrandLabel("relux-adapter-custom-xyz"), "relux-adapter-custom-xyz");
+});
+
+test("isCapabilityGrantSuggestion matches only the approval-gated grant pre-fill", () => {
+  const grant: ReluxPrimeSuggestion = {
+    label: "Grant GitHub access to researcher",
+    message: "grant tool:relux-tools-github:access to researcher",
+    send: false,
+  };
+  assert.equal(isCapabilityGrantSuggestion(grant), true);
+  // A send:true chip is never a grant pre-fill, even if it mentions granting.
+  assert.equal(isCapabilityGrantSuggestion({ label: "x", message: "grant it", send: true }), false);
+  // A non-grant pre-fill is excluded.
+  assert.equal(isCapabilityGrantSuggestion({ label: "Start the run", message: "start it", send: false }), false);
+});
+
+test("agentCreatedView surfaces the deterministic adapter and no setup when nothing was requested", () => {
+  const view = agentCreatedView(agentTurn());
+  assert.ok(view);
+  assert.equal(view!.agentId, "researcher");
+  assert.equal(view!.name, "researcher");
+  assert.equal(view!.adapterId, "relux-adapter-local-prime");
+  assert.equal(view!.adapterLabel, "Local (deterministic)");
+  assert.equal(view!.capabilitiesNeedSetup, false);
+  assert.equal(view!.grants.length, 0);
+  // No brain slots on the deterministic path → no provenance.
+  assert.equal(view!.brainSource, null);
+});
+
+test("agentCreatedView flags requested capabilities as needing setup and carries the grant follow-ups", () => {
+  const view = agentCreatedView(
+    agentTurn({
+      suggested_actions: [
+        { label: "Grant GitHub access to researcher", message: "grant tool:relux-tools-github:access to researcher", send: false },
+      ],
+    }),
+  );
+  assert.ok(view);
+  assert.equal(view!.capabilitiesNeedSetup, true);
+  assert.equal(view!.grants.length, 1);
+  assert.equal(view!.grants[0].label, "Grant GitHub access to researcher");
+});
+
+test("agentCreatedView prefers the brain-validated adapter slot and folds in role/persona", () => {
+  const view = agentCreatedView(
+    agentTurn({
+      agent_slots: {
+        name: "Researcher",
+        id: "researcher",
+        description: "Reads GitHub and drafts PRs",
+        adapter: "relux-adapter-claude-cli",
+        persona: "Methodical and concise",
+        source: "Claude CLI",
+      },
+    }),
+  );
+  assert.ok(view);
+  // The brain-validated adapter wins over the action's pre-brain default.
+  assert.equal(view!.adapterId, "relux-adapter-claude-cli");
+  assert.equal(view!.adapterLabel, "Claude");
+  assert.equal(view!.name, "Researcher");
+  assert.equal(view!.description, "Reads GitHub and drafts PRs");
+  assert.equal(view!.persona, "Methodical and concise");
+  assert.equal(view!.brainSource, "Claude CLI");
+});
+
+test("agentCreatedView returns null for a non-creation turn or a duplicate-name refusal", () => {
+  // Casual ideation must render as normal chat, never an action card.
+  assert.equal(agentCreatedView(agentTurn({ intent: "brainstorming", created_agent: null })), null);
+  // A duplicate-name refusal is an agent_creation INTENT but created nothing.
+  assert.equal(agentCreatedView(agentTurn({ disposition: "answered", created_agent: null })), null);
 });
