@@ -2978,3 +2978,65 @@ The new capabilities are strictly **read-only source introspection**, which is w
 are excluded from the synthetic source tools — their capabilities are already known and the
 contract is about *installed third-party* plugins that were dead rows. See
 `docs/plugins.md` "Plugin Lens (read-only source capabilities)" for the product surface.
+
+## Reference read — tool results as a natural answer, not raw JSON (this slice)
+
+**Problem this slice fixes:** Plugin Lens shipped four read-only source tools, but each one
+returns a **structured JSON body** (`plugin.inspect` → `{root, entries[]}`, `plugin.search`
+→ `{match_count, matches[]}`, `plugin.read_file` → `{content, …}`, `plugin.summary` → the
+metadata object). That raw value was handed straight to (a) the chat bubble — where
+`formatToolOutput` fell through to `JSON.stringify` — and (b) the agent loop's brain
+observation (`render_output` pretty-printed it). So a "summarize the X plugin" turn showed
+the operator wrapper braces, and the brain reasoned over JSON instead of prose. The product
+contract (`RELUX_MASTER_PLAN.md` §10.5/§11.1) is the opposite: **the visible Prime response
+must say what it found; raw detail stays expandable/audited.**
+
+Before building, re-read how the reference agents turn a tool's machine output into the text
+the model and the user actually read.
+
+### Hermes — files read
+
+- `reference/hermes-agent-main/agent/tools/mcp_tool.py` (the `{ "result": <text>,
+  "structuredContent": <json> }` shape): an MCP tool's structured payload is split into a
+  **human `result` string** (what flows back into the conversation as the `role:"tool"`
+  message body) and the machine `structuredContent`. **Pattern: the model reasons over a
+  rendered text result, not the raw transport envelope; the structured form rides alongside,
+  not in place of, the prose.** Relux already mirrors this for MCP tools; this slice extends
+  the SAME envelope to Plugin Lens results.
+- `reference/hermes-agent-main/agent/conversation_loop.py` `run_conversation` (the
+  tool-result append, L630-676): each executed tool's result is folded back as a text message
+  the next model turn reads; the final assistant `content` (prose) is the user-facing answer —
+  **the raw tool JSON is never the reply.** Relux's `prime_agent_loop::render_output` is the
+  same seam: this slice makes it prefer the `result` text so the loop's grounded answer is
+  built from prose.
+- `reference/hermes-agent-main/tools/skills_tool.py` `skill_view` (returns the rendered
+  SKILL.md body, not a struct): a "read this source" capability returns the **text a human
+  would read**, which the agent then summarizes. **Pattern: a read/summarize capability's
+  result is already human-shaped.** This is exactly `plugin.read_file` folding the file body
+  into `result`, and `plugin.summary` emitting a prose "what is this plugin" line.
+
+### OpenClaw / Paperclip — files read
+
+- `reference/openclaw-main/...` gateway tool-result handling + `references/paperclip/server/src/routes/plugins.ts`
+  (`POST /api/plugins/tools/execute`, L914-979) returning the worker's `ToolResult { content,
+  data }`: the plugin worker decides the **`content`** (the displayable rendering) and keeps
+  structured **`data`** separate. **Pattern: the displayable rendering and the structured data
+  are distinct fields; the surface shows `content`, not `data`.** Relux's
+  `{ result, structuredContent }` is the same split, and the dashboard now shows `result` in
+  the bubble with `structuredContent` behind a "raw details" expander.
+
+### How Relux maps it
+
+| Reference pattern | Relux adaptation (this slice) |
+|---|---|
+| Hermes `mcp_tool.py`: a tool result is `{ result: <human text>, structuredContent: <json> }`; the model reads the text | New `plugin_source::shape_result(tool_name, value)` wraps every Plugin Lens result in that exact envelope, with `humanize(tool_name, value)` deriving the prose summary per tool. Wired at the single chokepoint `KernelState::source_tool_output`, so the chat single-invoke path, the agent loop, and the dashboard all see clean prose. |
+| Hermes `conversation_loop`: the model reasons over the rendered text result, never raw JSON | `prime_agent_loop::render_output` now prefers a `result` string field (for Plugin Lens AND MCP envelopes) before falling back to pretty JSON — the brain's next-round observation and the grounded final answer are built from prose. |
+| Paperclip `ToolResult { content, data }`: show `content`, keep `data` separate | Dashboard `formatToolOutput` returns the human `result` only (no inlined JSON); new `formatToolDetails` returns the structured detail for a collapsible **"raw details"** expander (`Prime.tsx` `ToolOutputBlock`, reused by the ran-tool result and the post-approval card). The audited JSON stays available without cluttering the answer. |
+| Hermes `skill_view`: a read/summarize result is already human-shaped | `humanize` produces: a "**Name** vX — kind. description. N files, M dirs … Detected signals: … README: …" line for `summary`; "Found N matches for \"q\" across M files: path:line — text" for `search`; "Read path (N bytes): <body>" for `read_file`; "Listed N entries under <root>: …" for `inspect`. Derived from the structured value, never fabricated; the structured value is preserved verbatim in `structuredContent`. |
+
+**What we deliberately keep:** the shaping is **lossless** — the original structured body is
+preserved under `structuredContent` (audited, expandable), never dropped. A plain tool that
+returns no human `result` still shows its structured output (there is simply nothing extra to
+expand), so non-Lens tools are unaffected. Honesty is maintained: the summary is computed from
+the real result, and a failed/empty result still surfaces honestly (no fabricated success).
+See `docs/plugins.md` "Plugin Lens → Result shaping" for the product surface.

@@ -22,6 +22,7 @@ import {
   contextReadDetail,
   boundedContextReads,
   formatToolOutput,
+  formatToolDetails,
   githubPluginInstallAction,
   agentCreatedAction,
   adapterBrandLabel,
@@ -403,13 +404,14 @@ test("boundedContextReads caps the detail list and reports the hidden count", ()
 // formatToolOutput renders a tool's shaped result chat-naturally and bounded — never
 // the raw transport envelope (docs/mcp.md "Invocation"). Used by both the ran-tool
 // result block and the post-approval result inside the chat approval card.
-test("formatToolOutput surfaces the shaped result text without wrapper braces", () => {
-  // The shaped MCP/tool envelope { result: <text> } shows the text directly.
+test("formatToolOutput surfaces the human result text WITHOUT the structured JSON", () => {
+  // The shaped MCP/tool envelope { result: <text> } shows the human text directly.
   assert.equal(formatToolOutput({ result: "all systems nominal" }), "all systems nominal");
-  // structuredContent is appended as compact JSON only when present.
-  const withStructured = formatToolOutput({ result: "found 2 rows", structuredContent: { rows: 2 } });
-  assert.ok(withStructured.startsWith("found 2 rows"));
-  assert.ok(withStructured.includes("\"rows\": 2"));
+  // The machine structuredContent is NOT inlined into the natural answer — it belongs in the
+  // expander (formatToolDetails), so the chat bubble stays prose-only.
+  const main = formatToolOutput({ result: "found 2 rows", structuredContent: { rows: 2 } });
+  assert.equal(main, "found 2 rows");
+  assert.ok(!main.includes("\"rows\""), "structured JSON must not leak into the main bubble");
 });
 
 test("formatToolOutput handles plain strings, plain objects, and empty output", () => {
@@ -419,6 +421,22 @@ test("formatToolOutput handles plain strings, plain objects, and empty output", 
   // Empty / absent output renders nothing, so the caller shows no result block.
   assert.equal(formatToolOutput(undefined), "");
   assert.equal(formatToolOutput(null), "");
+});
+
+// formatToolDetails carries the MACHINE half — the structured detail — for a collapsible
+// "raw details" expander, so the audited JSON stays available without cluttering the answer.
+test("formatToolDetails returns the structured detail only for a shaped envelope", () => {
+  // A shaped { result, structuredContent } envelope -> the structured detail as pretty JSON.
+  const details = formatToolDetails({ result: "found 2 rows", structuredContent: { rows: 2 } });
+  assert.ok(details.includes("\"rows\": 2"));
+  // A shaped envelope with no structuredContent -> nothing extra to expand.
+  assert.equal(formatToolDetails({ result: "all good" }), "");
+  // A plain object's JSON is already the main body (formatToolOutput), so no separate detail.
+  assert.equal(formatToolDetails({ said: "hi" }), "");
+  // Plain strings / empty output have no detail.
+  assert.equal(formatToolDetails("hello"), "");
+  assert.equal(formatToolDetails(undefined), "");
+  assert.equal(formatToolDetails(null), "");
 });
 
 test("formatToolOutput clamps a pathologically large output so it never floods chat", () => {

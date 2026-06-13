@@ -969,12 +969,19 @@ fn first_line(body: &str, max: usize) -> String {
     sanitize_line(body.lines().next().unwrap_or(""), max)
 }
 
-/// Render a tool output JSON value to a compact, secret-redacted text body. A string value is used
-/// as-is; any other JSON is pretty-printed. Always redacted through the shared helper.
+/// Render a tool output JSON value to a compact, secret-redacted text body the brain reads next
+/// round (and that grounds the final reply). A string value is used as-is; a shaped
+/// `{ result, structuredContent }` envelope (the Hermes `mcp_tool.py` shape that Plugin Lens and
+/// MCP tools now return) surfaces its human `result` text — never the raw wrapper JSON — so the
+/// brain reasons over prose, not braces; any other JSON is pretty-printed. Always redacted.
 fn render_output(output: &serde_json::Value) -> String {
     let raw = match output {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Null => String::new(),
+        serde_json::Value::Object(map) => match map.get("result").and_then(|v| v.as_str()) {
+            Some(result) => result.to_string(),
+            None => serde_json::to_string_pretty(output).unwrap_or_else(|_| output.to_string()),
+        },
         other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
     };
     relux_core::redact_secrets(&raw)

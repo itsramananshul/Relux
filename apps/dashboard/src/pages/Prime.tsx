@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { Link } from "react-router-dom";
 import {
   reluxAi,
@@ -42,7 +42,7 @@ import {
   stepIsPrimeFallback,
   stepOutcomeTone,
 } from "../orchestration";
-import { afterActionLabel, agentCreatedView, boundedContextReads, brainSourceLabel, configureCommandToolAction, configurePluginCandidateAction, contextReadDetail, contextReadsHadMiss, contextReadsUsedLabel, decisionSourceLabel, formatToolOutput, githubPluginInstallAction, hasSteps, intentProvenance, isCapabilityGrantSuggestion, isRunOrchestrationSuggestion, pendingClarificationLabel, polishProvenance, PRIME_GREETING, PRIME_HINT, PRIME_PLACEHOLDER, PRIME_SUGGESTIONS, proposalDisplaySummary, replyPolishLabel, requestedToolLabel, slotProvenance, stepDisplayTitle, updateProvenance, type AgentCreatedView, type ConfigureCommandToolAction, type ConfigurePluginCandidateAction } from "../prime";
+import { afterActionLabel, agentCreatedView, boundedContextReads, brainSourceLabel, configureCommandToolAction, configurePluginCandidateAction, contextReadDetail, contextReadsHadMiss, contextReadsUsedLabel, decisionSourceLabel, formatToolOutput, formatToolDetails, githubPluginInstallAction, hasSteps, intentProvenance, isCapabilityGrantSuggestion, isRunOrchestrationSuggestion, pendingClarificationLabel, polishProvenance, PRIME_GREETING, PRIME_HINT, PRIME_PLACEHOLDER, PRIME_SUGGESTIONS, proposalDisplaySummary, replyPolishLabel, requestedToolLabel, slotProvenance, stepDisplayTitle, updateProvenance, type AgentCreatedView, type ConfigureCommandToolAction, type ConfigurePluginCandidateAction } from "../prime";
 import { commandToolInputFromDraft, validateCommandToolDraft, type CommandToolDraft } from "../plugins";
 import { workTaskHref, workRunHref } from "../routing";
 import { consumeInvestigationSeed } from "../investigateseed";
@@ -407,13 +407,51 @@ function PrimeToolInventoryPanel() {
   );
 }
 
-// The tool a Prime turn actually ran (with its real JSON output) or the honest
+// A shaped tool output rendered chat-naturally: the human ANSWER as the main body, with the
+// structured detail (when present) tucked into a collapsible "raw details" expander so the
+// machine JSON is audited/available but never clutters the bubble (Plugin Lens / MCP shaping,
+// `docs/RELUX_MASTER_PLAN.md` §11.1). The UI fabricates nothing — both halves come from the
+// kernel-shaped result the turn already carried. Renders nothing for an empty output.
+function ToolOutputBlock({ output }: { output: unknown }) {
+  const text = formatToolOutput(output);
+  const details = formatToolDetails(output);
+  if (!text && !details) return null;
+  const preStyle: CSSProperties = {
+    margin: "6px 0 0",
+    padding: "6px 8px",
+    fontSize: 11,
+    maxHeight: 220,
+    overflow: "auto",
+    border: "1px solid var(--border)",
+    borderRadius: 4,
+    whiteSpace: "pre-wrap",
+  };
+  return (
+    <>
+      {text && (
+        <pre className="mono" style={preStyle}>
+          {text}
+        </pre>
+      )}
+      {details && (
+        <details style={{ marginTop: 6 }}>
+          <summary className="muted" style={{ fontSize: 10, cursor: "pointer" }} title="The structured tool result, for audit — not needed to read the answer above">
+            raw details
+          </summary>
+          <pre className="mono" style={preStyle}>
+            {details}
+          </pre>
+        </details>
+      )}
+    </>
+  );
+}
+
+// The tool a Prime turn actually ran (with its real shaped output) or the honest
 // reason a requested tool did NOT run. Rendered straight from the turn — the UI
 // never fabricates a tool result. Nothing renders for a turn that touched no tool.
 function ToolResult({ turn }: { turn: ReluxPrimeTurn }) {
   if (turn.invoked_tool) {
-    // Chat-natural, bounded rendering of the shaped result — never the raw envelope.
-    const output = formatToolOutput(turn.tool_output);
     return (
       <div style={{ marginTop: 8 }}>
         <div className="row wrap" style={{ gap: 6, alignItems: "center", fontSize: 11 }}>
@@ -422,23 +460,7 @@ function ToolResult({ turn }: { turn: ReluxPrimeTurn }) {
           </span>
           <span className="mono muted">{turn.invoked_tool}</span>
         </div>
-        {output && (
-          <pre
-            className="mono"
-            style={{
-              margin: "6px 0 0",
-              padding: "6px 8px",
-              fontSize: 11,
-              maxHeight: 220,
-              overflow: "auto",
-              border: "1px solid var(--border)",
-              borderRadius: 4,
-              whiteSpace: "pre-wrap",
-            }}
-          >
-            {output}
-          </pre>
-        )}
+        <ToolOutputBlock output={turn.tool_output} />
       </div>
     );
   }
@@ -1343,9 +1365,9 @@ function ApprovalCard({
     }
   }
 
-  // The same chat-natural, bounded shaping the ran-tool result uses — surface the
-  // shaped result text directly, never the raw transport envelope.
-  const ranOutput = outcome?.kind === "ran" ? formatToolOutput(outcome.result.output) : "";
+  // The shaped result of the approved run, if it ran — rendered chat-naturally (human answer +
+  // collapsible raw details) by ToolOutputBlock, never the raw transport envelope.
+  const ranOutput = outcome?.kind === "ran" ? outcome.result.output : undefined;
 
   return (
     <div
@@ -1439,23 +1461,7 @@ function ApprovalCard({
             Ran <span className="mono">{request.label}</span> once through the approved path.
             {continuationId && " Prime is continuing with the result…"}
           </div>
-          {ranOutput && (
-            <pre
-              className="mono"
-              style={{
-                margin: "6px 0 0",
-                padding: "6px 8px",
-                fontSize: 11,
-                maxHeight: 220,
-                overflow: "auto",
-                border: "1px solid var(--border)",
-                borderRadius: 4,
-                whiteSpace: "pre-wrap",
-              }}
-            >
-              {ranOutput}
-            </pre>
-          )}
+          <ToolOutputBlock output={ranOutput} />
         </div>
       )}
       {err && (

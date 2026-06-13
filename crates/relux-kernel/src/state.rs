@@ -5626,19 +5626,25 @@ impl KernelState {
             tool: tool_name.to_string(),
             message: e.to_string(),
         };
-        match tool_name {
-            "plugin.inspect" => crate::plugin_source::inspect(dir, input).map_err(map_err),
-            "plugin.search" => crate::plugin_source::search(dir, input).map_err(map_err),
-            "plugin.read_file" => crate::plugin_source::read_file(dir, input).map_err(map_err),
+        // Each tool returns a STRUCTURED body; shape it into the Hermes
+        // `{ result, structuredContent }` envelope so the chat surface + the agent loop's brain
+        // see a human summary, never the raw JSON (`docs/plugins.md` "Plugin Lens"; §10.5/§11.1).
+        let raw = match tool_name {
+            "plugin.inspect" => crate::plugin_source::inspect(dir, input).map_err(map_err)?,
+            "plugin.search" => crate::plugin_source::search(dir, input).map_err(map_err)?,
+            "plugin.read_file" => crate::plugin_source::read_file(dir, input).map_err(map_err)?,
             "plugin.summary" => {
                 let meta = self.build_source_summary_meta(plugin_id, installed);
-                crate::plugin_source::summary(dir, &meta, input).map_err(map_err)
+                crate::plugin_source::summary(dir, &meta, input).map_err(map_err)?
             }
-            _ => Err(KernelError::ToolNotFound {
-                plugin: plugin_id.to_string(),
-                tool: tool_name.to_string(),
-            }),
-        }
+            _ => {
+                return Err(KernelError::ToolNotFound {
+                    plugin: plugin_id.to_string(),
+                    tool: tool_name.to_string(),
+                })
+            }
+        };
+        Ok(crate::plugin_source::shape_result(tool_name, raw))
     }
 
     /// Build the [`crate::plugin_source::SummaryMeta`] for `plugin.summary` from the
@@ -16604,16 +16610,20 @@ mod tests {
         assert!(matches!(summary.executable, ToolExecutability::Ready));
         assert_eq!(summary.permission, "plugin:source:read");
 
-        // They actually RUN, returning real data — not echo, not fabricated.
+        // They actually RUN, returning real data — not echo, not fabricated. The output is the
+        // shaped `{ result, structuredContent }` envelope: a human summary up front, the full
+        // structured detail preserved verbatim under `structuredContent`.
         let res = k
             .invoke_tool(&ctx.agent, &acme, "plugin.summary", serde_json::json!({}))
             .unwrap();
-        assert_eq!(res.output["plugin_id"], "acme-repo");
-        assert_eq!(res.output["generated_manifest"], true);
-        assert!(res.output["readme_excerpt"]
-            .as_str()
-            .unwrap()
-            .contains("Acme"));
+        let structured = &res.output["structuredContent"];
+        assert_eq!(structured["plugin_id"], "acme-repo");
+        assert_eq!(structured["generated_manifest"], true);
+        assert!(structured["readme_excerpt"].as_str().unwrap().contains("Acme"));
+        // The human `result` is natural prose, NOT a raw JSON envelope (no leading wrapper brace).
+        let human = res.output["result"].as_str().unwrap();
+        assert!(!human.trim_start().starts_with('{'), "summary leaked raw JSON: {human}");
+        assert!(human.contains("Acme"), "summary should name the plugin: {human}");
     }
 
     #[test]
@@ -16647,7 +16657,12 @@ mod tests {
                 serde_json::json!({ "path": "README.md" }),
             )
             .unwrap();
-        assert!(res.output["content"].as_str().unwrap().contains("Acme"));
+        // Shaped envelope: structured detail under `structuredContent`, the file body folded into
+        // the human `result` so the chat bubble reads naturally.
+        assert!(res.output["structuredContent"]["content"].as_str().unwrap().contains("Acme"));
+        let human = res.output["result"].as_str().unwrap();
+        assert!(human.starts_with("Read README.md"), "natural read header: {human}");
+        assert!(human.contains("Acme"), "file body folded into result: {human}");
 
         // A traversal payload fails closed — never reads outside the install dir.
         let err = k
@@ -16711,7 +16726,12 @@ mod tests {
             turn.invoked_tool.as_deref(),
             Some("acme-repo/plugin.summary")
         );
-        assert!(turn.tool_output.is_some());
+        // The chat-surfaced tool output is the shaped envelope: a natural-language summary in
+        // `result` (what the chat bubble shows), never the raw structured JSON.
+        let out = turn.tool_output.expect("source tool produced output");
+        let human = out["result"].as_str().expect("shaped result text");
+        assert!(!human.trim_start().starts_with('{'), "chat bubble leaked raw JSON: {human}");
+        assert!(human.contains("Acme"), "summary names the plugin: {human}");
         // A read-only source read is NOT new work: no task, no run.
         assert_eq!(k.task_count(), before, "a read-only source read creates no task");
         assert!(turn.created_task.is_none());
@@ -16724,10 +16744,9 @@ mod tests {
             turn.invoked_tool.as_deref(),
             Some("acme-repo/plugin.read_file")
         );
-        assert!(turn.tool_output.unwrap()["content"]
-            .as_str()
-            .unwrap()
-            .contains("Acme"));
+        let out = turn.tool_output.unwrap();
+        assert!(out["structuredContent"]["content"].as_str().unwrap().contains("Acme"));
+        assert!(out["result"].as_str().unwrap().starts_with("Read README.md"));
     }
 
     /// Install a manifest as a bundled, enabled plugin (test convenience).

@@ -574,6 +574,190 @@ fn clamp_chars(s: &str, max: usize) -> String {
     out
 }
 
+// --- Natural-language shaping ---------------------------------------------------------------
+//
+// Every source tool returns a STRUCTURED JSON body (a tree, a match list, a file read, the
+// summary fields). Handing that raw to Prime's chat surface or to the agent loop's brain
+// observation is exactly the "raw implementation envelope in the chat bubble" the product
+// forbids (`docs/RELUX_MASTER_PLAN.md` §10.5/§11.1, `docs/plugins.md` "Plugin Lens"). Instead,
+// the kernel shapes each result into the Hermes `mcp_tool.py` `{ result, structuredContent }`
+// envelope (`docs/reference-driven-development.md`): a human `result` SUMMARY of what was found
+// rides up front (what the chat bubble + the brain read), and the full structured detail rides
+// along in `structuredContent` (expandable / audited, never the primary view). Pure + lossless:
+// the summary is derived from the structured value, never fabricated, and the structured value
+// is preserved verbatim.
+
+/// Wrap one source tool's structured output in the `{ result, structuredContent }` envelope.
+/// `result` is the human-readable summary from [`humanize`]; `structuredContent` is the original
+/// value unchanged. This is the single chokepoint the kernel uses for every Plugin Lens result,
+/// so the chat single-invoke path, the agent loop, and the dashboard all see clean prose.
+pub fn shape_result(tool_name: &str, value: serde_json::Value) -> serde_json::Value {
+    let result = humanize(tool_name, &value);
+    serde_json::json!({ "result": result, "structuredContent": value })
+}
+
+/// Read a string field from a JSON object, defaulting to `""`.
+fn js_str<'a>(v: &'a serde_json::Value, key: &str) -> &'a str {
+    v.get(key).and_then(|x| x.as_str()).unwrap_or("")
+}
+
+/// Read an unsigned integer field from a JSON object, defaulting to `0`.
+fn js_u64(v: &serde_json::Value, key: &str) -> u64 {
+    v.get(key).and_then(|x| x.as_u64()).unwrap_or(0)
+}
+
+/// "1 file" / "3 files" — naive ASCII pluralization for a count line.
+fn count_noun(n: u64, noun: &str) -> String {
+    format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
+}
+
+/// Turn one source tool's structured output into a compact, human-readable summary — "what I
+/// found", not raw JSON. Read-only and derived purely from the structured value; the full detail
+/// is preserved by the caller in `structuredContent`. An unrecognized tool / shape falls back to
+/// pretty JSON so nothing is ever lost.
+pub fn humanize(tool_name: &str, value: &serde_json::Value) -> String {
+    match tool_name {
+        "plugin.summary" => humanize_summary(value),
+        "plugin.inspect" => humanize_inspect(value),
+        "plugin.search" => humanize_search(value),
+        "plugin.read_file" => humanize_read_file(value),
+        _ => serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()),
+    }
+}
+
+fn humanize_summary(v: &serde_json::Value) -> String {
+    let name = js_str(v, "name");
+    let id = js_str(v, "plugin_id");
+    let title = if name.is_empty() { id } else { name };
+    let version = js_str(v, "version");
+    let kind = js_str(v, "kind");
+    let desc = js_str(v, "description");
+    let files = js_u64(v, "file_count");
+    let dirs = js_u64(v, "dir_count");
+    let declared = js_u64(v, "declared_tool_count");
+    let generated = v.get("generated_manifest").and_then(|x| x.as_bool()).unwrap_or(false);
+
+    let mut head = format!("**{title}**");
+    if !version.is_empty() {
+        head.push_str(&format!(" v{version}"));
+    }
+    if !kind.is_empty() {
+        head.push_str(&format!(" — {kind}"));
+    }
+    head.push('.');
+    let mut lines = vec![head];
+    if !desc.is_empty() {
+        lines.push(desc.to_string());
+    }
+
+    let mut counts = format!("{}, {}", count_noun(files, "file"), count_noun(dirs, "directory"));
+    counts = counts.replace("directorys", "directories");
+    if declared > 0 {
+        counts.push_str(&format!(", {} declared", count_noun(declared, "tool")));
+    } else if generated {
+        counts.push_str(" · manifestless install (no declared tools — read-only source tools only)");
+    }
+    lines.push(counts);
+
+    // Detected hints: list the human labels (what kind of thing this looks like), or say so plainly.
+    let hint_labels: Vec<String> = v
+        .get("detected_hints")
+        .and_then(|h| h.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|h| h.get("label").and_then(|l| l.as_str()).map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if hint_labels.is_empty() {
+        lines.push("Detected signals: none — no MCP/CLI/package entrypoints recognized.".to_string());
+    } else {
+        lines.push(format!("Detected signals: {}.", hint_labels.join(", ")));
+    }
+
+    let readme = js_str(v, "readme_excerpt");
+    if !readme.is_empty() {
+        lines.push(format!("README:\n{}", clamp_chars(readme.trim(), 400)));
+    }
+    lines.join("\n")
+}
+
+fn humanize_inspect(v: &serde_json::Value) -> String {
+    let root = js_str(v, "root");
+    let count = js_u64(v, "entry_count");
+    let truncated = v.get("truncated").and_then(|x| x.as_bool()).unwrap_or(false);
+    let where_ = if root.is_empty() || root == "." { "the plugin root".to_string() } else { format!("`{root}`") };
+    let mut head = format!("Listed {} under {where_}", count_noun(count, "entry").replace("entrys", "entries"));
+    if truncated {
+        head.push_str(" (truncated)");
+    }
+    head.push('.');
+    let mut lines = vec![head];
+    if let Some(entries) = v.get("entries").and_then(|e| e.as_array()) {
+        for e in entries.iter().take(25) {
+            let path = e.get("path").and_then(|p| p.as_str()).unwrap_or("");
+            let size = e.get("size_bytes").and_then(|s| s.as_u64());
+            match size {
+                Some(b) => lines.push(format!("  {path} ({b} B)")),
+                None => lines.push(format!("  {path}")),
+            }
+        }
+        if entries.len() > 25 {
+            lines.push(format!("  …and {} more", entries.len() - 25));
+        }
+    }
+    lines.join("\n")
+}
+
+fn humanize_search(v: &serde_json::Value) -> String {
+    let query = js_str(v, "query");
+    let count = js_u64(v, "match_count");
+    let files = js_u64(v, "files_scanned");
+    let truncated = v.get("truncated").and_then(|x| x.as_bool()).unwrap_or(false);
+    if count == 0 {
+        return format!("No matches for \"{query}\" across {}.", count_noun(files, "file"));
+    }
+    let mut head = format!(
+        "Found {} for \"{query}\" across {}",
+        count_noun(count, "match").replace("matchs", "matches"),
+        count_noun(files, "file"),
+    );
+    if truncated {
+        head.push_str(" (truncated)");
+    }
+    head.push(':');
+    let mut lines = vec![head];
+    if let Some(matches) = v.get("matches").and_then(|m| m.as_array()) {
+        for m in matches.iter().take(15) {
+            let path = m.get("path").and_then(|p| p.as_str()).unwrap_or("");
+            let line = m.get("line").and_then(|l| l.as_u64()).unwrap_or(0);
+            let text = m.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            lines.push(format!("  {path}:{line} — {text}"));
+        }
+        if matches.len() > 15 {
+            lines.push(format!("  …and {} more", matches.len() - 15));
+        }
+    }
+    lines.join("\n")
+}
+
+fn humanize_read_file(v: &serde_json::Value) -> String {
+    let path = js_str(v, "path");
+    let total = js_u64(v, "total_bytes");
+    let returned = js_u64(v, "bytes_returned");
+    let truncated = v.get("truncated").and_then(|x| x.as_bool()).unwrap_or(false);
+    let content = js_str(v, "content");
+    let mut head = if truncated {
+        format!("Read {path} (first {returned} of {total} bytes, truncated):")
+    } else {
+        format!("Read {path} ({total} bytes):")
+    };
+    head.push('\n');
+    head.push('\n');
+    head.push_str(content);
+    head
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -671,5 +855,96 @@ mod tests {
         assert!(!is_source_tool("echo.say"));
         assert_eq!(source_risk(), RiskLevel::Low);
         assert_eq!(source_approval(), ApprovalRequirement::Never);
+    }
+
+    // --- Natural-language shaping ---------------------------------------------
+    //
+    // Every Plugin Lens result must reach the chat surface / brain as a human SUMMARY, never raw
+    // structured JSON. These pin that `humanize` derives clean prose for each tool and that
+    // `shape_result` preserves the full structured detail under `structuredContent`.
+
+    #[test]
+    fn shape_result_wraps_human_summary_and_keeps_structured_detail() {
+        let raw = serde_json::json!({ "match_count": 0, "files_scanned": 4, "query": "todo", "matches": [] });
+        let shaped = shape_result("plugin.search", raw.clone());
+        // The human summary rides up front and is NOT raw JSON.
+        let result = shaped["result"].as_str().unwrap();
+        assert!(!result.trim_start().starts_with('{'), "leaked raw JSON: {result}");
+        assert!(result.contains("No matches for \"todo\""), "{result}");
+        // The full structured detail is preserved verbatim for audit / expansion.
+        assert_eq!(shaped["structuredContent"], raw);
+    }
+
+    #[test]
+    fn humanize_summary_is_readable_prose() {
+        let v = serde_json::json!({
+            "plugin_id": "acme-repo",
+            "name": "Acme",
+            "version": "1.2.0",
+            "kind": "Manifestless",
+            "description": "Does acme things.",
+            "file_count": 7,
+            "dir_count": 2,
+            "declared_tool_count": 0,
+            "generated_manifest": true,
+            "detected_hints": [ { "kind": "npm-package", "label": "npm package", "detail": "acme" } ],
+            "readme_excerpt": "# Acme\nDoes acme things.",
+        });
+        let s = humanize("plugin.summary", &v);
+        assert!(s.contains("**Acme**"), "{s}");
+        assert!(s.contains("Does acme things."), "{s}");
+        assert!(s.contains("7 files, 2 directories"), "{s}");
+        assert!(s.contains("manifestless install"), "{s}");
+        assert!(s.contains("Detected signals: npm package."), "{s}");
+        assert!(s.contains("README:"), "{s}");
+        assert!(!s.trim_start().starts_with('{'), "leaked raw JSON: {s}");
+    }
+
+    #[test]
+    fn humanize_search_lists_hits_naturally() {
+        let v = serde_json::json!({
+            "query": "fixme",
+            "match_count": 2,
+            "files_scanned": 5,
+            "truncated": false,
+            "matches": [
+                { "path": "src/a.rs", "line": 12, "text": "// FIXME: handle" },
+                { "path": "src/b.rs", "line": 3, "text": "let fixme = 1;" },
+            ],
+        });
+        let s = humanize("plugin.search", &v);
+        assert!(s.starts_with("Found 2 matches for \"fixme\" across 5 files:"), "{s}");
+        assert!(s.contains("src/a.rs:12 — // FIXME: handle"), "{s}");
+    }
+
+    #[test]
+    fn humanize_read_file_folds_the_body() {
+        let v = serde_json::json!({
+            "path": "README.md",
+            "total_bytes": 24,
+            "bytes_returned": 24,
+            "truncated": false,
+            "content": "# Acme\nDoes acme things.",
+        });
+        let s = humanize("plugin.read_file", &v);
+        assert!(s.starts_with("Read README.md (24 bytes):"), "{s}");
+        assert!(s.contains("Does acme things."), "{s}");
+    }
+
+    #[test]
+    fn humanize_inspect_describes_the_tree() {
+        let v = serde_json::json!({
+            "root": ".",
+            "entry_count": 2,
+            "truncated": false,
+            "entries": [
+                { "path": "README.md", "kind": "file", "size_bytes": 24 },
+                { "path": "src/", "kind": "dir", "size_bytes": null },
+            ],
+        });
+        let s = humanize("plugin.inspect", &v);
+        assert!(s.contains("Listed 2 entries under the plugin root."), "{s}");
+        assert!(s.contains("README.md (24 B)"), "{s}");
+        assert!(s.contains("src/"), "{s}");
     }
 }

@@ -543,3 +543,34 @@ discovery (`docs/reference-driven-development.md`).
   one-click **"Summarize with Prime"** that seeds a read-only chat turn.
   A manifestless wrapper additionally points at the Configure step for
   *runnable* tools.
+
+### Result shaping: a human answer, never raw JSON
+
+Each source tool computes a **structured** body (a file tree, a match
+list, a file read, the summary fields). Handing that raw to the chat
+surface or to the agent loop's brain would be exactly the "raw
+implementation envelope in the chat bubble" the product forbids
+(`RELUX_MASTER_PLAN.md` §10.5/§11.1). So the kernel shapes every Plugin
+Lens result into the Hermes `mcp_tool.py` `{ result, structuredContent }`
+envelope at a single chokepoint
+(`plugin_source::shape_result` → `humanize`, called from
+`KernelState::source_tool_output`):
+
+- `result` is a **human-readable summary** of what was found — e.g.
+  *"**Acme** v1.2 — Manifestless. Does acme things. 7 files, 2
+  directories · manifestless install … Detected signals: npm package.
+  README: …"*, or *"Found 2 matches for \"fixme\" across 5 files:
+  src/a.rs:12 — …"*, or *"Read README.md (24 bytes): …"*. This is what
+  the chat bubble shows and what the brain reasons over next round
+  (`prime_agent_loop::render_output` prefers `result`).
+- `structuredContent` is the **original structured value, verbatim** —
+  available for audit and rendered in a collapsible **"raw details"**
+  expander beneath the answer (`formatToolDetails` +
+  `Prime.tsx` `ToolOutputBlock`), never inlined into the bubble.
+
+The summary is *derived* from the structured value, never fabricated, and
+the structured value is preserved losslessly — so honesty is maintained
+while the visible answer stays prose. The same shaping applies to MCP and
+other tool outputs that already return the `{ result, structuredContent }`
+shape; a plain tool with no human `result` still shows its structured
+output (there is simply nothing extra to expand).

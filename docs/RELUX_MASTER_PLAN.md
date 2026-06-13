@@ -1077,6 +1077,44 @@ It shows:
 - approval prompts
 - plugin/action results
 
+**Prime agent contract (chat-first).** Prime is a general agent *first*, a
+control-plane operator *second*:
+
+- **Chat by default; tasks only when explicit.** Normal conversation,
+  brainstorming, frustration/venting, casual questions, and "I have an idea…"
+  ideation create **no task and push nothing to the board** — they stay
+  conversational and may offer a one-click "turn this into a task" chip, never
+  mint work on their own. Only an explicit command ("create a task to…",
+  "orchestrate…", "run it") mints or runs work. The deterministic classifier
+  (`prime::classify_intent`) is the fallback rail; a configured brain proposes
+  the intent and is reconciled fail-closed (`prime_intent::reconcile_intent`) —
+  a brain may **never** promote a chat-guarded turn to a work intent
+  (`prime::is_chat_guarded`).
+- **Tools/plugins when asked.** When the user asks what an installed plugin can
+  do, or to summarize/search/read a plugin, or names an installed plugin/tool,
+  Prime uses the live tool catalogue / Plugin Lens — generalized over every
+  installed plugin id/name and the four source verbs
+  (`prime::resolve_source_tool_request`), not a fixed phrase list.
+- **A real, bounded tool loop.** On an explicit tool request Prime runs the
+  Hermes-style think → tool → observe → respond loop (`prime_agent_loop`),
+  executing **more than one** safe read-only call per turn up to the operator's
+  configured ceilings (`PrimeAgentPolicy`, standard/extended) — never an old toy
+  cap, never an unbounded loop. A gated tool pauses for approval; an off-catalogue
+  pick self-corrects.
+- **Results are a natural answer, never raw JSON.** Every tool result reaches the
+  chat bubble and the brain as a **human summary** — Plugin Lens results are
+  shaped into the Hermes `{ result, structuredContent }` envelope
+  (`plugin_source::shape_result`/`humanize`), the agent loop reads the prose
+  (`prime_agent_loop::render_output`), and the dashboard shows `result` with the
+  structured detail behind a collapsible **"raw details"** expander
+  (`formatToolOutput` / `formatToolDetails` / `Prime.tsx` `ToolOutputBlock`). The
+  structured body is preserved (audited, expandable), never dropped or fabricated.
+- **Read-only by default; execution stays gated.** Plugin Lens source tools are
+  `Low`/`Never`-approval read-only introspection. Turning a plugin into a runnable
+  tool (MCP register / governed command tool) is always an explicit,
+  approval-gated proposal — Prime proposes the safe configuration path and never
+  auto-runs downloaded code.
+
 ### 11.2 Board
 
 The board is core.
