@@ -1832,10 +1832,19 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\relux-package-local.
 ```
 
 The check script builds the dashboard, tests and lints the Relux kernel/core,
-builds the release binary, runs `doctor`, and smoke-tests Prime task creation
-plus assigned-task execution against a temporary `RELUX_DB`. `-SkipSmoke` skips
-that quick Prime smoke; `-FullE2E` additionally runs `scripts\relux-e2e-smoke.ps1`
-(it reuses the just-built release binary).
+builds the release binary, runs `doctor`, runs the static contract checks
+(`check-port-guidance.ps1`, `check-smoke-adapter-boundary.ps1`), and smoke-tests
+Prime against a temporary `RELUX_DB`. The Prime smoke proves the **honest local
+boundary** (§8.1): Prime creates a free-form "inspect this repo" task, and running
+it on the deterministic local adapter **fails closed** — a non-zero exit with
+actionable guidance and the task parked `Blocked` — never a silent hang and never
+a fabricated "done". (Local Prime does no external work; real agent work is a
+configured Claude/Codex adapter, exercised by the E2E smoke's opt-in real-adapter
+steps.) `-SkipSmoke` skips that quick Prime smoke; `-FullE2E` additionally runs
+`scripts\relux-e2e-smoke.ps1` (it reuses the just-built release binary).
+`scripts\check-smoke-adapter-boundary.ps1` is a static drift guard that pins this
+local-vs-real-adapter honesty contract so the smokes cannot quietly revert to
+making local Prime fake external work to turn the gate green.
 
 `scripts\relux-e2e-smoke.ps1` is the standalone first-release end-to-end smoke.
 It proves the first version of the product is actually usable - not just
@@ -1849,10 +1858,17 @@ the status tool, an echo request invokes the echo tool); the tool CLI (`tools`
 listing + `tool invoke ... echo.say {json}` round trip); Plugin Runtime v1 (an
 in-script loopback HTTP server is installed/configured/invoked through the
 kernel and its output flows back); adapter runtime controls (enable with a fake
-command + disable, **never spawning real Claude/Codex**); the autonomy loop (a
-ready task created through Prime moves Queued -> Completed via one tick); and the
-`serve` HTTP endpoints (`/dashboard`, `/v1/relux/state`, `/v1/relux/prime/autonomy`,
-`/v1/relux/tools`). Flags: `-SkipBuild`, `-SkipServe`, `-SkipLoopback`, `-KeepTemp`.
+command + disable, **never spawning real Claude/Codex**); the autonomy loop's
+**honest fail-closed** (a free-form "inspect this repo" task created through Prime
+is driven by one tick to a terminal Failed run + parked `Blocked` with guidance —
+never a hang, never a fabricated Completed); the **positive local path** over HTTP
+(a task carrying an echo.say `tool_call` directive is created, executed as
+assigned, and both the run and the task honestly reach `completed` — local Prime
+runs what it CAN fulfil, for real); the optional real Claude/Codex adapter run +
+Prime-brain chat (opt-in, never bypass flags); and the `serve` HTTP endpoints
+(`/dashboard`, `/v1/relux/state`, `/v1/relux/prime/autonomy`, `/v1/relux/tools`).
+Flags: `-SkipBuild`, `-SkipServe`, `-SkipLoopback`, `-KeepTemp`,
+`-RunRealClaudeAdapter`, `-RunRealCodexAdapter`.
 It always cleans up its temp DB, server, jobs, and processes, and exits non-zero
 on any failure.
 
@@ -1924,173 +1940,44 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
-- **Unreleased (on `main`, post-v0.1.29)** — **Continuous tool use: live MCP names in Prime's first
-  decision + continuous approval (approve → run → continue).** Two follow-ups to the tool-awareness
-  slice below made tool use feel like a real agent flow rather than a disconnected admin step
-  (`docs/prime-tool-use.md`; §10.1/§10.5/§17.1; reference-first per
-  `docs/reference-driven-development.md`). **(A) Live MCP tool names in the *first* decision.** The
-  decision prompt previously named only the *enabled MCP servers* (their tool names needed an
-  off-lock `tools/list` the decision stage did not run), so the brain's first classification was
-  weaker than the agent loop's. Now a **bounded, off-lock, TTL-cached** discovery
-  (`decision_time_mcp_catalog` in `server.rs`) runs *before* the decision and feeds the new
-  `render_tool_inventory_with_mcp`, so the brain sees the actual MCP tool names (in `mcp:<server>/<tool>`
-  form) and can classify a natural-language MCP request. It is **non-blocking** (an overall timeout
-  falls back to the last cached catalog, or to naming the servers only) and **fail-closed** (an
-  unreachable server is listed *unavailable*, never given a fabricated tool); the **same** catalog is
-  reused to ground the agent loop, so a tool turn pays at most one bounded discovery (usually a cache
-  hit). An empty/absent catalog renders byte-for-byte the prior servers-only prompt. **(B) Continuous
-  approval.** When the agent loop paused on a gated tool, the operator had to approve *and then
-  manually* send another message to resume. Now, after **Approve & run** / **Allow always** runs the
-  bound call through the unchanged `/v1/relux/approvals/*` routes (`execute_approved_tool_invocation`
-  → `fold_approved_into_continuation` folds the real result in and clears the pause), the dashboard
-  **auto-resumes** the paused loop (`POST /v1/relux/prime/agent/continue`), so Prime continues with the
-  result **without a second typed prompt**. **No gate weakened:** nothing is auto-approved, **Deny**
-  still drops the continuation, the resumed loop runs behind the same gates and never re-runs the
-  completed call, and a turn with no continuation simply shows the inline result (never a dead-end).
-  `cargo test` + `clippy --all-targets` clean on `relux-kernel` (new: `render_with_mcp_*` enumerate /
-  fail-closed / empty-equals-servers-only, `decision_time_mcp_catalog_*` empty-when-disabled +
-  fail-closed-on-unreachable + cache-reuse; the existing `approved_tool_result_folds_into_the_waiting_continuation`
-  pins the resume foundation); dashboard typecheck + 601 tests + build green, `dashboard-dist` rebuilt
-  in sync (new `prime-approval-continuation-render.test.mjs`). **Files:**
-  `crates/relux-kernel/src/prime_decision.rs`, `crates/relux-kernel/src/server.rs`,
-  `crates/relux-kernel/src/lib.rs`, `apps/dashboard/src/pages/Prime.tsx`,
-  `apps/dashboard/test/prime-approval-continuation-render.test.mjs`, `docs/prime-tool-use.md`. No
-  release cut; no master-plan safety property is weakened.
-- **Unreleased (on `main`, post-v0.1.29)** — **Prime tool/plugin awareness + brain-driven tool use
-  (closes the "installed tool is unusable from chat" gap).** Installing/configuring a plugin tool was
-  largely inert: Prime would only use a tool if the *deterministic keyword classifier* matched the
-  message, the live MCP `tools/list` discovery only ran when the message literally contained `"mcp:"`,
-  and the decision brain was never handed the installed-tool inventory — so a user could install a
-  capability and still not get Prime to use it from natural language. This slice makes an installed/
-  configured tool a real, usable capability (`docs/prime-tool-use.md`; built reference-first per
-  `docs/reference-driven-development.md` against Hermes' "hand the model its tool list, then loop"
-  shape — §10.1/§10.5/§17.1). **What changes (no gate weakened):** (1) the Prime Agent Loop entry is
-  now **brain-driven** — the brain proposes the intent and the UNCHANGED fail-closed `reconcile_intent`
-  decides (keyword classifier demoted to the fallback rail per §10.1), so an explicit request the
-  brain recognises (*"summarise this repo with the readme tool"*) enters the governed loop while
-  guarded chat still **never** can (`tool_invocation` is a *sensitive* intent `reconcile_intent`
-  refuses to promote from guarded chat); (2) `render_tool_inventory` injects the **runnable** tool
-  inventory (installed `ready`/`needs_approval` tools + enabled MCP server names — exactly the agent
-  loop's offered set, never a tool the kernel would refuse) into the decision prompt, with a tool-use
-  rule carried INSIDE that block so an empty inventory leaves the prompt byte-for-byte unchanged;
-  (3) the live MCP discovery gate becomes the brain-derived `effective_is_tool_turn` (or a literal
-  `mcp:` ref) + an enabled server, so a natural-language request can use an MCP tool and normal chat
-  pays nothing; (4) new `GET /v1/relux/prime/tools` (the runnable catalog incl. live MCP) + a
-  dashboard **"Tools Prime can use"** panel on the Prime page (collapsed, lazy-loaded). Every
-  execution still flows through the single `prime_invoke_tool` → `invoke_tool` chokepoint
-  (permission → risk/approval + per-call / allow-always grant → audit); a gated tool still stages the
-  existing per-call approval card and pauses, nothing is auto-approved, no raw CLI/MCP envelope
-  reaches the user. Recorded in `docs/ARTIFICIAL_CONSTRAINT_AUDIT.md` (FIX NOW #6). `cargo test` +
-  `clippy` clean on `relux-core`/`relux-kernel` (new tests: inventory lists runnable + omits
-  non-runnable + empty when none, the decision prompt injects the inventory + tool-use rule only when
-  present, the `/v1/relux/prime/tools` route lists the runnable catalog); dashboard typecheck + 599
-  tests + build green, `dashboard-dist` rebuilt in sync; the Prime render smoke pins the new panel.
-  **Files:** `crates/relux-kernel/src/prime_decision.rs`, `crates/relux-kernel/src/server.rs`,
-  `crates/relux-kernel/src/ai.rs`, `crates/relux-kernel/src/lib.rs`, `apps/dashboard/src/api.ts`,
-  `apps/dashboard/src/pages/Prime.tsx`, `apps/dashboard/test/routes-render.test.mjs`,
-  `docs/prime-tool-use.md`, `docs/ARTIFICIAL_CONSTRAINT_AUDIT.md`. No release cut; no master-plan
-  safety property is weakened.
-- **Unreleased (on `main`, post-v0.1.29)** — **Governed command tools (closes the "non-MCP
-  candidate is a dead end" gap).** A detected `cli_command` capability candidate (an npm `bin`, a
-  Python `[project.scripts]`, a Cargo `[[bin]]`) is no longer an honest-but-dead-end `manual`
-  record: it now carries a pre-filled `command_tool` argv draft and a one-click
-  **"Configure (command tool)…"** review form. The operator confirms a `(program, args, cwd?,
-  input_args?, timeout, risk)` recipe; the kernel validates the **argv safety contract**
-  (`relux_core::command_tool` — argv-only, no shell, no danger flag, bounded, no `..` cwd, reusing
-  the managed-stdio `validate_stdio_command`), adds a manifest tool (approval **always Required**),
-  and stores a `CommandToolConfig`. The tool surfaces in the Tools list as `needs_approval` and runs
-  ONLY through the existing gated invoke path — argv-only, confined to the plugin's install dir
-  (`secret_store::validate_managed_cwd`, symlink-escape refused), with a timeout, cancellation via
-  kill-on-timeout, and bounded (64 KiB/stream) secret-redacted output
-  (`crates/relux-kernel/src/command_exec.rs`). Nothing runs on import or at configure time; a non-zero
-  exit is an honest `success:false` run, a timeout is `timed_out:true`, and a bad cwd / missing input /
-  spawn failure is a clear value-free error — never a fabricated success. New endpoints
-  `GET`/`POST /v1/relux/plugins/:id/command-tools` + `DELETE …/:tool`; recipe round-trips in the
-  snapshot (`command_tool_configs`) and survives restart. Built reference-first against
-  `reference/hermes-agent-main/tools/environments/local.py` (argv + validated cwd + timeout + bounded
-  capture) and `reference/openclaw-main/src/agents/bash-tools.exec-*` / `infra/exec-approvals.ts`
-  (argv binding, approval-before-execution, output bounding). Pinned by `relux_core::command_tool`,
-  `command_exec.rs`, `state.rs`, the `command_tools_route_activates_a_detected_cli_candidate` server
-  test, and the dashboard `plugins.test.ts` + `install-to-usable-render.test.mjs` assertions. `cargo
-  test` + `clippy` clean on `relux-core`/`relux-kernel`; dashboard green; `dashboard-dist` rebuilt.
-  Every prior safety property holds — MCP activation is untouched and no path auto-runs downloaded code.
-- **Unreleased (on `main`, post-v0.1.29)** — **MCP sampling v1 (gated, default-deny).** MCP
-  **sampling** (`sampling/createMessage`) **inverts the trust direction**: a managed-stdio server can,
-  mid-operation, ask Relux to run its OWN configured LLM and return the completion. Relux ships a
-  **gated safe subset**, fail-closed by construction (full mapping in `docs/mcp.md` "MCP sampling
-  (v1)"; reference-first against Hermes `tools/mcp_tool.py` + `website/docs/user-guide/features/mcp.md`,
-  stricter than Hermes). It is served **only** from an operator-started managed-stdio **session**;
-  **disabled by default** (`McpServerConfig.sampling.enabled`), and the `sampling` capability is
-  advertised in `initialize` **only** when serviceable (enabled AND a Prime/AI provider configured).
-  The stdio pump (`StdioChild::request`) now detects a server-initiated request — checking `method`
-  before the id-match so a colliding server id is never confused for our response — and dispatches to
-  `crate::mcp_sampling::handle_inbound_request`: a gated `sampling/createMessage`, or a clean `-32601`
-  for any other server method, written back immediately so the server **degrades instead of hanging**
-  (the prior silent-drain-until-timeout bug is fixed). The decision is fail-closed: disabled (`-32001`),
-  no provider (`-32002`), or malformed/over-bounds (`-32003`) each refuse honestly; a provider failure
-  is `-32010`, never a faked completion. The completion is produced by a synchronous `Sampler` the
-  kernel builds from the resolved `AiConfig` (`crate::ai::build_sampling_sampler`, key by secret
-  reference, run on a dedicated-thread current-thread Tokio runtime) — the **provider key never reaches
-  the server**; only the clamped + `redact_secrets`-redacted completion text is returned. Input/output
-  are bounded (`MAX_MCP_SAMPLING_*`), there are **no tool calls and no task/run mutation**, and every
-  request is audited secret-free (`McpSamplingAuditRecord` on the process-global
-  `crate::mcp_sampling::audit_tail`). Surfaces: `PUT/PATCH …/:id/sampling`, `sampling_enabled` on the
-  listing, `GET …/mcp/sampling/audit`, and a dashboard **Sampling** row on the managed-stdio Process
-  card. v1 is **policy-based allow/deny** (a standing per-server toggle), not a per-request prompt —
-  the synchronous request would deadlock on an interactive approval (honest "future" note in the docs).
-  A `sample_probe` fixture tool round-trips a real server→client sampling request; `tests/mcp_stdio.rs`
-  proves denied-by-default, allowed-with-a-test-provider (redacted + clamped + audited),
-  missing-provider refusal, HTTP-rejection + policy-persistence, plus `crate::mcp_sampling` unit tests.
-  `cargo test` + `clippy --all-targets -D warnings` clean on `relux-core` + `relux-kernel`, dashboard
-  tests/typecheck/build green with the tracked `dashboard-dist` rebuilt. Still **out of scope**:
-  resource **subscriptions**, and a *per-request* interactive sampling approval. Every prior safety
-  property still holds.
-- **Unreleased (on `main`, post-v0.1.29)** — **MCP prompts v1.** MCP **prompts**
-  (`prompts/list` / `prompts/get`) are now bridged over **both** the loopback-HTTP and governed
-  managed-stdio transports — a THIRD **read-only** surface alongside tools + resources. They are
-  read-only by construction: listing/getting a prompt performs no action, and a `prompts/get` returns
-  **template text Relux shows as context, never a turn Relux executes** (full mapping in `docs/mcp.md`
-  "MCP prompts (v1)"; reference-first against Hermes `tools/mcp_tool.py` `_make_list_prompts_handler`
-  L2552-2612 / `_make_get_prompt_handler` L2615-2681). The HTTP client (`crate::mcp::list_prompts` /
-  `get_prompt`, with `parse_prompts_list` / `shape_get_prompt_result`) and the managed-stdio client
-  (`crate::mcp_stdio::list_prompts` / `get_prompt` + the `ManagedPool` reuse methods) reuse the SAME
-  shapers — bounded to `MAX_MCP_PROMPTS` / `MAX_MCP_PROMPT_MESSAGES` / `MAX_MCP_PROMPT_MESSAGE_CHARS`,
-  every string sanitized, message content **secret-redacted**, a non-text block summarized, the raw
-  JSON-RPC envelope never returned, and the prompt name validated fail-closed
-  (`is_valid_mcp_prompt_name`) before any dial/spawn. The kernel dispatches on transport
-  (`list_mcp_prompts` / `get_mcp_prompt`, reusing a running managed process and falling back to a
-  spawn-per-op read). New operator routes `GET …/:id/prompts` + `POST …/:id/prompts/get { name,
-  arguments? }` (read-locked — a `prompts/get` mutates nothing), the read-only Prime context tools
-  `mcp_list_prompts` / `mcp_get_prompt` (which return template text as an **observation**, never
-  auto-run as a user turn), and a dashboard **Prompts** panel (`McpPromptsPanel` / `McpPromptRow`, a
-  minimal arguments form) all dispatch on transport with no new authority. The real-subprocess fixture
-  advertises a `greet` (argument-forwarding) + a `leaky` (redaction) prompt, exercised end to end in
-  `tests/mcp_stdio.rs` + HTTP shaper/route tests in `mcp.rs` / `state.rs` / `server.rs`; dashboard
-  tests/typecheck/build green with the tracked `dashboard-dist` bundle rebuilt in sync. Still **out of
-  scope**: MCP **sampling** (inverts the trust direction) and resource **subscriptions**. Every safety
-  property from the resources bullet still holds.
-- **Unreleased (on `main`, post-v0.1.29)** — **managed-stdio MCP resources v1.** MCP **resources**
-  (`resources/list` / `resources/read`), previously an HTTP-only surface, are now bridged over the
-  governed managed-stdio transport — **read-only context only**, no `tools/call`, no mutation, no new
-  authority (full mapping in `docs/mcp.md` "Managed-stdio MCP resources (v1)"; reference-first against
-  Hermes `tools/mcp_tool.py` `_make_list_resources_handler` / `_make_read_resource_handler`). The
-  managed-stdio client (`crates/relux-kernel/src/mcp_stdio.rs`) gains `list_resources` /
-  `read_resource` (spawn-per-operation) and the pool gains the matching reuse methods; the kernel
-  dispatches on transport (`mcp_list_resources` / `mcp_read_resource`), **reusing** a running managed
-  process and **falling back** to a spawn-per-operation read (env-secret-resolved, `cwd`-validated)
-  when none is started. Both transports reuse the SAME HTTP shapers (`parse_resources_list` /
-  `shape_resource_read_result`): bounded to `MAX_MCP_RESOURCES` / `MAX_MCP_RESOURCE_TEXT_CHARS`, text
-  sanitized + **secret-redacted**, binary (`blob`) summarized never decoded, the raw JSON-RPC envelope
-  never returned, and the URI validated fail-closed before any spawn. The existing operator routes
-  (`GET …/:id/resources`, `…/resources/read?uri=…`), the read-only Prime context tools
-  (`mcp_list_resources` / `mcp_read_resource`), and the dashboard **Resources** panel (no longer hidden
-  for a stdio server) all dispatch on transport with no new route. A real-subprocess fixture
-  (`relux_mcp_test_server.rs`) advertises a text + a binary resource, exercised end to end in
-  `tests/mcp_stdio.rs`. (MCP **prompts** are now bridged too — see the MCP prompts v1 bullet above.)
-  Still **out of scope** over stdio: MCP **sampling** and resource
-  **subscriptions**. `cargo test` + `clippy --all-targets` clean on `relux-kernel`, dashboard
-  tests/typecheck/build green, the tracked `dashboard-dist` bundle rebuilt in sync. Every safety
-  property from v0.1.29 still holds.
+- **v0.1.30** (2026-06-13) — **agentic tool-use + MCP-surface completion** rollup. The
+  `relux-kernel` / `relux-core` crates move `0.1.29` → `0.1.30` in lockstep, packaging the whole
+  post-v0.1.29 line into a fresh Windows bundle (`docs/prime-tool-use.md`, `docs/mcp.md`;
+  RELUX_MASTER_PLAN §8.2 / §9.6.1 / §10.1 / §10.5 / §14 / §17.1; built reference-first per
+  `docs/reference-driven-development.md`). Headlines: (1) **Auto-detected CLI brain** — Prime
+  auto-adopts an enabled, on-`PATH` Claude / Codex CLI as its brain when none is selected
+  (`resolve_brain` / `available_cli_brains` in `ai.rs`, threaded at `run_prime` / ai-status /
+  health / doctor), so it is a real chat agent out of the box instead of silently falling back to
+  Local. (2) **Run watchdog** — a server-side watchdog recovers stale `Running` runs as
+  `RunFailureClass::Stale` so no run hangs silently (§9.6.1). (3) **Structured capability
+  candidates** — a manifestless / imported-repo scan yields structured per-capability candidates
+  (`capability_detect.rs`) so install-to-usable is a real per-candidate path (one-click `mcp_register`
+  vs. manual `pending`), not a dead end (§8.2). (4) **Governed command tools** — a detected
+  `cli_command` candidate (npm `bin`, Python `[project.scripts]`, Cargo `[[bin]]`) becomes a real
+  approval-gated tool: the operator confirms a validated argv recipe (`relux_core::command_tool`,
+  argv-only / no shell / no danger flag / bounded / confined cwd) stored as `CommandToolConfig`, and
+  it runs ONLY through the existing gated invoke path with timeout + kill-on-timeout + bounded,
+  secret-redacted output (`command_exec.rs`); nothing runs on import or at configure time (§8.2).
+  (5) **Prime tool / plugin awareness** — the Prime Agent Loop entry is brain-driven (the UNCHANGED
+  fail-closed `reconcile_intent`, keyword classifier demoted to fallback rail), the decision prompt
+  is handed the runnable tool inventory (`render_tool_inventory`), and a new `GET /v1/relux/prime/tools`
+  + a "Tools Prime can use" panel surface the catalog, so an installed / configured tool is finally
+  usable from natural-language chat — every execution still flowing through the single
+  `prime_invoke_tool` → `invoke_tool` chokepoint (§10.1 / §10.5 / §17.1). (6) **Continuous tool use**
+  — live MCP tool names land in Prime's *first* decision (`decision_time_mcp_catalog`, bounded /
+  off-lock / TTL-cached / fail-closed) and, after **Approve & run** / **Allow always**, the dashboard
+  auto-resumes the paused loop (`POST /v1/relux/prime/agent/continue`) into approve → run → continue
+  without a second typed prompt. The MCP surface also completed over managed stdio: **resources v1**
+  (`resources/list` + `resources/read`), **prompts v1** (`prompts/list` + `prompts/get`), and a gated,
+  default-deny **sampling v1** (`sampling/createMessage`, advertised only when serviceable) — leaving
+  only resource **subscriptions** out of scope. Plus **local-prime fails closed** on free-form
+  external goals (no dangling "running but nothing happens" runs) and **manifestless plugin import
+  made unmistakable** (no `relux-plugin.json` required, actionable after install). All reads/writes
+  hit real kernel state; no new authority is added and nothing auto-runs without an explicit gate.
+  Full-e2e release gate **PASS** (`scripts\relux-package-local.ps1 -FullE2E`); `cargo test` +
+  `clippy --all-targets -D warnings` clean on `relux-core` / `relux-kernel`; dashboard
+  typecheck / tests / build green; tracked `dashboard-dist` in sync. Every safety property from
+  v0.1.29 holds.
 - **v0.1.29** (2026-06-12) — **recovery + Cross-Guild Inbox** rollup. The `relux-kernel` / `relux-core`
   crates move `0.1.28` → `0.1.29` in lockstep, packaging the whole post-v0.1.28 line per
   `docs/relix-dashboard-design.md` §6.6–§6.11 and `relix-execution-and-issue-design.md` §3.3b. (1) **Safe

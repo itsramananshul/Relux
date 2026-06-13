@@ -9,6 +9,43 @@ once a stable release is cut.
 
 ### Added
 
+- **Relux local release v0.1.30 (Windows bundle).** The `relux-kernel` and
+  `relux-core` crates move `0.1.29` → `0.1.30` in lockstep, packaging the whole
+  post-v0.1.29 **agentic tool-use** line into a fresh Windows bundle. Everything
+  reads-from / writes-through real kernel state (no mocked data) and conforms to
+  `docs/RELUX_MASTER_PLAN.md` §8.2 / §9.6.1 / §10.1 / §10.5 / §14 / §17.1 and
+  `docs/prime-tool-use.md`. No master-plan safety property is weakened — no new
+  authority is added and nothing auto-runs without an explicit gate. Headlines:
+  - **Auto-detected CLI brain.** Prime auto-adopts an enabled, on-`PATH` Claude /
+    Codex CLI as its brain when none is selected, so it is a real chat agent out of
+    the box instead of silently falling back to Local (`resolve_brain` /
+    `available_cli_brains` in `ai.rs`).
+  - **Run watchdog.** A server-side watchdog recovers stale `Running` runs as
+    `RunFailureClass::Stale` so no run hangs silently (§9.6.1).
+  - **Structured capability candidates.** A manifestless / imported repo scan now
+    yields structured per-capability candidates (`capability_detect.rs`) so
+    install-to-usable is a real per-candidate path, not a dead end (§8.2).
+  - **Governed command tools.** A detected CLI / script / Cargo candidate becomes a
+    real gated tool (`command_tool` activation + safe argv `command_exec` spawn), so
+    a detected binary is an actual, approval-gated tool (§8.2).
+  - **Prime tool / plugin awareness.** Prime sees the runnable tool inventory in its
+    decision prompt and the agent-loop entry is brain-driven; installed / MCP tools
+    are usable from chat (`GET /v1/relux/prime/tools`; §10.1 / §10.5 / §17.1).
+  - **Continuous tool use.** Live MCP tool names land in Prime's *first* decision
+    (`decision_time_mcp_catalog`, TTL-cached / fail-closed) and the dashboard
+    auto-continues after an approval into run → continue.
+  - **Honest release smokes (local-vs-real-adapter boundary).** The first-release
+    gate no longer asks the deterministic local Prime adapter to run free-form
+    external work and expect success. It now proves the *correct* §8.1 behavior:
+    a free-form "inspect this repo" task **fails closed** (non-zero exit +
+    actionable guidance, task parked `Blocked`) — never a hang, never a fabricated
+    "done". The E2E smoke (`relux-e2e-smoke.ps1`) adds the **positive** counterpart
+    — a task carrying an echo.say `tool_call` directive is created, executed as
+    assigned, and both the run and task honestly reach `completed` — and keeps real
+    agent work behind the opt-in `-RunRealClaudeAdapter` / `-RunRealCodexAdapter`
+    paths. A new static drift guard (`scripts\check-smoke-adapter-boundary.ps1`,
+    run by the gate) pins this contract so the smokes cannot revert to faking
+    external work to turn the gate green. No product behavior changed.
 - **Relux local release v0.1.29 (Windows bundle).** The `relux-kernel` and
   `relux-core` crates move `0.1.28` → `0.1.29` in lockstep, packaging the whole
   post-v0.1.28 **recovery + Cross-Guild Inbox** line into a fresh Windows bundle.

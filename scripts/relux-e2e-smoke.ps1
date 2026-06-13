@@ -32,9 +32,13 @@
 #                        deliberately FAKE command persists+reports the runtime
 #                        config; disabling clears it. No real Claude/Codex is
 #                        ever spawned (no task is run through a CLI adapter).
-#   6. Autonomy        - creates a ready task through Prime, enables autonomy with
-#                        safe settings, runs ONE manual tick, and verifies the
-#                        task honestly moved Queued -> Completed with a run.
+#   6. Autonomy        - creates a free-form "inspect this repo" task through Prime,
+#                        enables autonomy, runs ONE manual tick, and verifies the
+#                        local (deterministic) adapter FAILS CLOSED honestly: zero
+#                        tasks completed + actionable guidance, and the task parked
+#                        Blocked (never a hang, never a fabricated completion). The
+#                        positive path - local Prime completing work it CAN fulfil -
+#                        is step 7's "local fulfillable task completes".
 #   7. HTTP serve (opt)- starts `relux-kernel serve` on a free loopback port and
 #                        exercises local operator login end to end: setup/login,
 #                        /v1/auth/me, an authenticated password change (with the
@@ -43,10 +47,13 @@
 #                        session server-side; the next login mints a fresh session
 #                        whose absolute 7-day ceiling is reset). Then hits
 #                        /dashboard, /v1/relux/state, /v1/relux/prime/autonomy,
-#                        and /v1/relux/tools; stops the server at the end. The
-#                        loopback test (step 4) rides on this same server because
-#                        granting Prime a new tool permission is an API operation.
-#                        Skip with -SkipServe.
+#                        and /v1/relux/tools; then proves the POSITIVE local path -
+#                        a task carrying an echo.say `tool_call` directive is created,
+#                        executed as assigned, and both the run AND the task honestly
+#                        reach `completed` ("local fulfillable task completes"). Stops
+#                        the server at the end. The loopback test (step 4) rides on
+#                        this same server because granting Prime a new tool permission
+#                        is an API operation. Skip with -SkipServe.
 #
 # Everything temporary (DB, plugins, uploads, server, jobs, processes) is always
 # cleaned up. Prints a concise PASS/FAIL table and exits non-zero on any failure.
@@ -219,8 +226,18 @@ try {
     $adShow2 = Exe adapter runtime relux-adapter-claude-cli
     Assert 'adapter disable clears runtime' (($adDisable -match 'disabled adapter runtime') -and ($adShow2 -match 'enabled:\s*false')) 'enabled=false after disable'
 
-    # -- 6) Autonomy: create a ready task, tick once, verify honest move ---
-    Section 'Prime autonomy'
+    # -- 6) Autonomy: a free-form external goal fails closed HONESTLY ------
+    # Prime CAN create work, and the autonomy tick CAN drive it - but the local
+    # Prime adapter is deterministic and does NO external work. A free-form
+    # "inspect this repo" goal (a `prime_request` with no executable directive) is
+    # something it cannot action, so one tick must drive the run to a terminal
+    # Failed state and PARK the task Blocked - never leave it Running (a hang) and
+    # never fake-echo it back as Completed (RELUX_MASTER_PLAN Sec 8.1 "Local Prime
+    # is deterministic"; is_unfulfillable_local_request / LocalAdapterUnsupported).
+    # The positive path - local Prime completing work it CAN fulfil - is proven
+    # over HTTP in step 7 ("local fulfillable task completes"); real agent work
+    # uses a real Claude/Codex adapter (-RunRealClaudeAdapter / -RunRealCodexAdapter).
+    Section 'Prime autonomy (honest fail-closed)'
     $createTurn = Exe prime 'create a task to inspect this repo'
     Assert 'prime creates a task' ($createTurn -match 'Created task_\d+') 'task queued + assigned to prime'
     $stateBefore = Exe state
@@ -229,11 +246,15 @@ try {
     [void](Exe prime autonomy configure --interval 5 --max-tasks 1 --auto-assign false)
     [void](Exe prime autonomy enable)
     $tick = Exe prime autonomy tick
-    $tickRan = ($tick -match 'Tasks Run:\s*1')
-    Assert 'autonomy tick runs one task' $tickRan 'one ready task executed'
+    # The tick attempted the task and refused honestly: zero tasks completed, with
+    # a skipped reason carrying the local-adapter guidance (not a hang, not a fake).
+    $tickRefused = ($tick -match 'Tasks Run:\s*0') -and ($tick -match 'cannot fulfil') -and ($tick -match 'no external work')
+    Assert 'autonomy tick refuses unfulfillable work honestly' $tickRefused 'Tasks Run: 0 + actionable guidance'
     $stateAfter = Exe state
-    $completedAfter = ($stateAfter -match 'task_0001\s+\[Completed\]') -and ($stateAfter -match 'runs=1')
-    Assert 'task honestly moved to Completed' $completedAfter 'Queued -> Completed with a run'
+    # Parked Blocked (reopenable once a real adapter is assigned) - NOT Completed,
+    # NOT still Running/Queued.
+    $parkedBlocked = ($stateAfter -match 'task_0001\s+\[Blocked\]') -and ($stateAfter -notmatch 'task_0001\s+\[Completed\]')
+    Assert 'task parked Blocked (fail-closed)' $parkedBlocked 'Queued -> Blocked (no fabricated completion)'
     [void](Exe prime autonomy disable)
 
     # -- 4 + 7) HTTP serve endpoints + loopback ToolSet runtime ------------
@@ -498,6 +519,36 @@ try {
             Assert 'GET /v1/relux/state' ((Invoke-Api 'GET' '/v1/relux/state' $null).Status -eq 200) '200'
             Assert 'GET /v1/relux/prime/autonomy' ((Invoke-Api 'GET' '/v1/relux/prime/autonomy' $null).Status -eq 200) '200'
             Assert 'GET /v1/relux/tools' ((Invoke-Api 'GET' '/v1/relux/tools' $null).Status -eq 200) '200'
+
+            # -- Local Prime completes work it CAN fulfil (positive path) -------
+            # The deterministic local adapter does no external work, but it DOES run
+            # an operator-authored tool directive through the gated `call_tool`
+            # chokepoint. Create a task carrying an explicit echo.say `tool_call`
+            # (auto-assigned to Prime), execute it as assigned, and confirm the run
+            # AND the task honestly reach `completed`. This is the honest counterpart
+            # to the fail-closed autonomy step: local Prime runs ONLY what it can
+            # fulfil, and does so for real (RELUX_MASTER_PLAN Sec 8.1; docs/mcp.md
+            # "Run-driven MCP tool call").
+            $fulTok = 'ful-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+            $fulBody = @{
+                title     = 'echo tool directive Prime can fulfil locally'
+                tool_call = @{ plugin = 'relux-tools-echo'; tool = 'echo.say'; args = @{ token = $fulTok } }
+            } | ConvertTo-Json -Compress -Depth 6
+            $fulCreate = Invoke-Api 'POST' '/v1/relux/tasks' $fulBody
+            $fulTaskId = $null; try { $fulTaskId = ($fulCreate.Body | ConvertFrom-Json).id } catch {}
+            Assert 'local fulfillable task created' (($fulCreate.Status -eq 200) -and $fulTaskId) ("create=$($fulCreate.Status) id=$fulTaskId")
+            if ($fulTaskId) {
+                $fulExec = Invoke-Api 'POST' "/v1/relux/tasks/$fulTaskId/execute-assigned" '{}'
+                $fulRunId = $null; try { $fulRunId = ($fulExec.Body | ConvertFrom-Json).run_id } catch {}
+                $fulRun = $null
+                if ($fulRunId) { try { $fulRun = (Invoke-Api 'GET' "/v1/relux/runs/$fulRunId" $null).Body | ConvertFrom-Json } catch {} }
+                $fulTask = $null; try { $fulTask = (Invoke-Api 'GET' "/v1/relux/tasks/$fulTaskId" $null).Body | ConvertFrom-Json } catch {}
+                $fulOk = ($fulExec.Status -eq 200) -and $fulRun -and ($fulRun.status -eq 'completed') -and $fulTask -and ($fulTask.status -eq 'completed')
+                $fulWhy = if ($fulRun) { "run=$($fulRun.status) task=$($fulTask.status)" } else { "execute=$($fulExec.Status)" }
+                Assert 'local fulfillable task completes' $fulOk $fulWhy
+            } else {
+                Fail 'local fulfillable task completes' 'task was not created'
+            }
 
             if ($SkipLoopback) {
                 Skip 'loopback runtime' '-SkipLoopback'

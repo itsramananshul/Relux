@@ -94,6 +94,16 @@ $portGuidanceCheck = Join-Path $PSScriptRoot "check-port-guidance.ps1"
 [void](Invoke-NativeStep -Name "port guidance contract" -Exe "powershell" `
     -Arguments @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $portGuidanceCheck))
 
+# The release smokes must prove HONEST local-vs-real-adapter behavior: local
+# Prime fails closed on free-form external work (never a hang, never a fake
+# "done"), runs only what it CAN fulfil, and defers real agent work to a
+# configured Claude/Codex adapter (RELUX_MASTER_PLAN Sec 8.1). This static check
+# pins that contract so the smokes cannot drift back to faking external work to
+# turn the gate green. No build/process needed.
+$smokeBoundaryCheck = Join-Path $PSScriptRoot "check-smoke-adapter-boundary.ps1"
+[void](Invoke-NativeStep -Name "smoke adapter boundary contract" -Exe "powershell" `
+    -Arguments @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $smokeBoundaryCheck))
+
 if (Test-Path -LiteralPath $ReleaseExe) {
     Invoke-NativeStep -Name "release doctor" -Exe $ReleaseExe -Arguments @("doctor")
 } elseif ($Cargo) {
@@ -108,8 +118,46 @@ if ($SkipSmoke) {
     $oldDb = $env:RELUX_DB
     $env:RELUX_DB = Join-Path $TempRoot "local.db"
     try {
+        # Prime CAN create work locally: a free-form "inspect this repo" goal
+        # becomes a queued, Prime-assigned task. This is the honest first half of
+        # the local flow.
         Invoke-NativeStep -Name "prime creates task" -Exe $ReleaseExe -Arguments @("prime", "create a task to inspect this repo")
-        Invoke-NativeStep -Name "assigned task runs" -Exe $ReleaseExe -Arguments @("task", "run-assigned", "task_0001")
+
+        # The local Prime adapter is DETERMINISTIC and does NO external work
+        # (clone/filesystem/network/import). Running this free-form goal must
+        # therefore FAIL CLOSED honestly: a non-zero exit + actionable guidance
+        # naming the real-adapter remedy - NOT a silent hang and NOT a fabricated
+        # "done" (RELUX_MASTER_PLAN Sec 8.1 "Local Prime is deterministic";
+        # relux_core::is_unfulfillable_local_request / LocalAdapterUnsupported).
+        # We assert the refusal, not a success. To run this as REAL agent work,
+        # configure a Claude/Codex adapter - see scripts\relux-e2e-smoke.ps1
+        # -RunRealClaudeAdapter / -RunRealCodexAdapter.
+        Write-Host ""
+        Write-Host ">> assigned run fails closed honestly" -ForegroundColor DarkCyan
+        $eapOld = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        $assignedOut = & $ReleaseExe task run-assigned task_0001 2>&1 | Out-String
+        $assignedCode = if ($null -eq $LASTEXITCODE) { 0 } else { $LASTEXITCODE }
+        $stateOut = & $ReleaseExe state 2>&1 | Out-String
+        $ErrorActionPreference = $eapOld
+        $refusedHonestly = ($assignedCode -ne 0) `
+            -and ($assignedOut -match 'cannot fulfil') `
+            -and ($assignedOut -match 'no external work') `
+            -and ($assignedOut -match 'Claude or Codex')
+        if ($refusedHonestly) {
+            Write-Step "assigned run fails closed honestly" "PASS" "local Prime refused free-form external work (exit $assignedCode)"
+        } else {
+            Write-Step "assigned run fails closed honestly" "FAIL" "expected non-zero exit + guidance, got exit $assignedCode"
+        }
+        # The refused task is parked Blocked (operator-actionable + reopenable once
+        # a real adapter is assigned) - never stuck Running (a hang) and never
+        # Completed (a fake success).
+        $parkedBlocked = ($stateOut -match 'task_0001\s+\[Blocked\]')
+        if ($parkedBlocked) {
+            Write-Step "refused task parked Blocked" "PASS" "task_0001 Blocked (reopenable), not Running/Completed"
+        } else {
+            Write-Step "refused task parked Blocked" "FAIL" "task_0001 not parked Blocked after honest refusal"
+        }
     } finally {
         if ($null -eq $oldDb) {
             Remove-Item Env:\RELUX_DB -ErrorAction SilentlyContinue
