@@ -26,6 +26,7 @@ import {
   agentCreatedAction,
   adapterBrandLabel,
   isCapabilityGrantSuggestion,
+  isRunOrchestrationSuggestion,
   agentCreatedView,
   PRIME_GREETING,
   PRIME_HINT,
@@ -496,6 +497,34 @@ test("isCapabilityGrantSuggestion matches only the approval-gated grant pre-fill
   assert.equal(isCapabilityGrantSuggestion({ label: "x", message: "grant it", send: true }), false);
   // A non-grant pre-fill is excluded.
   assert.equal(isCapabilityGrantSuggestion({ label: "Start the run", message: "start it", send: false }), false);
+});
+
+test("isRunOrchestrationSuggestion matches only the run chip for the given orchestration id", () => {
+  // The kernel's exact "Run this orchestration" chip — an immediate run command.
+  const runChip: ReluxPrimeSuggestion = {
+    label: "Run this orchestration",
+    message: "run orchestration orch_0001",
+    send: true,
+  };
+  assert.equal(isRunOrchestrationSuggestion(runChip, "orch_0001"), true);
+  // A chip for a DIFFERENT orchestration must not be filtered.
+  assert.equal(isRunOrchestrationSuggestion(runChip, "orch_0002"), false);
+  // The "Hire a … agent" pre-fill (send:false) is never the run chip.
+  assert.equal(
+    isRunOrchestrationSuggestion(
+      { label: "Hire a documentation agent", message: "create a documentation agent", send: false },
+      "orch_0001",
+    ),
+    false,
+  );
+  // A look-alike message that is not the exact run command is excluded.
+  assert.equal(
+    isRunOrchestrationSuggestion(
+      { label: "x", message: "run orchestration orch_0001 now", send: true },
+      "orch_0001",
+    ),
+    false,
+  );
 });
 
 test("agentCreatedView surfaces the deterministic adapter and no setup when nothing was requested", () => {

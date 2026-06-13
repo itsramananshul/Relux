@@ -3,10 +3,13 @@ import { Link } from "react-router-dom";
 import {
   reluxAi,
   reluxApprovals,
+  reluxOrchestration,
   reluxPrime,
   reluxWork,
+  ApiError,
   type ReluxAiStatus,
   type ReluxCapabilityCandidate,
+  type ReluxOrchestrationJob,
   type ReluxPrimeConfigureCandidateResult,
   type ReluxPrimeConfigureCommandToolResult,
   type ReluxPrimeInstallPluginResult,
@@ -24,10 +27,22 @@ import {
   orchestrationStatusTone,
   orchestrationProgressLabel,
   orchestrationAssignmentSummary,
+  canRunOrchestration,
+  jobCanCancel,
+  jobIsActive,
+  jobIsCanceling,
+  jobIsInterrupted,
+  jobIsReconstructed,
+  jobIsTerminal,
+  jobPendingCount,
+  jobPhaseLabel,
+  jobProgressLabel,
+  jobRunningStepIds,
+  runButtonLabel,
   stepIsPrimeFallback,
   stepOutcomeTone,
 } from "../orchestration";
-import { afterActionLabel, agentCreatedView, boundedContextReads, brainSourceLabel, configureCommandToolAction, configurePluginCandidateAction, contextReadDetail, contextReadsHadMiss, contextReadsUsedLabel, decisionSourceLabel, formatToolOutput, githubPluginInstallAction, hasSteps, intentProvenance, isCapabilityGrantSuggestion, pendingClarificationLabel, polishProvenance, PRIME_GREETING, PRIME_HINT, PRIME_PLACEHOLDER, PRIME_SUGGESTIONS, proposalDisplaySummary, replyPolishLabel, requestedToolLabel, slotProvenance, stepDisplayTitle, updateProvenance, type AgentCreatedView, type ConfigureCommandToolAction, type ConfigurePluginCandidateAction } from "../prime";
+import { afterActionLabel, agentCreatedView, boundedContextReads, brainSourceLabel, configureCommandToolAction, configurePluginCandidateAction, contextReadDetail, contextReadsHadMiss, contextReadsUsedLabel, decisionSourceLabel, formatToolOutput, githubPluginInstallAction, hasSteps, intentProvenance, isCapabilityGrantSuggestion, isRunOrchestrationSuggestion, pendingClarificationLabel, polishProvenance, PRIME_GREETING, PRIME_HINT, PRIME_PLACEHOLDER, PRIME_SUGGESTIONS, proposalDisplaySummary, replyPolishLabel, requestedToolLabel, slotProvenance, stepDisplayTitle, updateProvenance, type AgentCreatedView, type ConfigureCommandToolAction, type ConfigurePluginCandidateAction } from "../prime";
 import { commandToolInputFromDraft, validateCommandToolDraft, type CommandToolDraft } from "../plugins";
 import { workTaskHref, workRunHref } from "../routing";
 import { consumeInvestigationSeed } from "../investigateseed";
@@ -534,9 +549,19 @@ export function PrimeTurnCard({
   // shown it OWNS the capability-grant follow-ups and the Crew link, so they are filtered
   // out of the generic suggestion row / artifact line to avoid rendering them twice.
   const agentCreated = agentCreatedView(turn);
-  const shownSuggestions = agentCreated
-    ? suggestions.filter((s) => !isCapabilityGrantSuggestion(s))
-    : suggestions;
+  // The orchestration result card (below) is the PRIMARY run path: it carries a real,
+  // governed "Run orchestration" button + live progress. So when this turn produced an
+  // orchestration, drop the redundant "Run this orchestration" conversational chip from
+  // the generic suggestion row to avoid a confusing second run that could double-run
+  // (the chip stays valid if typed by hand; §10.4/§11.1/§17.1).
+  let shownSuggestions = suggestions;
+  if (agentCreated) {
+    shownSuggestions = shownSuggestions.filter((s) => !isCapabilityGrantSuggestion(s));
+  }
+  if (turn.orchestration) {
+    const orchId = turn.orchestration.id;
+    shownSuggestions = shownSuggestions.filter((s) => !isRunOrchestrationSuggestion(s, orchId));
+  }
   return (
     <div className="msg assistant" style={{ maxWidth: 720 }}>
       <div className="row wrap" style={{ gap: 6, marginBottom: 6, alignItems: "center" }}>
@@ -2151,17 +2176,153 @@ function ProposalCard({ proposal }: { proposal: ReluxPrimeProposal }) {
   );
 }
 
-// The executed multi-agent ORCHESTRATION result card (RELUX_MASTER_PLAN §10.4
-// Delegation Rules, §11.1 Prime Chat). It renders STRICTLY the durable record the turn
-// carried — the goal, the ordered briefs with their assigned agent + specialist role +
-// outcome, and the planner's honest notes (which name any role with no specialist on the
-// roster). A brief that fell back to Prime is marked as such so the "who is missing" gap
-// is legible, not hidden. The card commits nothing and runs nothing by showing it: the
-// briefs were already created + assigned, and the Run / Hire next actions are the ordinary
-// suggested_actions rendered below it (each a plain user message, never a privileged path).
-function OrchestrationResultCard({ orchestration }: { orchestration: ReluxOrchestration }) {
-  const o = orchestration;
+// How often the result card polls an in-flight orchestration job for live progress
+// (mirrors the standalone OrchestrationPanel's cadence so the two surfaces feel alike).
+const ORCH_JOB_POLL_MS = 1000;
+
+// The executed multi-agent ORCHESTRATION result card (RELUX_MASTER_PLAN §10.4 Delegation
+// Rules, §11.1 Prime Chat). It renders the durable record the turn carried — the goal, the
+// ordered briefs with their assigned agent + specialist role + outcome, and the planner's
+// honest notes — AND it is the PRIMARY run control for that orchestration: an explicit
+// "Run orchestration" button starts the EXISTING non-blocking `run-async` job (the same
+// route the OrchestrationPanel uses), then a 1s poll renders the live phase / progress
+// until the job is terminal, and the durable record is refreshed so the briefs show their
+// real outcomes + run ids. It NEVER auto-runs on render (§17.1) — only an operator click
+// starts a job, and every brief still gates through its agent's adapter at run time. It
+// reuses the shared `orchestration.ts` job helpers (no parallel logic) and adds no new
+// authority. Exported for the focused render test. A brief that fell back to Prime is
+// marked so the "who is missing" gap stays legible.
+export function OrchestrationResultCard({ orchestration }: { orchestration: ReluxOrchestration }) {
+  // The durable record this card renders. Seeded from the turn; refreshed from the kernel
+  // once a run finishes so the briefs show their real outcomes + run ids (never fabricated).
+  const [record, setRecord] = useState<ReluxOrchestration>(orchestration);
+  // Live background-job state for THIS orchestration (the backend guarantees at most one
+  // active job per orchestration). Null until a run is started or reconnected to.
+  const [job, setJob] = useState<ReluxOrchestrationJob | null>(null);
+  const [starting, setStarting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const mounted = useRef(true);
+  const reconnected = useRef(false);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
+  // Read-only reconnect on mount (contract C): if a job is ALREADY active for this
+  // orchestration — started here, from the Orchestration panel, or the Work board — attach
+  // to it and let the poll effect drive it, instead of ever offering to start a duplicate.
+  // This is a GET; it starts NOTHING (so it never violates the no-auto-run rule). A 404
+  // means no brief ever ran — we show the planned record untouched. A terminal/reconstructed
+  // job is ignored here so a freshly-created card never surfaces an unrelated prior run.
+  useEffect(() => {
+    if (reconnected.current) return;
+    reconnected.current = true;
+    void (async () => {
+      try {
+        const existing = await reluxOrchestration.latestJob(orchestration.id);
+        if (mounted.current && jobIsActive(existing)) setJob(existing);
+      } catch {
+        /* 404 (never ran) or transient — show the planned record */
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Poll the active job until it finishes, then stop (contract B). On a terminal state we
+  // refresh the durable record so the briefs reflect the real outcomes + run ids. A 404
+  // means the job was lost to a server restart — drop it and fall back to the record (the
+  // restart-honest reconstructed status comes back through `latestJob` as "interrupted").
+  useEffect(() => {
+    if (!jobIsActive(job)) return;
+    let cancelled = false;
+    const handle = window.setTimeout(async () => {
+      try {
+        const next = await reluxOrchestration.latestJob(orchestration.id);
+        if (cancelled || !mounted.current) return;
+        setJob(next);
+        if (jobIsTerminal(next.state)) {
+          try {
+            const fresh = await reluxOrchestration.get(orchestration.id);
+            if (mounted.current) setRecord(fresh);
+          } catch {
+            /* keep the last record if the refresh fails */
+          }
+        }
+      } catch (e) {
+        if (cancelled || !mounted.current) return;
+        if (e instanceof ApiError && e.status === 404) setJob(null);
+        /* transient: leave the job; the next tick retries */
+      }
+    }, ORCH_JOB_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(handle);
+    };
+  }, [job, orchestration.id]);
+
+  // Start a NON-BLOCKING run via the existing `run-async` route — the explicit,
+  // operator-triggered start. Honest about refusals: a duplicate active job (409) reconnects
+  // to it instead of starting another (contract C); an over-cap fleet (429) or any other
+  // refusal is surfaced verbatim. No new authority — each brief still gates at run time.
+  async function run() {
+    if (jobIsActive(job) || starting) return;
+    setError(null);
+    setStarting(true);
+    try {
+      const started = await reluxOrchestration.runAsync(orchestration.id);
+      if (mounted.current) setJob(started);
+    } catch (e) {
+      if (!mounted.current) return;
+      if (e instanceof ApiError && e.status === 409) {
+        // A run is already in progress — reconnect to it rather than double-run.
+        try {
+          const existing = await reluxOrchestration.latestJob(orchestration.id);
+          if (mounted.current) {
+            setJob(existing);
+            setError(null);
+          }
+        } catch {
+          setError("A run is already in progress for this orchestration.");
+        }
+      } else if (e instanceof ApiError && e.status === 429) {
+        setError(
+          e.message ||
+            "Too many orchestration runs are in flight right now — wait for one to finish, then run again.",
+        );
+      } else {
+        setError(e instanceof ApiError ? e.message : "Failed to start the orchestration run.");
+      }
+    } finally {
+      if (mounted.current) setStarting(false);
+    }
+  }
+
+  // Request cancellation of the active job. Cooperative and honest (same as the panel): the
+  // worker finishes the in-flight round, then stops before the next one and marks the job
+  // canceled — it never kills a running brief.
+  async function cancel() {
+    if (!jobCanCancel(job)) return;
+    setError(null);
+    try {
+      const updated = await reluxOrchestration.cancelJob(job!.id);
+      if (mounted.current) setJob(updated);
+    } catch (e) {
+      if (mounted.current) {
+        setError(e instanceof ApiError ? e.message : "Failed to cancel the orchestration run.");
+      }
+    }
+  }
+
+  const o = record;
   const { assignedAgents, unassignedRoles } = orchestrationAssignmentSummary(o);
+  const active = jobIsActive(job);
+  const runningIds = new Set(jobRunningStepIds(job));
+  const interrupted = jobIsReconstructed(job) && jobIsInterrupted(job);
+  const pending = jobPendingCount(job);
+  const runnable = canRunOrchestration(o);
   return (
     <div
       style={{
@@ -2202,6 +2363,7 @@ function OrchestrationResultCard({ orchestration }: { orchestration: ReluxOrches
       <ol style={{ margin: 0, paddingLeft: 0, listStyle: "none" }}>
         {o.steps.map((s, i) => {
           const onPrime = stepIsPrimeFallback(s);
+          const isRunning = active && s.outcome === "pending" && runningIds.has(s.task_id);
           return (
             <li
               key={s.task_id}
@@ -2234,9 +2396,29 @@ function OrchestrationResultCard({ orchestration }: { orchestration: ReluxOrches
                 → {s.agent_id}
                 {onPrime && " (no specialist yet)"}
               </span>
+              {/* A brief the live job is executing this round shows a real "running" badge
+                  (from the polled job snapshot), not a guess. */}
+              {isRunning && (
+                <span className="badge in_progress" style={{ fontSize: 9 }} title="Running now">
+                  running
+                </span>
+              )}
               <span className={"badge " + stepOutcomeTone(s.outcome)} style={{ fontSize: 9 }} title="Brief outcome">
                 {s.outcome}
               </span>
+              {/* Only a brief that actually produced a run gets a link, and it deep-links to
+                  that run's detail inside the Work surface — never a fake link for a step
+                  with no run (contract D). */}
+              {s.run_id && (
+                <Link
+                  to={workRunHref(s.run_id)}
+                  className="mono muted"
+                  style={{ fontSize: 10 }}
+                  title="Open this brief's run detail on the Work board"
+                >
+                  {s.run_id}
+                </Link>
+              )}
             </li>
           );
         })}
@@ -2250,13 +2432,111 @@ function OrchestrationResultCard({ orchestration }: { orchestration: ReluxOrches
           ))}
         </ul>
       )}
-      {/* The honest contract: creating the orchestration ran nothing. The Run /
-          Hire buttons below (suggested_actions) are the explicit, governed next
-          steps; the full controls (live progress, cancel, resume) live on the
-          Prime Orchestration panel and the Work board. */}
+
+      {/* Live / terminal job state — real phase, round, and per-brief progress from the
+          polled job, never a bare spinner. The restart-honest reconstructed "interrupted"
+          status (no live worker, pending briefs remain) gets its own callout so it is never
+          mistaken for a live run (RELUX_MASTER_PLAN §15). */}
+      {job &&
+        (interrupted ? (
+          <div
+            className="banner"
+            role="status"
+            style={{ fontSize: 11, marginTop: 8, borderColor: "var(--warn)" }}
+          >
+            <strong style={{ color: "var(--warn)" }}>Run interrupted — no live worker</strong>
+            <div className="muted" style={{ fontSize: 10, marginTop: 2 }}>
+              Reconstructed from the durable record (this is not a live run): a previous run
+              finished, was canceled, or was lost to a server restart, and nothing is driving
+              this orchestration now.
+            </div>
+            <div style={{ fontSize: 11, marginTop: 4 }}>
+              {jobProgressLabel(job)}
+              {pending > 0 ? ` · ${pending} pending` : ""}
+            </div>
+            {pending > 0 && (
+              <div className="muted" style={{ fontSize: 10, marginTop: 2 }}>
+                Run again to resume the {pending} pending brief{pending === 1 ? "" : "s"};
+                completed briefs are never re-run.
+              </div>
+            )}
+          </div>
+        ) : (
+          <div
+            className={"banner" + (job.state === "failed" ? " err" : "")}
+            style={{ fontSize: 11, marginTop: 8 }}
+            role="status"
+          >
+            <strong>{jobPhaseLabel(job)}</strong>
+            {jobProgressLabel(job) ? ` — ${jobProgressLabel(job)}` : ""}
+            {job.last_event && (
+              <div className="muted" style={{ fontSize: 10, marginTop: 2 }}>
+                {job.last_event}
+              </div>
+            )}
+            {job.error && <div style={{ fontSize: 10, marginTop: 2 }}>{job.error}</div>}
+          </div>
+        ))}
+
+      {/* A refused start (a duplicate that couldn't be reconnected, an over-cap fleet) or a
+          cancel error, surfaced verbatim so the operator is never left guessing (contract C). */}
+      {error && (
+        <div className="banner err" style={{ fontSize: 11, marginTop: 8 }}>
+          {error}
+        </div>
+      )}
+
+      {/* The PRIMARY run control: an explicit, operator-triggered start of the existing
+          governed `run-async` batch. Nothing runs until this is clicked (§17.1). */}
+      <div className="row wrap" style={{ gap: 8, marginTop: 10, alignItems: "center" }}>
+        <button
+          className="btn"
+          style={{ fontSize: 12, padding: "4px 12px" }}
+          onClick={() => void run()}
+          disabled={starting || active || !runnable}
+          title={
+            active
+              ? "A run is already in progress"
+              : runnable
+                ? "Start the governed multi-agent batch — runs the pending briefs through each agent's adapter"
+                : "No pending briefs to run"
+          }
+        >
+          {runButtonLabel(o, job)}
+        </button>
+        {/* Cancel is offered only while a job is active. Cooperative — it stops after the
+            in-flight round, leaving remaining briefs pending. */}
+        {active && (
+          <button
+            className="btn ghost"
+            style={{ fontSize: 12, padding: "4px 12px" }}
+            onClick={() => void cancel()}
+            disabled={!jobCanCancel(job)}
+            title={
+              jobIsCanceling(job)
+                ? "Canceling — finishing the in-flight round, then stopping"
+                : "Stop after the in-flight round; remaining briefs stay pending"
+            }
+          >
+            {jobIsCanceling(job) ? "Canceling…" : "Cancel"}
+          </button>
+        )}
+        <Link
+          to="/work"
+          className="btn ghost"
+          style={{ fontSize: 12, padding: "4px 12px" }}
+          title="Open the Work board to track every brief"
+        >
+          Track on Work board
+        </Link>
+      </div>
+
+      {/* The honest contract: showing the card ran nothing — the briefs were created +
+          assigned, and the run starts only on the explicit button above. */}
       <div className="muted" style={{ fontSize: 10, marginTop: 8, fontStyle: "italic" }}>
-        Nothing is running yet — use the buttons below to run it or hire a missing
-        specialist, or open the <Link to="/work">Work board</Link> to track the briefs.
+        {job
+          ? "Live progress updates here while a run is in flight; each brief still gates through its agent's adapter."
+          : "Nothing is running yet — use Run orchestration to start the briefs, hire a missing specialist below, or open the Work board to track them."}
       </div>
     </div>
   );

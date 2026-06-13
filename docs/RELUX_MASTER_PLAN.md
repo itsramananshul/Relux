@@ -1941,6 +1941,22 @@ download). The version is the `relux-kernel` / `relux-core` crate version and is
 stamped into `relux-kernel doctor`, `/v1/relux/health`, and the bundle's
 `VERSION.txt`. Build a bundle with `scripts\relux-package-local.ps1 -FullE2E`.
 
+- **Unreleased (dashboard-only)** — **The orchestration result card becomes a real run control**
+  (§10.4 / §11.1 / §17.1; UI only, no kernel change, no crate-version bump). The v0.1.35 card
+  rendered the briefs but pushed the operator to a conversational chip or the Advanced panel to
+  actually run. The card now owns the run: an explicit **Run orchestration** button starts the
+  EXISTING non-blocking `run-async` job (the same route the standalone `OrchestrationPanel` uses),
+  a 1s poll renders the live phase / round / per-brief progress and the terminal
+  completed/failed/canceled state, and a restart-honest **interrupted** callout appears when no
+  live worker is driving the run (reusing the shared `orchestration.ts` job helpers). It reconnects
+  to an already-active job instead of double-running (read-only mount reconnect + 409 → reconnect),
+  surfaces an over-cap refusal (429) verbatim, deep-links each brief's run into a populated
+  `/work?run=<id>`, and refreshes the durable record once a run finishes so outcomes are real — all
+  without auto-running on render (only an operator click starts a job; each brief still gates at run
+  time). The redundant "Run this orchestration" suggestion chip is filtered from the generic row
+  (`isRunOrchestrationSuggestion`) so there is one clear primary run path; the chip still works if
+  typed. Focused render tests pin the button, the deep links, the no-fabricated-link rule, the chip
+  filtering, and a no-stale-`dashboard-dist` bundle check; rebuilt bundle committed.
 - **v0.1.35** (2026-06-13) — **Grounded orchestration result card** rollup. The `relux-kernel` /
   `relux-core` crates move `0.1.34` → `0.1.35` in lockstep, packaging the post-v0.1.34 fix into a
   fresh Windows bundle (`docs/prime-tool-use.md`; RELUX_MASTER_PLAN §10.4 / §11.1 / §17.1; built

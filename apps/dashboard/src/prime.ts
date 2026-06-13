@@ -127,6 +127,23 @@ export function isCapabilityGrantSuggestion(s: ReluxPrimeSuggestion): boolean {
   return s.send === false && s.message.trim().toLowerCase().startsWith("grant ");
 }
 
+// True when a suggested action is the kernel's "Run this orchestration" chip for the
+// given orchestration id — the immediate (`send: true`) `run orchestration <id>` command
+// (orchestration_suggested_actions, state.rs). The orchestration result card now owns the
+// run with a real, governed Run button + live progress, so this conversational chip is
+// filtered out of the generic suggestion row to avoid a confusing second run path that
+// could double-run. The chip stays a valid fallback if the user types it by hand; this
+// only hides the redundant button on the card (RELUX_MASTER_PLAN §10.4, §11.1, §17.1).
+export function isRunOrchestrationSuggestion(
+  s: ReluxPrimeSuggestion,
+  orchestrationId: string,
+): boolean {
+  return (
+    s.send === true &&
+    s.message.trim().toLowerCase() === `run orchestration ${orchestrationId}`.trim().toLowerCase()
+  );
+}
+
 // A structured, presentation-only view of a "Prime created an operative" turn, built
 // STRICTLY from what the turn already carried — the created agent id, the adapter the
 // `CreateAgent` action resolved (or the brain-validated adapter slot), any brain-shaped
