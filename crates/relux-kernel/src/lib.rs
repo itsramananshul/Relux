@@ -104,7 +104,10 @@ pub use auth::{
     set_session_cookie_with_max_age, ChangePasswordError, DashboardAuth, SessionMeta,
     MIN_PASSWORD_LEN, SESSION_ABSOLUTE_MAX_SECS, SESSION_COOKIE, SESSION_TTL_SECS,
 };
-pub use builtin::{is_builtin_tool, is_internal_plugin, BUILTIN_TOOLS, INTERNAL_PLUGIN_IDS};
+pub use builtin::{
+    dev_fixtures_enabled, is_builtin_tool, is_hidden_fixture, is_hidden_fixture_when,
+    is_internal_plugin, BUILTIN_TOOLS, INTERNAL_PLUGIN_IDS,
+};
 pub use clock::Clock;
 pub use event::RunEvent;
 pub use capability_detect::{detect_candidates, CapabilityCandidate};

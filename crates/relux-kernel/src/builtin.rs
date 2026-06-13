@@ -52,6 +52,38 @@ pub fn is_internal_plugin(plugin_id: &str) -> bool {
     INTERNAL_PLUGIN_IDS.contains(&plugin_id)
 }
 
+/// True when dev/test fixtures (the echo ToolSet) should be REVEALED on the normal
+/// product + Prime surfaces in this process. Off by default; an operator opts in
+/// explicitly by exporting `RELUX_DEV_FIXTURES=1` (or `=true`). This is the single
+/// master switch the user asked for: with it unset, a loop-prover is never shown
+/// as a real capability anywhere; with it set, dev/test runs see the fixtures.
+pub fn dev_fixtures_enabled() -> bool {
+    std::env::var("RELUX_DEV_FIXTURES")
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false)
+}
+
+/// Pure composition of [`is_internal_plugin`] and the dev-fixtures switch, factored
+/// out so it can be unit-tested without touching process env. A plugin is a HIDDEN
+/// fixture when it is an internal fixture AND dev fixtures are not enabled.
+pub fn is_hidden_fixture_when(plugin_id: &str, dev_fixtures_enabled: bool) -> bool {
+    is_internal_plugin(plugin_id) && !dev_fixtures_enabled
+}
+
+/// True when this plugin must be hidden from user-facing AND Prime-facing surfaces
+/// in the current process: an internal dev/test fixture with `RELUX_DEV_FIXTURES`
+/// not set. Use this (not the bare [`is_internal_plugin`]) at every surface that
+/// offers a capability to an operator or to Prime's brain, so the master switch is
+/// honored consistently. The governed EXECUTION path is intentionally left alone:
+/// an explicitly named fixture still resolves + runs through the unchanged gate, so
+/// the internal smoke/test harness exercises the real tool/run path.
+pub fn is_hidden_fixture(plugin_id: &str) -> bool {
+    is_hidden_fixture_when(plugin_id, dev_fixtures_enabled())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,5 +103,17 @@ mod tests {
         assert!(is_internal_plugin("relux-tools-echo"));
         assert!(!is_internal_plugin("relux-tools-status"));
         assert!(!is_internal_plugin("relux-adapter-claude-cli"));
+    }
+
+    #[test]
+    fn hidden_fixture_respects_the_dev_switch() {
+        // Default (dev fixtures OFF): the echo fixture is hidden everywhere the
+        // helper gates, so Prime/operators never see it as a real ability.
+        assert!(is_hidden_fixture_when("relux-tools-echo", false));
+        // Dev fixtures ON: the fixture is revealed for dev/test runs.
+        assert!(!is_hidden_fixture_when("relux-tools-echo", true));
+        // A genuine capability is never hidden, regardless of the switch.
+        assert!(!is_hidden_fixture_when("relux-tools-status", false));
+        assert!(!is_hidden_fixture_when("relux-tools-status", true));
     }
 }

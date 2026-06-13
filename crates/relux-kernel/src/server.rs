@@ -1541,7 +1541,7 @@ async fn list_plugins(
     // operator never mistakes them for a real capability.
     let records = records
         .into_iter()
-        .filter(|p| include_internal || !relux_kernel::is_internal_plugin(&p.id))
+        .filter(|p| include_internal || !relux_kernel::is_hidden_fixture(&p.id))
         .collect();
     Ok(Json(records))
 }
@@ -1578,7 +1578,7 @@ async fn list_tools(
     // dev explicitly opts in.
     let tools = tools
         .into_iter()
-        .filter(|t| include_internal || !relux_kernel::is_internal_plugin(&t.plugin_id))
+        .filter(|t| include_internal || !relux_kernel::is_hidden_fixture(&t.plugin_id))
         .collect();
     Ok(Json(tools))
 }
@@ -4384,7 +4384,15 @@ async fn run_prime(
         // the prompt inventory OFF-LOCK below, enriched with the live MCP tool names — so what makes
         // an installed/configured plugin usable from chat is not a dead row on the Plugins page
         // (`docs/prime-tool-use.md`; §10.1/§10.5/§17.1). Cheap + in-memory.
-        let descriptors = kernel.discover_tools(None);
+        // Hide internal dev/test fixtures (echo) from the inventory rendered into the
+        // brain's decision prompt — unless dev fixtures are enabled — so the brain is
+        // never told it can use a loop-prover. The execution gate still resolves an
+        // explicitly named fixture, so the smoke/test harness is unaffected.
+        let descriptors: Vec<_> = kernel
+            .discover_tools(None)
+            .into_iter()
+            .filter(|t| !relux_kernel::is_hidden_fixture(&t.plugin_id))
+            .collect();
         // The bounded, secret-redacted recent-conversation context, so the (slow, off-lock) brain
         // can interpret a follow-up in context. Advisory BACKGROUND only — it is injected into the
         // decision prompt and never reaches the deterministic classifier or any gate.
@@ -9957,7 +9965,7 @@ async fn get_doctor(
                 let tools = kernel
                     .discover_tools(None)
                     .into_iter()
-                    .filter(|t| !relux_kernel::is_internal_plugin(&t.plugin_id))
+                    .filter(|t| !relux_kernel::is_hidden_fixture(&t.plugin_id))
                     .collect::<Vec<_>>();
                 (
                     true,

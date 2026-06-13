@@ -217,12 +217,16 @@ permission/audit path as `/v1/relux/tools/invoke`:
 
 - "what tools can you use?" - lists the installed tools with their honest
   executable status (grounded discovery; it never invents a tool). Internal
-  dev/test fixtures like `echo` are **hidden** from this catalogue and from the
-  dashboard Plugins/Tools lists, so they are never offered as a real ability.
+  dev/test fixtures like `echo` are **hidden** from this catalogue, from the
+  inventory in Prime's brain decision prompt, from Prime's agent-loop tool
+  catalogue (`GET /v1/relux/prime/tools`), and from the dashboard Plugins/Tools
+  lists, so they are never offered as a real ability. Set `RELUX_DEV_FIXTURES=1`
+  to reveal them for development/testing.
 - "give me a status summary" / "what is going on?" - consults
   `relux-tools-status/status.summary` and answers from the real output.
 - (dev/test only) `echo.say` is still invokable by exact name for the offline
-  smoke, but it is intentionally not surfaced or suggested anywhere in the product.
+  smoke (the governed execution path is unchanged), but it is intentionally not
+  surfaced or suggested anywhere in the product unless `RELUX_DEV_FIXTURES=1`.
 
 Prime stays honest: a plain "hey" never becomes a tool call, and a request to use
 an installed-but-unimplemented tool (e.g. a GitHub ToolSet) is reported as

@@ -8491,11 +8491,12 @@ impl KernelState {
             }
             PrimeAction::DiscoverTools => {
                 // Hide internal dev/test fixtures (echo) from the user-facing
-                // catalogue so Prime never offers it as a real ability.
+                // catalogue so Prime never offers it as a real ability (unless dev
+                // fixtures are explicitly enabled via RELUX_DEV_FIXTURES).
                 let tools: Vec<_> = self
                     .discover_tools(Some(&ctx.agent))
                     .into_iter()
-                    .filter(|t| !crate::builtin::is_internal_plugin(&t.plugin_id))
+                    .filter(|t| !crate::builtin::is_hidden_fixture(&t.plugin_id))
                     .collect();
                 let reply = render_tool_catalog(&text, &tools);
                 Ok(PrimeTurn {
@@ -9080,7 +9081,18 @@ impl KernelState {
     /// under the lock once (the proposal MCP catalog must already be injected via
     /// [`Self::set_proposal_mcp_catalog`]); the loop's brain rounds then run lock-free.
     pub fn prime_agent_catalog(&self, ctx: &PrimeContext) -> Vec<crate::prime_agent_loop::AgentTool> {
-        crate::prime_agent_loop::build_agent_catalog(&self.live_tool_catalog(Some(&ctx.agent)))
+        // Hide internal dev/test fixtures (the echo loop-prover) from the catalog the
+        // brain picks from and from `GET /v1/relux/prime/tools` — unless dev fixtures are
+        // enabled — so Prime never offers a fixture as a real ability. The governed
+        // EXECUTION path (`prime_invoke_tool`, which resolves against the unfiltered
+        // `live_tool_catalog`) is untouched, so an explicitly named fixture still runs for
+        // the internal smoke/test harness (`docs/prime-tool-use.md`; §10.1/§17.1).
+        let descriptors: Vec<_> = self
+            .live_tool_catalog(Some(&ctx.agent))
+            .into_iter()
+            .filter(|t| !crate::builtin::is_hidden_fixture(&t.plugin_id))
+            .collect();
+        crate::prime_agent_loop::build_agent_catalog(&descriptors)
     }
 
     /// Execute ONE bounded-agent-loop tool pick through the EXISTING single-invocation gate
@@ -19537,6 +19549,46 @@ mod tests {
             .expect("the runnable MCP tool is offered to the brain");
         assert_eq!(entry.source, "mcp");
         assert!(entry.gated, "an unclassified MCP tool is fail-closed gated");
+    }
+
+    /// The dev/test echo fixture is NEVER offered to Prime's brain on the default
+    /// product surface: it is absent from the agent catalog AND from the decision-
+    /// prompt tool inventory, while the genuine read-only status tool stays visible.
+    /// (`docs/prime-tool-use.md`; the RELUX_DEV_FIXTURES master switch — this asserts
+    /// the default OFF path, which is what ships.)
+    #[test]
+    fn echo_fixture_is_hidden_from_prime_catalog_and_inventory() {
+        let (k, ctx) = prime_chat_kernel();
+
+        // The catalog the agent loop's brain picks from (also `GET /v1/relux/prime/tools`).
+        let catalog = k.prime_agent_catalog(&ctx);
+        assert!(
+            !catalog.iter().any(|t| t.label.starts_with("relux-tools-echo/")),
+            "the echo fixture must never be offered to Prime: {catalog:?}"
+        );
+        assert!(
+            catalog
+                .iter()
+                .any(|t| t.label == "relux-tools-status/status.summary"),
+            "the genuine status tool stays visible to Prime: {catalog:?}"
+        );
+
+        // The inventory rendered into the brain's decision prompt (same hiding rule the
+        // server applies before `render_tool_inventory_with_mcp`).
+        let descriptors: Vec<_> = k
+            .discover_tools(None)
+            .into_iter()
+            .filter(|t| !crate::builtin::is_hidden_fixture(&t.plugin_id))
+            .collect();
+        let inventory = crate::render_tool_inventory(&descriptors, &[]);
+        assert!(
+            !inventory.contains("relux-tools-echo"),
+            "the decision prompt must not advertise the echo fixture: {inventory}"
+        );
+        assert!(
+            inventory.contains("relux-tools-status"),
+            "the decision prompt still advertises the genuine status tool: {inventory}"
+        );
     }
 
     #[test]
