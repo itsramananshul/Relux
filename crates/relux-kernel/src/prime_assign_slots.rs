@@ -288,6 +288,7 @@ mod tests {
             all_agent_ids: agents.iter().map(|s| s.to_string()).collect(),
             agent_skills: vec![],
             all_task_ids: tasks.iter().map(|s| s.to_string()).collect(),
+            available_adapter_ids: Vec::new(),
             queued: tasks
                 .iter()
                 .map(|id| TaskBrief {

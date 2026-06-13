@@ -264,7 +264,8 @@ pub fn classify_intent(message: &str) -> PrimeIntent {
         "crew member",
         "run claude on",
         "run codex on",
-    ]) {
+    ]) || creates_an_operative(&m)
+    {
         return PrimeIntent::AgentCreation;
     }
     if starts("assign")
@@ -674,12 +675,75 @@ pub fn decide(message: &str, intent: &PrimeIntent, summary: &StateSummary) -> Pr
         }
         PrimeIntent::AgentCreation => {
             let name = derive_agent_name(message);
+            // Fail closed on a duplicate before the kernel ever tries to create one: the
+            // derived handle (the same one the no-brain execute path derives) must not
+            // collide with an existing operative. The brain-slot layer rejects a duplicate
+            // proposal too ([`crate::prime_agent_slots::reconcile_agent_slots`]); this is
+            // the deterministic counterpart, so "create another researcher" gets an honest
+            // answer instead of a kernel `AgentExists` error.
+            let derived_id = name.to_lowercase().replace(' ', "-");
+            if summary
+                .all_agent_ids
+                .iter()
+                .any(|e| e.eq_ignore_ascii_case(&derived_id))
+            {
+                return PrimePlan::Reply {
+                    text: format!(
+                        "An operative \"{derived_id}\" already exists. Pick a different name, or tell me what to change about the existing one."
+                    ),
+                };
+            }
+            // Resolve an explicitly-named adapter/brain preference ("uses Claude", "run
+            // codex on this") against the LIVE installed adapters. An unknown/uninstalled
+            // preference is reported honestly and the safe local default stands — Prime
+            // never invents or enables an adapter (`docs/RELUX_MASTER_PLAN.md` §6, §7.3,
+            // §8.1; reference: openclaw `normalizeToolModelOverride`).
+            use crate::prime_agent_create::AdapterPreference;
+            let (adapter_plugin, adapter_clause, adapter_caveat) =
+                match crate::prime_agent_create::resolve_adapter_preference(
+                    message,
+                    &summary.available_adapter_ids,
+                ) {
+                    AdapterPreference::Resolved { adapter_id, label } => {
+                        (adapter_id, format!(" on {label}"), String::new())
+                    }
+                    AdapterPreference::NamedButUnavailable { label, .. } => (
+                        relux_core::LOCAL_PRIME_ADAPTER_ID.to_string(),
+                        " on the local adapter".to_string(),
+                        format!(
+                            " The {label} adapter isn't installed yet, so I'll start it on the local adapter — install/enable the {label} adapter and I can switch it over."
+                        ),
+                    ),
+                    AdapterPreference::None => (
+                        relux_core::LOCAL_PRIME_ADAPTER_ID.to_string(),
+                        " on the local adapter".to_string(),
+                        String::new(),
+                    ),
+                };
+            // Capabilities the user asked for are NEVER granted on create (§7.5: granting
+            // permissions is a reviewed action; §6: Prime names the scoped permission it
+            // needs and asks). Surface them honestly here; `attach_suggestions` offers the
+            // grant as a one-click, approval-gated follow-up through the unchanged
+            // `PermissionChange` path. No access is fabricated.
+            let caps = crate::prime_agent_create::requested_capabilities(message);
+            let cap_clause = if caps.is_empty() {
+                String::new()
+            } else {
+                let labels = caps
+                    .iter()
+                    .map(|c| c.label.clone())
+                    .collect::<Vec<_>>()
+                    .join(" and ");
+                format!(
+                    " I won't grant access to {labels} on creation — that needs the matching tool plugin and a scoped permission you approve. I'll create the operative now and offer the grant as a separate, reviewable step."
+                )
+            };
             PrimePlan::Act {
                 action: PrimeAction::CreateAgent {
                     name: name.clone(),
-                    adapter_plugin: "relux-adapter-local-prime".to_string(),
+                    adapter_plugin,
                 },
-                text: format!("Creating agent \"{name}\" on the local adapter."),
+                text: format!("Creating agent \"{name}\"{adapter_clause}.{adapter_caveat}{cap_clause}"),
             }
         }
         PrimeIntent::PluginInstallation => {
@@ -784,10 +848,17 @@ pub fn decide(message: &str, intent: &PrimeIntent, summary: &StateSummary) -> Pr
             }
         }
         PrimeIntent::PermissionChange => {
-            let subject = if message.to_lowercase().contains("agent") {
-                derive_agent_name(message)
-            } else {
-                "(unspecified subject)".to_string()
+            // Resolve the subject against the LIVE roster when the user named one ("grant
+            // … to <agent>"), so a created-operative grant follow-up lands on the real id;
+            // fall back to the keyword derivation, then an explicit unspecified subject.
+            // Resolution is fail closed (reuses [`resolve_assignee`]) — it can only ever
+            // name an operative that already exists.
+            let subject = match extract_assignee_phrase(message)
+                .map(|p| resolve_assignee(&p, &summary.all_agent_ids, &summary.agent_skills))
+            {
+                Some(AssigneeResolution::Resolved(id)) => id,
+                _ if message.to_lowercase().contains("agent") => derive_agent_name(message),
+                _ => "(unspecified subject)".to_string(),
             };
             let permission = derive_permission_label(message);
             PrimePlan::Propose {
@@ -2339,6 +2410,41 @@ fn plan_single_text(goal: &str) -> String {
     )
 }
 
+/// True when a creation verb governs the noun "agent"/"operative" as the thing being
+/// MADE ("make a coding agent", "build a research operative") — as opposed to a task
+/// that merely mentions an agent ("create a task for the research agent"). The
+/// keyword list above already catches the explicit "create an agent" phrasings; this
+/// catches the natural "<verb> a <role> agent" shape the list misses.
+///
+/// Conservative and fail-closed: the message must START with a creation verb, and the
+/// agent/operative noun must be the object of an indefinite article ("a"/"an") within a
+/// short window before it — never preceded by "the"/"this"/"for"/"to" (a prepositional
+/// phrase about an EXISTING operative). So it can never turn a task that references an
+/// agent into an agent-creation turn.
+fn creates_an_operative(m: &str) -> bool {
+    let toks: Vec<&str> = m
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    if toks.is_empty() || !CREATION_VERBS.contains(&toks[0]) {
+        return false;
+    }
+    for (i, w) in toks.iter().enumerate() {
+        if matches!(*w, "agent" | "agents" | "operative" | "operatives") {
+            let lo = i.saturating_sub(3);
+            let window = &toks[lo..i];
+            let has_article = window.contains(&"a") || window.contains(&"an");
+            let blocked = window
+                .iter()
+                .any(|x| matches!(*x, "the" | "this" | "that" | "existing" | "for" | "to"));
+            if has_article && !blocked {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn derive_agent_name(message: &str) -> String {
     let m = message.to_lowercase();
     for marker in [" named ", " called ", " as "] {
@@ -2377,7 +2483,7 @@ fn derive_plugin_id(message: &str) -> String {
         .unwrap_or_else(|| "(unspecified-plugin)".to_string())
 }
 
-fn derive_permission_label(message: &str) -> String {
+pub(crate) fn derive_permission_label(message: &str) -> String {
     let m = message.to_lowercase();
     if m.contains("github") {
         "tool:relux-tools-github:access".to_string()
@@ -2707,6 +2813,7 @@ mod tests {
             all_agent_ids: vec![],
             agent_skills: vec![],
             all_task_ids: vec![],
+            available_adapter_ids: vec![],
             queued: vec![],
             recent: vec![],
         }

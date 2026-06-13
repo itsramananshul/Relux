@@ -1513,6 +1513,7 @@ mod tests {
             all_agent_ids: vec![],
             agent_skills: vec![],
             all_task_ids: vec![],
+            available_adapter_ids: vec![],
             queued: vec![],
             recent: vec![],
         }

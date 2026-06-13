@@ -1165,6 +1165,7 @@ mod tests {
             all_agent_ids: agents.iter().map(|s| s.to_string()).collect(),
             agent_skills: vec![],
             all_task_ids: vec![],
+            available_adapter_ids: vec![],
             queued: vec![],
             recent: vec![],
         }

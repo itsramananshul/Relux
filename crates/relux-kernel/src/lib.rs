@@ -41,6 +41,7 @@ pub mod plugin_tool_config;
 pub mod prime;
 pub mod prime_after_action;
 pub mod prime_admin_slots;
+pub mod prime_agent_create;
 pub mod prime_agent_slots;
 pub mod prime_agent_loop;
 pub mod prime_assign_slots;

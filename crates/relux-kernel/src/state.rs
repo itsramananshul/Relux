@@ -7222,6 +7222,16 @@ impl KernelState {
                 .map(|a| (a.id.0.clone(), a.skills.clone()))
                 .collect(),
             all_task_ids: self.tasks.keys().map(|id| id.0.clone()).collect(),
+            // The installed adapter plugins an operative could be created on: every
+            // plugin whose id is recognized as an adapter kind (local-prime, claude-cli,
+            // codex-cli). `create_agent` requires the adapter plugin to be installed, so
+            // this is exactly the set a named adapter preference may resolve against.
+            available_adapter_ids: self
+                .plugins
+                .keys()
+                .filter(|id| relux_core::recognize_adapter_kind(id.as_str()).is_some())
+                .map(|id| id.0.clone())
+                .collect(),
             queued,
             recent,
         }
@@ -12101,6 +12111,24 @@ fn attach_suggestions(
         });
     }
 
+    // A freshly-created operative the user asked to have a capability gets a one-click,
+    // approval-gated grant follow-up. Prime never grants access on create
+    // (`docs/RELUX_MASTER_PLAN.md` §6, §7.5); this routes the scoped permission through
+    // the UNCHANGED `PermissionChange` → approval path. The button is `send: false` so
+    // the operator reviews the grant first — clicking it can do nothing the operator
+    // could not type, and nothing is granted until the approval is greenlit.
+    if turn.intent == PrimeIntent::AgentCreation {
+        if let Some(agent_id) = turn.created_agent.as_ref() {
+            for cap in crate::prime_agent_create::requested_capabilities(message) {
+                turn.suggested_actions.push(PrimeSuggestion {
+                    label: format!("Grant {} access to {}", cap.label, agent_id.as_str()),
+                    message: format!("grant {} to {}", cap.permission, agent_id.as_str()),
+                    send: false,
+                });
+            }
+        }
+    }
+
     // A plan request previews work but creates nothing (§10 planning layer, §11.1).
     // Offer the explicit one-click commit, keyed off the same decomposition the
     // preview showed: a multi-step plan routes the existing orchestration `Act`
@@ -13221,6 +13249,168 @@ mod tests {
         assert_eq!(created_agent_id.as_str(), "researcher-bot");
         assert_eq!(k.agent_count(), 2, "agent count should increase by 1"); // prime + researcher-bot
         assert!(k.agent(&created_agent_id).is_some());
+    }
+
+    #[test]
+    fn prime_creates_an_operative_from_a_natural_make_phrasing() {
+        // "make a coding agent for this repo" names no explicit "create an agent" phrase,
+        // but the verb governs the noun "agent" — it must hire, not mint a task.
+        let (mut k, ctx) = prime_chat_kernel();
+        let turn = k
+            .prime_turn(&ctx, "make a coding agent for this repo")
+            .unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::AgentCreation);
+        assert_eq!(turn.disposition, PrimeDisposition::Executed);
+        assert!(turn.created_agent.is_some(), "an operative was created");
+        assert!(turn.created_task.is_none(), "no task should be minted");
+    }
+
+    #[test]
+    fn prime_creates_a_task_for_an_existing_agent_without_hiring() {
+        // The mirror case: a task that merely REFERENCES an agent must stay task creation.
+        let (mut k, ctx) = prime_chat_kernel();
+        add_agent(&mut k, &ctx, "research-agent");
+        let turn = k
+            .prime_turn(&ctx, "create a task for the research agent to read the README")
+            .unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::TaskCreation);
+        assert!(turn.created_task.is_some(), "a task was created");
+        assert!(turn.created_agent.is_none(), "no new operative was hired");
+    }
+
+    #[test]
+    fn prime_create_agent_honors_an_installed_adapter_preference() {
+        // "uses Claude" puts the operative on the Claude adapter — but only because the
+        // Claude adapter plugin is installed in this kernel.
+        let (mut k, ctx) = prime_chat_kernel();
+        install_bundled(&mut k, claude_adapter_manifest());
+        let turn = k
+            .prime_turn(&ctx, "create an agent named researcher that uses Claude")
+            .unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::AgentCreation);
+        let id = turn.created_agent.expect("agent created");
+        assert_eq!(id.as_str(), "researcher");
+        assert_eq!(
+            k.agent(&id).unwrap().adapter_plugin.as_str(),
+            relux_core::CLAUDE_CLI_ADAPTER_ID
+        );
+        assert!(turn.reply.contains("Claude"));
+    }
+
+    #[test]
+    fn prime_create_agent_falls_back_honestly_when_the_named_adapter_is_absent() {
+        // Claude was named but its adapter plugin is NOT installed: never fabricate it —
+        // create on the local adapter and say setup is needed.
+        let (mut k, ctx) = prime_chat_kernel();
+        let turn = k
+            .prime_turn(&ctx, "create an agent named researcher that uses Claude")
+            .unwrap();
+        let id = turn.created_agent.expect("agent created");
+        assert_eq!(
+            k.agent(&id).unwrap().adapter_plugin.as_str(),
+            relux_core::LOCAL_PRIME_ADAPTER_ID
+        );
+        assert!(
+            turn.reply.contains("isn't installed"),
+            "reply must be honest about the missing adapter: {}",
+            turn.reply
+        );
+    }
+
+    #[test]
+    fn prime_create_agent_never_grants_a_requested_capability_on_create() {
+        // "can read GitHub" must NOT silently grant access nor fabricate it. The operative
+        // is created with NO permissions; the reply is honest; a reviewable grant
+        // follow-up is offered (routed through the approval-gated permission path).
+        let (mut k, ctx) = prime_chat_kernel();
+        let turn = k
+            .prime_turn(
+                &ctx,
+                "create an agent named researcher that can read GitHub",
+            )
+            .unwrap();
+        let id = turn.created_agent.expect("agent created");
+        assert!(
+            k.agent(&id).unwrap().permissions.is_empty(),
+            "no permission may be granted on create"
+        );
+        assert!(
+            turn.reply.to_lowercase().contains("github"),
+            "reply must name the requested capability: {}",
+            turn.reply
+        );
+        let grant = turn
+            .suggested_actions
+            .iter()
+            .find(|s| s.message.contains("grant") && s.message.contains("researcher"))
+            .expect("a grant follow-up suggestion is offered");
+        assert!(!grant.send, "the grant must be reviewed, not auto-sent");
+        assert!(grant.message.contains("tool:relux-tools-github:access"));
+    }
+
+    #[test]
+    fn prime_capability_grant_followup_resolves_through_the_approval_gate() {
+        // The offered follow-up message ("grant … to researcher") must classify as a
+        // permission change, resolve the real subject against the roster, and PROPOSE the
+        // grant behind an approval — never execute it.
+        let (mut k, ctx) = prime_chat_kernel();
+        let created = k
+            .prime_turn(&ctx, "create an agent named researcher that can read GitHub")
+            .unwrap();
+        let grant_msg = created
+            .suggested_actions
+            .iter()
+            .find(|s| s.message.starts_with("grant "))
+            .expect("grant follow-up")
+            .message
+            .clone();
+        let turn = k.prime_turn(&ctx, &grant_msg).unwrap();
+        assert_eq!(turn.intent, relux_core::PrimeIntent::PermissionChange);
+        assert_eq!(turn.disposition, PrimeDisposition::AwaitingApproval);
+        assert!(turn.approval.is_some(), "the grant is staged behind approval");
+        // Still no permission on the agent until the approval is greenlit.
+        assert!(k
+            .agent(&AgentId::new("researcher"))
+            .unwrap()
+            .permissions
+            .is_empty());
+        match turn.action {
+            Some(relux_core::PrimeAction::GrantPermission { subject_id, .. }) => {
+                assert_eq!(subject_id, "researcher", "subject resolved to the real id");
+            }
+            other => panic!("expected a GrantPermission proposal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prime_create_agent_refuses_a_duplicate_name() {
+        // A second "create an agent named researcher" must fail closed with an honest
+        // reply, not a kernel error and not a second operative.
+        let (mut k, ctx) = prime_chat_kernel();
+        k.prime_turn(&ctx, "create an agent named researcher")
+            .unwrap();
+        let before = k.agent_count();
+        let turn = k
+            .prime_turn(&ctx, "create an agent named researcher")
+            .unwrap();
+        assert_eq!(turn.disposition, PrimeDisposition::Answered);
+        assert!(turn.created_agent.is_none());
+        assert!(turn.reply.contains("already exists"), "{}", turn.reply);
+        assert_eq!(k.agent_count(), before, "no duplicate operative created");
+    }
+
+    #[test]
+    fn prime_casual_agent_ideation_does_not_create_anything() {
+        // Brainstorming about agents ("what if we had a research agent?") is a
+        // conversation — it must mutate no state.
+        let (mut k, ctx) = prime_chat_kernel();
+        let before = k.agent_count();
+        let turn = k
+            .prime_turn(&ctx, "what if we had a research agent someday?")
+            .unwrap();
+        assert!(turn.created_agent.is_none(), "ideation creates no operative");
+        assert_eq!(k.agent_count(), before);
+        assert_ne!(turn.disposition, PrimeDisposition::Executed);
     }
 
     #[test]

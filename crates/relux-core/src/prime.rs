@@ -702,6 +702,13 @@ pub struct StateSummary {
     pub agent_skills: Vec<(String, Vec<String>)>,
     /// All tasks known to the system, by their ID.
     pub all_task_ids: Vec<String>,
+    /// The installed adapter plugin ids an operative could be created on (the ids
+    /// recognized as adapter kinds). Used to resolve an explicitly-named adapter/brain
+    /// preference at agent-creation time against what actually exists (fail closed — an
+    /// unrecognized preference never invents an adapter). `#[serde(default)]` so an older
+    /// serialized summary (no adapters) deserializes to an empty list.
+    #[serde(default)]
+    pub available_adapter_ids: Vec<String>,
     /// Tasks assigned and ready to start, in id order.
     pub queued: Vec<TaskBrief>,
     /// The most recent tasks (newest first), used to ground explanations.
