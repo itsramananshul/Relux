@@ -8216,8 +8216,9 @@ struct PrimeConfigureCandidateReq {
 
 /// The structured result of a confirmed capability activation. One auditable envelope:
 /// which plugin/candidate was activated, through which governed path (MCP registry or
-/// command tool), the resulting server/tool status, the honest "ask me to use it" next
-/// step, and the no-code-run guarantee.
+/// command tool), the resulting server/tool status, the honest concrete next step (the
+/// exact "run the <tool> tool" / "use the <server> tools" phrase to try at Prime), and the
+/// no-code-run guarantee.
 #[derive(Debug, Serialize)]
 struct PrimeConfigureCandidateResponse {
     plugin_id: String,
@@ -8345,7 +8346,7 @@ fn build_post_activation_discovery(
                     format!("{gated_count} of {tool_count} stay gated until you classify them")
                 };
                 let guidance = format!(
-                    "Registered MCP server \"{server_id}\" and discovered {tool_count} tool(s): {names}. {gated_note} — ask me to use one and I'll stage the approval before it runs."
+                    "Registered MCP server \"{server_id}\" and discovered {tool_count} tool(s): {names}. {gated_note} — ask me to use the {server_id} tools and I'll stage the approval before the first one runs."
                 );
                 let next_step = guidance.clone();
                 (
@@ -8641,7 +8642,7 @@ async fn prime_configure_candidate_action(
                 Ok(record_for(kernel, &installed))
             })?;
             let step = format!(
-                "Configured command tool \"{tool_name}\". It is gated (needs approval) — ask me to use {tool_name} and I'll stage the approval before it runs."
+                "Configured command tool \"{tool_name}\". It is gated (needs approval) — ask me to run the {tool_name} tool and I'll stage the approval before it runs."
             );
             (None, Some(record), tool_name, step, None, None)
         }
@@ -8878,7 +8879,7 @@ async fn prime_configure_command_tool_action(
     }
 
     let next_step = format!(
-        "Configured command tool \"{tool_name}\". It is gated (needs approval) — ask me to use {tool_name} and I'll stage the approval before it runs."
+        "Configured command tool \"{tool_name}\". It is gated (needs approval) — ask me to run the {tool_name} tool and I'll stage the approval before it runs."
     );
     Ok(Json(PrimeConfigureCommandToolResponse {
         plugin_id: target.id,
@@ -13433,7 +13434,11 @@ mod tests {
         assert_eq!(v["no_code_executed"], true, "activation never runs code");
         // The new tool lands on the plugin record (its tool_count grows).
         assert!(v["plugin"]["tool_count"].as_u64().unwrap() >= 1, "body: {body}");
-        assert!(v["next_step"].as_str().unwrap().contains("ask me to use"), "body: {body}");
+        // The concrete next step names the exact phrase to try at Prime ("run the <tool> tool").
+        assert!(
+            v["next_step"].as_str().unwrap().contains("run the plain.run tool"),
+            "body: {body}"
+        );
     }
 
     #[tokio::test]
@@ -13803,8 +13808,12 @@ mod tests {
         assert_eq!(cv["activation"], "command_tool", "configure: {conf}");
         assert_eq!(cv["tool_name"], "greeter.run", "configure: {conf}");
         assert_eq!(cv["no_code_executed"], true, "activation never runs code: {conf}");
-        // Honest: the tool is gated until invoked — never a fake "ready".
-        assert!(cv["next_step"].as_str().unwrap().contains("ask me to use"), "configure: {conf}");
+        // Honest: the tool is gated until invoked — never a fake "ready". The next step names
+        // the exact concrete phrase to try at Prime ("run the <tool> tool").
+        assert!(
+            cv["next_step"].as_str().unwrap().contains("run the greeter.run tool"),
+            "configure: {conf}"
+        );
 
         let permission = format!("tool:{id}:run");
 
@@ -13961,7 +13970,11 @@ mod tests {
         assert_eq!(cv["no_code_executed"], true, "configuration never runs code: {conf}");
         assert_eq!(cv["catalog_refresh"], true, "the dashboard must re-pull the catalog: {conf}");
         assert_eq!(cv["permission"], format!("tool:{id}:run"), "configure: {conf}");
-        assert!(cv["next_step"].as_str().unwrap().contains("ask me to use"), "configure: {conf}");
+        // The next step names the exact concrete phrase to try at Prime ("run the <tool> tool").
+        assert!(
+            cv["next_step"].as_str().unwrap().contains("run the repo.run tool"),
+            "configure: {conf}"
+        );
 
         let permission = format!("tool:{id}:run");
 
@@ -14139,7 +14152,7 @@ mod tests {
     #[test]
     fn post_activation_discovery_reports_found_gated_tools() {
         // The happy path: the probe came back with tools. The user should see what landed,
-        // how many stay gated, and an honest "ask me to use one" — not a protocol chore.
+        // how many stay gated, and a concrete "use the <server> tools" cue — not a protocol chore.
         let tools = vec![
             mcp_tool("alpha", relux_core::ToolExecutability::NeedsApproval),
             mcp_tool("beta", relux_core::ToolExecutability::NeedsApproval),
@@ -14151,7 +14164,8 @@ mod tests {
         assert!(d.error.is_none());
         assert!(d.guidance.contains("alpha") && d.guidance.contains("beta"), "{}", d.guidance);
         assert!(d.guidance.contains("gated"), "{}", d.guidance);
-        assert!(step.contains("ask me to use"), "{step}");
+        // The concrete cue names the server so the user knows exactly what to ask Prime.
+        assert!(step.contains("use the srv tools"), "{step}");
     }
 
     #[test]

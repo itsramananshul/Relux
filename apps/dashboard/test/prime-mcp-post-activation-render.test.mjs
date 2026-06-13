@@ -59,11 +59,11 @@ const REACHABLE = {
     reachable: true,
     tool_count: 2,
     gated_count: 2,
-    guidance: "Registered MCP server \\"gh\\" and discovered 2 tool(s): create_issue, list_repos. Each stays gated until you classify it — ask me to use one and I'll stage the approval before it runs.",
+    guidance: "Registered MCP server \\"gh\\" and discovered 2 tool(s): create_issue, list_repos. Each stays gated until you classify it — ask me to use the gh tools and I'll stage the approval before the first one runs.",
     tools: [mcpTool("create_issue", "needs_approval", "Open a new issue"), mcpTool("list_repos", "needs_approval")],
   },
   tool_name: "gh",
-  next_step: "Registered MCP server \\"gh\\" and discovered 2 tool(s): create_issue, list_repos. Each stays gated until you classify it — ask me to use one and I'll stage the approval before it runs.",
+  next_step: "Registered MCP server \\"gh\\" and discovered 2 tool(s): create_issue, list_repos. Each stays gated until you classify it — ask me to use the gh tools and I'll stage the approval before the first one runs.",
   no_code_executed: true,
   approval_closed: true,
 };
@@ -88,7 +88,7 @@ const COMMAND_TOOL = {
   kind: "cli_command",
   activation: "command_tool",
   tool_name: "plain.run",
-  next_step: "Configured command tool \\"plain.run\\". It is gated (needs approval).",
+  next_step: "Configured command tool \\"plain.run\\". It is gated (needs approval) — ask me to run the plain.run tool and I'll stage the approval before it runs.",
   no_code_executed: true,
   approval_closed: false,
 };
@@ -135,8 +135,9 @@ test("a reachable MCP activation lists the discovered tools with gated chips + s
   // The "N tools found" / "N gated" summary chips render.
   assert.match(html, /2 tools found/);
   assert.match(html, /2 gated/);
-  // The honest "ask me to use one" next step is present.
-  assert.match(html, /ask me to use one/i);
+  // The honest, concrete "use the <server> tools" next step is present (mirrors the
+  // Plugins page primeUseCue mcp_server phrase, never a vague "ask me to use it").
+  assert.match(html, /use the gh tools/i);
 });
 
 test("an unreachable MCP activation shows guidance + sanitized error, no fabricated tools", () => {
@@ -156,4 +157,7 @@ test("a command-tool activation renders NO MCP discovery panel", () => {
   assert.match(html, /plain\.run/);
   assert.doesNotMatch(html, /tools found/i);
   assert.doesNotMatch(html, /not reachable yet/i);
+  // The concrete next step names the exact phrase to try at Prime ("run the <tool> tool"),
+  // mirroring the Plugins page primeUseCue — never a vague "ask me to use it".
+  assert.match(html, /run the plain\.run tool/i);
 });

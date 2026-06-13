@@ -341,9 +341,12 @@ The flow:
      envelope**.
 4. **Result.** The structured response carries the `plugin_id` / `plugin_name`, the
    activated candidate's `kind` + `activation`, the registered `mcp_server` **or** the
-   updated `plugin` record, the new `tool_name`, the honest `next_step` (**"ask me to use
-   it"** — the tool stays gated until invoked), and the `no_code_executed` guarantee. A
-   command tool is invokable through the same gated chat path (`prime_invoke_tool`).
+   updated `plugin` record, the new `tool_name`, the honest **concrete** `next_step` — the
+   exact phrase to try at Prime (**"run the `<tool>` tool"** for a command tool, **"use the
+   `<server>` tools"** for an MCP registration), with the tool gated until invoked — and the
+   `no_code_executed` guarantee. This mirrors the Plugins page `primeUseCue`, so the chat
+   card and the Plugins banner give the same call to action. A command tool is invokable
+   through the same gated chat path (`prime_invoke_tool`).
 5. **Guided post-activation discovery (MCP only).** Immediately after it registers an
    `mcp_register` candidate, the route runs ONE bounded `tools/list` probe against the
    freshly-registered server — **off the kernel lock** (a loopback dial or a
@@ -439,8 +442,9 @@ The flow (one backend chokepoint):
    plugin is refused. It closes the logged approval (best-effort) and returns **one
    structured envelope**.
 3. **Result.** The envelope carries the `plugin_id` / `plugin_name`, the `tool_name`, the
-   derived `permission` (`tool:<plugin>:<verb>`), `gated: true`, the honest `next_step`
-   (**"ask me to use it"**), `no_code_executed: true`, and `catalog_refresh: true` so the
+   derived `permission` (`tool:<plugin>:<verb>`), `gated: true`, the honest **concrete**
+   `next_step` (**"run the `<tool>` tool"** — the exact phrase to try at Prime, mirroring the
+   Plugins page `primeUseCue`), `no_code_executed: true`, and `catalog_refresh: true` so the
    dashboard re-pulls `GET /v1/relux/prime/tools` and the new tool shows up in **"Tools
    Prime can use"** — gated until invoked.
 

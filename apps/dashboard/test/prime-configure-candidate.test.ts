@@ -51,7 +51,7 @@ const SAMPLE = {
   kind: "cli_command",
   activation: "command_tool",
   tool_name: "cool.run",
-  next_step: "Configured command tool \"cool.run\". Ask me to use cool.run.",
+  next_step: "Configured command tool \"cool.run\". It is gated (needs approval) — ask me to run the cool.run tool and I'll stage the approval before it runs.",
   no_code_executed: true,
   approval_closed: true,
 };

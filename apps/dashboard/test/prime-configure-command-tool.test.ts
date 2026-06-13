@@ -49,7 +49,7 @@ const SAMPLE = {
   tool_name: "repo.build",
   permission: "tool:relux-plugin-repo:build",
   gated: true,
-  next_step: 'Configured command tool "repo.build". Ask me to use repo.build.',
+  next_step: 'Configured command tool "repo.build". It is gated (needs approval) — ask me to run the repo.build tool and I\'ll stage the approval before it runs.',
   no_code_executed: true,
   catalog_refresh: true,
   approval_closed: true,
