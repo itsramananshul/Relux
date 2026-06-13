@@ -18287,6 +18287,70 @@ mod tests {
     }
 
     #[test]
+    fn conversation_first_contract_holds_end_to_end() {
+        // One consolidated walk of the "Prime defaults to conversation; only an explicit
+        // ask OR a staged action mutates" contract over the REAL prime_turn path
+        // (deterministic Local brain). This pins the holistic behavior in one place so a
+        // future refactor cannot quietly re-grow the task-manager feel (§10.5, §17.1).
+        let (mut k, ctx) = prime_chat_kernel();
+        let tasks0 = k.task_count();
+        let plugins0 = k.plugin_count();
+
+        // 1) Casual ideation stays a conversation — no task, no run, no approval; it offers
+        //    a STAGED, pre-filled "Turn this into a task" chip (send=false), never a mutation.
+        let muse = k
+            .prime_turn(&ctx, "I was thinking we could build a better onboarding flow")
+            .unwrap();
+        assert_eq!(muse.intent, relux_core::PrimeIntent::Brainstorming);
+        assert_eq!(muse.disposition, PrimeDisposition::Answered);
+        assert!(muse.created_task.is_none() && muse.started_run.is_none() && muse.approval.is_none());
+        assert_eq!(k.task_count(), tasks0, "ideation must create nothing");
+        let promote = muse
+            .suggested_actions
+            .iter()
+            .find(|s| s.label == "Turn this into a task")
+            .expect("ideation offers a staged promote-to-task chip");
+        assert!(!promote.send, "the staged chip pre-fills, never auto-runs");
+        let staged_message = promote.message.clone();
+
+        // 2) Profanity / frustration is conversation/support — never task creation.
+        let vent = k.prime_turn(&ctx, "ugh this is shit, I give up").unwrap();
+        assert_eq!(vent.intent, relux_core::PrimeIntent::EmotionalSupport);
+        assert!(vent.created_task.is_none() && vent.approval.is_none());
+        assert_eq!(k.task_count(), tasks0, "venting must create nothing");
+
+        // 3) A plain greeting changes no state.
+        let hi = k.prime_turn(&ctx, "hey there").unwrap();
+        assert_eq!(hi.intent, relux_core::PrimeIntent::Greeting);
+        assert_eq!(k.task_count(), tasks0, "a greeting must create nothing");
+
+        // 4) An EXPLICIT plugin install is staged behind a human approval and installs nothing.
+        let install = k
+            .prime_turn(&ctx, "install nousresearch/hermes-agent as a plugin")
+            .unwrap();
+        assert_eq!(install.intent, relux_core::PrimeIntent::PluginInstallation);
+        assert_eq!(install.disposition, PrimeDisposition::AwaitingApproval);
+        assert!(install.approval.is_some(), "an install is approval-staged");
+        assert_eq!(k.plugin_count(), plugins0, "proposing an install installs nothing");
+
+        // 5) An EXPLICIT create command DOES create a task (the explicit path still acts).
+        let created = k
+            .prime_turn(&ctx, "create a task to summarize the README")
+            .unwrap();
+        assert_eq!(created.disposition, PrimeDisposition::Executed);
+        assert!(created.created_task.is_some(), "an explicit create acts");
+        let after_explicit = k.task_count();
+        assert_eq!(after_explicit, tasks0 + 1, "explicit create adds exactly one task");
+
+        // 6) Confirming the STAGED action from step 1 (sending the pre-filled chip message)
+        //    performs the mutation — staging is a real, one-click-away create, not a dead end.
+        let confirmed = k.prime_turn(&ctx, &staged_message).unwrap();
+        assert_eq!(confirmed.disposition, PrimeDisposition::Executed);
+        assert!(confirmed.created_task.is_some(), "confirming the staged chip creates the task");
+        assert_eq!(k.task_count(), after_explicit + 1, "the staged confirmation adds one task");
+    }
+
+    #[test]
     fn explicit_create_still_offers_the_start_cta() {
         // The Hermes-first suppression is surgical: an EXPLICIT work request still
         // yields its action and the "Start the run" CTA — only casual/emotional chat

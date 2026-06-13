@@ -365,6 +365,22 @@ test("PRIME_SUGGESTIONS lead with general chat before control-plane work", () =>
   );
 });
 
+test("PRIME_SUGGESTIONS carry no contextless cold-start work commands", () => {
+  // The chips shown on an EMPTY conversation must not be commands that have no
+  // referent on a fresh board: "start it" / "why did it fail?" answer "nothing to
+  // start" / "nothing failed", and "orchestrate …" would mint briefs on one click —
+  // all of which make Prime read like a work-board bot at first impression. The
+  // contextual work CTAs live UNDER a reply instead (§10.5, §11.1, §17.1).
+  for (const s of PRIME_SUGGESTIONS) {
+    const lc = s.toLowerCase();
+    assert.doesNotMatch(lc, /^start it$|^orchestrate\b|why did it fail/, `cold-start chip must not be a contextless work command: ${s}`);
+  }
+  // At most ONE explicit-work example, and it is not first (conversation leads).
+  const workChips = PRIME_SUGGESTIONS.filter((s) => s.toLowerCase().includes("create a task"));
+  assert.equal(workChips.length, 1, "exactly one explicit-work example chip");
+  assert.notEqual(PRIME_SUGGESTIONS[0].toLowerCase(), workChips[0].toLowerCase(), "the work example is never the first chip");
+});
+
 test("boundedContextReads caps the detail list and reports the hidden count", () => {
   const many = Array.from({ length: 11 }, (_, i) => read({ summary: `read ${i}` }));
   const { shown, hidden } = boundedContextReads(many);

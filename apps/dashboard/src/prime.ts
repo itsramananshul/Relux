@@ -72,16 +72,22 @@ export const PRIME_HINT =
 export const PRIME_PLACEHOLDER = "Message Prime — ask anything, or tell it what to do";
 
 // Discoverable example chips. General-chat prompts come FIRST; the control-plane
-// examples are kept but secondary, so Prime never reads as work-board-only.
+// is kept discoverable but secondary, so Prime never reads as work-board-only.
+//
+// Cold-start honesty: these are the chips shown on an EMPTY conversation, so they
+// must not be contextless work commands. Chips like "start it" / "why did it fail?"
+// have no referent on a fresh board (they answer "nothing is ready to start" /
+// "nothing has failed") and an "orchestrate …" chip would MINT briefs on a single
+// click — both make Prime read like a work-board bot at first impression. So the
+// cold-start set is conversation + read-only discovery + ONE explicit-work example
+// (last), and the contextual work CTAs ("Start the run", "Turn this into a task")
+// appear only UNDER a reply, where they actually have a referent (§10.5, §11.1).
 export const PRIME_SUGGESTIONS = [
   "what can you do?",
   "help me think through an idea",
-  "what is going on?",
   "what tools can you use?",
+  "what is going on?",
   "create a task to summarize the README",
-  "orchestrate research the options, build a prototype, and write the docs",
-  "start it",
-  "why did it fail?",
 ];
 
 // Pure helpers for rendering Prime's reviewable plan proposal as a card
